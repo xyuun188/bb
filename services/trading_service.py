@@ -14210,6 +14210,22 @@ class TradingService:
         if result is None:
             return "交易接口未返回执行结果。"
         raw = result.raw_response or {}
+        if isinstance(raw, dict) and raw.get("entry_tracking"):
+            message = str(sanitize_text(raw.get("message")) or "").strip()
+            remaining = self._safe_float(raw.get("remaining_contracts"), 0.0)
+            filled = self._safe_float(raw.get("filled_contracts"), 0.0)
+            if result.status == OrderStatus.PARTIAL:
+                return message or (
+                    f"OKX 开仓委托已部分成交，已成交约 {filled:g} 张，"
+                    f"剩余约 {remaining:g} 张仍在追单；本地等待 OKX 仓位同步确认。"
+                )
+            if result.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+                return message or (
+                    "OKX 开仓委托正在挂单或追单，尚未确认成交；"
+                    "系统不会先创建本地持仓，也不会重复提交同方向开仓单。"
+                )
+            if message:
+                return message
         if isinstance(raw, dict) and raw.get("exit_tracking"):
             message = str(sanitize_text(raw.get("message")) or "").strip()
             remaining = self._safe_float(raw.get("remaining_contracts"), 0.0)

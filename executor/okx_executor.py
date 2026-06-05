@@ -340,6 +340,61 @@ class OKXExecutor(AbstractExecutor):
                     raw_response={"error": "Order size is below OKX minimum contract size"},
                 )
 
+            if decision.is_entry:
+                existing_entry = await self._find_active_entry_order(ccxt, okx_symbol, side)
+                if existing_entry:
+                    info = existing_entry.get("info") or {}
+                    order_id = str(existing_entry.get("id") or info.get("ordId") or "")
+                    filled_contracts = self._safe_float(
+                        existing_entry.get("filled") or info.get("accFillSz"),
+                        0.0,
+                    )
+                    amount_contracts = self._safe_float(
+                        existing_entry.get("amount") or info.get("sz"),
+                        order_quantity,
+                    )
+                    remaining_contracts = max(amount_contracts - filled_contracts, 0.0)
+                    status = self._order_status_from_ccxt(
+                        existing_entry.get("status") or info.get("state")
+                    )
+                    if filled_contracts > 0 and status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+                        status = OrderStatus.PARTIAL
+                    execution_price = float(
+                        existing_entry.get("average")
+                        or existing_entry.get("price")
+                        or price
+                        or 0
+                    )
+                    return ExecutionResult(
+                        order_id=order_id or "entry_tracking",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=filled_contracts * contract_size if filled_contracts > 0 else 0.0,
+                        price=execution_price,
+                        status=status,
+                        fee=self._order_fee_cost(existing_entry),
+                        exchange_order_id=order_id or None,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_response={
+                            **existing_entry,
+                            "entry_tracking": True,
+                            "existing_entry_order": True,
+                            "message": (
+                                "OKX 已有同方向开仓委托正在挂单或追单，系统不会重复提交新的开仓单；"
+                                "成交后会由 OKX 仓位同步写入本地持仓。"
+                            ),
+                            "request_params": {"tdMode": "cross"},
+                            "okx_symbol": okx_symbol,
+                            "contract_size": contract_size,
+                            "order_contracts": amount_contracts,
+                            "filled_contracts": filled_contracts,
+                            "remaining_contracts": remaining_contracts,
+                            "planned_order_contracts": order_quantity,
+                            "planned_base_quantity": base_quantity,
+                        },
+                    )
+
             # For closing positions, get the actual position size
             if decision.is_exit:
                 positions = await self.get_positions(decision.symbol)
@@ -707,22 +762,11 @@ class OKXExecutor(AbstractExecutor):
                     raise
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
-            if not decision.is_exit and filled_contracts <= 0:
-                filled_contracts = self._safe_float(order.get("amount") or order_quantity, 0.0)
-            filled_base_quantity = filled_contracts * contract_size
             execution_price = float(order.get("average") or order.get("price") or price or 0)
             status = self._order_status_from_ccxt(order.get("status") or (order.get("info") or {}).get("state"))
-            if (
-                decision.is_entry
-                and status == OrderStatus.OPEN
-                and order.get("id")
-                and execution_price > 0
-                and (filled_contracts > 0 or order_quantity > 0)
-            ):
-                # OKX can briefly report swap market entries as "open" even
-                # after margin/position is created. Entries are still verified
-                # later by the position sync loop.
-                status = OrderStatus.FILLED
+            if decision.is_entry and status == OrderStatus.FILLED and filled_contracts <= 0:
+                filled_contracts = self._safe_float(order.get("amount") or order_quantity, 0.0)
+            filled_base_quantity = filled_contracts * contract_size
 
             if decision.is_exit and target_side:
                 after_contracts = pre_exit_contracts
@@ -839,25 +883,16 @@ class OKXExecutor(AbstractExecutor):
                 )
                 status = OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL
 
-            if (
-                decision.is_entry
-                and status == OrderStatus.OPEN
-                and order.get("id")
-                and execution_price > 0
-                and (filled_contracts > 0 or order_quantity > 0)
-            ):
-                # OKX can briefly report swap market orders as "open" even
-                # after margin/position is created. For the trading ledger,
-                # a market order with an exchange id, price, and size is an
-                # exchange-confirmed fill.
-                status = OrderStatus.FILLED
-
             return ExecutionResult(
                 order_id=order.get("id", ""),
                 symbol=decision.symbol,
                 side=side,
                 order_type="market",
-                quantity=filled_base_quantity if filled_base_quantity > 0 else base_quantity,
+                quantity=(
+                    filled_base_quantity
+                    if filled_base_quantity > 0
+                    else (base_quantity if status == OrderStatus.FILLED else 0.0)
+                ),
                 price=execution_price,
                 status=status,
                 fee=order.get("fee", {}).get("cost", 0) if isinstance(order.get("fee"), dict) else 0,
@@ -870,9 +905,24 @@ class OKXExecutor(AbstractExecutor):
                     "contract_size": contract_size,
                     "order_contracts": order_quantity,
                     "filled_contracts": filled_contracts,
-                    "base_quantity": filled_base_quantity if filled_base_quantity > 0 else base_quantity,
+                    "base_quantity": (
+                        filled_base_quantity
+                        if filled_base_quantity > 0
+                        else (base_quantity if status == OrderStatus.FILLED else 0.0)
+                    ),
                     "order_resize_note": order_resize_note,
                     "exit_order_replace_note": exit_order_replace_note,
+                    **({
+                        "entry_tracking": True,
+                        "message": (
+                            "OKX 开仓订单已提交，但仍在挂单或追单，尚未确认成交；"
+                            "本地不会先创建持仓，成交后会由 OKX 仓位同步补回。"
+                        ),
+                    } if decision.is_entry and status in {
+                        OrderStatus.OPEN,
+                        OrderStatus.PENDING,
+                        OrderStatus.PARTIAL,
+                    } else {}),
                     **({"leverage_check": leverage_check} if decision.is_entry else {}),
                     **({
                         "exit_tracking": True,
@@ -1024,6 +1074,40 @@ class OKXExecutor(AbstractExecutor):
             if reduce_only in (None, ""):
                 reduce_only = info.get("reduceOnly")
             if str(reduce_only).lower() != "true":
+                continue
+
+            status = self._order_status_from_ccxt(order.get("status") or info.get("state"))
+            if status in {OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.PARTIAL}:
+                return order
+        return None
+
+    async def _find_active_entry_order(self, ccxt, okx_symbol: str, side: str) -> dict | None:
+        """Return an active non-reduce-only entry order for the same symbol/side."""
+        try:
+            orders = await self._with_retry(ccxt.fetch_open_orders, okx_symbol)
+        except Exception as e:
+            logger.warning(
+                "fetch open entry orders failed",
+                symbol=okx_symbol,
+                side=side,
+                error=str(e),
+            )
+            return None
+
+        for order in orders or []:
+            info = order.get("info") or {}
+            order_side = str(order.get("side") or info.get("side") or "").lower()
+            if order_side != side:
+                continue
+
+            reduce_only = order.get("reduceOnly")
+            if reduce_only in (None, ""):
+                reduce_only = info.get("reduceOnly")
+            if str(reduce_only).lower() == "true":
+                continue
+
+            ord_type = str(info.get("ordType") or order.get("type") or "").lower()
+            if ord_type in {"oco", "conditional", "trigger"}:
                 continue
 
             status = self._order_status_from_ccxt(order.get("status") or info.get("state"))

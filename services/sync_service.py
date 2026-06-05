@@ -155,6 +155,85 @@ class OkxSyncService:
                 return True
         return False
 
+    async def active_exchange_order_for_local_position(self, pos: Position) -> dict[str, Any] | None:
+        """Return an active OKX order that can explain a temporary position mismatch."""
+        ts = self.orchestrator
+        symbol = ts._normalize_position_symbol(pos.symbol)
+        side = str(pos.side or "").lower()
+        if not symbol or side not in {"long", "short"}:
+            return None
+
+        entry_side = "buy" if side == "long" else "sell"
+        exit_side = "sell" if side == "long" else "buy"
+        try:
+            executor = await ts._get_okx_executor_for_mode(pos.execution_mode or "paper")
+            orders = await asyncio.wait_for(
+                executor.get_open_orders(pos.symbol),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "timed out checking active OKX orders before local close",
+                position_id=pos.id,
+                symbol=pos.symbol,
+                side=pos.side,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "failed to check active OKX orders before local close",
+                position_id=pos.id,
+                symbol=pos.symbol,
+                side=pos.side,
+                error=str(e),
+            )
+            return None
+
+        active_states = {"", "open", "pending", "live", "partially_filled", "partial"}
+        for order in orders or []:
+            info = order.get("info") if isinstance(order.get("info"), dict) else {}
+            order_symbol = ts._normalize_position_symbol(
+                order.get("symbol") or info.get("instId") or pos.symbol
+            )
+            if order_symbol != symbol:
+                continue
+
+            order_state = str(order.get("status") or info.get("state") or "").lower().strip()
+            if order_state not in active_states:
+                continue
+
+            order_side = str(order.get("side") or info.get("side") or "").lower().strip()
+            if order_side not in {"buy", "sell"}:
+                continue
+
+            reduce_only = order.get("reduceOnly")
+            if reduce_only in (None, ""):
+                reduce_only = info.get("reduceOnly")
+            is_reduce_only = str(reduce_only).lower() == "true"
+            ord_type = str(info.get("ordType") or order.get("type") or "").lower()
+
+            if is_reduce_only and order_side == exit_side:
+                return {
+                    "kind": "exit",
+                    "order_id": order.get("id") or info.get("ordId"),
+                    "side": order_side,
+                    "state": order_state or "open",
+                    "reduce_only": True,
+                }
+            if (
+                not is_reduce_only
+                and order_side == entry_side
+                and ord_type not in {"oco", "conditional", "trigger"}
+            ):
+                return {
+                    "kind": "entry",
+                    "order_id": order.get("id") or info.get("ordId"),
+                    "side": order_side,
+                    "state": order_state or "open",
+                    "reduce_only": False,
+                }
+        return None
+
 
     async def reconcile_exchange_positions(self) -> list[dict]:
         ts = self.orchestrator
@@ -417,6 +496,29 @@ class OkxSyncService:
 
                     close_fill = await ts._find_exchange_close_fill(pos)
                     if not close_fill.get("order_id"):
+                        active_order = await self.active_exchange_order_for_local_position(pos)
+                        if active_order:
+                            logger.warning(
+                                "skip synthetic local close because OKX still has active order",
+                                position_id=pos.id,
+                                symbol=pos.symbol,
+                                side=pos.side,
+                                order_id=active_order.get("order_id"),
+                                order_kind=active_order.get("kind"),
+                                order_state=active_order.get("state"),
+                            )
+                            reconciled.append({
+                                "model_name": pos.model_name,
+                                "symbol": pos.symbol,
+                                "side": pos.side,
+                                "exchange_order_id": active_order.get("order_id"),
+                                "note": (
+                                    "OKX 暂时没有返回对应持仓，但仍存在挂单/追单中的"
+                                    f"{'平仓' if active_order.get('kind') == 'exit' else '开仓'}委托；"
+                                    "本地不估算平仓，等待 OKX 成交、撤单或下一轮同步确认。"
+                                ),
+                            })
+                            continue
                         now = datetime.now(timezone.utc)
                         opened_at = pos.created_at
                         if opened_at and opened_at.tzinfo is None:
