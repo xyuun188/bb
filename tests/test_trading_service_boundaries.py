@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from executor.base_executor import ExecutionResult, OrderStatus
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.execution_service import ExecutionService
-from services.trading_policies import EntryPolicy, ExitPolicy
+from services.sync_service import OkxSyncService
+from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -44,45 +46,143 @@ async def test_analysis_services_call_their_own_scope():
 async def test_execution_service_serializes_candidate_execution():
     lock = asyncio.Lock()
     calls = []
+    stages = []
+
+    class FakeExecutor:
+        async def place_order(self, decision, account_id=None, override_balance=None):
+            assert lock.locked()
+            calls.append(("place_order", account_id, decision.action.value, override_balance))
+            return ExecutionResult(
+                order_id="order-1",
+                exchange_order_id="exchange-1",
+                symbol=decision.symbol,
+                side=decision.action.value,
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    class FakePolicy:
+        async def evaluate(self, *args, **kwargs):
+            return PolicyGateResult.allow({"intent": "entry"})
+
+    class FakeSkills:
+        def execution_skills(self, **kwargs):
+            return []
+
+        def attach(self, *args, **kwargs):
+            raise AssertionError("no skills should be attached in this test")
+
+        def block_reason(self, *args, **kwargs):
+            return None
+
+    class FakeBreaker:
+        def record_trade(self, amount):
+            calls.append(("record_trade", amount))
+
+    class FakeRiskEngine:
+        circuit_breaker = FakeBreaker()
 
     class FakeOrchestrator:
         _execution_lock = lock
+        entry_policy = FakePolicy()
+        exit_policy = FakePolicy()
+        agent_skills = FakeSkills()
+        risk_engine = FakeRiskEngine()
+        _trade_count = 0
 
-        async def _execute_candidate_locked(
-            self,
-            symbol,
-            model_name,
-            decision,
-            assessment,
-            decision_db_id,
-            results,
-            *,
-            open_positions=None,
-        ):
+        def _get_model_execution_mode(self, model_name):
+            return "paper"
+
+        async def _record_and_persist_decision_stage(self, decision_db_id, decision, stage, status, reason, data=None):
             assert self._execution_lock.locked()
-            calls.append((symbol, model_name, decision.action.value, decision_db_id))
-            return "executed"
+            stages.append((stage, status, reason))
+
+        async def _duplicate_decision_order_reason(self, decision_db_id, decision):
+            return None
+
+        async def _mark_decision_raw_response(self, decision_db_id, raw_response):
+            calls.append(("raw", decision_db_id))
+
+        async def _get_okx_executor_for_mode(self, mode):
+            return FakeExecutor()
+
+        async def _allocated_order_balance(self, model_mode, decision):
+            return 123.0
+
+        def _attach_execution_leverage_summary(self, decision, execution_result, ai_requested_leverage):
+            calls.append(("leverage", ai_requested_leverage))
+
+        def _is_untradable_exchange_error(self, text):
+            return False
+
+        def _is_transient_entry_exchange_error(self, text):
+            return False
+
+        async def _log_trade(self, execution_result, model_name, decision, decision_db_id):
+            calls.append(("log_trade", execution_result.order_id))
+
+        def _is_exchange_confirmed_execution(self, execution_result):
+            return bool(execution_result and execution_result.status == OrderStatus.FILLED)
+
+        def _is_exit_progress_execution(self, execution_result):
+            return False
+
+        def _execution_reason_from_result(self, execution_result):
+            return execution_result.status.value if execution_result else "missing"
+
+        async def _persist_position_from_execution(self, model_name, decision, execution_result, model_mode):
+            calls.append(("persist_position", model_name, model_mode))
+
+        def _apply_execution_to_open_positions(self, open_positions, model_name, decision, execution_result):
+            calls.append(("apply_open_positions", len(open_positions)))
+
+        async def _mark_decision_executed(self, decision_db_id, price):
+            calls.append(("executed", decision_db_id, price))
+
+        def _clear_market_no_opportunity_symbol(self, symbol):
+            calls.append(("clear_symbol", symbol))
+
+        def _position_review_alert_context(self, decision):
+            return None
 
     service = ExecutionService(FakeOrchestrator())
+    results = {"warnings": [], "decisions": [], "executions": []}
     result = await service.execute_candidate(
         "BTC/USDT",
         "ensemble_trader",
         _decision(Action.LONG),
         SimpleNamespace(warnings=[]),
         123,
-        {},
+        results,
         open_positions=[],
     )
 
-    assert result == "executed"
-    assert calls == [("BTC/USDT", "ensemble_trader", "long", 123)]
+    assert result.order_id == "order-1"
+    assert ("place_order", "ensemble_trader", "long", 123.0) in calls
+    assert ("persist_position", "ensemble_trader", "paper") in calls
+    assert ("executed", 123, 100.0) in calls
+    assert results["executions"][0]["order_id"] == "order-1"
+    assert results["decisions"][0]["executed"] is True
+    assert [stage for stage, _status, _reason in stages] == [
+        "strategy_arbitration",
+        "risk_check",
+        "risk_check",
+        "exchange_submit",
+        "exchange_confirm",
+        "local_sync",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_entry_policy_blocks_stale_signal_before_okx_submit():
+    stale_reason = "AI 信号已过有效期，等待下一轮新行情。"
+
     class FakeOrchestrator:
         def _stale_decision_reason(self, decision):
-            return "AI 信号已过有效期，等待下一轮新行情。"
+            return stale_reason
 
         def _abnormal_wick_entry_guard_reason(self, decision):
             raise AssertionError("stale should stop later entry checks")
@@ -96,11 +196,13 @@ async def test_entry_policy_blocks_stale_signal_before_okx_submit():
 
     assert result.passed is False
     assert result.blocker == "stale_decision"
-    assert result.reason == "AI 信号已过有效期，等待下一轮新行情。"
+    assert result.reason == stale_reason
 
 
 @pytest.mark.asyncio
 async def test_exit_policy_blocks_when_local_and_okx_position_are_missing():
+    missing_reason = "没有找到 BTC/USDT 对应的可平多单仓位，未向 OKX 提交平仓单。"
+
     class FakeSyncService:
         def __init__(self):
             self.reconciled = False
@@ -118,11 +220,8 @@ async def test_exit_policy_blocks_when_local_and_okx_position_are_missing():
         def __init__(self):
             self.okx_sync_service = FakeSyncService()
 
-        def _has_matching_exit_position(self, positions, model_name, decision):
-            return False
-
-        def _no_matching_exit_position_reason(self, decision):
-            return "没有找到该币种同方向可平仓位，未向 OKX 重复提交平仓。"
+        def _normalize_position_symbol(self, symbol):
+            return symbol
 
     orchestrator = FakeOrchestrator()
     open_positions = [{"symbol": "BTC/USDT"}]
@@ -136,7 +235,30 @@ async def test_exit_policy_blocks_when_local_and_okx_position_are_missing():
     assert open_positions == []
     assert result.passed is False
     assert result.blocker == "no_matching_exit_position"
-    assert result.reason == "没有找到该币种同方向可平仓位，未向 OKX 重复提交平仓。"
+    assert result.reason == missing_reason
+
+
+@pytest.mark.asyncio
+async def test_sync_service_reconcile_positions_owns_lock_boundary():
+    lock = asyncio.Lock()
+    calls = []
+
+    class FakeOrchestrator:
+        _exchange_reconcile_lock = lock
+        _last_round_error = None
+
+    service = OkxSyncService(FakeOrchestrator())
+
+    async def fake_reconcile():
+        assert lock.locked()
+        calls.append("reconciled")
+        return [{"symbol": "BTC/USDT", "side": "long"}]
+
+    service.reconcile_exchange_positions = fake_reconcile
+    result = await service.reconcile_positions("unit test")
+
+    assert result == [{"symbol": "BTC/USDT", "side": "long"}]
+    assert calls == ["reconciled"]
 
 
 @pytest.mark.asyncio

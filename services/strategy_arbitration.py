@@ -1,7 +1,8 @@
 """Strategy arbitration contract.
 
-This layer decides whether the strategy side accepts the AI intent.  It does
-not talk to OKX and it does not hide execution errors behind vague wording.
+This layer records whether strategy accepts the AI intent before execution
+checks. It does not talk to OKX, and it does not hide exchange errors behind
+vague wording.
 """
 
 from __future__ import annotations

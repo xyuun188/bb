@@ -47,7 +47,7 @@ from services.decision_state import DecisionStage, DecisionStageStatus, append_d
 from services.execution_service import ExecutionService
 from services.strategy_arbitration import arbitrate_decision
 from services.sync_service import OkxSyncService
-from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
+from services.trading_policies import EntryPolicy, ExitPolicy
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
@@ -608,7 +608,7 @@ class TradingService:
                 raw_response=raw,
                 feature_snapshot=feature_snapshot,
             )
-            score = self._candidate_opportunity_score(decision, strategy)
+            score = self.entry_policy.score_candidate(decision, strategy)
             opportunity = (
                 decision.raw_response.get("opportunity_score")
                 if isinstance(decision.raw_response, dict)
@@ -1833,7 +1833,7 @@ class TradingService:
             raw_response=raw_response,
             feature_snapshot=fv.to_dict() if hasattr(fv, "to_dict") else (original.feature_snapshot or {}),
         )
-        self._candidate_opportunity_score(candidate, strategy)
+        self.entry_policy.score_candidate(candidate, strategy)
         opportunity = (
             candidate.raw_response.get("opportunity_score")
             if isinstance(candidate.raw_response, dict) and isinstance(candidate.raw_response.get("opportunity_score"), dict)
@@ -5144,7 +5144,7 @@ class TradingService:
 
                 if mode_manager.is_auto_scan:
                     if False and auto_max_trades <= 0:
-                        reason = "鑷姩妯″紡姣忚疆鏈€澶ф墽琛岀瑪鏁颁负 0锛屾湰杞彧璁板綍淇″彿锛屼笉鎻愪氦璁㈠崟銆?"
+                        reason = "自动模式每轮最大执行笔数为 0，本轮只记录信号，不提交订单。"
                         if decision_db_id is not None:
                             await self._mark_decision_reason(decision_db_id, reason)
                         results["decisions"].append({
@@ -5161,10 +5161,10 @@ class TradingService:
                         continue
 
                     self._clear_market_no_opportunity_symbol(symbol)
-                    self._candidate_opportunity_score(executed, strategy_mode_context)
+                    self.entry_policy.score_candidate(executed, strategy_mode_context)
                     if decision_db_id is not None:
                         await self._mark_decision_raw_response(decision_db_id, executed.raw_response)
-                    opportunity_reason = self._entry_opportunity_gate_reason(executed)
+                    opportunity_reason = self.entry_policy.gate_reason(executed)
                     if opportunity_reason:
                         reason = f"候选评分未达执行标准：{opportunity_reason}"
                         raw_response = self._annotate_candidate_selection(
@@ -5187,7 +5187,7 @@ class TradingService:
                             "is_paper": (model_mode == "paper"),
                         })
                         continue
-                    immediate_reason = self._entry_immediate_execution_reason(executed)
+                    immediate_reason = self.entry_policy.immediate_execution_reason(executed)
                     if immediate_reason:
                         capacity_reason = self._entry_capacity_reason(
                             model_name,
@@ -5273,7 +5273,7 @@ class TradingService:
                             })
                         continue
 
-                    immediate_reason = self._entry_immediate_execution_reason(executed) or (
+                    immediate_reason = self.entry_policy.immediate_execution_reason(executed) or (
                         "开仓信号已通过 AI 和执行前严重风险检查，立即进入下单流程；"
                         "不再等待本轮候选排序，避免行情变化导致错过时机。"
                     )
@@ -5420,10 +5420,10 @@ class TradingService:
                         round_decision_ids.add(decision_db_id)
                     self._decision_count += 1
 
-                    # Risk assessment 鈥?only check this model's own positions
+                    # Risk assessment: only check this model's own positions
                     decision_key = (model_name, self._normalize_position_symbol(symbol))
                     if decision_key in review_blocked_keys and not decision.is_hold:
-                        reason = "鏈疆宸蹭紭鍏堝鐞嗚鎸佷粨鐨勫钩浠撳喅绛栵紝璺宠繃鍚屽竵绉嶇殑鍚庣画淇″彿銆?"
+                        reason = "本轮已优先处理该持仓的平仓决策，跳过同币种的后续信号。"
                         if decision_db_id is not None:
                             await self._mark_decision_reason(decision_db_id, reason)
                         results["decisions"].append({
@@ -5511,13 +5511,13 @@ class TradingService:
                     all_candidates.append((symbol, model_name, executed, assessment, decision_db_id))
 
             all_candidates.sort(
-                key=lambda x: self._candidate_opportunity_score(x[2], strategy_mode_context),
+                key=lambda x: self.entry_policy.score_candidate(x[2], strategy_mode_context),
                 reverse=True,
             )
             candidate_count = len(all_candidates)
             for rank, (_symbol, _model_name, decision, _assessment, decision_db_id) in enumerate(all_candidates, start=1):
-                self._candidate_opportunity_score(decision, strategy_mode_context)
-                pending_reason = self._entry_wait_sort_reason(
+                self.entry_policy.score_candidate(decision, strategy_mode_context)
+                pending_reason = self.entry_policy.wait_sort_reason(
                     decision,
                     rank=rank,
                     candidate_count=candidate_count,
@@ -5535,7 +5535,7 @@ class TradingService:
 
             opportunity_filtered_candidates = []
             for symbol, model_name, decision, assessment, decision_db_id in all_candidates:
-                reason = self._entry_opportunity_gate_reason(decision)
+                reason = self.entry_policy.gate_reason(decision)
                 if reason:
                     raw_response = self._annotate_candidate_selection(
                         decision,
@@ -5983,6 +5983,7 @@ class TradingService:
                         or_(
                             AIDecision.execution_reason.is_(None),
                             AIDecision.execution_reason == "",
+                            AIDecision.execution_reason.like("本轮还在分析或排队中%"),
                             AIDecision.execution_reason.like("鏈疆杩樺湪鍒嗘瀽鎴栨帓闃熶腑%"),
                         ),
                     )
@@ -6939,498 +6940,15 @@ class TradingService:
         results: dict[str, Any],
         open_positions: list[dict] | None = None,
     ) -> ExecutionResult | None:
-        for warning in assessment.warnings:
-            results["warnings"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "warning": warning,
-            })
-            await self._log_risk_event("warning", symbol, warning, model_name)
-
-        execution_result = None
-        model_mode = self._get_model_execution_mode(model_name)
-
-        async def mark_stage(
-            stage: str,
-            status: str,
-            reason: str,
-            data: dict[str, Any] | None = None,
-        ) -> None:
-            await self._record_and_persist_decision_stage(
-                decision_db_id,
-                decision,
-                stage,
-                status,
-                reason,
-                data,
-            )
-
-        async def mark_blocked(reason: str, data: dict[str, Any] | None = None) -> None:
-            await mark_stage(
-                DecisionStage.RISK_CHECK,
-                DecisionStageStatus.BLOCKED,
-                reason,
-                data,
-            )
-
-        async def block_before_submit(policy_result: PolicyGateResult) -> None:
-            reason = str(policy_result.reason or "策略或风控检查未通过，未提交 OKX 订单。")
-            blocker = str(policy_result.blocker or "policy_gate")
-            data = {"blocker": blocker}
-            if isinstance(policy_result.data, dict):
-                data.update(policy_result.data)
-            await mark_blocked(reason, data)
-            if decision_db_id is not None:
-                await self._mark_decision_reason(decision_db_id, reason)
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            await self._log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] {reason}",
-                model_name,
-            )
-            if self._position_review_alert_context(decision):
-                await self._log_position_review_risk_result(
-                    decision,
-                    model_name,
-                    f"未执行：{reason}",
-                )
-            results["decisions"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "action": decision.action.value,
-                "approved": True,
-                "confidence": decision.confidence,
-                "executed": False,
-                "execution_status": "skipped",
-                "reason": reason,
-                "is_paper": (model_mode == "paper"),
-            })
-
-        arbitration = arbitrate_decision(decision)
-        await mark_stage(
-            DecisionStage.STRATEGY_ARBITRATION,
-            arbitration.status,
-            arbitration.reason,
-            arbitration.data,
+        return await self.execution_service.execute_candidate_locked(
+            symbol,
+            model_name,
+            decision,
+            assessment,
+            decision_db_id,
+            results,
+            open_positions=open_positions,
         )
-        if decision.is_entry or decision.is_exit:
-            await mark_stage(
-                DecisionStage.RISK_CHECK,
-                DecisionStageStatus.PENDING,
-                "已进入执行前严重风险检查。",
-                {"mode": model_mode},
-            )
-        if decision_db_id is not None:
-            duplicate_reason = await self._duplicate_decision_order_reason(decision_db_id, decision)
-            if duplicate_reason:
-                await block_before_submit(
-                    PolicyGateResult.block(
-                        "duplicate_decision_order",
-                        duplicate_reason,
-                    )
-                )
-                return None
-
-        if decision.is_exit:
-            exit_policy_result = await self.exit_policy.evaluate(
-                decision,
-                model_name,
-                open_positions,
-            )
-            if not exit_policy_result.passed:
-                await block_before_submit(exit_policy_result)
-                return None
-
-        if decision.is_entry:
-            entry_policy_result = await self.entry_policy.evaluate(
-                decision,
-                model_name,
-                model_mode,
-                open_positions,
-            )
-            if not entry_policy_result.passed:
-                await block_before_submit(entry_policy_result)
-                return None
-            if decision_db_id is not None:
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-
-        if decision.is_entry or decision.is_exit:
-            await mark_stage(
-                DecisionStage.RISK_CHECK,
-                DecisionStageStatus.PASSED,
-                "执行前严重风险检查通过，进入交易所提交阶段。",
-                {"mode": model_mode},
-            )
-            await mark_stage(
-                DecisionStage.EXCHANGE_SUBMIT,
-                DecisionStageStatus.PENDING,
-                "正在提交 OKX 订单并等待交易所返回结果。",
-                {"mode": model_mode},
-            )
-
-        override_balance = None
-        try:
-            executor = await self._get_okx_executor_for_mode(model_mode)
-            ai_requested_leverage = float(decision.suggested_leverage or 1.0)
-            override_balance = await self._allocated_order_balance(model_mode, decision)
-            execution_agent_skills = self.agent_skills.execution_skills(
-                decision=decision,
-                model_mode=model_mode,
-                override_balance=override_balance,
-            )
-            if execution_agent_skills:
-                self.agent_skills.attach(
-                    decision,
-                    phase="execution_precheck",
-                    skills=execution_agent_skills,
-                    note="提交 OKX 前的 Agent/Skills 执行守门。",
-                )
-                if decision_db_id is not None:
-                    await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            execution_guard_reason = (
-                self.agent_skills.block_reason(execution_agent_skills, for_entry=True)
-                if AGENT_SKILLS_TRADING_EFFECTS_ENABLED
-                else None
-            )
-            if decision.is_entry and execution_guard_reason:
-                await mark_stage(
-                    DecisionStage.RISK_CHECK,
-                    DecisionStageStatus.BLOCKED,
-                    execution_guard_reason,
-                    {"blocker": "execution_agent_skills"},
-                )
-                await mark_stage(
-                    DecisionStage.EXCHANGE_SUBMIT,
-                    DecisionStageStatus.SKIPPED,
-                    "执行前守门模块拦截，未向 OKX 提交订单。",
-                    {"blocker": "execution_agent_skills"},
-                )
-                execution_result = self._rejected_execution_result(
-                    decision,
-                    execution_guard_reason,
-                )
-            else:
-                execution_timeout = 90.0 if decision.is_exit else 60.0
-                execution_result = await asyncio.wait_for(
-                    executor.place_order(
-                        decision,
-                        account_id=model_name,
-                        override_balance=override_balance,
-                    ),
-                    timeout=execution_timeout,
-                )
-            if decision.is_entry and execution_result is not None:
-                self._attach_execution_leverage_summary(
-                    decision,
-                    execution_result,
-                    ai_requested_leverage,
-                )
-        except asyncio.TimeoutError:
-            logger.error(
-                "decision execution timed out",
-                model=model_name,
-                symbol=symbol,
-                action=decision.action.value,
-                mode=model_mode,
-            )
-            execution_result = self._rejected_execution_result(
-                decision,
-                (
-                    "OKX 下单或确认超时，系统没有拿到最终订单结果；"
-                    "本轮按未执行处理，下一轮会继续复盘该仓位。"
-                ),
-            )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                self._execution_reason_from_result(execution_result),
-                {"error_type": "timeout"},
-            )
-            await self._log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] OKX execution timed out",
-                model_name,
-            )
-        except Exception as e:
-            logger.error(
-                "decision execution failed",
-                model=model_name,
-                symbol=symbol,
-                action=decision.action.value,
-                mode=model_mode,
-                error=str(e),
-            )
-            execution_result = self._rejected_execution_result(decision, e)
-            await mark_stage(
-                DecisionStage.EXCHANGE_SUBMIT,
-                DecisionStageStatus.FAILED,
-                self._execution_reason_from_result(execution_result),
-                {"error_type": "exception"},
-            )
-            await self._log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] OKX execution failed: {e}",
-                model_name,
-            )
-
-        if execution_result is None and decision.is_exit:
-            retry_intro = (
-                "平仓裁决已生成，但第一次提交没有返回 OKX 订单结果；"
-                "系统立即同步 OKX 仓位并重试一次平仓，避免错过平仓时机。"
-            )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                retry_intro,
-                {"retry": "exit_missing_execution_result"},
-            )
-            if decision_db_id is not None:
-                await self._mark_decision_pending_execution(decision_db_id, retry_intro)
-            await self._log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] {retry_intro}",
-                model_name,
-            )
-            await self._reconcile_exchange_positions_with_timeout("exit missing execution result")
-            exit_positions = await self._get_open_positions_context()
-            if open_positions is not None:
-                open_positions[:] = exit_positions
-            local_has_position = self._has_matching_exit_position(exit_positions, model_name, decision)
-            exchange_has_position = await self._has_matching_exchange_exit_position(
-                model_name,
-                decision,
-            )
-            if local_has_position or exchange_has_position:
-                try:
-                    retry_executor = await self._get_okx_executor_for_mode(model_mode)
-                    execution_result = await asyncio.wait_for(
-                        retry_executor.place_order(
-                            decision,
-                            account_id=model_name,
-                            override_balance=override_balance,
-                        ),
-                        timeout=45.0,
-                    )
-                    if execution_result is not None:
-                        raw = (
-                            execution_result.raw_response
-                            if isinstance(execution_result.raw_response, dict)
-                            else {}
-                        )
-                        raw["exit_missing_result_retry"] = True
-                        raw["retry_reason"] = retry_intro
-                        execution_result.raw_response = raw
-                except asyncio.TimeoutError:
-                    execution_result = self._rejected_execution_result(
-                        decision,
-                        (
-                            "平仓重试仍然超时：系统已同步 OKX 仓位并重新提交平仓，"
-                            "但 45 秒内仍没有拿到订单结果。请以 OKX 当前仓位和委托状态为准；"
-                            "下一轮持仓复盘会继续优先处理该仓位。"
-                        ),
-                    )
-                except Exception as e:
-                    execution_result = self._rejected_execution_result(
-                        decision,
-                        (
-                            "平仓重试失败：第一次提交没有返回订单结果，系统同步 OKX 仓位后已尝试重提，"
-                            f"但交易接口返回错误：{e}"
-                        ),
-                    )
-            else:
-                execution_result = self._rejected_execution_result(
-                    decision,
-                    (
-                        "平仓裁决已生成，但第一次提交没有返回订单结果；系统随即同步 OKX 仓位，"
-                        "发现本地和 OKX 都已经没有该方向可平仓位，因此没有重复提交平仓单。"
-                    ),
-                )
-
-            if execution_result is None:
-                execution_result = self._rejected_execution_result(
-                    decision,
-                    (
-                        "平仓重试后交易接口仍未返回执行结果。系统已避免把该状态继续标记为等待；"
-                        "下一轮持仓复盘会再次检查 OKX 实际仓位并重新处理。"
-                    ),
-                )
-
-        missing_result_reason = None
-        if execution_result:
-            result_text = " ".join(
-                str(part or "")
-                for part in (
-                    execution_result.raw_response,
-                    execution_result.exchange_order_id,
-                    execution_result.status.value,
-                )
-            )
-            if decision.is_entry and self._is_untradable_exchange_error(result_text):
-                self._remember_untradable_symbol(symbol, result_text)
-            elif decision.is_entry and self._is_transient_entry_exchange_error(result_text):
-                self._remember_temporary_entry_block(
-                    symbol,
-                    result_text,
-                    self._transient_entry_block_minutes(result_text),
-                )
-            await self._log_trade(execution_result, model_name, decision, decision_db_id)
-            exchange_confirmed = self._is_exchange_confirmed_execution(execution_result)
-            exit_progress = self._is_exit_progress_execution(execution_result)
-            confirm_reason = self._execution_reason_from_result(execution_result)
-            if exchange_confirmed:
-                await mark_stage(
-                    DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.COMPLETED,
-                    "OKX 已返回有效订单号并确认成交。",
-                    {
-                        "order_id": execution_result.order_id,
-                        "exchange_order_id": execution_result.exchange_order_id,
-                        "status": execution_result.status.value,
-                        "price": execution_result.price,
-                        "quantity": execution_result.quantity,
-                    },
-                )
-            elif exit_progress:
-                await mark_stage(
-                    DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.PENDING,
-                    confirm_reason,
-                    {
-                        "order_id": execution_result.order_id,
-                        "exchange_order_id": execution_result.exchange_order_id,
-                        "status": execution_result.status.value,
-                    },
-                )
-            else:
-                await mark_stage(
-                    DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.FAILED,
-                    confirm_reason,
-                    {
-                        "order_id": execution_result.order_id,
-                        "exchange_order_id": execution_result.exchange_order_id,
-                        "status": execution_result.status.value,
-                    },
-                )
-            if (
-                decision.is_exit
-                and not exchange_confirmed
-                and self._result_has_no_exchange_position(execution_result)
-            ):
-                await self._reconcile_exchange_positions_with_timeout("exit no-position result")
-                if open_positions is not None:
-                    open_positions[:] = await self._get_open_positions_context()
-            if exchange_confirmed or exit_progress:
-                self._trade_count += 1
-                await self._persist_position_from_execution(
-                    model_name,
-                    decision,
-                    execution_result,
-                    model_mode,
-                )
-                if open_positions is not None:
-                    self._apply_execution_to_open_positions(
-                        open_positions,
-                        model_name,
-                        decision,
-                        execution_result,
-                    )
-                if decision.is_exit:
-                    self._remember_recent_exit_group(model_name, decision)
-                await mark_stage(
-                    DecisionStage.LOCAL_SYNC,
-                    DecisionStageStatus.COMPLETED,
-                    "成交结果已写入本地订单/持仓记录。",
-                    {"exit_progress": bool(exit_progress), "exchange_confirmed": bool(exchange_confirmed)},
-                )
-            else:
-                await mark_stage(
-                    DecisionStage.LOCAL_SYNC,
-                    DecisionStageStatus.SKIPPED,
-                    "交易所未确认成交，本地未改动持仓。",
-                    {"exchange_confirmed": bool(exchange_confirmed), "exit_progress": bool(exit_progress)},
-                )
-            results["executions"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "action": decision.action.value,
-                "order_id": execution_result.order_id,
-                "status": execution_result.status.value,
-                "quantity": execution_result.quantity,
-                "price": execution_result.price,
-                "is_paper": (model_mode == "paper"),
-            })
-            if exchange_confirmed:
-                self.risk_engine.circuit_breaker.record_trade(
-                    execution_result.price * execution_result.quantity
-                )
-            if decision_db_id is not None and exchange_confirmed:
-                await self._mark_decision_executed(decision_db_id, execution_result.price)
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-                if decision.is_entry:
-                    self._clear_market_no_opportunity_symbol(symbol)
-            elif decision_db_id is not None:
-                await self._mark_decision_reason(
-                    decision_db_id,
-                    self._execution_reason_from_result(execution_result),
-                )
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            if model_mode != "paper" and decision.is_exit and execution_result.pnl != 0.0:
-                await self._persist_account_update(model_name, decision.model_name, execution_result)
-                if decision_db_id is not None:
-                    balance = await self._get_account_balance(model_name)
-                    pnl_pct = execution_result.pnl / balance if balance > 0 else 0.0
-                    outcome = "profit" if execution_result.pnl > 0 else ("loss" if execution_result.pnl < 0 else "flat")
-                    await self._mark_decision_outcome(decision_db_id, outcome, pnl_pct)
-            if self._position_review_alert_context(decision):
-                await self._log_position_review_risk_result(
-                    decision,
-                    model_name,
-                    execution_result=execution_result,
-                )
-        else:
-            missing_result_reason = (
-                "交易接口未返回执行结果，系统没有拿到 OKX 订单号，也没有生成本地订单；"
-                "本次裁决已按未执行处理。"
-            )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                missing_result_reason,
-                {"error_type": "missing_execution_result"},
-            )
-            await mark_stage(
-                DecisionStage.LOCAL_SYNC,
-                DecisionStageStatus.SKIPPED,
-                "没有成交结果，本地持仓未改动。",
-                {"error_type": "missing_execution_result"},
-            )
-            if decision_db_id is not None:
-                await self._mark_decision_reason(decision_db_id, missing_result_reason)
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            if self._position_review_alert_context(decision):
-                await self._log_position_review_risk_result(
-                    decision,
-                    model_name,
-                    f"未执行：{missing_result_reason}",
-                )
-
-        results["decisions"].append({
-            "model": model_name,
-            "symbol": symbol,
-            "action": decision.action.value,
-            "approved": True,
-            "confidence": decision.confidence,
-            "executed": self._is_exchange_confirmed_execution(execution_result),
-            "execution_status": execution_result.status.value if execution_result else None,
-            "reason": missing_result_reason,
-            "is_paper": (model_mode == "paper"),
-        })
-        return execution_result
 
     async def _exit_fee_churn_guard_reason(
         self,
@@ -7643,8 +7161,8 @@ class TradingService:
                     and not forced_exit
                 ):
                     return (
-                        f"骞充粨淇濇姢锛氳浠撲綅鍒氬紑浠?{age_minutes:.2f} 鍒嗛挓锛屼粛鍦ㄦ垚浜ょ粨绠楅槻鎶栫獥鍙ｅ唴锛?"
-                        "鏅€?AI 鍑忎粨/姝㈢泩/闄嶄綆椋庨櫓寤鸿鏆備笉鎵ц锛岄伩鍏嶅紑浠撳悗鍚岃疆鎴栨暟绉掑唴鍙嶅閮ㄥ垎骞充粨銆?"
+                        f"平仓保护：该仓位刚开仓 {age_minutes:.2f} 分钟，仍在成交结算防抖窗口内，"
+                        "普通 AI 减仓、止盈或降低风险建议暂不执行，避免开仓后同轮或数秒内反复部分平仓。"
                     )
 
                 if forced_exit:
@@ -7685,9 +7203,9 @@ class TradingService:
                     )
                     if not early_strong_profit and not early_deep_loss:
                         return (
-                            f"骞充粨淇濇姢锛氳浠撲綅鍙寔鏈?{age_minutes:.1f} 鍒嗛挓锛?"
-                            "鏈Е鍙戞鎹?姝㈢泩/瓒嬪娍涓ラ噸澶辨晥銆傛櫘閫?AI 骞充粨寤鸿鏆備笉鎵ц锛?"
-                            "閬垮厤鍒氬紑浠撳氨鍥犵煭绾垮櫔闊抽绻佸垏浠撱€?"
+                            f"平仓保护：该仓位只持有 {age_minutes:.1f} 分钟，"
+                            "未触发止损、止盈或趋势严重失效。普通 AI 平仓建议暂不执行，"
+                            "避免刚开仓就因短线噪音频繁切仓。"
                         )
 
                 profit_protection = self._exit_profit_protection_state(
@@ -7732,14 +7250,14 @@ class TradingService:
                 if protected_by_okx and confidence < DISCRETIONARY_CLOSE_CONFIDENCE:
                     if net_now > 0:
                         return (
-                            "骞充粨淇濇姢锛氳浠撲綅宸叉湁 OKX 姝㈢泩/姝㈡崯鎵樺簳锛屽綋鍓嶆墸璐瑰悗浠嶇泩鍒╋紝"
-                            f"浣嗕富鍔ㄥ钩浠撲俊鍙峰己搴﹀彧鏈?{confidence:.0%}锛岃秼鍔挎湭纭澶辨晥锛岀户缁寔鏈夈€?"
+                            "平仓保护：该仓位已有 OKX 止盈/止损托底，当前扣费后仍盈利，"
+                            f"但主动平仓信号强度只有 {confidence:.0%}，趋势尚未确认失效，继续持有。"
                         )
                     return (
-                        "骞充粨淇濇姢锛氳浠撲綅宸茬粡鏈?OKX 姝㈢泩/姝㈡崯淇濇姢锛?"
-                        f"褰撳墠淇″彿寮哄害 {confidence:.0%}锛屾湭杈惧埌涓诲姩骞查闂ㄦ "
-                        f"{DISCRETIONARY_CLOSE_CONFIDENCE:.0%}銆?"
-                        "涓洪伩鍏嶅拰浜ゆ槗鎵€姝㈢泩姝㈡崯浜掔浉鎵撴灦锛屾湰杞户缁寔鏈夈€?"
+                        "平仓保护：该仓位已经有 OKX 止盈/止损保护，"
+                        f"当前信号强度 {confidence:.0%}，未达到主动干预门槛 "
+                        f"{DISCRETIONARY_CLOSE_CONFIDENCE:.0%}。"
+                        "为避免和交易所止盈止损互相打架，本轮继续持有。"
                     )
 
                 if net_now < 0 and confidence < DISCRETIONARY_CLOSE_CONFIDENCE:
@@ -7758,23 +7276,23 @@ class TradingService:
                     ):
                         return None
                     return (
-                        "骞充粨淇濇姢锛氬綋鍓嶆寜鎵嬬画璐瑰悗棰勮鍑€鐩堜簭"
-                        f" {net_now:.4f} USDT锛屾湭瑙﹀彂纭鎹?姝㈢泩銆?"
-                        f"鎸佷粨 {age_minutes:.1f} 鍒嗛挓锛屼俊鍙峰己搴?{confidence:.0%}銆?"
-                        "灏忓箙娴簭涓嶄細鐩存帴骞充粨锛岄渶瑕佸叧閿綅璺岀牬銆侀噺鑳芥伓鍖栨垨瓒嬪娍鍙嶈浆纭銆?"
+                        "平仓保护：当前按手续费后预计净亏"
+                        f" {net_now:.4f} USDT，未触发硬止损或止盈。"
+                        f"持仓 {age_minutes:.1f} 分钟，信号强度 {confidence:.0%}。"
+                        "小幅浮亏不会直接平仓，需要关键位跌破、量能恶化或趋势反转确认。"
                     )
 
                 if net_now > 0 and net_now < fee_buffer * 1.5:
                     return (
-                        "骞充粨淇濇姢锛氬綋鍓嶇泩鍒╁皻鏈槑鏄捐鐩栧弻杈规墜缁垂锛?"
-                        f"棰勮鍑€鐩堜簭 {net_now:.4f} USDT锛屾寔浠?{age_minutes:.1f} 鍒嗛挓锛?"
-                        "鍏堢户缁瀵燂紝绛夊緟姝㈢泩/姝㈡崯鎴栨洿寮轰俊鍙枫€?"
+                        "平仓保护：当前盈利尚未明显覆盖双边手续费，"
+                        f"预计净盈亏 {net_now:.4f} USDT，持仓 {age_minutes:.1f} 分钟，"
+                        "先继续观察，等待止盈、止损或更强信号。"
                     )
                 if net_now > 0 and continuation_valid and drawdown_ratio < PROFIT_DRAWDOWN_PARTIAL_RETRACE and confidence < 0.82:
                     return (
-                        "骞充粨淇濇姢锛氭墸璐瑰悗浠嶆湁鐩堝埄锛屼絾瓒嬪娍寤剁画璇佹嵁娌℃湁澶辨晥锛?"
-                        f"鍑€鏀剁泭 {net_now:.4f} USDT锛屾墜缁垂瑕嗙洊 {fee_coverage_multiple:.1f} 鍊嶏紝"
-                        f"宄板€煎洖鎾?{drawdown_ratio:.0%}銆傛湰杞户缁寔鏈夛紝绛夊緟鏄庣‘鍙嶈浆鎴栨槑鏄惧洖鎾ゅ啀骞炽€?"
+                        "平仓保护：扣费后仍有盈利，但趋势延续证据没有失效，"
+                        f"净收益 {net_now:.4f} USDT，手续费覆盖 {fee_coverage_multiple:.1f} 倍，"
+                        f"峰值回撤 {drawdown_ratio:.0%}。本轮继续持有，等待明确反转或明显回撤再平。"
                     )
         except Exception as e:
             logger.warning("exit fee churn guard failed", symbol=decision.symbol, error=str(e))
@@ -7827,8 +7345,8 @@ class TradingService:
             "strong_lock": bool(strong_lock),
             "early_lock": bool(early_lock),
             "rule": (
-                "鎸変粨浣嶅悕涔変环鍊兼瘮渚嬪拰鎵嬬画璐瑰€嶆暟鍔ㄦ€佸垽鏂攣鐩堬紝"
-                "涓嶄娇鐢ㄥ浐瀹?8-10U 浣滀负澶ф诞鐩堥棬妲涖€?"
+                "按仓位名义价值比例和手续费倍数动态判断锁盈，"
+                "不使用固定 8-10U 作为大浮盈门槛。"
             ),
         }
 
@@ -7911,16 +7429,16 @@ class TradingService:
             "BLACK SWAN",
             "HARD STOP",
             "CRITICAL",
-            "寮哄埗骞充粨",
-            "纭鎹?",
-            "鏋佺椋庨櫓",
-            "榛戝ぉ楣?",
-            "鐔旀柇",
-            "瑙﹀彂姝㈡崯",
-            "瑙﹀彂姝㈢泩",
-            "姝㈡崯瑙﹀彂",
-            "姝㈢泩瑙﹀彂",
-            "蹇€熼鎺?",
+            "强制平仓",
+            "硬止损",
+            "极端风险",
+            "黑天鹅",
+            "熔断",
+            "触发止损",
+            "触发止盈",
+            "止损触发",
+            "止盈触发",
+            "快速风控",
         )
         return (
             bool(raw.get("fast_risk_exit") or raw.get("forced_exit"))
@@ -8197,51 +7715,7 @@ class TradingService:
         model_name: str,
         decision: DecisionOutput,
     ) -> bool:
-        """Check OKX directly before rejecting a close decision for local mismatch."""
-        if not decision.is_exit:
-            return True
-        target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-        target_symbol = self._normalize_position_symbol(decision.symbol)
-        mode = self._get_model_execution_mode(model_name)
-        try:
-            executor = await self._get_okx_executor_for_mode(mode)
-            positions = await asyncio.wait_for(
-                executor.get_positions(decision.symbol),
-                timeout=8.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "timed out checking OKX position before exit",
-                model=model_name,
-                symbol=decision.symbol,
-            )
-            return False
-        except Exception as e:
-            logger.warning(
-                "failed to check OKX position before exit",
-                model=model_name,
-                symbol=decision.symbol,
-                error=str(e),
-            )
-            return False
-
-        for pos in positions or []:
-            if self._normalize_position_symbol(pos.get("symbol")) != target_symbol:
-                continue
-            if str(pos.get("side") or "").lower() != target_side:
-                continue
-            info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
-            quantity = self._safe_float(
-                pos.get("contracts")
-                or pos.get("size")
-                or pos.get("positionAmt")
-                or info.get("pos")
-                or info.get("qty"),
-                0.0,
-            )
-            if abs(quantity) > 0:
-                return True
-        return False
+        return await self.okx_sync_service.has_matching_exchange_exit_position(model_name, decision)
 
     def _is_no_exchange_position_error(self, message: Any) -> bool:
         text = str(message or "").lower()
@@ -8249,9 +7723,9 @@ class TradingService:
             "51169" in text
             or "don't have any positions in this direction" in text
             or "no matching position to close" in text
-            or "娌℃湁瀵瑰簲鏂瑰悜" in text
-            or "娌℃湁鍙钩" in text
-            or "鍙钩浠撲綅" in text
+            or "没有对应方向" in text
+            or "没有可平" in text
+            or "可平仓位" in text
         )
 
     def _result_has_no_exchange_position(self, result: ExecutionResult | None) -> bool:
@@ -8264,8 +7738,8 @@ class TradingService:
         return self._is_no_exchange_position_error(" ".join(str(p or "") for p in pieces))
 
     def _no_matching_exit_position_reason(self, decision: DecisionOutput) -> str:
-        side = "long" if decision.action == Action.CLOSE_LONG else "short"
-        return f"No matching closeable {side} position was found; no OKX close order submitted."
+        side_label = "多单" if decision.action == Action.CLOSE_LONG else "空单"
+        return f"没有找到 {decision.symbol} 对应的可平{side_label}仓位，未向 OKX 提交平仓单。"
 
     def _apply_execution_to_open_positions(
         self,
@@ -8488,7 +7962,7 @@ class TradingService:
             result["rejection_reason"] = f"Failed to get feature vector: {e}"
             return result
 
-        open_positions = await self._get_open_positions_context()
+        open_positions = await self.okx_sync_service.get_open_positions_context()
 
         # Manual trades also use the unified multi-model ensemble.
         memory_context = await self._expert_memory_context(symbol)
@@ -8570,20 +8044,20 @@ class TradingService:
         decision_db_id = await self._log_decision(executed, is_paper=mode_manager.is_paper)
         self._decision_count += 1
 
-        if executed.is_exit and not self._has_matching_exit_position(
+        if executed.is_exit and not self.exit_policy.has_matching_position(
             open_positions,
             result["model"],
             executed,
         ):
-            await self._reconcile_exchange_positions_with_timeout("manual exit precheck")
-            open_positions[:] = await self._get_open_positions_context()
+            await self.okx_sync_service.reconcile_positions("manual exit precheck")
+            open_positions[:] = await self.okx_sync_service.get_open_positions_context()
 
-        if executed.is_exit and not self._has_matching_exit_position(
+        if executed.is_exit and not self.exit_policy.has_matching_position(
             open_positions,
             result["model"],
             executed,
         ):
-            reason = self._no_matching_exit_position_reason(executed)
+            reason = self.exit_policy.no_matching_position_reason(executed)
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, reason)
             result["approved"] = False
@@ -8591,7 +8065,7 @@ class TradingService:
             return result
 
         if executed.is_exit:
-            guard_reason = await self._exit_fee_churn_guard_reason(result["model"], executed)
+            guard_reason = await self.exit_policy.fee_churn_guard_reason(result["model"], executed)
             if guard_reason:
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, guard_reason)
@@ -8622,7 +8096,7 @@ class TradingService:
             result["rejection_reason"] = stale_reason
             return result
 
-        price_guard_reason = await self._pre_execution_price_guard_reason(executed)
+        price_guard_reason = await self.entry_policy.pre_execution_price_guard_reason(executed)
         if price_guard_reason:
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, price_guard_reason)
@@ -8644,7 +8118,7 @@ class TradingService:
         if executed.is_entry and override_balance <= 0:
             execution_result = self._rejected_execution_result(
                 executed,
-                "OKX 褰撳墠鍙敤浣欓涓嶈冻锛岃鍗曟湭鎻愪氦銆傝妫€鏌?OKX 浣欓銆佷繚璇侀噾鍗犵敤鍜岃处鎴烽鎺х姸鎬併€?",
+                "OKX 当前可用余额不足，订单未提交。请检查 OKX 余额、保证金占用和账户风控状态。",
             )
         else:
             try:
@@ -8659,8 +8133,8 @@ class TradingService:
                 )
             except asyncio.TimeoutError:
                 reason = (
-                    "OKX 涓嬪崟鎴栫‘璁よ秴鏃讹紝绯荤粺娌℃湁鎷垮埌鏈€缁堣鍗曠粨鏋滐紱"
-                    "鏈鎵嬪姩瑁佸喅宸叉寜鏈墽琛屽鐞嗐€?"
+                    "OKX 下单或确认超时，系统没有拿到最终订单结果；"
+                    "本次手动裁决已按未执行处理。"
                 )
                 execution_result = self._rejected_execution_result(executed, reason)
                 await self._log_risk_event(
@@ -8679,8 +8153,8 @@ class TradingService:
                 and not exchange_confirmed
                 and self._result_has_no_exchange_position(execution_result)
             ):
-                await self._reconcile_exchange_positions_with_timeout("manual exit no-position result")
-                open_positions[:] = await self._get_open_positions_context()
+                await self.okx_sync_service.reconcile_positions("manual exit no-position result")
+                open_positions[:] = await self.okx_sync_service.get_open_positions_context()
             if exchange_confirmed or exit_progress:
                 await self._persist_position_from_execution(
                     result["model"], executed, execution_result,
@@ -8710,8 +8184,8 @@ class TradingService:
                     await self._mark_decision_outcome(decision_db_id, outcome, pnl_pct)
         else:
             reason = (
-                "浜ゆ槗鎺ュ彛鏈繑鍥炴墽琛岀粨鏋滐紝绯荤粺娌℃湁鎷垮埌 OKX 璁㈠崟鍙凤紝涔熸病鏈夌敓鎴愭湰鍦拌鍗曪紱"
-                "鏈瑁佸喅宸叉寜鏈墽琛屽鐞嗐€?"
+                "交易接口未返回执行结果，系统没有拿到 OKX 订单号，也没有生成本地订单；"
+                "本次裁决已按未执行处理。"
             )
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, reason)
@@ -8721,520 +8195,10 @@ class TradingService:
         return result
 
     async def _refresh_db_position_prices(self, feature_vectors: dict) -> None:
-        """Update persisted open-position prices and unrealized PnL."""
-        try:
-            async with get_session_ctx() as session:
-                trade_repo = TradeRepository(session)
-                account_repo = AccountRepository(session)
-                positions = await trade_repo.get_open_positions()
-                open_context: list[dict] = []
-                pnl_by_model: dict[str, float] = {}
-
-                for pos in positions:
-                    fv = feature_vectors.get(pos.symbol)
-                    current_price = (
-                        fv.current_price
-                        if fv is not None and getattr(fv, "current_price", 0)
-                        else pos.current_price or pos.entry_price
-                    )
-                    if not current_price or current_price <= 0:
-                        continue
-
-                    if pos.side == "short":
-                        unrealized_pnl = (pos.entry_price - current_price) * pos.quantity
-                    else:
-                        unrealized_pnl = (current_price - pos.entry_price) * pos.quantity
-
-                    await trade_repo.update_position_price(
-                        pos.id,
-                        float(current_price),
-                        float(unrealized_pnl),
-                    )
-                    open_context.append({
-                        "model_name": pos.model_name,
-                        "symbol": pos.symbol,
-                        "side": pos.side,
-                        "current_price": float(current_price),
-                        "entry_price": float(pos.entry_price or 0.0),
-                        "unrealized_pnl": float(unrealized_pnl),
-                        "created_at": pos.created_at,
-                        "is_open": True,
-                    })
-                    self._update_position_profit_peak(
-                        model_name=pos.model_name,
-                        symbol=pos.symbol,
-                        side=pos.side,
-                        current_price=float(current_price),
-                        entry_price=float(pos.entry_price or 0.0),
-                        unrealized_pnl=float(unrealized_pnl),
-                        hold_minutes=self._position_age_minutes(pos.created_at),
-                    )
-                    pnl_by_model[pos.model_name] = pnl_by_model.get(pos.model_name, 0.0) + float(unrealized_pnl)
-
-                for model_name, unrealized_pnl in pnl_by_model.items():
-                    await account_repo.update_unrealized_pnl(model_name, round(unrealized_pnl, 8))
-                self._prune_position_profit_peaks(open_context)
-        except Exception as e:
-            logger.warning("failed to refresh DB position prices", error=str(e))
+        return await self.okx_sync_service.refresh_position_prices(feature_vectors)
 
     async def reconcile_exchange_positions(self) -> list[dict]:
-        """Reconcile local paper positions with actual OKX demo positions.
-
-        OKX attached TP/SL orders can close positions without going through the
-        AI decision loop. When that happens, close the local DB position using
-        the exchange fill so the dashboard and account state remain truthful.
-        """
-        if not self._okx_paper:
-            return []
-
-        try:
-            exchange_positions = await asyncio.wait_for(
-                self._okx_paper.get_positions_strict(),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("timed out fetching OKX positions for reconciliation")
-            return []
-        except Exception as e:
-            logger.warning("failed to fetch OKX positions for reconciliation", error=str(e))
-            return []
-
-        protection_by_key = await self._fetch_exchange_protection_map(
-            self._okx_paper,
-            exchange_positions,
-        )
-
-        exchange_position_keys = {
-            (
-                self._normalize_position_symbol(p.get("symbol")),
-                str(p.get("side") or "").lower(),
-            )
-            for p in exchange_positions or []
-            if self._exchange_position_is_open(p)
-        }
-        exchange_position_keys.discard(("", ""))
-        reconciled: list[dict] = []
-
-        try:
-            async with get_session_ctx() as session:
-                trade_repo = TradeRepository(session)
-                account_repo = AccountRepository(session)
-                positions = await trade_repo.get_open_positions()
-                local_open_keys = {
-                    (
-                        self._normalize_position_symbol(pos.symbol),
-                        str(pos.side or "").lower(),
-                    )
-                    for pos in positions
-                    if pos.execution_mode == "paper" and pos.is_open
-                }
-
-                for exchange_pos in exchange_positions or []:
-                    if not self._exchange_position_is_open(exchange_pos):
-                        continue
-                    symbol = self._normalize_position_symbol(exchange_pos.get("symbol"))
-                    side = str(exchange_pos.get("side") or "").lower()
-                    if not symbol or side not in {"long", "short"}:
-                        continue
-                    key = (symbol, side)
-
-                    info = exchange_pos.get("info") or {}
-                    contracts = self._safe_float(exchange_pos.get("contracts"), 0.0)
-                    contract_size = self._safe_float(exchange_pos.get("contractSize"), 1.0) or 1.0
-                    quantity = abs(contracts * contract_size)
-                    entry_price = self._safe_float(
-                        exchange_pos.get("entryPrice") or info.get("avgPx"),
-                        0.0,
-                    )
-                    if quantity <= 0 or entry_price <= 0:
-                        continue
-
-                    current_price = self._safe_float(
-                        exchange_pos.get("markPrice") or exchange_pos.get("lastPrice") or entry_price,
-                        entry_price,
-                    )
-                    leverage = self._safe_float(exchange_pos.get("leverage") or info.get("lever"), 1.0) or 1.0
-                    exchange_unrealized = self._safe_float(exchange_pos.get("unrealizedPnl"), 0.0)
-                    exchange_realized = self._safe_float(exchange_pos.get("realizedPnl"), 0.0)
-                    protection = protection_by_key.get(key, {})
-                    fallback_protection = await self._fallback_position_protection_from_decision(
-                        session,
-                        symbol=symbol,
-                        side=side,
-                        entry_price=entry_price,
-                    )
-                    stop_loss_price = protection.get("stop_loss_price") or fallback_protection.get("stop_loss_price")
-                    take_profit_price = protection.get("take_profit_price") or fallback_protection.get("take_profit_price")
-
-                    matching_local_positions = [
-                        pos for pos in positions
-                        if (
-                            pos.execution_mode == "paper"
-                            and pos.is_open
-                            and self._normalize_position_symbol(pos.symbol) == symbol
-                            and str(pos.side or "").lower() == side
-                        )
-                    ]
-                    if matching_local_positions:
-                        changed = self._sync_local_open_position_snapshot(
-                            matching_local_positions,
-                            exchange_quantity=quantity,
-                            current_price=current_price,
-                            entry_price=entry_price,
-                            leverage=leverage,
-                            exchange_unrealized=exchange_unrealized,
-                            stop_loss_price=stop_loss_price,
-                            take_profit_price=take_profit_price,
-                        )
-                        local_open_keys.add(key)
-                        if changed:
-                            reconciled.append({
-                                "model_name": matching_local_positions[0].model_name,
-                                "symbol": symbol,
-                                "side": side,
-                                "quantity": quantity,
-                                "current_price": current_price,
-                                "note": "OKX 鎸佷粨鏁伴噺/浠锋牸宸插彉鍖栵紝鏈湴鎸佷粨宸插悓姝ユ洿鏂般€?",
-                            })
-                        continue
-
-                    closed_position_result = await session.execute(
-                        select(Position)
-                        .where(
-                            Position.execution_mode == "paper",
-                            Position.symbol == symbol,
-                            Position.side == side,
-                            Position.is_open == False,
-                        )
-                        .order_by(Position.created_at.desc())
-                        .limit(1)
-                    )
-                    closed_position = closed_position_result.scalar_one_or_none()
-                    if closed_position:
-                        closed_position.is_open = True
-                        closed_position.quantity = quantity
-                        closed_position.entry_price = entry_price
-                        closed_position.current_price = current_price
-                        closed_position.leverage = leverage
-                        closed_position.unrealized_pnl = exchange_unrealized
-                        closed_position.realized_pnl = exchange_realized
-                        closed_position.stop_loss_price = stop_loss_price
-                        closed_position.take_profit_price = take_profit_price
-                        closed_position.closed_at = None
-                        closed_position.updated_at = datetime.now(timezone.utc)
-                        local_open_keys.add(key)
-                        reconciled.append({
-                            "model_name": closed_position.model_name,
-                            "symbol": symbol,
-                            "side": side,
-                            "entry_price": entry_price,
-                            "note": "OKX 浠嶆湁鎸佷粨锛屾湰鍦颁箣鍓嶈璁颁负宸插钩浠擄紝宸查噸鏂版墦寮€鏈湴鎸佷粨璁板綍銆?",
-                        })
-                        logger.warning(
-                            "reopened local position still open on OKX",
-                            position_id=closed_position.id,
-                            symbol=symbol,
-                            side=side,
-                        )
-                        continue
-
-                    entry_side = "buy" if side == "long" else "sell"
-                    order_result = await session.execute(
-                        select(Order)
-                        .where(
-                            Order.execution_mode == "paper",
-                            Order.symbol == symbol,
-                            Order.side == entry_side,
-                            Order.exchange_order_id.is_not(None),
-                            Order.exchange_order_id != "",
-                            Order.status.in_([
-                                OrderStatus.OPEN.value,
-                                OrderStatus.PENDING.value,
-                                OrderStatus.PARTIAL.value,
-                                OrderStatus.FILLED.value,
-                            ]),
-                        )
-                        .order_by(Order.created_at.desc())
-                        .limit(1)
-                    )
-                    order = order_result.scalar_one_or_none()
-                    if not order:
-                        continue
-                    if not stop_loss_price or not take_profit_price:
-                        order_fallback_protection = await self._fallback_position_protection_from_decision(
-                            session,
-                            symbol=symbol,
-                            side=side,
-                            entry_price=entry_price,
-                            order=order,
-                        )
-                        stop_loss_price = stop_loss_price or order_fallback_protection.get("stop_loss_price")
-                        take_profit_price = take_profit_price or order_fallback_protection.get("take_profit_price")
-
-                    opened_at = self._datetime_from_ms(exchange_pos.get("timestamp") or info.get("cTime"))
-                    order.status = OrderStatus.FILLED.value
-                    order.quantity = order.quantity or quantity
-                    order.price = order.price or entry_price
-                    order.filled_at = order.filled_at or opened_at
-
-                    await trade_repo.open_position({
-                        "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
-                        "execution_mode": "paper",
-                        "symbol": symbol,
-                        "side": side,
-                        "quantity": quantity,
-                        "entry_price": entry_price,
-                        "current_price": current_price,
-                        "leverage": leverage,
-                        "unrealized_pnl": exchange_unrealized,
-                        "realized_pnl": exchange_realized,
-                        "stop_loss_price": stop_loss_price,
-                        "take_profit_price": take_profit_price,
-                    })
-                    local_open_keys.add(key)
-                    reconciled.append({
-                        "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
-                        "symbol": symbol,
-                        "side": side,
-                        "entry_price": entry_price,
-                        "exchange_order_id": order.exchange_order_id,
-                        "note": "OKX 宸叉湁鎸佷粨锛屾湰鍦扮己澶憋紝宸叉寜鎵ц璁㈠崟琛ュ洖鎸佷粨璁板綍銆?",
-                    })
-                    logger.warning(
-                        "synced missing local position from OKX",
-                        symbol=symbol,
-                        side=side,
-                        order_id=order.exchange_order_id,
-                    )
-
-                for pos in positions:
-                    if pos.execution_mode != "paper":
-                        continue
-                    if not pos.is_open:
-                        continue
-                    symbol = self._normalize_position_symbol(pos.symbol)
-                    if (symbol, str(pos.side or "").lower()) in exchange_position_keys:
-                        continue
-
-                    try:
-                        await session.refresh(pos)
-                    except Exception as e:
-                        logger.warning(
-                            "failed to refresh local position before exchange reconciliation close",
-                            position_id=pos.id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                            error=str(e),
-                        )
-                    if not pos.is_open:
-                        logger.info(
-                            "skip exchange reconciliation close; local position already closed",
-                            position_id=pos.id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                        )
-                        continue
-
-                    close_fill = await self._find_exchange_close_fill(pos)
-                    if not close_fill.get("order_id"):
-                        now = datetime.now(timezone.utc)
-                        opened_at = pos.created_at
-                        if opened_at and opened_at.tzinfo is None:
-                            opened_at = opened_at.replace(tzinfo=timezone.utc)
-                        age_seconds = (now - opened_at).total_seconds() if opened_at else 0.0
-                        if age_seconds < UNCONFIRMED_EXCHANGE_CLOSE_GRACE_SECONDS:
-                            logger.warning(
-                                "exchange position missing but close fill not found; waiting before local close",
-                                position_id=pos.id,
-                                symbol=pos.symbol,
-                                side=pos.side,
-                                age_seconds=round(age_seconds, 1),
-                            )
-                            continue
-
-                        exit_price = pos.current_price or pos.entry_price
-                        fresh = await self._fresh_feature_vector_for_price_recheck(pos.symbol)
-                        if fresh is not None:
-                            fresh_price = self._safe_float(
-                                self._market_value(fresh, "current_price")
-                                or self._market_value(fresh, "close")
-                                or self._market_value(fresh, "bid")
-                                or self._market_value(fresh, "ask"),
-                                0.0,
-                            )
-                            if fresh_price > 0:
-                                exit_price = fresh_price
-                        if pos.side == "short":
-                            gross_pnl = (float(pos.entry_price or 0.0) - float(exit_price or 0.0)) * float(pos.quantity or 0.0)
-                            close_side = "buy"
-                        else:
-                            gross_pnl = (float(exit_price or 0.0) - float(pos.entry_price or 0.0)) * float(pos.quantity or 0.0)
-                            close_side = "sell"
-                        entry_fee = await self._entry_fee_for_position(session, pos, pos.quantity)
-                        realized_pnl = gross_pnl - entry_fee
-                        decision_id = await self._log_exchange_sync_close_decision(
-                            session=session,
-                            pos=pos,
-                            exit_price=exit_price,
-                            realized_pnl=realized_pnl,
-                            closed_at=now,
-                            reason=(
-                                "OKX 已没有这笔持仓，但没有查到对应平仓成交回报；"
-                                "系统按交易所仓位状态同步为平仓，并用本地开仓价与同步平仓价估算盈亏。"
-                            ),
-                            close_fill={
-                                "estimated": True,
-                                "price": exit_price,
-                                "gross_pnl": gross_pnl,
-                                "entry_fee": entry_fee,
-                                "fee": 0.0,
-                                "pnl": realized_pnl,
-                                "fresh_price_used": bool(fresh is not None),
-                                "note": "close fill not found; realized pnl estimated from local entry and freshest available sync price",
-                            },
-                        )
-                        pos.is_open = False
-                        pos.current_price = exit_price
-                        pos.unrealized_pnl = 0.0
-                        pos.realized_pnl = realized_pnl
-                        pos.closed_at = now
-                        await trade_repo.create_order({
-                            "model_name": pos.model_name,
-                            "execution_mode": pos.execution_mode,
-                            "symbol": pos.symbol,
-                            "side": close_side,
-                            "order_type": "market",
-                            "quantity": pos.quantity,
-                            "price": exit_price,
-                            "status": OrderStatus.FILLED.value,
-                            "fee": 0.0,
-                            "decision_id": decision_id,
-                            "exchange_order_id": None,
-                            "filled_at": now,
-                        })
-                        reconciled.append({
-                            "model_name": pos.model_name,
-                            "symbol": pos.symbol,
-                            "side": pos.side,
-                            "exit_price": pos.current_price,
-                            "realized_pnl": realized_pnl,
-                            "exchange_order_id": None,
-                            "note": "OKX 已无对应持仓，未查到平仓成交回报；本地已按同步价格估算盈亏并关闭仓位。",
-                        })
-                        logger.warning(
-                            "closed unsynced local position; no OKX open position or close fill found",
-                            position_id=pos.id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                        )
-                        continue
-                    exit_price = close_fill.get("price") or pos.current_price or pos.entry_price
-                    if not exit_price or exit_price <= 0:
-                        logger.warning(
-                            "skip local close; invalid OKX close fill price",
-                            position_id=pos.id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                            exchange_order_id=close_fill.get("order_id"),
-                        )
-                        continue
-                    close_fee = float(close_fill.get("fee") or 0.0)
-                    if pos.side == "short":
-                        gross_pnl = (pos.entry_price - exit_price) * pos.quantity
-                        close_side = "buy"
-                    else:
-                        gross_pnl = (exit_price - pos.entry_price) * pos.quantity
-                        close_side = "sell"
-                    entry_fee = await self._entry_fee_for_position(session, pos, pos.quantity)
-                    realized_pnl = gross_pnl - entry_fee - close_fee
-
-                    pos.is_open = False
-                    pos.current_price = exit_price
-                    pos.unrealized_pnl = 0.0
-                    pos.realized_pnl = realized_pnl
-                    pos.closed_at = close_fill.get("timestamp") or datetime.now(timezone.utc)
-                    decision_id = await self._log_exchange_sync_close_decision(
-                        session=session,
-                        pos=pos,
-                        exit_price=exit_price,
-                        realized_pnl=realized_pnl,
-                        closed_at=pos.closed_at,
-                        reason=(
-                            "OKX 宸茶繑鍥炲钩浠撴垚浜わ紝绯荤粺鍚屾涓哄钩浠撹褰曪紱"
-                            "杩欓€氬父鏉ヨ嚜 OKX 姝㈢泩/姝㈡崯銆佹墜鍔ㄥ钩浠撴垨浜ゆ槗鎵€渚ц嚜鍔ㄥ钩浠撱€?"
-                        ),
-                        close_fill=close_fill,
-                    )
-                    await self._record_trade_reflection_in_session(
-                        session,
-                        pos,
-                        exit_price=exit_price,
-                        entry_fee=entry_fee,
-                        close_fee=close_fee,
-                        gross_pnl=gross_pnl,
-                        source="okx_reconcile",
-                        decision=None,
-                    )
-
-                    existing_close_order = None
-                    close_order_id = str(close_fill.get("order_id") or "")
-                    if close_order_id:
-                        existing_close_order_result = await session.execute(
-                            select(Order.id)
-                            .where(
-                                Order.execution_mode == pos.execution_mode,
-                                Order.exchange_order_id == close_order_id,
-                            )
-                            .limit(1)
-                        )
-                        existing_close_order = existing_close_order_result.scalar_one_or_none()
-
-                    if not existing_close_order:
-                        await trade_repo.create_order({
-                            "model_name": pos.model_name,
-                            "execution_mode": pos.execution_mode,
-                            "symbol": pos.symbol,
-                            "side": close_side,
-                            "order_type": "market",
-                            "quantity": pos.quantity,
-                            "price": exit_price,
-                            "status": OrderStatus.FILLED.value,
-                            "fee": close_fee,
-                            "decision_id": decision_id,
-                            "exchange_order_id": close_fill.get("order_id"),
-                            "filled_at": pos.closed_at,
-                        })
-
-                    released_margin = self._position_margin(
-                        pos.quantity * pos.entry_price,
-                        pos.leverage,
-                    )
-                    await account_repo.update_balance(
-                        pos.model_name,
-                        released_margin + realized_pnl,
-                        realized_pnl,
-                    )
-                    await account_repo.record_trade_result(pos.model_name, realized_pnl > 0)
-                    self._remove_memory_position(pos.model_name, pos.symbol, pos.side)
-
-                    reconciled.append({
-                        "model_name": pos.model_name,
-                        "symbol": pos.symbol,
-                        "side": pos.side,
-                        "exit_price": exit_price,
-                        "realized_pnl": realized_pnl,
-                        "gross_pnl": gross_pnl,
-                        "fees": entry_fee + close_fee,
-                        "exchange_order_id": close_fill.get("order_id"),
-                    })
-
-        except Exception as e:
-            logger.warning("exchange position reconciliation failed", error=str(e))
-            return reconciled
-
-        if reconciled:
-            logger.info("reconciled exchange-closed positions", count=len(reconciled), positions=reconciled)
-        return reconciled
+        return await self.okx_sync_service.reconcile_exchange_positions()
 
     async def _log_exchange_sync_close_decision(
         self,
@@ -9985,7 +8949,7 @@ class TradingService:
             return {
                 "should_exit": False,
                 "fraction": 0.0,
-                "note": "鍒氬仛杩囦竴娆″埄娑︿繚鎶わ紝鏆備笉杩炵画纰庣墖鍖栭儴鍒嗗钩浠撱€?",
+                "note": "刚做过一次利润保护，暂不连续碎片化部分平仓。",
                 "seconds_since_last_profit_exit": seconds_since_exit,
                 "peak_ratio": peak_ratio,
             }
@@ -10267,7 +9231,7 @@ class TradingService:
                 "fraction": 0.0,
                 "adverse_pct": adverse_pct,
                 "risk_progress": risk_progress,
-                "note": "褰撳墠浠锋牸浠嶆湭鐩稿寮€浠撲环浜忔崯锛岀煭绾垮弽鍚戝彧璁板綍瑙傚療銆?",
+                "note": "当前价格仍未相对开仓价亏损，短线反向只记录观察。",
             }
 
         if adverse_pct < FAST_RISK_MIN_LOSS_PCT and not near_stop:
@@ -10276,7 +9240,7 @@ class TradingService:
                 "fraction": 0.0,
                 "adverse_pct": adverse_pct,
                 "risk_progress": risk_progress,
-                "note": "浜忔崯骞呭害杩樺皬锛屾湭鎺ヨ繎姝㈡崯锛岀户缁氦缁欐寔浠撳鐩樺垽鏂€?",
+                "note": "亏损幅度还小，未接近止损，继续交给持仓复盘判断。",
             }
 
         if not old_enough and not full_stop_progress and adverse_pct < FAST_RISK_FULL_LOSS_PCT:
@@ -10285,7 +9249,7 @@ class TradingService:
                 "fraction": 0.0,
                 "adverse_pct": adverse_pct,
                 "risk_progress": risk_progress,
-                "note": f"寮€浠撲笉瓒?{FAST_RISK_MIN_HOLD_MINUTES:.0f} 鍒嗛挓锛屾殏涓嶅洜鏅€氱煭绾挎尝鍔ㄥ钩浠撱€?",
+                "note": f"开仓不足 {FAST_RISK_MIN_HOLD_MINUTES:.0f} 分钟，暂不因普通短线波动平仓。",
             }
 
         force_full_by_loss = bool(
@@ -10331,13 +9295,13 @@ class TradingService:
             "fraction": 0.0,
             "adverse_pct": adverse_pct,
             "risk_progress": risk_progress,
-            "note": "鐭嚎鍙嶅悜灏氭湭婊¤冻鍑忎粨鎴栧叏骞虫潯浠讹紝缁х画瑙傚療銆?",
+            "note": "短线反向尚未满足减仓或全平条件，继续观察。",
         }
 
     async def _enforce_sl_tp(self, feature_vectors: dict) -> list[dict]:
         """Run fast non-AI protection for open positions before slow AI review."""
         auto_closes = []
-        open_positions = await self._get_open_positions_context()
+        open_positions = await self.okx_sync_service.get_open_positions_context()
         if not open_positions:
             return auto_closes
 
@@ -10489,10 +9453,10 @@ class TradingService:
 
             if hit_sl:
                 trigger = "stop_loss"
-                reason = "蹇€熼鎺цЕ鍙戯細浠锋牸宸茬粡瑙﹀強鏈湴璁板綍鐨勬鎹熶綅锛屼紭鍏堟彁浜ゅ钩浠擄紝涓嶇瓑寰?AI 浼氳瘖銆?"
+                reason = "快速风控触发：价格已经触及本地记录的止损位，优先提交平仓，不等待 AI 会诊。"
             elif hit_tp:
                 trigger = "take_profit"
-                reason = "蹇€熼鎺цЕ鍙戯細浠锋牸宸茬粡瑙﹀強鏈湴璁板綍鐨勬鐩堜綅锛屼紭鍏堟彁浜ゅ钩浠撻攣瀹氱粨鏋溿€?"
+                reason = "快速风控触发：价格已经触及本地记录的止盈位，优先提交平仓锁定结果。"
             elif profit_exit_plan.get("should_exit"):
                 fast_exit_plan = profit_exit_plan
                 close_fraction = self._safe_float(profit_exit_plan.get("fraction"), 1.0)
@@ -10506,17 +9470,17 @@ class TradingService:
             elif hit_full_stop_progress:
                 trigger = "near_stop_progress"
                 reason = (
-                    "蹇€熼鎺цЕ鍙戯細浜忔崯宸茬粡璧板畬姝㈡崯璺濈鐨?"
-                    f"{adverse_pct / max(stop_distance_pct, 1e-12):.0%}锛?"
-                    f"瓒呰繃寮哄埗閫€鍑洪槇鍊?{FAST_RISK_FULL_STOP_PROGRESS:.0%}銆?"
-                    "涓洪伩鍏嶇户缁嫋鍒板畬鏁存鎹燂紝浼樺厛鎻愪氦鍏ㄥ钩銆?"
+                    "快速风控触发：亏损已经走完止损距离的"
+                    f"{adverse_pct / max(stop_distance_pct, 1e-12):.0%}，"
+                    f"超过强制退出阈值 {FAST_RISK_FULL_STOP_PROGRESS:.0%}。"
+                    "为避免继续拖到完整止损，优先提交全平。"
                 )
             elif hit_hard_adverse:
                 trigger = "hard_adverse_move"
                 reason = (
-                    "蹇€熼鎺цЕ鍙戯細浠锋牸宸茬浉瀵瑰紑浠撲环鍑虹幇鏄庢樉鍙嶅悜娉㈠姩锛?"
-                    f"瓒呰繃蹇€熺‖椋庨櫓闃堝€?{fast_adverse_pct:.2%}锛?"
-                    "杩欎笉鏄櫘閫氱煭绾垮洖鎾わ紝浼樺厛鎻愪氦骞充粨鎺у埗鍗曠瑪浜忔崯銆?"
+                    "快速风控触发：价格已经相对开仓价出现明显反向波动，"
+                    f"超过快速硬风险阈值 {fast_adverse_pct:.2%}，"
+                    "这不是普通短线回撤，优先提交平仓控制单笔亏损。"
                 )
             elif hit_fast_adverse or hit_near_stop_progress:
                 fast_exit_plan = self._fast_adverse_exit_plan(
@@ -10656,7 +9620,7 @@ class TradingService:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            recent_exit_reason = self._recent_exit_cooldown_reason(model_name, close_decision)
+            recent_exit_reason = self.exit_policy.recent_exit_cooldown_reason(model_name, close_decision)
             if recent_exit_reason:
                 logger.info(
                     "fast risk close skipped by recent exit cooldown",
@@ -11113,7 +10077,7 @@ class TradingService:
                         await self._log_position_review_risk_result(
                             decision,
                             model_name,
-                            f"鏈墽琛岋細{capacity_reason}",
+                            f"未执行：{capacity_reason}",
                         )
                     if decision_db_id is not None:
                         await self._mark_decision_reason(decision_db_id, capacity_reason)
@@ -11195,7 +10159,7 @@ class TradingService:
                     })
                 continue
             if executed.is_exit:
-                review_guard_reason = await self._exit_fee_churn_guard_reason(model_name, executed)
+                review_guard_reason = await self.exit_policy.fee_churn_guard_reason(model_name, executed)
                 if review_guard_reason:
                     if decision_db_id is not None:
                         await self._mark_decision_reason(decision_db_id, review_guard_reason)
@@ -11203,7 +10167,7 @@ class TradingService:
                         await self._log_position_review_risk_result(
                             executed,
                             model_name,
-                            f"鏈墽琛岋細{review_guard_reason}",
+                            f"未执行：{review_guard_reason}",
                         )
                     if results is not None:
                         results["decisions"].append({
@@ -12148,21 +11112,21 @@ class TradingService:
         risk_conf = self._safe_float(risk_opinion.get("confidence"), 0.0)
         risk_reason = self._short_text(risk_opinion.get("reasoning"), 220)
         urgent_terms = (
-            "涓€绁ㄥ惁鍐?",
-            "纭€у惁鍐?",
-            "绂佹",
-            "绱ф€?",
-            "绔嬪嵆",
-            "鏋佺",
-            "寮傚父",
-            "榛戝ぉ楣?",
-            "鐖嗕粨",
-            "姝㈡崯",
-            "骞充粨",
-            "涓ラ噸",
-            "娴佸姩鎬?",
-            "楂樻尝鍔?",
-            "椋庨櫓",
+            "一票否决",
+            "硬性否决",
+            "禁止",
+            "紧急",
+            "立即",
+            "极端",
+            "异常",
+            "黑天鹅",
+            "爆仓",
+            "止损",
+            "平仓",
+            "严重",
+            "流动性",
+            "高波动",
+            "风险",
         )
         urgent = (
             risk_action in {"close_long", "close_short"}
@@ -12217,9 +11181,9 @@ class TradingService:
         if execution_result is not None:
             if execution_result.status == OrderStatus.FILLED:
                 result_text = (
-                    f"宸叉墽琛屽畬鎴愶細鍔ㄤ綔={self._action_label_text(decision.action)}锛?"
-                    f"鏁伴噺={execution_result.quantity:g}锛屼环鏍?{execution_result.price:g}锛?"
-                    f"璁㈠崟鐘舵€?{execution_result.status.value}銆?"
+                    f"已执行完成：动作={self._action_label_text(decision.action)}，"
+                    f"数量={execution_result.quantity:g}，价格={execution_result.price:g}，"
+                    f"订单状态={execution_result.status.value}。"
                 )
             else:
                 result_text = (
@@ -12278,155 +11242,7 @@ class TradingService:
         decision.suggested_leverage = float(summary["actual_leverage"])
 
     async def _get_open_positions_context(self) -> list[dict]:
-        """Get open positions for LLM context (paper + live)."""
-        positions = []
-
-        try:
-            async with get_session_ctx() as session:
-                repo = TradeRepository(session)
-                db_positions = await repo.get_position_records(
-                    execution_mode=mode_manager.mode.value,
-                    model_name=ENSEMBLE_TRADER_NAME,
-                    limit=1000,
-                )
-                for p in db_positions:
-                    if p.is_open:
-                        positions.append({
-                            "model_name": p.model_name,
-                            "symbol": p.symbol,
-                            "side": p.side,
-                            "entry_price": p.entry_price,
-                            "current_price": p.current_price or p.entry_price,
-                            "quantity": p.quantity,
-                            "leverage": p.leverage or 1.0,
-                            "unrealized_pnl": p.unrealized_pnl,
-                            "stop_loss": p.stop_loss_price,
-                            "take_profit": p.take_profit_price,
-                            "is_open": p.is_open,
-                            "created_at": p.created_at,
-                        })
-        except Exception as e:
-            logger.warning("failed to load DB positions for context", error=str(e))
-
-        # Keep in-memory paper positions as a fallback for positions opened before
-        # persistence was introduced in this process.
-        if not positions and self.paper_executor:
-            positions.extend(await self.paper_executor.get_positions())
-
-        # OKX positions for the active execution account.
-        active_okx = self._okx_live if mode_manager.mode.value == "live" else self._okx_paper
-        if active_okx:
-            try:
-                okx_positions = await asyncio.wait_for(
-                    active_okx.get_positions(),
-                    timeout=8.0,
-                )
-                exchange_keys = {
-                    (
-                        self._normalize_position_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    for p in (okx_positions or [])
-                    if self._exchange_position_is_open(p)
-                }
-                positions = [
-                    p for p in positions
-                    if (
-                        self._normalize_position_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    ) in exchange_keys
-                ]
-                existing_keys = {
-                    (
-                        self._normalize_position_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    for p in positions
-                }
-                for p in (okx_positions or []):
-                    p["model_name"] = p.get("model_name") or ENSEMBLE_TRADER_NAME
-                    key = (
-                        self._normalize_position_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    if key not in existing_keys:
-                        positions.append(p)
-            except Exception:
-                pass
-
-        return [
-            {
-                "model_name": p.get("model_name", ""),
-                "symbol": p.get("symbol", ""),
-                "side": p.get("side", "long"),
-                "entry_price": p.get("entry_price") or p.get("entryPrice") or p.get("avgPx") or 0,
-                "current_price": (
-                    p.get("current_price")
-                    or p.get("markPrice")
-                    or p.get("lastPrice")
-                    or p.get("entry_price")
-                    or p.get("entryPrice")
-                    or p.get("avgPx")
-                    or 0
-                ),
-                "quantity": p.get("quantity") or p.get("contracts") or p.get("sz") or 0,
-                "contracts": p.get("contracts") or p.get("sz"),
-                "contract_size": (
-                    p.get("contract_size")
-                    or p.get("contractSize")
-                    or (p.get("info") or {}).get("ctVal")
-                ),
-                "contractSize": (
-                    p.get("contractSize")
-                    or p.get("contract_size")
-                    or (p.get("info") or {}).get("ctVal")
-                ),
-                "leverage": self._safe_float(
-                    p.get("leverage") or (p.get("info") or {}).get("lever"),
-                    1.0,
-                ),
-                "notional": (
-                    p.get("notional")
-                    or p.get("notional_usd")
-                    or p.get("notionalUsd")
-                    or (p.get("info") or {}).get("notionalUsd")
-                    or (p.get("info") or {}).get("notional")
-                    or (p.get("info") or {}).get("posValue")
-                    or 0
-                ),
-                "margin": (
-                    p.get("margin")
-                    or p.get("initial_margin")
-                    or p.get("initialMargin")
-                    or p.get("margin_used")
-                    or (p.get("info") or {}).get("margin")
-                    or (p.get("info") or {}).get("imr")
-                ),
-                "initial_margin": (
-                    p.get("initial_margin")
-                    or p.get("initialMargin")
-                    or (p.get("info") or {}).get("imr")
-                ),
-                "initialMargin": (
-                    p.get("initialMargin")
-                    or p.get("initial_margin")
-                    or (p.get("info") or {}).get("imr")
-                ),
-                "unrealized_pnl": p.get("unrealized_pnl", p.get("unrealizedPnl", 0)),
-                "stop_loss": p.get("stop_loss"),
-                "take_profit": p.get("take_profit"),
-                "is_open": p.get("is_open", True),
-                "created_at": (
-                    p.get("created_at")
-                    or p.get("timestamp")
-                    or p.get("opened_at")
-                    or (p.get("info") or {}).get("cTime")
-                    or (p.get("info") or {}).get("uTime")
-                ),
-                "info": p.get("info") if isinstance(p.get("info"), dict) else {},
-            }
-            for p in (positions or [])
-        ]
+        return await self.okx_sync_service.get_open_positions_context()
 
     def _get_model_execution_mode(self, model_name: str) -> str:
         """Return the execution_mode for a model. Defaults to 'paper'."""
@@ -12547,9 +11363,9 @@ class TradingService:
             )
             if today_total <= profit_floor:
                 return (
-                    f"浠婃棩鐩堝埄鏈€楂樺埌杩?{high_water:.2f} USDT锛屽綋鍓嶅洖钀藉埌 {today_total:.2f} USDT锛?"
-                    f"宸茶Е鍙婄洰鏍囦繚鎶ょ嚎 {profit_floor:.2f} USDT锛涙殏鍋滄柊寮€浠擄紝浼樺厛瀹堜綇宸插疄鐜板埄娑︺€?"
-                    "宸叉湁鎸佷粨浠嶄細缁х画鎸夎鍒欐鐩堟鎹熷拰骞充粨銆?"
+                    f"今日盈利最高到过 {high_water:.2f} USDT，当前回落到 {today_total:.2f} USDT，"
+                    f"已触及目标保护线 {profit_floor:.2f} USDT；暂停新开仓，优先守住已实现利润。"
+                    "已有持仓仍会继续按规则止盈、止损和平仓。"
                 )
 
         return None
@@ -13207,7 +12023,7 @@ class TradingService:
                 "win_rate": round(win_rate, 4),
                 "avg_pnl": round(avg_pnl, 6),
                 "profit_factor": round(profit_factor, 4),
-                "reason": f"鍖椾含鏃堕棿浠婃棩鍚屽悜鍙備笌 {count} 绗旓紝鐪熷疄鐩堜簭 {pnl:.2f}U锛岃儨鐜?{win_rate:.0%}锛屾潈閲嶈皟鍒?{multiplier:.2f} 鍊嶃€?",
+                "reason": f"北京时间今日同向参与 {count} 笔，真实盈亏 {pnl:.2f}U，胜率 {win_rate:.0%}，权重调到 {multiplier:.2f} 倍。",
             }
         self._realized_expert_weight_cache = {
             "expires_at": now + timedelta(minutes=15),
@@ -13255,7 +12071,7 @@ class TradingService:
                     "evidence_count": 0,
                     "success_count": 0,
                     "failure_count": 0,
-                    "reason": "鏆傛棤瓒冲鍘嗗彶鏍锋湰锛屼娇鐢ㄥ熀纭€鏉冮噸銆?",
+                    "reason": "暂无足够历史样本，使用基础权重。",
                 }
                 continue
 
@@ -13284,11 +12100,11 @@ class TradingService:
                 multiplier = max(multiplier, 1.05)
 
             if multiplier > 1.03:
-                reason = f"杩戞湡璁板繂涓垚鍔熸牱鏈緝澶氭垨姝ｅ悜鏁欒鏇寸ǔ瀹氾紝鏉冮噸鎻愰珮鍒?{multiplier:.2f} 鍊嶃€?"
+                reason = f"近期记忆中成功样本较多或正向教训更稳定，权重提高到 {multiplier:.2f} 倍。"
             elif multiplier < 0.97:
-                reason = f"杩戞湡璁板繂鎻愮ず璇ヤ笓瀹剁浉鍏冲満鏅簭鎹熷亸澶氾紝鏉冮噸闄嶅埌 {multiplier:.2f} 鍊嶃€?"
+                reason = f"近期记忆提示该专家相关场景亏损偏多，权重降到 {multiplier:.2f} 倍。"
             else:
-                reason = "鍘嗗彶鏍锋湰鏈樉绀烘槑鏄句紭鍔ｏ紝淇濇寔鍩虹鏉冮噸銆?"
+                reason = "历史样本未显示明显优劣，保持基础权重。"
 
             result[expert_name] = {
                 "base_weight": base_weight,
@@ -13367,7 +12183,7 @@ class TradingService:
             "loss_pause_usdt": self._daily_cooldown_trigger_loss_usdt(mode, target_usdt) if target_usdt > 0 else 0.0,
             "phase": daily_phase,
             "gap_usdt": max(target_usdt - today_total_pnl, 0.0),
-            "note": "姣忔棩鐩爣鍙敤浜庣瓫閫夋洿楂樿川閲忔満浼氾紝涓嶈兘浣滀负杩藉崟銆佹斁澶ф潬鏉嗘垨鏀炬澗椋庢帶鐨勭悊鐢便€?",
+            "note": "每日目标只用于筛选更高质量机会，不能作为追单、放大杠杆或放松风控的理由。",
         }
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
@@ -14374,12 +13190,12 @@ class TradingService:
                     note = ""
                     if missed:
                         note = (
-                            f"褰撴椂瑙傛湜锛屼絾 {int(row.horizon_minutes)} 鍒嗛挓鍚?"
-                            f"{'鍋氬' if best_action == 'long' else '鍋氱┖'}鏂瑰悜鏀剁泭绾?"
-                            f"{max(long_return, short_return) * 100:.2f}%銆?"
+                            f"当时观望，但 {int(row.horizon_minutes)} 分钟后"
+                            f"{'做多' if best_action == 'long' else '做空'}方向收益约"
+                            f"{max(long_return, short_return) * 100:.2f}%。"
                         )
                     elif decision_action in {"long", "short"} and decision_action != best_action and best_action != "hold":
-                        note = f"瀹為檯鏇翠紭鏂瑰悜鏄?{'鍋氬' if best_action == 'long' else '鍋氱┖'}锛岀敤浜庡悗缁鐩樸€?"
+                        note = f"实际更优方向是 {'做多' if best_action == 'long' else '做空'}，用于后续复盘。"
 
                     await repo.complete_shadow_backtest(
                         row,
@@ -14431,8 +13247,8 @@ class TradingService:
             success_count = 1
             failure_count = 0
             outcome_text = (
-                f"褰撴椂閫夋嫨瑙傛湜锛屼絾 {horizon} 鍒嗛挓鍚?"
-                f"{'鍋氬' if side == 'long' else '鍋氱┖'}鏂瑰悜娑ㄨ穼鏀剁泭绾?{realized * 100:.2f}%銆?"
+                f"当时选择观望，但 {horizon} 分钟后"
+                f"{'做多' if side == 'long' else '做空'}方向涨跌收益约 {realized * 100:.2f}%。"
             )
             recommended = "allow_small_probe_with_filters"
         elif decision_action in {"long", "short"}:
@@ -14587,11 +13403,11 @@ class TradingService:
         horizon: int,
     ) -> str:
         return (
-            f"{symbol} {self._side_label(side)}褰卞瓙澶嶇洏 {horizon}鍒嗛挓锛?"
-            f"ADX={self._safe_float(feature_snapshot.get('adx_14'), 0.0):.1f}锛?"
-            f"閲忔瘮={self._safe_float(feature_snapshot.get('volume_ratio'), 0.0):.2f}锛?"
-            f"5鍛ㄦ湡鏀剁泭={self._safe_float(feature_snapshot.get('returns_5'), 0.0) * 100:.2f}%锛?"
-            f"鐩樺彛鍊炬枩={self._safe_float(feature_snapshot.get('orderbook_imbalance'), 0.0):.2f}"
+            f"{symbol} {self._side_label(side)}影子复盘 {horizon}分钟，"
+            f"ADX={self._safe_float(feature_snapshot.get('adx_14'), 0.0):.1f}，"
+            f"量比={self._safe_float(feature_snapshot.get('volume_ratio'), 0.0):.2f}，"
+            f"5周期收益={self._safe_float(feature_snapshot.get('returns_5'), 0.0) * 100:.2f}%，"
+            f"盘口倾斜={self._safe_float(feature_snapshot.get('orderbook_imbalance'), 0.0):.2f}"
         )
 
     def _shadow_feature_bucket(self, feature_snapshot: dict[str, Any]) -> str:
@@ -15217,13 +14033,13 @@ class TradingService:
             return None
         if decision.is_exit:
             return (
-                f"鍚屼竴鏉″钩浠撳喅绛栧凡缁忕敓鎴愯繃 {int(order_count)} 鏉¤鍗曪紝"
-                "涓洪伩鍏嶉噸澶嶅钩浠擄紝鏈閲嶅杩涘叆鎵ц娴佺▼宸茶烦杩囥€?"
+                f"同一条平仓决策已经生成过 {int(order_count)} 条订单，"
+                "为避免重复平仓，本次重复进入执行流程已跳过。"
             )
         if decision.is_entry:
             return (
-                f"鍚屼竴鏉″紑浠撳喅绛栧凡缁忕敓鎴愯繃 {int(order_count)} 鏉¤鍗曪紝"
-                "涓洪伩鍏嶉噸澶嶅紑浠擄紝鏈閲嶅杩涘叆鎵ц娴佺▼宸茶烦杩囥€?"
+                f"同一条开仓决策已经生成过 {int(order_count)} 条订单，"
+                "为避免重复开仓，本次重复进入执行流程已跳过。"
             )
         return None
 

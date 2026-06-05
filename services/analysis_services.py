@@ -1,9 +1,8 @@
-"""Analysis loop service wrappers.
+"""Analysis loop service boundaries.
 
-TradingService still owns the legacy implementation, but market analysis and
-position review now have explicit service boundaries.  This keeps scheduling
-and scope ownership out of ad-hoc call sites while the large orchestrator is
-being split apart.
+Market analysis and position review have separate loop owners.  TradingService
+still provides shared dependencies and low-level helpers, but scope scheduling,
+position-review candidate execution, and SL/TP review sequencing live here.
 """
 
 from __future__ import annotations
