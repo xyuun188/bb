@@ -49,6 +49,7 @@ const state = {
     expertMemoryTotal: 0,
     tradeReflectionPage: 1,
     tradeReflectionTotal: 0,
+    expertMemoryView: 'memories',
     shadowBacktests: [],
     shadowBacktestPage: 1,
     shadowBacktestTotal: 0,
@@ -61,6 +62,7 @@ const state = {
     tradesTotalPages: 1,
     openingFunnel: null,
     profitAttribution: null,
+    profitAttributionView: 'overview',
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
@@ -2733,7 +2735,6 @@ function renderExpertMemories(data = {}) {
     const pagination = data.pagination || {};
     const countEl = document.getElementById('expert-memory-count');
     const reflectionCountEl = document.getElementById('trade-reflection-count');
-    const targetEl = document.getElementById('expert-memory-target');
     const memoryBody = document.getElementById('expert-memory-tbody');
     const reflectionBody = document.getElementById('trade-reflection-tbody');
     const memoryTotal = Number(pagination.memory_total ?? state.expertMemoryTotal ?? memories.length);
@@ -2744,10 +2745,7 @@ function renderExpertMemories(data = {}) {
     const reflectionTotalPages = Number(pagination.reflection_total_pages || Math.max(Math.ceil(reflectionTotal / EXPERT_MEMORY_PAGE_SIZE), 1));
     if (countEl) countEl.textContent = `${memoryTotal} 条`;
     if (reflectionCountEl) reflectionCountEl.textContent = `${reflectionTotal} 条`;
-    if (targetEl) {
-        const target = data.daily_target || {};
-        targetEl.innerHTML = `每日目标：约 ${fmtMoney(target.target_usdt)} USDT。长期记忆只用于提高筛选质量，不会绕过风控追单。`;
-    }
+    setExpertMemoryView(state.expertMemoryView || 'memories');
 
     if (memoryBody) {
         if (!memories.length) {
@@ -2806,6 +2804,16 @@ function changeExpertMemoryPage(page) {
 function changeTradeReflectionPage(page) {
     state.tradeReflectionPage = Math.max(1, Number(page) || 1);
     fetchExpertMemories();
+}
+
+function setExpertMemoryView(view) {
+    const selected = view === 'reflections' ? 'reflections' : 'memories';
+    state.expertMemoryView = selected;
+    document.querySelectorAll('#expert-memory-tabs .trade-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.expertMemoryView === selected);
+    });
+    document.getElementById('expert-memory-panel-memories')?.classList.toggle('active', selected === 'memories');
+    document.getElementById('expert-memory-panel-reflections')?.classList.toggle('active', selected === 'reflections');
 }
 
 // ========== Shadow Backtest ==========
@@ -5939,8 +5947,19 @@ async function fetchProfitAttribution() {
     renderProfitAttribution();
 }
 
+function setProfitAttributionView(view) {
+    const selected = view === 'records' ? 'records' : 'overview';
+    state.profitAttributionView = selected;
+    document.querySelectorAll('#profit-attribution-tabs .trade-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.profitAttributionView === selected);
+    });
+    document.getElementById('profit-attribution-panel-overview')?.classList.toggle('active', selected === 'overview');
+    document.getElementById('profit-attribution-panel-records')?.classList.toggle('active', selected === 'records');
+}
+
 function renderProfitAttribution() {
     const data = state.profitAttribution || {};
+    setProfitAttributionView(state.profitAttributionView || 'overview');
     renderProfitAttributionSummary(data);
     renderProfitAttributionBuckets(data);
     renderProfitAttributionState(data);

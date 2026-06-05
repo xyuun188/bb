@@ -9,6 +9,46 @@ from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
 
 
+MEMORY_MOJIBAKE_MARKERS = (
+    "閿",
+    "缁",
+    "閹",
+    "閸",
+    "楠",
+    "娴",
+    "鈧",
+    "鎾",
+    "閫",
+    "嫨",
+    "瑙",
+    "傛",
+    "澧",
+    "鍫",
+    "鐟",
+    "闁",
+    "锟",
+    "褰",
+    "鏃",
+    "涓",
+    "鏆",
+    "姣",
+    "锛",
+    "絾",
+    "鍒",
+    "挓",
+    "鍚",
+    "庢",
+    "敹",
+    "鐩",
+    "婁",
+)
+MEMORY_DAMAGED_MARKERS = (
+    "原始说明已损坏",
+    "raw note is damaged",
+    "无法准确还原",
+)
+
+
 class MemoryRepository(BaseRepository):
     """Repository for expert long-term memories and trade reflections."""
 
@@ -52,6 +92,7 @@ class MemoryRepository(BaseRepository):
                 or not side_norm
                 or str(row.side or "").lower() == side_norm
             )
+            and _memory_row_usable(row)
         ]
         return filtered[:max(int(limit or 4), 1)]
 
@@ -68,6 +109,7 @@ class MemoryRepository(BaseRepository):
         await self.session.flush()
 
     async def upsert_memory(self, data: dict[str, Any]) -> ExpertMemory:
+        data = _normalize_memory_payload(dict(data or {}))
         memory_key = str(data.get("memory_key") or "").strip()
         existing = None
         if memory_key:
@@ -102,6 +144,8 @@ class MemoryRepository(BaseRepository):
             existing.recommended_action = str(data.get("recommended_action") or existing.recommended_action or "")
             existing.source_position_id = data.get("source_position_id") or existing.source_position_id
             existing.extra = data.get("extra") or existing.extra
+            if data.get("is_active") is False:
+                existing.is_active = False
             existing.updated_at = datetime.now(timezone.utc)
             await self.session.flush()
             return existing
@@ -279,3 +323,28 @@ def _norm_symbol(symbol: str | None) -> str:
         if len(parts) >= 2:
             value = f"{parts[0]}/{parts[1]}"
     return value.upper()
+
+
+def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("lesson", "market_pattern"):
+        value = data.get(key)
+        if value is not None:
+            data[key] = str(value)
+    if not _memory_text_usable(data.get("lesson")) or not _memory_text_usable(data.get("market_pattern")):
+        data["is_active"] = False
+    return data
+
+
+def _memory_row_usable(row: ExpertMemory) -> bool:
+    return _memory_text_usable(getattr(row, "lesson", None)) and _memory_text_usable(getattr(row, "market_pattern", None))
+
+
+def _memory_text_usable(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in MEMORY_DAMAGED_MARKERS):
+        return False
+    marker_hits = sum(1 for marker in MEMORY_MOJIBAKE_MARKERS if marker in text)
+    return marker_hits < 2

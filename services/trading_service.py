@@ -11439,14 +11439,8 @@ class TradingService:
         }
 
     def _configured_daily_target_usdt(self) -> float:
-        target_usdt_setting = max(float(settings.daily_profit_target_usdt or 0.0), 0.0)
-        target_cny = max(float(settings.daily_profit_target_cny or 0.0), 0.0)
-        cny_per_usdt = max(float(settings.cny_per_usdt_assumption or 7.2), 0.0001)
-        return (
-            target_usdt_setting
-            if target_usdt_setting > 0
-            else target_cny / cny_per_usdt if target_cny > 0 else 0.0
-        )
+        """Daily profit target is disabled and must not gate trading."""
+        return 0.0
 
     async def _cooldown_loss_pause_reason(
         self,
@@ -12119,19 +12113,9 @@ class TradingService:
         return result
 
     async def _daily_target_context(self) -> dict[str, Any]:
-        """Return today's target gap without encouraging unsafe overtrading."""
-        target_usdt_setting = max(float(settings.daily_profit_target_usdt or 0.0), 0.0)
-        target_cny = max(float(settings.daily_profit_target_cny or 0.0), 0.0)
-        cny_per_usdt = max(float(settings.cny_per_usdt_assumption or 7.2), 0.0001)
-        target_usdt = (
-            target_usdt_setting
-            if target_usdt_setting > 0
-            else target_cny / cny_per_usdt if target_cny > 0 else 0.0
-        )
-        target_cny_equivalent = target_usdt * cny_per_usdt if target_usdt > 0 else target_cny
+        """Return a disabled daily-target context for telemetry only."""
         mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
         today_pnl = 0.0
-        control_state: dict[str, Any] = {}
         try:
             now_local = datetime.now(timezone(timedelta(hours=8)))
             start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -12148,42 +12132,22 @@ class TradingService:
                 )
                 today_pnl = float(result.scalar() or 0.0)
         except Exception as e:
-            logger.warning("failed to calculate daily target context", error=str(e))
-
-        if target_usdt > 0:
-            try:
-                control_state = await self._daily_profit_control_state(mode, target_usdt)
-            except Exception as e:
-                logger.warning("failed to enrich daily target context", error=str(e))
-
-        today_total_pnl = float(control_state.get("today_total_pnl", today_pnl) or 0.0)
-        today_high_water = float(control_state.get("today_high_water_pnl", today_total_pnl) or 0.0)
-        daily_phase = "normal"
-        if target_usdt > 0:
-            loss_line = -self._daily_cooldown_trigger_loss_usdt(mode, target_usdt)
-            if today_total_pnl <= loss_line:
-                daily_phase = "loss_control"
-            elif today_total_pnl < 0:
-                daily_phase = "recovery"
-            elif today_high_water >= target_usdt:
-                daily_phase = "profit_protected_expand"
-            elif today_total_pnl >= target_usdt * 0.70:
-                daily_phase = "near_target"
-
+            logger.warning("failed to calculate disabled daily target context", error=str(e))
         return {
-            "target_currency": "USDT" if target_usdt_setting > 0 else "CNY",
-            "target_cny": target_cny_equivalent,
-            "target_usdt": target_usdt,
+            "enabled": False,
+            "target_currency": "USDT",
+            "target_cny": 0.0,
+            "target_usdt": 0.0,
             "today_realized_pnl": today_pnl,
-            "today_total_pnl": today_total_pnl,
-            "today_high_water_pnl": today_high_water,
-            "today_realized_profit": control_state.get("today_realized_profit"),
-            "today_realized_loss": control_state.get("today_realized_loss"),
-            "today_trade_count": control_state.get("today_trade_count"),
-            "loss_pause_usdt": self._daily_cooldown_trigger_loss_usdt(mode, target_usdt) if target_usdt > 0 else 0.0,
-            "phase": daily_phase,
-            "gap_usdt": max(target_usdt - today_total_pnl, 0.0),
-            "note": "每日目标只用于筛选更高质量机会，不能作为追单、放大杠杆或放松风控的理由。",
+            "today_total_pnl": today_pnl,
+            "today_high_water_pnl": max(today_pnl, 0.0),
+            "today_realized_profit": None,
+            "today_realized_loss": None,
+            "today_trade_count": None,
+            "loss_pause_usdt": 0.0,
+            "phase": "disabled",
+            "gap_usdt": 0.0,
+            "note": "每日目标已禁用，不参与开仓、平仓、仓位、杠杆或暂停新开仓判断。",
         }
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
@@ -13261,9 +13225,8 @@ class TradingService:
                 success_count = 1
                 failure_count = 0
                 outcome_text = (
-                    f"Shadow replay: {self._side_label(side)} signal returned "
-                    f"{realized * 100:.2f}% after {horizon} minutes. "
-                    "This pattern was short-term effective."
+                    f"影子复盘显示：{self._side_label(side)}信号在 {horizon} 分钟后"
+                    f"收益约 {realized * 100:.2f}%，该形态短线有效。"
                 )
                 recommended = "keep_with_filters"
             elif realized <= -threshold:
@@ -13275,9 +13238,9 @@ class TradingService:
                 opposite = "short" if side == "long" else "long"
                 opposite_return = short_return if opposite == "short" else long_return
                 outcome_text = (
-                    f"Shadow replay: {self._side_label(side)} signal lost "
-                    f"{abs(realized) * 100:.2f}% after {horizon} minutes, while "
-                    f"{self._side_label(opposite)} returned {opposite_return * 100:.2f}%."
+                    f"影子复盘显示：{self._side_label(side)}信号在 {horizon} 分钟后"
+                    f"亏损约 {abs(realized) * 100:.2f}%，而"
+                    f"{self._side_label(opposite)}方向收益约 {opposite_return * 100:.2f}%。"
                 )
                 recommended = "reduce_risk"
             else:
@@ -13341,57 +13304,57 @@ class TradingService:
         if memory_type == "shadow_missed_opportunity":
             return {
                 "trend_expert": (
-                    f"{symbol} {side_label} missed opportunity. {outcome_text} "
-                    "When directional structure, ADX, moving averages and MACD align, raise directional support without deciding size."
+                    f"{symbol} {side_label}机会曾被观望错过。{outcome_text}"
+                    "当方向结构、ADX、均线和 MACD 同向时，可以提高方向支持，但不能直接决定仓位。"
                 ),
                 "momentum_expert": (
-                    f"{symbol} {side_label} missed opportunity. {outcome_text} "
-                    "If expected net return, fee coverage and loss probability are favorable, support a small profit-quality probe."
+                    f"{symbol} {side_label}机会曾被观望错过。{outcome_text}"
+                    "如果预期净收益、手续费覆盖和亏损概率都合格，可以支持小仓位盈利质量试单。"
                 ),
                 "sentiment_expert": (
-                    f"{symbol} {side_label} missed opportunity. {outcome_text} "
-                    "If 1/5/10/30 minute path and event shock risk are favorable, support earlier execution timing."
+                    f"{symbol} {side_label}机会曾被观望错过。{outcome_text}"
+                    "如果 1/5/10/30 分钟路径和事件冲击风险有利，可以支持更早执行。"
                 ),
                 "risk_expert": (
-                    f"{symbol} {side_label} missed opportunity. {outcome_text} "
-                    "If there is no hard risk, prefer size/leverage control instead of blocking the trade."
+                    f"{symbol} {side_label}机会曾被观望错过。{outcome_text}"
+                    "没有硬风险时，优先用仓位和杠杆控制风险，不要直接否决交易。"
                 ),
             }
         if memory_type == "shadow_good_signal":
             return {
                 "trend_expert": (
-                    f"{symbol} {side_label} signal validated by shadow replay. {outcome_text} "
-                    "Raise directional confidence when a similar directional structure appears."
+                    f"{symbol} {side_label}信号被影子复盘验证有效。{outcome_text}"
+                    "下次出现相似方向结构时，可以适当提高方向信心。"
                 ),
                 "momentum_expert": (
-                    f"{symbol} {side_label} signal validated by shadow replay. {outcome_text} "
-                    "Support execution when expected net return and payoff quality stay positive after fees."
+                    f"{symbol} {side_label}信号被影子复盘验证有效。{outcome_text}"
+                    "当扣费后预期净收益和盈亏质量仍为正时，可以支持执行。"
                 ),
                 "sentiment_expert": (
-                    f"{symbol} {side_label} signal validated by shadow replay. {outcome_text} "
-                    "Support execution timing when short-horizon path continuation is similar."
+                    f"{symbol} {side_label}信号被影子复盘验证有效。{outcome_text}"
+                    "短周期路径延续相似时，可以支持当前执行时机。"
                 ),
                 "risk_expert": (
-                    f"{symbol} {side_label} signal validated by shadow replay. {outcome_text} "
-                    "Allow small size when no hard risk is present."
+                    f"{symbol} {side_label}信号被影子复盘验证有效。{outcome_text}"
+                    "没有硬风险时，可以允许小仓位执行。"
                 ),
             }
         return {
             "trend_expert": (
-                f"{symbol} {side_label} signal looked weak in shadow replay. {outcome_text} "
-                "Require trend continuation before raising confidence next time."
+                f"{symbol} {side_label}信号在影子复盘中表现偏弱。{outcome_text}"
+                "下次必须先看到趋势延续，再提高方向信心。"
             ),
             "momentum_expert": (
-                f"{symbol} {side_label} signal looked weak in shadow replay. {outcome_text} "
-                "Check whether expected net return, fee coverage or payoff ratio is too weak before chasing."
+                f"{symbol} {side_label}信号在影子复盘中表现偏弱。{outcome_text}"
+                "追单前要检查预期净收益、手续费覆盖和盈亏比是否过弱。"
             ),
             "sentiment_expert": (
-                f"{symbol} {side_label} signal looked weak in shadow replay. {outcome_text} "
-                "Check whether the short-horizon path is already reversing before execution."
+                f"{symbol} {side_label}信号在影子复盘中表现偏弱。{outcome_text}"
+                "执行前要确认短周期路径是否已经反转。"
             ),
             "risk_expert": (
-                f"{symbol} {side_label} signal looked weak in shadow replay. {outcome_text} "
-                "Reduce size/leverage or block new entries under similar conditions."
+                f"{symbol} {side_label}信号在影子复盘中表现偏弱。{outcome_text}"
+                "相似条件下需要降低仓位/杠杆，必要时阻止新开仓。"
             ),
         }
 
@@ -13699,11 +13662,11 @@ class TradingService:
         return max((closed - opened).total_seconds() / 60.0, 0.0)
 
     def _reflection_pattern(self, pos, pnl_pct: float, hold_minutes: float) -> str:
-        side_label = "long" if str(pos.side).lower() == "long" else "short"
-        speed = "ultra_short" if hold_minutes < 5 else "short_term" if hold_minutes < 30 else "longer_hold"
-        loss_level = "large_loss" if pnl_pct <= -0.01 else "small_loss" if pnl_pct < 0 else "profit" if pnl_pct > 0 else "flat"
+        side_label = "做多" if str(pos.side).lower() == "long" else "做空"
+        speed = "极短持仓" if hold_minutes < 5 else "短线持仓" if hold_minutes < 30 else "较长持仓"
+        loss_level = "大亏" if pnl_pct <= -0.01 else "小亏" if pnl_pct < 0 else "盈利" if pnl_pct > 0 else "打平"
         leverage = float(getattr(pos, "leverage", 1.0) or 1.0)
-        return f"{pos.symbol} {side_label}, {speed}, {leverage:.1f}x, {loss_level}"
+        return f"{pos.symbol} {side_label}，{speed}，{leverage:.1f}x，{loss_level}"
 
     def _reflection_summary(
         self,
@@ -13754,28 +13717,29 @@ class TradingService:
         evidence_failure = 1 if is_loss else 0
 
         labels = {slot["name"]: slot.get("label", slot["name"]) for slot in FIXED_AI_MODEL_SLOTS}
-        side_label = "long" if side == "long" else "short"
+        side_label = "做多" if side == "long" else "做空"
+        outcome_label = {"loss": "亏损", "profit": "盈利", "flat": "打平"}.get(outcome, outcome)
         base_key = f"{symbol}|{side}|{memory_type}|{self._lesson_bucket(pnl_pct, hold_minutes)}"
         lessons = {
             "trend_expert": (
-                f"{symbol} {side_label} under pattern [{pattern}] ended as {outcome}. "
-                "Next time judge only directional quality: MA direction, ADX, MACD and breakout structure."
+                f"{symbol} {side_label}在场景[{pattern}]下结果为{outcome_label}。"
+                "下次只判断方向质量：均线方向、ADX、MACD 和突破结构，不直接决定仓位。"
             ),
             "momentum_expert": (
-                f"{symbol} {side_label} under pattern [{pattern}] ended as {outcome}. "
-                "Next time prioritize expected net return, fee coverage, loss probability and payoff ratio over win rate."
+                f"{symbol} {side_label}在场景[{pattern}]下结果为{outcome_label}。"
+                "下次优先看预期净收益、手续费覆盖、亏损概率和盈亏比，不只看胜率。"
             ),
             "sentiment_expert": (
-                f"{symbol} {side_label} under pattern [{pattern}] ended as {outcome}. "
-                "Next time verify the 1/5/10/30 minute path, continuation risk, reversal risk and event shock before timing execution."
+                f"{symbol} {side_label}在场景[{pattern}]下结果为{outcome_label}。"
+                "下次核对 1/5/10/30 分钟路径、延续风险、反转风险和事件冲击后再判断执行时机。"
             ),
             "position_expert": (
-                f"{symbol} {side_label} held {hold_minutes:.1f} minutes and ended as {outcome}. "
-                "Check whether profit should be locked, loss can repair, loss is expanding, or the position deserves adding/reducing."
+                f"{symbol} {side_label}持仓 {hold_minutes:.1f} 分钟后结果为{outcome_label}。"
+                "下次检查是否该锁盈、亏损能否修复、亏损是否扩大，以及是否值得加仓/减仓。"
             ),
             "risk_expert": (
-                f"{symbol} {side_label} under pattern [{pattern}] ended as {outcome}. "
-                "Check abnormal wick, liquidity, extreme volatility, margin limits and exchange constraints before allowing risk."
+                f"{symbol} {side_label}在场景[{pattern}]下结果为{outcome_label}。"
+                "下次检查异常插针、流动性、极端波动、保证金限制和交易所约束后再放行风险。"
             ),
         }
         result: dict[str, dict[str, Any]] = {}

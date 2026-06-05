@@ -1585,6 +1585,28 @@ select.form-input { cursor: pointer; }
 .trade-tab.active { background: var(--accent); color: #000; }
 .trade-tab:hover:not(.active) { color: var(--text); }
 
+.card-tabs {
+    padding: 0 12px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.card-tabs .trade-tabs {
+    width: fit-content;
+    max-width: 100%;
+    overflow-x: auto;
+}
+.tab-panel {
+    display: none;
+}
+.tab-panel.active {
+    display: block;
+}
+.tab-table-wrap {
+    border-top: 0;
+}
+#page-expert-memory .tab-panel .pagination {
+    padding: 0 12px 12px;
+}
+
 /* ── Result box ── */
 .result-box {
     margin-top: 8px;

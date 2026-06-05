@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     min_entry_adx: float = 15.0
     min_entry_volume_ratio: float = 0.2
     daily_profit_target_usdt: float = 0.0
-    daily_profit_target_cny: float = 1000.0
+    daily_profit_target_cny: float = 0.0
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
     expert_memory_per_prompt: int = 4

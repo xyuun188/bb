@@ -3184,8 +3184,8 @@ async def get_expert_memories(
             "symbol": m.symbol,
             "side": m.side,
             "memory_type": m.memory_type,
-            "market_pattern": m.market_pattern,
-            "lesson": m.lesson,
+            "market_pattern": sanitize_text(m.market_pattern),
+            "lesson": sanitize_text(m.lesson),
             "recommended_action": m.recommended_action,
             "confidence_adjustment": m.confidence_adjustment,
             "position_size_multiplier": m.position_size_multiplier,
@@ -3213,8 +3213,8 @@ async def get_expert_memories(
             "fee_estimate": r.fee_estimate,
             "hold_minutes": r.hold_minutes,
             "outcome": r.outcome,
-            "mistake_summary": r.mistake_summary,
-            "improvement_summary": r.improvement_summary,
+            "mistake_summary": sanitize_text(r.mistake_summary),
+            "improvement_summary": sanitize_text(r.improvement_summary),
             "source": r.source,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
@@ -3352,14 +3352,13 @@ def _shadow_backtest_conclusion(
 
 def _daily_target_payload() -> dict:
     cny_per_usdt = max(float(settings.cny_per_usdt_assumption or 7.2), 0.0001)
-    configured_usdt = max(float(settings.daily_profit_target_usdt or 0.0), 0.0)
-    configured_cny = max(float(settings.daily_profit_target_cny or 0.0), 0.0)
-    target_usdt = configured_usdt if configured_usdt > 0 else configured_cny / cny_per_usdt if configured_cny > 0 else 0.0
     return {
-        "target_currency": "USDT" if configured_usdt > 0 else "CNY",
-        "target_usdt": target_usdt,
-        "target_cny": target_usdt * cny_per_usdt if target_usdt > 0 else configured_cny,
+        "enabled": False,
+        "target_currency": "USDT",
+        "target_usdt": 0.0,
+        "target_cny": 0.0,
         "cny_per_usdt_assumption": cny_per_usdt,
+        "note": "每日目标已禁用，不参与交易判断。",
     }
 
 

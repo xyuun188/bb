@@ -2579,6 +2579,16 @@ class EnsembleCoordinator:
         daily = context.get("daily_target") if isinstance(context, dict) else {}
         if not isinstance(daily, dict):
             daily = {}
+        if daily.get("enabled") is False:
+            return {
+                "mode": "normal",
+                "score_bonus": 0.0,
+                "min_confidence": MIN_EXECUTABLE_ENTRY_CONFIDENCE,
+                "min_quality_points": 2,
+                "allow_probe": True,
+                "max_position_size": MAX_NORMAL_ENTRY_SIZE,
+                "max_leverage": settings.max_leverage,
+            }
         target = self._safe_float(daily.get("target_usdt"), 0.0)
         today_total = self._safe_float(
             daily.get("today_total_pnl"),

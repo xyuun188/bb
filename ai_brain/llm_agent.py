@@ -188,7 +188,7 @@ def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]
 
 
 def _format_expert_memories(memories: list[dict[str, Any]]) -> str:
-    lines = ["Long-term memory, use as risk lessons, not as forced orders:"]
+    lines = ["专家长期记忆：只作为风险教训和筛选参考，不是强制交易指令。"]
     for idx, item in enumerate(memories[: max(int(settings.expert_memory_per_prompt or 4), 1)], start=1):
         lesson = str(item.get("lesson") or "").strip()
         pattern = str(item.get("market_pattern") or "").strip()
@@ -224,7 +224,7 @@ def _format_daily_target(target: dict[str, Any]) -> str:
         else f"{target_cny:.0f} CNY / {target_usdt:.2f} USDT"
     )
     return (
-        "Daily objective context: "
+        "每日目标上下文："
         f"目标约 {target_label}，"
         f"今日已实现 {today:.2f} USDT，差距 {gap:.2f} USDT。"
         "此目标只能帮助优先选择高质量机会，不能放松风控、追单或无依据提高杠杆。"
@@ -922,8 +922,14 @@ class LLMAgent(AbstractAIModel):
         if expert_mode and expert_memories:
             memories_text = _format_expert_memories(expert_memories)
         target_text = ""
-        if expert_mode and context.get("daily_target"):
-            target_text = _format_daily_target(context.get("daily_target") or {})
+        daily_target = context.get("daily_target") if isinstance(context, dict) else {}
+        if (
+            expert_mode
+            and isinstance(daily_target, dict)
+            and daily_target.get("enabled") is not False
+            and float(daily_target.get("target_usdt") or 0.0) > 0
+        ):
+            target_text = _format_daily_target(daily_target)
         regime_text = ""
         if expert_mode and context.get("market_regime"):
             regime_text = _format_market_regime(context.get("market_regime") or {})

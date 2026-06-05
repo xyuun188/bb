@@ -604,26 +604,35 @@
                         <button class="btn btn-sm" onclick="fetchProfitAttribution()">刷新</button>
                     </div>
                 </div>
+                <div class="card-tabs">
+                    <div class="trade-tabs" id="profit-attribution-tabs">
+                        <button class="trade-tab active" data-profit-attribution-view="overview" onclick="setProfitAttributionView('overview')">汇总归因</button>
+                        <button class="trade-tab" data-profit-attribution-view="records" onclick="setProfitAttributionView('records')">逐笔交易归因</button>
+                    </div>
+                </div>
                 <div class="opening-funnel-body profit-attribution-body">
-                    <div class="opening-funnel-summary profit-attribution-summary" id="profit-attribution-summary">
-                        <div class="opening-funnel-empty">加载中...</div>
-                    </div>
-                    <div class="opening-funnel-columns profit-attribution-grid">
-                        <div class="opening-funnel-panel profit-attribution-panel">
-                            <div class="analysis-section-head">
-                                <span class="analysis-section-title">主要归因</span>
-                                <span class="analysis-section-subtitle">按真实已平仓盈亏聚合</span>
-                            </div>
-                            <div id="profit-attribution-buckets" class="opening-funnel-list"></div>
+                    <div class="tab-panel active" id="profit-attribution-panel-overview">
+                        <div class="opening-funnel-summary profit-attribution-summary" id="profit-attribution-summary">
+                            <div class="opening-funnel-empty">加载中...</div>
                         </div>
-                        <div class="opening-funnel-panel profit-attribution-panel">
-                            <div class="analysis-section-head">
-                                <span class="analysis-section-title">决策链路状态机</span>
-                                <span class="analysis-section-subtitle">AI分析 → 策略仲裁 → 风控 → OKX → 同步</span>
+                        <div class="opening-funnel-columns profit-attribution-grid">
+                            <div class="opening-funnel-panel profit-attribution-panel">
+                                <div class="analysis-section-head">
+                                    <span class="analysis-section-title">主要归因</span>
+                                    <span class="analysis-section-subtitle">按真实已平仓盈亏聚合</span>
+                                </div>
+                                <div id="profit-attribution-buckets" class="opening-funnel-list"></div>
                             </div>
-                            <div id="profit-attribution-state" class="opening-funnel-list"></div>
+                            <div class="opening-funnel-panel profit-attribution-panel">
+                                <div class="analysis-section-head">
+                                    <span class="analysis-section-title">决策链路状态机</span>
+                                    <span class="analysis-section-subtitle">AI分析 → 策略仲裁 → 风控 → OKX → 同步</span>
+                                </div>
+                                <div id="profit-attribution-state" class="opening-funnel-list"></div>
+                            </div>
                         </div>
                     </div>
+                    <div class="tab-panel" id="profit-attribution-panel-records">
                     <div class="opening-funnel-panel opening-funnel-panel-full profit-attribution-records-panel">
                         <div class="analysis-section-head">
                             <span class="analysis-section-title">逐笔交易归因</span>
@@ -648,6 +657,7 @@
                                 </tbody>
                             </table>
                         </div>
+                    </div>
                     </div>
                 </div>
             </div>
@@ -708,14 +718,19 @@
         <div class="page-section" id="page-expert-memory">
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">专家长期记忆</span>
+                    <span class="card-title">专家记忆</span>
                     <div style="display:flex;align-items:center;gap:10px;">
-                        <span class="card-subtitle" id="expert-memory-count">0 条</span>
                         <button class="btn btn-sm" onclick="fetchExpertMemories()">刷新</button>
                     </div>
                 </div>
-                <div id="expert-memory-target" style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);"></div>
-                <div class="table-wrap">
+                <div class="card-tabs">
+                    <div class="trade-tabs" id="expert-memory-tabs">
+                        <button class="trade-tab active" data-expert-memory-view="memories" onclick="setExpertMemoryView('memories')">专家长期记忆 <span id="expert-memory-count">0 条</span></button>
+                        <button class="trade-tab" data-expert-memory-view="reflections" onclick="setExpertMemoryView('reflections')">交易复盘 <span id="trade-reflection-count">0 条</span></button>
+                    </div>
+                </div>
+                <div class="tab-panel active" id="expert-memory-panel-memories">
+                <div class="table-wrap tab-table-wrap">
                     <table>
                         <thead>
                             <tr>
@@ -735,13 +750,9 @@
                     </table>
                 </div>
                 <div class="pagination" id="expert-memory-pagination" style="display:none;"></div>
-            </div>
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">交易复盘</span>
-                    <span class="card-subtitle" id="trade-reflection-count">0 条</span>
                 </div>
-                <div class="table-wrap">
+                <div class="tab-panel" id="expert-memory-panel-reflections">
+                <div class="table-wrap tab-table-wrap">
                     <table>
                         <thead>
                             <tr>
@@ -760,6 +771,7 @@
                     </table>
                 </div>
                 <div class="pagination" id="trade-reflection-pagination" style="display:none;"></div>
+                </div>
             </div>
         </div>
 
