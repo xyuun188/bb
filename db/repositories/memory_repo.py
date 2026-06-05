@@ -347,4 +347,23 @@ def _memory_text_usable(value: Any) -> bool:
     if any(marker.lower() in lowered for marker in MEMORY_DAMAGED_MARKERS):
         return False
     marker_hits = sum(1 for marker in MEMORY_MOJIBAKE_MARKERS if marker in text)
-    return marker_hits < 2
+    return marker_hits < 2 and not _has_suspicious_unicode(text)
+
+
+def _has_suspicious_unicode(text: str) -> bool:
+    suspicious = 0
+    for ch in text:
+        code = ord(ch)
+        if (
+            0x0300 <= code <= 0x036F
+            or 0x0370 <= code <= 0x03FF
+            or 0x0400 <= code <= 0x052F
+            or 0x0590 <= code <= 0x05FF
+            or 0x0600 <= code <= 0x06FF
+            or 0x0700 <= code <= 0x074F
+            or 0x1100 <= code <= 0x11FF
+            or 0x1E00 <= code <= 0x1EFF
+            or 0xAC00 <= code <= 0xD7AF
+        ):
+            suspicious += 1
+    return suspicious >= 2

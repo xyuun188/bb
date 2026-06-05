@@ -1141,21 +1141,94 @@ body {
 }
 .profit-attribution-records-panel {
     margin-top: 0;
-    padding: 12px 12px 0;
+    padding: 12px;
 }
 .profit-attribution-table-wrap {
     margin: 10px -12px 0;
-    max-height: min(44vh, 420px);
+    max-height: none;
     overflow: auto;
     border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
 }
 .profit-attribution-table {
-    min-width: 920px;
+    min-width: 1040px;
+    table-layout: fixed;
 }
 .profit-attribution-table thead th {
     position: sticky;
     top: 0;
     z-index: 1;
+}
+.profit-attribution-table th:nth-child(1),
+.profit-attribution-table td:nth-child(1) { width: 92px; }
+.profit-attribution-table th:nth-child(2),
+.profit-attribution-table td:nth-child(2) { width: 92px; }
+.profit-attribution-table th:nth-child(3),
+.profit-attribution-table td:nth-child(3) { width: 64px; }
+.profit-attribution-table th:nth-child(4),
+.profit-attribution-table td:nth-child(4) { width: 92px; }
+.profit-attribution-table th:nth-child(5),
+.profit-attribution-table td:nth-child(5) { width: 72px; }
+.profit-attribution-table td {
+    vertical-align: top;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+.profit-attribution-main-reason {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text);
+}
+.profit-attribution-note {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.55;
+}
+.profit-attribution-evidence {
+    color: var(--text-dim);
+    font-size: 11px;
+    line-height: 1.7;
+}
+.profit-attribution-state {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.55;
+}
+#profit-attribution-record-pagination {
+    padding: 10px 0 0;
+}
+
+.trade-reflection-table-wrap {
+    max-height: none;
+    overflow: auto;
+}
+.trade-reflection-table {
+    min-width: 980px;
+    table-layout: fixed;
+}
+.trade-reflection-table th:nth-child(1),
+.trade-reflection-table td:nth-child(1) { width: 92px; }
+.trade-reflection-table th:nth-child(2),
+.trade-reflection-table td:nth-child(2) { width: 96px; }
+.trade-reflection-table th:nth-child(3),
+.trade-reflection-table td:nth-child(3) { width: 64px; }
+.trade-reflection-table th:nth-child(4),
+.trade-reflection-table td:nth-child(4) { width: 96px; }
+.trade-reflection-table th:nth-child(5),
+.trade-reflection-table td:nth-child(5) { width: 72px; }
+.trade-reflection-table td {
+    vertical-align: top;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+.trade-reflection-text {
+    color: var(--text-dim);
+    line-height: 1.6;
+}
+.trade-reflection-time {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
 }
 @media (max-width: 1180px) {
     .profit-attribution-summary .opening-funnel-kpis {

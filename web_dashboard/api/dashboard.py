@@ -2320,6 +2320,16 @@ def _opening_funnel_reason_bucket(reason: str | None) -> str:
     return "other"
 
 
+def _opening_funnel_is_repair_cleanup(decision) -> bool:
+    """Rows created only to document a local repair must not pollute the entry funnel."""
+    reason = str(getattr(decision, "execution_reason", "") or "")
+    if "已清理修复前误记" in reason:
+        return True
+    if "未确认成交" in reason and "撤销" in reason:
+        return True
+    return False
+
+
 @router.get("/opening-funnel")
 async def get_opening_funnel(
     mode: str | None = None,
@@ -2365,10 +2375,14 @@ async def get_opening_funnel(
                     order_map[order.decision_id] = order
 
     market_rows = []
+    repair_cleanup_rows = 0
     for row in rows:
         raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
         analysis_type = str(row.analysis_type or raw.get("analysis_type") or "").lower()
         if analysis_type == "position" or str(row.action or "").lower() in {"close_long", "close_short"}:
+            continue
+        if _opening_funnel_is_repair_cleanup(row):
+            repair_cleanup_rows += 1
             continue
         market_rows.append(row)
 
@@ -2487,6 +2501,7 @@ async def get_opening_funnel(
         "window_hours": capped_hours,
         "sample_limit": capped_limit,
         "sampled_decisions": len(rows),
+        "repair_cleanup_rows": repair_cleanup_rows,
         "market_scans": total_scans,
         "average_confidence": (confidence_total / confidence_count) if confidence_count else 0.0,
         "stages": {
@@ -3274,6 +3289,17 @@ async def get_shadow_backtests(
         long_return = _safe_float(row.long_return_pct, None)
         short_return = _safe_float(row.short_return_pct, None)
         best_action = row.best_action or None
+        raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
+        decision_maker = raw.get("decision_maker") if isinstance(raw.get("decision_maker"), dict) else {}
+        decision_note = ""
+        if str(row.decision_action or "").lower() == "hold":
+            decision_note = str(decision_maker.get("reason") or "").strip()
+            if not decision_note:
+                weighted_score = _safe_float(raw.get("weighted_score"), 0.0) or 0.0
+                if abs(weighted_score) < 1e-9 and _safe_float(row.decision_confidence, 0.0) <= 0:
+                    decision_note = "当时没有形成可执行开仓信号，系统记录为观望样本。"
+                else:
+                    decision_note = "当时最终裁决为观望，用于复盘是否错过机会。"
         records.append({
             "id": row.id,
             "decision_id": row.decision_id,
@@ -3284,6 +3310,8 @@ async def get_shadow_backtests(
             "decision_action": row.decision_action,
             "decision_action_label": _action_label_text(row.decision_action),
             "decision_confidence": row.decision_confidence,
+            "decision_note": decision_note,
+            "decision_maker_status": decision_maker.get("status") or "",
             "entry_price": row.entry_price,
             "status": row.status,
             "status_label": "已完成" if row.status == "completed" else "等待复盘",

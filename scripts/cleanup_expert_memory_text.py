@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import sqlite3
@@ -157,11 +158,43 @@ def has_english_template(value: str | None) -> bool:
     return any(marker in text for marker in ENGLISH_MARKERS)
 
 
+def has_suspicious_unicode(value: str | None) -> bool:
+    text = str(value or "")
+    suspicious = 0
+    for ch in text:
+        code = ord(ch)
+        if (
+            0x0300 <= code <= 0x036F
+            or 0x0370 <= code <= 0x03FF
+            or 0x0400 <= code <= 0x052F
+            or 0x0590 <= code <= 0x05FF
+            or 0x0600 <= code <= 0x06FF
+            or 0x0700 <= code <= 0x074F
+            or 0x1100 <= code <= 0x11FF
+            or 0x1E00 <= code <= 0x1EFF
+            or 0xAC00 <= code <= 0xD7AF
+        ):
+            suspicious += 1
+    return suspicious >= 2
+
+
 def expert_advice(expert_name: str, text: str = "") -> str:
     name = str(expert_name or "")
-    shadow_missed = "机会曾被观望错过" in text or "missed opportunity" in text
-    shadow_good = "信号被影子复盘验证有效" in text or "signal validated by shadow replay" in text
-    shadow_bad = "信号在影子复盘中表现偏弱" in text or "signal looked weak in shadow replay" in text
+    shadow_missed = (
+        "shadow_missed_opportunity" in text
+        or "机会曾被观望错过" in text
+        or "missed opportunity" in text
+    )
+    shadow_good = (
+        "shadow_good_signal" in text
+        or "信号被影子复盘验证有效" in text
+        or "signal validated by shadow replay" in text
+    )
+    shadow_bad = (
+        "shadow_bad_signal" in text
+        or "信号在影子复盘中表现偏弱" in text
+        or "signal looked weak in shadow replay" in text
+    )
     if name == "trend_expert" or "directional structure" in text:
         if shadow_good:
             return "下次出现相似方向结构时，可以适当提高方向信心。"
@@ -259,7 +292,7 @@ def translate_market_pattern(value: str | None) -> str:
     parts = [part.strip() for part in text.split(",")]
     if len(parts) >= 4:
         first = parts[0]
-        match = re.match(r"^(?P<symbol>\S+)\s+(?P<side>long|short)$", first)
+        match = re.match(r"^(?P<symbol>\S+)\s+(?P<side>long|short|做多|做空)$", first)
         if match:
             speed_map = {
                 "ultra_short": "极短持仓",
@@ -289,6 +322,95 @@ def translate_market_pattern(value: str | None) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
     return text
+
+
+def parse_extra(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def shadow_return_pct(extra: dict, side: str) -> float:
+    key = "long_return_pct" if str(side).lower() == "long" else "short_return_pct"
+    return safe_float(extra.get(key), 0.0)
+
+
+def shadow_metrics_from_pattern(pattern: str | None) -> tuple[float | None, float | None, float | None, float | None]:
+    text = str(pattern or "")
+    if "ADX=" not in text:
+        return None, None, None, None
+    tail = text.split("ADX=", 1)[1]
+    values = re.findall(r"[-+]?\d+(?:\.\d+)?%?", tail)
+    numeric: list[float] = []
+    for item in values:
+        if "." not in item and not item.endswith("%"):
+            continue
+        numeric.append(safe_float(item.rstrip("%"), 0.0))
+    if len(numeric) < 4:
+        return None, None, None, None
+    return numeric[0], numeric[1], numeric[2], numeric[3]
+
+
+def build_shadow_memory_texts(row: sqlite3.Row | dict) -> tuple[str, str, bool]:
+    get = row.get if isinstance(row, dict) else row.__getitem__
+    memory_type = str(get("memory_type") or "")
+    if not memory_type.startswith("shadow_"):
+        return "", "", False
+    extra = parse_extra(get("extra"))
+    symbol = str(get("symbol") or "").strip()
+    side = str(get("side") or extra.get("best_action") or extra.get("decision_action") or "").lower()
+    if memory_type == "shadow_missed_opportunity" and str(extra.get("best_action") or "").lower() in {"long", "short"}:
+        side = str(extra.get("best_action")).lower()
+    if side not in {"long", "short"}:
+        side = "long"
+    side_label = side_zh(side)
+    horizon = int(safe_float(extra.get("horizon_minutes"), 0.0))
+    if horizon <= 0:
+        horizon_match = re.search(r"(\d+)\s*(?:分钟|鍒嗛挓|鐚|鍒)", str(get("market_pattern") or get("lesson") or ""))
+        horizon = int(horizon_match.group(1)) if horizon_match else 0
+    pct = shadow_return_pct(extra, side)
+    opposite = "short" if side == "long" else "long"
+    opposite_pct = shadow_return_pct(extra, opposite)
+    advice = expert_advice(str(get("expert_name") or ""), memory_type)
+
+    if memory_type == "shadow_missed_opportunity":
+        lesson = (
+            f"{symbol} {side_label}机会曾被观望错过。"
+            f"当时选择观望，但 {horizon} 分钟后{side_label}方向涨跌收益约 {pct:.2f}%。 "
+            f"{advice}"
+        )
+    elif memory_type == "shadow_good_signal":
+        lesson = (
+            f"{symbol} {side_label}信号被影子复盘验证有效。"
+            f"影子复盘显示：{side_label}信号在 {horizon} 分钟后收益约 {pct:.2f}%，该形态短线有效。 "
+            f"{advice}"
+        )
+    else:
+        lesson = (
+            f"{symbol} {side_label}信号在影子复盘中表现偏弱。"
+            f"影子复盘显示：{side_label}信号在 {horizon} 分钟后亏损约 {abs(pct):.2f}%，"
+            f"而{side_zh(opposite)}方向收益约 {opposite_pct:.2f}%。 "
+            f"{advice}"
+        )
+
+    adx, volume_ratio, returns_5, imbalance = shadow_metrics_from_pattern(str(get("market_pattern") or ""))
+    pattern = f"{symbol} {side_label}影子复盘 {horizon}分钟"
+    if adx is not None:
+        pattern += f"，ADX={adx:.1f}，量比={volume_ratio:.2f}，5周期收益={returns_5:.2f}%，盘口倾斜={imbalance:.2f}"
+    return pattern, lesson, True
 
 
 def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
@@ -377,6 +499,17 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         ), True
 
     m = re.match(
+        r"^(?P<symbol>\S+)\s+(?P<side>做多|做空)\s+在场景\[(?P<pattern>.*?)\]下结果为(?P<outcome>亏损|盈利|打平)。\s*(?P<body>.*)$",
+        text,
+    )
+    if m:
+        pattern = translate_market_pattern(m.group("pattern"))
+        return (
+            f"{m.group('symbol')} {side_zh(m.group('side'))}在场景[{pattern}]下结果为{m.group('outcome')}。"
+            f"{expert_advice(expert_name, text)}"
+        ), True
+
+    m = re.match(
         r"^(?P<symbol>\S+)\s+(?P<side>long|short|做多|做空)\s+held\s+(?P<minutes>[-+]?\d+(?:\.\d+)?)\s+minutes\s+and\s+ended as\s+(?P<outcome>loss|profit|flat)\.\s*(?P<body>.*)$",
         text,
     )
@@ -389,7 +522,7 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
     if text.startswith("Next time") or text.startswith("Check abnormal"):
         return expert_advice(expert_name, text), True
 
-    if has_mojibake(text):
+    if has_mojibake(text) or has_suspicious_unicode(text):
         return text, False
     if has_english_template(text):
         return text, False
@@ -400,7 +533,7 @@ def clean_reflection_text(value: str | None) -> str:
     text = repair_mojibake(value).strip()
     if not text:
         return ""
-    if damaged(text) or has_mojibake(text):
+    if damaged(text) or has_mojibake(text) or has_suspicious_unicode(text):
         return "该笔复盘原文已损坏，已不作为专家记忆依据；请以成交记录和 OKX 订单状态为准。"
     return text
 
@@ -427,12 +560,15 @@ def cleanup(db_path: Path, apply: bool) -> dict[str, int | str]:
     }
     try:
         rows = con.execute(
-            "select id, expert_name, lesson, market_pattern, is_active from expert_memories"
+            "select id, expert_name, symbol, side, memory_type, lesson, market_pattern, is_active, extra from expert_memories"
         ).fetchall()
         for row in rows:
             stats["memories_seen"] += 1
-            lesson, usable = translate_lesson(row["lesson"], row["expert_name"])
-            pattern = translate_market_pattern(row["market_pattern"])
+            if str(row["memory_type"] or "").startswith("shadow_"):
+                pattern, lesson, usable = build_shadow_memory_texts(row)
+            else:
+                lesson, usable = translate_lesson(row["lesson"], row["expert_name"])
+                pattern = translate_market_pattern(row["market_pattern"])
             should_deactivate = not usable
             changed = (
                 lesson != (row["lesson"] or "")

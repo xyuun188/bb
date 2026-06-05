@@ -63,10 +63,12 @@ const state = {
     openingFunnel: null,
     profitAttribution: null,
     profitAttributionView: 'overview',
+    profitAttributionRecordPage: 1,
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
 const ML_SIGNAL_PAGE_SIZE = 10;
+const PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE = 10;
 const FIXED_AI_EXPERT_FALLBACKS = [
     {
         name: 'trend_expert',
@@ -2781,13 +2783,13 @@ function renderExpertMemories(data = {}) {
                 const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
                 return `
                     <tr>
-                        <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${toBeijingTime(r.created_at)}</td>
+                        <td class="trade-reflection-time">${toBeijingTime(r.created_at)}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
                         <td style="color:${pnlColor};white-space:nowrap;">${signedMoney(pnl)} USDT</td>
                         <td>${Number(r.hold_minutes || 0).toFixed(1)} 分钟</td>
-                        <td style="max-width:320px;">${escHtml(r.mistake_summary || '-')}</td>
-                        <td style="max-width:320px;">${escHtml(r.improvement_summary || '-')}</td>
+                        <td><div class="trade-reflection-text">${escHtml(r.mistake_summary || '-')}</div></td>
+                        <td><div class="trade-reflection-text">${escHtml(r.improvement_summary || '-')}</div></td>
                     </tr>
                 `;
             }).join('');
@@ -2856,11 +2858,12 @@ function renderShadowBacktests(data = {}) {
             const statusColor = r.status === 'completed' ? 'var(--green)' : 'var(--accent-light)';
             const conclusion = String(r.conclusion || '');
             const conclusionColor = r.missed_opportunity ? 'var(--accent-light)' : conclusion.includes('有效') ? 'var(--green)' : conclusion.includes('偏差') ? 'var(--red)' : 'var(--text)';
+            const decisionNote = shadowDecisionNote(r);
             return `
                 <tr>
                     <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${toBeijingTime(r.created_at)}</td>
                     <td>${escHtml(r.symbol || '-')}</td>
-                    <td><span class="badge badge-${r.decision_action || 'hold'}">${escHtml(r.decision_action_label || actionLabel(r.decision_action))}</span><div style="font-size:10px;color:var(--text-muted);margin-top:4px;">${Math.round(Number(r.decision_confidence || 0) * 100)}%</div></td>
+                    <td><span class="badge badge-${r.decision_action || 'hold'}">${escHtml(r.decision_action_label || actionLabel(r.decision_action))}</span><div style="font-size:10px;color:var(--text-muted);margin-top:4px;">${Math.round(Number(r.decision_confidence || 0) * 100)}%</div>${decisionNote ? `<div style="font-size:10px;color:var(--text-muted);line-height:1.45;margin-top:3px;">${escHtml(decisionNote)}</div>` : ''}</td>
                     <td>${Number(r.horizon_minutes || 0)} 分钟</td>
                     <td>${fmtPrice(r.entry_price)}</td>
                     <td>${r.actual_price ? fmtPrice(r.actual_price) : '-'}</td>
@@ -2875,6 +2878,17 @@ function renderShadowBacktests(data = {}) {
         }).join('');
     }
     renderPagination('shadow-backtest-pagination', page, totalPages, total, 'changeShadowBacktestPage');
+}
+
+function shadowDecisionNote(row) {
+    const action = String(row?.decision_action || '').toLowerCase();
+    const confidence = Number(row?.decision_confidence || 0);
+    const note = String(row?.decision_note || '').trim();
+    if (note) return note;
+    if (action === 'hold' && confidence <= 0) {
+        return '当时没有形成可执行开仓信号。';
+    }
+    return '';
 }
 
 function changeShadowBacktestPage(page) {
@@ -2899,6 +2913,7 @@ function showShadowBacktestDetail(id) {
     const row = (state.shadowBacktests || []).find(r => Number(r.id) === Number(id));
     if (!row) return;
     setDecisionModalWide(false);
+    const decisionNote = shadowDecisionNote(row);
     document.getElementById('decision-reason-title').textContent = `${row.symbol || '-'} / 影子复盘`;
     document.getElementById('decision-reason-body').innerHTML = `
         <div class="reason-block">
@@ -2906,15 +2921,9 @@ function showShadowBacktestDetail(id) {
             <div>${escapeMultiline(row.conclusion || '-')}</div>
         </div>
         <div class="reason-block">
-            <div class="reason-label">杠杆明细</div>
-            <div>
-                AI建议：${Number(trade.ai_suggested_leverage ?? trade.leverage ?? 1).toFixed(1)}x<br>
-                实际下单：${Number(trade.actual_leverage ?? trade.leverage ?? 1).toFixed(1)}x
-            </div>
-        </div>
-        <div class="reason-block">
             <div class="reason-label">当时决策</div>
             <div>${escHtml(row.decision_action_label || actionLabel(row.decision_action))}，信心度 ${Math.round(Number(row.decision_confidence || 0) * 100)}%，周期 ${Number(row.horizon_minutes || 0)} 分钟</div>
+            ${decisionNote ? `<div class="reason-meta">${escHtml(decisionNote)}</div>` : ''}
             <div class="reason-meta">入场价：${fmtPrice(row.entry_price)}<br>结果价：${row.actual_price ? fmtPrice(row.actual_price) : '等待结果'}<br>做多收益：${shadowReturnText(row.long_return_pct)}<br>做空收益：${shadowReturnText(row.short_return_pct)}<br>最优方向：${escHtml(row.best_action_label || actionLabel(row.best_action))}</div>
         </div>
         <div class="reason-block">
@@ -5943,6 +5952,7 @@ async function fetchProfitAttribution() {
     const hours = hoursEl ? Number(hoursEl.value || 24) : 24;
     const mode = state.mode || 'paper';
     const data = await fetchJSON(`/api/profit-attribution?mode=${mode}&hours=${hours}&limit=300&_=${Date.now()}`);
+    state.profitAttributionRecordPage = 1;
     state.profitAttribution = data || null;
     renderProfitAttribution();
 }
@@ -6049,13 +6059,21 @@ function renderProfitAttributionState(data) {
 
 function renderProfitAttributionRecords(data) {
     const tbody = document.getElementById('profit-attribution-tbody');
+    const paginationEl = document.getElementById('profit-attribution-record-pagination');
     if (!tbody) return;
     const rows = Array.isArray(data.records) ? data.records : [];
     if (!rows.length) {
         tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无归因数据</td></tr>';
+        if (paginationEl) paginationEl.style.display = 'none';
         return;
     }
-    tbody.innerHTML = rows.map(row => {
+    const total = rows.length;
+    const totalPages = Math.max(Math.ceil(total / PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE), 1);
+    const page = Math.min(Math.max(Number(state.profitAttributionRecordPage || 1), 1), totalPages);
+    state.profitAttributionRecordPage = page;
+    const start = (page - 1) * PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE;
+    const pageRows = rows.slice(start, start + PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE);
+    tbody.innerHTML = pageRows.map(row => {
         const pnl = Number(row.realized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
         const entryDecision = row.entry_decision || {};
@@ -6073,7 +6091,7 @@ function renderProfitAttributionRecords(data) {
             shadow.best_action ? `影子 ${sideZh(shadow.best_action)}` : '',
         ].filter(Boolean).join('<br>');
         const notes = Array.isArray(row.notes) && row.notes.length
-            ? `<div style="color:var(--text-muted);margin-top:4px;">${row.notes.map(escHtml).join('；')}</div>`
+            ? `<div class="profit-attribution-note">${row.notes.map(escHtml).join('；')}</div>`
             : '';
         return `
             <tr>
@@ -6082,11 +6100,17 @@ function renderProfitAttributionRecords(data) {
                 <td>${escHtml(row.side_label || sideZh(row.side))}</td>
                 <td style="color:${pnlColor};font-weight:700;">${signedMoney(pnl)} U</td>
                 <td>${Number(row.hold_minutes || 0).toFixed(1)} 分钟</td>
-                <td><strong>${escHtml(row.main_reason || '-')}</strong>${notes}<div style="color:var(--text-muted);font-size:11px;">置信度 ${confidenceZh(row.attribution_confidence)}</div></td>
-                <td>${evidence || '-'}</td>
-                <td><strong>${escHtml(stateText)}</strong><div style="color:var(--text-muted);font-size:11px;">${escHtml(stateSummary.final_reason || '')}</div></td>
+                <td><strong class="profit-attribution-main-reason">${escHtml(row.main_reason || '-')}</strong>${notes}<div class="profit-attribution-note">置信度 ${confidenceZh(row.attribution_confidence)}</div></td>
+                <td><div class="profit-attribution-evidence">${evidence || '-'}</div></td>
+                <td><strong>${escHtml(stateText)}</strong><div class="profit-attribution-state">${escHtml(stateSummary.final_reason || '')}</div></td>
             </tr>`;
     }).join('');
+    renderPagination('profit-attribution-record-pagination', page, totalPages, total, 'changeProfitAttributionRecordPage');
+}
+
+function changeProfitAttributionRecordPage(page) {
+    state.profitAttributionRecordPage = Math.max(1, Number(page) || 1);
+    renderProfitAttributionRecords(state.profitAttribution || {});
 }
 
 function sideZh(side) {
