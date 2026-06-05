@@ -3,7 +3,7 @@
 This repository has a project-specific Hindsight memory bank:
 
 - Bank ID: `bb`
-- Project root: `D:\bb - 副本`
+- Project root: `D:\bb`
 - Scope: only memories about this project. Do not store this project's memories in `codex` or another project bank.
 
 At the beginning of a Codex session for this repository, recall project memory:
@@ -176,7 +176,7 @@ For this repository, use the project-specific Hindsight bank `bb` automatically.
 At the beginning of every Codex session for this repository, recall memory before substantive work:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_start.ps1" -ProjectRoot "D:\bb - 副本"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_start.ps1" -ProjectRoot "D:\bb"
 ```
 
 During work, save durable project facts to Hindsight when they would prevent repeated work later: architecture decisions, important paths, service ports, tested fixes, setup steps, user preferences for this project, and non-obvious debugging results. Do not save secrets, one-off chatter, temporary failed guesses, or bulky command output.
@@ -184,13 +184,13 @@ During work, save durable project facts to Hindsight when they would prevent rep
 Before finishing a meaningful task in this repository, summarize and distill the useful long-term facts before saving them to the `bb` bank. Do not store the whole chat verbatim:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_summarize_and_save.ps1" -ProjectRoot "D:\bb - 副本" -Content "session notes to distill"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_summarize_and_save.ps1" -ProjectRoot "D:\bb" -Content "session notes to distill"
 ```
 
 Shortcut:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_end.ps1" -ProjectRoot "D:\bb - 副本" -Content "session notes to distill"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_end.ps1" -ProjectRoot "D:\bb" -Content "session notes to distill"
 ```
 
 Keep all memories for this repository in `bb`; do not store this project's facts in the global `codex` bank.
