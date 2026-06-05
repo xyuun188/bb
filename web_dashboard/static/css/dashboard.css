@@ -1068,6 +1068,113 @@ body {
 }
 
 /* ── Grid ── */
+/* Profit attribution review */
+.profit-attribution-card {
+    overflow: hidden;
+}
+.profit-attribution-card .card-header {
+    align-items: flex-start;
+    gap: 12px;
+}
+.profit-attribution-card .opening-funnel-controls {
+    grid-template-columns: minmax(170px, 240px) auto;
+}
+.profit-attribution-card .opening-funnel-controls #profit-attribution-hours {
+    grid-area: range;
+    width: 100%;
+}
+.profit-attribution-body {
+    padding: 12px;
+    gap: 12px;
+}
+.profit-attribution-summary .opening-funnel-verdict {
+    min-height: 96px;
+    padding: 14px 16px;
+}
+.profit-attribution-summary .opening-funnel-verdict strong {
+    font-size: 22px;
+}
+.profit-attribution-summary .opening-funnel-kpis {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 10px;
+}
+.profit-attribution-summary .opening-funnel-kpis div {
+    min-height: 64px;
+    padding: 10px;
+}
+.profit-attribution-summary .opening-funnel-kpis strong {
+    font-size: 21px;
+}
+#page-profit-attribution .profit-attribution-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+}
+#page-profit-attribution .profit-attribution-panel {
+    padding: 12px;
+}
+#page-profit-attribution .profit-attribution-panel .analysis-section-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: baseline;
+}
+#page-profit-attribution .profit-attribution-panel .analysis-section-subtitle {
+    max-width: 18em;
+    text-align: right;
+}
+#page-profit-attribution .opening-funnel-list {
+    margin-top: 10px;
+}
+#profit-attribution-buckets.opening-funnel-list,
+#profit-attribution-state.opening-funnel-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 7px;
+}
+#page-profit-attribution .opening-funnel-row {
+    padding: 10px;
+}
+#page-profit-attribution .opening-funnel-bar {
+    margin: 8px 0 6px;
+}
+.profit-attribution-records-panel {
+    margin-top: 0;
+    padding: 12px 12px 0;
+}
+.profit-attribution-table-wrap {
+    margin: 10px -12px 0;
+    max-height: min(44vh, 420px);
+    overflow: auto;
+    border-top: 1px solid var(--border);
+}
+.profit-attribution-table {
+    min-width: 920px;
+}
+.profit-attribution-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+@media (max-width: 1180px) {
+    .profit-attribution-summary .opening-funnel-kpis {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    #page-profit-attribution .profit-attribution-panel .analysis-section-subtitle {
+        text-align: left;
+    }
+}
+@media (max-width: 720px) {
+    .profit-attribution-card .card-header {
+        flex-direction: column;
+    }
+    .profit-attribution-card .opening-funnel-controls,
+    .profit-attribution-summary .opening-funnel-kpis {
+        grid-template-columns: 1fr;
+    }
+}
+
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
