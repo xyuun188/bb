@@ -1,0 +1,1129 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 量化交易系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+        (function () {
+            try {
+                var theme = localStorage.getItem('dashboardTheme');
+                if (theme === 'light' || theme === 'dark') {
+                    document.documentElement.dataset.theme = theme;
+                }
+            } catch (e) {}
+        })();
+    </script>
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260531mlreadable">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div class="app">
+
+    <!-- ═══════ SIDEBAR ═══════ -->
+    <aside class="sidebar">
+        <div class="sidebar-logo"><span>◆</span> AI Quant</div>
+        <nav class="sidebar-nav">
+            <button class="nav-item active" data-page="dashboard">
+                <span class="nav-icon">📊</span> 主面板
+            </button>
+            <button class="nav-item" data-page="analysis">
+                <span class="nav-icon">🔎</span> 分析记录
+            </button>
+            <button class="nav-item" data-page="decisions">
+                <span class="nav-icon">🧠</span> AI 决策
+            </button>
+            <button class="nav-item" data-page="opening-funnel">
+                <span class="nav-icon">⏱</span> 开仓漏斗
+            </button>
+            <button class="nav-item" data-page="trades">
+                <span class="nav-icon">📋</span> 执行记录
+            </button>
+            <button class="nav-item" data-page="positions">
+                <span class="nav-icon">📌</span> 持仓记录
+            </button>
+            <button class="nav-item" data-page="position-history">
+                <span class="nav-icon">📚</span> 历史持仓
+            </button>
+            <button class="nav-item" data-page="daily-pnl">
+                <span class="nav-icon">￥</span> 盈亏记录
+            </button>
+            <button class="nav-item" data-page="alerts">
+                <span class="nav-icon">⚠️</span> 风控告警
+            </button>
+            <button class="nav-item" data-page="expert-memory">
+                <span class="nav-icon">📝</span> 专家记忆
+            </button>
+            <button class="nav-item" data-page="shadow-backtest">
+                <span class="nav-icon">🧪</span> 影子复盘
+            </button>
+            <button class="nav-item" data-page="ml-signal">
+                <span class="nav-icon">📡</span> 本地ML
+            </button>
+            <button class="nav-item" data-page="server-monitor">
+                <span class="nav-icon">🖥️</span> 服务器监控
+            </button>
+            <button class="nav-item" data-page="settings">
+                <span class="nav-icon">⚙️</span> 系统设置
+            </button>
+        </nav>
+        <div class="sidebar-footer">
+            <button class="theme-toggle-btn" id="theme-toggle" type="button" aria-label="切换为浅色模式">
+                <span class="theme-toggle-icon" id="theme-toggle-icon">☀️</span>
+                <span id="theme-toggle-text">浅色模式</span>
+            </button>
+            <span id="ws-dot" class="ws-dot ws-disconnected"></span> WS
+            <span id="mode-badge" class="status-badge status-paper" style="margin-left:6px;">模拟盘</span>
+        </div>
+    </aside>
+
+    <!-- ═══════ MAIN ═══════ -->
+    <main class="main">
+
+        <!-- ═══════ PAGE: DASHBOARD ═══════ -->
+        <div class="page-section active" id="page-dashboard">
+
+            <!-- Top bar -->
+            <div class="topbar">
+                <div class="topbar-left">
+                    <div class="mode-toggle">
+                        <button class="mode-btn active" data-mode="paper">模拟盘</button>
+                        <button class="mode-btn" data-mode="live">实盘</button>
+                    </div>
+                    <div class="mode-toggle" style="margin-left:4px;">
+                        <button class="mode-btn active" data-scan="auto">自动模式</button>
+                        <button class="mode-btn" data-scan="manual">手动模式</button>
+                    </div>
+                    <button class="btn" onclick="togglePause()" id="pause-btn">暂停交易</button>
+                    <span style="font-size:11px;color:var(--text-muted);">
+                        执行账户 <strong id="live-model-name" style="color:var(--text);">加载中</strong>
+                    </span>
+                </div>
+                <div class="topbar-right">
+                    <span class="symbol-bar">
+                        <span class="symbol-selector" id="symbol-selector">
+                            <span style="color:var(--text-muted);font-size:11px;">加载中...</span>
+                        </span>
+                        <div class="symbol-dropdown" id="symbol-dropdown">
+                            <button class="symbol-add" onclick="toggleSymbolDropdown()">+ 币种</button>
+                            <div class="symbol-dd-menu" id="symbol-dropdown-menu">
+                                <div class="symbol-dd-search">
+                                    <input type="text" placeholder="搜索..." oninput="filterSymbolDropdown()" id="symbol-search-input">
+                                </div>
+                                <div class="symbol-dd-list" id="symbol-dropdown-list">
+                                    <div class="symbol-dd-item" style="color:var(--text-muted)">加载中...</div>
+                                </div>
+                            </div>
+                        </div>
+                    </span>
+                </div>
+            </div>
+
+            <!-- Stats -->
+            <div class="grid-4" style="margin-bottom:16px;">
+                <div class="stat-card">
+                    <div class="stat-icon a">🧠</div>
+                    <div class="stat-info">
+                        <div class="stat-value" style="color:var(--accent-light)" id="stat-decisions">0</div>
+                        <div class="stat-label">今日 AI 决策</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon g">📈</div>
+                    <div class="stat-info">
+                        <div class="stat-value" style="color:var(--green)" id="stat-trades">0</div>
+                        <div class="stat-label">当前持仓</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon b">⏱️</div>
+                    <div class="stat-info">
+                        <div class="stat-value" style="color:var(--blue)" id="stat-uptime">0时0分</div>
+                        <div class="stat-label">运行时长</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon p">💎</div>
+                    <div class="stat-info">
+                        <div class="stat-value" style="color:var(--purple)" id="stat-symbols">3</div>
+                        <div class="stat-label">监控币种</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main Grid -->
+            <div class="grid-2">
+
+                <!-- LEFT -->
+                <div>
+                    <!-- Tickers -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">实时行情</span>
+                            <span class="card-subtitle" id="ticker-count">0 个币种</span>
+                        </div>
+                        <div class="ticker-grid" id="ticker-list">
+                            <div class="ticker-card"><div class="ticker-sym">---</div><div class="ticker-price" style="color:var(--text-muted)">等待数据</div></div>
+                        </div>
+                    </div>
+
+                    <!-- PnL Chart -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">收益曲线</span>
+                            <span class="card-subtitle">模拟盘</span>
+                        </div>
+                        <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+                    </div>
+
+                    <!-- Execution Account -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">执行账户状态</span>
+                            <span class="card-subtitle">统一下单账户</span>
+                        </div>
+                        <div id="execution-account-panel">
+                            <div style="color:var(--text-muted);font-size:12px;padding:8px;">加载账户状态中...</div>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- RIGHT -->
+                <div>
+                    <!-- Price Chart -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title" id="price-chart-title">BTC/USDT 价格走势</span>
+                            <span class="card-subtitle">实时</span>
+                        </div>
+                        <div style="display:flex;gap:8px;margin:0 16px 8px;flex-wrap:wrap;">
+                            <select class="form-input" id="price-chart-symbol" onchange="onPriceChartSymbolChange()"
+                                    style="max-width:180px;font-size:11px;padding:4px 8px;">
+                                <option value="BTC/USDT">BTC/USDT</option>
+                            </select>
+                            <select class="form-input" id="price-chart-timeframe" onchange="onPriceChartSymbolChange()"
+                                    style="max-width:90px;font-size:11px;padding:4px 8px;">
+                                <option value="1m">1分</option>
+                                <option value="5m">5分</option>
+                                <option value="15m">15分</option>
+                                <option value="1h" selected>1时</option>
+                                <option value="4h">4时</option>
+                                <option value="1d">日线</option>
+                            </select>
+                        </div>
+                        <div class="chart-wrap"><canvas id="price-chart"></canvas></div>
+                    </div>
+
+                    <!-- System Auto Status -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">系统运行状态</span>
+                            <span class="card-subtitle" id="scan-mode-label">自动扫描中</span>
+                        </div>
+                        <div class="auto-status-grid">
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x1F504;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">扫描模式</div>
+                                    <div class="auto-status-value" id="status-scan-mode">自动扫描全市场</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x23F1;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">决策间隔</div>
+                                    <div class="auto-status-value" id="status-interval">60秒/轮</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x1F9E0;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">专家 / 执行账户</div>
+                                    <div class="auto-status-value" id="status-model-count">0</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x1F4CA;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">累计决策 / 持仓</div>
+                                    <div class="auto-status-value" id="status-decision-trade">0 / 0</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x25B6;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">当前分析进度</div>
+                                    <div class="auto-status-value" id="status-current-stage">等待状态</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item">
+                                <span class="auto-status-icon">&#x1F552;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">本轮耗时 / 上轮完成</div>
+                                    <div class="auto-status-value" id="status-round-timing">-</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item auto-status-wide" id="status-loop-error-row" style="display:none;">
+                                <span class="auto-status-icon">&#x26A0;</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">最近外部接口问题</div>
+                                    <div class="auto-status-value status-warning-text" id="status-loop-error">-</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI Decisions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">最近 AI 决策</span>
+                            <span class="card-subtitle" id="decision-count">0</span>
+                        </div>
+                        <div id="decision-list">
+                            <div style="color:var(--text-muted);font-size:12px;padding:8px;">等待决策数据...</div>
+                        </div>
+                    </div>
+
+                    <!-- Executions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">最近执行</span>
+                            <span class="card-subtitle" id="execution-count">0</span>
+                        </div>
+                        <div id="execution-list">
+                            <div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无执行记录</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: EXECUTION HISTORY ═══════ -->
+        <div class="page-section" id="page-trades">
+            <div class="card opening-funnel-card">
+                <div class="card-header">
+                    <span class="card-title">执行记录</span>
+                    <span class="card-subtitle" id="trade-mode-label">模拟盘</span>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>执行时间</th>
+                                <th>币种</th>
+                                <th>方向</th>
+                                <th>杠杆</th>
+                                <th>数量</th>
+                                <th>价格</th>
+                                <th>状态</th>
+                                <th>执行来源</th>
+                                <th>详情</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-tbody">
+                            <tr><td colspan="9" style="color:var(--text-muted);text-align:center;padding:24px;">加载交易记录中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="trades-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: POSITIONS ═══════ -->
+        <div class="page-section" id="page-positions">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">持仓记录</span>
+                    <span class="card-subtitle" id="positions-mode-label">模拟盘</span>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>币种</th>
+                                <th>方向</th>
+                                <th>杠杆</th>
+                                <th>数量</th>
+                                <th>开仓价</th>
+                                <th>当前价</th>
+                                <th>浮动盈亏</th>
+                                <th>止盈价</th>
+                                <th>止损价</th>
+                                <th>开仓时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-tbody">
+                            <tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">加载持仓记录中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="positions-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: CLOSED POSITIONS ═══════ -->
+        <div class="page-section" id="page-position-history">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">历史持仓</span>
+                    <span class="card-subtitle" id="position-history-mode-label">模拟盘</span>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>币种</th>
+                                <th>方向</th>
+                                <th>仓位状态</th>
+                                <th>杠杆</th>
+                                <th>数量</th>
+                                <th>开仓价</th>
+                                <th>平仓价</th>
+                                <th>已实现盈亏</th>
+                                <th>开仓时间</th>
+                                <th>平仓时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="position-history-tbody">
+                            <tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">加载历史持仓中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="position-history-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: DAILY PNL ═══════ -->
+        <div class="page-section" id="page-daily-pnl">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">每日盈亏记录</span>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <span class="card-subtitle" id="daily-pnl-subtitle">北京时间</span>
+                        <select class="form-input" id="daily-pnl-days" onchange="fetchDailyPnlRecords()" style="font-size:11px;padding:4px 8px;width:auto;">
+                            <option value="7">近 7 天</option>
+                            <option value="30" selected>近 30 天</option>
+                            <option value="90">近 90 天</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="fetchDailyPnlRecords()">刷新</button>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
+                    按北京时间自然日统计；列表展示已平仓盈亏、当日总盈亏和累计盈亏。
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>北京时间日期</th>
+                                <th>亏损合计</th>
+                                <th>盈利合计</th>
+                                <th>已平仓净盈亏</th>
+                                <th>当日总盈亏</th>
+                                <th>累计盈亏</th>
+                                <th>交易数</th>
+                                <th>详情</th>
+                            </tr>
+                        </thead>
+                        <tbody id="daily-pnl-tbody">
+                            <tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">加载每日盈亏中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal-overlay" id="daily-pnl-modal-overlay" style="display:none;">
+            <div class="modal modal-wide">
+                <div class="modal-header">
+                    <span id="daily-pnl-modal-title">每日盈亏详情</span>
+                    <button class="modal-close" onclick="closeDailyPnlModal()">&times;</button>
+                </div>
+                <div class="modal-body" id="daily-pnl-modal-body"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: AI DECISIONS ═══════ -->
+        <div class="page-section" id="page-decisions">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">AI 决策记录</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="all-decisions-count">0 条</span>
+                        <button class="btn btn-sm" onclick="clearAllDecisions()" style="color:var(--red);border-color:var(--red);">清空记录</button>
+                    </div>
+                </div>
+                <!-- Filter bar -->
+                <div style="display:flex;gap:8px;padding:8px 12px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border);">
+                    <label style="font-size:11px;color:var(--text-muted);">时间:</label>
+                    <input type="datetime-local" class="form-input" id="filter-start-date" style="font-size:11px;padding:3px 6px;width:auto;" onchange="onDecisionFilterChange()">
+                    <span style="color:var(--text-muted);font-size:11px;">至</span>
+                    <input type="datetime-local" class="form-input" id="filter-end-date" style="font-size:11px;padding:3px 6px;width:auto;" onchange="onDecisionFilterChange()">
+                    <label style="font-size:11px;color:var(--text-muted);margin-left:8px;">模型:</label>
+                    <select class="form-input" id="filter-model" style="font-size:11px;padding:3px 6px;width:auto;" onchange="onDecisionFilterChange()">
+                        <option value="">全部模型</option>
+                    </select>
+                    <label style="font-size:11px;color:var(--text-muted);margin-left:8px;">方向:</label>
+                    <select class="form-input" id="filter-action" style="font-size:11px;padding:3px 6px;width:auto;" onchange="onDecisionFilterChange()">
+                        <option value="">全部方向</option>
+                        <option value="long">做多</option>
+                        <option value="short">做空</option>
+                        <option value="close_long">平多</option>
+                        <option value="close_short">平空</option>
+                        <option value="hold">观望</option>
+                    </select>
+                    <label style="font-size:11px;color:var(--text-muted);margin-left:8px;">执行:</label>
+                    <select class="form-input" id="filter-executed" style="font-size:11px;padding:3px 6px;width:auto;" onchange="onDecisionFilterChange()">
+                        <option value="">全部</option>
+                        <option value="true">已执行</option>
+                        <option value="false">未执行</option>
+                    </select>
+                    <button class="btn btn-sm" onclick="resetDecisionFilters()" style="margin-left:auto;">重置</button>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>币种</th>
+                                <th>方向</th>
+                                <th>分析信心</th>
+                                <th>仓位%</th>
+                                <th>已执行</th>
+                                <th>未执行原因</th>
+                            </tr>
+                        </thead>
+                        <tbody id="all-decisions-tbody">
+                            <tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="decisions-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- Modal: Decision Reason -->
+        <div class="modal-overlay" id="decision-reason-modal-overlay" style="display:none;">
+            <div class="modal">
+                <div class="modal-header">
+                    <span id="decision-reason-title">决策原因</span>
+                    <button class="modal-close" onclick="closeDecisionReasonModal()">&times;</button>
+                </div>
+                <div class="modal-body" id="decision-reason-body"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: OPENING FUNNEL ═══════ -->
+        <div class="page-section" id="page-opening-funnel">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">开仓漏斗诊断</span>
+                    <div class="opening-funnel-controls">
+                        <span class="card-subtitle" id="opening-funnel-updated">等待刷新</span>
+                        <select class="form-input" id="opening-funnel-hours" onchange="fetchOpeningFunnel()">
+                            <option value="6">最近 6 小时</option>
+                            <option value="24" selected>最近 24 小时</option>
+                            <option value="72">最近 3 天</option>
+                            <option value="168">最近 7 天</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="fetchOpeningFunnel()">刷新</button>
+                    </div>
+                </div>
+                <div class="opening-funnel-body">
+                    <div class="opening-funnel-overview">
+                        <div class="opening-funnel-summary" id="opening-funnel-summary">
+                            <div class="opening-funnel-empty">加载中...</div>
+                        </div>
+                        <div class="opening-funnel-grid" id="opening-funnel-stages"></div>
+                    </div>
+                    <div class="opening-funnel-columns">
+                        <div class="opening-funnel-left-stack">
+                        <div class="opening-funnel-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">未开仓原因</span>
+                                <span class="analysis-section-subtitle">只统计 AI 已给 long/short 但未执行的信号</span>
+                            </div>
+                            <div id="opening-funnel-reasons" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel opening-funnel-panel-full">
+                        <div class="analysis-section-head">
+                            <span class="analysis-section-title">最近被挡的开仓信号</span>
+                            <span class="analysis-section-subtitle">用于定位风控、执行、排队或预算问题</span>
+                        </div>
+                        <div class="table-wrap opening-funnel-table-wrap">
+                        <table class="opening-funnel-table">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>币种</th>
+                                    <th>方向</th>
+                                    <th>信心</th>
+                                    <th>分类</th>
+                                    <th>原因</th>
+                                </tr>
+                            </thead>
+                            <tbody id="opening-funnel-blocked-tbody">
+                                <tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无数据</td></tr>
+                            </tbody>
+                        </table>
+                        </div>
+                        </div>
+                        </div>
+                        <div class="opening-funnel-panel opening-funnel-symbol-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">币种分布</span>
+                                <span class="analysis-section-subtitle">看哪些币种有信号，哪些真的成交</span>
+                            </div>
+                            <div id="opening-funnel-symbols" class="opening-funnel-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: ANALYSIS RECORDS ═══════ -->
+        <div class="page-section" id="page-analysis">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">专家协作分析记录</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div class="trade-tabs" id="analysis-view-tabs">
+                            <button class="trade-tab active" data-analysis-view="market" onclick="setAnalysisView('market')">市场分析 <span id="analysis-market-count">0</span></button>
+                            <button class="trade-tab" data-analysis-view="position" onclick="setAnalysisView('position')">持仓分析 <span id="analysis-position-count">0</span></button>
+                        </div>
+                        <span class="card-subtitle" id="analysis-count">0 条</span>
+                        <button class="btn btn-sm" onclick="fetchAnalysisRecords()">刷新</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>币种</th>
+                                <th>专家协作</th>
+                                <th>交叉验证</th>
+                                <th>深度会诊</th>
+                                <th>最终裁决</th>
+                                <th>信心度</th>
+                                <th>综合分</th>
+                                <th>详情</th>
+                            </tr>
+                        </thead>
+                        <tbody id="analysis-tbody">
+                            <tr><td colspan="9" style="color:var(--text-muted);text-align:center;padding:24px;">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="analysis-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: RISK ALERTS ═══════ -->
+        <div class="page-section" id="page-alerts">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">风控告警</span>
+                    <span class="card-subtitle" id="alert-count">0</span>
+                </div>
+                <div id="risk-alerts">
+                    <div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无告警</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: EXPERT MEMORY ═══════ -->
+        <div class="page-section" id="page-expert-memory">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">专家长期记忆</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="expert-memory-count">0 条</span>
+                        <button class="btn btn-sm" onclick="fetchExpertMemories()">刷新</button>
+                    </div>
+                </div>
+                <div id="expert-memory-target" style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);"></div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>专家</th>
+                                <th>币种</th>
+                                <th>类型</th>
+                                <th>场景</th>
+                                <th>教训</th>
+                                <th>动作</th>
+                                <th>证据/命中</th>
+                                <th>调整</th>
+                            </tr>
+                        </thead>
+                        <tbody id="expert-memory-tbody">
+                            <tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无专家记忆</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="expert-memory-pagination" style="display:none;"></div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">交易复盘</span>
+                    <span class="card-subtitle" id="trade-reflection-count">0 条</span>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>币种</th>
+                                <th>方向</th>
+                                <th>盈亏</th>
+                                <th>持仓</th>
+                                <th>复盘结论</th>
+                                <th>改进建议</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trade-reflection-tbody">
+                            <tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">暂无复盘记录</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="trade-reflection-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: SHADOW BACKTEST ═══════ -->
+        <div class="page-section" id="page-shadow-backtest">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">影子复盘</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="shadow-backtest-count">0 条</span>
+                        <button class="btn btn-sm" onclick="fetchShadowBacktests()">刷新</button>
+                    </div>
+                </div>
+                <div style="display:flex;gap:8px;padding:8px 12px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border);">
+                    <label style="font-size:11px;color:var(--text-muted);">状态:</label>
+                    <select id="shadow-backtest-status" class="form-input" style="font-size:11px;padding:3px 6px;width:auto;" onchange="changeShadowBacktestStatus()">
+                        <option value="">全部</option>
+                        <option value="pending">等待复盘</option>
+                        <option value="completed">已完成</option>
+                    </select>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
+                    影子复盘不会下单，只记录当时决策在 10/30/60 分钟后的市场结果，用来发现错过机会、错误方向和有效信号。
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>币种</th>
+                                <th>当时决策</th>
+                                <th>周期</th>
+                                <th>入场价</th>
+                                <th>结果价</th>
+                                <th>做多收益</th>
+                                <th>做空收益</th>
+                                <th>最优方向</th>
+                                <th>结论</th>
+                                <th>状态</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody id="shadow-backtest-tbody">
+                            <tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">暂无影子复盘数据</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="shadow-backtest-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: LOCAL ML SIGNAL ═══════ -->
+        <div class="page-section" id="page-ml-signal">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">服务器量化模型</span>
+                    <span class="card-subtitle" id="local-ai-tools-updated">等待加载</span>
+                </div>
+                <div id="local-ai-tools-status" style="padding:12px;">
+                    <div style="color:var(--text-muted);font-size:12px;">正在读取服务器模型状态...</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">本地 ML 盈亏质量</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="ml-signal-updated">等待加载</span>
+                        <button class="btn btn-sm" onclick="fetchMLSignalDashboard()">刷新</button>
+                    </div>
+                </div>
+                <div id="ml-signal-overview">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">加载本地 ML 状态中...</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">训练效果</span>
+                    <span class="card-subtitle">来自影子复盘样本</span>
+                </div>
+                <div id="ml-signal-metrics">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">暂无训练指标</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">模型实盘贡献</span>
+                    <span class="card-subtitle">按真实已平仓盈亏拆分</span>
+                </div>
+                <div id="model-contribution-stats">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待贡献统计...</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">可训练模型详情</span>
+                    <span class="card-subtitle">每个模型的用途、样本和训练状态</span>
+                </div>
+                <div id="ml-trainable-models">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待模型训练状态...</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">最近 ML 预测</span>
+                    <span class="card-subtitle" id="ml-signal-recent-count">0 条</span>
+                </div>
+                <div id="ml-signal-recent">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">暂无预测记录</div>
+                </div>
+                <div class="pagination" id="ml-signal-pagination" style="display:none;"></div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: SERVER MONITOR ═══════ -->
+        <div class="page-section" id="page-server-monitor">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">服务器硬件状态</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="server-monitor-updated">等待加载</span>
+                        <button class="btn btn-sm" onclick="fetchServerMonitor()">刷新</button>
+                    </div>
+                </div>
+                <div class="server-monitor-grid" id="server-monitor-overview">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">正在读取服务器硬件状态...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">模型运行情况</span>
+                    <span class="card-subtitle">vLLM / 本地训练模型 / 显存进程</span>
+                </div>
+                <div id="server-monitor-model-runtime">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待模型运行数据...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">模型服务</span>
+                    <span class="card-subtitle">DeepSeek 与本地量化工具</span>
+                </div>
+                <div id="server-monitor-services">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待服务状态...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════ PAGE: SYSTEM SETTINGS ═══════ -->
+        <div class="page-section" id="page-settings">
+
+            <!-- OKX: Paper + Live side by side -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">OKX 账户配置</span>
+                    <span class="card-subtitle">模拟盘 / 实盘独立凭证</span>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                    <!-- Paper Account -->
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">模拟盘账户 <span style="font-size:10px;color:var(--accent);font-weight:500;">Demo Sandbox</span></div>
+                        <div class="account-kv-grid">
+                            <div class="account-kv">
+                                <span>当前可用</span>
+                                <strong id="paper-current-available">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>账户权益</span>
+                                <strong id="paper-account-equity">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>累计亏损</span>
+                                <strong id="paper-cumulative-loss">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>累计收益</span>
+                                <strong id="paper-cumulative-profit">-- USDT</strong>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Key</label>
+                            <input type="password" class="form-input" id="paper-api-key" placeholder="模拟盘 API Key">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Secret</label>
+                            <input type="password" class="form-input" id="paper-api-secret" placeholder="模拟盘 API Secret">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Passphrase</label>
+                            <input type="password" class="form-input" id="paper-passphrase" placeholder="Passphrase（必需）">
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <button class="btn btn-accent btn-sm" onclick="saveOKXSettings('paper')">保存</button>
+                            <button class="btn btn-sm" onclick="testOKXConnection('paper')" id="test-paper-btn">测试连接</button>
+                            <span id="paper-conn-status"></span>
+                        </div>
+                    </div>
+                    <!-- Live Account -->
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">实盘账户 <span style="font-size:10px;color:var(--red);font-weight:500;">Real Trading</span></div>
+                        <div class="account-kv-grid">
+                            <div class="account-kv">
+                                <span>当前可用</span>
+                                <strong id="live-current-available">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>账户权益</span>
+                                <strong id="live-account-equity">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>累计亏损</span>
+                                <strong id="live-cumulative-loss">-- USDT</strong>
+                            </div>
+                            <div class="account-kv">
+                                <span>累计收益</span>
+                                <strong id="live-cumulative-profit">-- USDT</strong>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Key</label>
+                            <input type="password" class="form-input" id="live-api-key" placeholder="实盘 API Key">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Secret</label>
+                            <input type="password" class="form-input" id="live-api-secret" placeholder="实盘 API Secret">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Passphrase</label>
+                            <input type="password" class="form-input" id="live-passphrase" placeholder="Passphrase（必需）">
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <button class="btn btn-accent btn-sm" onclick="saveOKXSettings('live')">保存</button>
+                            <button class="btn btn-sm" onclick="testOKXConnection('live')" id="test-live-btn">测试连接</button>
+                            <span id="live-conn-status"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Execution Account -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">执行账户设置</span>
+                    <span class="card-subtitle">统一交易账户与风险比例</span>
+                </div>
+                <div class="settings-panel" style="margin-bottom:12px;">
+                    <div class="form-group">
+                        <label class="form-label">账户名称</label>
+                        <input type="text" class="form-input" id="exec-account-name" placeholder="多专家执行账户">
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted);">5 个 AI 专家只负责分析，最终只由这个执行账户提交交易。</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">模拟盘风控</div>
+                        <div class="form-group">
+                            <label class="form-label">最高可亏损比例 %</label>
+                            <input type="number" class="form-input" id="exec-paper-max-loss-pct" min="0" max="100" step="1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">冷静期触发比例 %</label>
+                            <input type="number" class="form-input" id="exec-paper-cooldown-loss-pct" min="0" max="100" step="1">
+                        </div>
+                    </div>
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">实盘风控</div>
+                        <div class="form-group">
+                            <label class="form-label">最高可亏损比例 %</label>
+                            <input type="number" class="form-input" id="exec-live-max-loss-pct" min="0" max="100" step="1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">冷静期触发比例 %</label>
+                            <input type="number" class="form-input" id="exec-live-cooldown-loss-pct" min="0" max="100" step="1">
+                        </div>
+                    </div>
+                </div>
+                <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;margin-top:12px;">
+                    <button class="btn btn-accent btn-sm" onclick="saveExecutionAccountSettings()">保存执行账户</button>
+                    <span id="execution-account-save-status" style="font-size:11px;color:var(--text-muted);"></span>
+                </div>
+            </div>
+
+            <!-- Trading Parameters -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">交易参数</span>
+                    <span class="card-subtitle">全局决策控制</span>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">决策间隔</div>
+                        <div class="form-group">
+                            <label class="form-label">间隔秒数（10-3600）</label>
+                            <input type="number" class="form-input" id="cfg-decision-interval" min="10" max="3600" step="5" placeholder="60">
+                        </div>
+                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">AI 每隔多少秒扫描一次市场并做出决策</div>
+                    </div>
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">信心阈值</div>
+                        <div class="form-group">
+                            <label class="form-label">最低信心度（0.10-1.00）</label>
+                            <input type="number" class="form-input" id="cfg-confidence-threshold" min="0.1" max="1.0" step="0.05" placeholder="0.65">
+                        </div>
+                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">AI 信心低于此值则不会开仓（降低=更频繁交易，提高=更保守）</div>
+                    </div>
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">仓位保证金上限</div>
+                        <div class="form-group">
+                            <label class="form-label">总保证金占用上限 %</label>
+                            <input type="number" class="form-input" id="cfg-total-margin-limit-pct" min="10" max="100" step="1" placeholder="45">
+                        </div>
+                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">达到上限后暂停分析新交易对，已有持仓仍会复盘和平仓</div>
+                    </div>
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">本地量化 AI 工具</div>
+                        <div class="form-group" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                            <div>
+                                <label class="form-label" style="margin-bottom:2px;">盈利/时序/情绪辅助</label>
+                                <div style="font-size:10px;color:var(--text-muted);line-height:1.5;">作为 AI 决策证据，不会直接下单；服务异常时自动跳过</div>
+                            </div>
+                            <label class="toggle" title="开启本地量化 AI 工具">
+                                <input type="checkbox" id="cfg-local-ai-tools-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">工具服务地址</label>
+                            <input type="text" class="form-input" id="cfg-local-ai-tools-api-base" placeholder="http://175.155.64.171:31841">
+                        </div>
+                        <div class="form-group" style="margin-top:10px;">
+                            <label class="form-label">单项超时秒数</label>
+                            <input type="number" class="form-input" id="cfg-local-ai-tools-timeout" min="0.2" max="15" step="0.1" placeholder="2.5">
+                        </div>
+                    </div>
+                    <div class="settings-panel">
+                        <div class="settings-panel-title">高风险复核模型</div>
+                        <div class="form-group" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                            <div>
+                                <label class="form-label" style="margin-bottom:2px;">重大冲突时复核</label>
+                                <div style="font-size:10px;color:var(--text-muted);line-height:1.5;">只在专家方向严重冲突时调用，失败后回退主模型</div>
+                            </div>
+                            <label class="toggle" title="开启 32B 高风险复核">
+                                <input type="checkbox" id="cfg-high-risk-review-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">复核 API Base</label>
+                            <input type="text" class="form-input" id="cfg-high-risk-review-api-base" placeholder="http://175.155.64.171:31841/v1">
+                        </div>
+                        <div class="form-group" style="margin-top:10px;">
+                            <label class="form-label">复核 API Key</label>
+                            <input type="password" class="form-input" id="cfg-high-risk-review-api-key" placeholder="线上模型 API Key，留空不变">
+                        </div>
+                        <div class="form-group" style="margin-top:10px;">
+                            <label class="form-label">复核模型名</label>
+                            <input type="text" class="form-input" id="cfg-high-risk-review-model" placeholder="deepseek-r1-distill-qwen-32b-trade">
+                        </div>
+                    </div>
+                </div>
+                <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;">
+                    <button class="btn btn-accent btn-sm" onclick="saveTradingParams()">保存参数</button>
+                    <span style="font-size:11px;color:var(--text-muted);">修改后立即生效，无需重启</span>
+                </div>
+            </div>
+
+            <!-- AI Model Config (fixed expert slots) -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">AI 专家模型配置</span>
+                    <span class="card-subtitle">固定专家槽位，只需填写 URL / Key / Model</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="model-table">
+                        <thead>
+                            <tr>
+                                <th>专家</th>
+                                <th>职责</th>
+                                <th>API Base</th>
+                                <th>Model</th>
+                                <th>Key</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="model-config-tbody">
+                            <tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="okx-balance-info" style="font-size:11px;color:var(--text-muted);padding:8px 12px;border-top:1px solid var(--border);"></div>
+            </div>
+        </div>
+
+        <!-- Modal: Add/Edit AI Model -->
+        <div class="modal-overlay" id="model-modal-overlay" style="display:none;">
+            <div class="modal">
+                <div class="modal-header">
+                    <span id="model-modal-title">添加 AI 模型</span>
+                    <button class="modal-close" onclick="closeModelModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="model-edit-orig-name">
+                    <div class="form-group">
+                        <label class="form-label">专家槽位</label>
+                        <input type="text" class="form-input" id="model-cfg-name" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">API Base URL</label>
+                        <input type="text" class="form-input" id="model-cfg-api-base" placeholder="https://api.openai.com/v1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">API Key</label>
+                        <input type="password" class="form-input" id="model-cfg-api-key" placeholder="sk-...">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Model Name</label>
+                        <input type="text" class="form-input" id="model-cfg-model" placeholder="gpt-4">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-sm" onclick="closeModelModal()">取消</button>
+                    <button class="btn btn-accent btn-sm" onclick="saveModelConfig()" id="model-save-btn">保存</button>
+                </div>
+            </div>
+        </div>
+
+    </main>
+</div>
+
+<script src="/static/js/ws_client.js?v=20260523c"></script>
+<script src="/static/js/charts.js?v=20260528theme"></script>
+<script src="/static/js/dashboard.js?v=20260602decisionaction"></script>
+</body>
+</html>

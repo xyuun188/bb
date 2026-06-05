@@ -1,0 +1,77 @@
+# Environment
+.env
+.env.local
+.env.production
+*.key
+*.pem
+*.p12
+*.pfx
+*秘钥*.txt
+*密钥*.txt
+*服务器资料*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+# Data
+data/
+data/*.db
+data/*.log
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (large files)
+ai_brain/models_cache/
+
+# Logs
+*.log
+logs/
+tmp_*.log
+*.out.log
+*.err.log
+
+# Local archives / generated scratch
+*.zip
+*.7z
+*.rar
+.tmp/
+.rtk/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+.codex-memory/
+PROJECT_MEMORY.md
+tmp_*_check.py
+
+# Accidental scratch files
+/1
+/=
+
+# Docker
+.docker/
+
+# Alembic
+alembic/versions/*.pyc

@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import func, or_, select
+
+from db.repositories.base import BaseRepository
+from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
+
+
+class MemoryRepository(BaseRepository):
+    """Repository for expert long-term memories and trade reflections."""
+
+    model = ExpertMemory
+
+    async def get_relevant_memories(
+        self,
+        expert_name: str,
+        symbol: str,
+        side: str | None = None,
+        limit: int = 4,
+    ) -> list[ExpertMemory]:
+        stmt = (
+            select(ExpertMemory)
+            .where(
+                ExpertMemory.expert_name == expert_name,
+                ExpertMemory.is_active == True,
+                or_(ExpertMemory.symbol.is_(None), ExpertMemory.symbol == symbol),
+            )
+            .order_by(
+                ExpertMemory.symbol.desc(),
+                ExpertMemory.confidence_score.desc(),
+                ExpertMemory.evidence_count.desc(),
+                ExpertMemory.updated_at.desc().nullslast(),
+                ExpertMemory.created_at.desc(),
+            )
+            .limit(max(int(limit or 4), 1) * 2)
+        )
+        result = await self.session.execute(stmt)
+        rows = list(result.scalars().all())
+        symbol_norm = _norm_symbol(symbol)
+        side_norm = str(side or "").lower()
+        filtered = [
+            row for row in rows
+            if (
+                not row.symbol
+                or _norm_symbol(row.symbol) == symbol_norm
+            )
+            and (
+                not row.side
+                or not side_norm
+                or str(row.side or "").lower() == side_norm
+            )
+        ]
+        return filtered[:max(int(limit or 4), 1)]
+
+    async def mark_memories_used(self, memory_ids: list[int]) -> None:
+        if not memory_ids:
+            return
+        result = await self.session.execute(
+            select(ExpertMemory).where(ExpertMemory.id.in_(memory_ids))
+        )
+        now = datetime.now(timezone.utc)
+        for memory in result.scalars().all():
+            memory.hit_count = int(memory.hit_count or 0) + 1
+            memory.last_used_at = now
+        await self.session.flush()
+
+    async def upsert_memory(self, data: dict[str, Any]) -> ExpertMemory:
+        memory_key = str(data.get("memory_key") or "").strip()
+        existing = None
+        if memory_key:
+            result = await self.session.execute(
+                select(ExpertMemory)
+                .where(
+                    ExpertMemory.expert_name == data.get("expert_name"),
+                    ExpertMemory.memory_key == memory_key,
+                )
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
+
+        if existing:
+            existing.evidence_count = int(existing.evidence_count or 0) + int(data.get("evidence_count", 1) or 1)
+            existing.success_count = int(existing.success_count or 0) + int(data.get("success_count", 0) or 0)
+            existing.failure_count = int(existing.failure_count or 0) + int(data.get("failure_count", 0) or 0)
+            existing.confidence_adjustment = _blend(
+                float(existing.confidence_adjustment or 0.0),
+                float(data.get("confidence_adjustment", existing.confidence_adjustment) or 0.0),
+            )
+            existing.position_size_multiplier = min(
+                float(existing.position_size_multiplier or 1.0),
+                float(data.get("position_size_multiplier", existing.position_size_multiplier) or 1.0),
+            )
+            existing.confidence_score = min(
+                0.95,
+                max(0.10, float(existing.confidence_score or 0.5) + 0.05),
+            )
+            existing.lesson = str(data.get("lesson") or existing.lesson or "")
+            existing.market_pattern = str(data.get("market_pattern") or existing.market_pattern or "")
+            existing.recommended_action = str(data.get("recommended_action") or existing.recommended_action or "")
+            existing.source_position_id = data.get("source_position_id") or existing.source_position_id
+            existing.extra = data.get("extra") or existing.extra
+            existing.updated_at = datetime.now(timezone.utc)
+            await self.session.flush()
+            return existing
+
+        memory = ExpertMemory(**data)
+        self.session.add(memory)
+        await self.session.flush()
+        return memory
+
+    async def create_reflection(self, data: dict[str, Any]) -> TradeReflection | None:
+        position_id = int(data.get("position_id") or 0)
+        if position_id:
+            result = await self.session.execute(
+                select(TradeReflection)
+                .where(TradeReflection.position_id == position_id)
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                return None
+        reflection = TradeReflection(**data)
+        self.session.add(reflection)
+        await self.session.flush()
+        return reflection
+
+    async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
+        row = ShadowBacktest(**data)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
+        now = datetime.now(timezone.utc)
+        stmt = (
+            select(ShadowBacktest)
+            .where(
+                ShadowBacktest.status == "pending",
+                ShadowBacktest.due_at <= now,
+            )
+            .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
+            .limit(max(int(limit or 200), 1))
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def complete_shadow_backtest(
+        self,
+        row: ShadowBacktest,
+        *,
+        actual_price: float,
+        long_return_pct: float,
+        short_return_pct: float,
+        best_action: str,
+        missed_opportunity: bool,
+        note: str = "",
+    ) -> ShadowBacktest:
+        row.actual_price = actual_price
+        row.long_return_pct = long_return_pct
+        row.short_return_pct = short_return_pct
+        row.best_action = best_action
+        row.missed_opportunity = missed_opportunity
+        row.note = note
+        row.status = "completed"
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def list_shadow_backtests(
+        self,
+        status: str | None = None,
+        symbol: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[ShadowBacktest]:
+        stmt = (
+            select(ShadowBacktest)
+            .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+            .offset(max(int(offset or 0), 0))
+            .limit(max(int(limit or 100), 1))
+        )
+        if status:
+            stmt = stmt.where(ShadowBacktest.status == status)
+        if symbol:
+            stmt = stmt.where(ShadowBacktest.symbol == symbol)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_shadow_backtests(
+        self,
+        status: str | None = None,
+        symbol: str | None = None,
+    ) -> int:
+        stmt = select(func.count(ShadowBacktest.id))
+        if status:
+            stmt = stmt.where(ShadowBacktest.status == status)
+        if symbol:
+            stmt = stmt.where(ShadowBacktest.symbol == symbol)
+        result = await self.session.execute(stmt)
+        return int(result.scalar() or 0)
+
+    async def list_memories(
+        self,
+        expert_name: str | None = None,
+        symbol: str | None = None,
+        active_only: bool = True,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[ExpertMemory]:
+        stmt = select(ExpertMemory).order_by(
+            ExpertMemory.updated_at.desc().nullslast(),
+            ExpertMemory.created_at.desc(),
+        ).offset(max(int(offset or 0), 0)).limit(max(int(limit or 200), 1))
+        if expert_name:
+            stmt = stmt.where(ExpertMemory.expert_name == expert_name)
+        if symbol:
+            stmt = stmt.where(ExpertMemory.symbol == symbol)
+        if active_only:
+            stmt = stmt.where(ExpertMemory.is_active == True)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_memories(
+        self,
+        expert_name: str | None = None,
+        symbol: str | None = None,
+        active_only: bool = True,
+    ) -> int:
+        stmt = select(func.count(ExpertMemory.id))
+        if expert_name:
+            stmt = stmt.where(ExpertMemory.expert_name == expert_name)
+        if symbol:
+            stmt = stmt.where(ExpertMemory.symbol == symbol)
+        if active_only:
+            stmt = stmt.where(ExpertMemory.is_active == True)
+        result = await self.session.execute(stmt)
+        return int(result.scalar() or 0)
+
+    async def list_reflections(
+        self,
+        symbol: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[TradeReflection]:
+        stmt = (
+            select(TradeReflection)
+            .order_by(TradeReflection.created_at.desc())
+            .offset(max(int(offset or 0), 0))
+            .limit(max(int(limit or 100), 1))
+        )
+        if symbol:
+            stmt = stmt.where(TradeReflection.symbol == symbol)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_reflections(self, symbol: str | None = None) -> int:
+        stmt = select(func.count(TradeReflection.id))
+        if symbol:
+            stmt = stmt.where(TradeReflection.symbol == symbol)
+        result = await self.session.execute(stmt)
+        return int(result.scalar() or 0)
+
+
+def _blend(old: float, new: float) -> float:
+    return (old * 0.7) + (new * 0.3)
+
+
+def _norm_symbol(symbol: str | None) -> str:
+    if not symbol:
+        return ""
+    value = str(symbol).split(":")[0]
+    if value.endswith("-SWAP"):
+        value = value[:-5]
+    if "/" not in value and "-" in value:
+        parts = value.split("-")
+        if len(parts) >= 2:
+            value = f"{parts[0]}/{parts[1]}"
+    return value.upper()
