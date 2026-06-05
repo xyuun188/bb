@@ -4692,47 +4692,18 @@ class TradingService:
             # 2.5 Enforce stop-loss / take-profit before AI decisions
             review_blocked_keys: set[tuple[str, str]] = set()
             if run_position_analysis:
-                self._set_loop_stage("enforce_sl_tp")
-                sl_tp_results = await self._enforce_sl_tp(feature_vectors)
-                for ac in sl_tp_results:
-                    results["executions"].append({
-                        "model": ac["model_name"],
-                        "symbol": ac["symbol"],
-                        "action": f"auto_close_{ac['trigger']}",
-                        "quantity": ac["quantity"],
-                        "price": ac["exit_price"],
-                        "status": ac.get("status", "filled"),
-                    })
-
-                self._set_loop_stage("review_open_positions")
-                open_positions = await self.okx_sync_service.get_open_positions_context()
-                review_candidates, review_blocked_keys = await self._review_open_positions(
-                    open_positions,
-                    feature_vectors,
+                open_positions, review_blocked_keys = await self.position_review_service.review_open_positions(
+                    feature_vectors=feature_vectors,
                     results=results,
                     round_decision_ids=round_decision_ids,
+                    open_positions=open_positions,
                     position_entry_pause_reason=new_pair_pause_reason,
-                    max_groups_override=int(analysis_budget_context.get("position_max_groups") or POSITION_REVIEW_MAX_GROUPS_PER_ROUND),
+                    max_groups_override=int(
+                        analysis_budget_context.get("position_max_groups")
+                        or POSITION_REVIEW_MAX_GROUPS_PER_ROUND
+                    ),
+                    claimed_analysis_symbols=claimed_analysis_symbols,
                 )
-                if review_candidates:
-                    logger.info("review pass added execution candidates", count=len(review_candidates))
-                for symbol, model_name, decision, assessment, decision_db_id in review_candidates:
-                    if not await self._try_claim_analysis_symbol(symbol, "position"):
-                        logger.info("position execution skipped because another analysis owns symbol", symbol=symbol)
-                        continue
-                    claimed_analysis_symbols.append(symbol)
-                    if decision_db_id is not None:
-                        round_decision_ids.add(decision_db_id)
-                    review_blocked_keys.add((model_name, self._normalize_position_symbol(symbol)))
-                    await self._execute_candidate(
-                        symbol,
-                        model_name,
-                        decision,
-                        assessment,
-                        decision_db_id,
-                        results,
-                        open_positions=open_positions,
-                    )
 
             # 3. Collect all entry decisions from all symbols/models
             all_candidates = []  # (symbol, model_name, decision, assessment)
