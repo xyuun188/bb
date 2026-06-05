@@ -1,7 +1,7 @@
-"""Lightweight strategy arbitration contract.
+"""Strategy arbitration contract.
 
-This first pass does not rewrite trading thresholds.  It records whether the
-strategy layer accepts the AI's intent before execution-layer checks run.
+This layer decides whether the strategy side accepts the AI intent.  It does
+not talk to OKX and it does not hide execution errors behind vague wording.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class StrategyArbitrationResult:
 
 
 def arbitrate_decision(decision: DecisionOutput) -> StrategyArbitrationResult:
-    """Record the policy view of an AI decision without changing it."""
+    """Record the strategy view of an AI decision before execution checks."""
 
     action = decision.action.value
     data = {
@@ -39,8 +39,8 @@ def arbitrate_decision(decision: DecisionOutput) -> StrategyArbitrationResult:
         return StrategyArbitrationResult(
             status=DecisionStageStatus.PASSED,
             reason=(
-                "策略仲裁已承认 AI 的开仓意图；后续只允许余额、仓位不存在、"
-                "行情严重过期、交易所错误等硬问题拦截。"
+                "策略仲裁已承认 AI 的开仓意图；后续只允许余额、仓位、行情严重过期、"
+                "交易所错误、价格异常等硬问题拦截。"
             ),
             data={**data, "intent": "entry"},
         )
@@ -48,7 +48,8 @@ def arbitrate_decision(decision: DecisionOutput) -> StrategyArbitrationResult:
         return StrategyArbitrationResult(
             status=DecisionStageStatus.PASSED,
             reason=(
-                "策略仲裁已承认 AI 的平仓/减仓意图；后续风控只做硬错误和重复订单保护。"
+                "策略仲裁已承认 AI 的平仓/减仓意图；后续只做仓位存在、重复订单、"
+                "交易所错误和明确保护规则检查。"
             ),
             data={**data, "intent": "exit"},
         )

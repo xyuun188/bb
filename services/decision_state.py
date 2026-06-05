@@ -1,8 +1,9 @@
 """Decision state tracking helpers.
 
-The trading code is still being split apart.  This module gives every decision
-one visible state trail first, so the dashboard can show where a decision was
-accepted, blocked, submitted, confirmed, or synced.
+Every AI decision should have one visible state trail:
+
+AI analysis -> strategy arbitration -> risk check -> OKX submit ->
+exchange confirm -> local sync.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ STAGE_LABELS = {
     DecisionStage.EXCHANGE_CONFIRM: "成交确认",
     DecisionStage.LOCAL_SYNC: "本地同步",
 }
+
 
 STATUS_LABELS = {
     DecisionStageStatus.PENDING: "处理中",

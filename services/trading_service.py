@@ -42,8 +42,12 @@ from services.equity_baseline import apply_daily_equity_baseline
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.ml_signal_service import AUTO_TRAIN_CHECK_INTERVAL_SECONDS, MLSignalService
+from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.execution_service import ExecutionService
 from services.strategy_arbitration import arbitrate_decision
+from services.sync_service import OkxSyncService
+from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
@@ -300,6 +304,12 @@ class TradingService:
         self.local_ai_tools = LocalAIToolsClient()
         self.agent_skills = TradingAgentSkillBook()
         self.redis = redis_client
+        self.market_analysis_service = MarketAnalysisService(self)
+        self.position_review_service = PositionReviewService(self)
+        self.execution_service = ExecutionService(self)
+        self.okx_sync_service = OkxSyncService(self)
+        self.entry_policy = EntryPolicy(self)
+        self.exit_policy = ExitPolicy(self)
 
         # Executors 鈥?paper routes to OKX demo, live routes to OKX real.
         self.paper_executor: PaperExecutor | None = None
@@ -4451,9 +4461,9 @@ class TradingService:
             # 0. Refresh per-model execution mode mapping from current config
             self._refresh_model_modes()
             self._set_loop_stage("sync_exchange_positions")
-            await self._reconcile_exchange_positions_with_timeout("round start")
+            await self.okx_sync_service.reconcile_positions("round start")
             self._set_loop_stage("load_open_positions")
-            open_positions = await self._get_open_positions_context()
+            open_positions = await self.okx_sync_service.get_open_positions_context()
             await self._recover_pending_exit_decisions(
                 results,
                 open_positions,
@@ -4677,7 +4687,7 @@ class TradingService:
             )
 
             self._set_loop_stage("refresh_position_prices")
-            await self._refresh_db_position_prices(feature_vectors) 
+            await self.okx_sync_service.refresh_position_prices(feature_vectors) 
 
             # 2.5 Enforce stop-loss / take-profit before AI decisions
             review_blocked_keys: set[tuple[str, str]] = set()
@@ -4695,7 +4705,7 @@ class TradingService:
                     })
 
                 self._set_loop_stage("review_open_positions")
-                open_positions = await self._get_open_positions_context()
+                open_positions = await self.okx_sync_service.get_open_positions_context()
                 review_candidates, review_blocked_keys = await self._review_open_positions(
                     open_positions,
                     feature_vectors,
@@ -5720,7 +5730,10 @@ class TradingService:
                             results,
                         )
                 except Exception as exc:
-                    reason = f"Candidate entered execution queue but crashed: {str(exc)[:160]}. Skipped this order and continued."
+                    reason = (
+                        "候选进入执行流程后异常中断："
+                        f"{str(exc)[:160]}。系统已跳过本次订单，下一轮会用最新行情重新评估。"
+                    )
                     logger.error(
                         "entry candidate execution crashed",
                         symbol=symbol,
@@ -5783,10 +5796,10 @@ class TradingService:
         logger.info("trading service started", mode=mode_manager.mode.value, scheduler="parallel_market_position")
 
         self._position_analysis_task = asyncio.create_task(
-            self._analysis_loop("position", max(5.0, float(settings.decision_interval_seconds) * 0.65))
+            self.position_review_service.loop(max(5.0, float(settings.decision_interval_seconds) * 0.65))
         )
         self._market_analysis_task = asyncio.create_task(
-            self._analysis_loop("market", max(8.0, float(settings.decision_interval_seconds)))
+            self.market_analysis_service.loop(max(8.0, float(settings.decision_interval_seconds)))
         )
         try:
             await asyncio.gather(self._position_analysis_task, self._market_analysis_task)
@@ -6935,16 +6948,15 @@ class TradingService:
         results: dict[str, Any],
         open_positions: list[dict] | None = None,
     ) -> ExecutionResult | None:
-        async with self._execution_lock:
-            return await self._execute_candidate_locked(
-                symbol,
-                model_name,
-                decision,
-                assessment,
-                decision_db_id,
-                results,
-                open_positions=open_positions,
-            )
+        return await self.execution_service.execute_candidate(
+            symbol,
+            model_name,
+            decision,
+            assessment,
+            decision_db_id,
+            results,
+            open_positions=open_positions,
+        )
 
     async def _execute_candidate_locked(
         self,
@@ -6990,6 +7002,40 @@ class TradingService:
                 data,
             )
 
+        async def block_before_submit(policy_result: PolicyGateResult) -> None:
+            reason = str(policy_result.reason or "策略或风控检查未通过，未提交 OKX 订单。")
+            blocker = str(policy_result.blocker or "policy_gate")
+            data = {"blocker": blocker}
+            if isinstance(policy_result.data, dict):
+                data.update(policy_result.data)
+            await mark_blocked(reason, data)
+            if decision_db_id is not None:
+                await self._mark_decision_reason(decision_db_id, reason)
+                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
+            await self._log_risk_event(
+                "warning",
+                symbol,
+                f"[{model_name}] {reason}",
+                model_name,
+            )
+            if self._position_review_alert_context(decision):
+                await self._log_position_review_risk_result(
+                    decision,
+                    model_name,
+                    f"未执行：{reason}",
+                )
+            results["decisions"].append({
+                "model": model_name,
+                "symbol": symbol,
+                "action": decision.action.value,
+                "approved": True,
+                "confidence": decision.confidence,
+                "executed": False,
+                "execution_status": "skipped",
+                "reason": reason,
+                "is_paper": (model_mode == "paper"),
+            })
+
         arbitration = arbitrate_decision(decision)
         await mark_stage(
             DecisionStage.STRATEGY_ARBITRATION,
@@ -7007,257 +7053,33 @@ class TradingService:
         if decision_db_id is not None:
             duplicate_reason = await self._duplicate_decision_order_reason(decision_db_id, decision)
             if duplicate_reason:
-                await mark_blocked(duplicate_reason, {"blocker": "duplicate_decision_order"})
-                await self._mark_decision_reason(decision_db_id, duplicate_reason)
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": duplicate_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
+                await block_before_submit(
+                    PolicyGateResult.block(
+                        "duplicate_decision_order",
+                        duplicate_reason,
+                    )
+                )
                 return None
 
         if decision.is_exit:
-            await self._reconcile_exchange_positions_with_timeout("exit precheck")
-            exit_positions = await self._get_open_positions_context()
-            if open_positions is not None:
-                open_positions[:] = exit_positions
-            if not self._has_matching_exit_position(exit_positions, model_name, decision):
-                exchange_has_position = await self._has_matching_exchange_exit_position(
-                    model_name,
-                    decision,
-                )
-                if not exchange_has_position:
-                    reason = self._no_matching_exit_position_reason(decision)
-                    await mark_blocked(reason, {"blocker": "no_matching_exit_position"})
-                    if decision_db_id is not None:
-                        await self._mark_decision_reason(decision_db_id, reason)
-                    results["decisions"].append({
-                        "model": model_name,
-                        "symbol": symbol,
-                        "action": decision.action.value,
-                        "approved": True,
-                        "confidence": decision.confidence,
-                        "executed": False,
-                        "execution_status": "skipped",
-                        "reason": reason,
-                        "is_paper": (model_mode == "paper"),
-                    })
-                    return None
-                logger.info(
-                    "exit decision allowed by live OKX position after local mismatch",
-                    model=model_name,
-                    symbol=decision.symbol,
-                    action=decision.action.value,
-                )
-
-            loss_partial_reason = self._loss_partial_exit_guard_reason(
-                model_name,
+            exit_policy_result = await self.exit_policy.evaluate(
                 decision,
-                exit_positions,
-            )
-            if loss_partial_reason:
-                await mark_blocked(loss_partial_reason, {"blocker": "loss_partial_exit_guard"})
-                if decision_db_id is not None:
-                    await self._mark_decision_reason(decision_db_id, loss_partial_reason)
-                    await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-                await self._log_risk_event(
-                    "warning",
-                    symbol,
-                    f"[{model_name}] {loss_partial_reason}",
-                    model_name,
-                )
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": loss_partial_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
-                return None
-
-            recent_exit_reason = self._recent_exit_cooldown_reason(model_name, decision)
-            if recent_exit_reason:
-                await mark_blocked(recent_exit_reason, {"blocker": "recent_exit_cooldown"})
-                if decision_db_id is not None:
-                    await self._mark_decision_reason(decision_db_id, recent_exit_reason)
-                    await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": recent_exit_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
-                return None
-
-            profit_exit_guard_reason = await self._pre_execution_profit_exit_guard_reason(
-                decision,
-                exit_positions,
-            )
-            if profit_exit_guard_reason:
-                await mark_blocked(profit_exit_guard_reason, {"blocker": "profit_exit_precheck"})
-                if decision_db_id is not None:
-                    await self._mark_decision_reason(decision_db_id, profit_exit_guard_reason)
-                await self._log_risk_event(
-                    "warning",
-                    symbol,
-                    f"[{model_name}] {profit_exit_guard_reason}",
-                    model_name,
-                )
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": profit_exit_guard_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
-                return None
-
-            guard_reason = await self._exit_fee_churn_guard_reason(model_name, decision)
-            if guard_reason:
-                await mark_blocked(guard_reason, {"blocker": "exit_fee_churn_guard"})
-                if decision_db_id is not None:
-                    await self._mark_decision_reason(decision_db_id, guard_reason)
-                if self._position_review_alert_context(decision):
-                    await self._log_position_review_risk_result(
-                        decision,
-                        model_name,
-                        f"鏈墽琛岋細{guard_reason}",
-                    )
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": guard_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
-                return None
-
-        stale_reason = self._stale_decision_reason(decision)
-        if stale_reason:
-            await mark_blocked(stale_reason, {"blocker": "stale_decision"})
-            if decision_db_id is not None:
-                await self._mark_decision_reason(decision_db_id, stale_reason)
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            if self._position_review_alert_context(decision):
-                await self._log_position_review_risk_result(
-                    decision,
-                    model_name,
-                    f"鏈墽琛岋細{stale_reason}",
-                )
-            results["decisions"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "action": decision.action.value,
-                "approved": True,
-                "confidence": decision.confidence,
-                "executed": False,
-                "execution_status": "skipped",
-                "reason": stale_reason,
-                "is_paper": (model_mode == "paper"),
-            })
-            return None
-
-        abnormal_wick_reason = self._abnormal_wick_entry_guard_reason(decision)
-        if abnormal_wick_reason:
-            await mark_blocked(abnormal_wick_reason, {"blocker": "abnormal_wick_entry_guard"})
-            if decision_db_id is not None:
-                await self._mark_decision_reason(decision_db_id, abnormal_wick_reason)
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            await self._log_risk_event(
-                "abnormal_wick_entry_block",
-                symbol,
-                f"[{model_name}] {abnormal_wick_reason}",
                 model_name,
-                severity="critical",
+                open_positions,
             )
-            results["decisions"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "action": decision.action.value,
-                "approved": True,
-                "confidence": decision.confidence,
-                "executed": False,
-                "execution_status": "skipped",
-                "reason": abnormal_wick_reason,
-                "is_paper": (model_mode == "paper"),
-            })
-            return None
-
-        price_guard_reason = await self._pre_execution_price_guard_reason(decision)
-        if price_guard_reason:
-            await mark_blocked(price_guard_reason, {"blocker": "pre_execution_price_guard"})
-            if decision_db_id is not None:
-                await self._mark_decision_reason(decision_db_id, price_guard_reason)
-            await self._log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] {price_guard_reason}",
-                model_name,
-            )
-            results["decisions"].append({
-                "model": model_name,
-                "symbol": symbol,
-                "action": decision.action.value,
-                "approved": True,
-                "confidence": decision.confidence,
-                "executed": False,
-                "execution_status": "skipped",
-                "reason": price_guard_reason,
-                "is_paper": (model_mode == "paper"),
-            })
-            return None
+            if not exit_policy_result.passed:
+                await block_before_submit(exit_policy_result)
+                return None
 
         if decision.is_entry:
-            await self._apply_entry_profit_risk_sizing(
+            entry_policy_result = await self.entry_policy.evaluate(
                 decision,
+                model_name,
                 model_mode,
-                open_positions=open_positions or [],
+                open_positions,
             )
-            high_risk_reason = await self._high_risk_review_gate(
-                decision,
-                model_mode,
-                open_positions or [],
-            )
-            if decision_db_id is not None:
-                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
-            if high_risk_reason:
-                await mark_blocked(high_risk_reason, {"blocker": "high_risk_review"})
-                if decision_db_id is not None:
-                    await self._mark_decision_reason(decision_db_id, high_risk_reason)
-                results["decisions"].append({
-                    "model": model_name,
-                    "symbol": symbol,
-                    "action": decision.action.value,
-                    "approved": True,
-                    "confidence": decision.confidence,
-                    "executed": False,
-                    "execution_status": "skipped",
-                    "reason": high_risk_reason,
-                    "is_paper": (model_mode == "paper"),
-                })
+            if not entry_policy_result.passed:
+                await block_before_submit(entry_policy_result)
                 return None
             if decision_db_id is not None:
                 await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -7623,7 +7445,7 @@ class TradingService:
                 await self._log_position_review_risk_result(
                     decision,
                     model_name,
-                    f"鏈墽琛岋細{missing_result_reason}",
+                    f"未执行：{missing_result_reason}",
                 )
 
         results["decisions"].append({

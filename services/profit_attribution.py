@@ -534,3 +534,137 @@ def _decision_state_or_closed_fallback(
         },
         "inferred": True,
     }
+
+
+# Clean UTF-8 overrides.  Earlier helper definitions are kept above only to
+# avoid a high-risk full-file rewrite while this module is being refactored.
+def _action_label(action: str | None) -> str:
+    labels = {
+        "long": "做多",
+        "short": "做空",
+        "close_long": "平多",
+        "close_short": "平空",
+        "hold": "观望",
+    }
+    return labels.get(str(action or "").lower(), str(action or "-"))
+
+
+def _side_label(side: str | None) -> str:
+    labels = {"long": "做多", "short": "做空"}
+    return labels.get(str(side or "").lower(), str(side or "-"))
+
+
+def _classify_record(
+    position: Position,
+    entry_decision: AIDecision | None,
+    close_decision: AIDecision | None,
+    shadow: ShadowBacktest | None,
+) -> tuple[str, str, str, list[str]]:
+    pnl = _safe_float(position.realized_pnl, 0.0)
+    side = str(position.side or "").lower()
+    raw_entry = _raw(entry_decision)
+    raw_close = _raw(close_decision)
+    signals = extract_signal_sides(raw_entry)
+    shadow_action = _shadow_best_action(shadow)
+    hold_minutes = 0.0
+    opened = _position_open_time(position)
+    closed = _position_close_time(position)
+    if opened and closed:
+        hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
+
+    notes: list[str] = []
+    if shadow_action in {"long", "short"} and shadow_action != side:
+        notes.append(f"影子复盘显示更优方向是{_side_label(shadow_action)}")
+    for key, label in (
+        ("ml", "本地ML"),
+        ("server_profit", "服务器盈利模型"),
+        ("timeseries", "时序预测"),
+        ("sentiment", "情绪模型"),
+    ):
+        signal_side = signals.get(key, {}).get("side")
+        if signal_side in {"long", "short"} and signal_side != side:
+            notes.append(f"{label}当时偏向{_side_label(signal_side)}")
+
+    close_evidence = raw_close.get("close_evidence") if isinstance(raw_close.get("close_evidence"), dict) else {}
+    close_reason = str(
+        raw_close.get("execution_reason")
+        or close_evidence.get("reason")
+        or getattr(close_decision, "execution_reason", "")
+        or getattr(close_decision, "reasoning", "")
+        or ""
+    )
+    close_reason = str(sanitize_text(close_reason) or "")
+    lowered_close_reason = close_reason.lower()
+    if close_reason:
+        if "止损" in close_reason or "stop" in lowered_close_reason:
+            notes.append("平仓来自止损或快速风控")
+        if "锁盈" in close_reason or "止盈" in close_reason or "profit" in lowered_close_reason:
+            notes.append("平仓来自锁盈/止盈")
+
+    if pnl < 0:
+        if shadow_action in {"long", "short"} and shadow_action != side:
+            return "ai_direction_error", "AI方向判断偏差", "high", notes
+        if notes:
+            return "model_conflict_ignored", "模型分歧未充分消化", "medium", notes
+        if hold_minutes <= 5:
+            return "entry_quality", "入场后快速不利", "medium", notes
+        if "止损" in close_reason or "stop" in lowered_close_reason:
+            return "stop_loss_or_fast_risk", "止损/快速风控亏损", "medium", notes
+        return "loss_unclassified", "亏损原因待复盘", "low", notes
+
+    if pnl > 0:
+        if hold_minutes <= 5 and pnl < 1.0:
+            return "early_small_profit", "小盈快跑", "medium", notes
+        if close_reason and ("锁盈" in close_reason or "止盈" in close_reason):
+            return "profit_locked", "利润保护生效", "medium", notes
+        return "profitable_exit", "盈利兑现", "medium", notes
+
+    return "flat_or_fee_churn", "盈亏接近 0", "medium", notes
+
+
+def _decision_state_or_closed_fallback(
+    raw_response: dict[str, Any],
+    position: Position,
+    decision: AIDecision | None,
+) -> dict[str, Any]:
+    machine = decision_state_from_raw(raw_response)
+    summary = machine.get("summary") if isinstance(machine.get("summary"), dict) else {}
+    if summary.get("final_stage"):
+        return machine
+    if position.is_open or not position.closed_at:
+        return machine
+
+    at = (_position_close_time(position) or datetime.now(timezone.utc)).isoformat()
+    reason = (
+        "历史记录已完成平仓；旧版本未写入完整逐阶段状态机，"
+        "系统根据已平仓持仓和本地订单记录推断为本地同步完成。"
+    )
+    stages = []
+    if decision is not None:
+        stages.append({
+            "stage": DecisionStage.AI_ANALYSIS,
+            "stage_label": STAGE_LABELS[DecisionStage.AI_ANALYSIS],
+            "status": DecisionStageStatus.COMPLETED,
+            "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
+            "reason": "历史 AI 决策记录存在，但旧版本未保存完整状态机。",
+            "at": (_aware(decision.created_at) or _position_open_time(position) or _position_close_time(position)).isoformat(),
+            "inferred": True,
+        })
+    stages.append({
+        "stage": DecisionStage.LOCAL_SYNC,
+        "stage_label": STAGE_LABELS[DecisionStage.LOCAL_SYNC],
+        "status": DecisionStageStatus.COMPLETED,
+        "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
+        "reason": reason,
+        "at": at,
+        "inferred": True,
+    })
+    return {
+        "stages": stages,
+        "summary": {
+            **summarize_decision_stages(stages),
+            "inferred": True,
+            "final_reason": reason,
+        },
+        "inferred": True,
+    }
