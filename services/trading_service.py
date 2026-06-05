@@ -136,6 +136,16 @@ ENTRY_NET_WEIGHT_TIMESERIES = 0.14
 ENTRY_SMALL_WIN_BIG_LOSS_PENALTY_CAP = 0.90
 ENTRY_REALIZED_EDGE_BONUS_CAP = 0.85
 ENTRY_REALIZED_EDGE_PENALTY_CAP = 1.15
+ENTRY_SYMBOL_WINNER_MIN_COUNT = 2
+ENTRY_SYMBOL_WINNER_MIN_PNL_USDT = 5.0
+ENTRY_SYMBOL_WINNER_MIN_PROFIT_FACTOR = 1.20
+ENTRY_SYMBOL_WINNER_SCORE_RELIEF = 0.12
+ENTRY_SYMBOL_WINNER_SCORE_BONUS_CAP = 0.45
+ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER = 0.55
+ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT = 1.50
+ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE = 0.65
+ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = 1.05
+ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = 1.35
 ML_EXPECTED_RETURN_SCORE_CAP_PCT = 3.0
 QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = 0.18
 QUANT_PROFIT_PROBE_MIN_EDGE_PCT = 0.22
@@ -168,15 +178,15 @@ SYMBOL_TOTAL_COOLDOWN_LOSS_USDT = 60.0
 SYMBOL_QUARANTINE_LOSS_USDT = 120.0
 SYMBOL_QUARANTINE_MIN_LOSSES = 2
 SYMBOL_SIDE_HARD_COOLDOWN_HOURS = 6.0
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_CONFIDENCE = 0.74
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_SCORE = 5.50
-ENTRY_LOSS_COOLDOWN_OVERRIDE_SCORE_MULTIPLE = 2.20
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_EXPECTED_NET = 1.50
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_PROFIT_QUALITY = 1.40
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_REWARD_RISK = 2.00
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_SERVER_EXPECTED = 2.00
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MAX_LOSS_PROBABILITY = 0.42
-ENTRY_LOSS_COOLDOWN_OVERRIDE_MAX_TAIL_RISK = 0.90
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_CONFIDENCE = 0.72
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_SCORE = 3.20
+ENTRY_LOSS_COOLDOWN_OVERRIDE_SCORE_MULTIPLE = 1.45
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_EXPECTED_NET = 0.90
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_PROFIT_QUALITY = 0.90
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_REWARD_RISK = 1.30
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MIN_SERVER_EXPECTED = 0.80
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MAX_LOSS_PROBABILITY = 0.48
+ENTRY_LOSS_COOLDOWN_OVERRIDE_MAX_TAIL_RISK = 0.85
 DRAWDOWN_REDUCED_RISK_USDT = 100.0
 DRAWDOWN_DEFENSIVE_RISK_USDT = 220.0
 ENTRY_MAX_STOP_LOSS_NORMAL_USDT = 16.0
@@ -1706,8 +1716,9 @@ class TradingService:
             if roster_underfilled
             else 0.58
         )
-        min_expected = max(min_expected, QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT)
-        min_edge = max(min_edge, QUANT_PROFIT_PROBE_MIN_EDGE_PCT)
+        if not roster_underfilled:
+            min_expected = max(min_expected, QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT)
+            min_edge = max(min_edge, QUANT_PROFIT_PROBE_MIN_EDGE_PCT)
         if side_expected < min_expected or edge < min_edge:
             return None
         if loss_probability >= max_loss_probability:
@@ -2240,6 +2251,55 @@ class TradingService:
         side_largest_loss = abs(self._safe_float(side_profile.get("largest_loss"), 0.0)) if isinstance(side_profile, dict) else 0.0
         side_profit = self._safe_float(side_profile.get("profit"), 0.0) if isinstance(side_profile, dict) else 0.0
         side_count = int(side_profile.get("count") or 0) if isinstance(side_profile, dict) else 0
+        side_pnl = self._safe_float(side_profile.get("pnl"), 0.0) if isinstance(side_profile, dict) else 0.0
+        side_loss = self._safe_float(side_profile.get("loss"), 0.0) if isinstance(side_profile, dict) else 0.0
+        symbol_pnl = self._safe_float(symbol_profile.get("pnl"), 0.0) if isinstance(symbol_profile, dict) else 0.0
+        symbol_count = int(symbol_profile.get("count") or 0) if isinstance(symbol_profile, dict) else 0
+        symbol_profit_factor = (
+            self._safe_float(symbol_profile.get("profit_factor"), 1.0)
+            if isinstance(symbol_profile, dict)
+            else 1.0
+        )
+        symbol_profit_tier = "neutral"
+        symbol_tier_reason = "该币种/方向近期真实盈亏样本不足，按中性处理。"
+        symbol_tier_score_adjustment = 0.0
+        if (
+            side_count >= ENTRY_SYMBOL_WINNER_MIN_COUNT
+            and side_pnl >= ENTRY_SYMBOL_WINNER_MIN_PNL_USDT
+            and side_profit_factor >= ENTRY_SYMBOL_WINNER_MIN_PROFIT_FACTOR
+        ):
+            symbol_profit_tier = "side_winner"
+            symbol_tier_score_adjustment = min(side_pnl / 28.0, ENTRY_SYMBOL_WINNER_SCORE_BONUS_CAP)
+            min_score_required = max(
+                min(min_score_required, base_min_score_required - ENTRY_SYMBOL_WINNER_SCORE_RELIEF),
+                0.68,
+            )
+            symbol_tier_reason = (
+                f"该币种{('做多' if side == 'long' else '做空')}方向最近真实盈利 {side_pnl:.2f}U，"
+                f"盈利因子 {side_profit_factor:.2f}，优先把资金给已验证能赚钱的方向。"
+            )
+        elif (
+            symbol_count >= ENTRY_SYMBOL_WINNER_MIN_COUNT
+            and symbol_pnl >= ENTRY_SYMBOL_WINNER_MIN_PNL_USDT
+            and symbol_profit_factor >= ENTRY_SYMBOL_WINNER_MIN_PROFIT_FACTOR
+        ):
+            symbol_profit_tier = "symbol_winner"
+            symbol_tier_score_adjustment = min(symbol_pnl / 44.0, ENTRY_SYMBOL_WINNER_SCORE_BONUS_CAP * 0.65)
+            min_score_required = max(
+                min(min_score_required, base_min_score_required - ENTRY_SYMBOL_WINNER_SCORE_RELIEF * 0.5),
+                0.72,
+            )
+            symbol_tier_reason = (
+                f"该币种最近真实盈利 {symbol_pnl:.2f}U，盈利因子 {symbol_profit_factor:.2f}；"
+                "方向仍按当前 AI/模型判断，但执行层给予轻微优先级。"
+            )
+        elif side_count >= 2 and side_pnl < 0 and (side_loss > side_profit * 1.15 or side_profit_factor < 0.80):
+            symbol_profit_tier = "side_loser"
+            symbol_tier_score_adjustment = -min(abs(side_pnl) / 32.0 + side_losses * 0.05, 0.75)
+            symbol_tier_reason = (
+                f"该币种{('做多' if side == 'long' else '做空')}方向近期真实净亏 {side_pnl:.2f}U，"
+                "不永久禁用，但降低评分和仓位，等待新证据证明值得再试。"
+            )
         small_win_big_loss_penalty = 0.0
         if side_count >= 2 and side_largest_loss > 0:
             avg_win = side_profit / max(side_wins, 1)
@@ -2310,6 +2370,7 @@ class TradingService:
         historical_adjustment_cap = -0.85 if strong_current_profit_support else -1.80
         if historical_adjustment < historical_adjustment_cap:
             historical_adjustment = historical_adjustment_cap
+        historical_adjustment += symbol_tier_score_adjustment
 
         expected_net_return_pct = (
             ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
@@ -2483,6 +2544,11 @@ class TradingService:
             "small_win_big_loss_penalty": round(small_win_big_loss_penalty, 6),
             "side_largest_loss_usdt": round(side_largest_loss, 6),
             "side_profit_factor": round(side_profit_factor, 6),
+            "symbol_profit_tier": symbol_profit_tier,
+            "symbol_profit_tier_reason": symbol_tier_reason,
+            "symbol_tier_score_adjustment": round(symbol_tier_score_adjustment, 6),
+            "side_realized_pnl_usdt": round(side_pnl, 6),
+            "symbol_realized_pnl_usdt": round(symbol_pnl, 6),
             "model_contribution_adjustment": contribution_adjustment,
             "model_contribution_sources": contribution_sources,
             "model_contribution_score_adjustment": round(contribution_score_adjustment, 6),
@@ -2638,6 +2704,7 @@ class TradingService:
         profit_quality = self._safe_float(opportunity.get("profit_quality_ratio"), 0.0)
         confidence = max(float(decision.confidence or 0.0), self._safe_float(opportunity.get("confidence"), 0.0))
         entry_votes = int(self._safe_float(opportunity.get("entry_vote_count"), 0.0))
+        tail_risk_score = self._safe_float(opportunity.get("tail_risk_score"), 0.0)
         high_disagreement = bool(opportunity.get("high_disagreement"))
         abnormal_volatility = bool(opportunity.get("abnormal_volatility"))
         quant_probe = raw.get("quant_profit_probe") if isinstance(raw.get("quant_profit_probe"), dict) else {}
@@ -2693,6 +2760,15 @@ class TradingService:
             and quant_loss_probability <= 0.52
             and float(decision.position_size_pct or 0.0) <= 0.03
         )
+        positive_expectancy = (
+            score >= max(min_score - 0.15, 0.55)
+            and confidence >= 0.68
+            and expected_net >= 0.35
+            and profit_quality >= 0.30
+            and quant_loss_probability <= 0.58
+            and tail_risk_score < 0.88
+            and (aligned or entry_votes >= 1 or quant_probe_triggered)
+        )
         roster_fill_quant = (
             roster_underfilled
             and roster_fill_probe
@@ -2703,7 +2779,7 @@ class TradingService:
             and quant_loss_probability <= 0.62
             and float(decision.position_size_pct or 0.0) <= 0.025
         )
-        if not (exceptional or strong_aligned or strong_quant or medium_quant or roster_fill_quant):
+        if not (exceptional or strong_aligned or strong_quant or medium_quant or positive_expectancy or roster_fill_quant):
             return None
         signal_label = (
             "极强信号"
@@ -2714,6 +2790,8 @@ class TradingService:
             if roster_fill_quant
             else "中等量化探针"
             if medium_quant
+            else "正期望信号"
+            if positive_expectancy
             else "强信号"
         )
         return (
@@ -6060,6 +6138,7 @@ class TradingService:
             else {}
         )
         roster = opportunity.get("portfolio_roster") if isinstance(opportunity.get("portfolio_roster"), dict) else {}
+        symbol_profit_tier = str(opportunity.get("symbol_profit_tier") or "neutral")
         roster_fill_candidate = bool(
             roster_fill_relief.get("applied")
             or quant_probe.get("roster_fill_probe")
@@ -6140,6 +6219,12 @@ class TradingService:
                 leverage = ENTRY_LOW_QUALITY_MAX_LEVERAGE
                 decision.suggested_leverage = leverage
                 caps.append("收益质量不足或存在小盈大亏风险，杠杆降到低档")
+        if symbol_profit_tier == "side_loser" and not high_quality_entry:
+            loser_size_cap = max(ENTRY_LOW_QUALITY_MAX_SIZE, current_size * ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER)
+            if current_size > loser_size_cap:
+                current_size = loser_size_cap
+                decision.position_size_pct = current_size
+                caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
         balance = await self._allocated_order_balance(model_mode, decision)
         if balance <= 0:
             return
@@ -6171,6 +6256,11 @@ class TradingService:
             configured_max_loss = min(configured_max_loss, ENTRY_MAX_STOP_LOSS_DEFENSIVE_USDT)
         configured_max_loss = min(configured_max_loss, dynamic_hard_cap)
         max_loss = max(configured_max_loss, 1.0)
+        pnl_structure_guard = {
+            "applied": False,
+            "expected_net_return_pct": round(expected_net, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+        }
         stress_stop_loss_pct = max(
             stop_loss_pct,
             expected_loss_pct / 100.0 if expected_loss_pct > 0 else 0.0,
@@ -6303,6 +6393,13 @@ class TradingService:
             target_min_notional = balance * notional_floor_ratio
             notional_floor_reason = meaningful_size_reason
             high_quality_entry = high_quality_entry or quality_tier in {"elite", "strong_probe", "winner_add", "high_profit"}
+            if symbol_profit_tier in {"side_winner", "symbol_winner"} and quality_tier in {"base", "probe", "good_probe", "roster_fill"}:
+                target_min_notional *= 1.15
+                notional_floor_reason = (
+                    f"{notional_floor_reason} 该币种近期真实盈利，名义本金地板小幅上调。"
+                    if notional_floor_reason
+                    else "该币种近期真实盈利，名义本金地板小幅上调。"
+                )
 
         if high_quality_entry and not low_payoff_quality:
             quality_reference = max(min_profit_quality_ratio, 0.85)
@@ -6324,6 +6421,35 @@ class TradingService:
             notional_floor_ratio = ENTRY_NORMAL_MIN_NOTIONAL_BALANCE_RATIO * quality_multiplier
             target_min_notional = balance * notional_floor_ratio
             notional_floor_reason = "普通正收益信号获得本地模型或时序模型支持，按当前可用资金动态设置基础名义本金"
+
+        intended_notional_for_profit = max(original_notional, target_min_notional)
+        expected_profit_usdt = intended_notional_for_profit * max(expected_net, 0.0) / 100.0
+        if expected_net > 0 and intended_notional_for_profit > 0:
+            max_loss_multiple = (
+                ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE
+                if low_payoff_quality or symbol_profit_tier == "side_loser"
+                else ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE
+                if high_quality_entry or quality_tier in {"elite", "winner_add", "high_profit", "strong_probe"}
+                else ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE
+            )
+            structure_max_loss = max(
+                ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT,
+                expected_profit_usdt * max_loss_multiple,
+            )
+            if structure_max_loss < max_loss:
+                previous_max_loss = max_loss
+                max_loss = max(structure_max_loss, 1.0)
+                pnl_structure_guard = {
+                    "applied": True,
+                    "previous_max_stop_loss_usdt": round(previous_max_loss, 6),
+                    "max_stop_loss_usdt": round(max_loss, 6),
+                    "expected_profit_usdt": round(expected_profit_usdt, 6),
+                    "expected_net_return_pct": round(expected_net, 6),
+                    "max_loss_multiple": round(max_loss_multiple, 6),
+                    "quality_tier": quality_tier,
+                    "symbol_profit_tier": symbol_profit_tier,
+                    "reason": "按预期净收益动态压缩单笔止损预算，避免小盈大亏结构。",
+                }
 
         notional_floor_blocked = ""
         if target_min_notional > 0:
@@ -6367,6 +6493,7 @@ class TradingService:
             "meaningful_size_reason": meaningful_size_reason,
             "same_side_existing_winner": existing_winner,
             "risk_budget_boost": risk_budget_boost,
+            "pnl_structure_guard": pnl_structure_guard,
             "notional_floor_applied": current_size > original_size_before_floor,
             "original_notional_usdt": round(original_notional, 6),
             "target_min_notional_usdt": round(target_min_notional, 6),
