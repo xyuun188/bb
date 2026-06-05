@@ -14014,17 +14014,35 @@ class TradingService:
 
         min_profit = max(PROFIT_PROTECTION_MIN_NET_USDT * 0.25, 0.05)
         if total_unrealized <= min_profit:
+            non_profit_exit_evidence = bool(
+                close_evidence.get("hard_risk")
+                or close_evidence.get("raw_hard_risk")
+                or close_evidence.get("position_loss")
+                or close_evidence.get("strong_opposite_pressure")
+                or close_evidence.get("moderate_opposite_pressure")
+                or close_evidence.get("profit_retrace_protection")
+                or close_evidence.get("predictive_reversal_exit")
+                or close_evidence.get("predictive_full_exit")
+            )
             raw["execution_profit_protection_guard"] = {
-                "applied": True,
+                "applied": not non_profit_exit_evidence,
                 "latest_price": latest_price,
                 "target_side": target_side,
                 "estimated_unrealized_pnl_from_price": round(estimated_unrealized, 6),
                 "reported_unrealized_pnl": round(reported_unrealized, 6) if reported_available else None,
                 "estimated_unrealized_pnl": round(total_unrealized, 6),
                 "min_required_profit": round(min_profit, 6),
-                "reason": "最新价格复核显示该仓位已不满足利润保护条件。",
+                "non_profit_exit_evidence": non_profit_exit_evidence,
+                "reason": (
+                    "最新价格复核显示该仓位已不满足纯锁盈条件；但存在趋势反转/硬风险证据，"
+                    "本次不再按锁盈不足拦截，继续交给平仓执行。"
+                    if non_profit_exit_evidence
+                    else "最新价格复核显示该仓位已不满足纯锁盈条件。"
+                ),
             }
             decision.raw_response = raw
+            if non_profit_exit_evidence:
+                return None
             return (
                 f"利润保护执行前复核未通过：按最新价格 {latest_price:g} 估算该仓位浮盈为 "
                 f"{total_unrealized:.4f}U，未达到锁盈所需最小浮盈 {min_profit:.4f}U；"

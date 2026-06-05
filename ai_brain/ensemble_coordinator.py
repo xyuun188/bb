@@ -71,6 +71,7 @@ PROFIT_PROTECT_STRONG_MIN_LOCK_USDT = 2.50
 PROFIT_PROTECT_FULL_MIN_LOCK_USDT = 4.00
 PROFIT_PROTECT_MODERATE_OPPOSITE_SCORE = 0.10
 PROFIT_PROTECT_REDUCE_SIZE = 0.45
+PROFIT_EXIT_ANALYSIS_MIN_FLOOR_USDT = 0.75
 MIN_DISCRETIONARY_CLOSE_HOLD_MINUTES = 4.0
 EARLY_CLOSE_MIN_RISK_USAGE = 0.70
 LOSS_REDUCE_MIN_RISK_USAGE = 0.55
@@ -4126,6 +4127,11 @@ class EnsembleCoordinator:
             - estimated_fee_usdt * PROFIT_PROTECT_REDUCE_SIZE,
             0.0,
         )
+        analysis_profit_exit_floor = max(
+            PROFIT_EXIT_ANALYSIS_MIN_FLOOR_USDT,
+            estimated_fee_usdt * PROFIT_LOCK_FEE_MULTIPLE,
+        )
+        profit_floor_ready = position_unrealized_pnl >= analysis_profit_exit_floor
         meaningful_reduce_lock = expected_reduce_lock_net >= meaningful_reduce_lock_line
         portfolio_focus_lock_line = max(
             PORTFOLIO_FOCUS_LOCK_MIN_USDT,
@@ -4258,16 +4264,19 @@ class EnsembleCoordinator:
             )
         )
         profit_lock_ready_for_exit = bool(
-            profit_protect
-            or strong_profit
-            or full_profit
-            or quick_profit
-            or rotation_profit
-            or quick_full_profit
-            or profit_retrace_protection
-            or predictive_reduce_lock_ready
-            or predictive_full_lock_ready
-            or portfolio_focus_profit_lock
+            profit_floor_ready
+            and (
+                profit_protect
+                or strong_profit
+                or full_profit
+                or quick_profit
+                or rotation_profit
+                or quick_full_profit
+                or profit_retrace_protection
+                or predictive_reduce_lock_ready
+                or predictive_full_lock_ready
+                or portfolio_focus_profit_lock
+            )
         )
         abnormal_wick_max_pct = self._safe_float(getattr(features, "abnormal_wick_max_pct", 0.0), 0.0) if features else 0.0
         abnormal_wick_count = int(self._safe_float(getattr(features, "abnormal_wick_count_72h", 0.0), 0.0)) if features else 0
@@ -4603,6 +4612,8 @@ class EnsembleCoordinator:
             "position_profit_pct": round(position_profit_pct, 6),
             "profit_protection": bool(should_close and position_profit and profit_lock_ready_for_exit),
             "profit_lock_ready_for_exit": bool(profit_lock_ready_for_exit),
+            "profit_floor_ready_for_exit": bool(profit_floor_ready),
+            "analysis_profit_exit_floor_usdt": round(analysis_profit_exit_floor, 6),
             "portfolio_profit_focus": bool(portfolio_profit_focus),
             "portfolio_focus_profit_lock": bool(portfolio_focus_profit_lock),
             "portfolio_profit_share": round(portfolio_profit_share, 6),
