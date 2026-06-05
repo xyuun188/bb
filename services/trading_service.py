@@ -42,6 +42,8 @@ from services.equity_baseline import apply_daily_equity_baseline
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.ml_signal_service import AUTO_TRAIN_CHECK_INTERVAL_SECONDS, MLSignalService
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.strategy_arbitration import arbitrate_decision
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
@@ -6964,9 +6966,48 @@ class TradingService:
 
         execution_result = None
         model_mode = self._get_model_execution_mode(model_name)
+
+        async def mark_stage(
+            stage: str,
+            status: str,
+            reason: str,
+            data: dict[str, Any] | None = None,
+        ) -> None:
+            await self._record_and_persist_decision_stage(
+                decision_db_id,
+                decision,
+                stage,
+                status,
+                reason,
+                data,
+            )
+
+        async def mark_blocked(reason: str, data: dict[str, Any] | None = None) -> None:
+            await mark_stage(
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.BLOCKED,
+                reason,
+                data,
+            )
+
+        arbitration = arbitrate_decision(decision)
+        await mark_stage(
+            DecisionStage.STRATEGY_ARBITRATION,
+            arbitration.status,
+            arbitration.reason,
+            arbitration.data,
+        )
+        if decision.is_entry or decision.is_exit:
+            await mark_stage(
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.PENDING,
+                "已进入执行前严重风险检查。",
+                {"mode": model_mode},
+            )
         if decision_db_id is not None:
             duplicate_reason = await self._duplicate_decision_order_reason(decision_db_id, decision)
             if duplicate_reason:
+                await mark_blocked(duplicate_reason, {"blocker": "duplicate_decision_order"})
                 await self._mark_decision_reason(decision_db_id, duplicate_reason)
                 results["decisions"].append({
                     "model": model_name,
@@ -6993,6 +7034,7 @@ class TradingService:
                 )
                 if not exchange_has_position:
                     reason = self._no_matching_exit_position_reason(decision)
+                    await mark_blocked(reason, {"blocker": "no_matching_exit_position"})
                     if decision_db_id is not None:
                         await self._mark_decision_reason(decision_db_id, reason)
                     results["decisions"].append({
@@ -7020,6 +7062,7 @@ class TradingService:
                 exit_positions,
             )
             if loss_partial_reason:
+                await mark_blocked(loss_partial_reason, {"blocker": "loss_partial_exit_guard"})
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, loss_partial_reason)
                     await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -7044,6 +7087,7 @@ class TradingService:
 
             recent_exit_reason = self._recent_exit_cooldown_reason(model_name, decision)
             if recent_exit_reason:
+                await mark_blocked(recent_exit_reason, {"blocker": "recent_exit_cooldown"})
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, recent_exit_reason)
                     await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -7065,6 +7109,7 @@ class TradingService:
                 exit_positions,
             )
             if profit_exit_guard_reason:
+                await mark_blocked(profit_exit_guard_reason, {"blocker": "profit_exit_precheck"})
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, profit_exit_guard_reason)
                 await self._log_risk_event(
@@ -7088,6 +7133,7 @@ class TradingService:
 
             guard_reason = await self._exit_fee_churn_guard_reason(model_name, decision)
             if guard_reason:
+                await mark_blocked(guard_reason, {"blocker": "exit_fee_churn_guard"})
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, guard_reason)
                 if self._position_review_alert_context(decision):
@@ -7111,6 +7157,7 @@ class TradingService:
 
         stale_reason = self._stale_decision_reason(decision)
         if stale_reason:
+            await mark_blocked(stale_reason, {"blocker": "stale_decision"})
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, stale_reason)
                 await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -7135,6 +7182,7 @@ class TradingService:
 
         abnormal_wick_reason = self._abnormal_wick_entry_guard_reason(decision)
         if abnormal_wick_reason:
+            await mark_blocked(abnormal_wick_reason, {"blocker": "abnormal_wick_entry_guard"})
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, abnormal_wick_reason)
                 await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -7160,6 +7208,7 @@ class TradingService:
 
         price_guard_reason = await self._pre_execution_price_guard_reason(decision)
         if price_guard_reason:
+            await mark_blocked(price_guard_reason, {"blocker": "pre_execution_price_guard"})
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, price_guard_reason)
             await self._log_risk_event(
@@ -7195,6 +7244,7 @@ class TradingService:
             if decision_db_id is not None:
                 await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
             if high_risk_reason:
+                await mark_blocked(high_risk_reason, {"blocker": "high_risk_review"})
                 if decision_db_id is not None:
                     await self._mark_decision_reason(decision_db_id, high_risk_reason)
                 results["decisions"].append({
@@ -7211,6 +7261,20 @@ class TradingService:
                 return None
             if decision_db_id is not None:
                 await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
+
+        if decision.is_entry or decision.is_exit:
+            await mark_stage(
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.PASSED,
+                "执行前严重风险检查通过，进入交易所提交阶段。",
+                {"mode": model_mode},
+            )
+            await mark_stage(
+                DecisionStage.EXCHANGE_SUBMIT,
+                DecisionStageStatus.PENDING,
+                "正在提交 OKX 订单并等待交易所返回结果。",
+                {"mode": model_mode},
+            )
 
         override_balance = None
         try:
@@ -7237,6 +7301,18 @@ class TradingService:
                 else None
             )
             if decision.is_entry and execution_guard_reason:
+                await mark_stage(
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.BLOCKED,
+                    execution_guard_reason,
+                    {"blocker": "execution_agent_skills"},
+                )
+                await mark_stage(
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.SKIPPED,
+                    "执行前守门模块拦截，未向 OKX 提交订单。",
+                    {"blocker": "execution_agent_skills"},
+                )
                 execution_result = self._rejected_execution_result(
                     decision,
                     execution_guard_reason,
@@ -7272,6 +7348,12 @@ class TradingService:
                     "本轮按未执行处理，下一轮会继续复盘该仓位。"
                 ),
             )
+            await mark_stage(
+                DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStageStatus.FAILED,
+                self._execution_reason_from_result(execution_result),
+                {"error_type": "timeout"},
+            )
             await self._log_risk_event(
                 "warning",
                 symbol,
@@ -7288,6 +7370,12 @@ class TradingService:
                 error=str(e),
             )
             execution_result = self._rejected_execution_result(decision, e)
+            await mark_stage(
+                DecisionStage.EXCHANGE_SUBMIT,
+                DecisionStageStatus.FAILED,
+                self._execution_reason_from_result(execution_result),
+                {"error_type": "exception"},
+            )
             await self._log_risk_event(
                 "warning",
                 symbol,
@@ -7299,6 +7387,12 @@ class TradingService:
             retry_intro = (
                 "平仓裁决已生成，但第一次提交没有返回 OKX 订单结果；"
                 "系统立即同步 OKX 仓位并重试一次平仓，避免错过平仓时机。"
+            )
+            await mark_stage(
+                DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStageStatus.FAILED,
+                retry_intro,
+                {"retry": "exit_missing_execution_result"},
             )
             if decision_db_id is not None:
                 await self._mark_decision_pending_execution(decision_db_id, retry_intro)
@@ -7393,6 +7487,42 @@ class TradingService:
             await self._log_trade(execution_result, model_name, decision, decision_db_id)
             exchange_confirmed = self._is_exchange_confirmed_execution(execution_result)
             exit_progress = self._is_exit_progress_execution(execution_result)
+            confirm_reason = self._execution_reason_from_result(execution_result)
+            if exchange_confirmed:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.COMPLETED,
+                    "OKX 已返回有效订单号并确认成交。",
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                        "price": execution_result.price,
+                        "quantity": execution_result.quantity,
+                    },
+                )
+            elif exit_progress:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.PENDING,
+                    confirm_reason,
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                    },
+                )
+            else:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.FAILED,
+                    confirm_reason,
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                    },
+                )
             if (
                 decision.is_exit
                 and not exchange_confirmed
@@ -7418,6 +7548,19 @@ class TradingService:
                     )
                 if decision.is_exit:
                     self._remember_recent_exit_group(model_name, decision)
+                await mark_stage(
+                    DecisionStage.LOCAL_SYNC,
+                    DecisionStageStatus.COMPLETED,
+                    "成交结果已写入本地订单/持仓记录。",
+                    {"exit_progress": bool(exit_progress), "exchange_confirmed": bool(exchange_confirmed)},
+                )
+            else:
+                await mark_stage(
+                    DecisionStage.LOCAL_SYNC,
+                    DecisionStageStatus.SKIPPED,
+                    "交易所未确认成交，本地未改动持仓。",
+                    {"exchange_confirmed": bool(exchange_confirmed), "exit_progress": bool(exit_progress)},
+                )
             results["executions"].append({
                 "model": model_name,
                 "symbol": symbol,
@@ -7434,6 +7577,7 @@ class TradingService:
                 )
             if decision_db_id is not None and exchange_confirmed:
                 await self._mark_decision_executed(decision_db_id, execution_result.price)
+                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
                 if decision.is_entry:
                     self._clear_market_no_opportunity_symbol(symbol)
             elif decision_db_id is not None:
@@ -7441,6 +7585,7 @@ class TradingService:
                     decision_db_id,
                     self._execution_reason_from_result(execution_result),
                 )
+                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
             if model_mode != "paper" and decision.is_exit and execution_result.pnl != 0.0:
                 await self._persist_account_update(model_name, decision.model_name, execution_result)
                 if decision_db_id is not None:
@@ -7459,8 +7604,21 @@ class TradingService:
                 "交易接口未返回执行结果，系统没有拿到 OKX 订单号，也没有生成本地订单；"
                 "本次裁决已按未执行处理。"
             )
+            await mark_stage(
+                DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStageStatus.FAILED,
+                missing_result_reason,
+                {"error_type": "missing_execution_result"},
+            )
+            await mark_stage(
+                DecisionStage.LOCAL_SYNC,
+                DecisionStageStatus.SKIPPED,
+                "没有成交结果，本地持仓未改动。",
+                {"error_type": "missing_execution_result"},
+            )
             if decision_db_id is not None:
                 await self._mark_decision_reason(decision_db_id, missing_result_reason)
+                await self._mark_decision_raw_response(decision_db_id, decision.raw_response)
             if self._position_review_alert_context(decision):
                 await self._log_position_review_risk_result(
                     decision,
@@ -14283,6 +14441,18 @@ class TradingService:
                     analysis_type = "position"
                 else:
                     analysis_type = "market"
+                raw_response = append_decision_stage(
+                    raw_response,
+                    DecisionStage.AI_ANALYSIS,
+                    DecisionStageStatus.COMPLETED,
+                    "AI 已完成分析并生成裁决。",
+                    data={
+                        "analysis_type": analysis_type,
+                        "action": decision.action.value,
+                        "confidence": float(decision.confidence or 0.0),
+                    },
+                )
+                decision.raw_response = raw_response
                 display_symbol = self._normalize_position_symbol(decision.symbol) or decision.symbol
                 record = await repo.log_decision({
                     "model_name": decision.model_name,
@@ -15102,6 +15272,39 @@ class TradingService:
         if fallback:
             return str(fallback)
         return None
+
+    def _record_decision_stage(
+        self,
+        decision: DecisionOutput,
+        stage: str,
+        status: str,
+        reason: str | None,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw = append_decision_stage(
+            raw,
+            stage,
+            status,
+            sanitize_text(reason) if reason else "",
+            data=self._json_safe_payload(data or {}) if data else None,
+        )
+        decision.raw_response = raw
+        return raw
+
+    async def _record_and_persist_decision_stage(
+        self,
+        decision_id: int | None,
+        decision: DecisionOutput,
+        stage: str,
+        status: str,
+        reason: str | None,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw = self._record_decision_stage(decision, stage, status, reason, data)
+        if decision_id is not None:
+            await self._mark_decision_raw_response(decision_id, raw)
+        return raw
 
     async def _mark_decision_reason(self, decision_id: int, reason: str | None) -> None:
         try:

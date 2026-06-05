@@ -2854,6 +2854,131 @@ async def get_analysis_records(
     }
 
 
+@router.get("/profit-attribution")
+async def get_profit_attribution(
+    mode: str | None = None,
+    hours: int = 24,
+    limit: int = 200,
+):
+    """Explain why recent closed trades made or lost money."""
+    from db.session import get_session_ctx
+    from models.decision import AIDecision
+    from models.learning import ShadowBacktest
+    from models.trade import Order, Position
+    from services.profit_attribution import build_profit_attribution
+    from sqlalchemy import or_, select
+
+    selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    is_paper = selected_mode == "paper"
+    capped_hours = max(1, min(int(hours or 24), 720))
+    max_rows = max(20, min(int(limit or 200), 1000))
+    since = datetime.now(timezone.utc) - timedelta(hours=capped_hours)
+
+    async with get_session_ctx() as session:
+        position_result = await session.execute(
+            select(Position)
+            .where(
+                Position.model_name == ENSEMBLE_TRADER_NAME,
+                Position.execution_mode == selected_mode,
+                Position.is_open.is_(False),
+                Position.closed_at.is_not(None),
+                Position.closed_at >= since,
+            )
+            .order_by(Position.closed_at.desc(), Position.created_at.desc())
+            .limit(max_rows)
+        )
+        positions = list(position_result.scalars().all())
+        if not positions:
+            return {
+                "mode": selected_mode,
+                "window_hours": capped_hours,
+                "summary": {
+                    "trade_count": 0,
+                    "total_closed_pnl": 0.0,
+                    "win_count": 0,
+                    "loss_count": 0,
+                    "win_rate": 0.0,
+                    "avg_win": 0.0,
+                    "avg_loss": 0.0,
+                    "profit_factor": 0.0,
+                },
+                "buckets": [],
+                "records": [],
+                "message": "最近窗口内暂无已平仓记录。",
+            }
+
+        symbols = {p.symbol for p in positions if p.symbol}
+        earliest_position_time = min(
+            (_as_utc_datetime(p.created_at) for p in positions if p.created_at),
+            default=since,
+        )
+        order_since = min(since, earliest_position_time or since) - timedelta(hours=2)
+        order_result = await session.execute(
+            select(Order)
+            .where(
+                Order.model_name == ENSEMBLE_TRADER_NAME,
+                Order.execution_mode == selected_mode,
+                Order.symbol.in_(symbols) if symbols else Order.id == -1,
+                Order.created_at >= order_since,
+            )
+            .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
+            .limit(max_rows * 8)
+        )
+        orders = list(order_result.scalars().all())
+
+        decision_ids = {int(o.decision_id) for o in orders if o.decision_id}
+        decision_conditions = []
+        if decision_ids:
+            decision_conditions.append(AIDecision.id.in_(decision_ids))
+        if symbols:
+            decision_conditions.append(
+                (
+                    AIDecision.model_name == ENSEMBLE_TRADER_NAME
+                )
+                & (AIDecision.symbol.in_(symbols))
+                & (AIDecision.is_paper.is_(is_paper))
+                & (AIDecision.created_at >= order_since)
+            )
+        decisions = []
+        if decision_conditions:
+            decision_result = await session.execute(
+                select(AIDecision)
+                .where(or_(*decision_conditions))
+                .order_by(AIDecision.created_at.desc())
+                .limit(max_rows * 10)
+            )
+            decisions = list(decision_result.scalars().all())
+
+        shadow_conditions = []
+        if decision_ids:
+            shadow_conditions.append(ShadowBacktest.decision_id.in_(decision_ids))
+        if symbols:
+            shadow_conditions.append(
+                (ShadowBacktest.symbol.in_(symbols))
+                & (ShadowBacktest.execution_mode == selected_mode)
+                & (ShadowBacktest.created_at >= order_since)
+            )
+        shadows = []
+        if shadow_conditions:
+            shadow_result = await session.execute(
+                select(ShadowBacktest)
+                .where(or_(*shadow_conditions))
+                .order_by(ShadowBacktest.created_at.desc())
+                .limit(max_rows * 10)
+            )
+            shadows = list(shadow_result.scalars().all())
+
+    payload = build_profit_attribution(positions, orders, decisions, shadows)
+    return sanitize_payload({
+        "mode": selected_mode,
+        "window_hours": capped_hours,
+        "sample_limit": max_rows,
+        "since": since.isoformat(),
+        **payload,
+        "message": "按已平仓真实盈亏，结合 AI 决策、订单、影子复盘和本地模型证据做交易级归因。",
+    })
+
+
 @router.get("/model-contribution/stats")
 async def get_model_contribution_stats(
     mode: str | None = None,

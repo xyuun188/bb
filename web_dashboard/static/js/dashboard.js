@@ -60,6 +60,7 @@ const state = {
     mlSignalPage: 1,
     tradesTotalPages: 1,
     openingFunnel: null,
+    profitAttribution: null,
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
@@ -1251,6 +1252,7 @@ function initSidebarNav() {
             if (page === 'daily-pnl') fetchDailyPnlRecords();
             if (page === 'decisions') { populateDecisionModelFilter(); fetchAllDecisions(); }
             if (page === 'opening-funnel') fetchOpeningFunnel();
+            if (page === 'profit-attribution') fetchProfitAttribution();
             if (page === 'analysis') fetchAnalysisRecords();
             if (page === 'alerts') fetchRiskEvents();
             if (page === 'expert-memory') fetchExpertMemories();
@@ -1293,6 +1295,7 @@ function initModeButtons() {
             fetchAllDecisions();
             fetchAnalysisRecords();
             if (isPageActive('opening-funnel')) fetchOpeningFunnel();
+            if (isPageActive('profit-attribution')) fetchProfitAttribution();
             if (isPageActive('expert-memory')) fetchExpertMemories();
             fetchPositions();
             fetchPositionHistory();
@@ -5924,6 +5927,184 @@ function renderTrainableModels() {
         <div class="ml-train-model-list ml-train-model-list-clear">
             ${models.map(renderReadableTrainableModelCard).join('')}
         </div>`;
+}
+
+// ========== Profit Attribution ==========
+async function fetchProfitAttribution() {
+    const hoursEl = document.getElementById('profit-attribution-hours');
+    const hours = hoursEl ? Number(hoursEl.value || 24) : 24;
+    const mode = state.mode || 'paper';
+    const data = await fetchJSON(`/api/profit-attribution?mode=${mode}&hours=${hours}&limit=300&_=${Date.now()}`);
+    state.profitAttribution = data || null;
+    renderProfitAttribution();
+}
+
+function renderProfitAttribution() {
+    const data = state.profitAttribution || {};
+    renderProfitAttributionSummary(data);
+    renderProfitAttributionBuckets(data);
+    renderProfitAttributionState(data);
+    renderProfitAttributionRecords(data);
+    const updated = document.getElementById('profit-attribution-updated');
+    if (updated) {
+        const modeLabel = data.mode === 'live' ? '实盘' : '模拟盘';
+        updated.textContent = `${modeLabel} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString()}`;
+    }
+}
+
+function renderProfitAttributionSummary(data) {
+    const el = document.getElementById('profit-attribution-summary');
+    if (!el) return;
+    const summary = data.summary || {};
+    const pnl = Number(summary.total_closed_pnl || 0);
+    const trades = Number(summary.trade_count || 0);
+    const tone = pnl > 0 ? 'good' : pnl < 0 ? 'warn' : 'muted';
+    if (!trades) {
+        el.innerHTML = `
+            <div class="opening-funnel-verdict opening-funnel-muted">
+                <strong>暂无已平仓样本</strong>
+                <span>${escHtml(data.message || '最近窗口内没有可归因的交易。')}</span>
+            </div>`;
+        return;
+    }
+    el.innerHTML = `
+        <div class="opening-funnel-verdict opening-funnel-${tone}">
+            <strong>${signedMoney(pnl)} U</strong>
+            <span>最近 ${data.window_hours || 24} 小时已平仓 ${trades} 笔，胜率 ${pctLabel(summary.win_rate, 1)}，盈亏比 ${Number(summary.profit_factor || 0).toFixed(2)}。</span>
+        </div>
+        <div class="opening-funnel-kpis">
+            <div><span>盈利 / 亏损</span><strong>${Number(summary.win_count || 0)} / ${Number(summary.loss_count || 0)}</strong></div>
+            <div><span>平均盈利</span><strong>${signedMoney(summary.avg_win || 0)} U</strong></div>
+            <div><span>平均亏损</span><strong>-${fmtMoney(summary.avg_loss || 0)} U</strong></div>
+            <div><span>小盈 / 大亏</span><strong>${Number(summary.small_win_count || 0)} / ${Number(summary.large_loss_count || 0)}</strong></div>
+        </div>`;
+}
+
+function renderProfitAttributionBuckets(data) {
+    const el = document.getElementById('profit-attribution-buckets');
+    if (!el) return;
+    const rows = Array.isArray(data.buckets) ? data.buckets : [];
+    if (!rows.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂无归因桶。</div>';
+        return;
+    }
+    const maxAbs = Math.max(...rows.map(row => Math.abs(Number(row.pnl || 0))), 1);
+    el.innerHTML = rows.map(row => {
+        const pnl = Number(row.pnl || 0);
+        const width = Math.max(4, Math.abs(pnl) / maxAbs * 100);
+        const color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        return `
+            <div class="opening-funnel-row opening-funnel-reason-row">
+                <div><strong>${escHtml(row.label || row.key || '-')}</strong><span>${Number(row.count || 0)} 笔 · 均值 ${signedMoney(row.avg_pnl || 0)} U</span></div>
+                <div class="opening-funnel-bar"><span style="width:${width}%;background:${color};"></span></div>
+                <em style="color:${color};">${signedMoney(pnl)} U</em>
+            </div>`;
+    }).join('');
+}
+
+function renderProfitAttributionState(data) {
+    const el = document.getElementById('profit-attribution-state');
+    if (!el) return;
+    const records = Array.isArray(data.records) ? data.records : [];
+    const counts = {};
+    records.forEach(row => {
+        const summary = row.decision_state?.summary || {};
+        const label = summary.final_status
+            ? `${stateStageLabel(summary.final_stage)} / ${stateStatusLabel(summary.final_status)}`
+            : '无状态机记录';
+        counts[label] = (counts[label] || 0) + 1;
+    });
+    const items = Object.entries(counts);
+    if (!items.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂无状态机样本。</div>';
+        return;
+    }
+    const max = Math.max(...items.map(([, count]) => Number(count || 0)), 1);
+    el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([label, count]) => `
+        <div class="opening-funnel-row opening-funnel-symbol-row">
+            <div><strong>${escHtml(label)}</strong><span>${Number(count || 0)} 笔</span></div>
+            <div class="opening-funnel-bar"><span style="width:${Math.max(4, Number(count || 0) / max * 100)}%;"></span></div>
+            <em>${Number(count || 0)}</em>
+        </div>`).join('');
+}
+
+function renderProfitAttributionRecords(data) {
+    const tbody = document.getElementById('profit-attribution-tbody');
+    if (!tbody) return;
+    const rows = Array.isArray(data.records) ? data.records : [];
+    if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无归因数据</td></tr>';
+        return;
+    }
+    tbody.innerHTML = rows.map(row => {
+        const pnl = Number(row.realized_pnl || 0);
+        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const entryDecision = row.entry_decision || {};
+        const signals = row.signals || {};
+        const shadow = row.shadow || {};
+        const stateSummary = row.decision_state?.summary || {};
+        const stateText = stateSummary.final_stage
+            ? `${stateStageLabel(stateSummary.final_stage)}：${stateStatusLabel(stateSummary.final_status)}`
+            : '无状态机记录';
+        const evidence = [
+            `AI ${escHtml(entryDecision.action_label || '-')}`,
+            `ML ${sideZh(signals.ml?.side)}`,
+            `盈利模型 ${sideZh(signals.server_profit?.side)}`,
+            `时序 ${sideZh(signals.timeseries?.side)}`,
+            shadow.best_action ? `影子 ${sideZh(shadow.best_action)}` : '',
+        ].filter(Boolean).join('<br>');
+        const notes = Array.isArray(row.notes) && row.notes.length
+            ? `<div style="color:var(--text-muted);margin-top:4px;">${row.notes.map(escHtml).join('；')}</div>`
+            : '';
+        return `
+            <tr>
+                <td>${toBeijingTime(row.closed_at)}</td>
+                <td>${escHtml(row.symbol || '-')}</td>
+                <td>${escHtml(row.side_label || sideZh(row.side))}</td>
+                <td style="color:${pnlColor};font-weight:700;">${signedMoney(pnl)} U</td>
+                <td>${Number(row.hold_minutes || 0).toFixed(1)} 分钟</td>
+                <td><strong>${escHtml(row.main_reason || '-')}</strong>${notes}<div style="color:var(--text-muted);font-size:11px;">置信度 ${confidenceZh(row.attribution_confidence)}</div></td>
+                <td>${evidence || '-'}</td>
+                <td><strong>${escHtml(stateText)}</strong><div style="color:var(--text-muted);font-size:11px;">${escHtml(stateSummary.final_reason || '')}</div></td>
+            </tr>`;
+    }).join('');
+}
+
+function sideZh(side) {
+    const value = String(side || '').toLowerCase();
+    if (value === 'long') return '做多';
+    if (value === 'short') return '做空';
+    if (value === 'hold') return '观望';
+    return '-';
+}
+
+function stateStageLabel(stage) {
+    const labels = {
+        ai_analysis: 'AI分析',
+        strategy_arbitration: '策略仲裁',
+        risk_check: '风控检查',
+        exchange_submit: 'OKX提交',
+        exchange_confirm: '成交确认',
+        local_sync: '本地同步',
+    };
+    return labels[stage] || stage || '-';
+}
+
+function stateStatusLabel(status) {
+    const labels = {
+        pending: '处理中',
+        passed: '通过',
+        blocked: '拦截',
+        failed: '失败',
+        skipped: '跳过',
+        completed: '完成',
+    };
+    return labels[status] || status || '-';
+}
+
+function confidenceZh(value) {
+    const labels = { high: '高', medium: '中', low: '低' };
+    return labels[String(value || '').toLowerCase()] || '中';
 }
 
 // ========== Opening Funnel ==========

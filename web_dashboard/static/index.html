@@ -17,7 +17,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260531mlreadable">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260605attribution">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -38,6 +38,9 @@
             </button>
             <button class="nav-item" data-page="opening-funnel">
                 <span class="nav-icon">⏱</span> 开仓漏斗
+            </button>
+            <button class="nav-item" data-page="profit-attribution">
+                <span class="nav-icon">◎</span> 策略复盘
             </button>
             <button class="nav-item" data-page="trades">
                 <span class="nav-icon">📋</span> 执行记录
@@ -585,6 +588,71 @@
             </div>
         </div>
 
+        <!-- ═══════ PAGE: PROFIT ATTRIBUTION ═══════ -->
+        <div class="page-section" id="page-profit-attribution">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">策略复盘 / 盈利归因</span>
+                    <div class="opening-funnel-controls">
+                        <span class="card-subtitle" id="profit-attribution-updated">等待刷新</span>
+                        <select class="form-input" id="profit-attribution-hours" onchange="fetchProfitAttribution()">
+                            <option value="6">最近 6 小时</option>
+                            <option value="24" selected>最近 24 小时</option>
+                            <option value="72">最近 3 天</option>
+                            <option value="168">最近 7 天</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="fetchProfitAttribution()">刷新</button>
+                    </div>
+                </div>
+                <div class="opening-funnel-body">
+                    <div class="opening-funnel-summary" id="profit-attribution-summary">
+                        <div class="opening-funnel-empty">加载中...</div>
+                    </div>
+                    <div class="opening-funnel-columns">
+                        <div class="opening-funnel-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">主要归因</span>
+                                <span class="analysis-section-subtitle">按真实已平仓盈亏聚合</span>
+                            </div>
+                            <div id="profit-attribution-buckets" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">决策链路状态机</span>
+                                <span class="analysis-section-subtitle">AI分析 → 策略仲裁 → 风控 → OKX → 同步</span>
+                            </div>
+                            <div id="profit-attribution-state" class="opening-funnel-list"></div>
+                        </div>
+                    </div>
+                    <div class="opening-funnel-panel opening-funnel-panel-full" style="margin-top:14px;">
+                        <div class="analysis-section-head">
+                            <span class="analysis-section-title">逐笔交易归因</span>
+                            <span class="analysis-section-subtitle">显示每一笔赚亏主要来自哪一环</span>
+                        </div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>平仓时间</th>
+                                        <th>币种</th>
+                                        <th>方向</th>
+                                        <th>已实现盈亏</th>
+                                        <th>持仓</th>
+                                        <th>主要归因</th>
+                                        <th>AI/ML/影子复盘</th>
+                                        <th>执行链路</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="profit-attribution-tbody">
+                                    <tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无归因数据</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- ═══════ PAGE: ANALYSIS RECORDS ═══════ -->
         <div class="page-section" id="page-analysis">
             <div class="card">
@@ -1124,6 +1192,6 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-<script src="/static/js/dashboard.js?v=20260602decisionaction"></script>
+<script src="/static/js/dashboard.js?v=20260605attribution"></script>
 </body>
 </html>
