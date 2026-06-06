@@ -6088,6 +6088,7 @@ function renderProfitAttributionRecords(data) {
             `ML ${sideZh(signals.ml?.side)}`,
             `盈利模型 ${sideZh(signals.server_profit?.side)}`,
             `时序 ${sideZh(signals.timeseries?.side)}`,
+            `情绪 ${sideZh(signals.sentiment?.side)}`,
             shadow.best_action ? `影子 ${sideZh(shadow.best_action)}` : '',
         ].filter(Boolean).join('<br>');
         const notes = Array.isArray(row.notes) && row.notes.length

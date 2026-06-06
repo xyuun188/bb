@@ -3,7 +3,52 @@ from datetime import datetime, timedelta, timezone
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.trade import Order, Position
-from services.profit_attribution import build_profit_attribution
+from services.profit_attribution import build_profit_attribution, extract_signal_sides
+
+
+def test_extract_signal_sides_reads_current_quant_tool_keys():
+    signals = extract_signal_sides({
+        "ml_signal": {
+            "predictions": [
+                {"best_side": "short", "best_expected_return_pct": 0.4235}
+            ],
+        },
+        "local_ai_tools": {
+            "profit_prediction": {
+                "available": True,
+                "trained": True,
+                "best_side": "short",
+                "expected_return_pct": 0.3566,
+            },
+            "time_series_prediction": {
+                "available": True,
+                "trained": True,
+                "best_side": "short",
+                "side": "short",
+                "direction": "down",
+                "expected_return_pct": -0.094,
+            },
+            "sentiment_analysis": {
+                "available": True,
+                "trained": True,
+                "best_side": "long",
+                "side": "long",
+                "expected_return_pct": 0.5803,
+            },
+        },
+    })
+
+    assert signals["ml"]["available"] is True
+    assert signals["ml"]["side"] == "short"
+    assert signals["server_profit"]["available"] is True
+    assert signals["server_profit"]["side"] == "short"
+    assert signals["server_profit"]["expected_return_pct"] == 0.3566
+    assert signals["timeseries"]["available"] is True
+    assert signals["timeseries"]["side"] == "short"
+    assert signals["timeseries"]["expected_return_pct"] == -0.094
+    assert signals["sentiment"]["available"] is True
+    assert signals["sentiment"]["side"] == "long"
+    assert signals["sentiment"]["expected_return_pct"] == 0.5803
 
 
 def test_profit_attribution_flags_direction_error_from_shadow_backtest():

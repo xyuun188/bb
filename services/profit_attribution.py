@@ -98,21 +98,90 @@ def _payload_side(payload: dict[str, Any] | None, side_key: str = "best_side") -
     return ""
 
 
+def _first_tool_payload(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
+    """Return the first model payload across legacy and current tool containers."""
+    containers = (
+        raw.get("local_ai_tools"),
+        raw.get("server_quant_tools"),
+        raw.get("quant_tools"),
+        raw.get("local_tools"),
+        raw.get("server_tools"),
+        raw,
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def _signal_available(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    for key in ("available", "enabled", "ok"):
+        if key in payload and payload.get(key) is False:
+            return False
+    return True
+
+
+def _expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
+    side = str(side or "").lower()
+    keys: list[str] = []
+    if side in {"long", "short"}:
+        keys.extend([
+            f"expected_{side}_return_pct",
+            f"{side}_expected_return_pct",
+            f"adjusted_{side}_return_pct",
+            f"{side}_return_pct",
+        ])
+    keys.extend([
+        "expected_return_pct",
+        "best_expected_return_pct",
+        "expected_move_pct",
+        "forecast_return_pct",
+        "return_pct",
+        "expected_profit_pct",
+    ])
+    for key in keys:
+        if key in payload:
+            return _safe_float(payload.get(key), 0.0)
+    return 0.0
+
+
 def extract_signal_sides(raw: dict[str, Any]) -> dict[str, Any]:
     ml = raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else {}
     predictions = ml.get("predictions") if isinstance(ml.get("predictions"), list) else []
     primary_ml = predictions[0] if predictions and isinstance(predictions[0], dict) else ml
 
-    local_tools = (
-        raw.get("local_ai_tools")
-        if isinstance(raw.get("local_ai_tools"), dict)
-        else raw.get("server_quant_tools")
-        if isinstance(raw.get("server_quant_tools"), dict)
-        else {}
+    profit = _first_tool_payload(
+        raw,
+        "profit_prediction",
+        "profit_model",
+        "server_profit",
+        "server_profit_model",
+        "profit",
     )
-    profit = local_tools.get("profit_model") if isinstance(local_tools.get("profit_model"), dict) else {}
-    timeseries = local_tools.get("timeseries") if isinstance(local_tools.get("timeseries"), dict) else {}
-    sentiment = local_tools.get("sentiment") if isinstance(local_tools.get("sentiment"), dict) else {}
+    timeseries = _first_tool_payload(
+        raw,
+        "time_series_prediction",
+        "timeseries_prediction",
+        "sequence_prediction",
+        "timeseries",
+        "time_series",
+    )
+    sentiment = _first_tool_payload(
+        raw,
+        "sentiment_analysis",
+        "sentiment_prediction",
+        "sentiment_model",
+        "sentiment",
+    )
+    profit_side = _payload_side(profit)
+    timeseries_side = _payload_side(timeseries)
+    sentiment_side = _payload_side(sentiment)
 
     return {
         "ml": {
@@ -124,18 +193,19 @@ def extract_signal_sides(raw: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "server_profit": {
-            "available": bool(profit),
-            "side": _payload_side(profit),
-            "expected_return_pct": _safe_float(profit.get("expected_return_pct", profit.get("return_pct", 0.0)), 0.0),
+            "available": _signal_available(profit),
+            "side": profit_side,
+            "expected_return_pct": _expected_return_pct(profit, profit_side),
         },
         "timeseries": {
-            "available": bool(timeseries),
-            "side": _payload_side(timeseries),
-            "expected_return_pct": _safe_float(timeseries.get("expected_return_pct", timeseries.get("return_pct", 0.0)), 0.0),
+            "available": _signal_available(timeseries),
+            "side": timeseries_side,
+            "expected_return_pct": _expected_return_pct(timeseries, timeseries_side),
         },
         "sentiment": {
-            "available": bool(sentiment),
-            "side": _payload_side(sentiment),
+            "available": _signal_available(sentiment),
+            "side": sentiment_side,
+            "expected_return_pct": _expected_return_pct(sentiment, sentiment_side),
             "score": _safe_float(sentiment.get("score", sentiment.get("sentiment_score", 0.0)), 0.0),
         },
     }
