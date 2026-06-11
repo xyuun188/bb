@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
 from services.entry_loss_cooldown import EntryLossCooldownPolicy
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 
@@ -52,6 +53,7 @@ class EntryOpportunityGatePolicy:
     evaluator: EntryOpportunityGateEvaluator | None = None
     suspicious_symbol_policy: Any | None = None
     symbol_loss_cooldown_policy: EntryLossCooldownPolicy | None = None
+    crowded_side_cap_policy: EntryCrowdedSideCapPolicy | None = None
     post_crash_rebound_guard: Any | None = None
 
     def gate_reason(self, decision: DecisionOutput) -> str | None:
@@ -99,6 +101,9 @@ class EntryOpportunityGatePolicy:
         symbol_loss_cooldown_reason = self._symbol_loss_cooldown_reason(decision)
         if symbol_loss_cooldown_reason:
             return symbol_loss_cooldown_reason
+        crowded_side_cap_reason = self._crowded_side_cap_reason(decision)
+        if crowded_side_cap_reason:
+            return crowded_side_cap_reason
         post_crash_rebound_reason = self._post_crash_rebound_reason(decision)
         if post_crash_rebound_reason:
             return post_crash_rebound_reason
@@ -444,6 +449,11 @@ class EntryOpportunityGatePolicy:
         if self.symbol_loss_cooldown_policy is None:
             return None
         return self.symbol_loss_cooldown_policy.reason(decision)
+
+    def _crowded_side_cap_reason(self, decision: DecisionOutput) -> str | None:
+        if self.crowded_side_cap_policy is None:
+            return None
+        return self.crowded_side_cap_policy.block_reason(decision)
 
     def _post_crash_rebound_reason(self, decision: DecisionOutput) -> str | None:
         if self.post_crash_rebound_guard is not None:

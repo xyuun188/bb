@@ -52,6 +52,7 @@ from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
 from services.entry_candidate_queue import EntryCandidateQueuePolicy
 from services.entry_capacity import EntryCapacityPolicy
+from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
 from services.entry_evidence_probe import EntryEvidenceProbePolicy
 from services.entry_existing_winner import EntryExistingWinnerContextPolicy
@@ -664,9 +665,11 @@ class TradingService:
             lambda: settings.max_leverage,
             self.entry_probe_market_quality,
         )
+        self.entry_crowded_side_cap = EntryCrowdedSideCapPolicy()
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
             symbol_loss_cooldown_policy=self.entry_loss_cooldown,
+            crowded_side_cap_policy=self.entry_crowded_side_cap,
             post_crash_rebound_guard=self.entry_post_crash_rebound_guard,
         )
         self.entry_low_payoff_quality = EntryLowPayoffQualityPolicy()
@@ -1849,6 +1852,7 @@ class TradingService:
         selected_mode = "live" if mode == "live" else "paper"
         daily_state = await self.daily_performance_service.state(selected_mode)
         side_perf = await self._today_side_performance(selected_mode)
+        side_perf_multiday = await self._multiday_side_performance(selected_mode)
         symbol_side_perf = await self._recent_symbol_side_performance(selected_mode)
         model_contribution_perf = await self._recent_model_contribution_performance(selected_mode)
         position_exposure = self.entry_position_exposure.context(open_positions or [])
@@ -1858,6 +1862,7 @@ class TradingService:
             market_regime=market_regime,
             daily_state=daily_state,
             side_performance=side_perf,
+            side_performance_multiday=side_perf_multiday,
             symbol_side_performance=symbol_side_perf,
             model_contribution_performance=model_contribution_perf,
             position_exposure=position_exposure,
@@ -2027,6 +2032,14 @@ class TradingService:
             service = DailySidePerformanceService()
             self.daily_side_performance_service = service
         return await service.state(mode)
+
+    async def _multiday_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
+        """Recent multi-day realized PnL split by side, for posture feedback."""
+        service = getattr(self, "daily_side_performance_service", None)
+        if service is None:
+            service = DailySidePerformanceService()
+            self.daily_side_performance_service = service
+        return await service.multiday_state(mode, lookback_days=5.0)
 
     async def _recent_symbol_side_performance(self, mode: str) -> dict[str, dict[str, Any]]:
         """Delegate recent symbol/side realized-PnL feedback to a dedicated service."""

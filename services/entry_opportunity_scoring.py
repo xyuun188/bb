@@ -886,6 +886,7 @@ class EntryOpportunityScoringPolicy:
             "risk_penalty": round(risk_penalty, 6),
             "weak_rr_penalty": round(weak_rr_penalty, 6),
             "exposure_penalty": round(exposure_penalty, 6),
+            "position_exposure": exposure if isinstance(exposure, dict) else {},
             "exposure_balance_bonus": round(exposure_balance_bonus, 6),
             "direction_competition": direction_competition,
             "direction_preferred_side": direction_preferred_side,

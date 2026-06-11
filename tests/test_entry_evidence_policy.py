@@ -598,3 +598,62 @@ def test_weak_conflict_probe_sizing_caps_position_and_leverage():
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_budget_caps_loss_to_balanced_probe_limit() -> None:
+    service = _service()
+
+    async def fake_balance(*args, **kwargs):
+        return 1000.0
+
+    service.account_accounting_service = SimpleNamespace(allocated_order_balance=fake_balance)
+
+    class FakeExistingWinnerContext:
+        def context(self, *args, **kwargs):
+            return {"has_winner": False}
+
+    service.entry_existing_winner_context = FakeExistingWinnerContext()
+    service.entry_low_payoff_quality = EntryLowPayoffQualityPolicy()
+    service.entry_stress_stop = EntryStressStopPolicy()
+    service.entry_stop_loss_budget = EntryStopLossBudgetPolicy()
+
+    decision = _decision(
+        Action.SHORT,
+        {
+            "opportunity_score": {
+                "score": 1.6,
+                "min_score_required": 0.55,
+                "expected_net_return_pct": 0.6,
+                "expected_loss_pct": 0.4,
+                "tail_risk_score": 0.2,
+                "raw_expected_return_pct": 0.6,
+                "profit_quality_ratio": 1.0,
+                "server_profit_loss_probability": 0.45,
+                "max_entry_stop_loss_usdt": 16.0,
+                "risk_mode": "normal",
+            },
+            "quant_profit_probe": {
+                "triggered": True,
+                "strong_probe": False,
+                "side": "short",
+                "loss_probability": 0.5,
+            },
+        },
+        confidence=0.62,
+    )
+    decision.position_size_pct = 0.05
+    decision.suggested_leverage = 3.0
+    decision.stop_loss_pct = 0.012
+    decision.feature_snapshot = {"current_price": 100.0}
+
+    await service._apply_entry_profit_risk_sizing(decision, "paper", [])
+
+    sizing = _raw_response(decision)["profit_risk_sizing"]
+    guard = sizing["probe_budget_guard"]
+    assert guard["applied"] is True
+    assert guard["strong_probe"] is False
+    assert guard["max_stop_loss_usdt"] == pytest.approx(5.0)
+    assert guard["previous_max_stop_loss_usdt"] > 5.0
+    # Later structural guards may tighten further, but never above the probe budget.
+    assert sizing["max_stop_loss_usdt"] <= 5.0

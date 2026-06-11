@@ -54,6 +54,8 @@ ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT = 1.50
 ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE = 0.65
 ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = 1.05
 ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = 1.35
+ENTRY_BALANCED_PROBE_MAX_LOSS_USDT = 5.0
+ENTRY_STRONG_PROBE_MAX_LOSS_USDT = 9.0
 
 
 def _settings_max_leverage() -> float:
@@ -71,6 +73,8 @@ class EntryProfitRiskSizingPolicy:
     entry_stress_stop: Any | None = None
     entry_existing_winner_context: Any | None = None
     max_leverage_provider: Callable[[], float] = _settings_max_leverage
+    probe_max_loss_usdt: float = ENTRY_BALANCED_PROBE_MAX_LOSS_USDT
+    strong_probe_max_loss_usdt: float = ENTRY_STRONG_PROBE_MAX_LOSS_USDT
 
     @staticmethod
     def _safe_dict(value: Any) -> dict[str, Any]:
@@ -289,6 +293,24 @@ class EntryProfitRiskSizingPolicy:
         )
         max_loss = stop_loss_budget.max_loss_usdt
         risk_budget_boost = stop_loss_budget.risk_budget_boost
+        probe_budget_guard: dict[str, Any] = {"applied": False}
+        if (quant_probe_triggered or evidence_probe_triggered) and not high_quality_entry:
+            probe_budget = (
+                self.strong_probe_max_loss_usdt if strong_probe else self.probe_max_loss_usdt
+            )
+            if 0.0 < probe_budget < max_loss:
+                probe_budget_guard = {
+                    "applied": True,
+                    "strong_probe": bool(strong_probe),
+                    "previous_max_stop_loss_usdt": round(max_loss, 6),
+                    "max_stop_loss_usdt": round(probe_budget, 6),
+                    "reason": (
+                        "\u63a2\u9488\u6863\u4f7f\u7528\u72ec\u7acb\u7684\u5c0f\u98ce\u9669\u9884\u7b97"
+                        "\uff0c\u5355\u7b14\u6700\u5927\u4e8f\u635f\u9650\u5728\u63a2\u9488\u9884\u7b97\u5185"
+                        "\uff0c\u4ee5\u4fdd\u6301\u6210\u4ea4\u91cf\u7684\u540c\u65f6\u63a7\u4f4f\u5355\u6b21\u635f\u5931\u3002"
+                    ),
+                }
+                max_loss = probe_budget
         pnl_structure_guard: dict[str, Any] = {
             "applied": False,
             "expected_net_return_pct": round(expected_net, 6),
@@ -566,6 +588,7 @@ class EntryProfitRiskSizingPolicy:
             "meaningful_size_reason": meaningful_size_reason,
             "same_side_existing_winner": existing_winner,
             "risk_budget_boost": risk_budget_boost,
+            "probe_budget_guard": probe_budget_guard,
             "pnl_structure_guard": pnl_structure_guard,
             "notional_floor_applied": current_size > original_size_before_floor,
             "original_notional_usdt": round(original_notional, 6),

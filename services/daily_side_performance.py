@@ -66,6 +66,60 @@ class DailySidePerformanceService:
         self._limit = int(limit)
         self._clock = clock or (lambda: datetime.now(timezone(timedelta(hours=8))))
 
+    async def multiday_state(
+        self, mode: str, *, lookback_days: float = 5.0
+    ) -> dict[str, dict[str, float]]:
+        """Return realized PnL split by side over the recent multi-day window."""
+
+        selected_mode = "live" if mode == "live" else "paper"
+        try:
+            async with self._session_factory() as session:
+                rows = await self._trade_repository_factory(session).get_position_records(
+                    execution_mode=selected_mode,
+                    model_name=self._model_name,
+                    is_open=False,
+                    limit=self._limit,
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to calculate multiday side performance",
+                mode=selected_mode,
+                error=safe_error_text(exc),
+            )
+            return self.build_window([], lookback_days=lookback_days)
+        return self.build_window(rows, lookback_days=lookback_days)
+
+    def build_window(
+        self, rows: Iterable[Any], *, lookback_days: float = 5.0
+    ) -> dict[str, dict[str, float]]:
+        """Build side buckets from closed rows within the recent N-day window."""
+
+        now_local = _normalize_local_now(self._clock())
+        window_start_utc = (now_local - timedelta(days=max(lookback_days, 0.0))).astimezone(UTC)
+        result: dict[str, dict[str, float]] = {
+            "long": _empty_side_bucket(),
+            "short": _empty_side_bucket(),
+        }
+        for pos in rows:
+            closed_at = _aware_utc(getattr(pos, "closed_at", None))
+            if closed_at is None or closed_at < window_start_utc:
+                continue
+            side = "short" if str(getattr(pos, "side", "") or "").lower() == "short" else "long"
+            pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)
+            bucket = result[side]
+            bucket["count"] += 1
+            bucket["pnl"] += pnl
+            if pnl >= 0:
+                bucket["wins"] += 1
+                bucket["profit"] += pnl
+            else:
+                bucket["losses"] += 1
+                bucket["loss"] += abs(pnl)
+        self._finalize(result)
+        for bucket in result.values():
+            bucket["lookback_days"] = round(float(lookback_days), 4)
+        return result
+
     async def state(self, mode: str) -> dict[str, dict[str, float]]:
         """Return today's closed-position PnL split by side."""
 

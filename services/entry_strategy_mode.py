@@ -54,9 +54,11 @@ class EntryStrategyModeContextPolicy:
         position_group_count: int,
         account_equity: float,
         account_config: dict[str, Any],
+        side_performance_multiday: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         market_regime = _safe_dict(market_regime)
         side_performance = _safe_dict(side_performance)
+        side_performance_multiday = _safe_dict(side_performance_multiday)
         account_config = _safe_dict(account_config)
         today_total = _safe_float(daily_state.get("today_total_pnl"), 0.0)
         high_water = _safe_float(daily_state.get("today_high_water_pnl"), today_total)
@@ -105,11 +107,23 @@ class EntryStrategyModeContextPolicy:
 
         long_pnl = _safe_float(_safe_dict(side_performance.get("long")).get("pnl"), 0.0)
         short_pnl = _safe_float(_safe_dict(side_performance.get("short")).get("pnl"), 0.0)
-        side_quality = self._side_quality(side_performance)
+        side_quality = self._side_quality(side_performance, side_performance_multiday)
+        multiday_long = _safe_dict(side_performance_multiday.get("long"))
+        multiday_short = _safe_dict(side_performance_multiday.get("short"))
+        multiday_long_pnl = _safe_float(multiday_long.get("pnl"), 0.0)
+        multiday_short_pnl = _safe_float(multiday_short.get("pnl"), 0.0)
+        multiday_long_losses = int(_safe_float(multiday_long.get("losses"), 0.0))
+        multiday_long_wins = int(_safe_float(multiday_long.get("wins"), 0.0))
+        multiday_short_losses = int(_safe_float(multiday_short.get("losses"), 0.0))
+        multiday_short_wins = int(_safe_float(multiday_short.get("wins"), 0.0))
         if short_pnl < 0 and abs(short_pnl) > max(abs(long_pnl), 1e-9) * 1.5:
             avoid_short = True
         if long_pnl < 0 and abs(long_pnl) > max(abs(short_pnl), 1e-9) * 1.5:
             avoid_long = True
+        if multiday_long_pnl < 0 and multiday_long_losses >= multiday_long_wins + 4:
+            avoid_long = True
+        if multiday_short_pnl < 0 and multiday_short_losses >= multiday_short_wins + 4:
+            avoid_short = True
 
         allow_long = True
         allow_short = True
@@ -207,6 +221,7 @@ class EntryStrategyModeContextPolicy:
             "loss_pause_usdt": round(loss_pause, 4),
             "market_regime": market_regime,
             "side_performance": side_performance,
+            "side_performance_multiday": side_performance_multiday,
             "side_quality": side_quality,
             "symbol_side_performance": symbol_side_performance,
             "model_contribution_performance": model_contribution_performance,
@@ -238,7 +253,11 @@ class EntryStrategyModeContextPolicy:
         }
 
     @staticmethod
-    def _side_quality(side_performance: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def _side_quality(
+        side_performance: dict[str, Any],
+        side_performance_multiday: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        multiday = _safe_dict(side_performance_multiday)
         result: dict[str, dict[str, Any]] = {}
         for side in ("long", "short"):
             bucket = _safe_dict(side_performance.get(side))
@@ -248,6 +267,15 @@ class EntryStrategyModeContextPolicy:
             pnl = _safe_float(bucket.get("pnl"), 0.0)
             avg_pnl = _safe_float(bucket.get("avg_pnl"), 0.0)
             win_rate = _safe_float(bucket.get("win_rate"), 0.0)
+            md_bucket = _safe_dict(multiday.get(side))
+            md_count = int(_safe_float(md_bucket.get("count"), 0.0))
+            md_wins = int(_safe_float(md_bucket.get("wins"), 0.0))
+            md_losses = int(_safe_float(md_bucket.get("losses"), 0.0))
+            md_pnl = _safe_float(md_bucket.get("pnl"), 0.0)
+            md_win_rate = _safe_float(md_bucket.get("win_rate"), 0.0)
+            md_degraded = (
+                md_count >= 6 and md_pnl < 0 and (md_losses >= md_wins + 4 or md_win_rate <= 0.30)
+            )
             state = "neutral"
             score_adjustment = 0.0
             min_score_delta = 0.0
@@ -267,6 +295,17 @@ class EntryStrategyModeContextPolicy:
                 reason = (
                     "today realized side performance is positive; allow small confidence support"
                 )
+            if md_degraded:
+                # Multi-day side bleeding overrides toward a stronger downgrade so a
+                # direction that keeps losing for days cannot stay neutral or working.
+                state = "degraded"
+                score_adjustment = min(score_adjustment, -0.30)
+                min_score_delta = max(min_score_delta, 0.28)
+                size_multiplier = min(size_multiplier, 0.55)
+                reason = (
+                    "multi-day realized side performance keeps losing; demote this side and "
+                    "require clearly stronger, profit-aligned proof"
+                )
             result[side] = {
                 "state": state,
                 "count": count,
@@ -275,6 +314,10 @@ class EntryStrategyModeContextPolicy:
                 "pnl": round(pnl, 6),
                 "avg_pnl": round(avg_pnl, 6),
                 "win_rate": round(win_rate, 6),
+                "multiday_count": md_count,
+                "multiday_pnl": round(md_pnl, 6),
+                "multiday_win_rate": round(md_win_rate, 6),
+                "multiday_degraded": bool(md_degraded),
                 "score_adjustment": round(score_adjustment, 6),
                 "min_score_delta": round(min_score_delta, 6),
                 "size_multiplier": round(size_multiplier, 6),
