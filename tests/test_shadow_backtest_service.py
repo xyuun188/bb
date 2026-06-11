@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from ai_brain.base_model import Action, DecisionOutput
+from services.shadow_backtest_service import ShadowBacktestService, side_label
+
+
+class _SessionCtx:
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _FakeRepo:
+    def __init__(self) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.due_rows: list[Any] = []
+        self.completed: list[dict[str, Any]] = []
+        self.memories: list[dict[str, Any]] = []
+
+    async def create_shadow_backtest(self, data: dict[str, Any]) -> None:
+        self.created.append(data)
+
+    async def get_due_shadow_backtests(self, limit: int = 200) -> list[Any]:
+        assert limit == 200
+        return self.due_rows
+
+    async def complete_shadow_backtest(self, row: Any, **data: Any) -> None:
+        for key, value in data.items():
+            setattr(row, key, value)
+        self.completed.append(data)
+
+    async def upsert_memory(self, data: dict[str, Any]) -> None:
+        self.memories.append(data)
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _service(repo: _FakeRepo, latest_price: float = 101.0) -> ShadowBacktestService:
+    async def latest(_symbol: str) -> float:
+        return latest_price
+
+    return ShadowBacktestService(
+        latest_price_provider=latest,
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=_SessionCtx,
+        repository_factory=lambda _session: repo,
+        horizons_minutes=(10, 30),
+    )
+
+
+def _decision() -> DecisionOutput:
+    return DecisionOutput(
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.7,
+        reasoning="test shadow backtest",
+        position_size_pct=0.05,
+        model_name="ensemble_trader",
+        feature_snapshot={"current_price": 100.0, "adx_14": 28.0},
+        raw_response={"reason": "test"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_service_creates_pending_horizons() -> None:
+    repo = _FakeRepo()
+    feature_vector = SimpleNamespace(current_price=100.0, close=99.0)
+
+    await _service(repo).create(123, _decision(), feature_vector, "paper")
+
+    assert [item["horizon_minutes"] for item in repo.created] == [10, 30]
+    assert all(item["status"] == "pending" for item in repo.created)
+    assert repo.created[0]["decision_id"] == 123
+    assert repo.created[0]["decision_action"] == "long"
+    assert repo.created[0]["entry_price"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    monkeypatch.setattr(settings, "shadow_memory_min_return_pct", 0.40)
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=7,
+        decision_id=123,
+        model_name="ensemble_trader",
+        symbol="btc/usdt",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        feature_snapshot={
+            "adx_14": 28.0,
+            "volume_ratio": 1.4,
+            "returns_5": 0.004,
+            "orderbook_imbalance": 0.15,
+        },
+    )
+    repo.due_rows = [row]
+
+    await _service(repo, latest_price=101.0).update_due()
+
+    assert repo.completed == [
+        {
+            "actual_price": 101.0,
+            "long_return_pct": pytest.approx(1.0),
+            "short_return_pct": pytest.approx(-1.0),
+            "best_action": "long",
+            "missed_opportunity": True,
+            "note": "当时观望，但 10 分钟后做多方向收益约1.00%。",
+        }
+    ]
+    assert len(repo.memories) == 4
+    assert {item["expert_name"] for item in repo.memories} == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    }
+    assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
+    assert repo.memories[0]["extra"]["actual_price"] == 101.0
+
+
+def test_shadow_backtest_side_label() -> None:
+    assert side_label("long") == "做多"
+    assert side_label("short") == "做空"
+    assert side_label("hold") == "hold"

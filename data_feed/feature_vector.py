@@ -7,7 +7,7 @@ into a unified FeatureVector dataclass consumed by all AI models.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -19,7 +19,7 @@ class FeatureVector:
     """
 
     symbol: str
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     # --- Price data ---
     current_price: float = 0.0
@@ -90,6 +90,7 @@ class FeatureVector:
     def to_dict(self) -> dict[str, Any]:
         """Convert to a flat dict for storage or serialization."""
         from datetime import datetime as dt
+
         d = {}
         for f_name, f_value in self.__dict__.items():
             if f_name in ("recent_headlines", "recent_news_items"):
@@ -102,22 +103,28 @@ class FeatureVector:
 
     def to_llm_context(self) -> str:
         """Format as a human-readable context string for LLM prompts."""
-        headlines_text = "\n".join(
-            f"  - {h}" for h in self.recent_headlines[:10]
-        ) if self.recent_headlines else "  (no recent headlines)"
-        news_items_text = "\n".join(
-            "  - "
-            + " | ".join(
-                str(part)
-                for part in (
-                    item.get("source") or "-",
-                    item.get("event_type") or "news",
-                    item.get("impact_level") or 1,
-                    item.get("title") or "-",
+        headlines_text = (
+            "\n".join(f"  - {h}" for h in self.recent_headlines[:10])
+            if self.recent_headlines
+            else "  (no recent headlines)"
+        )
+        news_items_text = (
+            "\n".join(
+                "  - "
+                + " | ".join(
+                    str(part)
+                    for part in (
+                        item.get("source") or "-",
+                        item.get("event_type") or "news",
+                        item.get("impact_level") or 1,
+                        item.get("title") or "-",
+                    )
                 )
+                for item in self.recent_news_items[:8]
             )
-            for item in self.recent_news_items[:8]
-        ) if self.recent_news_items else "  (no matched news items)"
+            if self.recent_news_items
+            else "  (no matched news items)"
+        )
 
         return f"""Symbol: {self.symbol}
 Current Price: {self.current_price:.4f}
@@ -220,7 +227,9 @@ def build_feature_vector(
         fv.news_article_count = sentiment_data.get("article_count", 0)
         fv.headline_count = sentiment_data.get("headline_count", fv.news_article_count)
         fv.sentiment_data_available = bool(sentiment_data.get("sentiment_data_available", False))
-        fv.direct_sentiment_data_available = bool(sentiment_data.get("direct_sentiment_data_available", False))
+        fv.direct_sentiment_data_available = bool(
+            sentiment_data.get("direct_sentiment_data_available", False)
+        )
         fv.direct_news_item_count = int(sentiment_data.get("direct_news_item_count", 0) or 0)
         fv.market_news_item_count = int(sentiment_data.get("market_news_item_count", 0) or 0)
         fv.news_sources = list(sentiment_data.get("news_sources") or [])

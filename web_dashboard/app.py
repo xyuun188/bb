@@ -9,15 +9,19 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+import structlog
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from web_dashboard.api.router import api_router
+from web_dashboard.api.security import is_dashboard_write_request, validate_dashboard_write_access
 from web_dashboard.api.text_sanitize import sanitize_payload
 from web_dashboard.api.ws_endpoints import WebSocketManager
+
+logger = structlog.get_logger(__name__)
 
 # Global WebSocket manager
 ws_manager = WebSocketManager()
@@ -45,7 +49,7 @@ def create_app() -> FastAPI:
     # CORS
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=settings.dashboard_allowed_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -54,6 +58,20 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def sanitize_json_text_middleware(request, call_next):
         """Last line of defense: never send mojibake text to the dashboard API."""
+        if is_dashboard_write_request(request):
+            try:
+                validate_dashboard_write_access(
+                    request,
+                    authorization=request.headers.get("authorization"),
+                    dashboard_admin_key=request.headers.get("x-dashboard-admin-key"),
+                )
+            except HTTPException as exc:
+                return JSONResponse(
+                    content={"detail": exc.detail},
+                    status_code=exc.status_code,
+                    headers=getattr(exc, "headers", None),
+                )
+
         response = await call_next(request)
         content_type = response.headers.get("content-type", "")
         if not request.url.path.startswith("/api") or "application/json" not in content_type:
@@ -65,7 +83,13 @@ def create_app() -> FastAPI:
             return response
         try:
             payload = json.loads(body)
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "dashboard JSON sanitize skipped invalid payload",
+                path=request.url.path,
+                status_code=response.status_code,
+                error=type(exc).__name__,
+            )
             return JSONResponse(
                 content=body.decode("utf-8", errors="replace"),
                 status_code=response.status_code,
@@ -111,8 +135,11 @@ def create_app() -> FastAPI:
                     msg = json.loads(data)
                     if msg.get("type") == "ping":
                         await ws.send_json({"type": "pong"})
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as exc:
+                    logger.debug(
+                        "dashboard websocket ignored invalid JSON",
+                        error=type(exc).__name__,
+                    )
         except WebSocketDisconnect:
             pass
         finally:
@@ -122,7 +149,8 @@ def create_app() -> FastAPI:
 
 
 # Default index page (fallback if no static/index.html)
-DEFAULT_INDEX_HTML = """<!DOCTYPE html>
+DEFAULT_INDEX_HTML = (
+    """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -152,12 +180,15 @@ DEFAULT_INDEX_HTML = """<!DOCTYPE html>
         <h1>AI Crypto Trading Dashboard</h1>
         <div class="card">
             <p>Dashboard is loading... If this persists, check that the server is running.</p>
-            <p>Port: """ + str(settings.dashboard_port) + """</p>
+            <p>Port: """
+    + str(settings.dashboard_port)
+    + """</p>
         </div>
     </div>
 </body>
 </html>
 """
+)
 
 
 # Singleton app instance

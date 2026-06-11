@@ -6,8 +6,8 @@ Protects against cascading losses from runaway algorithms.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 import structlog
 
@@ -16,10 +16,10 @@ from config.settings import settings
 logger = structlog.get_logger(__name__)
 
 
-class BreakerState(str, Enum):
-    CLOSED = "closed"       # Normal operation
-    OPEN = "open"           # Trading halted
-    HALF_OPEN = "half_open" # Testing if we can resume
+class BreakerState(StrEnum):
+    CLOSED = "closed"  # Normal operation
+    OPEN = "open"  # Trading halted
+    HALF_OPEN = "half_open"  # Testing if we can resume
 
 
 @dataclass
@@ -30,7 +30,7 @@ class CircuitBreakerState:
     daily_pnl: float = 0.0
     consecutive_losses: int = 0
     total_trades_today: int = 0
-    last_reset_date: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_reset_date: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class CircuitBreaker:
@@ -58,7 +58,7 @@ class CircuitBreaker:
         if (
             self._state.state == BreakerState.OPEN
             and self._state.tripped_at
-            and datetime.now(timezone.utc) - self._state.tripped_at > self.cooldown
+            and datetime.now(UTC) - self._state.tripped_at > self.cooldown
         ):
             self._state.state = BreakerState.HALF_OPEN
             logger.info("circuit breaker cooling down", state="half_open")
@@ -128,7 +128,7 @@ class CircuitBreaker:
 
     def _trip(self, reason: str) -> None:
         self._state.state = BreakerState.OPEN
-        self._state.tripped_at = datetime.now(timezone.utc)
+        self._state.tripped_at = datetime.now(UTC)
         self._state.tripped_reason = reason
         logger.warning("circuit breaker tripped", reason=reason)
 
@@ -139,7 +139,7 @@ class CircuitBreaker:
 
     def _check_daily_reset(self) -> None:
         """Reset daily counters if it's a new day."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if now.date() > self._state.last_reset_date.date():
             self._state.daily_pnl = 0.0
             self._state.total_trades_today = 0

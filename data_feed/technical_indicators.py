@@ -13,8 +13,13 @@ import ta
 
 # Map of CCXT timeframe strings to readable names
 TIMEFRAME_LABELS = {
-    "1m": "1分钟", "5m": "5分钟", "15m": "15分钟",
-    "30m": "30分钟", "1h": "1小时", "4h": "4小时", "1d": "日线",
+    "1m": "1分钟",
+    "5m": "5分钟",
+    "15m": "15分钟",
+    "30m": "30分钟",
+    "1h": "1小时",
+    "4h": "4小时",
+    "1d": "日线",
 }
 
 
@@ -52,9 +57,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_12"] = ta.trend.EMAIndicator(close=close, window=12).ema_indicator()
     df["ema_26"] = ta.trend.EMAIndicator(close=close, window=26).ema_indicator()
 
-    df["adx_14"] = ta.trend.ADXIndicator(
-        high=high, low=low, close=close, window=14
-    ).adx()
+    df["adx_14"] = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
 
     # --- Volatility ---
     bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
@@ -71,9 +74,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # --- Volume ---
     df["volume_sma_20"] = volume.rolling(window=20).mean()
     df["volume_ratio"] = volume / (df["volume_sma_20"] + 1e-10)
-    df["obv"] = ta.volume.OnBalanceVolumeIndicator(
-        close=close, volume=volume
-    ).on_balance_volume()
+    df["obv"] = ta.volume.OnBalanceVolumeIndicator(close=close, volume=volume).on_balance_volume()
 
     # --- Price derivatives ---
     df["returns_1"] = close.pct_change(1)
@@ -101,12 +102,29 @@ def extract_latest_features(df: pd.DataFrame) -> dict[str, float]:
 
     latest = df.iloc[-1]
     feature_keys = [
-        "rsi_14", "rsi_7", "macd", "macd_signal", "macd_diff",
-        "stoch_k", "ema_12", "ema_26", "adx_14",
-        "bb_upper", "bb_middle", "bb_lower", "bb_width", "bb_pct",
-        "atr_14", "volume_ratio", "obv",
-        "returns_1", "returns_5", "returns_20", "volatility_20",
-        "price_vs_sma20", "price_vs_sma50",
+        "rsi_14",
+        "rsi_7",
+        "macd",
+        "macd_signal",
+        "macd_diff",
+        "stoch_k",
+        "ema_12",
+        "ema_26",
+        "adx_14",
+        "bb_upper",
+        "bb_middle",
+        "bb_lower",
+        "bb_width",
+        "bb_pct",
+        "atr_14",
+        "volume_ratio",
+        "obv",
+        "returns_1",
+        "returns_5",
+        "returns_20",
+        "volatility_20",
+        "price_vs_sma20",
+        "price_vs_sma50",
     ]
     features = {}
     for key in feature_keys:

@@ -3,17 +3,18 @@ OKX REST client via CCXT for fallback and private API operations.
 Used when WebSocket is unavailable or for account/trading endpoints.
 """
 
-from __future__ import annotations 
+from __future__ import annotations
 
 import asyncio
 import math
-import os 
-from typing import Any 
+import os
+from typing import Any
 
 import ccxt.async_support as ccxt_async
 import structlog
 
 from config.settings import settings
+from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 
 logger = structlog.get_logger(__name__)
@@ -78,7 +79,12 @@ class OKXRestClient:
             self._ensure_rest_url()
 
             await self._load_usdt_swap_markets()
-            logger.info("OKX REST markets loaded", mode=mode, demo=is_demo, symbols_count=len(self._exchange.markets))
+            logger.info(
+                "OKX REST markets loaded",
+                mode=mode,
+                demo=is_demo,
+                symbols_count=len(self._exchange.markets),
+            )
 
         return self._exchange
 
@@ -99,10 +105,9 @@ class OKXRestClient:
             self._exchange.hostname = OKX_HOSTNAME
 
     def _is_broken_rest_url_error(self, exc: Exception) -> bool:
-        message = str(exc)
-        return (
-            "unsupported operand type(s) for +: 'NoneType' and 'str'" in message
-            or ("NoneType" in message and "+:" in message and "str" in message)
+        message = safe_error_text(exc)
+        return "unsupported operand type(s) for +: 'NoneType' and 'str'" in message or (
+            "NoneType" in message and "+:" in message and "str" in message
         )
 
     async def _ccxt_call(self, method_name: str, *args, **kwargs):
@@ -117,7 +122,7 @@ class OKXRestClient:
                     logger.warning(
                         "OKX REST URL state invalid; reinitializing CCXT client",
                         method=method_name,
-                        error=str(exc),
+                        error=safe_error_text(exc),
                     )
                     await self.reinitialize()
                     continue
@@ -135,7 +140,8 @@ class OKXRestClient:
         response = await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
         filtered = [
-            item for item in instruments
+            item
+            for item in instruments
             if item.get("instType") == "SWAP"
             and item.get("state") == "live"
             and item.get("ctType") == "linear"
@@ -170,15 +176,13 @@ class OKXRestClient:
         try:
             data = await self._ccxt_call("fetch_funding_rate", self._to_swap_symbol(symbol))
         except Exception as exc:
-            logger.debug("fetch funding rate failed", symbol=symbol, error=str(exc))
+            logger.debug("fetch funding rate failed", symbol=symbol, error=safe_error_text(exc))
             return {"funding_rate": 0.0, "next_funding_time": None}
 
         info = data.get("info") or {}
         return {
             "funding_rate": self._safe_float(
-                data.get("fundingRate")
-                or data.get("funding_rate")
-                or info.get("fundingRate")
+                data.get("fundingRate") or data.get("funding_rate") or info.get("fundingRate")
             ),
             "next_funding_time": (
                 data.get("nextFundingDatetime")
@@ -193,14 +197,12 @@ class OKXRestClient:
         try:
             data = await self._ccxt_call("fetch_open_interest", self._to_swap_symbol(symbol))
         except Exception as exc:
-            logger.debug("fetch open interest failed", symbol=symbol, error=str(exc))
+            logger.debug("fetch open interest failed", symbol=symbol, error=safe_error_text(exc))
             return {"open_interest_contracts": 0.0, "open_interest_value": 0.0}
 
         info = data.get("info") or {}
         contracts = self._safe_float(
-            data.get("openInterestAmount")
-            or data.get("openInterest")
-            or info.get("oi")
+            data.get("openInterestAmount") or data.get("openInterest") or info.get("oi")
         )
         value = self._safe_float(
             data.get("openInterestValue")
@@ -222,7 +224,7 @@ class OKXRestClient:
                 limit=limit,
             )
         except Exception as exc:
-            logger.debug("fetch order book failed", symbol=symbol, error=str(exc))
+            logger.debug("fetch order book failed", symbol=symbol, error=safe_error_text(exc))
             return {
                 "spread_pct": 0.0,
                 "orderbook_bid_depth": 0.0,
@@ -264,8 +266,7 @@ class OKXRestClient:
             return_exceptions=True,
         )
         funding, open_interest, orderbook = (
-            item if isinstance(item, dict) else {}
-            for item in results
+            item if isinstance(item, dict) else {} for item in results
         )
         return {
             **funding,
@@ -281,10 +282,17 @@ class OKXRestClient:
         return await self._ccxt_call("fetch_positions", swap_symbols)
 
     async def create_order(
-        self, symbol: str, order_type: str, side: str, amount: float,
-        price: float | None = None, params: dict | None = None
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params: dict | None = None,
     ) -> dict:
-        return await self._ccxt_call("create_order", symbol, order_type, side, amount, price, params or {})
+        return await self._ccxt_call(
+            "create_order", symbol, order_type, side, amount, price, params or {}
+        )
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict:
         return await self._ccxt_call("cancel_order", order_id, symbol)
@@ -298,42 +306,45 @@ class OKXRestClient:
             self._to_swap_symbol(symbol) if symbol else None,
         )
 
-    async def get_available_symbols(self) -> list[dict[str, Any]]: 
-        """Return active OKX USDT linear perpetual swaps.""" 
-        try: 
-            ex = await self._get_exchange() 
+    async def get_available_symbols(self) -> list[dict[str, Any]]:
+        """Return active OKX USDT linear perpetual swaps."""
+        try:
+            ex = await self._get_exchange()
             tickers = {}
             try:
                 tickers = await self._ccxt_call("fetch_tickers")
             except Exception as exc:
-                logger.warning("fetch all tickers failed, using market metadata only", error=str(exc))
-            symbols = [] 
-            for market_id, market in ex.markets.items(): 
-                if not self._is_usdt_linear_swap(market): 
-                    continue 
-                symbol = self._display_symbol(market) 
+                logger.warning(
+                    "fetch all tickers failed, using market metadata only",
+                    error=safe_error_text(exc),
+                )
+            symbols = []
+            for market_id, market in ex.markets.items():
+                if not self._is_usdt_linear_swap(market):
+                    continue
+                symbol = self._display_symbol(market)
                 if not symbol:
                     continue
                 if symbol.split("/")[0] in {"XAU", "XAG"}:
                     continue
                 if _is_suspicious_contract_base(market.get("base", "")):
                     continue
-                if market.get("base", "").endswith(("1", "2", "3")) and market.get("base", "")[:-1] in {"AMZN", "ASTER"}: 
-                    continue 
+                if market.get("base", "").endswith(("1", "2", "3")) and market.get("base", "")[
+                    :-1
+                ] in {"AMZN", "ASTER"}:
+                    continue
                 ticker = self._ticker_for_market(tickers, market, symbol)
                 ticker_info = ticker.get("info") or {}
-                info = market.get("info") or {} 
+                info = market.get("info") or {}
                 volume = self._safe_float(
-                    ticker.get("baseVolume")
-                    or ticker_info.get("vol24h")
-                    or info.get("vol24h")
-                ) 
-                base_volume = self._safe_float(ticker_info.get("volCcy24h") or info.get("volCcy24h"))
+                    ticker.get("baseVolume") or ticker_info.get("vol24h") or info.get("vol24h")
+                )
+                base_volume = self._safe_float(
+                    ticker_info.get("volCcy24h") or info.get("volCcy24h")
+                )
                 last = self._safe_float(ticker.get("last") or ticker_info.get("last"))
                 open_24h = self._safe_float(
-                    ticker.get("open")
-                    or ticker_info.get("open24h")
-                    or ticker_info.get("sodUtc8")
+                    ticker.get("open") or ticker_info.get("open24h") or ticker_info.get("sodUtc8")
                 )
                 high_24h = self._safe_float(ticker.get("high") or ticker_info.get("high24h"))
                 low_24h = self._safe_float(ticker.get("low") or ticker_info.get("low24h"))
@@ -341,7 +352,9 @@ class OKXRestClient:
                 if change_pct == 0 and open_24h:
                     change_pct = (last - open_24h) / open_24h * 100
                 spread_pct = self._spread_pct(ticker, ticker_info, last)
-                range_pct = ((high_24h - low_24h) / last * 100) if last and high_24h > low_24h else 0.0
+                range_pct = (
+                    ((high_24h - low_24h) / last * 100) if last and high_24h > low_24h else 0.0
+                )
                 activity_score = self._market_activity_score(
                     volume=volume,
                     base_volume=base_volume,
@@ -350,31 +363,52 @@ class OKXRestClient:
                     spread_pct=spread_pct,
                     base=market.get("base", ""),
                 )
-                symbols.append({ 
-                    "symbol": symbol, 
-                    "base": market.get("base", ""), 
-                    "quote": "USDT", 
-                    "type": "swap", 
-                    "id": market.get("id", market_id), 
-                    "ccxt_symbol": market.get("symbol", market_id), 
-                    "volume_24h": volume, 
-                    "base_volume_24h": base_volume,
-                    "change_24h_pct": change_pct,
-                    "range_24h_pct": range_pct,
-                    "spread_pct": spread_pct,
-                    "activity_score": activity_score,
-                }) 
-            if symbols: 
-                return self._sort_symbols(symbols) 
-        except Exception: 
-            pass 
+                symbols.append(
+                    {
+                        "symbol": symbol,
+                        "base": market.get("base", ""),
+                        "quote": "USDT",
+                        "type": "swap",
+                        "id": market.get("id", market_id),
+                        "ccxt_symbol": market.get("symbol", market_id),
+                        "volume_24h": volume,
+                        "base_volume_24h": base_volume,
+                        "change_24h_pct": change_pct,
+                        "range_24h_pct": range_pct,
+                        "spread_pct": spread_pct,
+                        "activity_score": activity_score,
+                    }
+                )
+            if symbols:
+                return self._sort_symbols(symbols)
+        except Exception as exc:
+            logger.warning(
+                "OKX symbol discovery failed; using fallback list",
+                error=safe_error_text(exc),
+            )
 
         # Fallback: common OKX USDT perpetual swaps.
         common = [
-            "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT",
-            "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "SUI/USDT",
-            "LTC/USDT", "BCH/USDT", "DOT/USDT", "TRX/USDT", "TON/USDT",
-            "APT/USDT", "ARB/USDT", "OP/USDT", "NEAR/USDT", "FIL/USDT",
+            "BTC/USDT",
+            "ETH/USDT",
+            "SOL/USDT",
+            "XRP/USDT",
+            "BNB/USDT",
+            "DOGE/USDT",
+            "ADA/USDT",
+            "AVAX/USDT",
+            "LINK/USDT",
+            "SUI/USDT",
+            "LTC/USDT",
+            "BCH/USDT",
+            "DOT/USDT",
+            "TRX/USDT",
+            "TON/USDT",
+            "APT/USDT",
+            "ARB/USDT",
+            "OP/USDT",
+            "NEAR/USDT",
+            "FIL/USDT",
         ]
         return [
             {
@@ -407,11 +441,11 @@ class OKXRestClient:
             return f"{inst_id.removesuffix('-USDT-SWAP')}/USDT"
         return ""
 
-    def _safe_float(self, value: Any) -> float: 
-        try: 
-            return float(value) 
-        except (TypeError, ValueError): 
-            return 0.0 
+    def _safe_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _ticker_for_market(
         self,
@@ -464,10 +498,32 @@ class OKXRestClient:
         movement = min(abs(change_pct), 12.0) * 2.0
         tradable_range = min(max(range_pct, 0.0), 18.0) * 1.4
         spread_penalty = min(max(spread_pct, 0.0), 1.0) * 35.0
-        blue_chip_bonus = 14.0 if base in {
-            "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI",
-            "LTC", "BCH", "DOT", "TRX", "TON", "NEAR", "APT", "OP", "ARB",
-        } else 0.0
+        blue_chip_bonus = (
+            14.0
+            if base
+            in {
+                "BTC",
+                "ETH",
+                "SOL",
+                "XRP",
+                "BNB",
+                "DOGE",
+                "ADA",
+                "AVAX",
+                "LINK",
+                "SUI",
+                "LTC",
+                "BCH",
+                "DOT",
+                "TRX",
+                "TON",
+                "NEAR",
+                "APT",
+                "OP",
+                "ARB",
+            }
+            else 0.0
+        )
         extreme_range_penalty = 18.0 if range_pct > 45.0 else 0.0
         tiny_price_penalty = 8.0 if base in {"SHIB", "FLOKI", "CAT", "PEPE"} else 0.0
         return (
@@ -499,17 +555,17 @@ class OKXRestClient:
                 return f"{parts[0]}/USDT:USDT"
         return symbol
 
-    def _sort_symbols(self, symbols: list[dict[str, Any]]) -> list[dict[str, Any]]: 
-        deduped = {s["symbol"]: s for s in symbols} 
-        return sorted( 
-            deduped.values(), 
-            key=lambda s: ( 
-                -float(s.get("activity_score") or 0), 
+    def _sort_symbols(self, symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped = {s["symbol"]: s for s in symbols}
+        return sorted(
+            deduped.values(),
+            key=lambda s: (
+                -float(s.get("activity_score") or 0),
                 -float(s.get("volume_24h") or 0),
                 -abs(float(s.get("change_24h_pct") or 0)),
-                s.get("symbol", ""), 
-            ), 
-        ) 
+                s.get("symbol", ""),
+            ),
+        )
 
     async def reinitialize(self) -> None:
         """Close and recreate the exchange with current settings."""

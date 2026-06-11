@@ -6,16 +6,18 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 
-from db.repositories.trade_repo import TradeRepository
 from db.repositories.risk_repo import RiskRepository
+from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
+from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
 
 router = APIRouter()
@@ -51,9 +53,7 @@ def _translate_execution_text(message: str | None) -> str:
 
     lower_text = text.lower()
     if (
-        "open interest" in lower_text
-        and "platform" in lower_text
-        and "limit" in lower_text
+        "open interest" in lower_text and "platform" in lower_text and "limit" in lower_text
     ) or "has reached the platform's limit" in lower_text:
         return (
             "OKX 拒绝开仓：该合约当前平台总持仓量已经达到 OKX 上限，"
@@ -94,7 +94,10 @@ def _translate_execution_text(message: str | None) -> str:
 
     checks = [
         ("59670", "OKX 当前该交易对挂单超过 5 个，需要先撤掉多余挂单后才能调整杠杆。"),
-        ("more than 5 open orders", "OKX 当前该交易对挂单超过 5 个，需要先撤掉多余挂单后才能调整杠杆。"),
+        (
+            "more than 5 open orders",
+            "OKX 当前该交易对挂单超过 5 个，需要先撤掉多余挂单后才能调整杠杆。",
+        ),
         ("51008", "OKX 返回错误码 51008：账户 USDT 保证金不足，订单没有成交。"),
         ("Insufficient USDT margin", "OKX 返回错误码 51008：账户 USDT 保证金不足，订单没有成交。"),
         ("51004", "OKX 提示账户可用保证金不足或订单金额超过可用额度。"),
@@ -103,7 +106,10 @@ def _translate_execution_text(message: str | None) -> str:
         ("local compliance restrictions", "OKX 提示该交易受地区或账户合规限制。"),
         ("don't have any positions in this direction", "OKX 当前没有这个方向的可平仓位。"),
         ("No current price available", "系统没有拿到当前价格，未提交订单。"),
-        ("Order size is below OKX minimum contract size", "订单数量低于 OKX 最小合约张数，未提交订单。"),
+        (
+            "Order size is below OKX minimum contract size",
+            "订单数量低于 OKX 最小合约张数，未提交订单。",
+        ),
         ("No matching position to close", "系统没有找到匹配的可平仓位，未提交平仓单。"),
         ("Insufficient balance", "账户可用余额不足，未提交订单。"),
         ("Invalid OK-ACCESS-KEY", "OKX API Key 无效，请检查系统设置中的 OKX Key。"),
@@ -135,11 +141,17 @@ def _text_is_unusable(text: str | None) -> bool:
     return _looks_mojibake(value)
 
 
-def _safe_float(value, default: float = 0.0) -> float:
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
+        if value is None:
+            return default
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _pct_text(value, digits: int = 2) -> str | None:
@@ -149,7 +161,7 @@ def _pct_text(value, digits: int = 2) -> str | None:
     return f"{number * 100:+.{digits}f}%"
 
 
-def _fast_risk_reason_from_raw(symbol: str | None, raw: dict) -> str | None:
+def _fast_risk_reason_from_raw(symbol: str | None, raw: dict[str, Any]) -> str | None:
     """Build a readable reason for old fast-risk close records whose reasoning was mojibake."""
     if not isinstance(raw, dict):
         return None
@@ -157,7 +169,7 @@ def _fast_risk_reason_from_raw(symbol: str | None, raw: dict) -> str | None:
     if not (raw.get("fast_risk_exit") or trigger or raw.get("predictive_reversal")):
         return None
 
-    plan = raw.get("fast_exit_plan") if isinstance(raw.get("fast_exit_plan"), dict) else {}
+    plan = _safe_dict(raw.get("fast_exit_plan"))
     fraction = _safe_float(raw.get("close_fraction") or plan.get("fraction"), 1.0)
     close_label = "全部平仓" if fraction >= 0.999 else f"部分平仓 {fraction:.0%}"
     symbol_text = str(symbol or "").strip() or "该币种"
@@ -165,7 +177,7 @@ def _fast_risk_reason_from_raw(symbol: str | None, raw: dict) -> str | None:
     note = str(plan.get("note") or "").strip()
     note_text = note if note and not _text_is_unusable(note) else ""
 
-    reversal = raw.get("predictive_reversal") if isinstance(raw.get("predictive_reversal"), dict) else {}
+    reversal = _safe_dict(raw.get("predictive_reversal"))
     reversal_score = _safe_float(raw.get("predictive_reversal_score") or reversal.get("score"), 0.0)
     reversal_text = f"短周期反向风险评分 {reversal_score:.0f}。" if reversal_score > 0 else ""
 
@@ -174,7 +186,11 @@ def _fast_risk_reason_from_raw(symbol: str | None, raw: dict) -> str | None:
         for label in (
             f"1分钟 {_pct_text(raw.get('returns_1'))}" if _pct_text(raw.get("returns_1")) else None,
             f"5分钟 {_pct_text(raw.get('returns_5'))}" if _pct_text(raw.get("returns_5")) else None,
-            f"20分钟 {_pct_text(raw.get('returns_20'))}" if _pct_text(raw.get("returns_20")) else None,
+            (
+                f"20分钟 {_pct_text(raw.get('returns_20'))}"
+                if _pct_text(raw.get("returns_20"))
+                else None
+            ),
         )
         if label
     ]
@@ -226,7 +242,7 @@ async def get_trades(
             require_exchange_order_id=True,
         )
         decision_ids = [o.decision_id for o in orders if o.decision_id]
-        decision_meta = {}
+        decision_meta: dict[int, dict[str, Any]] = {}
         if decision_ids:
             result = await session.execute(
                 select(
@@ -240,8 +256,8 @@ async def get_trades(
                     AIDecision.raw_llm_response,
                 ).where(AIDecision.id.in_(decision_ids))
             )
-        decision_meta = {
-                row.id: {
+            decision_meta = {
+                int(row.id): {
                     "action": row.action,
                     "reasoning": row.reasoning,
                     "execution_reason": row.execution_reason,
@@ -284,7 +300,7 @@ async def get_trades(
 
     def aware_dt(value: datetime | None) -> datetime | None:
         if value and value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
+            return value.replace(tzinfo=UTC)
         return value
 
     def matching_closed_position(order):
@@ -311,6 +327,35 @@ async def get_trades(
             return None
         return sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
 
+    def matching_entry_position(order):
+        if order.status != "filled" or not order.filled_at:
+            return None
+        candidates = []
+        for p in all_positions:
+            if (
+                p.model_name != order.model_name
+                or p.execution_mode != order.execution_mode
+                or p.symbol != order.symbol
+                or not p.created_at
+            ):
+                continue
+            entry_side = "buy" if p.side == "long" else "sell"
+            if order.side in {"buy", "sell"} and order.side != entry_side:
+                continue
+            created_at = aware_dt(p.created_at)
+            filled_at = aware_dt(order.filled_at)
+            if not created_at or not filled_at:
+                continue
+            time_delta = abs((created_at - filled_at).total_seconds())
+            if time_delta > 10:
+                continue
+            price_delta = abs(float(order.price or 0) - float(p.entry_price or 0))
+            qty_delta = abs(float(order.quantity or 0) - float(p.quantity or 0))
+            candidates.append((time_delta, price_delta, qty_delta, p))
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
+
     def display_action(order) -> str:
         if order.side in {"long", "short", "close_long", "close_short"}:
             return order.side
@@ -324,7 +369,10 @@ async def get_trades(
             return "close_long" if p.side == "long" else "close_short"
 
         if order.decision_id is None:
-            return "close_long" if order.side == "sell" else "close_short"
+            p = matching_entry_position(order)
+            if p:
+                return "long" if p.side == "long" else "short"
+            return "short" if order.side == "sell" else "long"
 
         if order.side in {"buy", "sell"}:
             failure_text = str(order.exchange_order_id or "").lower()
@@ -363,7 +411,10 @@ async def get_trades(
         for sibling in all_positions:
             if sibling.id == position.id:
                 continue
-            if sibling.model_name != position.model_name or sibling.execution_mode != position.execution_mode:
+            if (
+                sibling.model_name != position.model_name
+                or sibling.execution_mode != position.execution_mode
+            ):
                 continue
             if normalize_symbol(sibling.symbol) != symbol_key:
                 continue
@@ -412,6 +463,15 @@ async def get_trades(
 
         return "system", "系统执行"
 
+    def meta_for_order(order) -> dict[str, Any]:
+        return _safe_dict(decision_meta.get(order.decision_id))
+
+    def raw_for_order(order) -> dict[str, Any]:
+        return _safe_dict(meta_for_order(order).get("raw_llm_response"))
+
+    def execution_leverage_for_order(order) -> dict[str, Any]:
+        return _safe_dict(raw_for_order(order).get("execution_leverage"))
+
     def display_reason(order) -> str:
         meta = decision_meta.get(order.decision_id) or {}
         raw = meta.get("raw_llm_response") or {}
@@ -450,12 +510,24 @@ async def get_trades(
             if order.decision_id is None or raw.get("system_sync"):
                 return f"OKX 侧平仓同步，成交价 {close_price:g}，实现盈亏 {float(p.realized_pnl or 0):.4f}。"
 
-        if raw.get("system_sync") or str(raw.get("source") or snapshot.get("source") or "").lower() == "okx_position_reconcile":
-            close_fill = raw.get("close_fill") if isinstance(raw.get("close_fill"), dict) else {}
+        if (
+            raw.get("system_sync")
+            or str(raw.get("source") or snapshot.get("source") or "").lower()
+            == "okx_position_reconcile"
+        ):
+            close_fill = _safe_dict(raw.get("close_fill"))
             close_price = order.price or close_fill.get("price") or snapshot.get("exit_price") or 0
             pnl = close_fill.get("pnl") or snapshot.get("realized_pnl")
-            pnl_text = f"，OKX 返回盈亏 {float(pnl):.4f}" if isinstance(pnl, (int, float)) or str(pnl or "").replace(".", "", 1).replace("-", "", 1).isdigit() else ""
-            return f"OKX 已触发止盈/止损或交易所侧平仓，系统已同步为平仓记录，成交价 {float(close_price or 0):g}{pnl_text}。"
+            pnl_text = (
+                f"，OKX 返回盈亏 {_safe_float(pnl):.4f}"
+                if isinstance(pnl, (int, float))
+                or str(pnl or "").replace(".", "", 1).replace("-", "", 1).isdigit()
+                else ""
+            )
+            return (
+                "OKX 已触发止盈/止损或交易所侧平仓，系统已同步为平仓记录，"
+                f"成交价 {_safe_float(close_price):g}{pnl_text}。"
+            )
 
         fast_reason = _fast_risk_reason_from_raw(order.symbol, raw)
         if fast_reason:
@@ -478,6 +550,7 @@ async def get_trades(
             (
                 lambda reason, source, close_status: {
                     "id": o.id,
+                    "decision_id": o.decision_id,
                     "model_name": o.model_name,
                     "mode": o.execution_mode,
                     "symbol": o.symbol,
@@ -489,24 +562,22 @@ async def get_trades(
                     "price": o.price,
                     "status": o.status,
                     "fee": o.fee,
-                    "leverage": (
-                        ((decision_meta.get(o.decision_id) or {}).get("raw_llm_response") or {}).get("execution_leverage") or {}
-                    ).get("actual_leverage")
-                    or (decision_meta.get(o.decision_id) or {}).get("suggested_leverage")
-                    or 1.0,
-                    "ai_suggested_leverage": (
-                        ((decision_meta.get(o.decision_id) or {}).get("raw_llm_response") or {}).get("execution_leverage") or {}
-                    ).get("ai_suggested_leverage")
-                    or (decision_meta.get(o.decision_id) or {}).get("suggested_leverage")
-                    or 1.0,
-                    "okx_max_leverage": (
-                        ((decision_meta.get(o.decision_id) or {}).get("raw_llm_response") or {}).get("execution_leverage") or {}
-                    ).get("okx_max_leverage"),
-                    "actual_leverage": (
-                        ((decision_meta.get(o.decision_id) or {}).get("raw_llm_response") or {}).get("execution_leverage") or {}
-                    ).get("actual_leverage")
-                    or (decision_meta.get(o.decision_id) or {}).get("suggested_leverage")
-                    or 1.0,
+                    "leverage": _safe_float(
+                        execution_leverage_for_order(o).get("actual_leverage")
+                        or meta_for_order(o).get("suggested_leverage"),
+                        1.0,
+                    ),
+                    "ai_suggested_leverage": _safe_float(
+                        execution_leverage_for_order(o).get("ai_suggested_leverage")
+                        or meta_for_order(o).get("suggested_leverage"),
+                        1.0,
+                    ),
+                    "okx_max_leverage": execution_leverage_for_order(o).get("okx_max_leverage"),
+                    "actual_leverage": _safe_float(
+                        execution_leverage_for_order(o).get("actual_leverage")
+                        or meta_for_order(o).get("suggested_leverage"),
+                        1.0,
+                    ),
                     "close_status": close_status[0],
                     "close_status_label": close_status[1],
                     "execution_source": source[0],
@@ -542,22 +613,24 @@ async def get_trade_detail(trade_id: int):
     if not order:
         return {"error": "Trade not found"}
 
-    return sanitize_payload({
-        "id": order.id,
-        "model_name": order.model_name,
-        "mode": order.execution_mode,
-        "symbol": order.symbol,
-        "side": order.side,
-        "action": action,
-        "order_type": order.order_type,
-        "quantity": order.quantity,
-        "price": order.price,
-        "status": order.status,
-        "fee": order.fee,
-        "exchange_order_id": sanitize_text(order.exchange_order_id),
-        "filled_at": order.filled_at.isoformat() if order.filled_at else None,
-        "created_at": order.created_at.isoformat() if order.created_at else None,
-    })
+    return sanitize_payload(
+        {
+            "id": order.id,
+            "model_name": order.model_name,
+            "mode": order.execution_mode,
+            "symbol": order.symbol,
+            "side": order.side,
+            "action": action,
+            "order_type": order.order_type,
+            "quantity": order.quantity,
+            "price": order.price,
+            "status": order.status,
+            "fee": order.fee,
+            "exchange_order_id": sanitize_text(order.exchange_order_id),
+            "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+            "created_at": order.created_at.isoformat() if order.created_at else None,
+        }
+    )
 
 
 @router.get("/positions")
@@ -593,7 +666,10 @@ async def get_positions(mode: str | None = None):
     }
 
 
-@router.delete("/trades")
+@router.delete(
+    "/trades",
+    dependencies=[Depends(require_destructive_dashboard_confirmation)],
+)
 async def clear_trades():
     """Delete all trade/order records."""
     from db.repositories.trade_repo import TradeRepository

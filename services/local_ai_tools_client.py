@@ -3,29 +3,68 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
-from enum import Enum
+from collections.abc import Mapping
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 from typing import Any
 
 import httpx
 import structlog
 
 from config.settings import settings
+from core.safe_output import safe_error_text, safe_response_error_text
+from core.url_safety import normalize_http_base_url
 
 logger = structlog.get_logger(__name__)
+
+_AUTH_FAILURE_STATUS_CODES = {401, 403}
+_ERROR_EXCERPT_LIMIT = 700
+_MIN_REQUEST_TIMEOUT_SECONDS = 0.2
+_MAX_REQUEST_TIMEOUT_SECONDS = 15.0
+_MAX_CIRCUIT_BREAKER_FAILURES = 20
+_MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
 
 
 class LocalAIToolsClient:
     """Fetch profit, time-series, and sentiment signals without blocking trading."""
 
     def __init__(self) -> None:
-        self._timeout = max(float(settings.local_ai_tools_timeout_seconds or 2.5), 0.2)
+        self._timeout = 2.5
+        self._failure_threshold = 3
+        self._cooldown_seconds = 45.0
+        self._refresh_runtime_settings()
+        self._failure_count = 0
+        self._circuit_open_until: datetime | None = None
+        self._last_failure: str = ""
+        self._last_success_at: datetime | None = None
+
+    def _refresh_runtime_settings(self) -> None:
+        self._timeout = min(
+            max(
+                float(settings.local_ai_tools_timeout_seconds or 2.5), _MIN_REQUEST_TIMEOUT_SECONDS
+            ),
+            _MAX_REQUEST_TIMEOUT_SECONDS,
+        )
+        self._failure_threshold = min(
+            max(int(settings.local_ai_tools_circuit_breaker_failures or 3), 1),
+            _MAX_CIRCUIT_BREAKER_FAILURES,
+        )
+        self._cooldown_seconds = min(
+            max(
+                float(settings.local_ai_tools_circuit_breaker_cooldown_seconds or 45.0),
+                self._timeout,
+            ),
+            _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+        )
 
     def enabled(self) -> bool:
+        self._refresh_runtime_settings()
         return bool(settings.local_ai_tools_enabled and settings.local_ai_tools_api_base)
 
-    async def enrich(self, features: Any, ml_signal: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def enrich(
+        self, features: Any, ml_signal: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         return await self.enrich_with_context(features, ml_signal=ml_signal)
 
     async def enrich_with_context(
@@ -37,6 +76,9 @@ class LocalAIToolsClient:
     ) -> dict[str, Any]:
         if not self.enabled():
             return {"enabled": False, "status": "disabled"}
+        circuit_open = self._circuit_open_payload()
+        if circuit_open:
+            return circuit_open
 
         payload = self._feature_payload(features)
         if isinstance(ml_signal, dict):
@@ -45,7 +87,7 @@ class LocalAIToolsClient:
             payload["open_positions"] = open_positions
         payload = self._json_safe(payload)
 
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         calls = [
             ("profit_prediction", self._post("/profit/predict", payload)),
             ("time_series_prediction", self._post("/timeseries/deep/predict", payload)),
@@ -57,20 +99,27 @@ class LocalAIToolsClient:
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
-            "api_base": settings.local_ai_tools_api_base,
+            "api_base": self._public_api_base(),
             "started_at": started.isoformat(),
-            "duration_sec": round((datetime.now(timezone.utc) - started).total_seconds(), 3),
+            "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
         }
         errors: dict[str, str] = {}
-        for (name, _), item in zip(calls, results):
+        for (name, _), item in zip(calls, results, strict=False):
             if isinstance(item, Exception):
-                errors[name] = str(item)[:180]
-                data[name] = {"available": False, "error": str(item)[:180]}
+                error = safe_error_text(item, limit=180)
+                errors[name] = error
+                data[name] = {"available": False, "error": error}
             else:
                 data[name] = self._normalize_signal(name, item)
         if errors:
             data["status"] = "partial" if len(errors) < len(calls) else "unavailable"
             data["errors"] = errors
+        if errors and len(errors) == len(calls):
+            self._record_failure("; ".join(errors.values()))
+            data.update(self._breaker_fields())
+        else:
+            self._record_success()
+            data.update(self._breaker_fields())
         return data
 
     def _normalize_signal(self, name: str, item: Any) -> dict[str, Any]:
@@ -107,10 +156,17 @@ class LocalAIToolsClient:
             if side in {"long", "short"}:
                 normalized["best_side"] = side
                 normalized["side"] = side
-            if "expected_return_pct" not in normalized and "expected_return_from_sentiment_pct" in normalized:
-                normalized["expected_return_pct"] = normalized.get("expected_return_from_sentiment_pct")
+            if (
+                "expected_return_pct" not in normalized
+                and "expected_return_from_sentiment_pct" in normalized
+            ):
+                normalized["expected_return_pct"] = normalized.get(
+                    "expected_return_from_sentiment_pct"
+                )
         elif name == "exit_advice":
-            action = str(normalized.get("action") or normalized.get("recommendation") or "hold").lower()
+            action = str(
+                normalized.get("action") or normalized.get("recommendation") or "hold"
+            ).lower()
             normalized["action"] = action or "hold"
             reason = str(normalized.get("reason") or normalized.get("note") or "").strip()
             normalized["reason"] = self._humanize_exit_reason(reason, action)
@@ -131,9 +187,9 @@ class LocalAIToolsClient:
             "no_position": "无匹配持仓",
             "reduce_or_close": "减仓或平仓",
             "protect_profit": "保护利润",
-            "close_if_ai_agrees": "AI确认后平仓",
+            "close_if_ai_agrees": "AI 确认后平仓",
             "trail_profit": "移动锁盈",
-        }.get(str(action or "").lower(), str(action or "继续观察"))
+        }.get(str(action or "").lower(), "继续观察")
 
     def _humanize_exit_reason(self, reason: str, action: str = "") -> str:
         text = str(reason or "").strip()
@@ -166,10 +222,26 @@ class LocalAIToolsClient:
     async def status(self) -> dict[str, Any]:
         if not self.enabled():
             return {"available": False, "status": "disabled"}
+        circuit_open = self._circuit_open_payload()
+        if circuit_open:
+            return {
+                "available": False,
+                **circuit_open,
+            }
         try:
-            return await self._get("/models/status")
+            status = await self._get("/models/status")
+            self._record_success()
+            status.update(self._breaker_fields())
+            return status
         except Exception as exc:
-            return {"available": False, "status": "error", "error": str(exc)[:180]}
+            error = safe_error_text(exc, limit=180)
+            self._record_failure(error)
+            return {
+                "available": False,
+                "status": "error",
+                "error": error,
+                **self._breaker_fields(),
+            }
 
     async def train(
         self,
@@ -182,6 +254,9 @@ class LocalAIToolsClient:
     ) -> dict[str, Any]:
         if not self.enabled():
             return {"trained": False, "reason": "disabled"}
+        circuit_open = self._circuit_open_payload()
+        if circuit_open:
+            return {"trained": False, "reason": "circuit_open", **circuit_open}
         payload = {
             "source": source,
             "shadow_samples": shadow_samples,
@@ -190,38 +265,158 @@ class LocalAIToolsClient:
             "text_sentiment_samples": text_sentiment_samples or [],
         }
         payload = self._json_safe(payload)
-        return await self._post("/train", payload, timeout=max(self._timeout, 180.0))
+        try:
+            result = await self._post(
+                "/train",
+                payload,
+                request_timeout=max(self._timeout, 180.0),
+            )
+        except Exception as exc:
+            error = safe_error_text(exc, limit=180)
+            self._record_failure(error)
+            logger.warning(
+                "local AI tools training request failed",
+                reason="request_failed",
+                error=error,
+                shadow_sample_count=len(shadow_samples),
+                trade_sample_count=len(trade_samples),
+            )
+            return {
+                "trained": False,
+                "reason": "request_failed",
+                "error": error,
+                **self._breaker_fields(),
+            }
+        self._record_success()
+        return result
+
+    def _circuit_open_payload(self) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        if self._circuit_open_until is None:
+            return None
+        if now >= self._circuit_open_until:
+            self._circuit_open_until = None
+            return None
+        remaining = max((self._circuit_open_until - now).total_seconds(), 0.0)
+        return {
+            "enabled": True,
+            "available": False,
+            "status": "circuit_open",
+            "api_base": self._public_api_base(),
+            "failure_count": self._failure_count,
+            "cooldown_remaining_sec": round(remaining, 1),
+            "circuit_open_until": self._circuit_open_until.isoformat(),
+            "error": self._last_failure[:180],
+        }
+
+    def _breaker_fields(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "failure_count": self._failure_count,
+            "circuit_breaker_threshold": self._failure_threshold,
+        }
+        if self._last_success_at is not None:
+            data["last_success_at"] = self._last_success_at.isoformat()
+        if self._circuit_open_until is not None:
+            data["circuit_open_until"] = self._circuit_open_until.isoformat()
+        return data
+
+    def _record_success(self) -> None:
+        self._failure_count = 0
+        self._circuit_open_until = None
+        self._last_failure = ""
+        self._last_success_at = datetime.now(UTC)
+
+    def _record_failure(self, reason: str) -> None:
+        self._failure_count += 1
+        self._last_failure = safe_error_text(
+            reason,
+            limit=180,
+            fallback="local AI tools request failed",
+        )
+        if self._failure_count < self._failure_threshold:
+            return
+        self._circuit_open_until = datetime.now(UTC) + timedelta(seconds=self._cooldown_seconds)
+        logger.warning(
+            "local AI tools circuit breaker opened",
+            failure_count=self._failure_count,
+            threshold=self._failure_threshold,
+            cooldown_seconds=self._cooldown_seconds,
+            reason=self._last_failure,
+        )
 
     async def _get(self, path: str) -> dict[str, Any]:
-        base = str(settings.local_ai_tools_api_base or "").rstrip("/")
-        if not base:
-            raise RuntimeError("local AI tools API base is empty")
-        headers = {}
-        if settings.local_ai_tools_api_key:
-            headers["Authorization"] = f"Bearer {settings.local_ai_tools_api_key}"
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(f"{base}{path}", headers=headers)
-            response.raise_for_status()
-            parsed = response.json()
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        base = self._api_base()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.get(f"{base}{path}", headers=self._auth_headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(
+                f"local AI tools request could not reach the service: {safe_error_text(exc)}"
+            ) from exc
+        return self._parse_response(response, path)
 
     async def _post(
         self,
         path: str,
         payload: dict[str, Any],
-        timeout: float | None = None,
+        request_timeout: float | None = None,
     ) -> dict[str, Any]:
-        base = str(settings.local_ai_tools_api_base or "").rstrip("/")
-        if not base:
-            raise RuntimeError("local AI tools API base is empty")
-        headers = {}
-        if settings.local_ai_tools_api_key:
-            headers["Authorization"] = f"Bearer {settings.local_ai_tools_api_key}"
-        async with httpx.AsyncClient(timeout=timeout or self._timeout) as client:
-            response = await client.post(f"{base}{path}", json=payload, headers=headers)
-            response.raise_for_status()
+        base = self._api_base()
+        try:
+            async with httpx.AsyncClient(timeout=request_timeout or self._timeout) as client:
+                response = await client.post(
+                    f"{base}{path}",
+                    json=payload,
+                    headers=self._auth_headers(),
+                )
+        except httpx.RequestError as exc:
+            raise RuntimeError(
+                f"local AI tools request could not reach the service: {safe_error_text(exc)}"
+            ) from exc
+        return self._parse_response(response, path)
+
+    def _api_base(self) -> str:
+        try:
+            return normalize_http_base_url(
+                settings.local_ai_tools_api_base,
+                field_name="local AI tools API base",
+            )
+        except ValueError as exc:
+            raise RuntimeError(safe_error_text(exc)) from exc
+
+    def _public_api_base(self) -> str:
+        try:
+            return self._api_base()
+        except RuntimeError:
+            return "invalid_config"
+
+    def _auth_headers(self) -> dict[str, str]:
+        key = str(settings.local_ai_tools_api_key or "").strip()
+        if not key:
+            return {}
+        return {"Authorization": f"Bearer {key}"}
+
+    def _parse_response(self, response: httpx.Response, path: str) -> dict[str, Any]:
+        if not response.is_success:
+            detail = self._response_error_excerpt(response)
+            if response.status_code in _AUTH_FAILURE_STATUS_CODES:
+                message = (
+                    f"local AI tools request {path} was rejected with HTTP "
+                    f"{response.status_code}; check LOCAL_AI_TOOLS_API_KEY on both sides"
+                )
+            else:
+                message = f"local AI tools request {path} failed with HTTP {response.status_code}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise RuntimeError(message)
+        try:
             parsed = response.json()
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        except ValueError as exc:
+            raise RuntimeError(f"local AI tools request {path} returned invalid JSON") from exc
+        return dict(parsed) if isinstance(parsed, Mapping) else {"value": parsed}
+
+    def _response_error_excerpt(self, response: httpx.Response) -> str:
+        return safe_response_error_text(response, limit=_ERROR_EXCERPT_LIMIT)
 
     def _feature_payload(self, features: Any) -> dict[str, Any]:
         if hasattr(features, "to_dict"):
@@ -233,7 +428,7 @@ class LocalAIToolsClient:
             snapshot = dict(features or {})
         return {
             "symbol": snapshot.get("symbol") or getattr(features, "symbol", ""),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "features": snapshot,
         }
 

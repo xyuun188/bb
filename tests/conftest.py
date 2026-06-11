@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import pytest_asyncio
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -27,6 +26,7 @@ def event_loop():
 def sample_feature_vector():
     """Return a mock feature vector for testing models."""
     from data_feed.feature_vector import FeatureVector
+
     return FeatureVector(
         symbol="BTC/USDT",
         current_price=50000.0,

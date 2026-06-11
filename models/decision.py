@@ -26,9 +26,7 @@ class AIDecision(Base, TimestampMixin):
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True)
     was_executed: Mapped[bool] = mapped_column(Boolean, default=False)
     execution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    executed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     execution_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(20), nullable=True)  # profit/loss/flat
     outcome_pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)

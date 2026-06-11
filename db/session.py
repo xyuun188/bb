@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import text
 
 from config.settings import settings
 from models.base import Base
@@ -21,7 +22,7 @@ async def get_engine():
     global _engine
     if _engine is None:
         is_sqlite = "sqlite" in settings.database_url
-        engine_kwargs = dict(echo=False)
+        engine_kwargs: dict[str, Any] = {"echo": False}
         if is_sqlite:
             engine_kwargs["connect_args"] = {"check_same_thread": False}
         else:
@@ -35,9 +36,7 @@ async def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     global _sessionmaker
     if _sessionmaker is None:
         engine = await get_engine()
-        _sessionmaker = async_sessionmaker(
-            engine, class_=AsyncSession, expire_on_commit=False
-        )
+        _sessionmaker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return _sessionmaker
 
 
@@ -120,6 +119,24 @@ async def init_db() -> None:
                     """
                 )
             )
+            result = await conn.execute(text("PRAGMA table_info(trade_reflections)"))
+            reflection_columns = {row[1] for row in result.fetchall()}
+            if "closed_at" not in reflection_columns:
+                await conn.execute(text("ALTER TABLE trade_reflections ADD COLUMN closed_at DATETIME"))
+            await conn.execute(
+                text(
+                    """
+                    UPDATE trade_reflections
+                    SET closed_at = (
+                        SELECT positions.closed_at
+                        FROM positions
+                        WHERE positions.id = trade_reflections.position_id
+                    )
+                    WHERE closed_at IS NULL
+                      AND position_id IS NOT NULL
+                    """
+                )
+            )
             for ddl in [
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created ON ai_decisions (is_paper, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_model_mode_created ON ai_decisions (model_name, is_paper, created_at DESC)",
@@ -130,6 +147,7 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_open_created ON positions (execution_mode, is_open, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_closed_created ON positions (execution_mode, is_open, closed_at DESC, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_symbol_side ON positions (execution_mode, symbol, side)",
+                "CREATE INDEX IF NOT EXISTS idx_trade_reflections_closed_created ON trade_reflections (closed_at DESC, created_at DESC)",
             ]:
                 await conn.execute(text(ddl))
 

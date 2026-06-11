@@ -29,9 +29,7 @@ class RiskRepository(BaseRepository):
         await self.session.flush()
         return snap
 
-    async def get_latest_snapshot(
-        self, model_name: str
-    ) -> ModelPerformanceSnapshot | None:
+    async def get_latest_snapshot(self, model_name: str) -> ModelPerformanceSnapshot | None:
         result = await self.session.execute(
             select(ModelPerformanceSnapshot)
             .where(ModelPerformanceSnapshot.model_name == model_name)

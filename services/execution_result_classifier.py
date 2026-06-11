@@ -1,0 +1,203 @@
+"""Execution-result classification and user-facing reason text.
+
+The execution state machine needs consistent answers for three questions:
+
+- did OKX confirm a real order?
+- is an exit order still making progress?
+- what should the dashboard show when an order did not count as executed?
+
+Keeping those rules here prevents TradingService from owning exchange-error
+wording and makes order-state behavior testable without building the full
+orchestrator.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from executor.base_executor import ExecutionResult, OrderStatus
+from web_dashboard.api.text_sanitize import sanitize_text
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class ExecutionResultClassifier:
+    """Classify exchange execution results and normalize failure reasons."""
+
+    def __init__(
+        self,
+        *,
+        untradable_exchange_error_checker: Callable[[str], bool] | None = None,
+    ) -> None:
+        self._untradable_exchange_error_checker = untradable_exchange_error_checker
+
+    def reason_from_result(self, result: ExecutionResult | None) -> str:
+        if result is None:
+            return "交易接口未返回执行结果。"
+
+        raw = result.raw_response or {}
+        if isinstance(raw, dict) and raw.get("entry_tracking"):
+            reason = self._entry_tracking_reason(result, raw)
+            if reason:
+                return reason
+
+        if isinstance(raw, dict) and raw.get("exit_tracking"):
+            reason = self._exit_tracking_reason(result, raw)
+            if reason:
+                return reason
+
+        error = raw.get("error") if isinstance(raw, dict) else None
+        raw_error = raw.get("raw_error") if isinstance(raw, dict) else None
+        error_text = f"{error or ''} {raw_error or ''}"
+        translated_error = self.translate_execution_error_text(error_text)
+        if translated_error:
+            return translated_error
+        if self._is_untradable_exchange_error(error_text):
+            return (
+                "OKX 提示该交易对当前不可交易，可能受账户地区/合规限制影响；"
+                "系统已暂时跳过该交易对，避免重复分析和下单。"
+            )
+        if self.is_no_exchange_position_error(error_text):
+            return (
+                "OKX 提示当前没有对应方向的可平仓位，可能已被 OKX 止盈/止损、"
+                "手动平仓或刚刚同步延迟；本轮未重复提交。"
+            )
+        if error:
+            return str(sanitize_text(error) or error)
+        if result.status == OrderStatus.FILLED:
+            return "订单已成交。"
+
+        status_map = {
+            OrderStatus.PENDING: "待成交",
+            OrderStatus.OPEN: "挂单中",
+            OrderStatus.PARTIAL: "部分成交",
+            OrderStatus.CANCELLED: "已取消",
+            OrderStatus.REJECTED: "已拒绝",
+        }
+        status = status_map.get(result.status, result.status.value)
+        return f"订单状态为{status}，未计为已执行。"
+
+    def translate_execution_error_text(self, text: str | None) -> str | None:
+        message = str(text or "").strip()
+        if not message:
+            return None
+        if "51008" in message or "Insufficient USDT margin" in message:
+            return (
+                "OKX 返回错误码 51008：账户可用 USDT 保证金不足，订单没有提交成功。"
+                "通常是当前持仓/挂单占用保证金过高、可用余额不足，或本轮计划仓位过大；"
+                "系统应优先处理已有持仓的平仓/减仓，不再继续加仓。"
+            )
+        if "59670" in message or "more than 5 open orders" in message:
+            return (
+                "OKX 拒绝调整杠杆：该交易对当前挂单超过 5 条。"
+                "系统会跳过重复杠杆设置，必要时只清理旧的非保护挂单后重试。"
+            )
+        if (
+            "open interest" in message.lower()
+            and "platform" in message.lower()
+            and "limit" in message.lower()
+        ) or "has reached the platform's limit" in message:
+            return (
+                "OKX 拒绝开仓：该合约当前平台总持仓量已经达到 OKX 上限，"
+                "交易所暂时不允许继续增加这个合约的新仓。"
+                "这不是 AI 方向或下单数量计算错误；系统会临时跳过该币种，稍后等 OKX 限制解除再重新分析。"
+            )
+        return None
+
+    @staticmethod
+    def is_no_exchange_position_error(message: Any) -> bool:
+        text = str(message or "").lower()
+        return (
+            "51169" in text
+            or "don't have any positions in this direction" in text
+            or "no matching position to close" in text
+            or "没有对应方向" in text
+            or "没有可平" in text
+            or "可平仓位" in text
+        )
+
+    def result_has_no_exchange_position(self, result: ExecutionResult | None) -> bool:
+        if result is None:
+            return False
+        raw = result.raw_response or {}
+        pieces = [result.order_id, result.exchange_order_id]
+        if isinstance(raw, dict):
+            pieces.extend([raw.get("error"), raw.get("raw_error")])
+        return self.is_no_exchange_position_error(" ".join(str(piece or "") for piece in pieces))
+
+    @staticmethod
+    def is_exit_tracking_execution(result: ExecutionResult | None) -> bool:
+        raw = result.raw_response if result else None
+        return bool(isinstance(raw, dict) and raw.get("exit_tracking"))
+
+    def is_exit_progress_execution(self, result: ExecutionResult | None) -> bool:
+        if not self.is_exit_tracking_execution(result):
+            return False
+        if result is None or result.status != OrderStatus.PARTIAL:
+            return False
+        order_id = str(result.exchange_order_id or "").strip()
+        return bool(order_id and result.quantity > 0)
+
+    @staticmethod
+    def is_exchange_confirmed_execution(result: ExecutionResult | None) -> bool:
+        """Only treat an execution as real after OKX returns a concrete order id."""
+
+        if result is None or result.status != OrderStatus.FILLED:
+            return False
+        order_id = str(result.exchange_order_id or "").strip()
+        return bool(order_id and order_id not in {"hold", "rejected", "no_position"})
+
+    def _entry_tracking_reason(
+        self,
+        result: ExecutionResult,
+        raw: dict[str, Any],
+    ) -> str | None:
+        message = str(sanitize_text(raw.get("message")) or "").strip()
+        remaining = _safe_float(raw.get("remaining_contracts"), 0.0)
+        filled = _safe_float(raw.get("filled_contracts"), 0.0)
+        if result.status == OrderStatus.PARTIAL:
+            return message or (
+                f"OKX 开仓委托已部分成交，已成交约 {filled:g} 张，"
+                f"剩余约 {remaining:g} 张仍在追单；本地等待 OKX 仓位同步确认。"
+            )
+        if result.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+            return message or (
+                "OKX 开仓委托正在挂单或追单，尚未确认成交；"
+                "系统不会先创建本地持仓，也不会重复提交同方向开仓单。"
+            )
+        return message or None
+
+    def _exit_tracking_reason(
+        self,
+        result: ExecutionResult,
+        raw: dict[str, Any],
+    ) -> str | None:
+        message = str(sanitize_text(raw.get("message")) or "").strip()
+        remaining = _safe_float(raw.get("remaining_contracts"), 0.0)
+        filled = _safe_float(raw.get("filled_contracts"), 0.0)
+        if result.status == OrderStatus.PARTIAL:
+            if remaining > 0:
+                return (
+                    message
+                    or f"OKX 平仓已部分成交，仍剩约 {remaining:g} 张合约在处理；系统会继续同步，不会重复提交平仓单。"
+                )
+            return message or "OKX 平仓已部分成交，系统会继续同步最终成交结果。"
+        if result.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+            if filled > 0 or remaining > 0:
+                return (
+                    message
+                    or f"OKX 平仓订单正在追单中，已成交约 {filled:g} 张，剩余约 {remaining:g} 张；系统不会重复提交。"
+                )
+            return message or "OKX 平仓订单正在追单或等待成交，系统不会重复提交平仓单。"
+        return message or None
+
+    def _is_untradable_exchange_error(self, message: str) -> bool:
+        if self._untradable_exchange_error_checker is None:
+            return False
+        return bool(self._untradable_exchange_error_checker(message))

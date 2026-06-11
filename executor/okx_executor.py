@@ -10,21 +10,20 @@ import asyncio
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
-from core.trading_mode import mode_manager
 from core.exceptions import (
     ExchangeAPIError,
-    InsufficientBalanceError,
-    OrderCancellationError,
     OrderPlacementError,
     RateLimitError,
 )
+from core.safe_output import safe_error_text
+from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
 
 logger = structlog.get_logger(__name__)
@@ -74,7 +73,9 @@ class TokenBucket:
         return False
 
     async def wait_for_token(self) -> None:
-        while not self.consume():
+        # Token refill is time-based, so this wait intentionally sleeps until
+        # enough time has passed for another token to become available.
+        while not self.consume():  # noqa: ASYNC110
             await asyncio.sleep(1.0 / self.rate)
 
 
@@ -87,7 +88,7 @@ class OKXExecutor(AbstractExecutor):
 
     def __init__(self, mode: str | None = None) -> None:
         self._mode_override = mode  # "paper" or "live", overrides global mode
-        self._exchange = None
+        self._exchange: Any = None
         self._rate_limiter = TokenBucket(RATE_LIMIT_TOKENS, RATE_LIMIT_TOKENS * 2)
         self._connected = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
@@ -157,10 +158,9 @@ class OKXExecutor(AbstractExecutor):
             self._exchange.hostname = OKX_HOSTNAME
 
     def _is_broken_rest_url_error(self, exc: Exception) -> bool:
-        message = str(exc)
-        return (
-            "unsupported operand type(s) for +: 'NoneType' and 'str'" in message
-            or ("NoneType" in message and "+:" in message and "str" in message)
+        message = safe_error_text(exc)
+        return "unsupported operand type(s) for +: 'NoneType' and 'str'" in message or (
+            "NoneType" in message and "+:" in message and "str" in message
         )
 
     async def _load_usdt_swap_markets(self) -> None:
@@ -178,7 +178,8 @@ class OKXExecutor(AbstractExecutor):
         response = await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
         filtered = [
-            item for item in instruments
+            item
+            for item in instruments
             if item.get("instType") == "SWAP"
             and item.get("state") == "live"
             and item.get("ctType") == "linear"
@@ -198,8 +199,11 @@ class OKXExecutor(AbstractExecutor):
         if self._exchange:
             try:
                 await self._exchange.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "OKX exchange close failed during reinitialize",
+                    error=safe_error_text(exc),
+                )
         self._exchange = None
         self._connected = False
         await self.initialize()
@@ -219,7 +223,7 @@ class OKXExecutor(AbstractExecutor):
                     timeout=OKX_REST_CALL_TIMEOUT,
                 )
                 return result
-            except asyncio.TimeoutError as e:
+            except TimeoutError as e:
                 logger.warning(
                     "OKX REST call timed out",
                     method=method_name,
@@ -231,35 +235,38 @@ class OKXExecutor(AbstractExecutor):
                 ) from e
             except ccxt_async.RateLimitExceeded as e:
                 logger.warning("rate limited", attempt=attempt)
-                await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                await asyncio.sleep(RETRY_DELAY * (2**attempt))
                 last_error = e
             except ccxt_async.NetworkError as e:
-                logger.warning("network error", attempt=attempt, error=str(e))
-                await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                logger.warning("network error", attempt=attempt, error=safe_error_text(e))
+                await asyncio.sleep(RETRY_DELAY * (2**attempt))
                 last_error = e
             except ccxt_async.ExchangeError as e:
-                logger.error("exchange error", error=str(e))
-                raise ExchangeAPIError(str(e)) from e
+                message = safe_error_text(e)
+                logger.error("exchange error", error=message)
+                raise ExchangeAPIError(message) from e
             except Exception as e:
                 if self._is_broken_rest_url_error(e) and attempt < MAX_RETRIES - 1:
                     logger.warning(
                         "OKX executor REST URL state invalid; reinitializing CCXT client",
                         method=method_name,
                         attempt=attempt,
-                        error=str(e),
+                        error=safe_error_text(e),
                     )
                     await self.reinitialize()
                     if method_name and self._exchange is not None:
                         fn = getattr(self._exchange, method_name, fn)
-                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
                 raise
 
-        raise RateLimitError(f"Max retries exceeded: {last_error}")
+        raise RateLimitError(f"Max retries exceeded: {safe_error_text(last_error)}")
 
     async def place_order(
-        self, decision: DecisionOutput, account_id: str | None = None,
+        self,
+        decision: DecisionOutput,
+        account_id: str | None = None,
         override_balance: float | None = None,
     ) -> ExecutionResult:
         if not self._connected:
@@ -360,10 +367,7 @@ class OKXExecutor(AbstractExecutor):
                     if filled_contracts > 0 and status in {OrderStatus.OPEN, OrderStatus.PENDING}:
                         status = OrderStatus.PARTIAL
                     execution_price = float(
-                        existing_entry.get("average")
-                        or existing_entry.get("price")
-                        or price
-                        or 0
+                        existing_entry.get("average") or existing_entry.get("price") or price or 0
                     )
                     return ExecutionResult(
                         order_id=order_id or "entry_tracking",
@@ -375,7 +379,7 @@ class OKXExecutor(AbstractExecutor):
                         status=status,
                         fee=self._order_fee_cost(existing_entry),
                         exchange_order_id=order_id or None,
-                        timestamp=datetime.now(timezone.utc),
+                        timestamp=datetime.now(UTC),
                         raw_response={
                             **existing_entry,
                             "entry_tracking": True,
@@ -397,12 +401,12 @@ class OKXExecutor(AbstractExecutor):
 
             # For closing positions, get the actual position size
             if decision.is_exit:
-                positions = await self.get_positions(decision.symbol)
+                positions = await self.get_positions_strict(decision.symbol)
                 target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
                 matching = [
-                    p for p in positions
-                    if p.get("side") == target_side
-                    and self._position_contracts(p) > 0
+                    p
+                    for p in positions
+                    if p.get("side") == target_side and self._position_contracts(p) > 0
                 ]
                 if matching:
                     pre_exit_contracts = self._position_contracts(matching[0])
@@ -413,8 +417,13 @@ class OKXExecutor(AbstractExecutor):
                     order_quantity = pre_exit_contracts * requested_exit_fraction
                     try:
                         order_quantity = float(ccxt.amount_to_precision(okx_symbol, order_quantity))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "OKX amount precision failed for exit order",
+                            symbol=okx_symbol,
+                            quantity=order_quantity,
+                            error=safe_error_text(exc),
+                        )
                     amount_min = self._amount_min(market)
                     if amount_min > 0 and 0 < order_quantity < amount_min:
                         order_quantity = min(pre_exit_contracts, amount_min)
@@ -441,7 +450,9 @@ class OKXExecutor(AbstractExecutor):
                         quantity=0,
                         price=price,
                         status=OrderStatus.REJECTED,
-                        raw_response={"error": "OKX 当前没有对应方向的可平仓位，本轮未提交平仓订单。"},
+                        raw_response={
+                            "error": "OKX 当前没有对应方向的可平仓位，本轮未提交平仓订单。"
+                        },
                     )
 
                 existing_exit = await self._find_active_exit_order(ccxt, okx_symbol, side)
@@ -457,14 +468,16 @@ class OKXExecutor(AbstractExecutor):
                         order_quantity,
                     )
                     remaining_contracts = max(amount_contracts - filled_contracts, 0.0)
-                    order_status = self._order_status_from_ccxt(existing_exit.get("status") or info.get("state"))
-                    if filled_contracts > 0 and order_status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+                    order_status = self._order_status_from_ccxt(
+                        existing_exit.get("status") or info.get("state")
+                    )
+                    if filled_contracts > 0 and order_status in {
+                        OrderStatus.OPEN,
+                        OrderStatus.PENDING,
+                    }:
                         order_status = OrderStatus.PARTIAL
                     execution_price = float(
-                        existing_exit.get("average")
-                        or existing_exit.get("price")
-                        or price
-                        or 0
+                        existing_exit.get("average") or existing_exit.get("price") or price or 0
                     )
                     order_age = self._order_age_seconds(existing_exit)
                     if order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS:
@@ -486,7 +499,7 @@ class OKXExecutor(AbstractExecutor):
                                 status=order_status,
                                 fee=self._order_fee_cost(existing_exit),
                                 exchange_order_id=order_id or None,
-                                timestamp=datetime.now(timezone.utc),
+                                timestamp=datetime.now(UTC),
                                 raw_response={
                                     **existing_exit,
                                     "exit_tracking": True,
@@ -513,11 +526,11 @@ class OKXExecutor(AbstractExecutor):
                             )
 
                         await asyncio.sleep(0.5)
-                        positions = await self.get_positions(decision.symbol)
+                        positions = await self.get_positions_strict(decision.symbol)
                         matching = [
-                            p for p in positions
-                            if p.get("side") == target_side
-                            and self._position_contracts(p) > 0
+                            p
+                            for p in positions
+                            if p.get("side") == target_side and self._position_contracts(p) > 0
                         ]
                         if not matching:
                             return ExecutionResult(
@@ -530,7 +543,7 @@ class OKXExecutor(AbstractExecutor):
                                 status=OrderStatus.FILLED,
                                 fee=self._order_fee_cost(existing_exit),
                                 exchange_order_id=order_id,
-                                timestamp=datetime.now(timezone.utc),
+                                timestamp=datetime.now(UTC),
                                 raw_response={
                                     **existing_exit,
                                     "exit_tracking": True,
@@ -556,9 +569,16 @@ class OKXExecutor(AbstractExecutor):
                         else:
                             order_quantity = pre_exit_contracts * requested_exit_fraction
                         try:
-                            order_quantity = float(ccxt.amount_to_precision(okx_symbol, order_quantity))
-                        except Exception:
-                            pass
+                            order_quantity = float(
+                                ccxt.amount_to_precision(okx_symbol, order_quantity)
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "OKX amount precision failed for replacement exit",
+                                symbol=okx_symbol,
+                                quantity=order_quantity,
+                                error=safe_error_text(exc),
+                            )
                         if amount_min > 0 and 0 < order_quantity < amount_min:
                             order_quantity = min(pre_exit_contracts, amount_min)
                         if order_quantity <= 0:
@@ -572,7 +592,7 @@ class OKXExecutor(AbstractExecutor):
                                 status=OrderStatus.REJECTED,
                                 fee=self._order_fee_cost(existing_exit),
                                 exchange_order_id=order_id,
-                                timestamp=datetime.now(timezone.utc),
+                                timestamp=datetime.now(UTC),
                                 raw_response={
                                     **existing_exit,
                                     "exit_tracking": True,
@@ -607,7 +627,7 @@ class OKXExecutor(AbstractExecutor):
                             status=order_status,
                             fee=self._order_fee_cost(existing_exit),
                             exchange_order_id=order_id or None,
-                            timestamp=datetime.now(timezone.utc),
+                            timestamp=datetime.now(UTC),
                             raw_response={
                                 **existing_exit,
                                 "exit_tracking": True,
@@ -640,7 +660,8 @@ class OKXExecutor(AbstractExecutor):
                         price=price,
                         status=OrderStatus.REJECTED,
                         raw_response={
-                            "error": leverage_check.get("error") or "OKX 杠杆设置失败，本次未开仓。",
+                            "error": leverage_check.get("error")
+                            or "OKX 杠杆设置失败，本次未开仓。",
                             "leverage_check": leverage_check,
                             "okx_symbol": okx_symbol,
                             "contract_size": contract_size,
@@ -656,7 +677,9 @@ class OKXExecutor(AbstractExecutor):
                 )
                 if actual_leverage > 0 and abs(actual_leverage - quantity_leverage) > 1e-9:
                     decision.suggested_leverage = actual_leverage
-                    position_value = balance * decision.position_size_pct * decision.suggested_leverage
+                    position_value = (
+                        balance * decision.position_size_pct * decision.suggested_leverage
+                    )
                     order_quantity, base_quantity = self._entry_order_amount(
                         ccxt,
                         market,
@@ -688,12 +711,14 @@ class OKXExecutor(AbstractExecutor):
                     price,
                     ticker=ticker,
                 )
-                params["attachAlgoOrds"] = [{
-                    "tpTriggerPx": str(take_profit_px),
-                    "tpOrdPx": "-1",
-                    "slTriggerPx": str(stop_loss_px),
-                    "slOrdPx": "-1",
-                }]
+                params["attachAlgoOrds"] = [
+                    {
+                        "tpTriggerPx": str(take_profit_px),
+                        "tpOrdPx": "-1",
+                        "slTriggerPx": str(stop_loss_px),
+                        "slOrdPx": "-1",
+                    }
+                ]
             elif decision.is_exit:
                 if position_side:
                     params["positionSide"] = position_side
@@ -726,8 +751,9 @@ class OKXExecutor(AbstractExecutor):
                 )
             except ExchangeAPIError as e:
                 if decision.is_entry:
+                    error_text = safe_error_text(e)
                     capped_quantity = self._capped_quantity_from_position_limit_error(
-                        str(e),
+                        error_text,
                         ccxt,
                         market,
                         order_quantity,
@@ -743,7 +769,7 @@ class OKXExecutor(AbstractExecutor):
                             okx_symbol=okx_symbol,
                             original_quantity=order_quantity,
                             capped_quantity=capped_quantity,
-                            error=str(e),
+                            error=error_text,
                         )
                         order_quantity = capped_quantity
                         base_quantity = order_quantity * contract_size
@@ -763,7 +789,9 @@ class OKXExecutor(AbstractExecutor):
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
             execution_price = float(order.get("average") or order.get("price") or price or 0)
-            status = self._order_status_from_ccxt(order.get("status") or (order.get("info") or {}).get("state"))
+            status = self._order_status_from_ccxt(
+                order.get("status") or (order.get("info") or {}).get("state")
+            )
             if decision.is_entry and status == OrderStatus.FILLED and filled_contracts <= 0:
                 filled_contracts = self._safe_float(order.get("amount") or order_quantity, 0.0)
             filled_base_quantity = filled_contracts * contract_size
@@ -780,24 +808,77 @@ class OKXExecutor(AbstractExecutor):
                         )
                         if refreshed:
                             order = {**order, **refreshed}
-                            status = self._order_status_from_ccxt(order.get("status") or (order.get("info") or {}).get("state"))
+                            status = self._order_status_from_ccxt(
+                                order.get("status") or (order.get("info") or {}).get("state")
+                            )
                             filled_contracts = max(
                                 filled_contracts,
                                 self._safe_float(order.get("filled"), 0.0),
                             )
-                            execution_price = float(order.get("average") or order.get("price") or execution_price or price or 0)
+                            execution_price = float(
+                                order.get("average")
+                                or order.get("price")
+                                or execution_price
+                                or price
+                                or 0
+                            )
                     except Exception as e:
                         logger.warning(
                             "exit order refresh failed",
                             order_id=order.get("id"),
                             symbol=okx_symbol,
-                            error=str(e),
+                            error=safe_error_text(e),
                         )
 
-                    after_contracts = await self._position_contracts_for_side(
-                        decision.symbol,
-                        target_side,
-                    )
+                    try:
+                        after_contracts = await self._position_contracts_for_side(
+                            decision.symbol,
+                            target_side,
+                        )
+                    except Exception as e:
+                        error_text = safe_error_text(e)
+                        logger.warning(
+                            "exit position refresh failed after order submit",
+                            order_id=order.get("id"),
+                            symbol=okx_symbol,
+                            side=target_side,
+                            error=error_text,
+                        )
+                        order_id = str(order.get("id") or "").strip()
+                        return ExecutionResult(
+                            order_id=order_id or "exit_position_snapshot_unknown",
+                            symbol=decision.symbol,
+                            side=side,
+                            order_type="market",
+                            quantity=0.0,
+                            price=execution_price,
+                            status=(
+                                OrderStatus.PARTIAL if filled_contracts > 0 else OrderStatus.PENDING
+                            ),
+                            fee=self._order_fee_cost(order),
+                            exchange_order_id=order_id or None,
+                            timestamp=datetime.now(UTC),
+                            raw_response={
+                                **order,
+                                "exit_tracking": True,
+                                "position_snapshot_unknown": True,
+                                "position_snapshot_error": error_text,
+                                "message": (
+                                    "OKX 平仓订单已提交，但系统暂时无法刷新 OKX 剩余仓位；"
+                                    "本地不估算剩余仓位为 0，等待下一轮同步确认成交和持仓状态。"
+                                ),
+                                "exit_order_replace_note": exit_order_replace_note,
+                                "request_params": params,
+                                "okx_symbol": okx_symbol,
+                                "contract_size": contract_size,
+                                "order_contracts": order_quantity,
+                                "order_status": status.value,
+                                "filled_contracts": filled_contracts,
+                                "position_contracts_before": pre_exit_contracts,
+                                "position_contracts_after": None,
+                                "remaining_contracts": None,
+                            },
+                        )
                     if pre_exit_contracts - after_contracts > max(pre_exit_contracts * 0.001, 1e-8):
                         break
                     if status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
@@ -820,10 +901,14 @@ class OKXExecutor(AbstractExecutor):
                             order_type="market",
                             quantity=0.0,
                             price=execution_price,
-                            status=OrderStatus.PARTIAL if filled_contracts > tolerance else OrderStatus.OPEN,
+                            status=(
+                                OrderStatus.PARTIAL
+                                if filled_contracts > tolerance
+                                else OrderStatus.OPEN
+                            ),
                             fee=self._order_fee_cost(order),
                             exchange_order_id=order_id,
-                            timestamp=datetime.now(timezone.utc),
+                            timestamp=datetime.now(UTC),
                             raw_response={
                                 **order,
                                 "exit_tracking": True,
@@ -852,9 +937,13 @@ class OKXExecutor(AbstractExecutor):
                         quantity=0,
                         price=execution_price,
                         status=OrderStatus.REJECTED,
-                        fee=order.get("fee", {}).get("cost", 0) if isinstance(order.get("fee"), dict) else 0,
+                        fee=(
+                            order.get("fee", {}).get("cost", 0)
+                            if isinstance(order.get("fee"), dict)
+                            else 0
+                        ),
                         exchange_order_id=order_id or None,
-                        timestamp=datetime.now(timezone.utc),
+                        timestamp=datetime.now(UTC),
                         raw_response={
                             **order,
                             "error": (
@@ -895,9 +984,11 @@ class OKXExecutor(AbstractExecutor):
                 ),
                 price=execution_price,
                 status=status,
-                fee=order.get("fee", {}).get("cost", 0) if isinstance(order.get("fee"), dict) else 0,
+                fee=(
+                    order.get("fee", {}).get("cost", 0) if isinstance(order.get("fee"), dict) else 0
+                ),
                 exchange_order_id=order.get("id"),
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
                 raw_response={
                     **order,
                     "request_params": params,
@@ -912,46 +1003,61 @@ class OKXExecutor(AbstractExecutor):
                     ),
                     "order_resize_note": order_resize_note,
                     "exit_order_replace_note": exit_order_replace_note,
-                    **({
-                        "entry_tracking": True,
-                        "message": (
-                            "OKX 开仓订单已提交，但仍在挂单或追单，尚未确认成交；"
-                            "本地不会先创建持仓，成交后会由 OKX 仓位同步补回。"
-                        ),
-                    } if decision.is_entry and status in {
-                        OrderStatus.OPEN,
-                        OrderStatus.PENDING,
-                        OrderStatus.PARTIAL,
-                    } else {}),
+                    **(
+                        {
+                            "entry_tracking": True,
+                            "message": (
+                                "OKX 开仓订单已提交，但仍在挂单或追单，尚未确认成交；"
+                                "本地不会先创建持仓，成交后会由 OKX 仓位同步补回。"
+                            ),
+                        }
+                        if decision.is_entry
+                        and status
+                        in {
+                            OrderStatus.OPEN,
+                            OrderStatus.PENDING,
+                            OrderStatus.PARTIAL,
+                        }
+                        else {}
+                    ),
                     **({"leverage_check": leverage_check} if decision.is_entry else {}),
-                    **({
-                        "exit_tracking": True,
-                        "position_contracts_before": pre_exit_contracts,
-                        "position_contracts_after": after_contracts,
-                        "requested_exit_fraction": requested_exit_fraction,
-                        "requested_exit_contracts": requested_exit_contracts,
-                        "remaining_contracts": max(after_contracts, 0.0),
-                        "message": (
-                            f"{exit_order_replace_note} OKX 平仓已全部成交。"
-                            if exit_order_replace_note and status == OrderStatus.FILLED and requested_exit_fraction >= 0.999
-                            else
-                            f"{exit_order_replace_note} OKX 已按计划减仓 {requested_exit_fraction:.0%}，剩余仓位继续同步追踪。"
-                            if exit_order_replace_note and status == OrderStatus.FILLED
-                            else
-                            (
-                                "OKX 平仓已全部成交。"
-                                if requested_exit_fraction >= 0.999
-                                else f"OKX 已按计划减仓 {requested_exit_fraction:.0%}，剩余仓位继续同步追踪。"
-                            )
-                            if status == OrderStatus.FILLED
-                            else "OKX 平仓已部分成交，剩余仓位继续同步追踪。"
-                        ),
-                    } if decision.is_exit else {}),
+                    **(
+                        {
+                            "exit_tracking": True,
+                            "position_contracts_before": pre_exit_contracts,
+                            "position_contracts_after": after_contracts,
+                            "requested_exit_fraction": requested_exit_fraction,
+                            "requested_exit_contracts": requested_exit_contracts,
+                            "remaining_contracts": max(after_contracts, 0.0),
+                            "message": (
+                                f"{exit_order_replace_note} OKX 平仓已全部成交。"
+                                if exit_order_replace_note
+                                and status == OrderStatus.FILLED
+                                and requested_exit_fraction >= 0.999
+                                else (
+                                    f"{exit_order_replace_note} OKX 已按计划减仓 {requested_exit_fraction:.0%}，剩余仓位继续同步追踪。"
+                                    if exit_order_replace_note and status == OrderStatus.FILLED
+                                    else (
+                                        (
+                                            "OKX 平仓已全部成交。"
+                                            if requested_exit_fraction >= 0.999
+                                            else f"OKX 已按计划减仓 {requested_exit_fraction:.0%}，剩余仓位继续同步追踪。"
+                                        )
+                                        if status == OrderStatus.FILLED
+                                        else "OKX 平仓已部分成交，剩余仓位继续同步追踪。"
+                                    )
+                                )
+                            ),
+                        }
+                        if decision.is_exit
+                        else {}
+                    ),
                 },
             )
 
         except ExchangeAPIError as e:
-            if decision.is_exit and self._is_no_position_error(str(e)):
+            error_text = safe_error_text(e)
+            if decision.is_exit and self._is_no_position_error(error_text):
                 return ExecutionResult(
                     order_id="no_position",
                     symbol=decision.symbol,
@@ -962,15 +1068,16 @@ class OKXExecutor(AbstractExecutor):
                     status=OrderStatus.REJECTED,
                     raw_response={
                         "error": "OKX 提示当前没有对应方向的可平仓位，可能已被 OKX 止盈/止损、手动平仓或刚刚同步延迟；本轮未重复提交。",
-                        "raw_error": str(e),
+                        "raw_error": error_text,
                     },
                 )
             raise
         except RateLimitError:
             raise
         except Exception as e:
-            logger.error("order placement failed", error=str(e))
-            raise OrderPlacementError(f"Failed to place order: {e}") from e
+            error_text = safe_error_text(e)
+            logger.error("order placement failed", error=error_text)
+            raise OrderPlacementError(f"Failed to place order: {error_text}") from e
 
     async def _confirm_market_order(self, ccxt, order: dict, symbol: str) -> dict:
         """Fetch the final OKX order state after market order submission."""
@@ -990,7 +1097,7 @@ class OKXExecutor(AbstractExecutor):
                 "order confirmation failed; keeping initial order status",
                 order_id=order_id,
                 symbol=symbol,
-                error=str(e),
+                error=safe_error_text(e),
             )
         return order
 
@@ -1017,6 +1124,8 @@ class OKXExecutor(AbstractExecutor):
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
         try:
+            if value is None:
+                return default
             return float(value)
         except (TypeError, ValueError):
             return default
@@ -1045,7 +1154,7 @@ class OKXExecutor(AbstractExecutor):
         return target_side
 
     async def _position_contracts_for_side(self, symbol: str, side: str) -> float:
-        positions = await self.get_positions(symbol)
+        positions = await self.get_positions_strict(symbol)
         for position in positions or []:
             if position.get("side") == side:
                 return self._position_contracts(position)
@@ -1060,7 +1169,7 @@ class OKXExecutor(AbstractExecutor):
                 "fetch open exit orders failed",
                 symbol=okx_symbol,
                 side=side,
-                error=str(e),
+                error=safe_error_text(e),
             )
             return None
 
@@ -1090,7 +1199,7 @@ class OKXExecutor(AbstractExecutor):
                 "fetch open entry orders failed",
                 symbol=okx_symbol,
                 side=side,
-                error=str(e),
+                error=safe_error_text(e),
             )
             return None
 
@@ -1126,20 +1235,30 @@ class OKXExecutor(AbstractExecutor):
             or info.get("created_at")
         )
         try:
-            ts = float(raw_ts)
+            ts = self._safe_float(raw_ts, 0.0)
+            if ts <= 0:
+                raise ValueError("missing timestamp")
             if ts > 1_000_000_000_000:
                 ts = ts / 1000.0
             return max(time.time() - ts, 0.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "failed to parse OKX order timestamp",
+                raw_timestamp=raw_ts,
+                error=safe_error_text(exc),
+            )
 
         raw_dt = order.get("datetime") or info.get("datetime")
         if raw_dt:
             try:
                 dt = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
-                return max((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds(), 0.0)
-            except Exception:
-                pass
+                return max((datetime.now(UTC) - dt.astimezone(UTC)).total_seconds(), 0.0)
+            except Exception as exc:
+                logger.debug(
+                    "failed to parse OKX order datetime",
+                    raw_datetime=raw_dt,
+                    error=safe_error_text(exc),
+                )
         return EXIT_ORDER_REPLACE_AFTER_SECONDS
 
     async def _cancel_stale_exit_order(
@@ -1161,14 +1280,15 @@ class OKXExecutor(AbstractExecutor):
             )
             return {"cancel_success": True}
         except Exception as e:
+            error_text = safe_error_text(e, limit=300)
             logger.warning(
                 "failed to cancel stale OKX exit order for replace",
                 symbol=okx_symbol,
                 order_id=order_id,
                 age_seconds=order_age,
-                error=str(e),
+                error=error_text,
             )
-            return {"cancel_success": False, "cancel_error": str(e)[:300]}
+            return {"cancel_success": False, "cancel_error": error_text}
 
     def _order_fee_cost(self, order: dict) -> float:
         fee = order.get("fee")
@@ -1217,8 +1337,13 @@ class OKXExecutor(AbstractExecutor):
 
         try:
             contracts = float(ccxt.amount_to_precision(market["symbol"], contracts))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "OKX amount precision failed for position size",
+                symbol=market.get("symbol"),
+                contracts=contracts,
+                error=safe_error_text(exc),
+            )
         if min_contracts > 0 and contracts < min_contracts:
             contracts = min_contracts
 
@@ -1249,8 +1374,13 @@ class OKXExecutor(AbstractExecutor):
         capped = max_contracts * 0.98
         try:
             capped = float(ccxt.amount_to_precision(market["symbol"], capped))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "OKX amount precision failed for capped quantity",
+                symbol=market.get("symbol"),
+                capped=capped,
+                error=safe_error_text(exc),
+            )
         min_contracts = self._amount_min(market)
         if min_contracts > 0 and capped < min_contracts:
             return None
@@ -1269,7 +1399,7 @@ class OKXExecutor(AbstractExecutor):
             await self._with_retry(ccxt.cancel_order, order_id, symbol)
             return True
         except Exception as e:
-            logger.error("cancel order failed", order_id=order_id, error=str(e))
+            logger.error("cancel order failed", order_id=order_id, error=safe_error_text(e))
             return False
 
     def _leverage_cache_key(self, okx_symbol: str, params: dict[str, Any]) -> tuple[str, str]:
@@ -1277,7 +1407,10 @@ class OKXExecutor(AbstractExecutor):
 
     def _cache_leverage(self, okx_symbol: str, params: dict[str, Any], leverage: float) -> None:
         if leverage > 0:
-            self._leverage_cache[self._leverage_cache_key(okx_symbol, params)] = (float(leverage), time.monotonic())
+            self._leverage_cache[self._leverage_cache_key(okx_symbol, params)] = (
+                float(leverage),
+                time.monotonic(),
+            )
 
     async def _fetch_current_leverage(
         self,
@@ -1326,9 +1459,16 @@ class OKXExecutor(AbstractExecutor):
         try:
             orders = await self._with_retry(ccxt.fetch_open_orders, okx_symbol)
         except Exception as e:
-            return {"checked": False, "cancelled": 0, "remaining": None, "error": str(e)[:220]}
+            return {
+                "checked": False,
+                "cancelled": 0,
+                "remaining": None,
+                "error": safe_error_text(e, limit=220),
+            }
 
-        safe_orders = [order for order in orders or [] if self._is_safe_to_cancel_for_leverage_retry(order)]
+        safe_orders = [
+            order for order in orders or [] if self._is_safe_to_cancel_for_leverage_retry(order)
+        ]
         safe_orders.sort(
             key=lambda order: self._safe_float(
                 order.get("timestamp") or (order.get("info") or {}).get("cTime") or 0,
@@ -1346,7 +1486,7 @@ class OKXExecutor(AbstractExecutor):
                 await self._with_retry(ccxt.cancel_order, order_id, okx_symbol)
                 cancelled += 1
             except Exception as e:
-                errors.append(str(e)[:160])
+                errors.append(safe_error_text(e, limit=160))
 
         remaining = max(len(orders or []) - cancelled, 0)
         return {
@@ -1356,125 +1496,6 @@ class OKXExecutor(AbstractExecutor):
             "cancelled": cancelled,
             "remaining": remaining,
             "errors": errors[:3],
-        }
-
-    async def _set_leverage_if_needed(self, decision: DecisionOutput) -> dict[str, Any]:
-        """Apply and verify the AI-selected leverage before entry orders."""
-        ccxt = await self._get_ccxt()
-        okx_symbol = self._to_swap_symbol(decision.symbol)
-        params = {"mgnMode": "cross"}
-        requested_leverage = int(max(1, min(int(round(decision.suggested_leverage)), settings.max_leverage)))
-        max_leverage = await self._fetch_okx_max_leverage(okx_symbol, params, requested_leverage)
-        leverage = int(max(1, min(requested_leverage, int(max_leverage or requested_leverage), settings.max_leverage)))
-        if leverage != requested_leverage:
-            decision.suggested_leverage = float(leverage)
-        response: dict[str, Any] | None = None
-        try:
-            response = await self._with_retry(
-                ccxt.set_leverage,
-                leverage,
-                okx_symbol,
-                params,
-            )
-        except Exception as e:
-            message = (
-                f"OKX 杠杆设置失败，本次未开仓。目标杠杆 {leverage}x，"
-                f"OKX 返回：{str(e)[:220]}"
-            )
-            logger.warning(
-                "set leverage failed; rejecting entry order",
-                symbol=decision.symbol,
-                okx_symbol=okx_symbol,
-                leverage=leverage,
-                error=str(e),
-            )
-            return {
-                "ok": False,
-                "error": message,
-                "ai_requested_leverage": requested_leverage,
-                "okx_max_leverage": max_leverage,
-                "target_leverage": leverage,
-                "actual_leverage": None,
-                "set_response": response,
-                "verify_response": None,
-                "params": params,
-            }
-
-        verify_response: dict[str, Any] | None = None
-        try:
-            verify_response = await self._with_retry(
-                ccxt.fetch_leverage,
-                okx_symbol,
-                params,
-            )
-            actual = self._extract_verified_leverage(verify_response)
-        except Exception as e:
-            message = (
-                f"OKX 杠杆设置后无法确认，本次未开仓。目标杠杆 {leverage}x，"
-                f"确认查询返回：{str(e)[:220]}"
-            )
-            logger.warning(
-                "set leverage verification failed; rejecting entry order",
-                symbol=decision.symbol,
-                okx_symbol=okx_symbol,
-                leverage=leverage,
-                error=str(e),
-                set_response=response,
-            )
-            return {
-                "ok": False,
-                "error": message,
-                "ai_requested_leverage": requested_leverage,
-                "okx_max_leverage": max_leverage,
-                "target_leverage": leverage,
-                "actual_leverage": None,
-                "set_response": response,
-                "verify_response": verify_response,
-                "params": params,
-            }
-
-        if int(actual or 0) != leverage:
-            message = (
-                f"OKX 杠杆设置未生效，本次未开仓。目标杠杆 {leverage}x，"
-                f"实际查询为 {actual or 0:g}x。"
-            )
-            logger.warning(
-                "set leverage mismatch; rejecting entry order",
-                symbol=decision.symbol,
-                okx_symbol=okx_symbol,
-                target_leverage=leverage,
-                actual_leverage=actual,
-                set_response=response,
-                verify_response=verify_response,
-            )
-            return {
-                "ok": False,
-                "error": message,
-                "ai_requested_leverage": requested_leverage,
-                "okx_max_leverage": max_leverage,
-                "target_leverage": leverage,
-                "actual_leverage": actual,
-                "set_response": response,
-                "verify_response": verify_response,
-                "params": params,
-            }
-
-        logger.info(
-            "set leverage confirmed",
-            symbol=decision.symbol,
-            okx_symbol=okx_symbol,
-            leverage=leverage,
-            response=response,
-        )
-        return {
-            "ok": True,
-            "ai_requested_leverage": requested_leverage,
-            "okx_max_leverage": max_leverage,
-            "target_leverage": leverage,
-            "actual_leverage": actual,
-            "set_response": response,
-            "verify_response": verify_response,
-            "params": params,
         }
 
     async def _fetch_okx_max_leverage(
@@ -1491,13 +1512,23 @@ class OKXExecutor(AbstractExecutor):
             if isinstance(tiers, list):
                 for tier in tiers:
                     if isinstance(tier, dict):
-                        values.append(self._safe_float(tier.get("maxLeverage") or tier.get("max_leverage"), 0.0))
+                        values.append(
+                            self._safe_float(
+                                tier.get("maxLeverage") or tier.get("max_leverage"), 0.0
+                            )
+                        )
         except Exception as e:
-            logger.debug("fetch leverage tiers failed", symbol=okx_symbol, error=str(e))
+            logger.debug(
+                "fetch leverage tiers failed",
+                symbol=okx_symbol,
+                error=safe_error_text(e),
+            )
 
         try:
             market = ccxt.market(okx_symbol)
-            inst_id = ((market.get("info") or {}).get("instId") or okx_symbol.replace("/", "-").replace(":USDT", "-SWAP"))
+            inst_id = (market.get("info") or {}).get("instId") or okx_symbol.replace(
+                "/", "-"
+            ).replace(":USDT", "-SWAP")
             estimate = await self._with_retry(
                 ccxt.privateGetAccountAdjustLeverageInfo,
                 {
@@ -1511,7 +1542,11 @@ class OKXExecutor(AbstractExecutor):
                 if isinstance(item, dict):
                     values.append(self._safe_float(item.get("maxLever"), 0.0))
         except Exception as e:
-            logger.debug("fetch OKX adjust leverage info failed", symbol=okx_symbol, error=str(e))
+            logger.debug(
+                "fetch OKX adjust leverage info failed",
+                symbol=okx_symbol,
+                error=safe_error_text(e),
+            )
 
         values = [value for value in values if value > 0]
         return max(values) if values else float(settings.max_leverage)
@@ -1539,9 +1574,20 @@ class OKXExecutor(AbstractExecutor):
         ccxt = await self._get_ccxt()
         okx_symbol = self._to_swap_symbol(decision.symbol)
         params = {"mgnMode": "cross"}
-        requested_leverage = int(max(1, min(int(round(decision.suggested_leverage)), settings.max_leverage)))
+        requested_leverage = int(
+            max(1, min(int(round(decision.suggested_leverage)), settings.max_leverage))
+        )
         max_leverage = await self._fetch_okx_max_leverage(okx_symbol, params, requested_leverage)
-        leverage = int(max(1, min(requested_leverage, int(max_leverage or requested_leverage), settings.max_leverage)))
+        leverage = int(
+            max(
+                1,
+                min(
+                    requested_leverage,
+                    int(max_leverage or requested_leverage),
+                    settings.max_leverage,
+                ),
+            )
+        )
         decision.suggested_leverage = float(leverage)
 
         actual = 0.0
@@ -1549,7 +1595,11 @@ class OKXExecutor(AbstractExecutor):
         try:
             actual, verify_response = await self._fetch_current_leverage(ccxt, okx_symbol, params)
         except Exception as e:
-            logger.debug("fetch current leverage before set failed", symbol=okx_symbol, error=str(e))
+            logger.debug(
+                "fetch current leverage before set failed",
+                symbol=okx_symbol,
+                error=safe_error_text(e),
+            )
         actual_rounded = int(round(actual or 0))
         if actual > 0 and actual_rounded == leverage:
             return {
@@ -1572,14 +1622,19 @@ class OKXExecutor(AbstractExecutor):
             set_response = await self._with_retry(ccxt.set_leverage, leverage, okx_symbol, params)
         except Exception as e:
             set_error = e
-            if self._is_leverage_open_order_limit_error(e):
+            set_error_text = safe_error_text(set_error, limit=220)
+            if self._is_leverage_open_order_limit_error(set_error_text):
                 cleanup_result = await self._reduce_open_orders_for_leverage_retry(ccxt, okx_symbol)
                 if int(cleanup_result.get("cancelled") or 0) > 0:
                     try:
-                        set_response = await self._with_retry(ccxt.set_leverage, leverage, okx_symbol, params)
+                        set_response = await self._with_retry(
+                            ccxt.set_leverage, leverage, okx_symbol, params
+                        )
                         set_error = None
+                        set_error_text = ""
                     except Exception as retry_error:
                         set_error = retry_error
+                        set_error_text = safe_error_text(set_error, limit=220)
                 if set_response is None:
                     try:
                         actual, verify_response = await self._fetch_current_leverage(
@@ -1592,14 +1647,17 @@ class OKXExecutor(AbstractExecutor):
                         logger.debug(
                             "fetch current leverage after 59670 failed",
                             symbol=okx_symbol,
-                            error=str(current_error),
+                            error=safe_error_text(current_error),
                         )
                     actual_rounded = int(round(actual or 0))
                     if actual > 0 and actual_rounded == leverage:
                         return {
                             "ok": True,
                             "skipped_set": True,
-                            "reason": "OKX 因未成交委托限制本轮杠杆调整，但当前杠杆已等于系统目标杠杆。",
+                            "reason": (
+                                "OKX 因未成交委托限制本轮无法调整杠杆，"
+                                "但当前杠杆已等于系统目标杠杆。"
+                            ),
                             "ai_requested_leverage": requested_leverage,
                             "okx_max_leverage": max_leverage,
                             "target_leverage": leverage,
@@ -1611,7 +1669,7 @@ class OKXExecutor(AbstractExecutor):
                         }
                     if actual <= 0:
                         try:
-                            positions = await self.get_positions(decision.symbol)
+                            positions = await self.get_positions_strict(decision.symbol)
                             for position in positions or []:
                                 info = position.get("info") or {}
                                 candidate = self._safe_float(
@@ -1627,25 +1685,53 @@ class OKXExecutor(AbstractExecutor):
                             logger.debug(
                                 "fetch position leverage after 59670 failed",
                                 symbol=okx_symbol,
-                                error=str(position_error),
+                                error=safe_error_text(position_error),
                             )
                     actual_rounded = int(round(actual or 0))
-                    fallback_leverage = actual if actual > 0 else float(leverage)
-                    if actual > 0 and actual_rounded > leverage:
+                    if actual <= 0:
                         message = (
-                            f"OKX 当前杠杆 {actual:g}x 高于系统目标 {leverage}x，"
-                            "且 OKX 因该交易对未成交委托数量限制，无法在本轮降低杠杆。"
-                            "为避免用更高杠杆放大亏损，本次不开仓。"
+                            f"OKX 因该交易对未成交委托数量限制，无法在本轮调整杠杆；"
+                            f"目标杠杆 {leverage}x，但系统无法确认当前实际杠杆。"
+                            "为避免在未知杠杆下开仓，本次不开仓。"
                         )
                         logger.warning(
-                            "leverage set blocked by open-order limit; rejecting higher existing leverage",
+                            "leverage 59670; rejecting unknown actual leverage",
+                            symbol=decision.symbol,
+                            okx_symbol=okx_symbol,
+                            requested_leverage=requested_leverage,
+                            target_leverage=leverage,
+                            cleanup_result=cleanup_result,
+                            error=set_error_text,
+                        )
+                        return {
+                            "ok": False,
+                            "error": message,
+                            "ai_requested_leverage": requested_leverage,
+                            "okx_max_leverage": max_leverage,
+                            "target_leverage": leverage,
+                            "actual_leverage": None,
+                            "set_response": None,
+                            "verify_response": verify_response,
+                            "cleanup_result": cleanup_result,
+                            "open_order_limit_error": set_error_text,
+                            "params": params,
+                        }
+                    fallback_leverage = actual
+                    if actual > 0 and actual_rounded > leverage:
+                        message = (
+                            f"OKX 当前杠杆 {actual:g}x 高于系统目标 {leverage}x；"
+                            "但 OKX 因该交易对未成交委托数量限制，无法在本轮降低杠杆。"
+                            "为避免使用更高杠杆放大亏损，本次不开仓。"
+                        )
+                        logger.warning(
+                            "leverage 59670; rejecting higher existing leverage",
                             symbol=decision.symbol,
                             okx_symbol=okx_symbol,
                             requested_leverage=requested_leverage,
                             target_leverage=leverage,
                             actual_leverage=actual,
                             cleanup_result=cleanup_result,
-                            error=str(set_error),
+                            error=set_error_text,
                         )
                         return {
                             "ok": False,
@@ -1657,19 +1743,19 @@ class OKXExecutor(AbstractExecutor):
                             "set_response": None,
                             "verify_response": verify_response,
                             "cleanup_result": cleanup_result,
-                            "open_order_limit_error": str(set_error)[:220],
+                            "open_order_limit_error": set_error_text,
                             "params": params,
                         }
                     decision.suggested_leverage = float(fallback_leverage)
                     logger.warning(
-                        "leverage set blocked by open-order limit; continuing with safer existing leverage",
+                        "leverage 59670; using safer existing leverage",
                         symbol=decision.symbol,
                         okx_symbol=okx_symbol,
                         requested_leverage=requested_leverage,
                         target_leverage=leverage,
                         fallback_leverage=fallback_leverage,
                         cleanup_result=cleanup_result,
-                        error=str(set_error),
+                        error=set_error_text,
                     )
                     return {
                         "ok": True,
@@ -1686,14 +1772,15 @@ class OKXExecutor(AbstractExecutor):
                         "set_response": None,
                         "verify_response": verify_response,
                         "cleanup_result": cleanup_result,
-                        "open_order_limit_error": str(set_error)[:220],
+                        "open_order_limit_error": set_error_text,
                         "params": params,
                     }
 
         if set_response is None:
+            set_error_text = safe_error_text(set_error, limit=220)
             message = (
                 f"OKX 杠杆设置失败，本次未开仓。目标杠杆 {leverage}x。"
-                f"OKX 返回：{str(set_error)[:220]}"
+                f"OKX 返回：{set_error_text}"
             )
             if cleanup_result:
                 message += (
@@ -1705,7 +1792,7 @@ class OKXExecutor(AbstractExecutor):
                 symbol=decision.symbol,
                 okx_symbol=okx_symbol,
                 leverage=leverage,
-                error=str(set_error),
+                error=set_error_text,
                 cleanup_result=cleanup_result,
             )
             return {
@@ -1726,16 +1813,17 @@ class OKXExecutor(AbstractExecutor):
             actual = self._extract_verified_leverage(verify_response)
             self._cache_leverage(okx_symbol, params, actual)
         except Exception as e:
+            error_text = safe_error_text(e, limit=220)
             message = (
-                f"OKX 杠杆已提交设置，但系统无法确认是否生效，本次未开仓。"
-                f"目标杠杆 {leverage}x。确认查询返回：{str(e)[:220]}"
+                "OKX 杠杆已提交设置，但系统无法确认是否生效，本次未开仓。"
+                f"目标杠杆 {leverage}x。确认查询返回：{error_text}"
             )
             logger.warning(
                 "set leverage verification failed; rejecting entry order",
                 symbol=decision.symbol,
                 okx_symbol=okx_symbol,
                 leverage=leverage,
-                error=str(e),
+                error=error_text,
                 set_response=set_response,
             )
             return {
@@ -1753,7 +1841,7 @@ class OKXExecutor(AbstractExecutor):
 
         if int(round(actual or 0)) != leverage:
             message = (
-                f"OKX 杠杆设置未生效，本次未开仓。"
+                "OKX 杠杆设置未生效，本次未开仓。"
                 f"目标杠杆 {leverage}x，实际查询为 {actual or 0:g}x。"
             )
             logger.warning(
@@ -1883,7 +1971,7 @@ class OKXExecutor(AbstractExecutor):
             balance_data = await self._with_retry(ccxt.fetch_balance)
             return float(balance_data.get(asset, {}).get("free", 0))
         except Exception as e:
-            logger.error("fetch balance failed", error=str(e))
+            logger.error("fetch balance failed", error=safe_error_text(e))
             return 0.0
 
     async def get_balance_snapshot(self, asset: str = "USDT") -> dict[str, Any]:
@@ -1922,8 +2010,9 @@ class OKXExecutor(AbstractExecutor):
                 "allocatable": allocatable,
             }
         except Exception as e:
-            logger.error("fetch balance snapshot failed", error=str(e))
-            return {"free": 0.0, "used": 0.0, "total": 0.0, "error": str(e)}
+            error_text = safe_error_text(e)
+            logger.error("fetch balance snapshot failed", error=error_text)
+            return {"free": 0.0, "used": 0.0, "total": 0.0, "error": error_text}
 
     async def get_positions(self, symbol: str | None = None) -> list[dict]:
         ccxt = await self._get_ccxt()
@@ -1932,7 +2021,7 @@ class OKXExecutor(AbstractExecutor):
             positions = await self._with_retry(ccxt.fetch_positions, symbols)
             return positions
         except Exception as e:
-            logger.error("fetch positions failed", error=str(e))
+            logger.error("fetch positions failed", error=safe_error_text(e))
             return []
 
     async def get_positions_strict(self, symbol: str | None = None) -> list[dict]:
@@ -1942,14 +2031,24 @@ class OKXExecutor(AbstractExecutor):
         return await self._with_retry(ccxt.fetch_positions, symbols)
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
-        ccxt = await self._get_ccxt()
+        okx_symbol = self._to_swap_symbol(symbol) if symbol else None
         try:
-            return await self._with_retry(
-                ccxt.fetch_open_orders,
-                self._to_swap_symbol(symbol) if symbol else None,
+            return await self.get_open_orders_strict(symbol)
+        except Exception as e:
+            logger.warning(
+                "fetch open orders failed",
+                symbol=okx_symbol,
+                error=safe_error_text(e),
             )
-        except Exception:
             return []
+
+    async def get_open_orders_strict(self, symbol: str | None = None) -> list[dict]:
+        """Fetch open orders and let errors propagate for reconciliation safety."""
+        ccxt = await self._get_ccxt()
+        return await self._with_retry(
+            ccxt.fetch_open_orders,
+            self._to_swap_symbol(symbol) if symbol else None,
+        )
 
     async def get_position_protection_orders(self, symbol: str | None = None) -> list[dict]:
         """Fetch active OKX TP/SL algo orders that protect open positions."""
@@ -1971,7 +2070,7 @@ class OKXExecutor(AbstractExecutor):
                     "fetch OKX protection orders failed",
                     symbol=okx_symbol,
                     ord_type=ord_type,
-                    error=str(e),
+                    error=safe_error_text(e),
                 )
                 continue
 
@@ -2007,18 +2106,24 @@ class OKXExecutor(AbstractExecutor):
                 if pos_side not in {"long", "short"}:
                     pos_side = "short" if close_side == "buy" else "long"
 
-                protection_orders.append({
-                    "symbol": self._from_swap_symbol(order.get("symbol") or info.get("instId") or symbol),
-                    "position_side": pos_side,
-                    "close_side": close_side,
-                    "order_type": info.get("ordType") or order.get("type") or ord_type,
-                    "take_profit_price": take_profit if take_profit > 0 else None,
-                    "stop_loss_price": stop_loss if stop_loss > 0 else None,
-                    "trigger_price": trigger_price if trigger_price > 0 else None,
-                    "algo_id": info.get("algoId") or order.get("id"),
-                    "updated_at_ms": self._safe_float(info.get("uTime") or info.get("cTime"), 0.0),
-                    "raw": order,
-                })
+                protection_orders.append(
+                    {
+                        "symbol": self._from_swap_symbol(
+                            order.get("symbol") or info.get("instId") or symbol
+                        ),
+                        "position_side": pos_side,
+                        "close_side": close_side,
+                        "order_type": info.get("ordType") or order.get("type") or ord_type,
+                        "take_profit_price": take_profit if take_profit > 0 else None,
+                        "stop_loss_price": stop_loss if stop_loss > 0 else None,
+                        "trigger_price": trigger_price if trigger_price > 0 else None,
+                        "algo_id": info.get("algoId") or order.get("id"),
+                        "updated_at_ms": self._safe_float(
+                            info.get("uTime") or info.get("cTime"), 0.0
+                        ),
+                        "raw": order,
+                    }
+                )
 
         return protection_orders
 

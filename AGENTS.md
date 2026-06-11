@@ -3,7 +3,7 @@
 This repository has a project-specific Hindsight memory bank:
 
 - Bank ID: `bb`
-- Project root: `D:\bb`
+- Project root: `F:\bb`
 - Scope: only memories about this project. Do not store this project's memories in `codex` or another project bank.
 
 At the beginning of a Codex session for this repository, recall project memory:
@@ -173,24 +173,36 @@ powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\add_project_memory
 
 For this repository, use the project-specific Hindsight bank `bb` automatically.
 
-At the beginning of every Codex session for this repository, recall memory before substantive work:
+At the beginning of every Codex session for this repository, recall memory before substantive work. The default command is the fast path: it reads `PROJECT_MEMORY.md` and skips server-side live recall to avoid shell timeouts.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_start.ps1" -ProjectRoot "D:\bb"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_start.ps1" -ProjectRoot "F:\bb"
 ```
+
+Use `-LiveRecall` only when a fresh Hindsight server recall is explicitly needed. Use `-RefreshSnapshot` only when rebuilding `PROJECT_MEMORY.md` is explicitly needed.
 
 During work, save durable project facts to Hindsight when they would prevent repeated work later: architecture decisions, important paths, service ports, tested fixes, setup steps, user preferences for this project, and non-obvious debugging results. Do not save secrets, one-off chatter, temporary failed guesses, or bulky command output.
 
-Before finishing a meaningful task in this repository, summarize and distill the useful long-term facts before saving them to the `bb` bank. Do not store the whole chat verbatim:
+Before finishing a meaningful task in this repository, summarize and distill the useful long-term facts before saving them to the `bb` bank. Do not store the whole chat verbatim. The default save path is fast: it saves the provided distilled notes asynchronously and does not refresh the large snapshot.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_summarize_and_save.ps1" -ProjectRoot "D:\bb" -Content "session notes to distill"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_summarize_and_save.ps1" -ProjectRoot "F:\bb" -Content "session notes to distill"
 ```
+
+Use `-UseReflect` only when Hindsight should do an extra cloud-model distillation pass before saving. Use `-RefreshSnapshot` only when the saved memory must immediately appear in `PROJECT_MEMORY.md`.
 
 Shortcut:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_end.ps1" -ProjectRoot "D:\bb" -Content "session notes to distill"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_end.ps1" -ProjectRoot "F:\bb" -Content "session notes to distill"
 ```
 
 Keep all memories for this repository in `bb`; do not store this project's facts in the global `codex` bank.
+<!-- BEGIN CODEX SEMBLE RTK -->
+## Project Tooling
+
+- Semble is available globally through the Codex MCP server. Use Semble first for semantic code discovery in this project.
+- Use mcp__semble.search with repo="F:\\bb" for broad codebase questions.
+- RTK is available globally from F:\SemblevsRTK\bin\rtk.exe. Prefer RTK for supported shell commands that produce large output.
+- Do not force RTK onto PowerShell-only commands such as Get-ChildItem, Get-Content, Select-String, or Test-Path.
+<!-- END CODEX SEMBLE RTK -->

@@ -8,9 +8,9 @@ major conflicts, then emits the only executable DecisionOutput.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import time
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -23,6 +23,10 @@ from config.settings import (
     FIXED_AI_MODEL_SLOTS,
     settings,
 )
+from core.safe_output import safe_error_text
+
+if TYPE_CHECKING:
+    from data_feed.feature_vector import FeatureVector
 
 logger = structlog.get_logger(__name__)
 
@@ -49,15 +53,21 @@ PROFIT_QUALITY_EXPAND_RECOVERY_MAX_SIZE = 0.090
 PROFIT_QUALITY_EXPAND_SELECTIVE_MAX_SIZE = 0.075
 PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE = 0.110
 PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE = 0.070
-DAILY_TARGET_PROTECTED_ENTRY_SCORE_BONUS = 0.08
-DAILY_TARGET_PROTECTED_MIN_ENTRY_CONFIDENCE = 0.72
-DAILY_TARGET_PROTECTED_MAX_ENTRY_SIZE = 0.05
-DAILY_TARGET_PROTECTED_MAX_LEVERAGE = 5.0
 MAX_NORMAL_ENTRY_SIZE = 0.12
 MAX_PROBE_ENTRY_SIZE = 0.03
+ML_SOFT_CAUTION_MAX_ENTRY_SIZE = 0.025
 MARKET_DIRECTION_EXCLUDED_EXPERTS = {"position_expert", "risk_expert"}
 ENTRY_DIRECTION_SUPPORT_EXPERTS = {"trend_expert", "sentiment_expert"}
 ENTRY_PROFIT_QUALITY_EXPERTS = {"momentum_expert"}
+NO_POSITION_ENTRY_BASE_WEIGHTS = {
+    "trend_expert": 0.33,
+    "momentum_expert": 0.33,
+    "sentiment_expert": 0.14,
+    "position_expert": 0.05,
+}
+NO_POSITION_POSITION_EXPERT_WEIGHT_CAP = 0.05
+RISK_ENTRY_SCORE_DISCOUNT_MAX = 0.30
+RISK_ENTRY_SIZE_MULTIPLIER_FLOOR = 0.45
 MIN_REVIEW_CLOSE_SUPPORT = 2
 FULL_CLOSE_SUPPORT = 3
 REVIEW_CLOSE_MIN_CONFIDENCE = 0.55
@@ -150,6 +160,8 @@ QUANT_VALIDATION_PROBE_SIZE = 0.04
 QUANT_VALIDATION_MAX_LOSS_PROBABILITY = 0.58
 QUANT_VALIDATION_MIN_LOCAL_EXPECTED_RETURN_PCT = 0.03
 QUANT_VALIDATION_MIN_PROFIT_QUALITY_SCORE = 0.20
+QUANT_ONLY_SHORT_DIRECTION_MIN_GAP = 0.08
+
 
 class EnsembleCoordinator:
     """Combines fixed expert model reports into one executable decision."""
@@ -161,7 +173,7 @@ class EnsembleCoordinator:
 
     async def decide(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
     ) -> tuple[DecisionOutput, dict[str, DecisionOutput]]:
         timing_records: list[dict[str, Any]] = []
@@ -187,23 +199,27 @@ class EnsembleCoordinator:
 
         # Step 2/3: requested cross-checks and trend-expert deep consultation.
         validation_timing: dict[str, Any] = {}
-        cross_validations, consultation = await self.cross_validator.validate_all(opinions, validation_timing)
+        cross_validations, consultation = await self.cross_validator.validate_all(
+            opinions, validation_timing
+        )
         if validation_timing.get("_cross_validation_timing"):
             timing_records.append(validation_timing["_cross_validation_timing"])
         if validation_timing.get("_consultation_timing"):
             timing_records.append(validation_timing["_consultation_timing"])
 
         # Step 4: deterministic ensemble decision.
-        combine_started_at = datetime.now(timezone.utc)
+        combine_started_at = datetime.now(UTC)
         combine_perf_started = time.perf_counter()
         final = self.combine(features, context, opinions, cross_validations, consultation)
-        timing_records.append({
-            "stage": "ensemble_rules",
-            "label": "规则汇总",
-            "status": "completed",
-            "started_at": combine_started_at.isoformat(),
-            "duration_sec": round(time.perf_counter() - combine_perf_started, 3),
-        })
+        timing_records.append(
+            {
+                "stage": "ensemble_rules",
+                "label": "规则汇总",
+                "status": "completed",
+                "started_at": combine_started_at.isoformat(),
+                "duration_sec": round(time.perf_counter() - combine_perf_started, 3),
+            }
+        )
 
         # Step 5: optional final decision maker. It reads the committee output
         # and can confirm, reduce risk, or veto; it does not join initial voting.
@@ -235,9 +251,13 @@ class EnsembleCoordinator:
         if isinstance(news_items, list):
             raw["news_context"] = {
                 "sentiment_available": bool(getattr(features, "sentiment_data_available", False)),
-                "direct_sentiment_data_available": bool(getattr(features, "direct_sentiment_data_available", False)),
+                "direct_sentiment_data_available": bool(
+                    getattr(features, "direct_sentiment_data_available", False)
+                ),
                 "news_sentiment_avg": float(getattr(features, "news_sentiment_avg", 0.0) or 0.0),
-                "social_sentiment_avg": float(getattr(features, "social_sentiment_avg", 0.0) or 0.0),
+                "social_sentiment_avg": float(
+                    getattr(features, "social_sentiment_avg", 0.0) or 0.0
+                ),
                 "social_mention_count": int(getattr(features, "social_mention_count", 0) or 0),
                 "news_article_count": int(getattr(features, "news_article_count", 0) or 0),
                 "direct_news_item_count": int(getattr(features, "direct_news_item_count", 0) or 0),
@@ -249,7 +269,7 @@ class EnsembleCoordinator:
         raw["analysis_type"] = analysis_type
         raw["analysis_type_label"] = "持仓分析" if analysis_type == "position" else "市场分析"
         final.raw_response = raw
-        return final, opinions 
+        return final, opinions
 
     def _base_expert_context(self, context: dict[str, Any]) -> dict[str, Any]:
         expert_context = dict(context)
@@ -260,7 +280,7 @@ class EnsembleCoordinator:
 
     async def _run_expert_pass(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         base_context: dict[str, Any],
         *,
         include_names: tuple[str, ...] | list[str] | None,
@@ -270,7 +290,7 @@ class EnsembleCoordinator:
         expert_context = dict(base_context)
         if include_names:
             expert_context["_include_model_names"] = list(include_names)
-        expert_started_at = datetime.now(timezone.utc)
+        expert_started_at = datetime.now(UTC)
         expert_perf_started = time.perf_counter()
         opinions = await self.registry.decide_all(features, expert_context)
         expert_duration = round(time.perf_counter() - expert_perf_started, 3)
@@ -285,8 +305,11 @@ class EnsembleCoordinator:
             "completed": len(opinions),
             "failed": len(expert_context.get("_model_failures", [])),
             "slowest_model": (
-                max(model_timings, key=lambda row: float(row.get("duration_sec") or 0.0)).get("name")
-                if model_timings else None
+                max(model_timings, key=lambda row: float(row.get("duration_sec") or 0.0)).get(
+                    "name"
+                )
+                if model_timings
+                else None
             ),
         }
         return opinions, expert_context, timing, model_timings
@@ -303,7 +326,7 @@ class EnsembleCoordinator:
 
     async def _apply_decision_maker(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         preliminary: DecisionOutput,
         opinions: dict[str, DecisionOutput],
@@ -311,7 +334,7 @@ class EnsembleCoordinator:
         consultation: dict[str, Any] | None,
     ) -> DecisionOutput:
         raw = dict(preliminary.raw_response or {})
-        dm_started_at = datetime.now(timezone.utc)
+        dm_started_at = datetime.now(UTC)
         dm_perf_started = time.perf_counter()
         protected_exit = self._protected_exit_evidence(raw) if preliminary.is_exit else {}
 
@@ -331,13 +354,19 @@ class EnsembleCoordinator:
                 decision_maker_payload["duration_sec"] = duration
             raw["decision_maker_timing"] = timing
 
-        def apply_final_proposal(proposal: DecisionOutput, prefix: str = "最终交易员独立执行") -> DecisionOutput:
+        def apply_final_proposal(
+            proposal: DecisionOutput, prefix: str = "最终交易员独立执行"
+        ) -> DecisionOutput:
             proposal.model_name = ENSEMBLE_TRADER_NAME
             proposal.symbol = features.symbol
             proposal.raw_response = raw
             proposal.feature_snapshot = proposal.feature_snapshot or features.to_dict()
-            proposal.suggested_leverage = min(max(float(proposal.suggested_leverage or 1.0), 1.0), settings.max_leverage)
-            proposal.position_size_pct = min(max(float(proposal.position_size_pct or 0.0), 0.0), 1.0)
+            proposal.suggested_leverage = min(
+                max(float(proposal.suggested_leverage or 1.0), 1.0), settings.max_leverage
+            )
+            proposal.position_size_pct = min(
+                max(float(proposal.position_size_pct or 0.0), 0.0), 1.0
+            )
             if prefix and prefix not in str(proposal.reasoning or ""):
                 proposal.reasoning = f"{prefix}：{proposal.reasoning}"
             return proposal
@@ -347,38 +376,38 @@ class EnsembleCoordinator:
             if not proposal.is_entry:
                 return {"allow": False, "status": "not_entry"}
             side = "long" if proposal.action == Action.LONG else "short"
-            quant_probe = raw.get("quant_only_probe_entry") if isinstance(raw.get("quant_only_probe_entry"), dict) else {}
-            quant_validation = raw.get("quant_validation_probe_entry") if isinstance(raw.get("quant_validation_probe_entry"), dict) else {}
-            entry_support = raw.get("entry_signal_support") if isinstance(raw.get("entry_signal_support"), dict) else {}
-            ml_gate = raw.get("ml_profit_quality_gate") if isinstance(raw.get("ml_profit_quality_gate"), dict) else {}
-            local_gate = raw.get("local_ai_tools_gate") if isinstance(raw.get("local_ai_tools_gate"), dict) else {}
+            quant_probe = self._safe_dict(raw.get("quant_only_probe_entry"))
+            quant_validation = self._safe_dict(raw.get("quant_validation_probe_entry"))
+            entry_support = self._safe_dict(raw.get("entry_signal_support"))
+            ml_gate = self._safe_dict(raw.get("ml_profit_quality_gate"))
+            local_gate = self._safe_dict(raw.get("local_ai_tools_gate"))
             if not local_gate and isinstance(ml_gate.get("local_ai_tools_gate"), dict):
-                local_gate = ml_gate.get("local_ai_tools_gate") or {}
+                local_gate = self._safe_dict(ml_gate.get("local_ai_tools_gate"))
 
             same_direction_experts = [
-                name for name, decision in opinions.items()
+                name
+                for name, decision in opinions.items()
                 if isinstance(decision, DecisionOutput)
                 and decision.action == proposal.action
                 and float(decision.confidence or 0.0) >= 0.58
             ]
             strong_direction_experts = [
-                name for name, decision in opinions.items()
+                name
+                for name, decision in opinions.items()
                 if isinstance(decision, DecisionOutput)
                 and decision.action == proposal.action
                 and float(decision.confidence or 0.0) >= 0.74
             ]
             hard_opposition = [
-                name for name, decision in opinions.items()
+                name
+                for name, decision in opinions.items()
                 if isinstance(decision, DecisionOutput)
                 and decision.action.is_entry()
                 and decision.action != proposal.action
                 and float(decision.confidence or 0.0) >= 0.62
             ]
 
-            quant_allowed = bool(
-                quant_probe.get("allow")
-                or quant_validation.get("allow")
-            )
+            quant_allowed = bool(quant_probe.get("allow") or quant_validation.get("allow"))
             entry_allowed = bool(
                 entry_support.get("allowed")
                 and str(entry_support.get("side") or "").lower() == side
@@ -397,8 +426,7 @@ class EnsembleCoordinator:
                 and (local_supported or same_direction_experts)
             )
             expert_supported = bool(
-                len(same_direction_experts) >= 2
-                or (strong_direction_experts and local_supported)
+                len(same_direction_experts) >= 2 or (strong_direction_experts and local_supported)
             )
             allow = bool(
                 not hard_opposition
@@ -452,20 +480,28 @@ class EnsembleCoordinator:
             return preliminary
 
         decider_context = dict(context)
-        decider_context.update({
-            "decision_maker_mode": True,
-            "expert_mode": False,
-            "position_model_name": ENSEMBLE_TRADER_NAME,
-            "preliminary_decision": preliminary.to_log_dict(),
-            "expert_opinions": [
-                self._decision_payload(name, decision)
-                for name, decision in opinions.items()
-                if isinstance(decision, DecisionOutput)
-            ],
-            "cross_validations": cross_validations or [],
-            "consultation": consultation,
-            "conflict_resolution": raw.get("conflict_resolution") or {},
-        })
+        decider_context.update(
+            {
+                "decision_maker_mode": True,
+                "expert_mode": False,
+                "position_model_name": ENSEMBLE_TRADER_NAME,
+                "preliminary_decision": preliminary.to_log_dict(),
+                "expert_opinions": [
+                    self._decision_payload(name, decision)
+                    for name, decision in opinions.items()
+                    if isinstance(decision, DecisionOutput)
+                ],
+                "cross_validations": cross_validations or [],
+                "consultation": consultation,
+                "conflict_resolution": raw.get("conflict_resolution") or {},
+                "close_evidence": raw.get("close_evidence") or {},
+                "position_review_policy": raw.get("position_review_policy") or {},
+                "add_evidence": raw.get("add_evidence") or {},
+                "opportunity_score": raw.get("opportunity_score") or {},
+                "ml_profit_quality_gate": raw.get("ml_profit_quality_gate") or {},
+                "local_ai_tools_gate": raw.get("local_ai_tools_gate") or {},
+            }
+        )
 
         try:
             dm_timeout = max(float(settings.ai_decision_maker_timeout_seconds or 20.0), 5.0)
@@ -473,7 +509,7 @@ class EnsembleCoordinator:
                 decision_maker.decide(features, decider_context),
                 timeout=dm_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             set_decision_maker_timing("timeout", "decision_maker_timeout")
             logger.warning("decision maker timed out", symbol=features.symbol)
             raw["decision_maker"] = {
@@ -485,16 +521,19 @@ class EnsembleCoordinator:
             preliminary.raw_response = raw
             return preliminary
         except Exception as e:
-            set_decision_maker_timing("failed", str(e))
-            logger.warning("decision maker failed", error=str(e), symbol=features.symbol)
+            error_text = safe_error_text(e, limit=240)
+            set_decision_maker_timing("failed", error_text)
+            logger.warning("decision maker failed", error=error_text, symbol=features.symbol)
             raw["decision_maker"] = {
                 "status": "failed",
                 "model_name": DECISION_MAKER_NAME,
-                "reason": str(e)[:240],
+                "reason": error_text,
                 "fallback": "保留 deterministic ensemble 初步裁决。",
             }
             if preliminary.is_entry:
-                raw["decision_maker"]["fallback"] = "新开仓信号改为观望；已有持仓的减仓/平仓风控信号保留。"
+                raw["decision_maker"][
+                    "fallback"
+                ] = "新开仓信号改为观望；已有持仓的减仓/平仓风控信号保留。"
                 return self._hold(
                     features,
                     "最终交易员调用失败，系统按保护规则禁止新增开仓；已有持仓仍继续复盘和风控处理。",
@@ -511,7 +550,9 @@ class EnsembleCoordinator:
                 "reason": "最终交易员没有返回标准决策结构，保留初步裁决。",
             }
             if preliminary.is_entry:
-                raw["decision_maker"]["reason"] = "最终交易员没有返回标准决策结构；新开仓改为观望，平仓风控信号保留。"
+                raw["decision_maker"][
+                    "reason"
+                ] = "最终交易员没有返回标准决策结构；新开仓改为观望，平仓风控信号保留。"
                 return self._hold(
                     features,
                     "最终交易员返回结果无效，系统按保护规则禁止新增开仓。",
@@ -528,12 +569,16 @@ class EnsembleCoordinator:
             "reasoning": proposal.reasoning,
             "position_size_pct": proposal.position_size_pct,
             "suggested_leverage": proposal.suggested_leverage,
-            "provider_model": (proposal.raw_response or {}).get("provider_model") if isinstance(proposal.raw_response, dict) else None,
+            "provider_model": (
+                (proposal.raw_response or {}).get("provider_model")
+                if isinstance(proposal.raw_response, dict)
+                else None
+            ),
         }
         set_decision_maker_timing("completed")
 
         if proposal.is_exit and context.get("review_positions"):
-            close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
+            close_evidence = self._safe_dict(raw.get("close_evidence"))
             position_loss = bool(close_evidence.get("position_loss"))
             position_profit = bool(close_evidence.get("position_profit"))
             profit_protection = bool(close_evidence.get("profit_protection"))
@@ -601,7 +646,9 @@ class EnsembleCoordinator:
                     raw,
                 )
 
-        if proposal.is_exit and not self._exit_matches_open_position(proposal.action, features.symbol, context):
+        if proposal.is_exit and not self._exit_matches_open_position(
+            proposal.action, features.symbol, context
+        ):
             raw["decision_maker"]["applied"] = False
             raw["decision_maker"]["guard_reason"] = (
                 "最终交易员提出平仓，但当前上下文没有该币种对应方向的本地/交易所持仓；"
@@ -611,7 +658,9 @@ class EnsembleCoordinator:
                 "applied": True,
                 "proposal_action": proposal.action.value,
                 "symbol": features.symbol,
-                "open_positions": context.get("open_positions") if isinstance(context, dict) else [],
+                "open_positions": (
+                    context.get("open_positions") if isinstance(context, dict) else []
+                ),
                 "reason": "没有匹配持仓，平仓建议被改为观望。",
             }
             return self._hold(
@@ -624,7 +673,7 @@ class EnsembleCoordinator:
             )
 
         if proposal.is_exit and context.get("review_positions") and preliminary.is_hold:
-            close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
+            close_evidence = self._safe_dict(raw.get("close_evidence"))
             protected_or_hard_exit = bool(
                 close_evidence.get("should_close")
                 or close_evidence.get("hard_risk")
@@ -684,12 +733,16 @@ class EnsembleCoordinator:
                     model_name=ENSEMBLE_TRADER_NAME,
                     symbol=features.symbol,
                     action=preliminary.action,
-                    confidence=max(float(preliminary.confidence or 0.0), PROFIT_FIRST_PROBE_CONFIDENCE),
+                    confidence=max(
+                        float(preliminary.confidence or 0.0), PROFIT_FIRST_PROBE_CONFIDENCE
+                    ),
                     reasoning=(
                         "强盈利质量小仓保留：最终交易员建议观望，"
                         f"但该方向已通过 ML 盈亏质量和规则层风控；普通瑕疵仅降级仓位。决策者提示：{proposal.reasoning}"
                     ),
-                    position_size_pct=min(float(preliminary.position_size_pct or 0.0), PROFIT_FIRST_PROBE_SIZE),
+                    position_size_pct=min(
+                        float(preliminary.position_size_pct or 0.0), PROFIT_FIRST_PROBE_SIZE
+                    ),
                     suggested_leverage=min(
                         max(float(preliminary.suggested_leverage or 1.0), 1.0),
                         DAILY_RECOVERY_MAX_LEVERAGE,
@@ -708,6 +761,36 @@ class EnsembleCoordinator:
 
         if preliminary.is_hold:
             if proposal.is_entry:
+                if context.get("review_positions"):
+                    add_evidence = self._safe_dict(raw.get("add_evidence"))
+                    position_review_policy = self._safe_dict(raw.get("position_review_policy"))
+                    review_result = str(position_review_policy.get("result") or "").lower()
+                    add_plan = str(add_evidence.get("action_plan") or "").lower()
+                    if (
+                        add_evidence
+                        and review_result in {"", "hold"}
+                        and (not add_evidence.get("should_add") or add_plan == "hold")
+                    ):
+                        raw["decision_maker"]["applied"] = False
+                        raw["decision_maker"]["guard_reason"] = (
+                            "持仓复盘规则层已判定继续持有或暂不加仓，最终交易员不能只凭同方向探针建议"
+                            "把本轮改成加仓；需要 add_evidence.should_add=true 才允许提交同向加仓。"
+                        )
+                        raw["decision_maker_position_add_guard"] = {
+                            "applied": True,
+                            "proposal_action": proposal.action.value,
+                            "proposal_reasoning": proposal.reasoning,
+                            "position_review_policy": position_review_policy,
+                            "add_evidence": add_evidence,
+                        }
+                        return self._hold(
+                            features,
+                            (
+                                "持仓复盘结论为继续持有或暂不加仓，未提交订单。"
+                                f"加仓侧：{add_evidence.get('block_reason') or '加仓证据不足'}"
+                            ),
+                            raw,
+                        )
                 hold_entry_evidence = hold_to_entry_support(proposal)
                 raw["decision_maker_hold_entry_guard"] = hold_entry_evidence
                 if not hold_entry_evidence.get("allow"):
@@ -727,16 +810,18 @@ class EnsembleCoordinator:
                     )
                 capped_size = min(
                     max(float(proposal.position_size_pct or 0.0), 0.015),
-                    float(hold_entry_evidence.get("max_position_size") or QUANT_VALIDATION_PROBE_SIZE),
+                    float(
+                        hold_entry_evidence.get("max_position_size") or QUANT_VALIDATION_PROBE_SIZE
+                    ),
                 )
                 capped_leverage = min(
                     max(float(proposal.suggested_leverage or 1.0), 1.0),
                     float(hold_entry_evidence.get("max_leverage") or DAILY_RECOVERY_MAX_LEVERAGE),
                 )
                 raw["decision_maker"]["applied"] = True
-                raw["decision_maker"]["guard_reason"] = (
-                    "初步委员会为观望，但存在专家/量化支持；允许小仓探针，不允许直接开成普通仓或大仓。"
-                )
+                raw["decision_maker"][
+                    "guard_reason"
+                ] = "初步委员会为观望，但存在专家/量化支持；允许小仓探针，不允许直接开成普通仓或大仓。"
                 raw["decision_maker_hold_entry_size_cap"] = {
                     "applied": True,
                     "original_position_size_pct": proposal.position_size_pct,
@@ -749,7 +834,10 @@ class EnsembleCoordinator:
                     model_name=ENSEMBLE_TRADER_NAME,
                     symbol=features.symbol,
                     action=proposal.action,
-                    confidence=min(max(float(proposal.confidence or 0.0), QUANT_VALIDATION_PROBE_CONFIDENCE), 0.82),
+                    confidence=min(
+                        max(float(proposal.confidence or 0.0), QUANT_VALIDATION_PROBE_CONFIDENCE),
+                        0.82,
+                    ),
                     reasoning=(
                         "观望转小仓探针：初步委员会未形成普通开仓，但最终交易员方向与部分专家/量化证据一致；"
                         "系统按小仓封顶执行，后续用真实盈亏反馈模型。"
@@ -760,10 +848,12 @@ class EnsembleCoordinator:
                     stop_loss_pct=proposal.stop_loss_pct,
                     take_profit_pct=proposal.take_profit_pct,
                     raw_response=raw,
-                    feature_snapshot=proposal.feature_snapshot or preliminary.feature_snapshot or features.to_dict(),
+                    feature_snapshot=proposal.feature_snapshot
+                    or preliminary.feature_snapshot
+                    or features.to_dict(),
                 )
             if proposal.is_exit and context.get("review_positions"):
-                close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
+                close_evidence = self._safe_dict(raw.get("close_evidence"))
                 protected_or_hard_exit = bool(
                     close_evidence.get("should_close")
                     or close_evidence.get("hard_risk")
@@ -771,9 +861,8 @@ class EnsembleCoordinator:
                 )
                 position_loss = bool(close_evidence.get("position_loss"))
                 risk_usage = self._safe_float(close_evidence.get("position_risk_usage"), 0.0)
-                if (
-                    not protected_or_hard_exit
-                    or (position_loss and risk_usage < LOSS_REDUCE_MIN_RISK_USAGE)
+                if not protected_or_hard_exit or (
+                    position_loss and risk_usage < LOSS_REDUCE_MIN_RISK_USAGE
                 ):
                     raw["decision_maker"]["applied"] = False
                     raw["decision_maker"]["guard_reason"] = (
@@ -804,13 +893,9 @@ class EnsembleCoordinator:
             return apply_final_proposal(proposal)
 
         if proposal.action != preliminary.action:
-            if (
-                context.get("review_positions")
-                and preliminary.is_entry
-                and proposal.is_exit
-            ):
-                close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
-                add_evidence = raw.get("add_evidence") if isinstance(raw.get("add_evidence"), dict) else {}
+            if context.get("review_positions") and preliminary.is_entry and proposal.is_exit:
+                close_evidence = self._safe_dict(raw.get("close_evidence"))
+                add_evidence = self._safe_dict(raw.get("add_evidence"))
                 protected_or_hard_exit = bool(
                     close_evidence.get("should_close")
                     or close_evidence.get("hard_risk")
@@ -855,7 +940,9 @@ class EnsembleCoordinator:
                 preliminary.raw_response = raw
                 return preliminary
             raw["decision_maker"]["applied"] = True
-            raw["decision_maker"]["guard_reason"] = "最终交易员与初步裁决方向不一致，按保守规则观望。"
+            raw["decision_maker"][
+                "guard_reason"
+            ] = "最终交易员与初步裁决方向不一致，按保守规则观望。"
             return self._hold(
                 features,
                 (
@@ -866,7 +953,12 @@ class EnsembleCoordinator:
             )
 
         raw["decision_maker"]["applied"] = True
-        confidence = min(max((float(preliminary.confidence or 0.0) + float(proposal.confidence or 0.0)) / 2, 0.0), 0.95)
+        confidence = min(
+            max(
+                (float(preliminary.confidence or 0.0) + float(proposal.confidence or 0.0)) / 2, 0.0
+            ),
+            0.95,
+        )
         proposal_size = float(proposal.position_size_pct or 0.0)
         preliminary_size = float(preliminary.position_size_pct or 0.0)
         if preliminary.is_entry:
@@ -890,10 +982,10 @@ class EnsembleCoordinator:
             leverage = 1.0
 
         if preliminary.is_entry:
-            daily_gate = self._daily_target_entry_gate(context)
+            entry_gate = self._entry_execution_gate()
             min_confidence = max(
                 MIN_EXECUTABLE_ENTRY_CONFIDENCE,
-                float(daily_gate.get("min_confidence") or 0.0),
+                float(entry_gate.get("min_confidence") or 0.0),
             )
             post_ml_gate = self._ml_profit_quality_entry_gate(
                 preliminary.action,
@@ -903,12 +995,14 @@ class EnsembleCoordinator:
             )
             raw["post_decision_maker_ml_profit_quality_gate"] = post_ml_gate
             if post_ml_gate.get("confidence_bonus"):
-                confidence = min(confidence + float(post_ml_gate.get("confidence_bonus") or 0.0), 0.95)
+                confidence = min(
+                    confidence + float(post_ml_gate.get("confidence_bonus") or 0.0), 0.95
+                )
             if not post_ml_gate.get("allow", True):
                 raw["decision_maker"]["applied"] = False
-                raw["decision_maker"]["guard_reason"] = (
-                    "最终确认后仍未通过 ML 盈亏质量过滤，禁止新开仓。"
-                )
+                raw["decision_maker"][
+                    "guard_reason"
+                ] = "最终确认后仍未通过 ML 盈亏质量过滤，禁止新开仓。"
                 return self._hold(
                     features,
                     post_ml_gate.get("reason") or "ML 盈亏质量过滤未通过，本轮不开仓。",
@@ -938,7 +1032,10 @@ class EnsembleCoordinator:
         """Keep strong profit-first entries when the final maker only raises soft concerns."""
         if not preliminary.is_entry:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations or []):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations or []
+        ):
             return False
 
         side = "long" if preliminary.action == Action.LONG else "short"
@@ -952,7 +1049,10 @@ class EnsembleCoordinator:
             return False
         if ml_hint.get("side") != side or not ml_hint.get("strong"):
             return False
-        if float(ml_gate.get("expected_return_pct") or 0.0) < ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT:
+        if (
+            float(ml_gate.get("expected_return_pct") or 0.0)
+            < ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT
+        ):
             return False
         if float(ml_gate.get("profit_edge_pct") or 0.0) < ML_PROFIT_FIRST_MIN_EDGE_PCT:
             return False
@@ -967,6 +1067,13 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]],
         context: dict[str, Any],
     ) -> bool:
+        if self._position_hold_fast_path_without_decision_maker(
+            preliminary,
+            opinions,
+            cross_validations,
+            context,
+        ):
+            return False
         if preliminary.is_entry:
             raw = preliminary.raw_response if isinstance(preliminary.raw_response, dict) else {}
             quant_probe = raw.get("quant_validation_probe_entry")
@@ -977,7 +1084,9 @@ class EnsembleCoordinator:
                 }
                 preliminary.raw_response = raw
                 return True
-            if self._fast_path_entry_without_decision_maker(preliminary, opinions, cross_validations, raw):
+            if self._fast_path_entry_without_decision_maker(
+                preliminary, opinions, cross_validations, raw
+            ):
                 raw["decision_maker_fast_path"] = {
                     "applied": True,
                     "reason": "专家方向一致且本地/服务器盈利质量支持，跳过最终交易员以缩短快照到下单时间。",
@@ -997,26 +1106,90 @@ class EnsembleCoordinator:
                 return False
             return True
         if context.get("review_positions") and any(
-            isinstance(d, DecisionOutput) and not d.is_hold
-            for d in opinions.values()
+            isinstance(d, DecisionOutput) and not d.is_hold for d in opinions.values()
         ):
             return True
         strong_actions = [
-            d for d in opinions.values()
+            d
+            for d in opinions.values()
             if isinstance(d, DecisionOutput)
             and not d.is_hold
             and float(d.confidence or 0.0) >= 0.74
         ]
         if len(strong_actions) >= 2:
             return True
-        if len(strong_actions) == 1 and self._context_profit_supports_action(context, strong_actions[0].action):
+        if len(strong_actions) == 1 and self._context_profit_supports_action(
+            context, strong_actions[0].action
+        ):
             return True
         return any(
-            isinstance(d, DecisionOutput)
-            and not d.is_hold
-            and float(d.confidence or 0.0) >= 0.82
+            isinstance(d, DecisionOutput) and not d.is_hold and float(d.confidence or 0.0) >= 0.82
             for d in opinions.values()
         )
+
+    def _position_hold_fast_path_without_decision_maker(
+        self,
+        preliminary: DecisionOutput,
+        opinions: dict[str, DecisionOutput],
+        cross_validations: list[dict[str, Any]],
+        context: dict[str, Any],
+    ) -> bool:
+        if not context.get("review_positions") or not preliminary.is_hold:
+            return False
+        raw = preliminary.raw_response if isinstance(preliminary.raw_response, dict) else {}
+        close_evidence = self._safe_dict(raw.get("close_evidence"))
+        position_review_policy = self._safe_dict(raw.get("position_review_policy"))
+        if not close_evidence and not position_review_policy:
+            return False
+        if str(position_review_policy.get("result") or "").lower() not in {"", "hold"}:
+            return False
+        if str(close_evidence.get("action_plan") or "").lower() not in {"", "hold"}:
+            return False
+        protected_or_hard_exit = bool(
+            close_evidence.get("should_close")
+            or close_evidence.get("hard_risk")
+            or close_evidence.get("raw_hard_risk")
+            or close_evidence.get("profit_protection")
+            or close_evidence.get("profit_lock_ready_for_exit")
+            or close_evidence.get("profit_floor_ready_for_exit")
+            or close_evidence.get("predictive_exit")
+            or close_evidence.get("quick_profit")
+            or close_evidence.get("capital_rotation_profit")
+            or close_evidence.get("profit_retrace_protection")
+            or close_evidence.get("portfolio_focus_profit_lock")
+        )
+        if protected_or_hard_exit:
+            return False
+        if any(
+            isinstance(item, dict) and (item.get("major_conflict") or item.get("needs_resolution"))
+            for item in cross_validations
+        ):
+            return False
+        non_hold = [
+            decision
+            for decision in opinions.values()
+            if isinstance(decision, DecisionOutput) and not decision.is_hold
+        ]
+        if not non_hold:
+            return False
+        if any(decision.action in {Action.LONG, Action.SHORT} for decision in non_hold):
+            return False
+        raw["decision_maker_fast_path"] = {
+            "applied": True,
+            "reason": (
+                "持仓规则层已判定继续持有，且退出证据不属于硬止损、止盈、严重趋势失效或利润保护；"
+                "跳过最终交易员，避免普通平仓建议被复核后再被规则层拦回造成延迟。"
+            ),
+            "close_evidence": {
+                "should_close": bool(close_evidence.get("should_close")),
+                "action_plan": close_evidence.get("action_plan"),
+                "support_count": close_evidence.get("support_count"),
+                "strong_support_count": close_evidence.get("strong_support_count"),
+                "block_reason": close_evidence.get("block_reason"),
+            },
+        }
+        preliminary.raw_response = raw
+        return True
 
     def _fast_path_entry_without_decision_maker(
         self,
@@ -1027,17 +1200,22 @@ class EnsembleCoordinator:
     ) -> bool:
         if not preliminary.is_entry:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations or []):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations or []
+        ):
             return False
         direction = "long" if preliminary.action == Action.LONG else "short"
         same_direction = [
-            d for d in opinions.values()
+            d
+            for d in opinions.values()
             if isinstance(d, DecisionOutput)
             and d.action == preliminary.action
             and float(d.confidence or 0.0) >= 0.58
         ]
         hard_opposition = [
-            d for d in opinions.values()
+            d
+            for d in opinions.values()
             if isinstance(d, DecisionOutput)
             and d.action.is_entry()
             and d.action != preliminary.action
@@ -1048,10 +1226,10 @@ class EnsembleCoordinator:
         if float(preliminary.confidence or 0.0) < max(MIN_EXECUTABLE_ENTRY_CONFIDENCE, 0.62):
             return False
 
-        ml_gate = raw.get("ml_profit_quality_gate") if isinstance(raw.get("ml_profit_quality_gate"), dict) else {}
-        local_gate = raw.get("local_ai_tools_gate") if isinstance(raw.get("local_ai_tools_gate"), dict) else {}
+        ml_gate = self._safe_dict(raw.get("ml_profit_quality_gate"))
+        local_gate = self._safe_dict(raw.get("local_ai_tools_gate"))
         if not local_gate and isinstance(ml_gate.get("local_ai_tools_gate"), dict):
-            local_gate = ml_gate.get("local_ai_tools_gate") or {}
+            local_gate = self._safe_dict(ml_gate.get("local_ai_tools_gate"))
         ml_supported = ml_gate.get("status") == "supported_by_profit_quality"
         local_supported = (
             local_gate.get("enabled")
@@ -1060,9 +1238,9 @@ class EnsembleCoordinator:
             and float(local_gate.get("expected_return_pct") or 0.0) > 0
             and str(local_gate.get("best_side") or direction).lower() in {direction, ""}
         )
-        opportunity = raw.get("opportunity_score") if isinstance(raw.get("opportunity_score"), dict) else {}
-        entry_evidence = raw.get("entry_candidate_evidence") if isinstance(raw.get("entry_candidate_evidence"), dict) else {}
-        side_evidence = entry_evidence.get(direction) if isinstance(entry_evidence.get(direction), dict) else {}
+        opportunity = self._safe_dict(raw.get("opportunity_score"))
+        entry_evidence = self._safe_dict(raw.get("entry_candidate_evidence"))
+        side_evidence = self._safe_dict(entry_evidence.get(direction))
         expected_net = max(
             self._safe_float(opportunity.get("expected_net_return_pct"), 0.0),
             self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0),
@@ -1072,11 +1250,19 @@ class EnsembleCoordinator:
             self._safe_float(side_evidence.get("profit_quality_ratio"), 0.0),
         )
         loss_probability = self._safe_float(
-            side_evidence.get("loss_probability", opportunity.get("server_profit_loss_probability")),
+            side_evidence.get(
+                "loss_probability", opportunity.get("server_profit_loss_probability")
+            ),
             1.0,
         )
-        tail_risk = self._safe_float(opportunity.get("tail_risk_score", side_evidence.get("tail_risk_score")), 1.0)
-        server_side = str(opportunity.get("server_profit_best_side") or side_evidence.get("server_profit_best_side") or "").lower()
+        tail_risk = self._safe_float(
+            opportunity.get("tail_risk_score", side_evidence.get("tail_risk_score")), 1.0
+        )
+        server_side = str(
+            opportunity.get("server_profit_best_side")
+            or side_evidence.get("server_profit_best_side")
+            or ""
+        ).lower()
         evidence_supported = (
             expected_net >= 0.75
             and profit_quality >= 0.80
@@ -1108,11 +1294,24 @@ class EnsembleCoordinator:
         tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
         profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
         if isinstance(profit, dict) and profit.get("available", True) is not False:
-            expected = float(profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")) or 0.0)
-            opposite_expected = float(profit.get(f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")) or 0.0)
+            expected = float(
+                profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct"))
+                or 0.0
+            )
+            opposite_expected = float(
+                profit.get(
+                    f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
+                )
+                or 0.0
+            )
             loss_probability = float(profit.get(f"{side}_loss_probability") or 0.0)
             best_side = str(profit.get("best_side") or "").lower()
-            if expected > 0 and expected >= opposite_expected and loss_probability < LOCAL_TOOLS_MAX_LOSS_PROBABILITY and best_side in {"", side}:
+            if (
+                expected > 0
+                and expected >= opposite_expected
+                and loss_probability < LOCAL_TOOLS_MAX_LOSS_PROBABILITY
+                and best_side in {"", side}
+            ):
                 return True
 
         ml_signal = context.get("ml_signal") if isinstance(context, dict) else {}
@@ -1123,7 +1322,11 @@ class EnsembleCoordinator:
             opposite_expected = float(primary.get(f"{opposite}_expected_return_pct") or 0.0)
             best_side = str(primary.get("best_side") or "").lower()
             edge = expected - opposite_expected
-            return expected >= ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT and edge >= ML_PROFIT_FIRST_MIN_EDGE_PCT and best_side == side
+            return (
+                expected >= ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT
+                and edge >= ML_PROFIT_FIRST_MIN_EDGE_PCT
+                and best_side == side
+            )
         return False
 
     def _protected_exit_evidence(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -1159,7 +1362,7 @@ class EnsembleCoordinator:
 
     def _guard_phantom_exit_opinions(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         opinions: dict[str, DecisionOutput],
     ) -> dict[str, DecisionOutput]:
@@ -1170,7 +1373,11 @@ class EnsembleCoordinator:
                 and decision.is_exit
                 and not self._exit_matches_open_position(decision.action, features.symbol, context)
             ):
-                raw = dict(decision.raw_response or {}) if isinstance(decision.raw_response, dict) else {}
+                raw = (
+                    dict(decision.raw_response or {})
+                    if isinstance(decision.raw_response, dict)
+                    else {}
+                )
                 raw["phantom_exit_opinion_guard"] = {
                     "applied": True,
                     "original_action": decision.action.value,
@@ -1197,26 +1404,314 @@ class EnsembleCoordinator:
                 guarded[name] = decision
         return guarded
 
+    def _effective_expert_weight(
+        self,
+        *,
+        name: str,
+        base_weight: float,
+        dynamic_multiplier: float,
+        review_positions: bool,
+        current_side: str | None,
+        timeout_fallback: bool,
+    ) -> tuple[float, dict[str, Any]]:
+        """Apply role-aware weighting without letting risk act as a direction vote."""
+
+        raw_weight = base_weight * dynamic_multiplier
+        policy: dict[str, Any] = {
+            "mode": "position_review" if review_positions else "market_entry",
+            "base_weight": round(base_weight, 6),
+            "dynamic_multiplier": round(dynamic_multiplier, 4),
+            "raw_weight": round(raw_weight, 6),
+            "entry_support_eligible": name not in MARKET_DIRECTION_EXCLUDED_EXPERTS,
+            "excluded_reason": None,
+        }
+        if timeout_fallback:
+            policy.update(
+                {
+                    "mode": "timeout_fallback",
+                    "effective_weight": 0.0,
+                    "excluded_reason": "timeout fallback opinion is trace-only",
+                }
+            )
+            return 0.0, policy
+
+        if review_positions:
+            policy["effective_weight"] = round(raw_weight, 6)
+            return raw_weight, policy
+
+        if name == "risk_expert":
+            policy.update(
+                {
+                    "mode": "entry_risk_veto_or_discount",
+                    "effective_weight": 0.0,
+                    "excluded_reason": (
+                        "risk_expert is not a market direction vote; it only "
+                        "hard-vetoes or discounts entry size/score"
+                    ),
+                }
+            )
+            return 0.0, policy
+
+        if name == "position_expert":
+            if current_side:
+                policy.update(
+                    {
+                        "mode": "market_entry_position_trace_only",
+                        "effective_weight": 0.0,
+                        "excluded_reason": (
+                            "position_expert is handled by position review when a "
+                            "symbol position already exists"
+                        ),
+                    }
+                )
+                return 0.0, policy
+            effective = min(
+                NO_POSITION_ENTRY_BASE_WEIGHTS["position_expert"] * dynamic_multiplier,
+                NO_POSITION_POSITION_EXPERT_WEIGHT_CAP,
+            )
+            policy.update(
+                {
+                    "mode": "no_position_entry_overlay",
+                    "overlay_base_weight": NO_POSITION_ENTRY_BASE_WEIGHTS["position_expert"],
+                    "effective_weight": round(effective, 6),
+                    "excluded_reason": (
+                        "position_expert keeps a tiny no-position context weight "
+                        "but is not eligible as entry support"
+                    ),
+                }
+            )
+            return effective, policy
+
+        if not current_side and name in NO_POSITION_ENTRY_BASE_WEIGHTS:
+            effective = NO_POSITION_ENTRY_BASE_WEIGHTS[name] * dynamic_multiplier
+            policy.update(
+                {
+                    "mode": "no_position_entry_overlay",
+                    "overlay_base_weight": NO_POSITION_ENTRY_BASE_WEIGHTS[name],
+                    "effective_weight": round(effective, 6),
+                }
+            )
+            return effective, policy
+
+        policy["effective_weight"] = round(raw_weight, 6)
+        return raw_weight, policy
+
+    def _risk_expert_entry_policy(
+        self,
+        risk_opinion: DecisionOutput | None,
+        features: FeatureVector,
+        *,
+        review_positions: bool,
+        current_side: str | None,
+        hard_veto: bool,
+    ) -> dict[str, Any]:
+        if risk_opinion is None:
+            return {"active": False, "reason": "risk_expert opinion missing"}
+        if review_positions or current_side:
+            return {
+                "active": False,
+                "reason": "risk_expert entry discount is only used for new-entry analysis",
+                "hard_veto": bool(hard_veto),
+            }
+        if hard_veto:
+            return {
+                "active": True,
+                "hard_veto": True,
+                "score_discount_pct": 1.0,
+                "size_multiplier": 0.0,
+                "reason": "risk_expert hard-vetoed this new entry",
+            }
+
+        confidence = self._safe_float(risk_opinion.confidence, 0.0)
+        discount = 0.0
+        reasons: list[str] = []
+        if risk_opinion.is_exit and confidence >= 0.55:
+            discount += 0.12
+            reasons.append("risk_expert emitted an exit-style caution during entry analysis")
+        elif risk_opinion.action == Action.HOLD and confidence >= 0.55:
+            hold_discount = 0.04
+            if confidence >= 0.80:
+                hold_discount = 0.10
+            elif confidence >= 0.65:
+                hold_discount = 0.07
+            discount += hold_discount
+            reasons.append("risk_expert preferred hold/caution")
+        elif risk_opinion.is_entry:
+            reasons.append(
+                "risk_expert direction was ignored as a vote and treated as risk clearance"
+            )
+
+        reasoning = str(risk_opinion.reasoning or "").lower()
+        caution_terms = (
+            "slippage",
+            "liquidity",
+            "fake breakout",
+            "tail risk",
+            "abnormal volatility",
+            "extreme volatility",
+            "插针",
+            "滑点",
+            "流动性",
+            "假突破",
+            "极端波动",
+            "异常波动",
+        )
+        if any(term in reasoning for term in caution_terms):
+            discount += 0.04
+            reasons.append("risk_expert reasoning contains market caution terms")
+
+        volume_ratio = self._safe_float(getattr(features, "volume_ratio", 0.0), 0.0)
+        spread_pct = self._safe_float(getattr(features, "spread_pct", 0.0), 0.0)
+        volatility_20 = self._safe_float(getattr(features, "volatility_20", 0.0), 0.0)
+        change_24h = abs(self._safe_float(getattr(features, "change_24h_pct", 0.0), 0.0))
+        abnormal_wick_count = int(getattr(features, "abnormal_wick_count_72h", 0) or 0)
+        abnormal_wick_max = self._safe_float(getattr(features, "abnormal_wick_max_pct", 0.0), 0.0)
+        abnormal_wick_recent = self._safe_float(
+            getattr(features, "abnormal_wick_recent_hours", 9999.0), 9999.0
+        )
+        if volume_ratio > 0 and volume_ratio < max(settings.min_entry_volume_ratio, 0.30):
+            discount += 0.05
+            reasons.append("low volume ratio")
+        if spread_pct >= 0.003:
+            discount += 0.05
+            reasons.append("wide spread")
+        if volatility_20 >= 0.08:
+            discount += 0.08
+            reasons.append("high short-term volatility")
+        elif volatility_20 >= 0.06:
+            discount += 0.04
+            reasons.append("elevated short-term volatility")
+        if change_24h >= 8.0 and volatility_20 >= 0.05:
+            discount += 0.04
+            reasons.append("large 24h move with volatility")
+        if abnormal_wick_count > 0 and abnormal_wick_recent <= 12 and abnormal_wick_max >= 0.50:
+            discount += 0.10
+            reasons.append("recent abnormal wick")
+
+        discount = min(max(discount, 0.0), RISK_ENTRY_SCORE_DISCOUNT_MAX)
+        size_multiplier = max(RISK_ENTRY_SIZE_MULTIPLIER_FLOOR, 1.0 - discount * 1.5)
+        return {
+            "active": bool(discount > 0 or reasons),
+            "hard_veto": False,
+            "score_discount_pct": round(discount, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "reason": (
+                "; ".join(reasons) if reasons else "risk_expert found no extra entry discount"
+            ),
+            "confidence": round(confidence, 4),
+            "risk_action": risk_opinion.action.value,
+        }
+
+    def _expert_weight_policy_summary(self, opinions: list[dict[str, Any]]) -> dict[str, Any]:
+        policies = {
+            str(opinion.get("model_name")): opinion.get("weight_policy")
+            for opinion in opinions
+            if opinion.get("model_name") and isinstance(opinion.get("weight_policy"), dict)
+        }
+        modes = {
+            str(policy.get("mode"))
+            for policy in policies.values()
+            if isinstance(policy, dict) and policy.get("mode")
+        }
+        return {
+            "mode": (
+                "no_position_entry_overlay"
+                if "no_position_entry_overlay" in modes
+                else "position_review" if "position_review" in modes else "market_entry"
+            ),
+            "policies": policies,
+            "entry_support_excluded_experts": sorted(MARKET_DIRECTION_EXCLUDED_EXPERTS),
+            "score_participants": [
+                str(opinion.get("model_name"))
+                for opinion in opinions
+                if self._safe_float(opinion.get("effective_weight"), 0.0) > 0
+            ],
+        }
+
+    def _risk_policy_from_opinions(self, opinions: list[dict[str, Any]]) -> dict[str, Any]:
+        for opinion in opinions:
+            if opinion.get("model_name") == "risk_expert" and isinstance(
+                opinion.get("risk_expert_policy"), dict
+            ):
+                return dict(opinion["risk_expert_policy"])
+        return {"active": False, "reason": "risk_expert opinion missing"}
+
+    def _entry_signal_support_payload(
+        self,
+        *,
+        action: Action,
+        decisions: dict[str, DecisionOutput],
+        cross_validations: list[dict[str, Any]],
+        validation_adjustment: float,
+        disagreement: float,
+        context: dict[str, Any] | None,
+        ml_profit_hint: dict[str, Any] | None,
+        allowed: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        action_side = "long" if action == Action.LONG else "short"
+        same_direction = [
+            name
+            for name, decision in decisions.items()
+            if isinstance(decision, DecisionOutput)
+            and decision.action == action
+            and float(decision.confidence or 0.0) >= 0.55
+        ]
+        return {
+            "allowed": allowed,
+            "side": action_side,
+            "same_direction_experts": same_direction,
+            "directional_support_experts": [
+                name for name in same_direction if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
+            ],
+            "excluded_direction_experts": [
+                name for name in same_direction if name in MARKET_DIRECTION_EXCLUDED_EXPERTS
+            ],
+            "technical_support": [
+                name
+                for name, decision in decisions.items()
+                if name in ENTRY_DIRECTION_SUPPORT_EXPERTS
+                and isinstance(decision, DecisionOutput)
+                and decision.action == action
+                and float(decision.confidence or 0.0) >= 0.55
+            ],
+            "aligned_validations": sum(
+                1
+                for validation in cross_validations
+                if isinstance(validation, dict) and validation.get("consistency") == "aligned"
+            ),
+            "local_profit_aligned": self._local_profit_aligned(context, action_side),
+            "ml_strong_aligned": bool(
+                isinstance(ml_profit_hint, dict)
+                and ml_profit_hint.get("strong")
+                and ml_profit_hint.get("side") == action_side
+            ),
+            "validation_adjustment": round(validation_adjustment, 4),
+            "disagreement": round(disagreement, 4),
+            "policy": (
+                "trend/sentiment plus profit-quality experts are executable entry support; "
+                "position_expert and risk_expert are trace, veto, or discount signals"
+            ),
+            "reason": reason,
+        }
+
     def combine(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         opinions: dict[str, DecisionOutput],
         cross_validations: list[dict[str, Any]] | None = None,
         consultation: dict[str, Any] | None = None,
     ) -> DecisionOutput:
         cross_validations = cross_validations or []
-        valid = {
-            name: d
-            for name, d in opinions.items()
-            if isinstance(d, DecisionOutput)
-        }
+        valid = {name: d for name, d in opinions.items() if isinstance(d, DecisionOutput)}
         if not valid:
             return self._hold(features, "没有可用专家模型输出，保持观望。", {})
 
         review_positions = bool(context.get("review_positions"))
         symbol_positions = self._symbol_positions(features.symbol, context)
-        current_side = symbol_positions[0].get("side") if symbol_positions else None
+        current_position = self._safe_dict(symbol_positions[0]) if symbol_positions else {}
+        current_side = current_position.get("side")
 
         weighted_score = 0.0
         total_weight = 0.0
@@ -1225,8 +1720,10 @@ class EnsembleCoordinator:
         stop_votes: list[float] = []
         profit_votes: list[float] = []
         raw_opinions: list[dict[str, Any]] = []
+        raw_opinions_by_name: dict[str, dict[str, Any]] = {}
         exit_votes: list[DecisionOutput] = []
         risk_vetoes: list[DecisionOutput] = []
+        risk_opinion: DecisionOutput | None = None
         score_participants: dict[str, DecisionOutput] = {}
         dynamic_weights = context.get("dynamic_expert_weights") if isinstance(context, dict) else {}
         if not isinstance(dynamic_weights, dict):
@@ -1234,22 +1731,27 @@ class EnsembleCoordinator:
 
         for name, decision in valid.items():
             meta = self._slot_meta.get(name, {})
-            base_weight = float(meta.get("weight", getattr(self.registry.get(name), "weight", 1.0)) or 1.0)
-            dynamic_info = dynamic_weights.get(name) if isinstance(dynamic_weights.get(name), dict) else {}
+            base_weight = float(
+                meta.get("weight", getattr(self.registry.get(name), "weight", 1.0)) or 1.0
+            )
+            dynamic_info = self._safe_dict(dynamic_weights.get(name))
             dynamic_multiplier = min(
                 max(self._safe_float(dynamic_info.get("multiplier"), 1.0), 0.70),
                 1.25,
             )
-            weight = base_weight * dynamic_multiplier
-            effective_weight = weight
             timeout_fallback = bool(
                 isinstance(decision.raw_response, dict)
                 and decision.raw_response.get("timeout_fallback")
             )
-            if timeout_fallback:
-                effective_weight = 0.0
-            if not review_positions and name in MARKET_DIRECTION_EXCLUDED_EXPERTS:
-                effective_weight = 0.0
+            effective_weight, weight_policy = self._effective_expert_weight(
+                name=name,
+                base_weight=base_weight,
+                dynamic_multiplier=dynamic_multiplier,
+                review_positions=review_positions,
+                current_side=str(current_side) if current_side else None,
+                timeout_fallback=timeout_fallback,
+            )
+            weight = base_weight * dynamic_multiplier
             score = ACTION_SCORE.get(decision.action, 0.0)
             weighted_score += effective_weight * decision.confidence * score
             total_weight += effective_weight
@@ -1257,38 +1759,50 @@ class EnsembleCoordinator:
                 score_participants[name] = decision
 
             if decision.is_entry and effective_weight > 0:
-                entry_size += effective_weight * decision.position_size_pct * max(decision.confidence, 0.1)
+                entry_size += (
+                    effective_weight * decision.position_size_pct * max(decision.confidence, 0.1)
+                )
                 leverage_votes.append(decision.suggested_leverage)
                 stop_votes.append(decision.stop_loss_pct)
                 profit_votes.append(decision.take_profit_pct)
             if decision.is_exit:
                 exit_votes.append(decision)
-            if name == "risk_expert" and self._is_hard_risk_veto(
-                decision,
-                features,
-                for_position_close=bool(review_positions and current_side),
-            ):
-                risk_vetoes.append(decision) 
+            if name == "risk_expert":
+                risk_opinion = decision
+                if self._is_hard_risk_veto(
+                    decision,
+                    features,
+                    for_position_close=bool(review_positions and current_side),
+                ):
+                    risk_vetoes.append(decision)
 
-            raw_opinions.append({
-                "model_name": name,
-                "role": meta.get("role", ""),
-                "label": meta.get("label", name),
-                "action": decision.action.value,
-                "confidence": decision.confidence,
-                "position_size_pct": decision.position_size_pct,
-                "suggested_leverage": decision.suggested_leverage,
-                "stop_loss_pct": decision.stop_loss_pct,
-                "take_profit_pct": decision.take_profit_pct,
-                "base_weight": base_weight,
-                "dynamic_weight_multiplier": dynamic_multiplier,
-                "dynamic_weight_reason": dynamic_info.get("reason", "暂无足够历史样本，使用基础权重。"),
-                "weight": weight,
-                "effective_weight": effective_weight,
-                "reasoning": decision.reasoning,
-                "cross_check_for": decision.cross_check_for,
-                "timeout_fallback": timeout_fallback,
-            })
+            raw_opinions.append(
+                {
+                    "model_name": name,
+                    "role": meta.get("role", ""),
+                    "label": meta.get("label", name),
+                    "action": decision.action.value,
+                    "confidence": decision.confidence,
+                    "position_size_pct": decision.position_size_pct,
+                    "suggested_leverage": decision.suggested_leverage,
+                    "stop_loss_pct": decision.stop_loss_pct,
+                    "take_profit_pct": decision.take_profit_pct,
+                    "base_weight": base_weight,
+                    "dynamic_weight_multiplier": dynamic_multiplier,
+                    "dynamic_weight_reason": dynamic_info.get(
+                        "reason", "暂无足够历史样本，使用基础权重。"
+                    ),
+                    "weight": weight,
+                    "effective_weight": effective_weight,
+                    "weight_policy": weight_policy,
+                    "entry_support_eligible": weight_policy.get("entry_support_eligible"),
+                    "excluded_reason": weight_policy.get("excluded_reason"),
+                    "reasoning": decision.reasoning,
+                    "cross_check_for": decision.cross_check_for,
+                    "timeout_fallback": timeout_fallback,
+                }
+            )
+            raw_opinions_by_name[name] = raw_opinions[-1]
 
         normalized_score = weighted_score / total_weight if total_weight else 0.0
         disagreement = self._disagreement((score_participants or valid).values())
@@ -1298,17 +1812,31 @@ class EnsembleCoordinator:
             normalized_score,
             validation_adjustment + memory_adjustment,
         )
+        risk_expert_policy = self._risk_expert_entry_policy(
+            risk_opinion,
+            features,
+            review_positions=review_positions,
+            current_side=str(current_side) if current_side else None,
+            hard_veto=bool(risk_vetoes),
+        )
+        score_before_risk_discount = decision_score
+        risk_score_discount = self._safe_float(risk_expert_policy.get("score_discount_pct"), 0.0)
+        if risk_score_discount > 0 and not risk_expert_policy.get("hard_veto"):
+            decision_score *= max(0.0, 1.0 - risk_score_discount)
+        risk_expert_policy["score_before_discount"] = round(score_before_risk_discount, 4)
+        risk_expert_policy["score_after_discount"] = round(decision_score, 4)
+        if "risk_expert" in raw_opinions_by_name:
+            raw_opinions_by_name["risk_expert"]["risk_expert_policy"] = risk_expert_policy
         major_conflicts = [v for v in cross_validations if v.get("major_conflict")]
         resolution_brief = self._conflict_resolution_brief(cross_validations, consultation)
         consultation_blocks_trade = (
-            isinstance(consultation, dict)
-            and consultation.get("should_trade") is False
+            isinstance(consultation, dict) and consultation.get("should_trade") is False
         )
         raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
         raw["base_weighted_score"] = round(normalized_score, 4)
         raw["memory_adjustment"] = round(memory_adjustment, 4)
         raw["memory_summary"] = self._memory_summary(context, normalized_score)
-        raw["daily_target"] = context.get("daily_target") or {}
+        raw["memory_feedback"] = self._memory_feedback(context)
         raw["market_regime"] = context.get("market_regime") or {}
         raw["strategy_mode"] = context.get("strategy_mode") or {}
         raw["ml_signal"] = context.get("ml_signal") or {}
@@ -1328,7 +1856,9 @@ class EnsembleCoordinator:
             return self._hold(features, reason, raw)
 
         if risk_vetoes and not current_side:
-            reason = self._reason("风控专家否决新开仓", decision_score, disagreement, raw_opinions, resolution_brief)
+            reason = self._reason(
+                "风控专家否决新开仓", decision_score, disagreement, raw_opinions, resolution_brief
+            )
             return self._hold(features, reason, raw)
 
         if major_conflicts and consultation_blocks_trade:
@@ -1393,12 +1923,16 @@ class EnsembleCoordinator:
                 raw_opinions,
                 symbol_positions,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
-            hold_raw["portfolio_profit_protection"] = context.get("portfolio_profit_protection") or {}
+            hold_raw["memory_feedback"] = self._memory_feedback(context)
+            hold_raw["portfolio_profit_protection"] = (
+                context.get("portfolio_profit_protection") or {}
+            )
             hold_raw["position_review_policy"] = {
                 "result": "hold",
                 "minimum_support_required": MIN_REVIEW_CLOSE_SUPPORT,
@@ -1439,10 +1973,10 @@ class EnsembleCoordinator:
         recovery_probe_entry = False
         normal_entry_threshold = 0.28
         probe_entry_threshold = 0.16
-        daily_entry_gate = self._daily_target_entry_gate(context)
-        raw["daily_target_entry_gate"] = daily_entry_gate
-        normal_entry_threshold += float(daily_entry_gate.get("score_bonus") or 0.0)
-        probe_entry_threshold += float(daily_entry_gate.get("score_bonus") or 0.0)
+        entry_gate = self._entry_execution_gate()
+        raw["entry_execution_gate"] = entry_gate
+        normal_entry_threshold += float(entry_gate.get("score_bonus") or 0.0)
+        probe_entry_threshold += float(entry_gate.get("score_bonus") or 0.0)
         if (
             ml_profit_hint.get("strong")
             and (
@@ -1456,8 +1990,12 @@ class EnsembleCoordinator:
                 min_confidence=0.60,
             )
         ):
-            relief = min(float(ml_profit_hint.get("score_relief") or 0.0), ML_PROFIT_FIRST_SCORE_RELIEF)
-            normal_entry_threshold = max(PROBE_ENTRY_SCORE_THRESHOLD, normal_entry_threshold - relief)
+            relief = min(
+                float(ml_profit_hint.get("score_relief") or 0.0), ML_PROFIT_FIRST_SCORE_RELIEF
+            )
+            normal_entry_threshold = max(
+                PROBE_ENTRY_SCORE_THRESHOLD, normal_entry_threshold - relief
+            )
             probe_entry_threshold = max(0.18, probe_entry_threshold - relief * 0.5)
             raw["profit_first_threshold_relief"] = {
                 "applied": True,
@@ -1476,51 +2014,46 @@ class EnsembleCoordinator:
             and quant_validation_probe.get("allow")
             and quant_validation_probe.get("status") in {"allowed", "quant_only_tiny_probe"}
         )
-        if action != Action.HOLD and not self._entry_signal_allowed(
-            action,
-            valid,
-            cross_validations,
-            validation_adjustment,
-            disagreement,
-            context,
-        ) and not quant_probe_can_bypass_support:
-            action_side = "long" if action == Action.LONG else "short"
-            same_direction = [
-                name for name, decision in valid.items()
-                if isinstance(decision, DecisionOutput)
-                and decision.action == action
-                and decision.confidence >= 0.55
-            ]
+        if (
+            action != Action.HOLD
+            and not self._entry_signal_allowed(
+                action,
+                valid,
+                cross_validations,
+                validation_adjustment,
+                disagreement,
+                context,
+            )
+            and not quant_probe_can_bypass_support
+        ):
             raw["entry_quality_gate"] = "entry_signal_support_block"
-            raw["entry_signal_support"] = {
-                "side": action_side,
-                "same_direction_experts": same_direction,
-                "aligned_validations": sum(
-                    1 for v in cross_validations
-                    if isinstance(v, dict) and v.get("consistency") == "aligned"
-                ),
-                "validation_adjustment": round(validation_adjustment, 4),
-                "disagreement": round(disagreement, 4),
-                "reason": "Entry score passed, but executable cross-expert support was not strong enough.",
-            }
+            raw["entry_signal_support"] = self._entry_signal_support_payload(
+                action=action,
+                decisions=valid,
+                cross_validations=cross_validations,
+                validation_adjustment=validation_adjustment,
+                disagreement=disagreement,
+                context=context,
+                ml_profit_hint=ml_profit_hint,
+                allowed=False,
+                reason="Entry score passed, but executable cross-expert support was not strong enough.",
+            )
             action = Action.HOLD
 
         if (
             PROBE_ENTRY_ENABLED
-            and daily_entry_gate.get("allow_probe", True)
+            and entry_gate.get("allow_probe", True)
             and action == Action.HOLD
             and not major_conflicts
             and disagreement < 0.50
         ):
-            if (
-                decision_score >= probe_entry_threshold
-                and self._probe_entry_allowed(Action.LONG, valid, cross_validations, validation_adjustment, features)
+            if decision_score >= probe_entry_threshold and self._probe_entry_allowed(
+                Action.LONG, valid, cross_validations, validation_adjustment, features
             ):
                 action = Action.LONG
                 probe_entry = True
-            elif (
-                decision_score <= -probe_entry_threshold
-                and self._probe_entry_allowed(Action.SHORT, valid, cross_validations, validation_adjustment, features)
+            elif decision_score <= -probe_entry_threshold and self._probe_entry_allowed(
+                Action.SHORT, valid, cross_validations, validation_adjustment, features
             ):
                 action = Action.SHORT
                 probe_entry = True
@@ -1558,7 +2091,9 @@ class EnsembleCoordinator:
             )
             raw["quant_validation_probe_entry"] = quant_validation_probe
             if quant_validation_probe.get("allow"):
-                action = Action.LONG if quant_validation_probe.get("side") == "long" else Action.SHORT
+                action = (
+                    Action.LONG if quant_validation_probe.get("side") == "long" else Action.SHORT
+                )
                 probe_entry = True
 
         if action == Action.HOLD and self._recovery_attack_probe_allowed(
@@ -1577,8 +2112,8 @@ class EnsembleCoordinator:
                 "enabled": True,
                 "action": action.value,
                 "reason": (
-                    "Recovery attack mode allows a tiny probe when one technical expert and risk expert "
-                    "support the same direction, without major conflict."
+                    "Recovery attack mode allows a tiny probe when one technical expert is aligned "
+                    "and risk_expert is cleared, without major conflict."
                 ),
             }
 
@@ -1599,34 +2134,58 @@ class EnsembleCoordinator:
             and quant_validation_probe.get("allow")
             and quant_validation_probe.get("status") == "quant_only_tiny_probe"
         )
-        if action != Action.HOLD and not self._entry_signal_allowed(
-            action,
-            valid,
-            cross_validations,
-            validation_adjustment,
-            disagreement,
-            context,
-        ) and not quant_probe_bypass_after_probe:
+        if (
+            action != Action.HOLD
+            and not self._entry_signal_allowed(
+                action,
+                valid,
+                cross_validations,
+                validation_adjustment,
+                disagreement,
+                context,
+            )
+            and not quant_probe_bypass_after_probe
+        ):
             action_side = "long" if action == Action.LONG else "short"
             raw["entry_quality_gate"] = "entry_signal_support_block_after_probe"
             raw["entry_signal_support"] = {
                 "allowed": False,
                 "side": action_side,
                 "same_direction_experts": [
-                    name for name, decision in valid.items()
+                    name
+                    for name, decision in valid.items()
                     if isinstance(decision, DecisionOutput)
                     and decision.action == action
                     and float(decision.confidence or 0.0) >= 0.55
                 ],
+                "directional_support_experts": [
+                    name
+                    for name, decision in valid.items()
+                    if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
+                    and isinstance(decision, DecisionOutput)
+                    and decision.action == action
+                    and float(decision.confidence or 0.0) >= 0.55
+                ],
+                "excluded_direction_experts": [
+                    name
+                    for name, decision in valid.items()
+                    if name in MARKET_DIRECTION_EXCLUDED_EXPERTS
+                    and isinstance(decision, DecisionOutput)
+                    and decision.action == action
+                    and float(decision.confidence or 0.0) >= 0.55
+                ],
                 "technical_support": [
-                    name for name, decision in valid.items()
+                    name
+                    for name, decision in valid.items()
                     if name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                     and isinstance(decision, DecisionOutput)
                     and decision.action == action
                     and float(decision.confidence or 0.0) >= 0.55
                 ],
                 "local_profit_aligned": self._local_profit_aligned(context, action_side),
-                "ml_strong_aligned": bool(ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side),
+                "ml_strong_aligned": bool(
+                    ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side
+                ),
                 "validation_adjustment": round(validation_adjustment, 4),
                 "disagreement": round(disagreement, 4),
                 "reason": "试单或量化验证生成了候选方向，但专家同向支持不足，本轮不允许开仓。",
@@ -1655,13 +2214,14 @@ class EnsembleCoordinator:
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "market_regime_forecast_block"
             hold_raw["market_regime"] = context.get("market_regime") or {}
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
 
         if action == Action.HOLD:
@@ -1672,12 +2232,13 @@ class EnsembleCoordinator:
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["ml_profit_first_direction_hint"] = ml_profit_hint
             if raw.get("entry_quality_gate"):
                 hold_raw["entry_quality_gate"] = raw.get("entry_quality_gate")
@@ -1688,9 +2249,9 @@ class EnsembleCoordinator:
                 hold_raw,
             )
 
-        daily_mode = str(daily_entry_gate.get("mode") or "")
+        entry_mode = str(entry_gate.get("mode") or "")
         action_side = "long" if action == Action.LONG else "short"
-        if daily_mode == "loss_recovery_selective" and not (
+        if entry_mode == "loss_recovery_selective" and not (
             ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side
         ):
             reason = self._reason(
@@ -1700,35 +2261,40 @@ class EnsembleCoordinator:
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "loss_recovery_requires_profit_first_ml"
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["ml_profit_first_direction_hint"] = ml_profit_hint
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
 
-        if float(daily_entry_gate.get("max_position_size") or 0.0) <= 0.0:
+        if float(entry_gate.get("max_position_size") or 0.0) <= 0.0:
             reason = self._reason(
-                "今日已进入亏损止血模式，停止新开仓，只允许已有持仓继续止盈止损和平仓",
+                "入场执行门禁已进入止血模式，停止新开仓，只允许已有持仓继续止盈止损和平仓",
                 decision_score,
                 disagreement,
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
-            hold_raw["entry_quality_gate"] = "daily_target_loss_control_no_new_entry"
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_quality_gate"] = "entry_execution_no_new_entry"
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
 
         avg_size = entry_size / total_weight if total_weight else 0.0
-        if quant_validation_probe and quant_validation_probe.get("status") == "quant_only_tiny_probe":
+        if (
+            quant_validation_probe
+            and quant_validation_probe.get("status") == "quant_only_tiny_probe"
+        ):
             avg_size = max(avg_size, QUANT_VALIDATION_PROBE_SIZE)
         confidence = min(max(abs(decision_score) + 0.35 - disagreement * 0.15, 0.0), 0.92)
         if probe_entry:
@@ -1738,7 +2304,7 @@ class EnsembleCoordinator:
         if quant_validation_probe and quant_validation_probe.get("allow"):
             confidence = max(confidence, QUANT_VALIDATION_PROBE_CONFIDENCE)
         quality_points = self._entry_quality_points(features, action)
-        min_quality_points = int(daily_entry_gate.get("min_quality_points") or 0)
+        min_quality_points = int(entry_gate.get("min_quality_points") or 0)
         if recovery_probe_entry:
             min_quality_points = min(min_quality_points, 1)
         elif profit_first_probe:
@@ -1759,24 +2325,25 @@ class EnsembleCoordinator:
             }
         if quality_points < min_quality_points:
             reason = self._reason(
-                f"今日目标控制要求至少 {min_quality_points}/3 项入场质量通过，当前只有 {quality_points}/3，避免低质量试错",
+                f"入场质量门禁要求至少 {min_quality_points}/3 项通过，当前只有 {quality_points}/3，避免低质量试错",
                 decision_score,
                 disagreement,
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
-            hold_raw["entry_quality_gate"] = "daily_target_quality_points_below_threshold"
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_quality_gate"] = "entry_quality_points_below_threshold"
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["entry_quality_points"] = quality_points
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
         min_confidence = max(
             MIN_EXECUTABLE_ENTRY_CONFIDENCE,
-            float(daily_entry_gate.get("min_confidence") or 0.0),
+            float(entry_gate.get("min_confidence") or 0.0),
         )
         ml_gate = self._ml_profit_quality_entry_gate(action, context, confidence, min_confidence)
         raw["ml_profit_quality_gate"] = ml_gate
@@ -1801,7 +2368,9 @@ class EnsembleCoordinator:
                 probe_entry = True
                 quant_validation_probe = reversal_probe
                 confidence = max(QUANT_VALIDATION_PROBE_CONFIDENCE, min(confidence, 0.78))
-                ml_gate = self._ml_profit_quality_entry_gate(action, context, confidence, min_confidence)
+                ml_gate = self._ml_profit_quality_entry_gate(
+                    action, context, confidence, min_confidence
+                )
                 raw["ml_profit_quality_gate"] = ml_gate
             if not ml_gate.get("allow", True):
                 reason = self._reason(
@@ -1811,16 +2380,17 @@ class EnsembleCoordinator:
                     raw_opinions,
                     resolution_brief,
                 )
-                hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+                hold_raw = self._raw(
+                    raw_opinions, decision_score, disagreement, cross_validations, consultation
+                )
                 hold_raw["base_weighted_score"] = round(normalized_score, 4)
                 hold_raw["entry_quality_gate"] = "ml_profit_quality_block"
                 hold_raw["ml_profit_quality_gate"] = ml_gate
                 hold_raw["quant_reversal_probe_entry"] = reversal_probe
                 hold_raw["ml_signal"] = context.get("ml_signal") or {}
-                hold_raw["daily_target_entry_gate"] = daily_entry_gate
+                hold_raw["entry_execution_gate"] = entry_gate
                 hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
                 hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-                hold_raw["daily_target"] = context.get("daily_target") or {}
                 return self._hold(features, reason, hold_raw)
         if False and not ml_gate.get("allow", True):
             reason = self._reason(
@@ -1830,15 +2400,16 @@ class EnsembleCoordinator:
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "ml_profit_quality_block"
             hold_raw["ml_profit_quality_gate"] = ml_gate
             hold_raw["ml_signal"] = context.get("ml_signal") or {}
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
         if False and confidence < min_confidence:
             reason = self._reason(
@@ -1848,13 +2419,14 @@ class EnsembleCoordinator:
                 raw_opinions,
                 resolution_brief,
             )
-            hold_raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+            hold_raw = self._raw(
+                raw_opinions, decision_score, disagreement, cross_validations, consultation
+            )
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "confidence_below_fee_adjusted_threshold"
-            hold_raw["daily_target_entry_gate"] = daily_entry_gate
+            hold_raw["entry_execution_gate"] = entry_gate
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            hold_raw["daily_target"] = context.get("daily_target") or {}
             return self._hold(features, reason, hold_raw)
         size = min(max(avg_size, 0.02), 1.0)
         if confidence < settings.confidence_threshold:
@@ -1872,6 +2444,8 @@ class EnsembleCoordinator:
         memory_size_multiplier = self._memory_size_multiplier(context, action)
         size = max(min(size * memory_size_multiplier, 1.0), 0.0)
         size = min(size, 1.0)
+        risk_size_multiplier = self._safe_float(risk_expert_policy.get("size_multiplier"), 1.0)
+        risk_size_discount: dict[str, Any] | None = None
         profit_quality_expand = self._profit_quality_entry_expand_evidence(
             context=context,
             action_side=action_side,
@@ -1880,7 +2454,7 @@ class EnsembleCoordinator:
             disagreement=disagreement,
             ml_gate=ml_gate,
             ml_profit_hint=ml_profit_hint,
-            daily_entry_gate=daily_entry_gate,
+            entry_gate=entry_gate,
             probe_entry=probe_entry,
             profit_first_probe=profit_first_probe,
             recovery_probe_entry=recovery_probe_entry,
@@ -1904,20 +2478,27 @@ class EnsembleCoordinator:
             }
         ml_soft_caution_size_cap = None
         if ml_gate.get("status") == "passed_high_confidence_slight_negative_expectancy":
-            size = min(size, 0.025)
+            size = min(size, ML_SOFT_CAUTION_MAX_ENTRY_SIZE)
             ml_soft_caution_size_cap = {
                 "applied": True,
-                "max_position_size": crowded_cap,
+                "max_position_size": ML_SOFT_CAUTION_MAX_ENTRY_SIZE,
                 "reason": "ML was slightly negative, so the AI signal is allowed but only as a small controlled entry.",
             }
-        exposure = ((context.get("strategy_mode") or {}).get("position_exposure") or {}) if isinstance(context, dict) else {}
+        exposure = (
+            ((context.get("strategy_mode") or {}).get("position_exposure") or {})
+            if isinstance(context, dict)
+            else {}
+        )
         crowded_side_size_cap = None
         if isinstance(exposure, dict) and exposure.get("dominant_side") == action_side:
             crowded_cap = 0.025
             crowded_reason = "同方向敞口已经偏高，普通信号只允许小仓，避免单边堆仓。"
             if profit_quality_expand.get("allow"):
                 crowded_cap = min(
-                    float(profit_quality_expand.get("max_position_size") or PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE),
+                    float(
+                        profit_quality_expand.get("max_position_size")
+                        or PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE
+                    ),
                     PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE,
                 )
                 crowded_reason = (
@@ -1934,6 +2515,16 @@ class EnsembleCoordinator:
                 "reason": "同方向敞口已偏高，仅允许盈利质量强的小仓机会，避免普通加仓堆单。",
             }
         leverage = min(max(leverage, min_leverage), leverage_cap, settings.max_leverage)
+        if 0.0 < risk_size_multiplier < 1.0:
+            original_size = size
+            size = max(min(size * risk_size_multiplier, 1.0), 0.0)
+            risk_size_discount = {
+                "applied": size < original_size,
+                "original_position_size_pct": round(original_size, 6),
+                "adjusted_position_size_pct": round(size, 6),
+                "size_multiplier": round(risk_size_multiplier, 4),
+                "reason": risk_expert_policy.get("reason"),
+            }
 
         reason = self._reason(
             (
@@ -1946,18 +2537,22 @@ class EnsembleCoordinator:
             raw_opinions,
             resolution_brief,
         )
-        raw_response = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+        raw_response = self._raw(
+            raw_opinions, decision_score, disagreement, cross_validations, consultation
+        )
         raw_response["base_weighted_score"] = round(normalized_score, 4)
         raw_response["memory_adjustment"] = round(memory_adjustment, 4)
         raw_response["memory_size_multiplier"] = round(memory_size_multiplier, 4)
         raw_response["memory_summary"] = self._memory_summary(context, normalized_score)
-        raw_response["daily_target"] = context.get("daily_target") or {}
+        raw_response["memory_feedback"] = self._memory_feedback(context)
         raw_response["market_regime"] = context.get("market_regime") or {}
         raw_response["strategy_mode"] = context.get("strategy_mode") or {}
         raw_response["ml_signal"] = context.get("ml_signal") or {}
         raw_response["ml_profit_quality_gate"] = ml_gate
         raw_response["ml_profit_first_direction_hint"] = ml_profit_hint
         raw_response["profit_quality_position_boost"] = profit_quality_expand
+        if risk_size_discount:
+            raw_response["risk_expert_size_discount"] = risk_size_discount
         if ml_soft_caution_size_cap:
             raw_response["ml_soft_caution_size_cap"] = ml_soft_caution_size_cap
         if crowded_side_size_cap:
@@ -1966,10 +2561,12 @@ class EnsembleCoordinator:
             raw_response["quant_validation_size_cap"] = quant_validation_size_cap
         if raw.get("quant_reversal_probe_entry"):
             raw_response["quant_reversal_probe_entry"] = raw.get("quant_reversal_probe_entry")
-        raw_response["daily_target_entry_gate"] = daily_entry_gate
+        raw_response["entry_execution_gate"] = entry_gate
         raw_response["probe_entry"] = probe_entry
         raw_response["profit_first_probe_entry"] = profit_first_probe
-        raw_response["quant_validation_probe_entry"] = quant_validation_probe or raw.get("quant_validation_probe_entry")
+        raw_response["quant_validation_probe_entry"] = quant_validation_probe or raw.get(
+            "quant_validation_probe_entry"
+        )
         raw_response["quant_only_probe_entry"] = raw.get("quant_only_probe_entry")
         raw_response["recovery_attack_probe_entry"] = recovery_probe_entry
         raw_response["entry_quality_points"] = quality_points
@@ -1977,20 +2574,40 @@ class EnsembleCoordinator:
             "allowed": True,
             "side": action_side,
             "same_direction_experts": [
-                name for name, decision in valid.items()
+                name
+                for name, decision in valid.items()
                 if isinstance(decision, DecisionOutput)
                 and decision.action == action
                 and float(decision.confidence or 0.0) >= 0.55
             ],
+            "directional_support_experts": [
+                name
+                for name, decision in valid.items()
+                if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
+                and isinstance(decision, DecisionOutput)
+                and decision.action == action
+                and float(decision.confidence or 0.0) >= 0.55
+            ],
+            "excluded_direction_experts": [
+                name
+                for name, decision in valid.items()
+                if name in MARKET_DIRECTION_EXCLUDED_EXPERTS
+                and isinstance(decision, DecisionOutput)
+                and decision.action == action
+                and float(decision.confidence or 0.0) >= 0.55
+            ],
             "technical_support": [
-                name for name, decision in valid.items()
+                name
+                for name, decision in valid.items()
                 if name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(decision, DecisionOutput)
                 and decision.action == action
                 and float(decision.confidence or 0.0) >= 0.55
             ],
             "local_profit_aligned": self._local_profit_aligned(context, action_side),
-            "ml_strong_aligned": bool(ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side),
+            "ml_strong_aligned": bool(
+                ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side
+            ),
             "validation_adjustment": round(validation_adjustment, 4),
             "disagreement": round(disagreement, 4),
             "policy": "专家同向支持是开仓主条件；ML/服务器盈利模型只作为辅助加分和过滤。",
@@ -2057,7 +2674,11 @@ class EnsembleCoordinator:
             "low_win_rate": bool(win_rate < ML_STRONG_SUPPORT_WIN_RATE),
             "score_relief": (
                 ML_PROFIT_FIRST_SCORE_RELIEF
-                * (ML_PROFIT_FIRST_LOW_WIN_RATE_SIZE_MULTIPLIER if win_rate < ML_STRONG_SUPPORT_WIN_RATE else 1.0)
+                * (
+                    ML_PROFIT_FIRST_LOW_WIN_RATE_SIZE_MULTIPLIER
+                    if win_rate < ML_STRONG_SUPPORT_WIN_RATE
+                    else 1.0
+                )
                 if strong
                 else 0.0
             ),
@@ -2075,21 +2696,27 @@ class EnsembleCoordinator:
         raw_opinions: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Allow a tiny candidate when quant tools agree but LLM experts stay neutral."""
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        profit = tools.get("profit_prediction") if isinstance(tools, dict) and isinstance(tools.get("profit_prediction"), dict) else {}
-        time_series = tools.get("time_series_prediction") if isinstance(tools, dict) and isinstance(tools.get("time_series_prediction"), dict) else {}
-        sentiment = tools.get("sentiment_analysis") if isinstance(tools, dict) and isinstance(tools.get("sentiment_analysis"), dict) else {}
+        tools = self._safe_dict(context.get("local_ai_tools") if isinstance(context, dict) else {})
+        profit = self._safe_dict(tools.get("profit_prediction"))
+        time_series = self._safe_dict(
+            tools.get("time_series_prediction")
+            or tools.get("timeseries_prediction")
+            or tools.get("sequence_prediction")
+        )
+        sentiment = self._safe_dict(tools.get("sentiment_analysis"))
         directional_expert_votes = [
-            o for o in raw_opinions
+            o
+            for o in raw_opinions
             if isinstance(o, dict) and str(o.get("action") or "") in {"long", "short"}
         ]
         if directional_expert_votes:
             return {"allow": False, "status": "experts_not_neutral"}
 
-        ml_side = str((ml_profit_hint or {}).get("side") or "").lower()
-        ml_expected = self._safe_float((ml_profit_hint or {}).get("expected_return_pct"), 0.0)
-        ml_edge = self._safe_float((ml_profit_hint or {}).get("profit_edge_pct"), 0.0)
-        ml_strong = bool((ml_profit_hint or {}).get("strong"))
+        ml_hint = self._safe_dict(ml_profit_hint)
+        ml_side = str(ml_hint.get("side") or "").lower()
+        ml_expected = self._safe_float(ml_hint.get("expected_return_pct"), 0.0)
+        ml_edge = self._safe_float(ml_hint.get("profit_edge_pct"), 0.0)
+        ml_strong = bool(ml_hint.get("strong"))
 
         best_profit_side = str(profit.get("best_side") or "").lower()
         ts_side = str(time_series.get("best_side") or time_series.get("side") or "").lower()
@@ -2098,16 +2725,25 @@ class EnsembleCoordinator:
             ts_side = "long" if ts_direction == "up" else "short" if ts_direction == "down" else ""
         sentiment_side = str(sentiment.get("best_side") or sentiment.get("side") or "").lower()
         sentiment_risk = str(sentiment.get("risk_level") or "").lower()
+        direction_competition = self._safe_dict(
+            context.get("direction_competition") if isinstance(context, dict) else {}
+        )
+        direction_preferred_side = str(direction_competition.get("preferred_side") or "").lower()
+        direction_gap = self._safe_float(direction_competition.get("score_gap"), 0.0)
 
         candidates: list[dict[str, Any]] = []
         for side in ("long", "short"):
             opposite = "short" if side == "long" else "long"
             local_expected = self._safe_float(
-                profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")),
+                profit.get(
+                    f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")
+                ),
                 0.0,
             )
             opposite_expected = self._safe_float(
-                profit.get(f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")),
+                profit.get(
+                    f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
+                ),
                 0.0,
             )
             loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.50)
@@ -2135,11 +2771,7 @@ class EnsembleCoordinator:
                 0.0,
             )
             ts_confidence = self._safe_float(time_series.get("confidence"), 0.0)
-            ts_support = (
-                ts_side == side
-                and abs(ts_expected) >= 0.003
-                and ts_confidence >= 0.004
-            )
+            ts_support = ts_side == side and abs(ts_expected) >= 0.003 and ts_confidence >= 0.004
             if ts_support:
                 supports.append("time_series_model")
             support_detail["time_series_model"] = {
@@ -2150,7 +2782,9 @@ class EnsembleCoordinator:
             }
 
             sentiment_expected = self._safe_float(
-                sentiment.get("expected_return_pct", sentiment.get("expected_return_from_sentiment_pct")),
+                sentiment.get(
+                    "expected_return_pct", sentiment.get("expected_return_from_sentiment_pct")
+                ),
                 0.0,
             )
             sentiment_support = (
@@ -2186,19 +2820,25 @@ class EnsembleCoordinator:
             hard_negative = (
                 local_expected < -0.20
                 or loss_probability >= ML_QUANT_ONLY_MAX_LOSS_PROBABILITY
-                or (best_profit_side in {"long", "short"} and best_profit_side != side and local_expected <= 0)
+                or (
+                    best_profit_side in {"long", "short"}
+                    and best_profit_side != side
+                    and local_expected <= 0
+                )
             )
-            candidates.append({
-                "side": side,
-                "supports": supports,
-                "support_count": len(supports),
-                "support_detail": support_detail,
-                "local_expected_return_pct": local_expected,
-                "loss_probability": loss_probability,
-                "hard_negative": hard_negative,
-                "has_profit_support": profit_support,
-                "score": len(supports) + max(local_expected, 0.0) * 0.05,
-            })
+            candidates.append(
+                {
+                    "side": side,
+                    "supports": supports,
+                    "support_count": len(supports),
+                    "support_detail": support_detail,
+                    "local_expected_return_pct": local_expected,
+                    "loss_probability": loss_probability,
+                    "hard_negative": hard_negative,
+                    "has_profit_support": profit_support,
+                    "score": len(supports) + max(local_expected, 0.0) * 0.05,
+                }
+            )
 
         candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         best = candidates[0] if candidates else {}
@@ -2229,13 +2869,34 @@ class EnsembleCoordinator:
                 "supports": supports,
                 "candidates": candidates,
             }
+        direction_support = bool(
+            direction_preferred_side == side and direction_gap >= QUANT_ONLY_SHORT_DIRECTION_MIN_GAP
+        )
+        if side == "short" and (not direction_support or "time_series_model" not in supports):
+            return {
+                "allow": False,
+                "status": "short_probe_needs_direction_competition",
+                "side": side,
+                "supports": supports,
+                "direction_preferred_side": direction_preferred_side,
+                "direction_gap": round(direction_gap, 4),
+                "candidates": candidates,
+                "reason": (
+                    "Short quant-only probes need server profit, time-series support, and "
+                    "long-vs-short direction competition aligned before execution."
+                ),
+            }
         return {
             "allow": True,
             "status": "quant_only_tiny_probe",
             "side": side,
             "supports": supports,
             "support_count": len(supports),
-            "local_expected_return_pct": round(self._safe_float(best.get("local_expected_return_pct"), 0.0), 4),
+            "direction_preferred_side": direction_preferred_side,
+            "direction_gap": round(direction_gap, 4),
+            "local_expected_return_pct": round(
+                self._safe_float(best.get("local_expected_return_pct"), 0.0), 4
+            ),
             "loss_probability": round(self._safe_float(best.get("loss_probability"), 0.0), 4),
             "support_detail": best.get("support_detail") or {},
             "candidates": candidates,
@@ -2284,7 +2945,11 @@ class EnsembleCoordinator:
             }
 
         direction = "long" if action == Action.LONG else "short"
-        side_policy = (ml_signal.get("influence_policy") or {}).get(direction) if isinstance(ml_signal.get("influence_policy"), dict) else {}
+        side_policy = (
+            (ml_signal.get("influence_policy") or {}).get(direction)
+            if isinstance(ml_signal.get("influence_policy"), dict)
+            else {}
+        )
         if isinstance(side_policy, dict) and side_policy and not side_policy.get("enabled", True):
             return {
                 "enabled": False,
@@ -2329,123 +2994,148 @@ class EnsembleCoordinator:
                 and confidence < 0.82
             )
             if hard_local_block:
-                gate.update({
-                    "allow": False,
-                    "status": local_tools_gate.get("status") or "blocked_local_quant_tools",
-                    "reason": local_tools_gate.get("reason") or "Local trained quant tools blocked this entry.",
-                })
+                gate.update(
+                    {
+                        "allow": False,
+                        "status": local_tools_gate.get("status") or "blocked_local_quant_tools",
+                        "reason": local_tools_gate.get("reason")
+                        or "Local trained quant tools blocked this entry.",
+                    }
+                )
                 return gate
-            gate.update({
-                "status": f"soft_{local_tools_gate.get('status') or 'local_quant_caution'}",
-                "local_quant_caution": True,
-                "confidence_bonus": min(float(gate.get("confidence_bonus") or 0.0), 0.0),
-                "reason": (
-                    "服务器盈利模型提示该方向质量偏弱，已降级为软风控："
-                    "不再一票否决强 AI/交叉验证信号，后续通过机会评分、仓位缩小和高风险复核控制风险。"
-                ),
-            })
+            gate.update(
+                {
+                    "status": f"soft_{local_tools_gate.get('status') or 'local_quant_caution'}",
+                    "local_quant_caution": True,
+                    "confidence_bonus": min(float(gate.get("confidence_bonus") or 0.0), 0.0),
+                    "reason": (
+                        "服务器盈利模型提示该方向质量偏弱，已降级为软风控："
+                        "不再一票否决强 AI/交叉验证信号，后续通过机会评分、仓位缩小和高风险复核控制风险。"
+                    ),
+                }
+            )
 
         if expected < 0:
             required = min_confidence + 0.06
             if expected > -ML_MIN_EXPECTED_RETURN_PCT and confidence >= required:
-                gate.update({
-                    "status": "passed_high_confidence_slight_negative_expectancy",
-                    "required_confidence": round(required, 4),
-                    "reason": (
-                        "ML expected return is slightly negative, but AI confidence is strong enough. "
-                        "Allow a small controlled entry instead of hard-blocking the signal."
-                    ),
-                })
+                gate.update(
+                    {
+                        "status": "passed_high_confidence_slight_negative_expectancy",
+                        "required_confidence": round(required, 4),
+                        "reason": (
+                            "ML expected return is slightly negative, but AI confidence is strong enough. "
+                            "Allow a small controlled entry instead of hard-blocking the signal."
+                        ),
+                    }
+                )
                 return gate
-            gate.update({
-                "allow": False,
-                "status": "blocked_negative_expectancy",
-                "reason": (
-                    f"ML 预测 AI 方向（{'做多' if direction == 'long' else '做空'}）预期盈亏为负 "
-                    f"{expected:.4f}%，本轮不执行该方向开仓。"
-                ),
-            })
+            gate.update(
+                {
+                    "allow": False,
+                    "status": "blocked_negative_expectancy",
+                    "reason": (
+                        f"ML 预测 AI 方向（{'做多' if direction == 'long' else '做空'}）预期盈亏为负 "
+                        f"{expected:.4f}%，本轮不执行该方向开仓。"
+                    ),
+                }
+            )
             return gate
 
         if best_side in {"long", "short"} and best_side != direction and edge <= 0:
             required = min_confidence + 0.10
             if confidence < required:
-                gate.update({
-                    "allow": False,
-                    "status": "blocked_ml_direction_conflict",
-                    "required_confidence": round(required, 4),
-                    "reason": (
-                        f"ML 盈亏期望更偏向{'做多' if best_side == 'long' else '做空'}，"
-                        f"而 AI 给出{'做多' if direction == 'long' else '做空'}；"
-                        f"当前置信度 {confidence:.2f} 低于冲突场景门槛 {required:.2f}，本轮观望。"
-                    ),
-                })
+                gate.update(
+                    {
+                        "allow": False,
+                        "status": "blocked_ml_direction_conflict",
+                        "required_confidence": round(required, 4),
+                        "reason": (
+                            f"ML 盈亏期望更偏向{'做多' if best_side == 'long' else '做空'}，"
+                            f"而 AI 给出{'做多' if direction == 'long' else '做空'}；"
+                            f"当前置信度 {confidence:.2f} 低于冲突场景门槛 {required:.2f}，本轮观望。"
+                        ),
+                    }
+                )
                 return gate
-            gate.update({
-                "status": "passed_high_confidence_direction_conflict",
-                "required_confidence": round(required, 4),
-                "reason": "ML 与 AI 方向冲突，但 AI 置信度足够高，仅记录风险提示。",
-            })
+            gate.update(
+                {
+                    "status": "passed_high_confidence_direction_conflict",
+                    "required_confidence": round(required, 4),
+                    "reason": "ML 与 AI 方向冲突，但 AI 置信度足够高，仅记录风险提示。",
+                }
+            )
             return gate
 
         if expected < ML_MIN_EXPECTED_RETURN_PCT:
             required = min_confidence + ML_LOW_EDGE_CONFIDENCE_BONUS
             if confidence < required:
-                gate.update({
-                    "allow": False,
-                    "status": "blocked_low_expected_return",
-                    "required_confidence": round(required, 4),
-                    "reason": (
-                        f"ML 预测该方向预期收益 {expected:.4f}% 低于最低盈利质量门槛 "
-                        f"{ML_MIN_EXPECTED_RETURN_PCT:.4f}%，且置信度不足以覆盖手续费/滑点风险。"
-                    ),
-                })
+                gate.update(
+                    {
+                        "allow": False,
+                        "status": "blocked_low_expected_return",
+                        "required_confidence": round(required, 4),
+                        "reason": (
+                            f"ML 预测该方向预期收益 {expected:.4f}% 低于最低盈利质量门槛 "
+                            f"{ML_MIN_EXPECTED_RETURN_PCT:.4f}%，且置信度不足以覆盖手续费/滑点风险。"
+                        ),
+                    }
+                )
                 return gate
-            gate.update({
-                "status": "passed_high_confidence_low_expected_return",
-                "required_confidence": round(required, 4),
-                "reason": "ML 预期收益偏低，但 AI 置信度足够高，仅小心放行。",
-            })
+            gate.update(
+                {
+                    "status": "passed_high_confidence_low_expected_return",
+                    "required_confidence": round(required, 4),
+                    "reason": "ML 预期收益偏低，但 AI 置信度足够高，仅小心放行。",
+                }
+            )
             return gate
 
         if edge < ML_MIN_PROFIT_EDGE_PCT:
             required = min_confidence + ML_LOW_EDGE_CONFIDENCE_BONUS
             if confidence < required:
-                gate.update({
-                    "allow": False,
-                    "status": "blocked_weak_profit_edge",
-                    "required_confidence": round(required, 4),
-                    "reason": (
-                        f"ML 多空预期收益差只有 {edge:.4f}%，优势不明显；"
-                        f"当前置信度 {confidence:.2f} 低于弱边际门槛 {required:.2f}。"
-                    ),
-                })
+                gate.update(
+                    {
+                        "allow": False,
+                        "status": "blocked_weak_profit_edge",
+                        "required_confidence": round(required, 4),
+                        "reason": (
+                            f"ML 多空预期收益差只有 {edge:.4f}%，优势不明显；"
+                            f"当前置信度 {confidence:.2f} 低于弱边际门槛 {required:.2f}。"
+                        ),
+                    }
+                )
                 return gate
-            gate.update({
-                "status": "passed_high_confidence_weak_profit_edge",
-                "required_confidence": round(required, 4),
-                "reason": "ML 收益差距不明显，但 AI 置信度足够高，仅小心放行。",
-            })
+            gate.update(
+                {
+                    "status": "passed_high_confidence_weak_profit_edge",
+                    "required_confidence": round(required, 4),
+                    "reason": "ML 收益差距不明显，但 AI 置信度足够高，仅小心放行。",
+                }
+            )
             return gate
 
         if win_rate < ML_MIN_SUPPORT_WIN_RATE:
             required = min_confidence + ML_LOW_WIN_CONFIDENCE_BONUS
             if confidence < required:
-                gate.update({
-                    "allow": False,
-                    "status": "blocked_low_ml_win_rate",
-                    "required_confidence": round(required, 4),
-                    "reason": (
-                        f"ML 预期收益为正但该方向胜率仅 {win_rate:.2%}，"
-                        f"当前置信度 {confidence:.2f} 低于低胜率补偿门槛 {required:.2f}。"
-                    ),
-                })
+                gate.update(
+                    {
+                        "allow": False,
+                        "status": "blocked_low_ml_win_rate",
+                        "required_confidence": round(required, 4),
+                        "reason": (
+                            f"ML 预期收益为正但该方向胜率仅 {win_rate:.2%}，"
+                            f"当前置信度 {confidence:.2f} 低于低胜率补偿门槛 {required:.2f}。"
+                        ),
+                    }
+                )
                 return gate
-            gate.update({
-                "status": "passed_high_confidence_low_win_rate",
-                "required_confidence": round(required, 4),
-                "reason": "ML 预期收益为正但胜率偏低，AI 置信度足够高，仅小心放行。",
-            })
+            gate.update(
+                {
+                    "status": "passed_high_confidence_low_win_rate",
+                    "required_confidence": round(required, 4),
+                    "reason": "ML 预期收益为正但胜率偏低，AI 置信度足够高，仅小心放行。",
+                }
+            )
             return gate
 
         if (
@@ -2454,17 +3144,21 @@ class EnsembleCoordinator:
             and win_rate >= ML_STRONG_SUPPORT_WIN_RATE
             and best_side == direction
         ):
-            gate.update({
-                "status": "supported_by_profit_quality",
-                "confidence_bonus": ML_SUPPORT_CONFIDENCE_BONUS,
-                "reason": "ML 盈亏质量与 AI 方向一致，给予小幅确认加成；仍需通过其他风控。",
-            })
+            gate.update(
+                {
+                    "status": "supported_by_profit_quality",
+                    "confidence_bonus": ML_SUPPORT_CONFIDENCE_BONUS,
+                    "reason": "ML 盈亏质量与 AI 方向一致，给予小幅确认加成；仍需通过其他风控。",
+                }
+            )
             return gate
 
         gate["reason"] = "ML 盈亏质量没有否决该方向，但也不足以明显加分。"
         return gate
 
-    def _local_ai_tools_profit_gate(self, direction: str, context: dict[str, Any]) -> dict[str, Any]:
+    def _local_ai_tools_profit_gate(
+        self, direction: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
         tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
         if not isinstance(tools, dict) or not tools.get("enabled"):
             return {"enabled": False, "allow": True, "status": "unavailable"}
@@ -2478,13 +3172,15 @@ class EnsembleCoordinator:
         )
         opposite = "short" if side == "long" else "long"
         opposite_expected = self._safe_float(
-            profit.get(f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
+            ),
             0.0,
         )
         best_side = str(profit.get("best_side") or "")
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
-        profile = profit.get("symbol_side_profile") if isinstance(profit.get("symbol_side_profile"), dict) else {}
-        side_profile = profile.get(side) if isinstance(profile.get(side), dict) else {}
+        profile = self._safe_dict(profit.get("symbol_side_profile"))
+        side_profile = self._safe_dict(profile.get(side))
         loss_pressure = self._safe_float(side_profile.get("loss_pressure"), 0.0)
         result = {
             "enabled": True,
@@ -2499,105 +3195,65 @@ class EnsembleCoordinator:
             "trained": bool(profit.get("trained")),
         }
         if loss_probability >= LOCAL_TOOLS_MAX_LOSS_PROBABILITY:
-            result.update({
-                "allow": False,
-                "status": "blocked_high_loss_probability",
-                "reason": (
-                    f"服务器盈利模型判断{('做多' if side == 'long' else '做空')}亏损概率 "
-                    f"{loss_probability:.1%} 过高，本轮不允许开仓。"
-                ),
-            })
+            result.update(
+                {
+                    "allow": False,
+                    "status": "blocked_high_loss_probability",
+                    "reason": (
+                        f"服务器盈利模型判断{('做多' if side == 'long' else '做空')}亏损概率 "
+                        f"{loss_probability:.1%} 过高，本轮不允许开仓。"
+                    ),
+                }
+            )
             return result
         if expected < 0:
-            result.update({
-                "allow": False,
-                "status": "blocked_server_negative_expectancy",
-                "reason": (
-                    f"服务器盈利模型给出{('做多' if side == 'long' else '做空')}调整后预期收益 "
-                    f"{expected:.4f}% 为负，本轮不允许开仓。"
-                ),
-            })
+            result.update(
+                {
+                    "allow": False,
+                    "status": "blocked_server_negative_expectancy",
+                    "reason": (
+                        f"服务器盈利模型给出{('做多' if side == 'long' else '做空')}调整后预期收益 "
+                        f"{expected:.4f}% 为负，本轮不允许开仓。"
+                    ),
+                }
+            )
             return result
         if best_side in {"long", "short"} and best_side != side and expected <= opposite_expected:
-            result.update({
-                "allow": False,
-                "status": "blocked_server_better_opposite_side",
-                "reason": (
-                    "服务器盈利模型判断相反方向的预期收益更好；"
-                    f"当前方向 {expected:.4f}%，相反方向 {opposite_expected:.4f}%。"
-                ),
-            })
+            result.update(
+                {
+                    "allow": False,
+                    "status": "blocked_server_better_opposite_side",
+                    "reason": (
+                        "服务器盈利模型判断相反方向的预期收益更好；"
+                        f"当前方向 {expected:.4f}%，相反方向 {opposite_expected:.4f}%。"
+                    ),
+                }
+            )
             return result
         if loss_pressure >= 0.70 and expected < ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT:
-            result.update({
-                "allow": False,
-                "status": "blocked_symbol_side_loss_profile",
-                "reason": "该币种/方向历史亏损压力过高，且当前预期收益不足以覆盖风险。",
-            })
+            result.update(
+                {
+                    "allow": False,
+                    "status": "blocked_symbol_side_loss_profile",
+                    "reason": "该币种/方向历史亏损压力过高，且当前预期收益不足以覆盖风险。",
+                }
+            )
         return result
 
-    def _market_regime_entry_block_reason(self, action: Action, context: dict[str, Any]) -> str | None:
+    def _market_regime_entry_block_reason(
+        self, action: Action, context: dict[str, Any]
+    ) -> str | None:
         if action not in (Action.LONG, Action.SHORT):
             return None
         # Market regime is only a soft context signal now. It must not hard-ban
         # either side; otherwise rebound regimes silently turn the whole system
         # into long-only and downtrend regimes into short-only.
         return None
-        strategy = context.get("strategy_mode") if isinstance(context, dict) else {}
-        if isinstance(strategy, dict) and strategy:
-            if strategy.get("direction_filter_policy") == "soft_bias_no_hard_direction_ban":
-                return None
-            if action == Action.LONG and not strategy.get("allow_long", True):
-                return (
-                    f"自动策略状态机当前为 {strategy.get('strategy') or 'unknown'}，"
-                    f"不允许新开多单：{strategy.get('reason') or '策略方向限制'}"
-                )
-            if action == Action.SHORT and not strategy.get("allow_short", True):
-                return (
-                    f"自动策略状态机当前为 {strategy.get('strategy') or 'unknown'}，"
-                    f"不允许新开空单：{strategy.get('reason') or '策略方向限制'}"
-                )
-        regime = context.get("market_regime") if isinstance(context, dict) else {}
-        if not isinstance(regime, dict):
-            return None
-        confidence = self._safe_float(regime.get("confidence"), 0.0)
-        if confidence < 0.45:
-            return None
-        if action == Action.SHORT and regime.get("avoid_short"):
-            return (
-                "市场预判层提示当前更像反弹/上行环境，空单容易被挤压；"
-                f"{regime.get('reason') or '全局方向与做空冲突'}。本轮不做逆环境空单。"
-            )
-        if action == Action.LONG and regime.get("avoid_long"):
-            return (
-                "市场预判层提示当前更像下行/回落环境，多单容易接回撤；"
-                f"{regime.get('reason') or '全局方向与做多冲突'}。本轮不做逆环境多单。"
-            )
-        return None
 
-    def _daily_target_entry_gate(self, context: dict[str, Any]) -> dict[str, Any]:
-        daily = context.get("daily_target") if isinstance(context, dict) else {}
-        if not isinstance(daily, dict):
-            daily = {}
-        if daily.get("enabled") is False:
-            return {
-                "mode": "normal",
-                "score_bonus": 0.0,
-                "min_confidence": MIN_EXECUTABLE_ENTRY_CONFIDENCE,
-                "min_quality_points": 2,
-                "allow_probe": True,
-                "max_position_size": MAX_NORMAL_ENTRY_SIZE,
-                "max_leverage": settings.max_leverage,
-            }
-        target = self._safe_float(daily.get("target_usdt"), 0.0)
-        today_total = self._safe_float(
-            daily.get("today_total_pnl"),
-            self._safe_float(daily.get("today_realized_pnl"), 0.0),
-        )
-        high_water = self._safe_float(daily.get("today_high_water_pnl"), today_total)
-        loss_pause_usdt = self._safe_float(daily.get("loss_pause_usdt"), max(target * 0.05, 50.0))
+    def _entry_execution_gate(self) -> dict[str, Any]:
+        """Return the default entry gate; daily profit targets are not a trading input."""
 
-        gate = {
+        return {
             "mode": "normal",
             "score_bonus": 0.0,
             "min_confidence": MIN_EXECUTABLE_ENTRY_CONFIDENCE,
@@ -2606,53 +3262,6 @@ class EnsembleCoordinator:
             "max_position_size": MAX_NORMAL_ENTRY_SIZE,
             "max_leverage": settings.max_leverage,
         }
-        if target <= 0:
-            return gate
-        strategy = context.get("strategy_mode") if isinstance(context, dict) else {}
-        strategy_name = str(strategy.get("strategy") or "") if isinstance(strategy, dict) else ""
-
-        loss_line = -max(loss_pause_usdt, 0.0)
-        if today_total <= loss_line:
-            gate.update({
-                "mode": "loss_recovery_selective",
-                "score_bonus": DAILY_RECOVERY_ENTRY_SCORE_BONUS + 0.05,
-                "min_confidence": 0.78,
-                "min_quality_points": 3,
-                "allow_probe": False,
-                "max_position_size": PROFIT_FIRST_PROBE_SIZE,
-                "max_leverage": DAILY_RECOVERY_MAX_LEVERAGE,
-            })
-        elif today_total < 0:
-            gate.update({
-                "mode": "recovery_attack" if strategy_name == "recovery_attack" else "recovery",
-                "score_bonus": 0.02 if strategy_name == "recovery_attack" else DAILY_RECOVERY_ENTRY_SCORE_BONUS,
-                "min_confidence": 0.64 if strategy_name == "recovery_attack" else DAILY_RECOVERY_MIN_ENTRY_CONFIDENCE,
-                "min_quality_points": 2 if strategy_name == "recovery_attack" else 3,
-                "allow_probe": strategy_name == "recovery_attack",
-                "max_position_size": 0.055 if strategy_name == "recovery_attack" else DAILY_RECOVERY_MAX_ENTRY_SIZE,
-                "max_leverage": DAILY_RECOVERY_MAX_LEVERAGE,
-            })
-        elif high_water >= target:
-            gate.update({
-                "mode": "profit_protected_expand",
-                "score_bonus": 0.02,
-                "min_confidence": 0.64,
-                "min_quality_points": 2,
-                "allow_probe": True,
-                "max_position_size": 0.06,
-                "max_leverage": DAILY_TARGET_PROTECTED_MAX_LEVERAGE,
-            })
-        elif today_total >= target * 0.70:
-            gate.update({
-                "mode": "near_target",
-                "score_bonus": 0.04,
-                "min_confidence": 0.68,
-                "min_quality_points": 3,
-                "allow_probe": False,
-                "max_position_size": 0.07,
-                "max_leverage": 8.0,
-            })
-        return gate
 
     def _local_profit_aligned(self, context: dict[str, Any] | None, side: str) -> bool:
         side = str(side or "").lower()
@@ -2668,7 +3277,11 @@ class EnsembleCoordinator:
         )
         best_side = str(profit.get("best_side") or "").lower()
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.50)
-        return expected > 0 and best_side in {"", side} and loss_probability < LOCAL_TOOLS_MAX_LOSS_PROBABILITY
+        return (
+            expected > 0
+            and best_side in {"", side}
+            and loss_probability < LOCAL_TOOLS_MAX_LOSS_PROBABILITY
+        )
 
     def _time_series_aligned(self, context: dict[str, Any] | None, side: str) -> bool:
         side = str(side or "").lower()
@@ -2701,7 +3314,7 @@ class EnsembleCoordinator:
         disagreement: float,
         ml_gate: dict[str, Any],
         ml_profit_hint: dict[str, Any],
-        daily_entry_gate: dict[str, Any],
+        entry_gate: dict[str, Any],
         probe_entry: bool,
         profit_first_probe: bool,
         recovery_probe_entry: bool,
@@ -2711,8 +3324,11 @@ class EnsembleCoordinator:
         action_side = str(action_side or "").lower()
         if action_side not in {"long", "short"}:
             return {"allow": False, "reason": "方向无效，不能扩仓。"}
-        if probe_entry or profit_first_probe or recovery_probe_entry or (
-            isinstance(quant_validation_probe, dict) and quant_validation_probe.get("allow")
+        if (
+            probe_entry
+            or profit_first_probe
+            or recovery_probe_entry
+            or (isinstance(quant_validation_probe, dict) and quant_validation_probe.get("allow"))
         ):
             return {"allow": False, "reason": "试单/量化验证单只允许小仓，不做扩仓。"}
         if not isinstance(ml_gate, dict):
@@ -2721,10 +3337,14 @@ class EnsembleCoordinator:
             return {"allow": False, "reason": "ML 盈利质量门禁未通过，不做扩仓。"}
 
         ml_supported = ml_gate.get("status") == "supported_by_profit_quality"
-        ml_hint_aligned = bool(ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side)
+        ml_hint_aligned = bool(
+            ml_profit_hint.get("strong") and ml_profit_hint.get("side") == action_side
+        )
         local_aligned = self._local_profit_aligned(context, action_side)
         timeseries_aligned = self._time_series_aligned(context, action_side)
-        evidence_count = sum(bool(v) for v in (ml_supported or ml_hint_aligned, local_aligned, timeseries_aligned))
+        evidence_count = sum(
+            bool(v) for v in (ml_supported or ml_hint_aligned, local_aligned, timeseries_aligned)
+        )
 
         if confidence < 0.76:
             return {"allow": False, "reason": f"AI 置信度 {confidence:.0%} 不足以放大仓位。"}
@@ -2735,21 +3355,21 @@ class EnsembleCoordinator:
         if evidence_count <= 0:
             return {"allow": False, "reason": "ML、服务器盈利模型、时序模型没有同向盈利证据。"}
 
-        daily_mode = str(daily_entry_gate.get("mode") or "normal")
+        entry_mode = str(entry_gate.get("mode") or "normal")
         max_size = PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE
-        if daily_mode == "loss_recovery_selective":
+        if entry_mode == "loss_recovery_selective":
             max_size = PROFIT_QUALITY_EXPAND_SELECTIVE_MAX_SIZE
-        elif daily_mode in {"recovery", "recovery_attack"}:
+        elif entry_mode in {"recovery", "recovery_attack"}:
             max_size = PROFIT_QUALITY_EXPAND_RECOVERY_MAX_SIZE
-        elif daily_mode in {"near_target", "profit_protected_expand"}:
+        elif entry_mode in {"near_target", "profit_protected_expand"}:
             max_size = min(PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE, 0.080)
-        if evidence_count >= 2 and daily_mode not in {"loss_recovery_selective"}:
+        if evidence_count >= 2 and entry_mode not in {"loss_recovery_selective"}:
             max_size = min(max_size + 0.010, PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE)
 
         return {
             "allow": True,
             "side": action_side,
-            "daily_mode": daily_mode,
+            "entry_gate_mode": entry_mode,
             "min_position_size": PROFIT_QUALITY_EXPAND_MIN_ENTRY_SIZE,
             "max_position_size": max_size,
             "confidence": round(confidence, 4),
@@ -2791,25 +3411,28 @@ class EnsembleCoordinator:
             return False
         if validation_adjustment < -0.05:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
             return False
 
         same_direction = [
-            (name, d) for name, d in decisions.items()
-            if isinstance(d, DecisionOutput)
-            and d.action == action
-            and d.confidence >= 0.55
+            (name, d)
+            for name, d in decisions.items()
+            if isinstance(d, DecisionOutput) and d.action == action and d.confidence >= 0.55
         ]
         directional_support = [
-            (name, d) for name, d in same_direction
-            if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
+            (name, d) for name, d in same_direction if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
         ]
         technical_support = [
-            (name, d) for name, d in same_direction
+            (name, d)
+            for name, d in same_direction
             if name in ENTRY_DIRECTION_SUPPORT_EXPERTS and d.confidence >= 0.55
         ]
         aligned_validations = sum(
-            1 for v in cross_validations
+            1
+            for v in cross_validations
             if isinstance(v, dict) and v.get("consistency") == "aligned"
         )
         ml_hint = self._ml_profit_first_direction_hint(context or {})
@@ -2842,16 +3465,6 @@ class EnsembleCoordinator:
             and len(technical_support) >= 2
         ):
             return True
-        if (
-            validation_adjustment >= 0.20
-            and aligned_validations >= 2
-            and len(technical_support) >= 1
-            and any(
-                name == "risk_expert" and d.confidence >= 0.55
-                for name, d in same_direction
-            )
-        ):
-            return True
         strategy = context.get("strategy_mode") if isinstance(context, dict) else {}
         if (
             isinstance(strategy, dict)
@@ -2873,7 +3486,7 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]],
         validation_adjustment: float,
         disagreement: float,
-        features: "FeatureVector",
+        features: FeatureVector,
     ) -> bool:
         if not isinstance(ml_hint, dict) or not ml_hint.get("strong"):
             return False
@@ -2885,13 +3498,17 @@ class EnsembleCoordinator:
         action = Action.LONG if side == "long" else Action.SHORT
         if validation_adjustment < -0.05 or disagreement >= 0.65:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
             return False
         if self._entry_quality_points(features, action) < 2:
             return False
 
         same_technical = [
-            d for name, d in decisions.items()
+            d
+            for name, d in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(d, DecisionOutput)
@@ -2904,7 +3521,8 @@ class EnsembleCoordinator:
 
         opposite = Action.SHORT if action == Action.LONG else Action.LONG
         strong_opposite_technical = [
-            d for name, d in decisions.items()
+            d
+            for name, d in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(d, DecisionOutput)
@@ -2922,7 +3540,7 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]],
         validation_adjustment: float,
         disagreement: float,
-        features: "FeatureVector",
+        features: FeatureVector,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "enabled": True,
@@ -2931,32 +3549,43 @@ class EnsembleCoordinator:
             "reason": "本轮本地量化证据不足，继续观望。",
         }
         if validation_adjustment < -0.08:
-            result.update({
-                "status": "blocked_negative_cross_validation",
-                "validation_adjustment": round(validation_adjustment, 4),
-                "reason": "交叉验证明显偏负，不使用量化验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_negative_cross_validation",
+                    "validation_adjustment": round(validation_adjustment, 4),
+                    "reason": "交叉验证明显偏负，不使用量化验证单。",
+                }
+            )
             return result
         if disagreement >= 0.72:
-            result.update({
-                "status": "blocked_high_disagreement",
-                "disagreement": round(disagreement, 4),
-                "reason": "专家分歧过高，不使用量化验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_high_disagreement",
+                    "disagreement": round(disagreement, 4),
+                    "reason": "专家分歧过高，不使用量化验证单。",
+                }
+            )
             return result
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
-            result.update({
-                "status": "blocked_major_conflict",
-                "reason": "交叉验证存在重大冲突，不使用量化验证单。",
-            })
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
+            result.update(
+                {
+                    "status": "blocked_major_conflict",
+                    "reason": "交叉验证存在重大冲突，不使用量化验证单。",
+                }
+            )
             return result
 
         if not isinstance(ml_hint, dict) or not ml_hint.get("strong"):
-            result.update({
-                "status": "blocked_ml_not_strong",
-                "ml_hint": ml_hint if isinstance(ml_hint, dict) else {},
-                "reason": "ML 盈亏期望不够强，不让服务器模型单独发起验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_ml_not_strong",
+                    "ml_hint": ml_hint if isinstance(ml_hint, dict) else {},
+                    "reason": "ML 盈亏期望不够强，不让服务器模型单独发起验证单。",
+                }
+            )
             return result
         side = str(ml_hint.get("side") or "").lower()
         if side not in {"long", "short"}:
@@ -2964,7 +3593,8 @@ class EnsembleCoordinator:
             return result
         action = Action.LONG if side == "long" else Action.SHORT
         same_technical_support = [
-            name for name, decision in decisions.items()
+            name
+            for name, decision in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(decision, DecisionOutput)
@@ -2973,19 +3603,23 @@ class EnsembleCoordinator:
             )
         ]
         if not same_technical_support:
-            result.update({
-                "status": "blocked_no_expert_support",
-                "reason": "量化模型不能单独发起开仓；本轮没有行情方向/短线时序专家同向强支持。",
-            })
+            result.update(
+                {
+                    "status": "blocked_no_expert_support",
+                    "reason": "量化模型不能单独发起开仓；本轮没有行情方向/短线时序专家同向强支持。",
+                }
+            )
             return result
 
         tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
         profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
         if not isinstance(profit, dict) or profit.get("available", True) is False:
-            result.update({
-                "status": "blocked_no_local_profit_prediction",
-                "reason": "服务器盈利预测不可用，不发起量化验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_no_local_profit_prediction",
+                    "reason": "服务器盈利预测不可用，不发起量化验证单。",
+                }
+            )
             return result
         opposite = "short" if side == "long" else "long"
         local_expected = self._safe_float(
@@ -2993,64 +3627,79 @@ class EnsembleCoordinator:
             0.0,
         )
         opposite_expected = self._safe_float(
-            profit.get(f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
+            ),
             0.0,
         )
         best_side = str(profit.get("best_side") or "").lower()
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
         profit_quality_score = self._safe_float(profit.get("profit_quality_score"), 0.0)
-        result.update({
-            "side": side,
-            "action": action.value,
-            "ml_expected_return_pct": ml_hint.get("expected_return_pct"),
-            "ml_profit_edge_pct": ml_hint.get("profit_edge_pct"),
-            "local_expected_return_pct": round(local_expected, 4),
-            "local_opposite_expected_return_pct": round(opposite_expected, 4),
-            "local_profit_quality_score": round(profit_quality_score, 4),
-            "loss_probability": round(loss_probability, 4),
-            "best_side": best_side or side,
-            "quality_points": self._entry_quality_points(features, action),
-        })
+        result.update(
+            {
+                "side": side,
+                "action": action.value,
+                "ml_expected_return_pct": ml_hint.get("expected_return_pct"),
+                "ml_profit_edge_pct": ml_hint.get("profit_edge_pct"),
+                "local_expected_return_pct": round(local_expected, 4),
+                "local_opposite_expected_return_pct": round(opposite_expected, 4),
+                "local_profit_quality_score": round(profit_quality_score, 4),
+                "loss_probability": round(loss_probability, 4),
+                "best_side": best_side or side,
+                "quality_points": self._entry_quality_points(features, action),
+            }
+        )
         if best_side in {"long", "short"} and best_side != side:
-            result.update({
-                "status": "blocked_local_direction_conflict",
-                "reason": (
-                    "ML 与服务器盈利模型方向不一致，"
-                    f"ML={side}，服务器盈利模型={best_side}，本轮不验证。"
-                ),
-            })
+            result.update(
+                {
+                    "status": "blocked_local_direction_conflict",
+                    "reason": (
+                        "ML 与服务器盈利模型方向不一致，"
+                        f"ML={side}，服务器盈利模型={best_side}，本轮不验证。"
+                    ),
+                }
+            )
             return result
         if local_expected < QUANT_VALIDATION_MIN_LOCAL_EXPECTED_RETURN_PCT:
-            result.update({
-                "status": "blocked_low_local_expected_return",
-                "reason": (
-                    f"服务器盈利模型该方向预期收益 {local_expected:.4f}% 偏低，"
-                    "不足以覆盖手续费/滑点验证成本。"
-                ),
-            })
+            result.update(
+                {
+                    "status": "blocked_low_local_expected_return",
+                    "reason": (
+                        f"服务器盈利模型该方向预期收益 {local_expected:.4f}% 偏低，"
+                        "不足以覆盖手续费/滑点验证成本。"
+                    ),
+                }
+            )
             return result
         if local_expected < opposite_expected:
-            result.update({
-                "status": "blocked_local_better_opposite",
-                "reason": "服务器盈利模型判断相反方向预期收益更高，本轮不验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_local_better_opposite",
+                    "reason": "服务器盈利模型判断相反方向预期收益更高，本轮不验证。",
+                }
+            )
             return result
         if loss_probability >= QUANT_VALIDATION_MAX_LOSS_PROBABILITY:
-            result.update({
-                "status": "blocked_high_loss_probability",
-                "reason": f"服务器盈利模型亏损概率 {loss_probability:.1%} 偏高，本轮不验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_high_loss_probability",
+                    "reason": f"服务器盈利模型亏损概率 {loss_probability:.1%} 偏高，本轮不验证。",
+                }
+            )
             return result
         if profit_quality_score < QUANT_VALIDATION_MIN_PROFIT_QUALITY_SCORE:
-            result.update({
-                "status": "blocked_low_profit_quality",
-                "reason": f"盈利质量分 {profit_quality_score:.4f} 偏低，本轮不验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_low_profit_quality",
+                    "reason": f"盈利质量分 {profit_quality_score:.4f} 偏低，本轮不验证。",
+                }
+            )
             return result
 
         opposite_action = Action.SHORT if action == Action.LONG else Action.LONG
         strong_opposite_technical = [
-            name for name, d in decisions.items()
+            name
+            for name, d in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(d, DecisionOutput)
@@ -3059,37 +3708,44 @@ class EnsembleCoordinator:
             )
         ]
         if strong_opposite_technical:
-            result.update({
-                "status": "blocked_strong_opposite_technical",
-                "opposite_experts": strong_opposite_technical,
-                "reason": "行情方向/短线时序专家存在强反向信号，不使用量化验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_strong_opposite_technical",
+                    "opposite_experts": strong_opposite_technical,
+                    "reason": "行情方向/短线时序专家存在强反向信号，不使用量化验证单。",
+                }
+            )
             return result
 
         risk_opinion = next(
             (
-                d for name, d in decisions.items()
+                d
+                for name, d in decisions.items()
                 if name == "risk_expert" and isinstance(d, DecisionOutput)
             ),
             None,
         )
         if risk_opinion is not None and self._is_hard_risk_veto(risk_opinion, features):
-            result.update({
-                "status": "blocked_hard_risk_veto",
-                "reason": "风控专家给出硬否决，不使用量化验证单。",
-            })
+            result.update(
+                {
+                    "status": "blocked_hard_risk_veto",
+                    "reason": "风控专家给出硬否决，不使用量化验证单。",
+                }
+            )
             return result
 
-        result.update({
-            "allow": True,
-            "status": "allowed",
-            "max_position_size": QUANT_VALIDATION_PROBE_SIZE,
-            "confidence_floor": QUANT_VALIDATION_PROBE_CONFIDENCE,
-            "reason": (
-                "普通专家投票仍偏观望，但 ML 与服务器盈利模型方向一致、预期收益为正、"
-                "亏损概率可接受，且无强反向技术专家/硬风控；允许小仓验证以产生可学习的真实结果。"
-            ),
-        })
+        result.update(
+            {
+                "allow": True,
+                "status": "allowed",
+                "max_position_size": QUANT_VALIDATION_PROBE_SIZE,
+                "confidence_floor": QUANT_VALIDATION_PROBE_CONFIDENCE,
+                "reason": (
+                    "普通专家投票仍偏观望，但 ML 与服务器盈利模型方向一致、预期收益为正、"
+                    "亏损概率可接受，且无强反向技术专家/硬风控；允许小仓验证以产生可学习的真实结果。"
+                ),
+            }
+        )
         return result
 
     def _quant_reversal_probe_evidence(
@@ -3102,33 +3758,43 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]],
         validation_adjustment: float,
         disagreement: float,
-        features: "FeatureVector",
+        features: FeatureVector,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "enabled": True,
             "allow": False,
             "status": "not_qualified",
-            "blocked_action": blocked_action.value if isinstance(blocked_action, Action) else str(blocked_action),
+            "blocked_action": (
+                blocked_action.value if isinstance(blocked_action, Action) else str(blocked_action)
+            ),
             "reason": "AI 方向被盈利模型否决，但反向量化证据不足，继续观望。",
         }
         if blocked_action not in (Action.LONG, Action.SHORT):
             return result
         if validation_adjustment < -0.08 or disagreement >= 0.72:
-            result.update({
-                "status": "blocked_validation_or_disagreement",
-                "validation_adjustment": round(validation_adjustment, 4),
-                "disagreement": round(disagreement, 4),
-                "reason": "交叉验证或专家分歧不适合反向验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_validation_or_disagreement",
+                    "validation_adjustment": round(validation_adjustment, 4),
+                    "disagreement": round(disagreement, 4),
+                    "reason": "交叉验证或专家分歧不适合反向验证。",
+                }
+            )
             return result
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
-            result.update({"status": "blocked_major_conflict", "reason": "存在重大冲突，不做反向验证。"})
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
+            result.update(
+                {"status": "blocked_major_conflict", "reason": "存在重大冲突，不做反向验证。"}
+            )
             return result
 
         reverse_side = "short" if blocked_action == Action.LONG else "long"
         reverse_action = Action.SHORT if reverse_side == "short" else Action.LONG
         same_technical_support = [
-            name for name, decision in decisions.items()
+            name
+            for name, decision in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(decision, DecisionOutput)
@@ -3137,19 +3803,27 @@ class EnsembleCoordinator:
             )
         ]
         if not same_technical_support:
-            result.update({
-                "status": "blocked_no_expert_support",
-                "reverse_side": reverse_side,
-                "reason": "量化模型不能单独反向开仓；本轮没有行情方向/短线时序专家同向强支持。",
-            })
+            result.update(
+                {
+                    "status": "blocked_no_expert_support",
+                    "reverse_side": reverse_side,
+                    "reason": "量化模型不能单独反向开仓；本轮没有行情方向/短线时序专家同向强支持。",
+                }
+            )
             return result
-        if not isinstance(ml_hint, dict) or ml_hint.get("side") != reverse_side or not ml_hint.get("strong"):
-            result.update({
-                "status": "blocked_ml_not_reverse_strong",
-                "ml_hint": ml_hint if isinstance(ml_hint, dict) else {},
-                "reverse_side": reverse_side,
-                "reason": "ML 没有明确支持被否决方向的反向，不做反向验证。",
-            })
+        if (
+            not isinstance(ml_hint, dict)
+            or ml_hint.get("side") != reverse_side
+            or not ml_hint.get("strong")
+        ):
+            result.update(
+                {
+                    "status": "blocked_ml_not_reverse_strong",
+                    "ml_hint": ml_hint if isinstance(ml_hint, dict) else {},
+                    "reverse_side": reverse_side,
+                    "reason": "ML 没有明确支持被否决方向的反向，不做反向验证。",
+                }
+            )
             return result
 
         local_gate = ml_gate.get("local_ai_tools_gate") if isinstance(ml_gate, dict) else {}
@@ -3158,60 +3832,87 @@ class EnsembleCoordinator:
         tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
         profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
         if not isinstance(profit, dict) or profit.get("available", True) is False:
-            result.update({"status": "blocked_no_local_profit_prediction", "reason": "服务器盈利预测不可用。"})
+            result.update(
+                {"status": "blocked_no_local_profit_prediction", "reason": "服务器盈利预测不可用。"}
+            )
             return result
 
         expected = self._safe_float(
-            profit.get(f"adjusted_{reverse_side}_return_pct", profit.get(f"{reverse_side}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{reverse_side}_return_pct",
+                profit.get(f"{reverse_side}_expected_return_pct"),
+            ),
             0.0,
         )
         blocked_side = "long" if blocked_action == Action.LONG else "short"
         blocked_expected = self._safe_float(
-            profit.get(f"adjusted_{blocked_side}_return_pct", profit.get(f"{blocked_side}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{blocked_side}_return_pct",
+                profit.get(f"{blocked_side}_expected_return_pct"),
+            ),
             0.0,
         )
         best_side = str(profit.get("best_side") or local_gate.get("best_side") or "").lower()
         loss_probability = self._safe_float(profit.get(f"{reverse_side}_loss_probability"), 0.0)
         profit_quality_score = self._safe_float(profit.get("profit_quality_score"), 0.0)
-        result.update({
-            "side": reverse_side,
-            "action": reverse_action.value,
-            "blocked_side": blocked_side,
-            "blocked_expected_return_pct": round(blocked_expected, 4),
-            "local_expected_return_pct": round(expected, 4),
-            "local_profit_quality_score": round(profit_quality_score, 4),
-            "loss_probability": round(loss_probability, 4),
-            "best_side": best_side or reverse_side,
-            "ml_expected_return_pct": ml_hint.get("expected_return_pct"),
-            "ml_profit_edge_pct": ml_hint.get("profit_edge_pct"),
-        })
+        result.update(
+            {
+                "side": reverse_side,
+                "action": reverse_action.value,
+                "blocked_side": blocked_side,
+                "blocked_expected_return_pct": round(blocked_expected, 4),
+                "local_expected_return_pct": round(expected, 4),
+                "local_profit_quality_score": round(profit_quality_score, 4),
+                "loss_probability": round(loss_probability, 4),
+                "best_side": best_side or reverse_side,
+                "ml_expected_return_pct": ml_hint.get("expected_return_pct"),
+                "ml_profit_edge_pct": ml_hint.get("profit_edge_pct"),
+            }
+        )
         if best_side in {"long", "short"} and best_side != reverse_side:
-            result.update({"status": "blocked_local_not_reverse", "reason": "服务器盈利模型最佳方向不是反向验证方向。"})
+            result.update(
+                {
+                    "status": "blocked_local_not_reverse",
+                    "reason": "服务器盈利模型最佳方向不是反向验证方向。",
+                }
+            )
             return result
         if expected < QUANT_VALIDATION_MIN_LOCAL_EXPECTED_RETURN_PCT:
-            result.update({
-                "status": "blocked_low_local_expected_return",
-                "reason": f"反向预期收益 {expected:.4f}% 偏低，不值得验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_low_local_expected_return",
+                    "reason": f"反向预期收益 {expected:.4f}% 偏低，不值得验证。",
+                }
+            )
             return result
         if expected <= blocked_expected:
-            result.update({"status": "blocked_reverse_not_better", "reason": "反向预期收益没有明显优于原方向。"})
+            result.update(
+                {
+                    "status": "blocked_reverse_not_better",
+                    "reason": "反向预期收益没有明显优于原方向。",
+                }
+            )
             return result
         if loss_probability >= QUANT_VALIDATION_MAX_LOSS_PROBABILITY:
-            result.update({
-                "status": "blocked_high_loss_probability",
-                "reason": f"反向亏损概率 {loss_probability:.1%} 偏高，不验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_high_loss_probability",
+                    "reason": f"反向亏损概率 {loss_probability:.1%} 偏高，不验证。",
+                }
+            )
             return result
         if profit_quality_score < QUANT_VALIDATION_MIN_PROFIT_QUALITY_SCORE:
-            result.update({
-                "status": "blocked_low_profit_quality",
-                "reason": f"盈利质量分 {profit_quality_score:.4f} 偏低，不验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_low_profit_quality",
+                    "reason": f"盈利质量分 {profit_quality_score:.4f} 偏低，不验证。",
+                }
+            )
             return result
 
         strong_original_technical = [
-            name for name, d in decisions.items()
+            name
+            for name, d in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(d, DecisionOutput)
@@ -3220,16 +3921,19 @@ class EnsembleCoordinator:
             )
         ]
         if strong_original_technical:
-            result.update({
-                "status": "blocked_very_strong_original_technical",
-                "opposite_experts": strong_original_technical,
-                "reason": "行情方向/短线时序专家原方向置信度极高，不直接反向验证。",
-            })
+            result.update(
+                {
+                    "status": "blocked_very_strong_original_technical",
+                    "opposite_experts": strong_original_technical,
+                    "reason": "行情方向/短线时序专家原方向置信度极高，不直接反向验证。",
+                }
+            )
             return result
 
         risk_opinion = next(
             (
-                d for name, d in decisions.items()
+                d
+                for name, d in decisions.items()
                 if name == "risk_expert" and isinstance(d, DecisionOutput)
             ),
             None,
@@ -3238,16 +3942,18 @@ class EnsembleCoordinator:
             result.update({"status": "blocked_hard_risk_veto", "reason": "风控专家给出硬否决。"})
             return result
 
-        result.update({
-            "allow": True,
-            "status": "allowed",
-            "max_position_size": QUANT_VALIDATION_PROBE_SIZE,
-            "confidence_floor": QUANT_VALIDATION_PROBE_CONFIDENCE,
-            "reason": (
-                "AI 原方向被 ML/服务器盈利模型否决，且二者一致支持相反方向；"
-                "允许小仓反向验证，用真实结果检验量化模型是否优于专家方向。"
-            ),
-        })
+        result.update(
+            {
+                "allow": True,
+                "status": "allowed",
+                "max_position_size": QUANT_VALIDATION_PROBE_SIZE,
+                "confidence_floor": QUANT_VALIDATION_PROBE_CONFIDENCE,
+                "reason": (
+                    "AI 原方向被 ML/服务器盈利模型否决，且二者一致支持相反方向；"
+                    "允许小仓反向验证，用真实结果检验量化模型是否优于专家方向。"
+                ),
+            }
+        )
         return result
 
     def _probe_entry_allowed(
@@ -3256,17 +3962,21 @@ class EnsembleCoordinator:
         decisions: dict[str, DecisionOutput],
         cross_validations: list[dict[str, Any]],
         validation_adjustment: float,
-        features: "FeatureVector",
+        features: FeatureVector,
     ) -> bool:
         if validation_adjustment < -0.05:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
             return False
         if self._entry_quality_points(features, action) < 2:
             return False
 
         same_direction = [
-            (name, d) for name, d in decisions.items()
+            (name, d)
+            for name, d in decisions.items()
             if (
                 isinstance(d, DecisionOutput)
                 and d.action == action
@@ -3275,17 +3985,16 @@ class EnsembleCoordinator:
             )
         ]
         technical_names = ENTRY_DIRECTION_SUPPORT_EXPERTS
-        technical_same = [
-            (name, d) for name, d in same_direction
-            if name in technical_names
-        ]
+        technical_same = [(name, d) for name, d in same_direction if name in technical_names]
         if len(technical_same) >= 2:
             return True
         if validation_adjustment >= 0.05 and any(
             name in technical_names and d.confidence >= 0.60 for name, d in same_direction
         ):
             return True
-        return len(same_direction) >= 2 and any(name in technical_names for name, _d in same_direction)
+        return len(same_direction) >= 2 and any(
+            name in technical_names for name, _d in same_direction
+        )
 
     def _recovery_attack_probe_allowed(
         self,
@@ -3294,7 +4003,7 @@ class EnsembleCoordinator:
         validation_adjustment: float,
         disagreement: float,
         context: dict[str, Any] | None,
-        features: "FeatureVector",
+        features: FeatureVector,
         decision_score: float,
     ) -> bool:
         strategy = context.get("strategy_mode") if isinstance(context, dict) else {}
@@ -3302,13 +4011,17 @@ class EnsembleCoordinator:
             return False
         if abs(decision_score) < 0.34 or disagreement >= 0.55 or validation_adjustment < -0.05:
             return False
-        if any(v.get("major_conflict") or v.get("consistency") == "divergent" for v in cross_validations):
+        if any(
+            v.get("major_conflict") or v.get("consistency") == "divergent"
+            for v in cross_validations
+        ):
             return False
         action = Action.LONG if decision_score >= 0 else Action.SHORT
         if self._entry_quality_points(features, action) < 1:
             return False
         technical_same = [
-            d for name, d in decisions.items()
+            d
+            for name, d in decisions.items()
             if (
                 name in ENTRY_DIRECTION_SUPPORT_EXPERTS
                 and isinstance(d, DecisionOutput)
@@ -3318,20 +4031,21 @@ class EnsembleCoordinator:
         ]
         risk_opinion = next(
             (
-                d for name, d in decisions.items()
+                d
+                for name, d in decisions.items()
                 if name == "risk_expert" and isinstance(d, DecisionOutput)
             ),
             None,
         )
         risk_cleared = True
         if risk_opinion is not None:
-            risk_cleared = (
-                risk_opinion.action in {action, Action.HOLD}
-                and not self._is_hard_risk_veto(risk_opinion, features)
-            )
+            risk_cleared = risk_opinion.action in {
+                action,
+                Action.HOLD,
+            } and not self._is_hard_risk_veto(risk_opinion, features)
         return bool(technical_same and risk_cleared)
 
-    def _entry_quality_points(self, features: "FeatureVector", action: Action) -> int:
+    def _entry_quality_points(self, features: FeatureVector, action: Action) -> int:
         """Score entry quality by liquidity, trend strength, and direction alignment."""
         volume_ratio = self._safe_float(getattr(features, "volume_ratio", 0.0), 0.0)
         adx_14 = self._safe_float(getattr(features, "adx_14", 0.0), 0.0)
@@ -3371,13 +4085,19 @@ class EnsembleCoordinator:
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
+            if value is None:
+                return default
             return float(value)
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _safe_dict(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
     def _close_decision_if_needed(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         current_side: str | None,
         exit_votes: list[DecisionOutput],
         risk_vetoes: list[DecisionOutput],
@@ -3412,31 +4132,35 @@ class EnsembleCoordinator:
         if review_positions:
             should_close = bool(evidence.get("should_close"))
         else:
-            opposite_pressure = (
-                current_side == "long" and score <= -0.25
-            ) or (
+            opposite_pressure = (current_side == "long" and score <= -0.25) or (
                 current_side == "short" and score >= 0.25
             )
             should_close = bool(matching_exit_votes) or bool(risk_vetoes) or opposite_pressure
-            evidence.update({
-                "should_close": should_close,
-                "action_plan": "full_close" if should_close else "hold",
-                "position_size_pct": 1.0 if should_close else 0.0,
-            })
+            evidence.update(
+                {
+                    "should_close": should_close,
+                    "action_plan": "full_close" if should_close else "hold",
+                    "position_size_pct": 1.0 if should_close else 0.0,
+                }
+            )
         if not should_close:
             return None
 
         confidence_candidates = [d.confidence for d in matching_exit_votes + risk_vetoes]
         evidence_confidence = float(
-            evidence.get("suggested_confidence")
-            or evidence.get("max_support_confidence")
-            or 0.0
+            evidence.get("suggested_confidence") or evidence.get("max_support_confidence") or 0.0
         )
         if evidence_confidence > 0:
             confidence_candidates.append(evidence_confidence)
         confidence_candidates.append(min(abs(score) + 0.45, 0.85))
         confidence = max(confidence_candidates)
-        confidence = min(max(confidence + self._validation_adjustment(cross_validations or [], consultation), 0.55), 0.95)
+        confidence = min(
+            max(
+                confidence + self._validation_adjustment(cross_validations or [], consultation),
+                0.55,
+            ),
+            0.95,
+        )
         position_size_pct = float(evidence.get("position_size_pct") or 1.0)
         action_plan = str(evidence.get("action_plan") or "full_close")
         plan_label = "全平" if action_plan == "full_close" else "减仓"
@@ -3477,7 +4201,7 @@ class EnsembleCoordinator:
 
     def _add_decision_if_needed(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         current_side: str | None,
         score: float,
         disagreement: float,
@@ -3554,24 +4278,25 @@ class EnsembleCoordinator:
             confidence = self._safe_float(opinion.get("confidence"), 0.0)
             if action != add_value or confidence < ADD_POSITION_MIN_CONFIDENCE:
                 continue
-            support.append({
-                "model_name": opinion.get("model_name"),
-                "label": opinion.get("label") or opinion.get("model_name"),
-                "action": action,
-                "confidence": round(confidence, 4),
-                "position_size_pct": self._safe_float(opinion.get("position_size_pct"), 0.0),
-                "suggested_leverage": self._safe_float(opinion.get("suggested_leverage"), 1.0),
-                "stop_loss_pct": self._safe_float(opinion.get("stop_loss_pct"), 0.035),
-                "take_profit_pct": self._safe_float(opinion.get("take_profit_pct"), 0.08),
-            })
+            support.append(
+                {
+                    "model_name": opinion.get("model_name"),
+                    "label": opinion.get("label") or opinion.get("model_name"),
+                    "action": action,
+                    "confidence": round(confidence, 4),
+                    "position_size_pct": self._safe_float(opinion.get("position_size_pct"), 0.0),
+                    "suggested_leverage": self._safe_float(opinion.get("suggested_leverage"), 1.0),
+                    "stop_loss_pct": self._safe_float(opinion.get("stop_loss_pct"), 0.035),
+                    "take_profit_pct": self._safe_float(opinion.get("take_profit_pct"), 0.08),
+                }
+            )
 
         strong_support = [
-            item for item in support
+            item
+            for item in support
             if self._safe_float(item.get("confidence"), 0.0) >= ADD_POSITION_STRONG_CONFIDENCE
         ]
-        aligned_score = (
-            current_side == "long" and score >= ADD_POSITION_SCORE_THRESHOLD
-        ) or (
+        aligned_score = (current_side == "long" and score >= ADD_POSITION_SCORE_THRESHOLD) or (
             current_side == "short" and score <= -ADD_POSITION_SCORE_THRESHOLD
         )
         continuation_score = score if current_side == "long" else -score
@@ -3594,20 +4319,31 @@ class EnsembleCoordinator:
             if entry_price > 0 and current_price > 0:
                 if current_side == "long":
                     adverse_move = max(entry_price - current_price, 0.0)
-                    planned_risk = max(entry_price - stop_loss, entry_price * 0.02) if stop_loss > 0 else entry_price * 0.05
+                    planned_risk = (
+                        max(entry_price - stop_loss, entry_price * 0.02)
+                        if stop_loss > 0
+                        else entry_price * 0.05
+                    )
                 else:
                     adverse_move = max(current_price - entry_price, 0.0)
-                    planned_risk = max(stop_loss - entry_price, entry_price * 0.02) if stop_loss > 0 else entry_price * 0.05
+                    planned_risk = (
+                        max(stop_loss - entry_price, entry_price * 0.02)
+                        if stop_loss > 0
+                        else entry_price * 0.05
+                    )
                 position_loss = adverse_move > 0 or position_unrealized_pnl < 0
                 if planned_risk > 0:
                     position_risk_usage = min(max(adverse_move / planned_risk, 0.0), 2.0)
 
         technical_support = [
-            item for item in support
+            item
+            for item in support
             if str(item.get("model_name") or "") in ENTRY_DIRECTION_SUPPORT_EXPERTS
         ]
         enough_support = len(support) >= ADD_POSITION_MIN_SUPPORT and bool(strong_support)
-        profit_ok = position_unrealized_pnl > 0 and position_profit_pct >= ADD_POSITION_MIN_PROFIT_RATIO
+        profit_ok = (
+            position_unrealized_pnl > 0 and position_profit_pct >= ADD_POSITION_MIN_PROFIT_RATIO
+        )
         risk_ok = not position_loss and position_risk_usage <= ADD_POSITION_MAX_RISK_USAGE
         winner_expand = bool(
             not position_loss
@@ -3618,10 +4354,15 @@ class EnsembleCoordinator:
             and (
                 enough_support
                 or bool(strong_support)
-                or any(self._safe_float(item.get("confidence"), 0.0) >= 0.64 for item in technical_support)
+                or any(
+                    self._safe_float(item.get("confidence"), 0.0) >= 0.64
+                    for item in technical_support
+                )
             )
         )
-        should_add = bool((enough_support and aligned_score and profit_ok and risk_ok) or winner_expand)
+        should_add = bool(
+            (enough_support and aligned_score and profit_ok and risk_ok) or winner_expand
+        )
         max_conf = max([self._safe_float(item.get("confidence"), 0.0) for item in support] or [0.0])
         avg_size = self._avg(
             [self._safe_float(item.get("position_size_pct"), 0.0) for item in support],
@@ -3630,13 +4371,28 @@ class EnsembleCoordinator:
         size_multiplier = 0.75 if winner_expand else 0.5
         size = min(max(avg_size * size_multiplier, ADD_POSITION_MIN_SIZE), ADD_POSITION_MAX_SIZE)
         leverage = min(
-            max(self._avg([self._safe_float(item.get("suggested_leverage"), 1.0) for item in support], 1.0), 1.0),
+            max(
+                self._avg(
+                    [self._safe_float(item.get("suggested_leverage"), 1.0) for item in support], 1.0
+                ),
+                1.0,
+            ),
             self._entry_leverage_cap(max(max_conf, MIN_EXECUTABLE_ENTRY_CONFIDENCE), 3),
         )
-        stop_loss_pct = min(max(self._avg([self._safe_float(item.get("stop_loss_pct"), 0.035) for item in support], 0.035), 0.015), 0.08)
+        stop_loss_pct = min(
+            max(
+                self._avg(
+                    [self._safe_float(item.get("stop_loss_pct"), 0.035) for item in support], 0.035
+                ),
+                0.015,
+            ),
+            0.08,
+        )
         take_profit_pct = min(
             max(
-                self._avg([self._safe_float(item.get("take_profit_pct"), 0.08) for item in support], 0.08),
+                self._avg(
+                    [self._safe_float(item.get("take_profit_pct"), 0.08) for item in support], 0.08
+                ),
                 stop_loss_pct * 1.8,
                 0.03,
             ),
@@ -3686,7 +4442,9 @@ class EnsembleCoordinator:
             "continuation_score": round(continuation_score, 4),
             "score": round(score, 4),
             "max_support_confidence": round(max_conf, 4),
-            "suggested_confidence": round(max(max_conf, min(abs(score) + 0.45, 0.85), MIN_EXECUTABLE_ENTRY_CONFIDENCE), 4),
+            "suggested_confidence": round(
+                max(max_conf, min(abs(score) + 0.45, 0.85), MIN_EXECUTABLE_ENTRY_CONFIDENCE), 4
+            ),
             "suggested_leverage": round(leverage, 4),
             "stop_loss_pct": round(stop_loss_pct, 6),
             "take_profit_pct": round(take_profit_pct, 6),
@@ -3705,7 +4463,7 @@ class EnsembleCoordinator:
         score: float,
         raw_opinions: list[dict[str, Any]],
         context: dict[str, Any] | None,
-        features: "FeatureVector" | None,
+        features: FeatureVector | None,
         position_unrealized_pnl: float,
         position_profit_pct: float,
         position_risk_usage: float,
@@ -3731,16 +4489,25 @@ class EnsembleCoordinator:
         if not isinstance(profit, dict):
             profit = {}
         local_expected = self._safe_float(
-            profit.get(f"adjusted_{current_side}_return_pct", profit.get(f"{current_side}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{current_side}_return_pct",
+                profit.get(f"{current_side}_expected_return_pct"),
+            ),
             0.0,
         )
         opposite_local_expected = self._safe_float(
-            profit.get(f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")),
+            profit.get(
+                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
+            ),
             0.0,
         )
-        local_loss_probability = self._safe_float(profit.get(f"{current_side}_loss_probability"), 0.50)
+        local_loss_probability = self._safe_float(
+            profit.get(f"{current_side}_loss_probability"), 0.50
+        )
         local_best_side = str(profit.get("best_side") or "").lower()
-        local_available = isinstance(profit, dict) and bool(profit) and profit.get("available", True) is not False
+        local_available = (
+            isinstance(profit, dict) and bool(profit) and profit.get("available", True) is not False
+        )
 
         ts_prediction = (
             tools.get("time_series_prediction")
@@ -3749,9 +4516,13 @@ class EnsembleCoordinator:
         )
         if not isinstance(ts_prediction, dict):
             ts_prediction = {}
-        ts_best_side = str(ts_prediction.get("best_side") or ts_prediction.get("side") or "").lower()
+        ts_best_side = str(
+            ts_prediction.get("best_side") or ts_prediction.get("side") or ""
+        ).lower()
         ts_expected = self._safe_float(
-            ts_prediction.get("expected_return_pct", ts_prediction.get(f"{current_side}_expected_return_pct")),
+            ts_prediction.get(
+                "expected_return_pct", ts_prediction.get(f"{current_side}_expected_return_pct")
+            ),
             0.0,
         )
         ts_direction = str(ts_prediction.get("direction") or "").lower()
@@ -3781,8 +4552,7 @@ class EnsembleCoordinator:
             and ml_best_side in {"", current_side}
         )
         ml_opposes = bool(
-            ml_expected < 0
-            or (ml_best_side == opposite and ml_opposite_expected >= ml_expected)
+            ml_expected < 0 or (ml_best_side == opposite and ml_opposite_expected >= ml_expected)
         )
 
         same_side_votes = 0
@@ -3822,7 +4592,9 @@ class EnsembleCoordinator:
         expansion_score = sum(
             bool(v)
             for v in (
-                local_available and local_loss_probability >= LOSS_EXPAND_MIN_LOSS_PROBABILITY and local_expected <= 0,
+                local_available
+                and local_loss_probability >= LOSS_EXPAND_MIN_LOSS_PROBABILITY
+                and local_expected <= 0,
                 local_best_side == opposite and opposite_local_expected >= local_expected,
                 ml_opposes,
                 ts_opposes,
@@ -3921,7 +4693,7 @@ class EnsembleCoordinator:
         self,
         *,
         current_side: str,
-        features: "FeatureVector" | None,
+        features: FeatureVector | None,
     ) -> dict[str, Any]:
         """Estimate whether the next short window is turning against the position."""
         side = str(current_side or "").lower()
@@ -4009,7 +4781,7 @@ class EnsembleCoordinator:
         score: float,
         raw_opinions: list[dict[str, Any]],
         symbol_positions: list[dict] | None = None,
-        features: "FeatureVector" | None = None,
+        features: FeatureVector | None = None,
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Summarize whether an open position has enough evidence to reduce/close."""
@@ -4040,20 +4812,17 @@ class EnsembleCoordinator:
                 support.append(item)
 
         strong_support = [
-            item for item in support
+            item
+            for item in support
             if self._safe_float(item.get("confidence"), 0.0) >= REVIEW_CLOSE_STRONG_CONFIDENCE
         ]
         raw_hard_risk = bool(risk_vetoes)
         strong_opposite_pressure = (
             current_side == "long" and score <= -REVIEW_STRONG_OPPOSITE_SCORE
-        ) or (
-            current_side == "short" and score >= REVIEW_STRONG_OPPOSITE_SCORE
-        )
+        ) or (current_side == "short" and score >= REVIEW_STRONG_OPPOSITE_SCORE)
         moderate_opposite_pressure = (
             current_side == "long" and score <= -PROFIT_PROTECT_MODERATE_OPPOSITE_SCORE
-        ) or (
-            current_side == "short" and score >= PROFIT_PROTECT_MODERATE_OPPOSITE_SCORE
-        )
+        ) or (current_side == "short" and score >= PROFIT_PROTECT_MODERATE_OPPOSITE_SCORE)
         max_conf = max([self._safe_float(item.get("confidence"), 0.0) for item in support] or [0.0])
         position_loss = False
         position_risk_usage = 0.0
@@ -4079,17 +4848,25 @@ class EnsembleCoordinator:
                     opened_at = None
             if isinstance(opened_at, datetime):
                 if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                age_minutes = max((datetime.now(timezone.utc) - opened_at).total_seconds() / 60.0, 0.0)
+                    opened_at = opened_at.replace(tzinfo=UTC)
+                age_minutes = max((datetime.now(UTC) - opened_at).total_seconds() / 60.0, 0.0)
             if position_notional > 0:
                 position_profit_pct = position_unrealized_pnl / position_notional
             if entry_price > 0 and current_price > 0:
                 if current_side == "long":
                     adverse_move = max(entry_price - current_price, 0.0)
-                    planned_risk = max(entry_price - stop_loss, entry_price * 0.02) if stop_loss > 0 else entry_price * 0.05
+                    planned_risk = (
+                        max(entry_price - stop_loss, entry_price * 0.02)
+                        if stop_loss > 0
+                        else entry_price * 0.05
+                    )
                 else:
                     adverse_move = max(current_price - entry_price, 0.0)
-                    planned_risk = max(stop_loss - entry_price, entry_price * 0.02) if stop_loss > 0 else entry_price * 0.05
+                    planned_risk = (
+                        max(stop_loss - entry_price, entry_price * 0.02)
+                        if stop_loss > 0
+                        else entry_price * 0.05
+                    )
                 planned_risk_price = planned_risk
                 planned_risk_usdt = planned_risk * quantity
                 position_loss = adverse_move > 0 or position_unrealized_pnl < 0
@@ -4103,15 +4880,13 @@ class EnsembleCoordinator:
         block_reason = ""
         suggested_confidence = 0.0
         position_profit = position_unrealized_pnl > 0 and position_profit_pct > 0
-        portfolio_profit = context.get("portfolio_profit_protection") if isinstance(context, dict) else {}
-        portfolio_profit_focus = bool(isinstance(portfolio_profit, dict) and portfolio_profit.get("active"))
-        portfolio_current_group = (
-            portfolio_profit.get("current_group")
-            if isinstance(portfolio_profit, dict) and isinstance(portfolio_profit.get("current_group"), dict)
-            else {}
+        portfolio_profit = self._safe_dict(
+            context.get("portfolio_profit_protection") if isinstance(context, dict) else {}
         )
+        portfolio_profit_focus = bool(portfolio_profit.get("active"))
+        portfolio_current_group = self._safe_dict(portfolio_profit.get("current_group"))
         portfolio_profit_share = self._safe_float(portfolio_current_group.get("profit_share"), 0.0)
-        portfolio_threshold_usdt = self._safe_float(portfolio_profit.get("threshold_usdt"), 0.0) if isinstance(portfolio_profit, dict) else 0.0
+        portfolio_threshold_usdt = self._safe_float(portfolio_profit.get("threshold_usdt"), 0.0)
         estimated_fee_usdt = max(position_notional * 0.001, 0.0)
         dynamic_profit_lock_line = min(
             max(
@@ -4197,7 +4972,9 @@ class EnsembleCoordinator:
         weak_continuation = continuation_score < 0.16
         returns_1 = self._safe_float(getattr(features, "returns_1", 0.0), 0.0) if features else 0.0
         returns_5 = self._safe_float(getattr(features, "returns_5", 0.0), 0.0) if features else 0.0
-        volume_ratio = self._safe_float(getattr(features, "volume_ratio", 1.0), 1.0) if features else 1.0
+        volume_ratio = (
+            self._safe_float(getattr(features, "volume_ratio", 1.0), 1.0) if features else 1.0
+        )
         bb_pct = self._safe_float(getattr(features, "bb_pct", 0.5), 0.5) if features else 0.5
         rsi_14 = self._safe_float(getattr(features, "rsi_14", 50.0), 50.0) if features else 50.0
         low_participation = volume_ratio < 0.55
@@ -4220,11 +4997,12 @@ class EnsembleCoordinator:
         predictive_reversal_score = self._safe_float(predictive_reversal.get("score"), 0.0)
         predictive_exit = predictive_reversal_score >= PREDICTIVE_REVERSAL_EXIT_SCORE
         predictive_full_exit = predictive_reversal_score >= PREDICTIVE_REVERSAL_FULL_EXIT_SCORE
-        predictive_reduce_lock_line = meaningful_reduce_lock_line / max(PREDICTIVE_REVERSAL_REDUCE_SIZE, 0.01)
+        predictive_reduce_lock_line = meaningful_reduce_lock_line / max(
+            PREDICTIVE_REVERSAL_REDUCE_SIZE, 0.01
+        )
         predictive_full_lock_line = max(dynamic_profit_lock_line, meaningful_reduce_lock_line)
         predictive_reduce_lock_ready = (
-            meaningful_reduce_lock
-            and position_unrealized_pnl >= predictive_reduce_lock_line
+            meaningful_reduce_lock and position_unrealized_pnl >= predictive_reduce_lock_line
         )
         peak_context = context.get("position_profit_peak") if isinstance(context, dict) else {}
         if not isinstance(peak_context, dict):
@@ -4235,16 +5013,16 @@ class EnsembleCoordinator:
         )
         profit_retrace_abs = max(peak_unrealized_pnl - position_unrealized_pnl, 0.0)
         profit_retrace_ratio = (
-            profit_retrace_abs / max(peak_unrealized_pnl, 1e-9)
-            if peak_unrealized_pnl > 0
-            else 0.0
+            profit_retrace_abs / max(peak_unrealized_pnl, 1e-9) if peak_unrealized_pnl > 0 else 0.0
         )
         predictive_full_lock_ready = (
             predictive_full_exit
             and position_unrealized_pnl >= predictive_full_lock_line
             and profit_retrace_ratio >= 0.18
         )
-        volatility_20 = self._safe_float(getattr(features, "volatility_20", 0.0), 0.0) if features else 0.0
+        volatility_20 = (
+            self._safe_float(getattr(features, "volatility_20", 0.0), 0.0) if features else 0.0
+        )
         dynamic_retrace_reduce_ratio = PROFIT_RETRACE_BASE_REDUCE_RATIO
         dynamic_retrace_reduce_ratio += min(max(volatility_20, 0.0), 0.08) * 1.25
         dynamic_retrace_reduce_ratio += max(continuation_score, 0.0) * 0.10
@@ -4262,7 +5040,9 @@ class EnsembleCoordinator:
             PROFIT_RETRACE_MAX_FULL_RATIO,
         )
         profit_retrace_peak_line = dynamic_profit_lock_line * PROFIT_RETRACE_PEAK_LINE_MULTIPLE
-        profit_retrace_current_line = dynamic_profit_lock_line * PROFIT_RETRACE_CURRENT_LINE_MULTIPLE
+        profit_retrace_current_line = (
+            dynamic_profit_lock_line * PROFIT_RETRACE_CURRENT_LINE_MULTIPLE
+        )
         profit_retrace_protection = (
             position_profit
             and peak_unrealized_pnl >= profit_retrace_peak_line
@@ -4288,13 +5068,32 @@ class EnsembleCoordinator:
                 or portfolio_focus_profit_lock
             )
         )
-        abnormal_wick_max_pct = self._safe_float(getattr(features, "abnormal_wick_max_pct", 0.0), 0.0) if features else 0.0
-        abnormal_wick_count = int(self._safe_float(getattr(features, "abnormal_wick_count_72h", 0.0), 0.0)) if features else 0
+        abnormal_wick_max_pct = (
+            self._safe_float(getattr(features, "abnormal_wick_max_pct", 0.0), 0.0)
+            if features
+            else 0.0
+        )
+        abnormal_wick_count = (
+            int(self._safe_float(getattr(features, "abnormal_wick_count_72h", 0.0), 0.0))
+            if features
+            else 0
+        )
         enough_age_for_fast_profit = age_minutes >= FAST_PROFIT_MIN_HOLD_MINUTES
         early_discretionary_close = age_minutes < MIN_DISCRETIONARY_CLOSE_HOLD_MINUTES
-        fresh_position_noise = age_minutes < 2.0 and position_risk_usage < EARLY_CLOSE_MIN_RISK_USAGE
-        hard_risk = raw_hard_risk and position_risk_usage >= LOSS_FULL_MIN_RISK_USAGE and not fresh_position_noise
-        if raw_hard_risk and not hard_risk and abnormal_wick_count > 0 and abnormal_wick_max_pct >= 12.0:
+        fresh_position_noise = (
+            age_minutes < 2.0 and position_risk_usage < EARLY_CLOSE_MIN_RISK_USAGE
+        )
+        hard_risk = (
+            raw_hard_risk
+            and position_risk_usage >= LOSS_FULL_MIN_RISK_USAGE
+            and not fresh_position_noise
+        )
+        if (
+            raw_hard_risk
+            and not hard_risk
+            and abnormal_wick_count > 0
+            and abnormal_wick_max_pct >= 12.0
+        ):
             hard_risk = True
         early_loss_exit_allowed = (
             position_loss
@@ -4350,7 +5149,9 @@ class EnsembleCoordinator:
         ):
             should_close = True
             action_plan = "full_close" if predictive_full_lock_ready else "reduce"
-            position_size_pct = 1.0 if action_plan == "full_close" else PREDICTIVE_REVERSAL_REDUCE_SIZE
+            position_size_pct = (
+                1.0 if action_plan == "full_close" else PREDICTIVE_REVERSAL_REDUCE_SIZE
+            )
             reason = (
                 f"预判型锁盈：当前仍有浮盈 {position_unrealized_pnl:.2f}U，"
                 f"但短周期反向风险评分 {predictive_reversal_score:.0f}，"
@@ -4361,7 +5162,9 @@ class EnsembleCoordinator:
             should_close = True
             action_plan = str(loss_repair.get("action_plan") or "reduce")
             position_size_pct = float(loss_repair.get("position_size_pct") or 0.60)
-            reason = str(loss_repair.get("reason") or "亏损修复评估显示扩亏概率更高，先处理亏损仓位。")
+            reason = str(
+                loss_repair.get("reason") or "亏损修复评估显示扩亏概率更高，先处理亏损仓位。"
+            )
             suggested_confidence = max(
                 max_conf,
                 0.74 if action_plan == "full_close" else 0.66,
@@ -4373,7 +5176,11 @@ class EnsembleCoordinator:
             and (position_risk_usage >= 0.25 or loss_abs >= dynamic_loss_reduce_usdt * 0.55)
         ):
             should_close = True
-            action_plan = "full_close" if predictive_full_exit or loss_abs >= dynamic_loss_full_usdt * 0.70 else "hold"
+            action_plan = (
+                "full_close"
+                if predictive_full_exit or loss_abs >= dynamic_loss_full_usdt * 0.70
+                else "hold"
+            )
             position_size_pct = 1.0 if action_plan == "full_close" else 0.0
             reason = (
                 f"亏损修复预判：当前浮亏 {position_unrealized_pnl:.2f}U，"
@@ -4424,19 +5231,32 @@ class EnsembleCoordinator:
             position_size_pct = 1.0
             reason = f"浮亏已经达到或超过计划止损风险的 {position_risk_usage * 100:.0f}%，执行全平，避免继续拖延。"
             suggested_confidence = max(max_conf, 0.72)
-        elif position_loss and position_risk_usage >= LOSS_FULL_MIN_RISK_USAGE and (len(strong_support) >= 2 or strong_opposite_pressure):
+        elif (
+            position_loss
+            and position_risk_usage >= LOSS_FULL_MIN_RISK_USAGE
+            and (len(strong_support) >= 2 or strong_opposite_pressure)
+        ):
             should_close = True
             action_plan = "full_close"
             position_size_pct = 1.0
             reason = f"浮亏已接近止损风险的 {position_risk_usage * 100:.0f}%，且出现反向压力，执行全平避免亏损扩大。"
             suggested_confidence = max(max_conf, 0.72)
-        elif position_loss and position_risk_usage >= LOSS_REDUCE_MIN_RISK_USAGE and (len(strong_support) >= 2 or strong_opposite_pressure):
+        elif (
+            position_loss
+            and position_risk_usage >= LOSS_REDUCE_MIN_RISK_USAGE
+            and (len(strong_support) >= 2 or strong_opposite_pressure)
+        ):
             should_close = False
             action_plan = "hold"
             position_size_pct = 0.0
             reason = f"浮亏已达到止损风险的 {position_risk_usage * 100:.0f}%，且已有退出线索，先减仓 50%，保留后续确认空间。"
             suggested_confidence = max(max_conf, 0.66)
-        elif False and position_loss and position_risk_usage >= 0.45 and (support or strong_opposite_pressure):
+        elif (
+            False
+            and position_loss
+            and position_risk_usage >= 0.45
+            and (support or strong_opposite_pressure)
+        ):
             should_close = True
             action_plan = "reduce"
             position_size_pct = 0.5
@@ -4501,7 +5321,11 @@ class EnsembleCoordinator:
                 f"盈利仓继续奔跑：当前浮盈 {position_unrealized_pnl:.2f}U / {position_profit_pct * 100:.2f}%，"
                 f"延续分 {continuation_score:.2f}，未出现强反向确认；不因小盈利或单个退出意见过早减仓。"
             )
-        elif quick_full_profit and enough_age_for_fast_profit and (support or moderate_opposite_pressure):
+        elif (
+            quick_full_profit
+            and enough_age_for_fast_profit
+            and (support or moderate_opposite_pressure)
+        ):
             should_close = True
             action_plan = "full_close"
             position_size_pct = 1.0
@@ -4510,7 +5334,12 @@ class EnsembleCoordinator:
                 "且继续持有优势下降，优先全平把账面利润转为已实现利润。"
             )
             suggested_confidence = max(max_conf, 0.66)
-        elif rotation_profit and enough_age_for_fast_profit and (support or moderate_opposite_pressure) and low_participation:
+        elif (
+            rotation_profit
+            and enough_age_for_fast_profit
+            and (support or moderate_opposite_pressure)
+            and low_participation
+        ):
             should_close = True
             action_plan = "reduce"
             position_size_pct = 0.70
@@ -4519,7 +5348,9 @@ class EnsembleCoordinator:
                 "但成交参与度低且继续持有分数不足，先平 70% 释放资金寻找更高优势机会。"
             )
             suggested_confidence = max(max_conf, 0.62)
-        elif quick_profit and enough_age_for_fast_profit and (support or moderate_opposite_pressure):
+        elif (
+            quick_profit and enough_age_for_fast_profit and (support or moderate_opposite_pressure)
+        ):
             should_close = True
             action_plan = "reduce"
             position_size_pct = PROFIT_PROTECT_REDUCE_SIZE
@@ -4555,7 +5386,11 @@ class EnsembleCoordinator:
                 "同时出现退出线索或趋势转弱，先减仓 35% 锁定一部分利润。"
             )
             suggested_confidence = max(max_conf, 0.60)
-        elif position_profit and not profit_lock_ready_for_exit and (support or strong_opposite_pressure or moderate_opposite_pressure):
+        elif (
+            position_profit
+            and not profit_lock_ready_for_exit
+            and (support or strong_opposite_pressure or moderate_opposite_pressure)
+        ):
             should_close = False
             action_plan = "hold"
             position_size_pct = 0.0
@@ -4586,7 +5421,12 @@ class EnsembleCoordinator:
             position_size_pct = 0.5
             reason = f"{len(support)} 个专家支持退出，但未达到全平门槛，先减仓 50%。"
             suggested_confidence = max(max_conf, 0.62)
-        elif not position_loss and len(support) == 1 and strong_opposite_pressure and max_conf >= 0.72:
+        elif (
+            not position_loss
+            and len(support) == 1
+            and strong_opposite_pressure
+            and max_conf >= 0.72
+        ):
             should_close = True
             action_plan = "reduce"
             position_size_pct = 0.5
@@ -4620,7 +5460,9 @@ class EnsembleCoordinator:
             "position_notional": round(position_notional, 6),
             "position_profit": position_profit,
             "position_profit_pct": round(position_profit_pct, 6),
-            "profit_protection": bool(should_close and position_profit and profit_lock_ready_for_exit),
+            "profit_protection": bool(
+                should_close and position_profit and profit_lock_ready_for_exit
+            ),
             "profit_lock_ready_for_exit": bool(profit_lock_ready_for_exit),
             "profit_floor_ready_for_exit": bool(profit_floor_ready),
             "analysis_profit_exit_floor_usdt": round(analysis_profit_exit_floor, 6),
@@ -4691,7 +5533,8 @@ class EnsembleCoordinator:
 
         target = normalize(symbol)
         rows = [
-            p for p in context.get("open_positions", [])
+            p
+            for p in context.get("open_positions", [])
             if (
                 p.get("model_name") == ENSEMBLE_TRADER_NAME
                 and normalize(p.get("symbol")) == target
@@ -4724,7 +5567,9 @@ class EnsembleCoordinator:
             leverage_weight = 0.0
             created_at = None
             for pos in side_rows:
-                entry = self._safe_float(pos.get("entry_price") or pos.get("entryPrice") or pos.get("avgPx"), 0.0)
+                entry = self._safe_float(
+                    pos.get("entry_price") or pos.get("entryPrice") or pos.get("avgPx"), 0.0
+                )
                 current = self._safe_float(
                     pos.get("current_price")
                     or pos.get("markPrice")
@@ -4734,22 +5579,28 @@ class EnsembleCoordinator:
                     or pos.get("avgPx"),
                     entry,
                 )
-                qty = abs(self._safe_float(pos.get("quantity") or pos.get("contracts") or pos.get("sz"), 0.0))
+                qty = abs(
+                    self._safe_float(
+                        pos.get("quantity") or pos.get("contracts") or pos.get("sz"), 0.0
+                    )
+                )
                 contract_size = self._safe_float(
                     pos.get("contract_size")
                     or pos.get("contractSize")
                     or (pos.get("info") or {}).get("ctVal"),
                     1.0,
                 )
-                direct_notional = abs(self._safe_float(
-                    pos.get("notional")
-                    or pos.get("notional_usd")
-                    or pos.get("notionalUsd")
-                    or (pos.get("info") or {}).get("notionalUsd")
-                    or (pos.get("info") or {}).get("notional")
-                    or (pos.get("info") or {}).get("posValue"),
-                    0.0,
-                ))
+                direct_notional = abs(
+                    self._safe_float(
+                        pos.get("notional")
+                        or pos.get("notional_usd")
+                        or pos.get("notionalUsd")
+                        or (pos.get("info") or {}).get("notionalUsd")
+                        or (pos.get("info") or {}).get("notional")
+                        or (pos.get("info") or {}).get("posValue"),
+                        0.0,
+                    )
+                )
                 if entry <= 0 or current <= 0:
                     continue
                 notional = (
@@ -4764,7 +5615,9 @@ class EnsembleCoordinator:
                 total_synthetic_qty += synthetic_qty
                 entry_value += entry * synthetic_qty
                 current_value += current * synthetic_qty
-                pnl_value = self._safe_float(pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0.0)), 0.0)
+                pnl_value = self._safe_float(
+                    pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0.0)), 0.0
+                )
                 if pnl_value == 0.0:
                     pnl_value = (
                         (current - entry) * synthetic_qty
@@ -4776,7 +5629,9 @@ class EnsembleCoordinator:
                 if stop > 0:
                     stop_value += stop * synthetic_qty
                     stop_weight += synthetic_qty
-                take_profit = self._safe_float(pos.get("take_profit") or pos.get("take_profit_price"), 0.0)
+                take_profit = self._safe_float(
+                    pos.get("take_profit") or pos.get("take_profit_price"), 0.0
+                )
                 if take_profit > 0:
                     take_profit_value += take_profit * synthetic_qty
                     take_profit_weight += synthetic_qty
@@ -4793,29 +5648,45 @@ class EnsembleCoordinator:
             entry_price = entry_value / total_synthetic_qty
             synthetic_quantity = total_synthetic_qty
             current_price = current_value / total_synthetic_qty
-            aggregates.append({
-                **side_rows[0],
-                "symbol": symbol,
-                "side": side,
-                "entry_price": entry_price,
-                "current_price": current_price,
-                "quantity": synthetic_quantity,
-                "notional": total_notional,
-                "unrealized_pnl": unrealized,
-                "stop_loss": stop_value / stop_weight if stop_weight > 0 else side_rows[0].get("stop_loss"),
-                "take_profit": take_profit_value / take_profit_weight if take_profit_weight > 0 else side_rows[0].get("take_profit"),
-                "leverage": leverage_value / leverage_weight if leverage_weight > 0 else side_rows[0].get("leverage", 1.0),
-                "created_at": created_at,
-                "aggregate_position": True,
-                "fragment_count": len(side_rows),
-            })
+            aggregates.append(
+                {
+                    **side_rows[0],
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "quantity": synthetic_quantity,
+                    "notional": total_notional,
+                    "unrealized_pnl": unrealized,
+                    "stop_loss": (
+                        stop_value / stop_weight
+                        if stop_weight > 0
+                        else side_rows[0].get("stop_loss")
+                    ),
+                    "take_profit": (
+                        take_profit_value / take_profit_weight
+                        if take_profit_weight > 0
+                        else side_rows[0].get("take_profit")
+                    ),
+                    "leverage": (
+                        leverage_value / leverage_weight
+                        if leverage_weight > 0
+                        else side_rows[0].get("leverage", 1.0)
+                    ),
+                    "created_at": created_at,
+                    "aggregate_position": True,
+                    "fragment_count": len(side_rows),
+                }
+            )
 
         if not aggregates:
             return rows
         aggregates.sort(key=lambda p: self._safe_float(p.get("notional"), 0.0), reverse=True)
         return aggregates
 
-    def _exit_matches_open_position(self, action: Action, symbol: str, context: dict[str, Any]) -> bool:
+    def _exit_matches_open_position(
+        self, action: Action, symbol: str, context: dict[str, Any]
+    ) -> bool:
         if action not in (Action.CLOSE_LONG, Action.CLOSE_SHORT):
             return True
         target_side = "long" if action == Action.CLOSE_LONG else "short"
@@ -4825,7 +5696,9 @@ class EnsembleCoordinator:
         )
 
     def _disagreement(self, decisions) -> float:
-        scores = [ACTION_SCORE.get(d.action, 0.0) for d in decisions if isinstance(d, DecisionOutput)]
+        scores = [
+            ACTION_SCORE.get(d.action, 0.0) for d in decisions if isinstance(d, DecisionOutput)
+        ]
         if not scores:
             return 1.0
         positive = sum(1 for s in scores if s > 0)
@@ -4835,7 +5708,7 @@ class EnsembleCoordinator:
             return 0.0
         return min(positive, negative) / directional
 
-    def _hold(self, features: "FeatureVector", reason: str, raw: dict[str, Any]) -> DecisionOutput:
+    def _hold(self, features: FeatureVector, reason: str, raw: dict[str, Any]) -> DecisionOutput:
         return DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
             symbol=features.symbol,
@@ -4850,12 +5723,16 @@ class EnsembleCoordinator:
 
     def _market_exit_guard_hold(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         decision: DecisionOutput,
         stage: str,
     ) -> DecisionOutput:
-        if context.get("review_positions") or not isinstance(decision, DecisionOutput) or not decision.is_exit:
+        if (
+            context.get("review_positions")
+            or not isinstance(decision, DecisionOutput)
+            or not decision.is_exit
+        ):
             return decision
         raw = dict(decision.raw_response or {}) if isinstance(decision.raw_response, dict) else {}
         raw["market_exit_guard"] = {
@@ -4883,7 +5760,9 @@ class EnsembleCoordinator:
             "ensemble": True,
             "weighted_score": round(score, 4),
             "disagreement": round(disagreement, 4),
-            "validation_adjustment": round(self._validation_adjustment(cross_validations or [], consultation), 4),
+            "validation_adjustment": round(
+                self._validation_adjustment(cross_validations or [], consultation), 4
+            ),
             "opinions": opinions,
             "dynamic_expert_weights": {
                 str(o.get("model_name")): {
@@ -4895,6 +5774,8 @@ class EnsembleCoordinator:
                 for o in opinions
                 if o.get("model_name")
             },
+            "expert_weight_policy": self._expert_weight_policy_summary(opinions),
+            "risk_expert_policy": self._risk_policy_from_opinions(opinions),
             "cross_validations": cross_validations or [],
             "consultation": consultation,
             "conflict_resolution": self._conflict_resolution_payload(
@@ -4912,11 +5793,13 @@ class EnsembleCoordinator:
         model_timings: list[dict[str, Any]],
     ) -> dict[str, Any]:
         stage_rows = [
-            row for row in timing_records
+            row
+            for row in timing_records
             if isinstance(row, dict) and row.get("duration_sec") is not None
         ]
         model_rows = [
-            row for row in model_timings
+            row
+            for row in model_timings
             if isinstance(row, dict) and row.get("duration_sec") is not None
         ]
         slowest_stage = max(
@@ -4950,20 +5833,27 @@ class EnsembleCoordinator:
                 3,
             ),
             "uses_shared_batch_call": any(
-                bool(row.get("shared_batch_call") or row.get("batch_expert"))
-                for row in model_rows
+                bool(row.get("shared_batch_call") or row.get("batch_expert")) for row in model_rows
             ),
-            "slowest_stage": {
-                "stage": slowest_stage.get("stage"),
-                "label": slowest_stage.get("label"),
-                "duration_sec": slowest_stage.get("duration_sec"),
-            } if slowest_stage else None,
-            "slowest_model": {
-                "name": slowest_model.get("name"),
-                "duration_sec": slowest_model.get("duration_sec"),
-                "provider_model": slowest_model.get("provider_model"),
-                "status": slowest_model.get("status"),
-            } if slowest_model else None,
+            "slowest_stage": (
+                {
+                    "stage": slowest_stage.get("stage"),
+                    "label": slowest_stage.get("label"),
+                    "duration_sec": slowest_stage.get("duration_sec"),
+                }
+                if slowest_stage
+                else None
+            ),
+            "slowest_model": (
+                {
+                    "name": slowest_model.get("name"),
+                    "duration_sec": slowest_model.get("duration_sec"),
+                    "provider_model": slowest_model.get("provider_model"),
+                    "status": slowest_model.get("status"),
+                }
+                if slowest_model
+                else None
+            ),
         }
 
     def _validation_adjustment(
@@ -4971,7 +5861,9 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]],
         consultation: dict[str, Any] | None,
     ) -> float:
-        adjustment = sum(float(v.get("confidence_adjustment", 0) or 0) for v in cross_validations) / 100.0
+        adjustment = (
+            sum(float(v.get("confidence_adjustment", 0) or 0) for v in cross_validations) / 100.0
+        )
         if isinstance(consultation, dict) and consultation.get("status") == "completed":
             adjustment += float(consultation.get("confidence_adjustment", 0) or 0) / 100.0
         return min(max(adjustment, -0.50), 0.50)
@@ -4986,7 +5878,11 @@ class EnsembleCoordinator:
             try:
                 confidence_score = float(memory.get("confidence_score", 0.5) or 0.5)
                 evidence = min(int(memory.get("evidence_count", 1) or 1), 6)
-                adjustment += float(memory.get("confidence_adjustment", 0.0) or 0.0) * confidence_score * (1 + evidence * 0.08)
+                adjustment += (
+                    float(memory.get("confidence_adjustment", 0.0) or 0.0)
+                    * confidence_score
+                    * (1 + evidence * 0.08)
+                )
             except (TypeError, ValueError):
                 continue
         return min(max(adjustment, -0.25), 0.12)
@@ -4998,21 +5894,23 @@ class EnsembleCoordinator:
         multiplier = 1.0
         for memory in memories:
             try:
-                multiplier = min(multiplier, float(memory.get("position_size_multiplier", 1.0) or 1.0))
+                multiplier = min(
+                    multiplier, float(memory.get("position_size_multiplier", 1.0) or 1.0)
+                )
             except (TypeError, ValueError):
                 continue
         return min(max(multiplier, 0.25), 1.15)
 
     def _directional_memories(self, context: dict[str, Any], score: float) -> list[dict[str, Any]]:
         memories = [
-            item for item in (context.get("expert_memories_flat") or [])
-            if isinstance(item, dict)
+            item for item in (context.get("expert_memories_flat") or []) if isinstance(item, dict)
         ]
         if not memories or abs(score) < 1e-9:
             return memories[:8]
         side = "long" if score > 0 else "short"
         return [
-            memory for memory in memories
+            memory
+            for memory in memories
             if not memory.get("side") or str(memory.get("side")).lower() == side
         ][:8]
 
@@ -5024,6 +5922,7 @@ class EnsembleCoordinator:
             "used": len(memories),
             "risk_lessons": len(negative),
             "positive_lessons": len(positive),
+            "feedback": self._memory_feedback(context),
             "top_lessons": [
                 {
                     "expert_label": m.get("expert_label") or m.get("expert_name"),
@@ -5034,6 +5933,11 @@ class EnsembleCoordinator:
                 for m in memories[:3]
             ],
         }
+
+    @staticmethod
+    def _memory_feedback(context: dict[str, Any]) -> dict[str, Any]:
+        feedback = context.get("memory_feedback") if isinstance(context, dict) else {}
+        return feedback if isinstance(feedback, dict) else {}
 
     def _score_after_validation(self, score: float, validation_adjustment: float) -> float:
         """Apply cross-validation confidence to direction without flipping sides."""
@@ -5056,10 +5960,10 @@ class EnsembleCoordinator:
         resolution_brief: str = "",
     ) -> str:
         top = sorted(opinions, key=lambda x: x.get("confidence", 0), reverse=True)[:3]
-        summary = "；".join( 
-            f"{o.get('label') or o.get('model_name')}={self._action_label(o.get('action'))}({float(o.get('confidence', 0)):.2f})" 
-            for o in top 
-        ) 
+        summary = "；".join(
+            f"{o.get('label') or o.get('model_name')}={self._action_label(o.get('action'))}({float(o.get('confidence', 0)):.2f})"
+            for o in top
+        )
         reason = f"{prefix}。加权方向分={score:.2f}，分歧度={disagreement:.2f}。主要意见：{summary}"
         if resolution_brief:
             reason += f"。分歧处理：{resolution_brief}"
@@ -5076,11 +5980,15 @@ class EnsembleCoordinator:
         divergent = [v for v in cross_validations if v.get("consistency") == "divergent"]
         aligned = [v for v in cross_validations if v.get("consistency") == "aligned"]
         neutral = [v for v in cross_validations if v.get("consistency") == "neutral"]
-        adjustment_points = sum(float(v.get("confidence_adjustment", 0) or 0) for v in cross_validations)
+        adjustment_points = sum(
+            float(v.get("confidence_adjustment", 0) or 0) for v in cross_validations
+        )
 
         parts: list[str] = []
         if divergent:
-            parts.append(f"{len(divergent)} 个分歧已按核验结果下调置信度 {abs(min(adjustment_points, 0)):.0f} 分")
+            parts.append(
+                f"{len(divergent)} 个分歧已按核验结果下调置信度 {abs(min(adjustment_points, 0)):.0f} 分"
+            )
         if aligned:
             parts.append(f"{len(aligned)} 个一致结论提高信号可信度")
         if neutral:
@@ -5088,12 +5996,20 @@ class EnsembleCoordinator:
 
         if isinstance(consultation, dict) and consultation.get("status") == "completed":
             should_trade = consultation.get("should_trade")
-            verdict = "允许继续交易" if should_trade is True else "建议不交易" if should_trade is False else "未给出明确交易许可"
+            verdict = (
+                "允许继续交易"
+                if should_trade is True
+                else "建议不交易" if should_trade is False else "未给出明确交易许可"
+            )
             note = str(consultation.get("conflict_note") or "").strip()
             parts.append(f"行情方向专家会诊：{verdict}{('，' + note[:80]) if note else ''}")
         elif isinstance(consultation, dict) and consultation.get("status") == "failed":
-            note = str(consultation.get("conflict_note") or consultation.get("reason") or "").strip()
-            parts.append(f"行情方向专家会诊失败，按保守规则不交易{('：' + note[:80]) if note else ''}")
+            note = str(
+                consultation.get("conflict_note") or consultation.get("reason") or ""
+            ).strip()
+            parts.append(
+                f"行情方向专家会诊失败，按保守规则不交易{('：' + note[:80]) if note else ''}"
+            )
         elif divergent:
             parts.append("未达到深度会诊条件的分歧，由加权分、风控否决和入场阈值共同消化")
 
@@ -5108,8 +6024,7 @@ class EnsembleCoordinator:
         consultation: dict[str, Any] | None,
     ) -> dict[str, Any]:
         action_by_name = {
-            str(o.get("model_name")): self._action_label(o.get("action"))
-            for o in opinions
+            str(o.get("model_name")): self._action_label(o.get("action")) for o in opinions
         }
         items = []
         for validation in cross_validations:
@@ -5133,36 +6048,42 @@ class EnsembleCoordinator:
                     f"{self._expert_label(target)} 的核验没有给出明确支持或否定，"
                     f"仅做 {adjustment:+.0f} 分调整。"
                 )
-            items.append({
-                "expert_pair": pair,
-                "source_action": action_by_name.get(source, "未知"),
-                "target_action": action_by_name.get(target, "未知"),
-                "consistency": consistency,
-                "confidence_adjustment": adjustment,
-                "question": validation.get("question"),
-                "validation_note": validation.get("validation_note") or validation.get("conflict_note"),
-                "resolution": resolution,
-                "major_conflict": bool(validation.get("major_conflict")),
-            })
+            items.append(
+                {
+                    "expert_pair": pair,
+                    "source_action": action_by_name.get(source, "未知"),
+                    "target_action": action_by_name.get(target, "未知"),
+                    "consistency": consistency,
+                    "confidence_adjustment": adjustment,
+                    "question": validation.get("question"),
+                    "validation_note": validation.get("validation_note")
+                    or validation.get("conflict_note"),
+                    "resolution": resolution,
+                    "major_conflict": bool(validation.get("major_conflict")),
+                }
+            )
 
         return {
             "summary": self._conflict_resolution_brief(cross_validations, consultation),
             "weighted_score_after_validation": round(score, 4),
             "disagreement": round(disagreement, 4),
-            "validation_adjustment": round(self._validation_adjustment(cross_validations, consultation), 4),
+            "validation_adjustment": round(
+                self._validation_adjustment(cross_validations, consultation), 4
+            ),
             "items": items,
-            "consultation_used": isinstance(consultation, dict) and consultation.get("status") == "completed",
+            "consultation_used": isinstance(consultation, dict)
+            and consultation.get("status") == "completed",
             "consultation_attempted": isinstance(consultation, dict),
         }
 
-    def _avg(self, values: list[float], default: float) -> float: 
-        clean = [float(v) for v in values if v is not None] 
+    def _avg(self, values: list[float], default: float) -> float:
+        clean = [float(v) for v in values if v is not None]
         return sum(clean) / len(clean) if clean else default
 
     def _is_hard_risk_veto(
         self,
         decision: DecisionOutput,
-        features: "FeatureVector",
+        features: FeatureVector,
         *,
         for_position_close: bool = False,
     ) -> bool:
@@ -5176,6 +6097,13 @@ class EnsembleCoordinator:
             "硬性否决",
             "禁止交易",
             "禁止开仓",
+        )
+        entry_veto_terms = entry_veto_terms + (
+            "hard veto",
+            "prohibit entry",
+            "entry prohibited",
+            "do not open",
+            "ban entry",
         )
         position_exit_terms = (
             "强制平仓",
@@ -5215,13 +6143,17 @@ class EnsembleCoordinator:
         if for_position_close:
             if self._has_unnegated_hard_risk_term(reasoning, position_exit_terms):
                 return decision.confidence >= 0.70
-            if extreme_volatility and self._has_unnegated_hard_risk_term(reasoning, severe_market_terms):
+            if extreme_volatility and self._has_unnegated_hard_risk_term(
+                reasoning, severe_market_terms
+            ):
                 return decision.confidence >= 0.78
             return False
 
         if self._has_unnegated_hard_risk_term(reasoning, entry_veto_terms):
             return decision.confidence >= 0.60
-        if extreme_volatility and self._has_unnegated_hard_risk_term(reasoning, severe_market_terms + ("高波动", "假突破")):
+        if extreme_volatility and self._has_unnegated_hard_risk_term(
+            reasoning, severe_market_terms + ("高波动", "假突破")
+        ):
             return decision.confidence >= 0.75
         if healthy_market and any(term in reasoning for term in caution_terms):
             return False
@@ -5247,13 +6179,21 @@ class EnsembleCoordinator:
             "未见",
             "未发现",
         )
+        negation_markers = negation_markers + (
+            "no ",
+            "not ",
+            "non-",
+            "without ",
+            "no-",
+            "not-a",
+        )
         for term in terms:
             start = 0
             while True:
                 idx = text.find(term, start)
                 if idx < 0:
                     break
-                prefix = text[max(0, idx - 8):idx]
+                prefix = text[max(0, idx - 8) : idx]
                 if not any(marker in prefix for marker in negation_markers):
                     return True
                 start = idx + len(term)

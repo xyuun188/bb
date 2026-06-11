@@ -6,19 +6,34 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
+import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config.settings import ENSEMBLE_TRADER_NAME, settings
+from core.model_runtime import (
+    HIGH_RISK_REVIEW_TOKEN_CAP,
+    HIGH_RISK_REVIEW_TOKEN_FLOOR,
+    ensure_no_think_text,
+    non_thinking_extra_body,
+    uses_thinking_tags,
+)
+from core.safe_output import redact_output, safe_error_text
+from core.secret_utils import is_masked_secret, mask_secret
+from core.url_safety import normalize_http_base_url
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
-_OKX_BALANCE_CACHE: dict[str, tuple[float, dict]] = {}
+logger = structlog.get_logger(__name__)
+_OKX_BALANCE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OKX_BALANCE_TTL_SECONDS = 10.0
+_MODEL_CONNECTION_ERROR_LIMIT = 700
 
 
 # ── Request models ──
+
 
 class OKXSettingsRequest(BaseModel):
     mode: str  # "paper" or "live"
@@ -58,13 +73,6 @@ class ExecutionAccountRequest(BaseModel):
 
 # ── Helpers ──
 
-def mask_secret(value: str) -> str:
-    """Show only last 4 chars of a secret string."""
-    if not value:
-        return ""
-    if len(value) <= 4:
-        return "****"
-    return "****" + value[-4:]
 
 def _masked(m: dict) -> dict:
     """Return a copy with api_key masked."""
@@ -72,14 +80,36 @@ def _masked(m: dict) -> dict:
     mc["api_key"] = mask_secret(mc.get("api_key", ""))
     return mc
 
-def _is_masked_secret(value: str | None) -> bool:
-    return bool(value and value.strip().startswith("****"))
 
-async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict:
+def _is_masked_secret(value: str | None) -> bool:
+    return is_masked_secret(value)
+
+
+def _normalize_api_base_or_400(
+    value: str | None,
+    *,
+    field_name: str,
+    allow_empty: bool = True,
+) -> str:
+    try:
+        return normalize_http_base_url(
+            value,
+            field_name=field_name,
+            allow_empty=allow_empty,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+
+
+def _connection_error_text(value: Any) -> str:
+    return safe_error_text(value, limit=_MODEL_CONNECTION_ERROR_LIMIT)
+
+
+async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
     """Fetch the real OKX USDT balance snapshot for paper/demo or live mode."""
     mode = "live" if mode == "live" else "paper"
     mode_label = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
-    result = {
+    result: dict[str, Any] = {
         "available_balance": None,
         "used_balance": None,
         "total_balance": None,
@@ -106,29 +136,38 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict:
         await executor.initialize()
         snapshot = await executor.get_balance_snapshot("USDT")
         if snapshot.get("error"):
-            result["balance_error"] = str(snapshot.get("error"))
+            result["balance_error"] = _connection_error_text(snapshot.get("error"))
             return result
-        result.update({
-            "available_balance": float(snapshot.get("free") or 0.0),
-            "used_balance": float(snapshot.get("used") or 0.0),
-            "total_balance": float(snapshot.get("total") or 0.0),
-            "cash_balance": float(snapshot.get("cash") or snapshot.get("total") or 0.0),
-            "equity_balance": float(snapshot.get("equity") or snapshot.get("total") or 0.0),
-            "allocatable_balance": float(
-                snapshot.get("allocatable")
-                or snapshot.get("equity")
-                or snapshot.get("total")
-                or snapshot.get("free")
-                or 0.0
-            ),
-        })
+        result.update(
+            {
+                "available_balance": float(snapshot.get("free") or 0.0),
+                "used_balance": float(snapshot.get("used") or 0.0),
+                "total_balance": float(snapshot.get("total") or 0.0),
+                "cash_balance": float(snapshot.get("cash") or snapshot.get("total") or 0.0),
+                "equity_balance": float(snapshot.get("equity") or snapshot.get("total") or 0.0),
+                "allocatable_balance": float(
+                    snapshot.get("allocatable")
+                    or snapshot.get("equity")
+                    or snapshot.get("total")
+                    or snapshot.get("free")
+                    or 0.0
+                ),
+            }
+        )
         _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
         return result
     except Exception as exc:
-        result["balance_error"] = f"OKX 余额查询失败: {exc}"
+        result["balance_error"] = f"OKX 余额查询失败: {_connection_error_text(exc)}"
         return result
     finally:
-        await executor.shutdown()
+        try:
+            await executor.shutdown()
+        except Exception as exc:
+            logger.debug(
+                "OKX executor shutdown failed after balance snapshot",
+                mode=mode,
+                error=_connection_error_text(exc),
+            )
 
 
 async def _get_okx_usdt_balance(mode: str, force: bool = False) -> float | None:
@@ -143,9 +182,15 @@ async def _paper_execution_account_summary() -> dict:
     """Return current paper execution account balance without requiring OKX."""
     if _dash._trading_service and _dash._trading_service.paper_executor:
         try:
-            return await _dash._trading_service.paper_executor.get_account_summary(ENSEMBLE_TRADER_NAME)
-        except Exception:
-            pass
+            return await _dash._trading_service.paper_executor.get_account_summary(
+                ENSEMBLE_TRADER_NAME
+            )
+        except Exception as exc:
+            logger.debug(
+                "paper execution account summary unavailable",
+                account=ENSEMBLE_TRADER_NAME,
+                error=_connection_error_text(exc),
+            )
 
     from db.repositories.account_repo import AccountRepository
     from db.session import get_session_ctx
@@ -163,7 +208,9 @@ async def _paper_execution_account_summary() -> dict:
                 "initial_balance": account.initial_balance,
                 "used_margin": 0.0,
                 "unrealized_pnl": account.unrealized_pnl,
-                "total_pnl": account.current_balance + account.unrealized_pnl - account.initial_balance,
+                "total_pnl": account.current_balance
+                + account.unrealized_pnl
+                - account.initial_balance,
                 "total_pnl_pct": account.total_pnl_pct * 100,
             }
 
@@ -197,15 +244,26 @@ async def _execution_account_status(mode: str) -> dict:
         or legacy_allocated
         or 0.0
     )
-    max_loss_usdt = account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
+    max_loss_usdt = (
+        account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
+    )
     risk_floor = max(account_equity - max_loss_usdt, 0.0) if account_equity > 0 else 0.0
     pause_reason = None
     if _dash._trading_service and _dash.mode_manager.mode.value == mode:
-        pause_reason = getattr(_dash._trading_service, "_new_pair_pause_reasons", {}).get(ENSEMBLE_TRADER_NAME)
+        pause_reason = getattr(_dash._trading_service, "_new_pair_pause_reasons", {}).get(
+            ENSEMBLE_TRADER_NAME
+        )
     if okx_snapshot.get("balance_error") and not pause_reason:
-        pause_reason = f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
+        pause_reason = (
+            f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
+        )
     total_pnl_for_risk = float(pnl_summary.get("total_pnl") or 0.0)
-    if account_equity > 0 and max_loss_usdt > 0 and total_pnl_for_risk <= -max_loss_usdt and not pause_reason:
+    if (
+        account_equity > 0
+        and max_loss_usdt > 0
+        and total_pnl_for_risk <= -max_loss_usdt
+        and not pause_reason
+    ):
         pause_reason = (
             f"{okx_snapshot.get('balance_source')} AI 执行账户累计盈亏 {total_pnl_for_risk:.2f} USDT "
             f"已达到最高亏损限制 {max_loss_pct * 100:.1f}%（{max_loss_usdt:.2f} USDT），暂停分析新的交易对。"
@@ -217,57 +275,61 @@ async def _execution_account_status(mode: str) -> dict:
             okx_snapshot.get("balance_source") or "执行账户",
         )
     status = dict(cfg)
-    status.update({
-        "allocated_balance": account_equity,
-        "account_equity": account_equity,
-        "max_loss_usdt": max_loss_usdt,
-        "available_balance": okx_available,
-        "equity": okx_snapshot.get("total_balance"),
-        "used_margin": okx_snapshot.get("used_balance"),
-        "unrealized_pnl": pnl_summary.get("unrealized_pnl", 0.0),
-        "realized_profit": pnl_summary.get("realized_profit", 0.0),
-        "realized_loss": pnl_summary.get("realized_loss", 0.0),
-        "realized_pnl": pnl_summary.get("realized_pnl", 0.0),
-        "today_realized_profit": pnl_summary.get("today_realized_profit", 0.0),
-        "today_realized_loss": pnl_summary.get("today_realized_loss", 0.0),
-        "today_realized_pnl": pnl_summary.get("today_realized_pnl", 0.0),
-        "today_closed_realized_profit": pnl_summary.get("today_closed_realized_profit", 0.0),
-        "today_closed_realized_loss": pnl_summary.get("today_closed_realized_loss", 0.0),
-        "today_closed_realized_pnl": pnl_summary.get("today_closed_realized_pnl", 0.0),
-        "today_equity_pnl": pnl_summary.get("today_equity_pnl", 0.0),
-        "today_equity_baseline": pnl_summary.get("today_equity_baseline"),
-        "today_equity_baseline_total_pnl": pnl_summary.get("today_equity_baseline_total_pnl"),
-        "today_equity_baseline_at": pnl_summary.get("today_equity_baseline_at"),
-        "today_equity_baseline_source": pnl_summary.get("today_equity_baseline_source"),
-        "today_snapshot_date": pnl_summary.get("today_snapshot_date"),
-        "today_total_pnl": pnl_summary.get("today_total_pnl", 0.0),
-        "today_risk_pnl": pnl_summary.get("today_risk_pnl", 0.0),
-        "cumulative_profit": pnl_summary.get("realized_profit", 0.0),
-        "cumulative_loss": pnl_summary.get("realized_loss", 0.0),
-        "total_pnl": pnl_summary.get("total_pnl", 0.0),
-        "remaining_allocation": okx_available,
-        "balance_error": okx_snapshot.get("balance_error"),
-        "balance_source": okx_snapshot.get("balance_source"),
-        "okx_available_balance": okx_available,
-        "okx_total_balance": okx_snapshot.get("total_balance"),
-        "okx_cash_balance": okx_snapshot.get("cash_balance"),
-        "okx_equity_balance": okx_snapshot.get("equity_balance"),
-        "okx_used_balance": okx_snapshot.get("used_balance"),
-        "max_allocatable_balance": okx_allocatable if okx_allocatable is not None else 0.0,
-        "allocation_exceeds_balance": False,
-        "risk_floor": risk_floor,
-        "risk_paused": bool(pause_reason),
-        "risk_pause_reason": pause_reason,
-    })
+    status.update(
+        {
+            "allocated_balance": account_equity,
+            "account_equity": account_equity,
+            "max_loss_usdt": max_loss_usdt,
+            "available_balance": okx_available,
+            "equity": okx_snapshot.get("total_balance"),
+            "used_margin": okx_snapshot.get("used_balance"),
+            "unrealized_pnl": pnl_summary.get("unrealized_pnl", 0.0),
+            "realized_profit": pnl_summary.get("realized_profit", 0.0),
+            "realized_loss": pnl_summary.get("realized_loss", 0.0),
+            "realized_pnl": pnl_summary.get("realized_pnl", 0.0),
+            "today_realized_profit": pnl_summary.get("today_realized_profit", 0.0),
+            "today_realized_loss": pnl_summary.get("today_realized_loss", 0.0),
+            "today_realized_pnl": pnl_summary.get("today_realized_pnl", 0.0),
+            "today_closed_realized_profit": pnl_summary.get("today_closed_realized_profit", 0.0),
+            "today_closed_realized_loss": pnl_summary.get("today_closed_realized_loss", 0.0),
+            "today_closed_realized_pnl": pnl_summary.get("today_closed_realized_pnl", 0.0),
+            "today_equity_pnl": pnl_summary.get("today_equity_pnl", 0.0),
+            "today_equity_baseline": pnl_summary.get("today_equity_baseline"),
+            "today_equity_baseline_total_pnl": pnl_summary.get("today_equity_baseline_total_pnl"),
+            "today_equity_baseline_at": pnl_summary.get("today_equity_baseline_at"),
+            "today_equity_baseline_source": pnl_summary.get("today_equity_baseline_source"),
+            "today_snapshot_date": pnl_summary.get("today_snapshot_date"),
+            "today_total_pnl": pnl_summary.get("today_total_pnl", 0.0),
+            "today_risk_pnl": pnl_summary.get("today_risk_pnl", 0.0),
+            "cumulative_profit": pnl_summary.get("realized_profit", 0.0),
+            "cumulative_loss": pnl_summary.get("realized_loss", 0.0),
+            "total_pnl": pnl_summary.get("total_pnl", 0.0),
+            "remaining_allocation": okx_available,
+            "balance_error": okx_snapshot.get("balance_error"),
+            "balance_source": okx_snapshot.get("balance_source"),
+            "okx_available_balance": okx_available,
+            "okx_total_balance": okx_snapshot.get("total_balance"),
+            "okx_cash_balance": okx_snapshot.get("cash_balance"),
+            "okx_equity_balance": okx_snapshot.get("equity_balance"),
+            "okx_used_balance": okx_snapshot.get("used_balance"),
+            "max_allocatable_balance": okx_allocatable if okx_allocatable is not None else 0.0,
+            "allocation_exceeds_balance": False,
+            "risk_floor": risk_floor,
+            "risk_paused": bool(pause_reason),
+            "risk_pause_reason": pause_reason,
+        }
+    )
     if mode == "paper":
         summary = await _paper_execution_account_summary()
-        status.update({
-            "paper_execution_available_balance": okx_available,
-            "paper_execution_equity": summary.get("equity"),
-            "paper_execution_used_margin": summary.get("used_margin"),
-            "paper_execution_unrealized_pnl": pnl_summary.get("unrealized_pnl"),
-            "initial_balance": account_equity,
-        })
+        status.update(
+            {
+                "paper_execution_available_balance": okx_available,
+                "paper_execution_equity": summary.get("equity"),
+                "paper_execution_used_margin": summary.get("used_margin"),
+                "paper_execution_unrealized_pnl": pnl_summary.get("unrealized_pnl"),
+                "initial_balance": account_equity,
+            }
+        )
         return status
 
     return status
@@ -293,7 +355,9 @@ async def _sync_execution_account_to_paper_account() -> None:
             account.unrealized_pnl = 0.0
         await session.flush()
         if _dash._trading_service and _dash._trading_service.paper_executor:
-            _dash._trading_service.paper_executor._balances[ENSEMBLE_TRADER_NAME] = account.current_balance
+            _dash._trading_service.paper_executor._balances[ENSEMBLE_TRADER_NAME] = (
+                account.current_balance
+            )
 
 
 async def _sync_models_to_running_services() -> None:
@@ -302,6 +366,7 @@ async def _sync_models_to_running_services() -> None:
         return
 
     import structlog
+
     log = structlog.get_logger(__name__)
 
     from db.repositories.account_repo import AccountRepository
@@ -327,10 +392,13 @@ async def _sync_models_to_running_services() -> None:
     if _dash._competition_service:
         _dash._competition_service.set_active_models([ENSEMBLE_TRADER_NAME])
         rankings = await _dash._competition_service.evaluate_all_models(force=True)
-        log.info("rankings updated", count=len(rankings), models=[r["model_name"] for r in rankings])
+        log.info(
+            "rankings updated", count=len(rankings), models=[r["model_name"] for r in rankings]
+        )
 
 
 # ── OKX Settings (split paper / live) ──
+
 
 @router.get("/settings/okx")
 async def get_okx_settings():
@@ -360,7 +428,11 @@ async def update_okx_settings(req: OKXSettingsRequest):
     if req.api_key is not None and req.api_key.strip() and not _is_masked_secret(req.api_key):
         updates[f"{prefix}_API_KEY"] = req.api_key.strip()
         setattr(settings, f"okx_{req.mode}_api_key", req.api_key.strip())
-    if req.api_secret is not None and req.api_secret.strip() and not _is_masked_secret(req.api_secret):
+    if (
+        req.api_secret is not None
+        and req.api_secret.strip()
+        and not _is_masked_secret(req.api_secret)
+    ):
         updates[f"{prefix}_API_SECRET"] = req.api_secret.strip()
         setattr(settings, f"okx_{req.mode}_api_secret", req.api_secret.strip())
     if req.passphrase is not None and not _is_masked_secret(req.passphrase):
@@ -378,8 +450,12 @@ async def update_okx_settings(req: OKXSettingsRequest):
         if _dash._data_service:
             try:
                 await _dash._data_service.rest_client.reinitialize()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "failed to reinitialize data service after OKX credential update",
+                    mode=req.mode,
+                    error=_connection_error_text(exc),
+                )
     if _dash._trading_service:
         from executor.okx_executor import OKXExecutor
 
@@ -388,13 +464,22 @@ async def update_okx_settings(req: OKXSettingsRequest):
         if old_executor:
             try:
                 await old_executor.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "failed to shutdown previous OKX executor after credential update",
+                    mode=req.mode,
+                    error=_connection_error_text(exc),
+                )
         new_executor = OKXExecutor(mode=req.mode)
         try:
             await new_executor.initialize()
             setattr(_dash._trading_service, attr, new_executor)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "failed to initialize OKX executor after credential update",
+                mode=req.mode,
+                error=_connection_error_text(exc),
+            )
             setattr(_dash._trading_service, attr, None)
 
     return {
@@ -425,7 +510,7 @@ async def test_okx_connection(req: OKXTestRequest):
         if snapshot.get("error"):
             return {
                 "success": False,
-                "error": f"连接失败: {snapshot.get('error')}",
+                "error": f"连接失败: {_connection_error_text(snapshot.get('error'))}",
             }
         usdt = float(snapshot.get("free") or 0.0)
         used = float(snapshot.get("used") or 0.0)
@@ -447,13 +532,20 @@ async def test_okx_connection(req: OKXTestRequest):
             "equity_balance": equity,
             "allocatable_balance": allocatable,
         }
-    except Exception as e:
+    except Exception as exc:
         return {
             "success": False,
-            "error": f"连接失败: {e}",
+            "error": f"连接失败: {_connection_error_text(exc)}",
         }
     finally:
-        await executor.shutdown()
+        try:
+            await executor.shutdown()
+        except Exception as exc:
+            logger.debug(
+                "OKX executor shutdown failed after connection test",
+                mode=req.mode,
+                error=_connection_error_text(exc),
+            )
 
 
 @router.get("/settings/okx/balance")
@@ -466,9 +558,11 @@ async def get_okx_balances():
         if not creds.get("api_key"):
             result[f"{mode}_error"] = "未配置API密钥"
             continue
-        bal = await _get_okx_usdt_balance(mode)
-        if bal is not None:
-            result[mode] = bal
+        snapshot = await _get_okx_usdt_snapshot(mode)
+        if snapshot.get("balance_error"):
+            result[f"{mode}_error"] = snapshot.get("balance_error")
+        elif snapshot.get("allocatable_balance") is not None:
+            result[mode] = snapshot.get("allocatable_balance")
         else:
             result[f"{mode}_error"] = "查询失败"
 
@@ -526,6 +620,7 @@ async def update_execution_account_settings(req: ExecutionAccountRequest):
 
 # ── AI Model CRUD ──
 
+
 @router.get("/settings/ai-models")
 async def get_ai_models():
     """Return fixed expert model slots with api_key masked.
@@ -571,15 +666,19 @@ async def add_ai_model_fixed(req: AIModelRequest):
 async def update_ai_model_fixed(name: str, req: AIModelRequest):
     """Update one fixed expert model slot."""
     try:
-        updates = {
-            "api_base": req.api_base,
-            "model": req.model,
-        }
-        if req.api_key is not None and req.api_key.strip():
+        updates: dict[str, Any] = {}
+        if req.api_base is not None:
+            updates["api_base"] = _normalize_api_base_or_400(
+                req.api_base,
+                field_name="AI model API base",
+            )
+        if req.model is not None:
+            updates["model"] = req.model
+        if req.api_key is not None and req.api_key.strip() and not _is_masked_secret(req.api_key):
             updates["api_key"] = req.api_key
         updated = settings.set_fixed_ai_model(name, updates)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=404, detail=safe_error_text(e)) from e
 
     settings.update_env_file({"AI_MODELS": json.dumps(settings.ai_models, ensure_ascii=False)})
     await _sync_models_to_running_services()
@@ -589,7 +688,9 @@ async def update_ai_model_fixed(name: str, req: AIModelRequest):
 @router.delete("/settings/ai-models/{name}")
 async def delete_ai_model_fixed(name: str):
     """Fixed expert slots cannot be deleted."""
-    raise HTTPException(status_code=400, detail="固定专家模型不能删除，只能清空 Key 或修改模型配置。")
+    raise HTTPException(
+        status_code=400, detail="固定专家模型不能删除，只能清空 Key 或修改模型配置。"
+    )
 
 
 @router.post("/settings/ai-models")
@@ -610,11 +711,11 @@ async def add_ai_model(req: AIModelRequest):
         okx_balance = await _get_okx_usdt_balance(mode)
         if okx_balance is not None:
             same_mode_models = [
-                m for m in settings.ai_models
-                if m.get("execution_mode", "paper") == mode
+                m for m in settings.ai_models if m.get("execution_mode", "paper") == mode
             ]
             current_total = sum(
-                float(m.get("balance", 0)) for m in same_mode_models
+                float(m.get("balance", 0))
+                for m in same_mode_models
                 if isinstance(m.get("balance"), (int, float))
             )
             if current_total + req.balance > okx_balance:
@@ -628,9 +729,12 @@ async def add_ai_model(req: AIModelRequest):
                     ),
                 )
 
-    new_model = {
+    new_model: dict[str, Any] = {
         "name": req.name.strip(),
-        "api_base": (req.api_base or "").strip(),
+        "api_base": _normalize_api_base_or_400(
+            req.api_base,
+            field_name="AI model API base",
+        ),
         "api_key": (req.api_key or "").strip(),
         "model": (req.model or "gpt-4").strip(),
         "execution_mode": mode,
@@ -659,8 +763,15 @@ async def update_ai_model(name: str, req: AIModelRequest):
             if req.name and req.name.strip() and req.name.strip() != name:
                 updated["name"] = req.name.strip()
             if req.api_base is not None:
-                updated["api_base"] = req.api_base.strip()
-            if req.api_key is not None and req.api_key.strip():
+                updated["api_base"] = _normalize_api_base_or_400(
+                    req.api_base,
+                    field_name="AI model API base",
+                )
+            if (
+                req.api_key is not None
+                and req.api_key.strip()
+                and not _is_masked_secret(req.api_key)
+            ):
                 updated["api_key"] = req.api_key.strip()
             if req.model is not None and req.model.strip():
                 updated["model"] = req.model.strip()
@@ -672,7 +783,8 @@ async def update_ai_model(name: str, req: AIModelRequest):
                     okx_balance = await _get_okx_usdt_balance(mode)
                     if okx_balance is not None:
                         others_total = sum(
-                            float(m2.get("balance", 0)) for m2 in settings.ai_models
+                            float(m2.get("balance", 0))
+                            for m2 in settings.ai_models
                             if isinstance(m2.get("balance"), (int, float))
                             and m2.get("name") != name
                             and m2.get("execution_mode", "paper") == mode
@@ -696,7 +808,11 @@ async def update_ai_model(name: str, req: AIModelRequest):
                 env_updates["MODEL_INITIAL_BALANCES"] = json.dumps(settings.model_initial_balances)
             settings.update_env_file(env_updates)
             await _sync_models_to_running_services()
-            return {"status": "ok", "message": f"Model '{name}' updated.", "model": _masked(updated)}
+            return {
+                "status": "ok",
+                "message": f"Model '{name}' updated.",
+                "model": _masked(updated),
+            }
 
     raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
 
@@ -717,12 +833,14 @@ async def delete_ai_model(name: str):
         settings.ai_api_key = ""
         settings.ai_api_base = ""
         settings.ai_model = ""
-        settings.update_env_file({
-            "AI_MODELS": "[]",
-            "AI_API_KEY": "",
-            "AI_API_BASE": "",
-            "AI_MODEL": "",
-        })
+        settings.update_env_file(
+            {
+                "AI_MODELS": "[]",
+                "AI_API_KEY": "",
+                "AI_API_BASE": "",
+                "AI_MODEL": "",
+            }
+        )
         await _sync_models_to_running_services()
         return {"status": "ok", "message": f"Legacy model '{name}' cleared."}
 
@@ -750,27 +868,49 @@ async def test_ai_model_connection(req: AIModelTestRequest):
     api_key = api_key or settings.ai_api_key
     model = model or settings.ai_model
 
+    try:
+        api_base = normalize_http_base_url(
+            api_base,
+            field_name="AI model API base",
+        )
+    except ValueError as exc:
+        return {"success": False, "error": _connection_error_text(exc), "model": model}
+
     if not api_key:
         return {"success": False, "error": "No API key configured"}
 
     try:
-        from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage
+        from langchain_openai import ChatOpenAI
+
+        llm_kwargs: dict[str, Any] = {
+            "base_url": api_base,
+            "api_key": api_key,
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 10,
+            "timeout": 15,
+            "max_retries": 0,
+        }
+        if uses_thinking_tags(model):
+            llm_kwargs["extra_body"] = non_thinking_extra_body()
+            prompt = ensure_no_think_text("Hi")
+        else:
+            prompt = "Hi"
 
         llm = ChatOpenAI(
-            base_url=api_base,
-            api_key=api_key,
-            model=model,
-            temperature=0,
-            max_tokens=10,
-            timeout=15,
-            max_retries=0,
+            **llm_kwargs,
         )
-        response = await llm.ainvoke([HumanMessage(content="Hi")])
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
         content = response.content if hasattr(response, "content") else str(response)
-        return {"success": True, "message": f"Connection OK. Response: {content[:100]}", "model": model}
-    except Exception as e:
-        return {"success": False, "error": str(e), "model": model}
+        safe_content = redact_output(content)[:100]
+        return {
+            "success": True,
+            "message": f"Connection OK. Response: {safe_content}",
+            "model": model,
+        }
+    except Exception as exc:
+        return {"success": False, "error": _connection_error_text(exc), "model": model}
 
 
 class IntervalRequest(BaseModel):
@@ -784,10 +924,16 @@ class ThresholdsRequest(BaseModel):
     local_ai_tools_enabled: bool | None = None
     local_ai_tools_api_base: str | None = None
     local_ai_tools_timeout_seconds: float | None = None
+    local_ai_tools_circuit_breaker_failures: int | None = None
+    local_ai_tools_circuit_breaker_cooldown_seconds: float | None = None
     high_risk_review_enabled: bool | None = None
     high_risk_review_api_base: str | None = None
     high_risk_review_api_key: str | None = None
     high_risk_review_model: str | None = None
+    high_risk_review_timeout_seconds: float | None = None
+    high_risk_review_max_tokens: int | None = None
+    high_risk_review_circuit_breaker_failures: int | None = None
+    high_risk_review_circuit_breaker_cooldown_seconds: float | None = None
 
 
 @router.get("/settings/thresholds")
@@ -804,11 +950,19 @@ async def get_thresholds():
         "local_ai_tools_enabled": settings.local_ai_tools_enabled,
         "local_ai_tools_api_base": settings.local_ai_tools_api_base,
         "local_ai_tools_timeout_seconds": settings.local_ai_tools_timeout_seconds,
+        "local_ai_tools_circuit_breaker_failures": settings.local_ai_tools_circuit_breaker_failures,
+        "local_ai_tools_circuit_breaker_cooldown_seconds": settings.local_ai_tools_circuit_breaker_cooldown_seconds,
         "high_risk_review_enabled": settings.high_risk_review_enabled,
         "high_risk_review_api_base": settings.high_risk_review_api_base,
         "high_risk_review_api_key": mask_secret(settings.high_risk_review_api_key),
         "high_risk_review_has_api_key": bool(settings.high_risk_review_api_key),
         "high_risk_review_model": settings.high_risk_review_model,
+        "high_risk_review_timeout_seconds": settings.high_risk_review_timeout_seconds,
+        "high_risk_review_max_tokens": settings.high_risk_review_max_tokens,
+        "high_risk_review_token_floor": HIGH_RISK_REVIEW_TOKEN_FLOOR,
+        "high_risk_review_token_cap": HIGH_RISK_REVIEW_TOKEN_CAP,
+        "high_risk_review_circuit_breaker_failures": settings.high_risk_review_circuit_breaker_failures,
+        "high_risk_review_circuit_breaker_cooldown_seconds": settings.high_risk_review_circuit_breaker_cooldown_seconds,
         "total_margin_limit_pct": total_margin_limit_pct,
     }
 
@@ -839,21 +993,57 @@ async def update_thresholds(req: ThresholdsRequest):
         updates["LOCAL_AI_TOOLS_ENABLED"] = "true" if settings.local_ai_tools_enabled else "false"
 
     if req.local_ai_tools_api_base is not None:
-        settings.local_ai_tools_api_base = req.local_ai_tools_api_base.strip()
+        settings.local_ai_tools_api_base = _normalize_api_base_or_400(
+            req.local_ai_tools_api_base,
+            field_name="Local AI tools API base",
+        )
         updates["LOCAL_AI_TOOLS_API_BASE"] = settings.local_ai_tools_api_base
 
     if req.local_ai_tools_timeout_seconds is not None:
         if req.local_ai_tools_timeout_seconds < 0.2 or req.local_ai_tools_timeout_seconds > 15:
-            raise HTTPException(status_code=400, detail="Local AI tools timeout must be between 0.2 and 15 seconds")
+            raise HTTPException(
+                status_code=400, detail="Local AI tools timeout must be between 0.2 and 15 seconds"
+            )
         settings.local_ai_tools_timeout_seconds = float(req.local_ai_tools_timeout_seconds)
         updates["LOCAL_AI_TOOLS_TIMEOUT_SECONDS"] = str(settings.local_ai_tools_timeout_seconds)
 
+    if req.local_ai_tools_circuit_breaker_failures is not None:
+        if (
+            req.local_ai_tools_circuit_breaker_failures < 1
+            or req.local_ai_tools_circuit_breaker_failures > 20
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Local AI tools circuit breaker failures must be between 1 and 20",
+            )
+        settings.local_ai_tools_circuit_breaker_failures = int(
+            req.local_ai_tools_circuit_breaker_failures
+        )
+        updates["LOCAL_AI_TOOLS_CIRCUIT_BREAKER_FAILURES"] = str(
+            settings.local_ai_tools_circuit_breaker_failures
+        )
+
+    if req.local_ai_tools_circuit_breaker_cooldown_seconds is not None:
+        cooldown = float(req.local_ai_tools_circuit_breaker_cooldown_seconds)
+        if cooldown < 5 or cooldown > 3600:
+            raise HTTPException(
+                status_code=400,
+                detail="Local AI tools circuit breaker cooldown must be between 5 and 3600 seconds",
+            )
+        settings.local_ai_tools_circuit_breaker_cooldown_seconds = cooldown
+        updates["LOCAL_AI_TOOLS_CIRCUIT_BREAKER_COOLDOWN_SECONDS"] = str(cooldown)
+
     if req.high_risk_review_enabled is not None:
         settings.high_risk_review_enabled = bool(req.high_risk_review_enabled)
-        updates["HIGH_RISK_REVIEW_ENABLED"] = "true" if settings.high_risk_review_enabled else "false"
+        updates["HIGH_RISK_REVIEW_ENABLED"] = (
+            "true" if settings.high_risk_review_enabled else "false"
+        )
 
     if req.high_risk_review_api_base is not None:
-        settings.high_risk_review_api_base = req.high_risk_review_api_base.strip()
+        settings.high_risk_review_api_base = _normalize_api_base_or_400(
+            req.high_risk_review_api_base,
+            field_name="High-risk review API base",
+        )
         updates["HIGH_RISK_REVIEW_API_BASE"] = settings.high_risk_review_api_base
 
     if req.high_risk_review_api_key is not None:
@@ -865,6 +1055,49 @@ async def update_thresholds(req: ThresholdsRequest):
     if req.high_risk_review_model is not None:
         settings.high_risk_review_model = req.high_risk_review_model.strip()
         updates["HIGH_RISK_REVIEW_MODEL"] = settings.high_risk_review_model
+
+    if req.high_risk_review_timeout_seconds is not None:
+        timeout_seconds = float(req.high_risk_review_timeout_seconds)
+        if timeout_seconds < 5 or timeout_seconds > 120:
+            raise HTTPException(
+                status_code=400,
+                detail="High-risk review timeout must be between 5 and 120 seconds",
+            )
+        settings.high_risk_review_timeout_seconds = timeout_seconds
+        updates["HIGH_RISK_REVIEW_TIMEOUT_SECONDS"] = str(timeout_seconds)
+
+    if req.high_risk_review_max_tokens is not None:
+        max_tokens = int(req.high_risk_review_max_tokens)
+        if max_tokens < HIGH_RISK_REVIEW_TOKEN_FLOOR or max_tokens > HIGH_RISK_REVIEW_TOKEN_CAP:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "High-risk review max tokens must be between "
+                    f"{HIGH_RISK_REVIEW_TOKEN_FLOOR} and {HIGH_RISK_REVIEW_TOKEN_CAP}"
+                ),
+            )
+        settings.high_risk_review_max_tokens = max_tokens
+        updates["HIGH_RISK_REVIEW_MAX_TOKENS"] = str(max_tokens)
+
+    if req.high_risk_review_circuit_breaker_failures is not None:
+        failures = int(req.high_risk_review_circuit_breaker_failures)
+        if failures < 1 or failures > 20:
+            raise HTTPException(
+                status_code=400,
+                detail="High-risk review circuit breaker failures must be between 1 and 20",
+            )
+        settings.high_risk_review_circuit_breaker_failures = failures
+        updates["HIGH_RISK_REVIEW_CIRCUIT_BREAKER_FAILURES"] = str(failures)
+
+    if req.high_risk_review_circuit_breaker_cooldown_seconds is not None:
+        cooldown = float(req.high_risk_review_circuit_breaker_cooldown_seconds)
+        if cooldown < 5 or cooldown > 3600:
+            raise HTTPException(
+                status_code=400,
+                detail="High-risk review circuit breaker cooldown must be between 5 and 3600 seconds",
+            )
+        settings.high_risk_review_circuit_breaker_cooldown_seconds = cooldown
+        updates["HIGH_RISK_REVIEW_CIRCUIT_BREAKER_COOLDOWN_SECONDS"] = str(cooldown)
 
     if req.total_margin_limit_pct is not None:
         if req.total_margin_limit_pct < 0.10:
@@ -890,11 +1123,19 @@ async def update_thresholds(req: ThresholdsRequest):
         "local_ai_tools_enabled": settings.local_ai_tools_enabled,
         "local_ai_tools_api_base": settings.local_ai_tools_api_base,
         "local_ai_tools_timeout_seconds": settings.local_ai_tools_timeout_seconds,
+        "local_ai_tools_circuit_breaker_failures": settings.local_ai_tools_circuit_breaker_failures,
+        "local_ai_tools_circuit_breaker_cooldown_seconds": settings.local_ai_tools_circuit_breaker_cooldown_seconds,
         "high_risk_review_enabled": settings.high_risk_review_enabled,
         "high_risk_review_api_base": settings.high_risk_review_api_base,
         "high_risk_review_api_key": mask_secret(settings.high_risk_review_api_key),
         "high_risk_review_has_api_key": bool(settings.high_risk_review_api_key),
         "high_risk_review_model": settings.high_risk_review_model,
+        "high_risk_review_timeout_seconds": settings.high_risk_review_timeout_seconds,
+        "high_risk_review_max_tokens": settings.high_risk_review_max_tokens,
+        "high_risk_review_token_floor": HIGH_RISK_REVIEW_TOKEN_FLOOR,
+        "high_risk_review_token_cap": HIGH_RISK_REVIEW_TOKEN_CAP,
+        "high_risk_review_circuit_breaker_failures": settings.high_risk_review_circuit_breaker_failures,
+        "high_risk_review_circuit_breaker_cooldown_seconds": settings.high_risk_review_circuit_breaker_cooldown_seconds,
         "total_margin_limit_pct": total_margin_limit_pct,
     }
 

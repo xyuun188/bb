@@ -17,6 +17,7 @@ const state = {
     accounts: [],
     aiExpertModels: [],
     riskEvents: [],
+    riskEventsPage: 1,
     tradeMode: 'paper',
     availableSymbolCount: 0,
     activeSymbols: [],
@@ -67,6 +68,7 @@ const state = {
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
+const RISK_ALERT_PAGE_SIZE = 10;
 const ML_SIGNAL_PAGE_SIZE = 10;
 const PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE = 10;
 const FIXED_AI_EXPERT_FALLBACKS = [
@@ -257,6 +259,30 @@ function initThemeToggle() {
 }
 
 // --- API Calls ---
+const DASHBOARD_ADMIN_KEY_STORAGE_KEYS = [
+    'dashboard_admin_api_key',
+    'dashboardAdminApiKey',
+];
+
+function getDashboardAdminKey() {
+    for (const key of DASHBOARD_ADMIN_KEY_STORAGE_KEYS) {
+        try {
+            const value = sessionStorage.getItem(key);
+            if (value && value.trim()) return value.trim();
+        } catch (_) {}
+    }
+    return '';
+}
+
+function dashboardWriteOptions(options = {}) {
+    const headers = { ...(options.headers || {}) };
+    const adminKey = getDashboardAdminKey();
+    if (adminKey && !headers.Authorization && !headers['X-Dashboard-Admin-Key']) {
+        headers['X-Dashboard-Admin-Key'] = adminKey;
+    }
+    return { ...options, headers };
+}
+
 async function fetchJSON(url) {
     try {
         const res = await fetch(url, { cache: 'no-store' });
@@ -389,28 +415,6 @@ async function fetchTrades() {
     const data = await fetchJSON(`/api/trades?limit=${PAGE_SIZE}&mode=${state.mode}&page=${state.tradesPage}`);
     if (!data) return;
     updateTradeTable(data.trades || [], state.mode, data.total ?? data.count);
-}
-
-async function fetchPositions() {
-    const requestToken = ++positionsRequestToken;
-    const data = await fetchJSON(`/api/dashboard/positions?mode=${state.mode}&page=${state.positionsPage}&page_size=${PAGE_SIZE}`);
-    if (!data) return;
-    if (requestToken !== positionsRequestToken) return;
-    state.positionsPage = data.page || state.positionsPage;
-    state.positionsTotal = data.total || 0;
-    updatePositionsTable(
-        data.positions || [],
-        state.positionsPage,
-        data.total_pages || 1,
-        data.total || 0,
-    );
-    // Update badge
-    const badge = document.getElementById('position-badge');
-    if (badge) {
-        const total = Number(data.total ?? data.count ?? 0);
-        badge.textContent = total;
-        badge.style.display = total > 0 ? '' : 'none';
-    }
 }
 
 async function fetchPositionTickerSnapshot() {
@@ -550,164 +554,6 @@ function updateTickers(tickers, options = {}) {
                 <div class="ticker-sym">${sym}</div>
                 <div class="ticker-price">${fmtPrice(price)}</div>
                 <div class="ticker-chg ${isUp ? 'ticker-up' : 'ticker-down'}">${isUp ? '+' : ''}${fmtPct(change)}</div>
-            </div>
-        `;
-    }).join('');
-}
-
-function updateModelRankings(rankings) {
-    state.rankings = rankings;
-    const container = document.getElementById('ranking-list');
-    if (!container) return;
-
-    if (!rankings.length) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无排名数据</div>';
-        return;
-    }
-
-    container.innerHTML = rankings.map((r, i) => {
-        const posCls = i === 0 ? 'rank-1' : i === 1 ? 'rank-2' : i === 2 ? 'rank-3' : 'rank-o';
-        return `
-        <div class="rank-item">
-            <div class="rank-pos ${posCls}">${i + 1}</div>
-            <div class="rank-body">
-                <div class="rank-name">${r.model_name}</div>
-                <div class="rank-bar"><div class="rank-bar-inner" style="width:${Math.max(r.composite_score * 100, 2)}%"></div></div>
-                <div class="rank-meta">
-                    <span>胜率 ${r.win_rate.toFixed(0)}%</span>
-                    <span>夏普 ${r.sharpe_ratio}</span>
-                    <span>交易 ${r.total_trades}</span>
-                    <span>回撤 ${r.max_drawdown.toFixed(1)}%</span>
-                </div>
-            </div>
-            <div class="rank-pnl" style="color:${r.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)'}">
-                ${r.pnl_pct >= 0 ? '+' : ''}${r.pnl_pct.toFixed(2)}%
-            </div>
-        </div>
-    `}).join('');
-
-    const liveSpan = document.getElementById('live-model-name');
-    if (liveSpan) {
-        liveSpan.textContent = state.liveModel || (rankings[0]?.model_name || '未选择');
-    }
-}
-
-function updateAccounts(accounts) {
-    state.accounts = accounts;
-    const container = document.getElementById('account-list');
-    if (!container) return;
-
-    // Update positions badge from accounts
-    const totalPositions = accounts.reduce((sum, a) => sum + (a.open_positions || 0), 0);
-    const posBadge = document.getElementById('position-badge');
-    if (posBadge) {
-        posBadge.textContent = totalPositions;
-        posBadge.style.display = totalPositions > 0 ? '' : 'none';
-    }
-
-    if (!accounts.length) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无账户</div>';
-        return;
-    }
-
-    container.innerHTML = accounts.map(a => {
-        const walletBalance = a.wallet_balance ?? a.balance ?? a.current_balance ?? 0;
-        const initialBalance = a.initial_balance ?? 0;
-        return `
-            <div class="acct-row">
-                <div>
-                    <div class="acct-name">${a.model_name}</div>
-                    <div style="font-size:12px;color:var(--text);font-weight:700;">当前余额 ${fmtNum(walletBalance)} USDT</div>
-                    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">初始 ${fmtNum(initialBalance)} USDT</div>
-                </div>
-            </div>
-        `;
-        return `
-            <div class="acct-row">
-                <div>
-                    <div class="acct-name">${a.model_name}</div>
-                    <div style="font-size:12px;color:var(--text);font-weight:700;">当前余额 ${fmtNum(walletBalance)} USDT</div>
-                    <div style="font-size:12px;color:var(--text);font-weight:700;">剩余余额 ${fmtNum(remainingBalance)} USDT</div>
-                    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">初始 ${fmtNum(initialBal)} | 保证金 ${fmtNum(usedMargin)} | 权益 ${fmtNum(equity)}</div>
-                    <div style="font-size:10px;color:${unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)'};margin-top:2px;">浮盈亏 ${fmtNum(unrealizedPnl)}</div>
-                    <div style="font-size:10px;color:var(--text-muted);">初始 ${fmtNum(initialBal)} USDT</div>
-                </div>
-            </div>
-        `;
-    }).join('').replace(/<div style="font-size:10px;color:var\(--text-muted\);">[^<]*USDT<\/div>/g, '');
-}
-
-function updateAccounts(accounts) {
-    state.accounts = accounts;
-    const container = document.getElementById('account-list');
-    if (!container) return;
-
-    const totalPositions = accounts.reduce((sum, a) => sum + (a.open_positions || 0), 0);
-    const posBadge = document.getElementById('position-badge');
-    if (posBadge) {
-        posBadge.textContent = totalPositions;
-        posBadge.style.display = totalPositions > 0 ? '' : 'none';
-    }
-
-    if (!accounts.length) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无账户</div>';
-        return;
-    }
-
-    container.innerHTML = accounts.map(a => {
-        const walletBalance = a.wallet_balance ?? a.balance ?? a.current_balance ?? 0;
-        const initialBalance = a.initial_balance ?? 0;
-        const unrealizedPnl = Number(a.display_unrealized_pnl ?? a.unrealized_pnl ?? 0);
-        const pnlColor = unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)';
-        return `
-            <div class="acct-row">
-                <div class="acct-main">
-                    <div class="acct-name">${a.model_name}</div>
-                    <div style="font-size:12px;color:var(--text);font-weight:700;">当前余额 ${fmtNum(walletBalance)} USDT</div>
-                    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">初始 ${fmtNum(initialBalance)} USDT</div>
-                </div>
-                <div class="acct-side">
-                    <div class="acct-side-label">浮动收益</div>
-                    <div class="acct-side-value" style="color:${pnlColor};">${unrealizedPnl >= 0 ? '+' : ''}${fmtNum(unrealizedPnl)} USDT</div>
-                </div>
-            </div>
-        `;
-    }).join('');
-}
-
-function updateAccounts(accounts) {
-    state.accounts = accounts;
-    const container = document.getElementById('account-list');
-    if (!container) return;
-
-    const totalPositions = accounts.reduce((sum, a) => sum + (a.open_positions || 0), 0);
-    const posBadge = document.getElementById('position-badge');
-    if (posBadge) {
-        posBadge.textContent = totalPositions;
-        posBadge.style.display = totalPositions > 0 ? '' : 'none';
-    }
-
-    if (!accounts.length) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">\u6682\u65e0\u8d26\u6237</div>';
-        return;
-    }
-
-    container.innerHTML = accounts.map(a => {
-        const walletBalance = a.wallet_balance ?? a.balance ?? a.current_balance ?? 0;
-        const initialBalance = a.initial_balance ?? 0;
-        const unrealizedPnl = Number(a.display_unrealized_pnl ?? a.unrealized_pnl ?? 0);
-        const pnlColor = unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)';
-        return `
-            <div class="acct-row">
-                <div class="acct-main">
-                    <div class="acct-name">${a.model_name}</div>
-                    <div style="font-size:12px;color:var(--text);font-weight:700;">当前余额 ${fmtNum(walletBalance)} USDT</div>
-                    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">初始 ${fmtNum(initialBalance)} USDT</div>
-                </div>
-                <div class="acct-side">
-                    <div class="acct-side-label">浮动收益</div>
-                    <div class="acct-side-value" style="color:${pnlColor};">${unrealizedPnl >= 0 ? '+' : ''}${fmtNum(unrealizedPnl)} USDT</div>
-                </div>
             </div>
         `;
     }).join('');
@@ -1047,64 +893,9 @@ function renderRecentExecutions(executions, total) {
     `;
 }
 
-function updateTradeTable(trades, mode, total) {
-    state.allTrades = trades || [];
-    state.tradesPageMode = mode || state.tradeMode;
-
-    const badge = document.getElementById('trade-badge');
-    state.tradesTotal = Number(total ?? state.allTrades.length);
-    if (badge) badge.textContent = state.tradesTotal;
-
-    renderTradePage();
-}
-
-function renderTradePage() {
-    const tbody = document.getElementById('trades-tbody');
-    if (!tbody) return;
-
-    const filtered = state.tradesPageMode
-        ? state.allTrades.filter(t => t.mode === state.tradesPageMode)
-        : state.allTrades;
-
-    if (!filtered.length) {
-        const modeLabel = state.tradesPageMode === 'live' ? '实盘' : '模拟盘';
-        tbody.innerHTML = `<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无${modeLabel}交易记录</td></tr>`;
-        document.getElementById('trades-pagination').style.display = 'none';
-        return;
-    }
-
-    const totalPages = Math.ceil((state.tradesTotal || filtered.length) / PAGE_SIZE);
-    const page = Math.min(state.tradesPage, totalPages);
-    const pageData = filtered;
-
-    tbody.innerHTML = pageData.map(t => {
-        const time = t.filled_at || t.timestamp || t.created_at || '';
-        const timeStr = toBeijingTime(time);
-        const reason = t.reason || '-';
-        return `
-        <tr>
-            <td>${t.model_name || '-'}</td>
-            <td>${t.symbol || '-'}</td>
-            <td>${executionActionCell(t)}</td>
-            <td>${fmtNum(t.quantity)}</td>
-            <td>${fmtPrice(t.price)}</td>
-            <td>${statusLabel(t.status)}</td>
-            <td title="${escHtml(reason)}" style="max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-muted);">${escHtml(reason)}</td>
-            <td style="font-size:10px;color:var(--text-muted);">${timeStr}</td>
-        </tr>
-    `}).join('');
-
-    renderPagination('trades-pagination', page, totalPages, state.tradesTotal || filtered.length, 'changeTradePage');
-}
-
 function changeTradePage(page) {
     state.tradesPage = page;
     fetchTrades();
-}
-
-function changePositionsPage(page) {
-    state.positionsPage = page;
-    fetchPositions();
 }
 
 function updateStats(stats) {
@@ -1144,7 +935,257 @@ function formatRiskAlertText(event) {
     return `[${type}]${symbol} ${message}`;
 }
 
+function riskAlertMessage(event) {
+    const details = event?.message || event?.warning || event?.reason || event?.details;
+    if (typeof details === 'string') return details.trim();
+    if (details && typeof details === 'object') {
+        for (const key of ['message', 'warning', 'reason', 'details']) {
+            if (typeof details[key] === 'string' && details[key].trim()) {
+                return details[key].trim();
+            }
+        }
+        return Object.entries(details)
+            .filter(([, value]) => value !== null && value !== undefined && value !== '')
+            .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+            .join(' | ');
+    }
+    return formatRiskAlertText(event);
+}
+
+function riskAlertMatch(text, pattern) {
+    const match = String(text || '').match(pattern);
+    return match && match[1] ? match[1].trim() : '';
+}
+
+function riskAlertSeverity(event) {
+    const value = String(event?.severity || event?.level || '').toLowerCase();
+    if (['critical', 'high', 'error', 'danger'].includes(value)) return 'critical';
+    if (['warn', 'warning', 'medium'].includes(value)) return 'warning';
+    return 'info';
+}
+
+function riskAlertTypeLabel(type) {
+    const labels = {
+        position_review_warning: '持仓复盘预警',
+        risk_alert: '风险告警',
+        circuit_breaker: '风险熔断',
+        stop_loss: '止损风险',
+        margin_warning: '保证金提醒',
+        black_swan: '极端风险',
+    };
+    return labels[type] || type || '风险事件';
+}
+
+function riskAlertActionLabel(action) {
+    const text = String(action || '').trim();
+    const normalized = text.toLowerCase();
+    if (!text) return '-';
+    if (normalized === 'hold' || text.includes('观望') || text.includes('持有')) return '观望';
+    if (normalized === 'long' || text.includes('做多')) return '做多';
+    if (normalized === 'short' || text.includes('做空')) return '做空';
+    if (normalized === 'close_long' || text.includes('平多')) return '平多';
+    if (normalized === 'close_short' || text.includes('平空')) return '平空';
+    return text;
+}
+
+function riskAlertSideLabel(side) {
+    const value = String(side || '').toLowerCase();
+    if (value === 'long') return '多头';
+    if (value === 'short') return '空头';
+    return side || '-';
+}
+
+function riskAlertMoneyLabel(value) {
+    const n = valueNumber(value);
+    if (n === null) return '--';
+    const abs = Math.abs(n);
+    const digits = abs > 0 && abs < 0.01 ? 4 : 2;
+    return `${n >= 0 ? '+' : ''}${n.toFixed(digits)} U`;
+}
+
+function parseRiskAlert(event) {
+    const message = riskAlertMessage(event);
+    const normalized = message.replace(/^Position review risk alert:\s*/i, '').trim();
+    const symbol = event?.symbol || riskAlertMatch(normalized, /\b([A-Z0-9-]+\/[A-Z0-9-]+)\b/);
+    const reason = riskAlertMatch(message, /Reason=(.*?)(?:\.\s*Final review action=|$)/is);
+    return {
+        id: event?.id,
+        type: event?.event_type || event?.type || 'risk_alert',
+        severity: riskAlertSeverity(event),
+        symbol,
+        side: riskAlertMatch(normalized, /\bcurrent\s+(long|short)\b/i),
+        entry: riskAlertMatch(normalized, /\bentry=([-+]?\d+(?:\.\d+)?)/i),
+        quantity: riskAlertMatch(normalized, /\bqty=([-+]?\d+(?:\.\d+)?)/i),
+        pnl: riskAlertMatch(normalized, /\bpnl=([-+]?\d+(?:\.\d+)?)/i),
+        expertAction: riskAlertMatch(message, /Risk expert action=([^,.]+)/i),
+        confidence: riskAlertMatch(message, /\bconfidence=([0-9.]+%?)/i),
+        finalAction: riskAlertMatch(message, /Final review action=([^.]*)/i),
+        systemAction: riskAlertMatch(message, /system_action=([^.]*)/i),
+        result: riskAlertMatch(message, /result=(.*)$/is),
+        reason,
+        message: normalized,
+        createdAt: event?.created_at,
+    };
+}
+
+function riskAlertMetric(label, value, tone = 'muted') {
+    if (value === undefined || value === null || value === '') return '';
+    return `
+        <div class="risk-alert-metric risk-alert-metric-${tone}">
+            <span>${escHtml(label)}</span>
+            <strong>${escHtml(value)}</strong>
+        </div>
+    `;
+}
+
+function riskAlertReasonHtml(reason) {
+    const parts = String(reason || '')
+        .split(/[；;]/)
+        .map(part => part.replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 4);
+    if (!parts.length) return '';
+    return `
+        <div class="risk-alert-reason">
+            ${parts.map(part => {
+                const [label, ...rest] = part.split(/[:：]/);
+                const body = rest.join('：').trim();
+                return body
+                    ? `<span><em>${escHtml(label)}</em>${escHtml(body)}</span>`
+                    : `<span>${escHtml(part)}</span>`;
+            }).join('')}
+        </div>
+    `;
+}
+
+function renderRiskAlertItem(event) {
+    const item = parseRiskAlert(event);
+    const pnl = valueNumber(item.pnl);
+    const pnlTone = pnl === null ? 'muted' : pnl < 0 ? 'bad' : pnl > 0 ? 'good' : 'muted';
+    const severityLabel = item.severity === 'critical' ? '严重' : item.severity === 'warning' ? '提醒' : '记录';
+    const time = toBeijingTime(item.createdAt);
+    const action = riskAlertActionLabel(item.expertAction || item.finalAction || item.systemAction);
+    const finalAction = riskAlertActionLabel(item.finalAction);
+    const systemAction = riskAlertActionLabel(item.systemAction);
+    const metrics = [
+        riskAlertMetric('方向', riskAlertSideLabel(item.side), 'muted'),
+        riskAlertMetric('入场', item.entry ? fmtPrice(item.entry) : '', 'muted'),
+        riskAlertMetric('数量', item.quantity ? fmtNum(item.quantity) : '', 'muted'),
+        riskAlertMetric('PnL', item.pnl ? riskAlertMoneyLabel(item.pnl) : '', pnlTone),
+        riskAlertMetric('置信度', item.confidence, 'muted'),
+    ].join('');
+    const result = item.result || item.message;
+
+    return `
+        <div class="risk-alert-item risk-alert-${item.severity}" data-id="${escHtml(item.id ?? '')}" role="listitem">
+            <div class="risk-alert-head">
+                <div class="risk-alert-title">
+                    <span class="risk-alert-dot"></span>
+                    <strong>${escHtml(item.symbol || '全局风险')}</strong>
+                    <span>${escHtml(riskAlertTypeLabel(item.type))}</span>
+                    <em>${escHtml(severityLabel)}</em>
+                </div>
+                <time>${escHtml(time || '-')}</time>
+            </div>
+            <div class="risk-alert-metrics">${metrics}</div>
+            <div class="risk-alert-flow">
+                <div><span>风控专家</span><strong>${escHtml(action)}${item.confidence ? ` / ${escHtml(item.confidence)}` : ''}</strong></div>
+                <div><span>复盘结论</span><strong>${escHtml(finalAction)}</strong></div>
+                <div><span>系统动作</span><strong>${escHtml(systemAction)}</strong></div>
+            </div>
+            ${riskAlertReasonHtml(item.reason)}
+            <div class="risk-alert-result">${escHtml(result || '暂无详情')}</div>
+        </div>
+    `;
+}
+
+function updateRiskAlertCounters(count) {
+    const countEl = document.getElementById('alert-count');
+    const badgeEl = document.getElementById('alert-badge');
+    if (countEl) countEl.textContent = count;
+    if (badgeEl) badgeEl.textContent = count;
+}
+
+function renderRiskAlertSummary(events) {
+    const el = document.getElementById('risk-alert-summary');
+    if (!el) return;
+    const parsed = events.map(parseRiskAlert);
+    const total = parsed.length;
+    const critical = parsed.filter(item => item.severity === 'critical').length;
+    const warning = parsed.filter(item => item.severity === 'warning').length;
+    const symbols = new Set(parsed.map(item => item.symbol).filter(Boolean));
+    const latest = parsed[0]?.createdAt ? toBeijingTime(parsed[0].createdAt) : '-';
+    el.innerHTML = `
+        <div class="risk-alert-kpi">
+            <span>总告警</span>
+            <strong>${total}</strong>
+        </div>
+        <div class="risk-alert-kpi risk-alert-kpi-critical">
+            <span>严重</span>
+            <strong>${critical}</strong>
+        </div>
+        <div class="risk-alert-kpi risk-alert-kpi-warning">
+            <span>提醒</span>
+            <strong>${warning}</strong>
+        </div>
+        <div class="risk-alert-kpi">
+            <span>涉及币种</span>
+            <strong>${symbols.size}</strong>
+        </div>
+        <div class="risk-alert-kpi risk-alert-kpi-wide">
+            <span>最新时间</span>
+            <strong>${escHtml(latest)}</strong>
+        </div>
+    `;
+}
+
+function renderRiskAlerts(events = state.riskEvents || []) {
+    const container = document.getElementById('risk-alerts');
+    if (!container) return;
+    const paginationId = 'risk-alert-pagination';
+    renderRiskAlertSummary(events);
+    updateRiskAlertCounters(events.length);
+    if (!events.length) {
+        container.innerHTML = '<div class="risk-alert-empty">暂无告警</div>';
+        renderPagination(paginationId, 1, 1, 0, 'changeRiskAlertPage');
+        return;
+    }
+    const total = events.length;
+    const totalPages = Math.max(Math.ceil(total / RISK_ALERT_PAGE_SIZE), 1);
+    const page = Math.min(Math.max(Number(state.riskEventsPage || 1), 1), totalPages);
+    state.riskEventsPage = page;
+    const start = (page - 1) * RISK_ALERT_PAGE_SIZE;
+    const pageEvents = events.slice(start, start + RISK_ALERT_PAGE_SIZE);
+    container.innerHTML = pageEvents.map(renderRiskAlertItem).join('');
+    renderPagination(paginationId, page, totalPages, total, 'changeRiskAlertPage');
+}
+
+function changeRiskAlertPage(page) {
+    state.riskEventsPage = Math.max(1, Number(page) || 1);
+    renderRiskAlerts(state.riskEvents || []);
+}
+
 function addRiskAlert(data) {
+    const event = {
+        ...data,
+        event_type: data.event_type || data.type || 'risk_alert',
+        created_at: data.created_at || new Date().toISOString(),
+    };
+    const seen = new Set();
+    state.riskEvents = [event, ...(state.riskEvents || [])]
+        .filter(item => {
+            const key = item.id !== undefined && item.id !== null
+                ? `id:${item.id}`
+                : `${item.event_type || item.type || ''}:${item.symbol || ''}:${riskAlertMessage(item)}:${item.created_at || ''}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        })
+        .slice(0, 50);
+    state.riskEventsPage = 1;
+    renderRiskAlerts(state.riskEvents);
+    return;
+
     const container = document.getElementById('risk-alerts');
     const countEl = document.getElementById('alert-count');
     const badgeEl = document.getElementById('alert-badge');
@@ -1177,6 +1218,12 @@ function addRiskAlert(data) {
 async function fetchRiskEvents() {
     const data = await fetchJSON('/api/risk/events?limit=50');
     if (!data || !data.events) return;
+    state.riskEvents = data.events || [];
+    const totalPages = Math.max(Math.ceil(state.riskEvents.length / RISK_ALERT_PAGE_SIZE), 1);
+    state.riskEventsPage = Math.min(Math.max(Number(state.riskEventsPage || 1), 1), totalPages);
+    renderRiskAlerts(state.riskEvents);
+    return;
+
     const container = document.getElementById('risk-alerts');
     if (!container) return;
 
@@ -1273,11 +1320,11 @@ function initModeButtons() {
     document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const mode = btn.dataset.mode;
-            const res = await fetch('/api/control/mode', {
+            const res = await fetch('/api/control/mode', dashboardWriteOptions({
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode }),
-            });
+            }));
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
                 alert('切换失败: ' + (err.detail || res.statusText));
@@ -1310,18 +1357,21 @@ function initModeButtons() {
 
 async function togglePause() {
     const endpoint = state.paused ? '/api/control/resume' : '/api/control/pause';
-    await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    await fetch(endpoint, dashboardWriteOptions({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+    }));
     await fetchDashboardSummary();
     const btn = document.getElementById('pause-btn');
     if (btn) btn.textContent = state.paused ? '恢复' : '暂停';
 }
 
 async function selectLiveModel(modelName) {
-    await fetch('/api/control/select-model', {
+    await fetch('/api/control/select-model', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_name: modelName }),
-    });
+    }));
     state.liveModel = modelName;
     await fetchDashboardSummary();
 }
@@ -1399,7 +1449,10 @@ async function populateDecisionModelFilter() {
 async function clearAllDecisions() {
     if (!confirm('确定要删除所有 AI 决策记录吗？此操作不可撤销。')) return;
 
-    const res = await fetch('/api/decisions', { method: 'DELETE' });
+    const res = await fetch('/api/decisions', dashboardWriteOptions({
+        method: 'DELETE',
+        headers: { 'X-Dashboard-Confirm': 'delete-records' },
+    }));
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         alert('清除失败: ' + (err.detail || '未知错误'));
@@ -1422,51 +1475,6 @@ function renderAllDecisions(decisions, meta = {}) {
     renderDecisionsPage(Number(meta.total_pages || 1));
 }
 
-function renderDecisionsPage(totalPagesOverride = null) {
-    const tbody = document.getElementById('all-decisions-tbody');
-    if (!tbody) return;
-
-    if (!state.allDecisions.length) {
-        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">暂无决策记录</td></tr>';
-        document.getElementById('decisions-pagination').style.display = 'none';
-        return;
-    }
-
-    const totalPages = Number(totalPagesOverride || Math.ceil(state.decisionsTotal / PAGE_SIZE) || 1);
-    const page = Math.min(state.decisionsPage, totalPages);
-    const pageData = state.allDecisions;
-
-    tbody.innerHTML = pageData.map(d => {
-        const time = toBeijingTime(d.created_at);
-        const confPct = ((d.confidence || 0) * 100).toFixed(0);
-        const confColor = d.confidence >= 0.65 ? 'var(--green)' : 'var(--text-muted)';
-        const sizePct = ((d.position_size_pct || 0) * 100).toFixed(1);
-        const executedHtml = d.was_executed
-            ? `<span style="color:var(--green);font-weight:600;">是</span>`
-            : `<span style="color:var(--text-dim);">否</span>`;
-        const isPaper = d.is_paper !== false;
-        const modeHtml = isPaper
-            ? '<span style="color:var(--accent);font-size:11px;">模拟盘</span>'
-            : '<span style="color:var(--red);font-size:11px;">实盘</span>';
-        const reasonLabel = d.was_executed ? '详情' : '查看';
-        return `
-        <tr>
-            <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${time}</td>
-            <td><strong>${escHtml(d.model_name)}</strong></td>
-            <td>${escHtml(d.symbol)}</td>
-            <td><span class="badge badge-${d.action || 'hold'}">${analysisActionLabel(d.action, d)}</span></td>
-            <td><span class="badge badge-${decisionType(d.action)}">${decisionTypeLabel(d)}</span></td>
-            <td style="color:${confColor};font-weight:600;">${confPct}%</td>
-            <td>${sizePct}%</td>
-            <td>${modeHtml}</td>
-            <td>${executedHtml}</td>
-            <td><button class="btn btn-sm" onclick="showDecisionReason(${Number(d.id)})">${reasonLabel}</button></td>
-        </tr>
-    `}).join('');
-
-    renderPagination('decisions-pagination', page, totalPages, state.decisionsTotal, 'changeDecisionsPage');
-}
-
 function opportunityScoreValue(value, digits = 4) {
     const num = Number(value);
     return Number.isFinite(num) ? num.toFixed(digits) : '-';
@@ -1474,9 +1482,6 @@ function opportunityScoreValue(value, digits = 4) {
 
 function opportunityScoreBlock(score) {
     if (!score || typeof score !== 'object') return '';
-    const rank = score.rank && score.candidate_count
-        ? `${score.rank} / ${score.candidate_count}`
-        : '-';
     const selected = score.selected_for_execution === true
         ? '已进入执行队列'
         : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
@@ -1486,7 +1491,6 @@ function opportunityScoreBlock(score) {
             <div class="reason-label">盈利机会评分</div>
             <div>
                 机会分：${opportunityScoreValue(score.score, 6)}<br>
-                排名：${escHtml(rank)}<br>
                 方向：${escHtml(actionLabel(score.side || '-'))}<br>
                 预期收益：${opportunityScoreValue(score.expected_return_pct, 4)}%<br>
                 相对反向优势：${opportunityScoreValue(score.profit_edge_pct, 4)}%<br>
@@ -2175,7 +2179,8 @@ function renderAnalysisNewsContext(news) {
         const rawEventType = item.event_type || 'market_news';
         const eventType = escHtml(item.direct_match && rawEventType === 'market_news' ? 'symbol_news' : rawEventType);
         const reason = escHtml(item.match_reason || '');
-        const url = item.url ? `<a href="${escHtml(item.url)}" target="_blank" rel="noopener">来源</a>` : '';
+        const sourceUrl = safeExternalUrl(item.url);
+        const url = sourceUrl ? `<a href="${escHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">来源</a>` : '';
         return `
             <div class="analysis-resolution-item">
                 <strong>${source}</strong>
@@ -2325,31 +2330,92 @@ function renderAnalysisPage() {
             <td><span class="badge badge-${r.final_action || 'hold'}">${analysisActionLabel(r.final_action, r)}</span></td>
             <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${(conf * 100).toFixed(0)}%</td>
             <td>${score}</td>
-            <td><button class="btn btn-sm" onclick="showAnalysisReason('${escHtml(r.id)}')">查看流程</button></td>
+            <td>
+                <button
+                    type="button"
+                    class="btn btn-sm js-analysis-reason"
+                    data-record-id="${escHtml(r.id ?? '')}"
+                    data-decision-id="${escHtml(r.decision_id ?? r.id ?? '')}"
+                >查看流程</button>
+            </td>
         </tr>
     `}).join('');
 
     renderPagination('analysis-pagination', page, totalPages, state.analysisTotal, 'changeAnalysisPage');
 }
 
-async function showAnalysisReason(recordId) { 
-    let record = state.analysisRecords.find(r => String(r.id) === String(recordId)); 
-    if (!record) return; 
-    if (!Array.isArray(record.experts)) {
-        const params = new URLSearchParams({
-            page: '1',
-            page_size: '1',
-            decision_id: String(record.decision_id || record.id),
-            include_detail: 'true',
-            is_paper: state.mode === 'paper' ? 'true' : 'false',
-        });
-        const detailData = await fetchJSON(`/api/analysis-records?${params.toString()}`);
-        const detailed = (detailData?.records || []).find(r => String(r.id) === String(recordId));
+function analysisRecordKeyMatches(record, recordId, decisionId) {
+    if (!record) return false;
+    const wanted = [recordId, decisionId]
+        .filter(value => value !== undefined && value !== null && String(value) !== '')
+        .map(value => String(value));
+    if (!wanted.length) return false;
+    return [record.id, record.decision_id]
+        .filter(value => value !== undefined && value !== null)
+        .map(value => String(value))
+        .some(value => wanted.includes(value));
+}
+
+function showAnalysisReasonLoading(recordId) {
+    setDecisionModalWide(true);
+    document.getElementById('decision-reason-title').textContent = `分析流程 ${recordId || ''}`.trim();
+    document.getElementById('decision-reason-body').innerHTML = `
+        <div class="analysis-empty">正在加载专家协作流程...</div>
+    `;
+    document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
+}
+
+function showAnalysisReasonLoadError(recordId, message = '没有找到这条分析记录的详情。') {
+    setDecisionModalWide(true);
+    document.getElementById('decision-reason-title').textContent = `分析流程 ${recordId || ''}`.trim();
+    document.getElementById('decision-reason-body').innerHTML = `
+        <div class="analysis-card analysis-card-warning">
+            <div class="analysis-card-head">
+                <div class="analysis-card-title">加载失败</div>
+                ${analysisPill('请刷新后重试', 'warn')}
+            </div>
+            <div class="analysis-card-text">${analysisText(message)}</div>
+        </div>
+    `;
+    document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
+}
+
+async function fetchAnalysisRecordDetail(recordId, decisionId) {
+    const lookupId = decisionId || recordId;
+    if (!lookupId) return null;
+    const params = new URLSearchParams({
+        page: '1',
+        page_size: '1',
+        decision_id: String(lookupId),
+        include_detail: 'true',
+        is_paper: state.mode === 'paper' ? 'true' : 'false',
+    });
+    const detailData = await fetchJSON(`/api/analysis-records?${params.toString()}`);
+    const records = detailData?.records || [];
+    return records.find(r => analysisRecordKeyMatches(r, recordId, decisionId)) || records[0] || null;
+}
+
+async function showAnalysisReason(recordId, decisionId = null) {
+    let record = state.analysisRecords.find(r => analysisRecordKeyMatches(r, recordId, decisionId));
+    if (!record || !Array.isArray(record.experts)) {
+        showAnalysisReasonLoading(recordId || decisionId);
+        const detailed = await fetchAnalysisRecordDetail(
+            recordId || record?.id,
+            decisionId || record?.decision_id || record?.id
+        );
         if (detailed) {
             record = detailed;
-            const idx = state.analysisRecords.findIndex(r => String(r.id) === String(recordId));
+            const idx = state.analysisRecords.findIndex(r => analysisRecordKeyMatches(r, recordId, decisionId));
             if (idx >= 0) state.analysisRecords[idx] = detailed;
         }
+    }
+    if (!record) {
+        showAnalysisReasonLoadError(recordId || decisionId);
+        return;
+    }
+    if (!Array.isArray(record.experts)) {
+        showAnalysisReasonLoadError(recordId || decisionId, '详情接口暂未返回专家流程数据。');
+        return;
     }
     setDecisionModalWide(true);
     const experts = record.experts || []; 
@@ -2781,9 +2847,11 @@ function renderExpertMemories(data = {}) {
             reflectionBody.innerHTML = reflections.map(r => {
                 const pnl = valueNumber(r.realized_pnl) || 0;
                 const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+                const generatedTime = tradeReflectionTimeHtml(r.created_at);
+                const generatedTimeTitle = toBeijingDateTime(r.created_at);
                 return `
                     <tr>
-                        <td class="trade-reflection-time">${toBeijingTime(r.created_at)}</td>
+                        <td class="trade-reflection-time" title="${escHtml(generatedTimeTitle)}">${generatedTime}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
                         <td style="color:${pnlColor};white-space:nowrap;">${signedMoney(pnl)} USDT</td>
@@ -2984,59 +3052,6 @@ function renderMLSignalDashboard() {
     renderMLSignalRecent();
 }
 
-/*
-function renderLocalAIToolsStatus() {
-    const container = document.getElementById('local-ai-tools-status');
-    const updatedEl = document.getElementById('local-ai-tools-updated');
-    if (!container) return;
-    const status = state.localAIToolsStatus || {};
-    const available = status.available === true;
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
-    if (updatedEl) {
-        updatedEl.textContent = available
-            ? `已训练 ${Number(status.shadow_sample_count || 0)} 条影子样本 / ${Number(status.trade_sample_count || 0)} 条交易样本`
-            : '服务不可用';
-    }
-    const models = status.models || {};
-    container.innerHTML = `
-        <div class="ml-overview-grid">
-            ${mlMetricCard('服务状态', available ? '可用' : '不可用', available ? '服务器 31841 已返回训练模型状态' : (status.error || status.message || '等待服务返回'), available ? 'good' : 'bad')}
-            ${mlMetricCard('训练时间', trainedAt, status.source ? `来源 ${status.source}` : '', 'muted')}
-            ${mlMetricCard('影子复盘样本', String(Number(status.shadow_sample_count || 0)), '用于盈利质量、亏损过滤和时间序列训练', Number(status.shadow_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('交易/平仓样本', String(Number(status.trade_sample_count || 0)), '用于币种亏损画像和平仓建议', Number(status.trade_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('盈利/亏损模型', models.profit || '未返回', models.loss_filter || '', models.profit ? 'good' : 'warn')}
-            ${mlMetricCard('时间序列模型', models.timeseries || '未返回', `周期 ${(status.horizons || []).join('/') || '-'}`, models.timeseries ? 'good' : 'warn')}
-            ${mlMetricCard('情绪模型', models.sentiment || '未返回', '独立情绪服务/校准器状态', models.sentiment ? 'good' : 'warn')}
-            ${mlMetricCard('平仓模型', models.exit || '未返回', status.objective || '以真实盈利为最终目标', models.exit ? 'good' : 'warn')}
-        </div>`;
-}
-
-*/
-function renderLocalAIToolsStatus() {
-    const container = document.getElementById('local-ai-tools-status');
-    const updatedEl = document.getElementById('local-ai-tools-updated');
-    if (!container) return;
-    const status = state.localAIToolsStatus || {};
-    const available = status.available === true;
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
-    if (updatedEl) {
-        updatedEl.textContent = available
-            ? `已训练 ${Number(status.shadow_sample_count || 0)} 条影子样本 / ${Number(status.trade_sample_count || 0)} 条交易样本`
-            : '服务不可用';
-    }
-    const models = status.models || {};
-    container.innerHTML = `
-        <div class="ml-overview-grid">
-            ${mlMetricCard('服务状态', available ? '可用' : '不可用', available ? '服务器 31841 已返回训练模型状态' : (status.error || status.message || '等待服务返回'), available ? 'good' : 'bad')}
-            ${mlMetricCard('训练时间', trainedAt, status.source ? `来源 ${status.source}` : '', 'muted')}
-            ${mlMetricCard('影子复盘样本', String(Number(status.shadow_sample_count || 0)), '用于盈利质量、亏损过滤和周期模型训练', Number(status.shadow_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('交易/平仓样本', String(Number(status.trade_sample_count || 0)), '用于币种亏损画像和平仓建议', Number(status.trade_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('序列样本', String(Number(status.sequence_sample_count || 0)), models.deep_timeseries || '用于 PatchTST/TFT 风格时间序列模型', Number(status.sequence_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('文本情绪样本', String(Number(status.text_sentiment_sample_count || 0)), models.deep_sentiment || '用于 CryptoBERT/FinBERT 风格文本情绪模型', Number(status.text_sentiment_sample_count || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('盈利/亏损模型', models.profit || '未返回', models.loss_filter || '', models.profit ? 'good' : 'warn')}
-            ${mlMetricCard('平仓模型', models.exit || '未返回', status.objective || '以真实盈利为最终目标', models.exit ? 'good' : 'warn')}
-        </div>`;
-}
 
 function mlPrimaryPrediction(signal) {
     if (!signal) return null;
@@ -3087,142 +3102,6 @@ function localModelStatus(status, key) {
     return Boolean(status?.available && models[key]);
 }
 
-function renderLocalAIToolsStatus() {
-    const container = document.getElementById('local-ai-tools-status');
-    const updatedEl = document.getElementById('local-ai-tools-updated');
-    if (!container) return;
-
-    const status = state.localAIToolsStatus || {};
-    const models = status.models || {};
-    const available = status.available === true;
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
-    const completedShadowSamples = Number(status.completed_shadow_sample_count || status.total_shadow_sample_count || 0);
-    const trainingShadowSamples = Number(status.training_shadow_sample_count || status.shadow_sample_count || 0);
-    const displayCompletedShadow = completedShadowSamples || trainingShadowSamples;
-    const trainingShadowLimit = Number(status.training_shadow_sample_limit || 20000);
-
-    if (updatedEl) {
-        updatedEl.textContent = available
-            ? `训练使用 ${trainingShadowSamples} 条影子样本 / 累计 ${displayCompletedShadow} 条 / 交易 ${Number(status.trade_sample_count || 0)} 条`
-            : '服务不可用';
-    }
-
-    const cards = [
-        {
-            label: '服务状态',
-            value: available ? '可用' : '不可用',
-            subtitle: available ? '服务器量化模型服务已连接，可给交易系统提供预测。' : (status.error || status.message || '等待服务器返回状态'),
-            tone: available ? 'good' : 'bad',
-        },
-        {
-            label: '最近训练',
-            value: trainedAt,
-            subtitle: status.source ? `数据来源：${status.source}` : '用于判断模型是否使用了最新样本。',
-            tone: 'muted',
-        },
-        {
-            label: '累计影子复盘样本',
-            value: String(displayCompletedShadow),
-            subtitle: '数据库里已经完成结果回填、可用于训练的影子复盘总数。',
-            tone: displayCompletedShadow > 0 ? 'good' : 'warn',
-        },
-        {
-            label: '本次训练使用样本',
-            value: String(trainingShadowSamples),
-            subtitle: `服务器每次取最近最多 ${trainingShadowLimit} 条训练；超过后这里会稳定在上限。`,
-            tone: trainingShadowSamples > 0 ? 'good' : 'warn',
-        },
-        {
-            label: '真实交易样本',
-            value: String(Number(status.trade_sample_count || 0)),
-            subtitle: '用于学习币种画像、历史亏损压力和平仓建议。',
-            tone: Number(status.trade_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-        {
-            label: 'K线序列样本',
-            value: String(Number(status.sequence_sample_count || 0)),
-            subtitle: '用于判断未来 10/30/60 分钟方向和波动。',
-            tone: Number(status.sequence_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-        {
-            label: '情绪文本样本',
-            value: String(Number(status.text_sentiment_sample_count || 0)),
-            subtitle: '用于新闻、公告、社媒情绪校准。',
-            tone: Number(status.text_sentiment_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-    ];
-
-    const purposeCards = [
-        {
-            title: '开仓盈利预测',
-            desc: '预测做多/做空扣除成本后的预期收益，帮助系统优先选择更可能赚钱的方向。',
-            detail: `技术模型：${mlTechName(models.profit)}`,
-            tone: models.profit ? 'good' : 'warn',
-        },
-        {
-            title: '亏损风险过滤',
-            desc: '判断某个币种和方向是否容易亏损，用来降低反复买入亏损组合的概率。',
-            detail: `技术模型：${mlTechName(models.loss_filter)}`,
-            tone: models.loss_filter ? 'good' : 'warn',
-        },
-        {
-            title: '多周期行情预测',
-            desc: `按 ${(status.horizons || [10, 30, 60]).join('/')} 分钟窗口预测未来收益变化，辅助判断入场时机。`,
-            detail: `技术模型：${mlTechName(models.deep_timeseries || models.timeseries)}`,
-            tone: (models.deep_timeseries || models.timeseries) ? 'good' : 'warn',
-        },
-        {
-            title: '平仓建议',
-            desc: '结合真实持仓盈亏、持仓时间和历史交易画像，判断继续持有、减仓、止盈或止损。',
-            detail: `技术模型：${mlTechName(models.exit)}`,
-            tone: models.exit ? 'good' : 'warn',
-        },
-    ];
-
-    container.innerHTML = `
-        <div class="ml-overview-grid ml-overview-grid-compact">
-            ${cards.map(item => mlMetricCard(item.label, item.value, item.subtitle, item.tone)).join('')}
-        </div>
-        <div class="ml-purpose-grid">
-            ${purposeCards.map(item => `
-                <div class="ml-purpose-card ml-purpose-${item.tone}">
-                    <div class="ml-purpose-title">${escHtml(item.title)}</div>
-                    <div class="ml-purpose-desc">${escHtml(item.desc)}</div>
-                    <div class="ml-purpose-tech">${escHtml(item.detail)}</div>
-                </div>
-            `).join('')}
-        </div>`;
-}
-
-function renderTrainableModelCard(model) {
-    const metrics = Array.isArray(model.metrics) && model.metrics.length
-        ? `<div class="ml-model-metrics">${model.metrics.map(item => `
-            <div class="ml-model-metric">
-                <span>${escHtml(item.label)}</span>
-                <strong>${escHtml(item.value)}</strong>
-            </div>
-        `).join('')}</div>`
-        : '';
-    return `
-        <div class="ml-train-model-card">
-            <div class="ml-train-model-head">
-                <div>
-                    <div class="ml-train-model-title">${escHtml(model.title)}</div>
-                    <div class="ml-train-model-type">${escHtml(model.type || '-')}</div>
-                </div>
-                ${mlModelStatusPill(model.ready, model.statusLabel)}
-            </div>
-            <div class="ml-train-model-desc">${escHtml(model.description || '-')}</div>
-            <div class="ml-train-model-grid">
-                <div><span>训练样本</span><strong>${escHtml(model.samples || '-')}</strong></div>
-                <div><span>训练时间</span><strong>${escHtml(model.trainedAt || '-')}</strong></div>
-                <div><span>当前作用</span><strong>${escHtml(model.usage || '-')}</strong></div>
-            </div>
-            ${metrics}
-            <div class="ml-train-model-note">${escHtml(model.note || '')}</div>
-        </div>`;
-}
-
 function mlSampleCounts() {
     const ml = state.mlSignalStatus || {};
     const local = state.localAIToolsStatus || {};
@@ -3258,148 +3137,6 @@ function mlSampleCounts() {
     };
 }
 
-function renderTrainableModels() {
-    const container = document.getElementById('ml-trainable-models');
-    if (!container) return;
-    const local = state.localAIToolsStatus || {};
-    const ml = state.mlSignalStatus || {};
-    const localTrainedAt = local.trained_at ? toBeijingTime(local.trained_at) : '-';
-    const mlTrainedAt = ml.trained_at ? toBeijingTime(ml.trained_at) : '-';
-    const metrics = ml.metrics || {};
-    const autoLast = ml.auto_train_last_result || {};
-    const autoTrainText = ml.auto_train_enabled
-        ? `自动训练开启；下次检查 ${ml.auto_train_next_check_at ? toBeijingTime(ml.auto_train_next_check_at) : '-'}`
-        : '自动训练未开启';
-    const models = [
-        {
-            title: '本地 ML 盈亏质量模型',
-            type: '本机 ExtraTrees / 盈亏过滤',
-            ready: ml.available === true,
-            statusLabel: ml.influence_enabled ? '已介入' : (ml.available ? '学习中' : '未就绪'),
-            description: '预测做多/做空的预期收益和收益质量，用于开仓门槛、否决和机会排序。',
-            samples: `${Number(ml.sample_count || 0)} 条影子复盘`,
-            trainedAt: mlTrainedAt,
-            usage: ml.influence_enabled ? '开仓过滤/机会排序' : '只学习不介入',
-            metrics: [
-                { label: '做多 AUC', value: Number(metrics.long_auc || 0).toFixed(3) },
-                { label: '做空 AUC', value: Number(metrics.short_auc || 0).toFixed(3) },
-                { label: '做多高分收益', value: signedPctValueLabel(metrics.top_long_avg_return_pct) },
-                { label: '做空高分收益', value: signedPctValueLabel(metrics.top_short_avg_return_pct) },
-            ],
-            note: autoLast.message || autoTrainText,
-        },
-        {
-            title: '盈利预测模型',
-            type: local.models?.profit || 'ExtraTreesRegressor',
-            ready: localModelStatus(local, 'profit'),
-            description: '预测某个币种和方向扣除成本后的预期收益，目标是净收益最大化。',
-            samples: `${Number(local.shadow_sample_count || 0)} 条影子样本`,
-            trainedAt: localTrainedAt,
-            usage: '给专家和最终决策提供收益证据',
-            metrics: [
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-                { label: '周期', value: (local.horizons || []).join('/') || '-' },
-            ],
-            note: local.objective || '以真实盈利为目标，胜率只作为辅助。',
-        },
-        {
-            title: '亏损过滤模型',
-            type: local.models?.loss_filter || 'ExtraTreesClassifier',
-            ready: localModelStatus(local, 'loss_filter'),
-            description: '判断币种/方向组合的亏损概率，帮助识别历史容易亏损的交易组合。',
-            samples: `${Number(local.shadow_sample_count || 0)} 条影子样本`,
-            trainedAt: localTrainedAt,
-            usage: '亏损概率提示/风险过滤',
-            metrics: [
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-            ],
-            note: '用于避免反复买入近期亏损压力很高的币种方向。',
-        },
-        {
-            title: '时间序列预测模型',
-            type: local.models?.timeseries || 'Per-horizon ExtraTreesRegressor',
-            ready: localModelStatus(local, 'timeseries'),
-            description: '按 10/30/60 分钟窗口预测未来收益变化，辅助判断入场窗口。',
-            samples: `${Number(local.sequence_sample_count || 0)} 条序列样本`,
-            trainedAt: localTrainedAt,
-            usage: '短周期方向和波动预判',
-            metrics: [
-                { label: '周期', value: (local.horizons || []).join('/') || '-' },
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-            ],
-            note: '传统 ML 时序模型，速度快，作为深度时序的稳定备份。',
-        },
-        {
-            title: '深度时序模型',
-            type: local.models?.deep_timeseries || 'Torch PatchTST/TFT-style',
-            ready: Boolean(local.torch_patch_status?.available),
-            description: '用 K 线序列学习未来收益和回撤结构，更适合多周期行情形态。',
-            samples: `${Number(local.torch_patch_status?.samples || local.sequence_sample_count || 0)} 条序列样本`,
-            trainedAt: localTrainedAt,
-            usage: '深度时序辅助预测',
-            metrics: [
-                { label: '后端', value: local.torch_patch_status?.backend || '-' },
-                { label: 'MAE', value: local.torch_patch_status?.train_mae_pct !== undefined ? `${Number(local.torch_patch_status.train_mae_pct).toFixed(4)}%` : '-' },
-                { label: '输入维度', value: String(local.torch_patch_status?.input_dim || '-') },
-            ],
-            note: local.torch_patch_status?.reason || '当前已经可用，但仍需要更多样本继续提升泛化能力。',
-        },
-        {
-            title: '情绪校准模型',
-            type: local.models?.sentiment || 'RandomForest sentiment calibration',
-            ready: localModelStatus(local, 'sentiment'),
-            description: '学习新闻、社媒和事件情绪对收益/风险的影响。',
-            samples: `${Number(local.text_sentiment_sample_count || 0)} 条文本情绪样本`,
-            trainedAt: localTrainedAt,
-            usage: '情绪风险和收益校准',
-            metrics: [
-                { label: '文本样本', value: String(Number(local.text_sentiment_sample_count || 0)) },
-                { label: 'Transformers', value: local.transformers_sentiment_backend?.available ? '可用' : '未启用' },
-            ],
-            note: '当前文本样本偏少，后续接入更多新闻/公告/社媒文本后会更有价值。',
-        },
-        {
-            title: '深度情绪模型',
-            type: local.models?.deep_sentiment || 'CryptoBERT/FinBERT-ready',
-            ready: localModelStatus(local, 'deep_sentiment'),
-            description: '面向 CryptoBERT / FinBERT 的文本情绪模型接口，支持后续替换为更强文本模型。',
-            samples: `${Number(local.text_sentiment_sample_count || 0)} 条文本情绪样本`,
-            trainedAt: localTrainedAt,
-            usage: '新闻文本情绪辅助',
-            metrics: [
-                { label: '库', value: local.transformers_sentiment_backend?.library || '-' },
-                { label: '版本', value: local.transformers_sentiment_backend?.version || '-' },
-            ],
-            note: (local.transformers_sentiment_backend?.preferred_models || []).join(' / ') || '等待更多文本数据。',
-        },
-        {
-            title: '平仓/退出建议模型',
-            type: local.models?.exit || 'trade-profile plus live pnl rules',
-            ready: localModelStatus(local, 'exit'),
-            description: '根据历史交易画像、当前浮盈浮亏和持仓时间，判断小赚快跑、止损或继续持有。',
-            samples: `${Number(local.trade_sample_count || 0)} 条交易/平仓样本`,
-            trainedAt: localTrainedAt,
-            usage: '持仓复盘和平仓建议',
-            metrics: [
-                { label: '交易样本', value: String(Number(local.trade_sample_count || 0)) },
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-            ],
-            note: '它不是单纯追求持仓浮盈，而是服务于已实现净利润。',
-        },
-    ];
-
-    container.innerHTML = `
-        <div class="ml-train-summary">
-            ${mlMetricCard('可训练模型', `${models.length} 个`, '包含本地 ML、盈利、亏损、时序、情绪和平仓模型', 'good')}
-            ${mlMetricCard('自动训练', ml.auto_train_enabled ? '已开启' : '未开启', autoTrainText, ml.auto_train_enabled ? 'good' : 'warn')}
-            ${mlMetricCard('新增样本', String(Number(autoLast.new_sample_count || 0)), autoLast.message || '等待下一次训练检查', Number(autoLast.new_sample_count || 0) >= Number(ml.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
-        </div>
-        <div class="ml-train-model-list">
-            ${models.map(renderTrainableModelCard).join('')}
-        </div>`;
-}
-
 function mlWinBar(label, value, tone = 'muted') {
     const num = Number(value);
     const pct = Number.isFinite(num) ? Math.max(0, Math.min(num * 100, 100)) : 0;
@@ -3408,59 +3145,6 @@ function mlWinBar(label, value, tone = 'muted') {
             ${label ? `<div class="ml-bar-label">${escHtml(label)}</div>` : ''}
             <div class="ml-bar-track"><div class="ml-bar-fill ml-bar-${tone}" style="width:${pct.toFixed(1)}%;"></div></div>
             <div class="ml-bar-value">${pctLabel(value)}</div>
-        </div>`;
-}
-
-function renderMLSignalOverview() {
-    const container = document.getElementById('ml-signal-overview');
-    const updatedEl = document.getElementById('ml-signal-updated');
-    if (!container) return;
-    const status = state.mlSignalStatus || {};
-    const records = state.mlSignalRecords || [];
-    const latestRecord = records[0] || null;
-    const latestSignal = latestRecord?.ml_signal || null;
-    const latestPrediction = mlPrimaryPrediction(latestSignal);
-    const ready = status.available === true;
-    const influenceEnabled = status.influence_enabled !== false && status.status === 'ready';
-    const mode = status.mode || latestSignal?.mode || 'observe_only';
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
-    const strongSignals = records.filter(r => {
-        const pred = mlPrimaryPrediction(r.ml_signal) || {};
-        return Number(pred.best_expected_return_pct || 0) > 0 && Number(pred.profit_edge_pct || 0) > 0;
-    }).length;
-    const latestText = latestRecord
-        ? `${toBeijingTime(latestRecord.created_at)} ${latestRecord.symbol || '-'}`
-        : '暂无最近预测';
-    if (updatedEl) updatedEl.textContent = ready
-        ? `已训练 ${Number(status.sample_count || 0)} 条样本 · ${influenceEnabled ? '已介入' : '学习中'}`
-        : '模型不可用';
-
-    container.innerHTML = `
-        <div class="ml-flow">
-            <div class="ml-flow-step">
-                <div class="ml-flow-index">1</div>
-                <div><strong>影子复盘样本</strong><span>${Number(status.sample_count || 0)} 条已用于训练</span></div>
-            </div>
-            <div class="ml-flow-step">
-                <div class="ml-flow-index">2</div>
-                <div><strong>提取行情特征</strong><span>${Number(status.feature_count || 0)} 个特征，周期 ${escHtml((status.horizons || []).join('/'))} 分钟</span></div>
-            </div>
-            <div class="ml-flow-step">
-                <div class="ml-flow-index">3</div>
-                <div><strong>预测多空盈亏</strong><span>预期收益和收益差为主，胜率仅作辅助</span></div>
-            </div>
-            <div class="ml-flow-step">
-                <div class="ml-flow-index">4</div>
-                <div><strong>${influenceEnabled ? '参与开仓过滤' : '学习观察中'}</strong><span>${influenceEnabled ? '负预期拦截，强收益质量小幅加分' : '指标未达标时不介入交易，继续训练'}</span></div>
-            </div>
-        </div>
-        <div class="ml-overview-grid">
-            ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '只学习不介入', ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
-            ${mlMetricCard('训练样本', String(Number(status.sample_count || 0)), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}`, 'good')}
-            ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
-            ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近 120 条分析里预期收益为正且有收益差', strongSignals ? 'warn' : 'muted')}
-            ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
-            ${mlMetricCard('生效方式', influenceEnabled ? '开仓过滤' : '自动暂停介入', influenceEnabled ? '不直接改方向；只影响开仓门槛/否决' : '继续预测、复盘和训练，达标后自动恢复', influenceEnabled ? 'good' : 'warn')}
         </div>`;
 }
 
@@ -3706,6 +3390,17 @@ function runtimeStatusBadge(ok) {
     return `<span class="status-badge ${ok ? 'status-live' : 'status-paused'}">${ok ? '运行中' : '异常'}</span>`;
 }
 
+function runtimeEndpointSummary(health) {
+    if (!health || typeof health !== 'object') return '';
+    const status = Number(health.status_code || 0);
+    const latency = Number(health.latency_ms);
+    const parts = [];
+    parts.push(status ? `HTTP ${status}` : (health.ok ? 'HTTP 正常' : 'HTTP 未连接'));
+    if (Number.isFinite(latency)) parts.push(`${monitorNumber(latency, 0)} ms`);
+    if (health.truncated) parts.push('响应已截断');
+    return parts.join(' · ');
+}
+
 function renderServerModelRuntime(data, container) {
     const runtime = data.model_runtime || {};
     const vllm = runtime.vllm || {};
@@ -3713,6 +3408,10 @@ function renderServerModelRuntime(data, container) {
     const processes = data.gpu_processes || [];
     const models = Array.isArray(vllm.models) && vllm.models.length ? vllm.models.join('、') : '未返回模型名';
     const toolsModels = tools.models || {};
+    const vllmLabel = vllm.label || vllm.provider_model || 'vLLM';
+    const vllmHealthLine = runtimeEndpointSummary(vllm.health);
+    const toolsStatusLine = runtimeEndpointSummary(tools.status_health);
+    const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const processRows = processes.length
         ? `<div class="server-monitor-process-list">${processes.map(p => `
             <div class="server-monitor-process">
@@ -3725,14 +3424,18 @@ function renderServerModelRuntime(data, container) {
     container.innerHTML = `
         <div class="server-monitor-runtime">
             <div class="server-monitor-runtime-card">
-                <strong>DeepSeek 14B / vLLM ${runtimeStatusBadge(vllm.available)}</strong>
+                <strong>${escHtml(vllmLabel)} / vLLM ${runtimeStatusBadge(vllm.available)}</strong>
                 <div>地址：${escHtml(vllm.endpoint || '-')}</div>
+                <div>状态：${escHtml(vllm.status || '-')}${vllmHealthLine ? ` · ${escHtml(vllmHealthLine)}` : ''}</div>
+                <div>配置模型：${escHtml(vllm.provider_model || '-')}</div>
                 <div>模型：${escHtml(models)}</div>
                 ${vllm.error ? `<div style="color:var(--red);">错误：${escHtml(vllm.error)}</div>` : ''}
             </div>
             <div class="server-monitor-runtime-card">
                 <strong>本地量化模型 ${runtimeStatusBadge(tools.available)}</strong>
                 <div>地址：${escHtml(tools.endpoint || '-')}</div>
+                <div>状态接口：${escHtml(toolsStatusLine || '-')}</div>
+                <div>健康接口：${escHtml(toolsHealthLine || '-')}</div>
                 <div>训练时间：${tools.trained_at ? toBeijingTime(tools.trained_at) : '-'}</div>
                 <div>影子样本：${monitorNumber(tools.shadow_sample_count, 0)} · 交易样本：${monitorNumber(tools.trade_sample_count, 0)}</div>
                 <div>盈利模型：${escHtml(toolsModels.profit || '未返回')}</div>
@@ -3835,6 +3538,41 @@ function toBeijingTime(isoStr) {
     return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
 }
 
+function beijingDateTimeParts(isoStr) {
+    if (!isoStr) return null;
+    const text = String(isoStr).trim();
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(text);
+    const normalized = hasTimezone ? text : text.replace(' ', 'T') + 'Z';
+    const d = new Date(normalized);
+    if (Number.isNaN(d.getTime())) return null;
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }).formatToParts(d).reduce((acc, part) => {
+        if (part.type !== 'literal') acc[part.type] = part.value;
+        return acc;
+    }, {});
+    const date = `${parts.year}/${parts.month}/${parts.day}`;
+    const time = `${parts.hour}:${parts.minute}:${parts.second}`;
+    return { date, time, full: `${date} ${time}` };
+}
+
+function toBeijingDateTime(isoStr) {
+    return beijingDateTimeParts(isoStr)?.full || '-';
+}
+
+function tradeReflectionTimeHtml(isoStr) {
+    const parts = beijingDateTimeParts(isoStr);
+    if (!parts) return '-';
+    return `<span>${escHtml(parts.date)}</span><em>${escHtml(parts.time)}</em>`;
+}
+
 function shortBeijingTime(isoStr) {
     if (!isoStr) return '-';
     const text = String(isoStr).trim();
@@ -3854,39 +3592,6 @@ function loopErrorLabel(message) {
         return 'OKX API Key 无效，余额/仓位同步可能失败，请检查当前模式的 OKX Key 配置。';
     }
     return text;
-}
-
-// ========== Pagination ==========
-
-function renderPagination(containerId, page, totalPages, totalItems, callbackName) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    if (totalPages <= 1) {
-        container.style.display = 'none';
-        return;
-    }
-    container.style.display = 'flex';
-
-    let html = '';
-    html += `<button onclick="${callbackName}(1)" ${page <= 1 ? 'disabled' : ''}>首页</button>`;
-    html += `<button onclick="${callbackName}(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>`;
-
-    // Page number buttons (show max 7)
-    let startP = Math.max(1, page - 3);
-    let endP = Math.min(totalPages, page + 3);
-    if (endP - startP < 6) {
-        if (startP === 1) endP = Math.min(totalPages, startP + 6);
-        else startP = Math.max(1, endP - 6);
-    }
-    for (let p = startP; p <= endP; p++) {
-        html += `<button onclick="${callbackName}(${p})" ${p === page ? 'class="active"' : ''}>${p}</button>`;
-    }
-
-    html += `<button onclick="${callbackName}(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>下一页</button>`;
-    html += `<button onclick="${callbackName}(${totalPages})" ${page >= totalPages ? 'disabled' : ''}>末页</button>`;
-    html += `<span class="page-info">共 ${totalItems} 条 / ${totalPages} 页</span>`;
-
-    container.innerHTML = html;
 }
 
 // ========== Symbol Selector ==========
@@ -3915,8 +3620,8 @@ function renderSymbolTags(symbols) {
     if (!container) return;
     container.innerHTML = symbols.map(s => `
         <span class="symbol-tag">
-            ${s}
-            <span class="remove-sym" onclick="removeSymbol('${s}')" title="移除">×</span>
+            ${escHtml(s)}
+            <span class="remove-sym" onclick="removeSymbol(${jsStringAttr(s)})" title="移除">×</span>
         </span>
     `).join('');
 }
@@ -3924,7 +3629,7 @@ function renderSymbolTags(symbols) {
 function updateSymbolDatalist(symbols) {
     const dl = document.getElementById('active-symbols-list');
     if (!dl) return;
-    dl.innerHTML = symbols.map(s => `<option value="${s}">`).join('');
+    dl.innerHTML = symbols.map(s => `<option value="${escHtml(s)}">`).join('');
 }
 
 function renderSymbolDropdown() {
@@ -3935,9 +3640,9 @@ function renderSymbolDropdown() {
         return;
     }
     list.innerHTML = availableSymbols.map(s => `
-        <div class="symbol-dropdown-item" onclick="addSymbol('${s.symbol}')">
-            <strong>${s.symbol}</strong>
-            <span style="color:var(--text-secondary);font-size:11px;margin-left:6px;">${s.type}</span>
+        <div class="symbol-dropdown-item" onclick="addSymbol(${jsStringAttr(s.symbol)})">
+            <strong>${escHtml(s.symbol || '-')}</strong>
+            <span style="color:var(--text-secondary);font-size:11px;margin-left:6px;">${escHtml(s.type || '')}</span>
         </div>
     `).join('');
 }
@@ -3963,11 +3668,11 @@ function filterSymbolDropdown() {
 }
 
 async function addSymbol(symbol) {
-    const res = await fetch('/api/symbols/add', {
+    const res = await fetch('/api/symbols/add', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol }),
-    });
+    }));
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         alert('添加失败: ' + (err.detail || '未知错误'));
@@ -3980,11 +3685,11 @@ async function addSymbol(symbol) {
 }
 
 async function removeSymbol(symbol) {
-    const res = await fetch('/api/symbols/remove', {
+    const res = await fetch('/api/symbols/remove', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol }),
-    });
+    }));
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         alert('移除失败: ' + (err.detail || '未知错误'));
@@ -4054,57 +3759,6 @@ async function loadPriceChartKlines(symbol, timeframe) {
 }
 
 // ========== Auto Status Panel ==========
-
-function updateAutoStatus(stats) {
-    const scanModeEl = document.getElementById('status-scan-mode');
-    if (scanModeEl) {
-        scanModeEl.textContent = state.scanMode === 'auto'
-            ? '自动扫描全市场 (OKX)'
-            : '手动选择币种';
-    }
-
-    const modelCountEl = document.getElementById('status-model-count');
-    if (modelCountEl) {
-        const expertCount = state.aiExpertModels.length || FIXED_AI_EXPERT_FALLBACKS.length;
-        modelCountEl.textContent = `${expertCount} / 1`;
-    }
-
-    if (stats && stats.decision_interval) {
-        state.decisionInterval = stats.decision_interval;
-    }
-
-    const intervalEl = document.getElementById('status-interval');
-    if (intervalEl) {
-        intervalEl.textContent = state.decisionInterval + '秒/轮';
-    }
-
-    const dtEl = document.getElementById('status-decision-trade');
-    if (dtEl) updateDecisionPositionStatus();
-
-    const stageEl = document.getElementById('status-current-stage');
-    if (stageEl) {
-        const stage = stats?.current_stage_label || (stats?.running ? '等待下一轮分析' : '服务未运行');
-        const seconds = Number(stats?.round_running_seconds || 0);
-        stageEl.textContent = stats?.round_active
-            ? `${stage}，已用 ${seconds} 秒`
-            : stage;
-    }
-
-    const timingEl = document.getElementById('status-round-timing');
-    if (timingEl) {
-        const started = stats?.last_round_started_at ? shortBeijingTime(stats.last_round_started_at) : '-';
-        const finished = stats?.last_round_finished_at ? shortBeijingTime(stats.last_round_finished_at) : '进行中';
-        timingEl.textContent = `开始 ${started} / 完成 ${finished}`;
-    }
-
-    const errRow = document.getElementById('status-loop-error-row');
-    const errEl = document.getElementById('status-loop-error');
-    if (errRow && errEl) {
-        const err = loopErrorLabel(stats?.last_round_error);
-        errRow.style.display = err ? 'flex' : 'none';
-        errEl.textContent = err || '-';
-    }
-}
 
 function isMojibakeText(value) {
     if (!value) return false;
@@ -4206,11 +3860,11 @@ function initScanModeButtons() {
     document.querySelectorAll('.mode-btn[data-scan]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const scanMode = btn.dataset.scan;
-            const res = await fetch('/api/control/scan-mode', {
+            const res = await fetch('/api/control/scan-mode', dashboardWriteOptions({
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode: scanMode }),
-            });
+            }));
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
                 alert('切换失败: ' + (err.detail || res.statusText));
@@ -4375,11 +4029,11 @@ async function saveExecutionAccountSettings() {
             if (body[key] === null || body[key] === undefined || body[key] === '') delete body[key];
         });
 
-        const res = await fetch('/api/settings/execution-account', {
+        const res = await fetch('/api/settings/execution-account', dashboardWriteOptions({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
-        });
+        }));
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             if (status) {
@@ -4409,11 +4063,11 @@ async function saveOKXSettings(mode) {
     if (apiSecret && !apiSecret.startsWith('****')) body.api_secret = apiSecret;
     if (passphrase) body.passphrase = passphrase;
 
-    const res = await fetch('/api/settings/okx', {
+    const res = await fetch('/api/settings/okx', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-    });
+    }));
 
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -4435,11 +4089,11 @@ async function testOKXConnection(mode) {
     status.textContent = '';
     status.className = '';
 
-    const res = await fetch('/api/settings/okx/test', {
+    const res = await fetch('/api/settings/okx/test', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode }),
-    });
+    }));
     const data = await res.json().catch(() => ({}));
 
     btn.disabled = false;
@@ -4457,157 +4111,6 @@ async function testOKXConnection(mode) {
 // ========== AI Model CRUD ==========
 let currentModelMode = 'paper';
 
-async function fetchAIModels() {
-    const data = await fetchJSON('/api/settings/ai-models');
-    if (!data) return;
-
-    const allModels = (data.models || []).concat(data.legacy || []);
-    // Store model -> mode mapping for dashboard filtering
-    state.modelModeMap = {};
-    allModels.forEach(m => { state.modelModeMap[m.name] = m.execution_mode || 'paper'; });
-    const models = allModels.filter(m => (m.execution_mode || 'paper') === currentModelMode);
-    renderModelList(models);
-
-    const balanceEl = document.getElementById('okx-balance-info');
-    if (balanceEl && data.okx) {
-        const sameModeModels = allModels.filter(m => (m.execution_mode || 'paper') === currentModelMode);
-        const allocated = sameModeModels.reduce((sum, m) => sum + (m.balance || 0), 0);
-        const balKey = currentModelMode === 'paper' ? 'paper_balance' : 'live_balance';
-        const errKey = currentModelMode === 'paper' ? 'paper_error' : 'live_error';
-        const modeLabel = currentModelMode === 'paper' ? '模拟盘' : '实盘';
-        let html = '';
-        if (data.okx[balKey] !== null && data.okx[balKey] !== undefined) {
-            html += `OKX${modeLabel}余额: <strong>${data.okx[balKey].toFixed(2)}</strong> USDT`;
-        } else if (data.okx[errKey]) {
-            html += `OKX${modeLabel}: <span style="color:var(--yellow)">${data.okx[errKey]}</span>`;
-        }
-        if (sameModeModels.length > 0) {
-            html += ` | 已分配: <strong>${allocated.toFixed(2)}</strong> USDT`;
-            if (data.okx[balKey] !== null && allocated > data.okx[balKey]) {
-                html += ` <span style="color:var(--red)">(超额!)</span>`;
-            }
-        }
-        balanceEl.innerHTML = html;
-    }
-}
-
-function renderModelList(models) {
-    const tbody = document.getElementById('model-config-tbody');
-    if (!tbody) return;
-
-    if (!models.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无模型配置，点击"+ 添加模型"开始</td></tr>';
-        return;
-    }
-
-    tbody.innerHTML = models.map(m => {
-        const mode = m.execution_mode || 'paper';
-        const modeLabel = mode === 'paper' ? '模拟盘' : '实盘';
-        const modeColor = mode === 'paper' ? 'var(--accent)' : 'var(--red)';
-        return `
-        <tr>
-            <td><strong>${escHtml(m.name)}</strong></td>
-            <td style="font-size:11px;color:var(--text-muted);">${escHtml(m.api_base || '-')}</td>
-            <td>${escHtml(m.model || '-')}</td>
-            <td>${m.balance ? fmtNum(m.balance) : '默认'}</td>
-            <td><span style="color:${modeColor};font-size:11px;font-weight:500;">${modeLabel}</span></td>
-            <td>
-                <button class="btn btn-sm" onclick="editModel('${escHtml(m.name)}')" title="编辑">✏️</button>
-                <button class="btn btn-sm" onclick="testModelByName('${escHtml(m.name)}')" title="测试连接">🔍</button>
-                <button class="btn btn-sm" onclick="deleteModel('${escHtml(m.name)}')" title="删除">🗑️</button>
-            </td>
-        </tr>
-    `}).join('');
-}
-
-function showAddModelForm() {
-    document.getElementById('model-modal-title').textContent = '添加 AI 模型';
-    document.getElementById('model-edit-orig-name').value = '';
-    document.getElementById('model-cfg-name').value = '';
-    document.getElementById('model-cfg-api-base').value = '';
-    document.getElementById('model-cfg-api-key').value = '';
-    document.getElementById('model-cfg-model').value = '';
-    document.getElementById('model-cfg-balance').value = '';
-    const modeSel = document.getElementById('model-cfg-mode');
-    if (modeSel) modeSel.value = currentModelMode;
-    document.getElementById('model-save-btn').textContent = '添加';
-    document.getElementById('model-modal-overlay').style.display = 'flex';
-}
-
-function editModel(name) {
-    fetchJSON('/api/settings/ai-models').then(data => {
-        if (!data) return;
-        const allModels = (data.models || []).concat(data.legacy || []);
-        const m = allModels.find(x => x.name === name);
-        if (!m) { alert('未找到模型: ' + name); return; }
-
-        document.getElementById('model-modal-title').textContent = '编辑 AI 模型';
-        document.getElementById('model-edit-orig-name').value = name;
-        document.getElementById('model-cfg-name').value = m.name || '';
-        document.getElementById('model-cfg-api-base').value = m.api_base || '';
-        document.getElementById('model-cfg-api-key').value = '';
-        document.getElementById('model-cfg-api-key').placeholder = m.api_key ? '已有密钥（已隐藏），留空不变' : 'API Key';
-        document.getElementById('model-cfg-model').value = m.model || '';
-        document.getElementById('model-cfg-balance').value = m.balance || '';
-        const modeSel = document.getElementById('model-cfg-mode');
-        if (modeSel) modeSel.value = m.execution_mode || 'paper';
-        document.getElementById('model-save-btn').textContent = '保存';
-        document.getElementById('model-modal-overlay').style.display = 'flex';
-    });
-}
-
-async function saveModelConfig() {
-    const origName = document.getElementById('model-edit-orig-name').value.trim();
-    const isEdit = !!origName;
-
-    const body = {
-        name: document.getElementById('model-cfg-name').value.trim(),
-        api_base: document.getElementById('model-cfg-api-base').value.trim(),
-        api_key: document.getElementById('model-cfg-api-key').value.trim(),
-        model: document.getElementById('model-cfg-model').value.trim(),
-        balance: parseFloat(document.getElementById('model-cfg-balance').value) || null,
-        execution_mode: document.getElementById('model-cfg-mode')?.value || 'paper',
-    };
-
-    if (!body.name) { alert('请输入模型名称'); return; }
-
-    const url = isEdit ? `/api/settings/ai-models/${encodeURIComponent(origName)}` : '/api/settings/ai-models';
-    const method = isEdit ? 'PUT' : 'POST';
-
-    const res = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        alert('保存失败: ' + (err.detail || '未知错误'));
-        return;
-    }
-
-    closeModelModal();
-    fetchAIModels();
-    alert(isEdit ? '模型已更新' : '模型已添加');
-}
-
-async function deleteModel(name) {
-    if (!confirm('确定要删除模型 "' + name + '" 吗？此操作不可撤销。')) return;
-
-    const res = await fetch('/api/settings/ai-models/' + encodeURIComponent(name), {
-        method: 'DELETE',
-    });
-
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        alert('删除失败: ' + (err.detail || '未知错误'));
-        return;
-    }
-
-    fetchAIModels();
-    alert('模型已删除');
-}
-
 async function testModelByName(name) {
     const btn = event && event.target;
     if (btn && btn.tagName === 'BUTTON') {
@@ -4615,11 +4118,11 @@ async function testModelByName(name) {
         btn.textContent = '...';
     }
 
-    const res = await fetch('/api/settings/ai-models/test', {
+    const res = await fetch('/api/settings/ai-models/test', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
-    });
+    }));
     const data = await res.json().catch(() => ({}));
 
     if (btn && btn.tagName === 'BUTTON') {
@@ -4690,8 +4193,8 @@ function renderModelList(models) {
             : `<span style="color:var(--text-muted);font-size:11px;">${loading ? '加载中' : '未设置'}</span>`;
         const actionButtons = loading
             ? '<button class="btn btn-sm" disabled title="配置加载中">编辑</button><button class="btn btn-sm" disabled title="配置加载中">测试</button>'
-            : `<button class="btn btn-sm" onclick="editModel('${escHtml(m.name)}')" title="编辑">编辑</button>
-                <button class="btn btn-sm" onclick="testModelByName('${escHtml(m.name)}')" title="测试连接">测试</button>`;
+            : `<button class="btn btn-sm" onclick="editModel(${jsStringAttr(m.name)})" title="编辑">编辑</button>
+                <button class="btn btn-sm" onclick="testModelByName(${jsStringAttr(m.name)})" title="测试连接">测试</button>`;
         return `
         <tr>
             <td>
@@ -4738,11 +4241,11 @@ async function saveModelConfig() {
 
     if (!origName || !body.name) { alert('请选择要编辑的专家模型'); return; }
 
-    const res = await fetch(`/api/settings/ai-models/${encodeURIComponent(origName)}`, {
+    const res = await fetch(`/api/settings/ai-models/${encodeURIComponent(origName)}`, dashboardWriteOptions({
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-    });
+    }));
 
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -4856,42 +4359,6 @@ function renderDailyPnlRecords(records) {
     const tbody = document.getElementById('daily-pnl-tbody');
     if (!tbody) return;
     if (!records.length) {
-        tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted);text-align:center;padding:24px;">暂无每日盈亏记录</td></tr>';
-        return;
-    }
-    tbody.innerHTML = records.map(row => {
-        const realized = Number(row.realized_pnl || 0);
-        const unrealized = Number(row.unrealized_pnl || 0);
-        const total = Number(row.total_pnl || 0);
-        const cumulative = Number(row.cumulative_total_pnl ?? row.cumulative_realized_pnl ?? 0);
-        const winLoss = `${Number(row.win_count || 0)}胜 / ${Number(row.loss_count || 0)}亏`;
-        const symbolCount = Array.isArray(row.symbol_pnl)
-            ? row.symbol_pnl.length
-            : (Array.isArray(row.symbols) ? row.symbols.length : 0);
-        const detailDisabled = symbolCount <= 0 ? 'disabled' : '';
-        return `
-        <tr>
-            <td style="font-weight:700;white-space:nowrap;">${escHtml(row.date || '-')}</td>
-            <td style="color:${realized >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700;">${signedMoney(realized)} USDT</td>
-            <td style="color:var(--green);">${fmtMoney(row.realized_profit || 0)} USDT</td>
-            <td style="color:var(--red);">${fmtMoney(row.realized_loss || 0)} USDT</td>
-            <td style="color:${unrealized >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(unrealized)} USDT</td>
-            <td style="color:${total >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700;">${signedMoney(total)} USDT</td>
-            <td style="color:${cumulative >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(cumulative)} USDT</td>
-            <td>${Number(row.trade_count || 0)} <span style="color:var(--text-muted);font-size:10px;">${winLoss}</span></td>
-            <td>
-                <button class="btn btn-sm" ${detailDisabled} onclick="openDailyPnlModal('${escHtml(row.date || '')}')">
-                    ${symbolCount ? `查看 ${symbolCount} 个币种` : '无交易'}
-                </button>
-            </td>
-        </tr>`;
-    }).join('');
-}
-
-function renderDailyPnlRecords(records) {
-    const tbody = document.getElementById('daily-pnl-tbody');
-    if (!tbody) return;
-    if (!records.length) {
         tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无每日盈亏记录</td></tr>';
         return;
     }
@@ -4914,7 +4381,7 @@ function renderDailyPnlRecords(records) {
             <td style="color:${cumulative >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(cumulative)} USDT</td>
             <td>${Number(row.trade_count || 0)} <span style="color:var(--text-muted);font-size:10px;">${winLoss}</span></td>
             <td>
-                <button class="btn btn-sm" ${detailDisabled} onclick="openDailyPnlModal('${escHtml(row.date || '')}')">
+                <button class="btn btn-sm" ${detailDisabled} onclick="openDailyPnlModal(${jsStringAttr(row.date || '')})">
                     ${symbolCount ? `查看 ${symbolCount} 个币种` : '无交易'}
                 </button>
             </td>
@@ -5062,39 +4529,6 @@ function renderDecisionsPage(totalPagesOverride = null) {
     renderPagination('decisions-pagination', page, totalPages, state.decisionsTotal, 'changeDecisionsPage');
 }
 
-function showExecutionDetail(tradeId) { 
-    const trade = state.allTrades.find(t => Number(t.id) === Number(tradeId)); 
-    if (!trade) return; 
-    setDecisionModalWide(false);
-    const success = trade.success === true || trade.status === 'filled'; 
-    const sourceLabel = trade.execution_source_label || (trade.execution_source === 'okx' ? 'OKX执行' : '系统执行');
-    const closeStatus = closeStatusLabel(trade);
-    const actionTitle = closeStatus
-        ? `${actionLabel(trade.action || trade.side)} · ${closeStatus}`
-        : actionLabel(trade.action || trade.side);
-    const detail = trade.detail || trade.reason || (success ? '订单执行成功。' : '订单执行失败，暂无详细原因。');
-    document.getElementById('decision-reason-title').textContent =
-        `${trade.symbol || '-'} / ${actionTitle} / ${success ? '执行成功' : '执行失败'}`;
-    document.getElementById('decision-reason-body').innerHTML = `
-        <div class="reason-block">
-            <div class="reason-label">${success ? '执行详情' : '失败原因'}</div>
-            <div>${escapeMultiline(detail)}</div>
-        </div>
-        <div class="reason-block">
-            <div class="reason-label">订单信息</div>
-            <div>
-                执行时间：${toBeijingTime(trade.filled_at || trade.created_at)}<br>
-                ${closeStatus ? `平仓类型：${escHtml(closeStatus)}<br>` : ''}
-                杠杆：${Number(trade.leverage || 1).toFixed(1)}x<br>
-                数量：${fmtNum(trade.quantity)}<br>
-                价格：${fmtPrice(trade.price)}<br>
-                来源：${escHtml(sourceLabel)}<br>
-                状态：${statusLabel(trade.status)}
-            </div>
-        </div>`;
-    document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
-}
-
 function changePositionsPage(page) {
     state.positionsPage = page;
     fetchPositions();
@@ -5110,6 +4544,12 @@ function changePositionHistoryPage(page) {
 function renderPagination(containerId, page, totalPages, totalItems, callbackName) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    const callback = safePaginationCallbackName(callbackName);
+    if (!callback) {
+        container.style.display = 'none';
+        container.innerHTML = '';
+        return;
+    }
 
     const currentPage = Math.max(1, Number(page || 1));
     const pages = Math.max(1, Number(totalPages || 1));
@@ -5129,13 +4569,13 @@ function renderPagination(containerId, page, totalPages, totalItems, callbackNam
     }
 
     let html = '';
-    html += `<button onclick="${callbackName}(1)" ${currentPage <= 1 ? 'disabled' : ''}>首页</button>`;
-    html += `<button onclick="${callbackName}(${currentPage - 1})" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>`;
+    html += `<button onclick="${callback}(1)" ${currentPage <= 1 ? 'disabled' : ''}>首页</button>`;
+    html += `<button onclick="${callback}(${currentPage - 1})" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>`;
     for (let p = startP; p <= endP; p++) {
-        html += `<button onclick="${callbackName}(${p})" ${p === currentPage ? 'class="active"' : ''}>${p}</button>`;
+        html += `<button onclick="${callback}(${p})" ${p === currentPage ? 'class="active"' : ''}>${p}</button>`;
     }
-    html += `<button onclick="${callbackName}(${currentPage + 1})" ${currentPage >= pages ? 'disabled' : ''}>下一页</button>`;
-    html += `<button onclick="${callbackName}(${pages})" ${currentPage >= pages ? 'disabled' : ''}>末页</button>`;
+    html += `<button onclick="${callback}(${currentPage + 1})" ${currentPage >= pages ? 'disabled' : ''}>下一页</button>`;
+    html += `<button onclick="${callback}(${pages})" ${currentPage >= pages ? 'disabled' : ''}>末页</button>`;
     html += `<span class="page-info">共 ${total} 条 / ${pages} 页</span>`;
     container.innerHTML = html;
 }
@@ -5144,46 +4584,7 @@ function closeModelModal() {
     document.getElementById('model-modal-overlay').style.display = 'none';
 }
 
-// Final override for execution details with readable leverage fields.
-function showExecutionDetail(tradeId) {
-    const trade = state.allTrades.find(t => Number(t.id) === Number(tradeId));
-    if (!trade) return;
-    setDecisionModalWide(false);
-    const success = trade.success === true || trade.status === 'filled';
-    const sourceLabel = trade.execution_source_label || (trade.execution_source === 'okx' ? 'OKX执行' : '系统执行');
-    const closeStatus = closeStatusLabel(trade);
-    const actionTitle = closeStatus
-        ? `${actionLabel(trade.action || trade.side)} / ${closeStatus}`
-        : actionLabel(trade.action || trade.side);
-    const detail = trade.detail || trade.reason || (success ? '订单执行成功。' : '订单执行失败，暂无详细原因。');
-    document.getElementById('decision-reason-title').textContent =
-        `${trade.symbol || '-'} / ${actionTitle} / ${success ? '执行成功' : '执行失败'}`;
-    document.getElementById('decision-reason-body').innerHTML = `
-        <div class="reason-block">
-            <div class="reason-label">${success ? '执行详情' : '失败原因'}</div>
-            <div>${escapeMultiline(detail)}</div>
-        </div>
-        <div class="reason-block">
-            <div class="reason-label">杠杆明细</div>
-            <div>
-                AI建议：${Number(trade.ai_suggested_leverage ?? trade.leverage ?? 1).toFixed(1)}x<br>
-                实际下单：${Number(trade.actual_leverage ?? trade.leverage ?? 1).toFixed(1)}x
-            </div>
-        </div>
-        <div class="reason-block">
-            <div class="reason-label">订单信息</div>
-            <div>
-                执行时间：${toBeijingTime(trade.filled_at || trade.created_at)}<br>
-                ${closeStatus ? `平仓类型：${escHtml(closeStatus)}<br>` : ''}
-                数量：${fmtNum(trade.quantity)}<br>
-                价格：${fmtPrice(trade.price)}<br>
-                来源：${escHtml(sourceLabel)}<br>
-                状态：${statusLabel(trade.status)}
-            </div>
-        </div>`;
-    document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
-}
-
+// Execution detail renderer with readable leverage fields and sanitized failure text.
 function cleanExecutionDetailText(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback;
     const text = String(value);
@@ -5272,6 +4673,15 @@ function showExecutionDetail(tradeId) {
 
 // Close modal on overlay click
 document.addEventListener('click', (e) => {
+    const analysisReasonButton = e.target?.closest?.('.js-analysis-reason');
+    if (analysisReasonButton) {
+        e.preventDefault();
+        showAnalysisReason(
+            analysisReasonButton.dataset.recordId,
+            analysisReasonButton.dataset.decisionId
+        );
+        return;
+    }
     if (e.target.id === 'decision-reason-modal-overlay') {
         closeDecisionReasonModal();
     }
@@ -5286,8 +4696,52 @@ function escHtml(str) {
     return div.innerHTML;
 }
 
+function jsStringAttr(value) {
+    return escHtml(JSON.stringify(String(value ?? '')));
+}
+
+const PAGINATION_CALLBACKS = new Set([
+    'changePositionsPage',
+    'changePositionHistoryPage',
+    'changeTradePage',
+    'changeDecisionsPage',
+    'changeAnalysisPage',
+    'changeRiskAlertPage',
+    'changeExpertMemoryPage',
+    'changeTradeReflectionPage',
+    'changeShadowBacktestPage',
+    'changeMLSignalPage',
+    'changeProfitAttributionRecordPage',
+]);
+
+function safePaginationCallbackName(callbackName) {
+    const value = String(callbackName || '');
+    return PAGINATION_CALLBACKS.has(value) ? value : '';
+}
+
+function safeExternalUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) return '';
+    try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+        if (parsed.username || parsed.password) return '';
+        return parsed.href;
+    } catch (_) {
+        return '';
+    }
+}
+
 function escapeMultiline(str) {
     return escHtml(str || '').replace(/\n/g, '<br>');
+}
+
+function finiteInputNumberAttr(input, attrName, fallback) {
+    if (!input) return fallback;
+    const rawValue = input.getAttribute(attrName);
+    if (rawValue === null || rawValue === '') return fallback;
+    const parsed = Number(rawValue);
+    return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 // ========== Trading Parameters ==========
@@ -5302,16 +4756,28 @@ async function fetchTradingParams() {
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
+    const localToolsBreakerFailuresInput = document.getElementById('cfg-local-ai-tools-breaker-failures');
+    const localToolsBreakerCooldownInput = document.getElementById('cfg-local-ai-tools-breaker-cooldown');
     const highRiskEnabledInput = document.getElementById('cfg-high-risk-review-enabled');
     const highRiskBaseInput = document.getElementById('cfg-high-risk-review-api-base');
     const highRiskKeyInput = document.getElementById('cfg-high-risk-review-api-key');
     const highRiskModelInput = document.getElementById('cfg-high-risk-review-model');
+    const highRiskTimeoutInput = document.getElementById('cfg-high-risk-review-timeout');
+    const highRiskMaxTokensInput = document.getElementById('cfg-high-risk-review-max-tokens');
+    const highRiskBreakerFailuresInput = document.getElementById('cfg-high-risk-review-breaker-failures');
+    const highRiskBreakerCooldownInput = document.getElementById('cfg-high-risk-review-breaker-cooldown');
 
     if (intervalInput) intervalInput.value = data.decision_interval;
     if (thresholdInput) thresholdInput.value = data.confidence_threshold;
     if (localToolsEnabledInput) localToolsEnabledInput.checked = Boolean(data.local_ai_tools_enabled);
     if (localToolsBaseInput) localToolsBaseInput.value = data.local_ai_tools_api_base || '';
     if (localToolsTimeoutInput) localToolsTimeoutInput.value = data.local_ai_tools_timeout_seconds ?? 2.5;
+    if (localToolsBreakerFailuresInput) {
+        localToolsBreakerFailuresInput.value = data.local_ai_tools_circuit_breaker_failures ?? 3;
+    }
+    if (localToolsBreakerCooldownInput) {
+        localToolsBreakerCooldownInput.value = data.local_ai_tools_circuit_breaker_cooldown_seconds ?? 45;
+    }
     if (highRiskEnabledInput) highRiskEnabledInput.checked = Boolean(data.high_risk_review_enabled);
     if (highRiskBaseInput) highRiskBaseInput.value = data.high_risk_review_api_base || '';
     if (highRiskKeyInput) {
@@ -5321,6 +4787,24 @@ async function fetchTradingParams() {
             : '线上模型 API Key';
     }
     if (highRiskModelInput) highRiskModelInput.value = data.high_risk_review_model || '';
+    if (highRiskTimeoutInput) highRiskTimeoutInput.value = data.high_risk_review_timeout_seconds ?? 30;
+    if (highRiskMaxTokensInput) {
+        const tokenFloor = Number(data.high_risk_review_token_floor);
+        const tokenCap = Number(data.high_risk_review_token_cap);
+        if (Number.isFinite(tokenFloor) && tokenFloor > 0) {
+            highRiskMaxTokensInput.min = String(tokenFloor);
+        }
+        if (Number.isFinite(tokenCap) && tokenCap >= finiteInputNumberAttr(highRiskMaxTokensInput, 'min', 1)) {
+            highRiskMaxTokensInput.max = String(tokenCap);
+        }
+        highRiskMaxTokensInput.value = data.high_risk_review_max_tokens ?? 480;
+    }
+    if (highRiskBreakerFailuresInput) {
+        highRiskBreakerFailuresInput.value = data.high_risk_review_circuit_breaker_failures ?? 2;
+    }
+    if (highRiskBreakerCooldownInput) {
+        highRiskBreakerCooldownInput.value = data.high_risk_review_circuit_breaker_cooldown_seconds ?? 120;
+    }
     if (totalMarginInput) {
         const pct = valueNumber(data.total_margin_limit_pct);
         totalMarginInput.value = pct !== null ? (pct * 100).toFixed(0) : '';
@@ -5334,10 +4818,16 @@ async function saveTradingParams() {
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
+    const localToolsBreakerFailuresInput = document.getElementById('cfg-local-ai-tools-breaker-failures');
+    const localToolsBreakerCooldownInput = document.getElementById('cfg-local-ai-tools-breaker-cooldown');
     const highRiskEnabledInput = document.getElementById('cfg-high-risk-review-enabled');
     const highRiskBaseInput = document.getElementById('cfg-high-risk-review-api-base');
     const highRiskKeyInput = document.getElementById('cfg-high-risk-review-api-key');
     const highRiskModelInput = document.getElementById('cfg-high-risk-review-model');
+    const highRiskTimeoutInput = document.getElementById('cfg-high-risk-review-timeout');
+    const highRiskMaxTokensInput = document.getElementById('cfg-high-risk-review-max-tokens');
+    const highRiskBreakerFailuresInput = document.getElementById('cfg-high-risk-review-breaker-failures');
+    const highRiskBreakerCooldownInput = document.getElementById('cfg-high-risk-review-breaker-cooldown');
 
     const body = {};
     if (intervalInput && intervalInput.value) {
@@ -5360,6 +4850,22 @@ async function saveTradingParams() {
         }
         body.local_ai_tools_timeout_seconds = timeout;
     }
+    if (localToolsBreakerFailuresInput && localToolsBreakerFailuresInput.value !== '') {
+        const failures = parseInt(localToolsBreakerFailuresInput.value, 10);
+        if (!Number.isFinite(failures) || failures < 1 || failures > 20) {
+            alert('保存失败: 本地 AI 工具熔断失败次数必须在 1 到 20 之间');
+            return;
+        }
+        body.local_ai_tools_circuit_breaker_failures = failures;
+    }
+    if (localToolsBreakerCooldownInput && localToolsBreakerCooldownInput.value !== '') {
+        const cooldown = parseFloat(localToolsBreakerCooldownInput.value);
+        if (!Number.isFinite(cooldown) || cooldown < 5 || cooldown > 3600) {
+            alert('保存失败: 本地 AI 工具熔断冷却时间必须在 5 到 3600 秒之间');
+            return;
+        }
+        body.local_ai_tools_circuit_breaker_cooldown_seconds = cooldown;
+    }
     if (highRiskEnabledInput) {
         body.high_risk_review_enabled = Boolean(highRiskEnabledInput.checked);
     }
@@ -5372,6 +4878,40 @@ async function saveTradingParams() {
     if (highRiskModelInput) {
         body.high_risk_review_model = highRiskModelInput.value.trim();
     }
+    if (highRiskTimeoutInput && highRiskTimeoutInput.value !== '') {
+        const timeout = parseFloat(highRiskTimeoutInput.value);
+        if (!Number.isFinite(timeout) || timeout < 5 || timeout > 120) {
+            alert('保存失败: 高风险复核超时必须在 5 到 120 秒之间');
+            return;
+        }
+        body.high_risk_review_timeout_seconds = timeout;
+    }
+    if (highRiskMaxTokensInput && highRiskMaxTokensInput.value !== '') {
+        const maxTokens = parseInt(highRiskMaxTokensInput.value, 10);
+        const tokenFloor = finiteInputNumberAttr(highRiskMaxTokensInput, 'min', 1);
+        const tokenCap = finiteInputNumberAttr(highRiskMaxTokensInput, 'max', Number.MAX_SAFE_INTEGER);
+        if (!Number.isFinite(maxTokens) || maxTokens < tokenFloor || maxTokens > tokenCap) {
+            alert(`保存失败: 高风险复核最大输出 Token 必须在 ${tokenFloor} 到 ${tokenCap} 之间`);
+            return;
+        }
+        body.high_risk_review_max_tokens = maxTokens;
+    }
+    if (highRiskBreakerFailuresInput && highRiskBreakerFailuresInput.value !== '') {
+        const failures = parseInt(highRiskBreakerFailuresInput.value, 10);
+        if (!Number.isFinite(failures) || failures < 1 || failures > 20) {
+            alert('保存失败: 高风险复核熔断失败次数必须在 1 到 20 之间');
+            return;
+        }
+        body.high_risk_review_circuit_breaker_failures = failures;
+    }
+    if (highRiskBreakerCooldownInput && highRiskBreakerCooldownInput.value !== '') {
+        const cooldown = parseFloat(highRiskBreakerCooldownInput.value);
+        if (!Number.isFinite(cooldown) || cooldown < 5 || cooldown > 3600) {
+            alert('保存失败: 高风险复核熔断冷却时间必须在 5 到 3600 秒之间');
+            return;
+        }
+        body.high_risk_review_circuit_breaker_cooldown_seconds = cooldown;
+    }
     if (totalMarginInput && totalMarginInput.value) {
         const pct = parseFloat(totalMarginInput.value);
         if (!Number.isFinite(pct) || pct < 10 || pct > 100) {
@@ -5381,11 +4921,11 @@ async function saveTradingParams() {
         body.total_margin_limit_pct = pct / 100;
     }
 
-    const res = await fetch('/api/settings/thresholds', {
+    const res = await fetch('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-    });
+    }));
 
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -5415,249 +4955,6 @@ function mlFriendlyStatusLabel(ready, activeText = '已介入') {
 
 function mlTechName(name) {
     return name || '技术模型未返回';
-}
-
-function renderLocalAIToolsStatus() {
-    const container = document.getElementById('local-ai-tools-status');
-    const updatedEl = document.getElementById('local-ai-tools-updated');
-    if (!container) return;
-    const status = state.localAIToolsStatus || {};
-    const models = status.models || {};
-    const available = status.available === true;
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
-    if (updatedEl) {
-        updatedEl.textContent = available
-            ? `已训练 ${Number(status.shadow_sample_count || 0)} 条影子样本 / ${Number(status.trade_sample_count || 0)} 条交易样本`
-            : '服务不可用';
-    }
-
-    const cards = [
-        {
-            label: '服务状态',
-            value: available ? '可用' : '不可用',
-            subtitle: available ? '服务器模型服务已连接，可给交易系统提供预测。' : (status.error || status.message || '等待服务器返回状态'),
-            tone: available ? 'good' : 'bad',
-        },
-        {
-            label: '最近训练',
-            value: trainedAt,
-            subtitle: status.source ? `数据来源：${status.source}` : '用于判断模型是否使用了最新样本。',
-            tone: 'muted',
-        },
-        {
-            label: '影子复盘样本',
-            value: String(Number(status.shadow_sample_count || 0)),
-            subtitle: '训练盈利预测、亏损过滤和多周期收益预测。',
-            tone: Number(status.shadow_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-        {
-            label: '真实交易样本',
-            value: String(Number(status.trade_sample_count || 0)),
-            subtitle: '用于学习币种画像、历史亏损压力和平仓建议。',
-            tone: Number(status.trade_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-        {
-            label: 'K线序列样本',
-            value: String(Number(status.sequence_sample_count || 0)),
-            subtitle: '用于判断未来 10/30/60 分钟方向和波动。',
-            tone: Number(status.sequence_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-        {
-            label: '情绪文本样本',
-            value: String(Number(status.text_sentiment_sample_count || 0)),
-            subtitle: '用于新闻、公告、社媒情绪校准。',
-            tone: Number(status.text_sentiment_sample_count || 0) > 0 ? 'good' : 'warn',
-        },
-    ];
-
-    const purposeCards = [
-        {
-            title: '开仓盈利预测',
-            desc: '预测做多/做空扣除成本后的预期收益，帮助系统优先选择更可能赚钱的方向。',
-            detail: `技术模型：${mlTechName(models.profit)}`,
-            tone: models.profit ? 'good' : 'warn',
-        },
-        {
-            title: '亏损风险过滤',
-            desc: '判断某个币种和方向是否容易亏损，用来降低反复买入亏损组合的概率。',
-            detail: `技术模型：${mlTechName(models.loss_filter)}`,
-            tone: models.loss_filter ? 'good' : 'warn',
-        },
-        {
-            title: '多周期行情预测',
-            desc: `按 ${(status.horizons || [10, 30, 60]).join('/')} 分钟窗口预测未来收益变化，辅助判断入场时机。`,
-            detail: `技术模型：${mlTechName(models.deep_timeseries || models.timeseries)}`,
-            tone: (models.deep_timeseries || models.timeseries) ? 'good' : 'warn',
-        },
-        {
-            title: '平仓建议',
-            desc: '结合真实持仓盈亏、持仓时间和历史交易画像，判断继续持有、减仓、止盈或止损。',
-            detail: `技术模型：${mlTechName(models.exit)}`,
-            tone: models.exit ? 'good' : 'warn',
-        },
-    ];
-
-    container.innerHTML = `
-        <div class="ml-overview-grid ml-overview-grid-compact">
-            ${cards.map(item => mlMetricCard(item.label, item.value, item.subtitle, item.tone)).join('')}
-        </div>
-        <div class="ml-purpose-grid">
-            ${purposeCards.map(item => `
-                <div class="ml-purpose-card ml-purpose-${item.tone}">
-                    <div class="ml-purpose-title">${escHtml(item.title)}</div>
-                    <div class="ml-purpose-desc">${escHtml(item.desc)}</div>
-                    <div class="ml-purpose-tech">${escHtml(item.detail)}</div>
-                </div>
-            `).join('')}
-        </div>`;
-}
-
-function renderTrainableModelCard(model) {
-    const metrics = Array.isArray(model.metrics) && model.metrics.length
-        ? `<div class="ml-model-metrics">${model.metrics.map(item => `
-            <div class="ml-model-metric">
-                <span>${escHtml(item.label)}</span>
-                <strong>${escHtml(item.value)}</strong>
-            </div>
-        `).join('')}</div>`
-        : '';
-    return `
-        <div class="ml-train-model-card ml-train-model-card-clear">
-            <div class="ml-train-model-head">
-                <div>
-                    <div class="ml-train-model-title">${escHtml(model.title)}</div>
-                    <div class="ml-train-model-desc">${escHtml(model.description || '-')}</div>
-                </div>
-                ${mlModelStatusPill(model.ready, model.statusLabel)}
-            </div>
-            <div class="ml-model-purpose-row">
-                <span>当前作用</span>
-                <strong>${escHtml(model.usage || '-')}</strong>
-            </div>
-            <div class="ml-train-model-grid">
-                <div><span>训练样本</span><strong>${escHtml(model.samples || '-')}</strong></div>
-                <div><span>训练时间</span><strong>${escHtml(model.trainedAt || '-')}</strong></div>
-                <div><span>技术模型</span><strong>${escHtml(model.type || '-')}</strong></div>
-            </div>
-            ${metrics}
-            <div class="ml-train-model-note">${escHtml(model.note || '')}</div>
-        </div>`;
-}
-
-function renderTrainableModels() {
-    const container = document.getElementById('ml-trainable-models');
-    if (!container) return;
-    const local = state.localAIToolsStatus || {};
-    const ml = state.mlSignalStatus || {};
-    const modelsMap = local.models || {};
-    const localTrainedAt = local.trained_at ? toBeijingTime(local.trained_at) : '-';
-    const mlTrainedAt = ml.trained_at ? toBeijingTime(ml.trained_at) : '-';
-    const metrics = ml.metrics || {};
-    const autoLast = ml.auto_train_last_result || {};
-    const autoTrainText = ml.auto_train_enabled
-        ? `自动训练已开启；下次检查 ${ml.auto_train_next_check_at ? toBeijingTime(ml.auto_train_next_check_at) : '-'}`
-        : '自动训练未开启';
-
-    const models = [
-        {
-            title: '本地 ML 盈亏质量',
-            type: '本机 ExtraTrees 盈亏过滤',
-            ready: ml.available === true,
-            statusLabel: ml.influence_enabled ? '已介入' : (ml.available ? '学习中' : '未就绪'),
-            description: '判断一笔交易是否有正期望，开仓时用于门槛、否决和机会排序。',
-            samples: `${Number(ml.sample_count || 0)} 条影子复盘`,
-            trainedAt: mlTrainedAt,
-            usage: ml.influence_enabled ? '开仓过滤 + 机会排序' : '只学习，不影响交易',
-            metrics: [
-                { label: '做多 AUC', value: Number(metrics.long_auc || 0).toFixed(3) },
-                { label: '做空 AUC', value: Number(metrics.short_auc || 0).toFixed(3) },
-                { label: '做多高分收益', value: signedPctValueLabel(metrics.top_long_avg_return_pct) },
-                { label: '做空高分收益', value: signedPctValueLabel(metrics.top_short_avg_return_pct) },
-            ],
-            note: autoLast.message || autoTrainText,
-        },
-        {
-            title: '开仓盈利预测',
-            type: mlTechName(modelsMap.profit),
-            ready: localModelStatus(local, 'profit'),
-            description: '预测做多和做空扣除成本后的预期收益，目标是净利润最大化。',
-            samples: `${Number(local.shadow_sample_count || 0)} 条影子样本`,
-            trainedAt: localTrainedAt,
-            usage: '给专家和最终裁决提供收益证据',
-            metrics: [
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-                { label: '预测周期', value: (local.horizons || []).join('/') || '-' },
-            ],
-            note: '胜率不是目标，真正目标是扣除手续费和滑点后的实现利润。',
-        },
-        {
-            title: '亏损风险过滤',
-            type: mlTechName(modelsMap.loss_filter),
-            ready: localModelStatus(local, 'loss_filter'),
-            description: '识别某个币种/方向近期是否容易亏损，避免反复交易亏损组合。',
-            samples: `${Number(local.shadow_sample_count || 0)} 条影子样本`,
-            trainedAt: localTrainedAt,
-            usage: '亏损概率提示 + 开仓风险过滤',
-            metrics: [
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-            ],
-            note: '例如某币种近期连续亏损时，会降低开仓优先级或要求更强证据。',
-        },
-        {
-            title: '多周期行情预测',
-            type: mlTechName(modelsMap.deep_timeseries || modelsMap.timeseries),
-            ready: localModelStatus(local, 'timeseries') || Boolean(local.torch_patch_status?.available),
-            description: '预测未来 10/30/60 分钟收益和波动，用来辅助判断入场窗口。',
-            samples: `${Number(local.sequence_sample_count || 0)} 条序列样本`,
-            trainedAt: localTrainedAt,
-            usage: '短周期方向 + 波动预判',
-            metrics: [
-                { label: '周期', value: (local.horizons || []).join('/') || '-' },
-                { label: 'MAE', value: local.torch_patch_status?.train_mae_pct !== undefined ? `${Number(local.torch_patch_status.train_mae_pct).toFixed(4)}%` : '-' },
-                { label: '输入维度', value: String(local.torch_patch_status?.input_dim || local.feature_count || '-') },
-            ],
-            note: '这部分用于辅助判断时机，不会单独决定买卖。',
-        },
-        {
-            title: '情绪风险校准',
-            type: mlTechName(modelsMap.deep_sentiment || modelsMap.sentiment),
-            ready: localModelStatus(local, 'sentiment') || localModelStatus(local, 'deep_sentiment'),
-            description: '学习新闻、公告和社媒情绪对收益/风险的影响。',
-            samples: `${Number(local.text_sentiment_sample_count || 0)} 条文本样本`,
-            trainedAt: localTrainedAt,
-            usage: '新闻情绪风险 + 收益校准',
-            metrics: [
-                { label: 'Transformers', value: local.transformers_sentiment_backend?.available ? '可用' : '未启用' },
-                { label: '库版本', value: local.transformers_sentiment_backend?.version || '-' },
-            ],
-            note: '文本样本越多，对突发新闻和事件风险的判断越有价值。',
-        },
-        {
-            title: '平仓/退出建议',
-            type: mlTechName(modelsMap.exit),
-            ready: localModelStatus(local, 'exit'),
-            description: '结合真实持仓盈亏、持仓时间和历史交易画像，判断止盈、止损、减仓或继续持有。',
-            samples: `${Number(local.trade_sample_count || 0)} 条交易/平仓样本`,
-            trainedAt: localTrainedAt,
-            usage: '持仓复盘 + 平仓建议',
-            metrics: [
-                { label: '交易样本', value: String(Number(local.trade_sample_count || 0)) },
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-            ],
-            note: '它服务于已实现净利润，不是单纯追求持仓浮盈。',
-        },
-    ];
-
-    container.innerHTML = `
-        <div class="ml-train-summary">
-            ${mlMetricCard('可训练模型', `${models.length} 个`, '覆盖开仓、亏损过滤、时序、情绪和平仓', 'good')}
-            ${mlMetricCard('自动训练', ml.auto_train_enabled ? '已开启' : '未开启', autoTrainText, ml.auto_train_enabled ? 'good' : 'warn')}
-            ${mlMetricCard('新增样本', String(Number(autoLast.new_sample_count || 0)), autoLast.message || '等待下一次训练检查', Number(autoLast.new_sample_count || 0) >= Number(ml.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
-        </div>
-        <div class="ml-train-model-list ml-train-model-list-clear">
-            ${models.map(renderTrainableModelCard).join('')}
-        </div>`;
 }
 
 // Final readable Local ML rendering override. Earlier definitions are kept for
@@ -5967,212 +5264,15 @@ function setProfitAttributionView(view) {
     document.getElementById('profit-attribution-panel-records')?.classList.toggle('active', selected === 'records');
 }
 
-function renderProfitAttribution() {
-    const data = state.profitAttribution || {};
-    setProfitAttributionView(state.profitAttributionView || 'overview');
-    renderProfitAttributionSummary(data);
-    renderProfitAttributionBuckets(data);
-    renderProfitAttributionState(data);
-    renderProfitAttributionRecords(data);
-    const updated = document.getElementById('profit-attribution-updated');
-    if (updated) {
-        const modeLabel = data.mode === 'live' ? '实盘' : '模拟盘';
-        updated.textContent = `${modeLabel} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString()}`;
-    }
-}
-
-function renderProfitAttributionSummary(data) {
-    const el = document.getElementById('profit-attribution-summary');
-    if (!el) return;
-    const summary = data.summary || {};
-    const pnl = Number(summary.total_closed_pnl || 0);
-    const trades = Number(summary.trade_count || 0);
-    const tone = pnl > 0 ? 'good' : pnl < 0 ? 'warn' : 'muted';
-    if (!trades) {
-        el.innerHTML = `
-            <div class="opening-funnel-verdict opening-funnel-muted">
-                <strong>暂无已平仓样本</strong>
-                <span>${escHtml(data.message || '最近窗口内没有可归因的交易。')}</span>
-            </div>`;
-        return;
-    }
-    el.innerHTML = `
-        <div class="opening-funnel-verdict opening-funnel-${tone}">
-            <strong>${signedMoney(pnl)} U</strong>
-            <span>最近 ${data.window_hours || 24} 小时已平仓 ${trades} 笔，胜率 ${pctLabel(summary.win_rate, 1)}，盈亏比 ${Number(summary.profit_factor || 0).toFixed(2)}。</span>
-        </div>
-        <div class="opening-funnel-kpis">
-            <div><span>盈利 / 亏损</span><strong>${Number(summary.win_count || 0)} / ${Number(summary.loss_count || 0)}</strong></div>
-            <div><span>平均盈利</span><strong>${signedMoney(summary.avg_win || 0)} U</strong></div>
-            <div><span>平均亏损</span><strong>-${fmtMoney(summary.avg_loss || 0)} U</strong></div>
-            <div><span>小盈 / 大亏</span><strong>${Number(summary.small_win_count || 0)} / ${Number(summary.large_loss_count || 0)}</strong></div>
-        </div>`;
-}
-
-function renderProfitAttributionBuckets(data) {
-    const el = document.getElementById('profit-attribution-buckets');
-    if (!el) return;
-    const rows = Array.isArray(data.buckets) ? data.buckets : [];
-    if (!rows.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂无归因桶。</div>';
-        return;
-    }
-    const maxAbs = Math.max(...rows.map(row => Math.abs(Number(row.pnl || 0))), 1);
-    el.innerHTML = rows.map(row => {
-        const pnl = Number(row.pnl || 0);
-        const width = Math.max(4, Math.abs(pnl) / maxAbs * 100);
-        const color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-        return `
-            <div class="opening-funnel-row opening-funnel-reason-row">
-                <div><strong>${escHtml(row.label || row.key || '-')}</strong><span>${Number(row.count || 0)} 笔 · 均值 ${signedMoney(row.avg_pnl || 0)} U</span></div>
-                <div class="opening-funnel-bar"><span style="width:${width}%;background:${color};"></span></div>
-                <em style="color:${color};">${signedMoney(pnl)} U</em>
-            </div>`;
-    }).join('');
-}
-
-function renderProfitAttributionState(data) {
-    const el = document.getElementById('profit-attribution-state');
-    if (!el) return;
-    const records = Array.isArray(data.records) ? data.records : [];
-    const counts = {};
-    records.forEach(row => {
-        const summary = row.decision_state?.summary || {};
-        const label = summary.final_status
-            ? `${stateStageLabel(summary.final_stage)} / ${stateStatusLabel(summary.final_status)}`
-            : '无状态机记录';
-        counts[label] = (counts[label] || 0) + 1;
-    });
-    const items = Object.entries(counts);
-    if (!items.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂无状态机样本。</div>';
-        return;
-    }
-    const max = Math.max(...items.map(([, count]) => Number(count || 0)), 1);
-    el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([label, count]) => `
-        <div class="opening-funnel-row opening-funnel-symbol-row">
-            <div><strong>${escHtml(label)}</strong><span>${Number(count || 0)} 笔</span></div>
-            <div class="opening-funnel-bar"><span style="width:${Math.max(4, Number(count || 0) / max * 100)}%;"></span></div>
-            <em>${Number(count || 0)}</em>
-        </div>`).join('');
-}
-
-function renderProfitAttributionRecords(data) {
-    const tbody = document.getElementById('profit-attribution-tbody');
-    const paginationEl = document.getElementById('profit-attribution-record-pagination');
-    if (!tbody) return;
-    const rows = Array.isArray(data.records) ? data.records : [];
-    if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无归因数据</td></tr>';
-        if (paginationEl) paginationEl.style.display = 'none';
-        return;
-    }
-    const total = rows.length;
-    const totalPages = Math.max(Math.ceil(total / PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE), 1);
-    const page = Math.min(Math.max(Number(state.profitAttributionRecordPage || 1), 1), totalPages);
-    state.profitAttributionRecordPage = page;
-    const start = (page - 1) * PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE;
-    const pageRows = rows.slice(start, start + PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE);
-    tbody.innerHTML = pageRows.map(row => {
-        const pnl = Number(row.realized_pnl || 0);
-        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-        const entryDecision = row.entry_decision || {};
-        const signals = row.signals || {};
-        const shadow = row.shadow || {};
-        const stateSummary = row.decision_state?.summary || {};
-        const stateText = stateSummary.final_stage
-            ? `${stateStageLabel(stateSummary.final_stage)}：${stateStatusLabel(stateSummary.final_status)}`
-            : '无状态机记录';
-        const evidence = [
-            `AI ${escHtml(entryDecision.action_label || '-')}`,
-            `ML ${sideZh(signals.ml?.side)}`,
-            `盈利模型 ${sideZh(signals.server_profit?.side)}`,
-            `时序 ${sideZh(signals.timeseries?.side)}`,
-            `情绪 ${sideZh(signals.sentiment?.side)}`,
-            shadow.best_action ? `影子 ${sideZh(shadow.best_action)}` : '',
-        ].filter(Boolean).join('<br>');
-        const notes = Array.isArray(row.notes) && row.notes.length
-            ? `<div class="profit-attribution-note">${row.notes.map(escHtml).join('；')}</div>`
-            : '';
-        return `
-            <tr>
-                <td>${toBeijingTime(row.closed_at)}</td>
-                <td>${escHtml(row.symbol || '-')}</td>
-                <td>${escHtml(row.side_label || sideZh(row.side))}</td>
-                <td style="color:${pnlColor};font-weight:700;">${signedMoney(pnl)} U</td>
-                <td>${Number(row.hold_minutes || 0).toFixed(1)} 分钟</td>
-                <td><strong class="profit-attribution-main-reason">${escHtml(row.main_reason || '-')}</strong>${notes}<div class="profit-attribution-note">置信度 ${confidenceZh(row.attribution_confidence)}</div></td>
-                <td><div class="profit-attribution-evidence">${evidence || '-'}</div></td>
-                <td><strong>${escHtml(stateText)}</strong><div class="profit-attribution-state">${escHtml(stateSummary.final_reason || '')}</div></td>
-            </tr>`;
-    }).join('');
-    renderPagination('profit-attribution-record-pagination', page, totalPages, total, 'changeProfitAttributionRecordPage');
-}
-
 function changeProfitAttributionRecordPage(page) {
     state.profitAttributionRecordPage = Math.max(1, Number(page) || 1);
     renderProfitAttributionRecords(state.profitAttribution || {});
-}
-
-function sideZh(side) {
-    const value = String(side || '').toLowerCase();
-    if (value === 'long') return '做多';
-    if (value === 'short') return '做空';
-    if (value === 'hold') return '观望';
-    return '-';
-}
-
-function stateStageLabel(stage) {
-    const labels = {
-        ai_analysis: 'AI分析',
-        strategy_arbitration: '策略仲裁',
-        risk_check: '风控检查',
-        exchange_submit: 'OKX提交',
-        exchange_confirm: '成交确认',
-        local_sync: '本地同步',
-    };
-    return labels[stage] || stage || '-';
-}
-
-function stateStatusLabel(status) {
-    const labels = {
-        pending: '处理中',
-        passed: '通过',
-        blocked: '拦截',
-        failed: '失败',
-        skipped: '跳过',
-        completed: '完成',
-    };
-    return labels[status] || status || '-';
-}
-
-function confidenceZh(value) {
-    const labels = { high: '高', medium: '中', low: '低' };
-    return labels[String(value || '').toLowerCase()] || '中';
 }
 
 // ========== Opening Funnel ==========
 function pctFmt(value) {
     const n = Number(value || 0);
     return `${(n * 100).toFixed(1)}%`;
-}
-
-function openingFunnelReasonLabel(key) {
-    const labels = {
-        risk_or_precheck: '风控/预检',
-        waiting_queue: '候选排队',
-        execution_or_exchange: '执行/交易所',
-        ai_budget: 'AI预算',
-        other: '其他',
-        unknown: '缺少原因',
-    };
-    return labels[key] || key || '-';
-}
-
-function openingFunnelActionLabel(action) {
-    if (action === 'long') return '做多';
-    if (action === 'short') return '做空';
-    return action || '-';
 }
 
 async function fetchOpeningFunnel() {
@@ -6211,129 +5311,9 @@ function renderOpeningFunnelUnavailable(data) {
     if (updatedEl) updatedEl.textContent = '需要重启服务';
 }
 
-function renderOpeningFunnel(data) {
-    renderOpeningFunnelSummary(data);
-    renderOpeningFunnelStages(data);
-    renderOpeningFunnelReasons(data);
-    renderOpeningFunnelSymbols(data);
-    renderOpeningFunnelBlocked(data);
-    const updatedEl = document.getElementById('opening-funnel-updated');
-    if (updatedEl) {
-        const modeLabel = data.mode === 'live' ? '实盘' : '模拟盘';
-        updatedEl.textContent = `${modeLabel} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString()}`;
-    }
-}
-
-function renderOpeningFunnelSummary(data) {
-    const el = document.getElementById('opening-funnel-summary');
-    if (!el) return;
-    const scans = Number(data.market_scans || 0);
-    const signals = Number(data.stages?.ai_entry_signals || 0);
-    const executed = Number(data.stages?.executed_entries || 0);
-    const bottleneck = data.bottleneck_label || '暂无足够数据';
-    const tone = data.bottleneck === 'healthy_selective' ? 'good' : scans ? 'warn' : 'muted';
-    el.innerHTML = `
-        <div class="opening-funnel-verdict opening-funnel-${tone}">
-            <strong>${escHtml(bottleneck)}</strong>
-            <span>市场分析 ${scans} 次，AI 开仓信号 ${signals} 次，实际开仓 ${executed} 次。总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。</span>
-        </div>
-        <div class="opening-funnel-kpis">
-            <div><span>AI 给信号率</span><strong>${pctFmt(data.rates?.signal_rate)}</strong></div>
-            <div><span>信号成单率</span><strong>${pctFmt(data.rates?.order_rate)}</strong></div>
-            <div><span>信号执行率</span><strong>${pctFmt(data.rates?.execution_rate)}</strong></div>
-            <div><span>平均信心</span><strong>${Number(data.average_confidence || 0).toFixed(2)}</strong></div>
-        </div>`;
-}
-
-function renderOpeningFunnelStages(data) {
-    const el = document.getElementById('opening-funnel-stages');
-    if (!el) return;
-    const stages = [
-        ['市场扫描', data.stages?.market_scans || 0, '系统完成的新机会分析'],
-        ['AI开仓信号', data.stages?.ai_entry_signals || 0, '最终裁决为做多/做空'],
-        ['生成订单', data.stages?.orders_created || 0, '本地订单表有关联记录'],
-        ['实际开仓', data.stages?.executed_entries || 0, '决策标记为已执行'],
-    ];
-    const max = Math.max(...stages.map(s => Number(s[1] || 0)), 1);
-    el.innerHTML = stages.map(([label, value, desc]) => {
-        const width = Math.max(4, (Number(value || 0) / max) * 100);
-        return `
-            <div class="opening-funnel-stage">
-                <div class="opening-funnel-stage-head">
-                    <span>${escHtml(label)}</span>
-                    <strong>${Number(value || 0)}</strong>
-                </div>
-                <div class="opening-funnel-bar"><span style="width:${width}%;"></span></div>
-                <div class="opening-funnel-stage-desc">${escHtml(desc)}</div>
-            </div>`;
-    }).join('');
-}
-
-function renderOpeningFunnelReasons(data) {
-    const el = document.getElementById('opening-funnel-reasons');
-    if (!el) return;
-    const buckets = data.reason_buckets || {};
-    const items = Object.entries(buckets).filter(([, count]) => Number(count || 0) > 0);
-    const total = items.reduce((sum, [, count]) => sum + Number(count || 0), 0);
-    if (!items.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">没有未执行的开仓信号。</div>';
-        return;
-    }
-    el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([key, count]) => {
-        const ratio = total ? Number(count || 0) / total : 0;
-        return `
-            <div class="opening-funnel-row">
-                <div><strong>${escHtml(openingFunnelReasonLabel(key))}</strong><span>${pctFmt(ratio)}</span></div>
-                <div class="opening-funnel-bar"><span style="width:${Math.max(4, ratio * 100)}%;"></span></div>
-                <em>${Number(count || 0)} 次</em>
-            </div>`;
-    }).join('');
-}
-
-function renderOpeningFunnelSymbols(data) {
-    const el = document.getElementById('opening-funnel-symbols');
-    if (!el) return;
-    const symbols = Array.isArray(data.top_symbols) ? data.top_symbols : [];
-    if (!symbols.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂无币种统计。</div>';
-        return;
-    }
-    el.innerHTML = symbols.map(item => {
-        const scans = Number(item.scans || 0);
-        const signals = Number(item.signals || 0);
-        const executed = Number(item.executed || 0);
-        const width = scans ? Math.max(4, (signals / scans) * 100) : 4;
-        return `
-            <div class="opening-funnel-row">
-                <div><strong>${escHtml(item.symbol || '-')}</strong><span>${signals}/${scans} 信号 · ${executed} 开仓</span></div>
-                <div class="opening-funnel-bar"><span style="width:${width}%;"></span></div>
-                <em>${pctFmt(item.signal_rate)}</em>
-            </div>`;
-    }).join('');
-}
-
-function renderOpeningFunnelBlocked(data) {
-    const tbody = document.getElementById('opening-funnel-blocked-tbody');
-    if (!tbody) return;
-    const rows = Array.isArray(data.recent_blocked) ? data.recent_blocked : [];
-    if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无被挡的开仓信号</td></tr>';
-        return;
-    }
-    tbody.innerHTML = rows.map(row => `
-        <tr>
-            <td class="opening-funnel-time">${toBeijingTime(row.created_at)}</td>
-            <td class="opening-funnel-symbol">${escHtml(row.symbol || '-')}</td>
-            <td><span class="opening-funnel-side">${openingFunnelActionLabel(row.action)}</span></td>
-            <td class="opening-funnel-confidence">${Number(row.confidence || 0).toFixed(2)}</td>
-            <td><span class="opening-funnel-bucket">${escHtml(openingFunnelReasonLabel(row.reason_bucket))}</span></td>
-            <td class="opening-funnel-reason-cell">${escHtml(row.reason || '-')}</td>
-        </tr>
-    `).join('');
-}
-
 function openingFunnelReasonLabel(key) {
     const labels = {
+        evidence_gate: '证据评分',
         risk_or_precheck: '风控/预检',
         waiting_queue: '候选排序',
         execution_or_exchange: '执行/交易所',
@@ -6473,3 +5453,396 @@ function renderOpeningFunnelBlocked(data) {
 }
 
 window.fetchOpeningFunnel = fetchOpeningFunnel;
+
+// Clean profit-attribution renderers. These intentionally live at the end of
+// the file so they override the older mojibake functions above.
+function renderProfitAttribution() {
+    const data = state.profitAttribution || {};
+    setProfitAttributionView(state.profitAttributionView || 'overview');
+    renderProfitAttributionSummary(data);
+    renderProfitAttributionBuckets(data);
+    renderProfitAttributionState(data);
+    renderProfitAttributionRecords(data);
+    const updated = document.getElementById('profit-attribution-updated');
+    if (updated) {
+        const modeLabel = data.mode === 'live' ? '实盘' : '模拟盘';
+        updated.textContent = `${modeLabel} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString()}`;
+    }
+}
+
+function renderProfitAttributionSummary(data) {
+    const el = document.getElementById('profit-attribution-summary');
+    if (!el) return;
+    const summary = data.summary || {};
+    const pnl = Number(summary.total_closed_pnl || 0);
+    const trades = Number(summary.trade_count || 0);
+    const tone = pnl > 0 ? 'good' : pnl < 0 ? 'warn' : 'muted';
+    if (!trades) {
+        el.innerHTML = `
+            <div class="opening-funnel-verdict opening-funnel-muted">
+                <strong>暂无已平仓样本</strong>
+                <span>${escHtml(data.message || '最近窗口内没有可归因的交易。')}</span>
+            </div>`;
+        return;
+    }
+    el.innerHTML = `
+        <div class="opening-funnel-verdict opening-funnel-${tone}">
+            <strong>${signedMoney(pnl)} U</strong>
+            <span>最近 ${data.window_hours || 24} 小时已平仓 ${trades} 笔，胜率 ${pctLabel(summary.win_rate, 1)}，盈亏比 ${Number(summary.profit_factor || 0).toFixed(2)}。</span>
+        </div>
+        <div class="opening-funnel-kpis">
+            <div><span>盈利 / 亏损</span><strong>${Number(summary.win_count || 0)} / ${Number(summary.loss_count || 0)}</strong></div>
+            <div><span>平均盈利</span><strong>${signedMoney(summary.avg_win || 0)} U</strong></div>
+            <div><span>平均亏损</span><strong>-${fmtMoney(summary.avg_loss || 0)} U</strong></div>
+            <div><span>小盈 / 大亏</span><strong>${Number(summary.small_win_count || 0)} / ${Number(summary.large_loss_count || 0)}</strong></div>
+        </div>`;
+}
+
+function renderProfitAttributionBuckets(data) {
+    const el = document.getElementById('profit-attribution-buckets');
+    if (!el) return;
+    const rows = Array.isArray(data.buckets) ? data.buckets : [];
+    if (!rows.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂无归因分类。</div>';
+        return;
+    }
+    const maxAbs = Math.max(...rows.map(row => Math.abs(Number(row.pnl || 0))), 1);
+    el.innerHTML = rows.map(row => {
+        const pnl = Number(row.pnl || 0);
+        const width = Math.max(4, Math.abs(pnl) / maxAbs * 100);
+        const color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        return `
+            <div class="opening-funnel-row opening-funnel-reason-row">
+                <div><strong>${escHtml(row.label || row.key || '-')}</strong><span>${Number(row.count || 0)} 笔 · 均值 ${signedMoney(row.avg_pnl || 0)} U</span></div>
+                <div class="opening-funnel-bar"><span style="width:${width}%;background:${color};"></span></div>
+                <em style="color:${color};">${signedMoney(pnl)} U</em>
+            </div>`;
+    }).join('');
+}
+
+function renderProfitAttributionState(data) {
+    const el = document.getElementById('profit-attribution-state');
+    if (!el) return;
+    const records = Array.isArray(data.records) ? data.records : [];
+    const counts = {};
+    records.forEach(row => {
+        const summary = row.decision_state?.summary || {};
+        const label = summary.final_status
+            ? `${stateStageLabel(summary.final_stage)} / ${stateStatusLabel(summary.final_status)}`
+            : '无状态机记录';
+        counts[label] = (counts[label] || 0) + 1;
+    });
+    const items = Object.entries(counts);
+    if (!items.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂无状态机样本。</div>';
+        return;
+    }
+    const max = Math.max(...items.map(([, count]) => Number(count || 0)), 1);
+    el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([label, count]) => `
+        <div class="opening-funnel-row opening-funnel-symbol-row">
+            <div><strong>${escHtml(label)}</strong><span>${Number(count || 0)} 笔</span></div>
+            <div class="opening-funnel-bar"><span style="width:${Math.max(4, Number(count || 0) / max * 100)}%;"></span></div>
+            <em>${Number(count || 0)}</em>
+        </div>`).join('');
+}
+
+// Profit attribution evidence rendering override.
+// Keep this block after the legacy renderers so the compact two-line view wins.
+function profitAttributionShortText(value, maxLen = 36) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+function sideTone(side) {
+    const value = String(side || '').toLowerCase();
+    if (value.includes('close_long') || value.includes('long') || value.includes('做多') || value.includes('平多')) return 'long';
+    if (value.includes('close_short') || value.includes('short') || value.includes('做空') || value.includes('平空')) return 'short';
+    if (value.includes('hold') || value.includes('观望') || value.includes('观察')) return 'hold';
+    return 'muted';
+}
+
+function sideZh(side) {
+    const value = String(side || '').toLowerCase();
+    if (value === 'long') return '做多';
+    if (value === 'short') return '做空';
+    if (value === 'close_long') return '平多';
+    if (value === 'close_short') return '平空';
+    if (value === 'hold') return '观望';
+    return '-';
+}
+
+function stateStageLabel(stage) {
+    const labels = {
+        ai_analysis: 'AI 分析',
+        strategy_arbitration: '策略仲裁',
+        risk_check: '风控检查',
+        exchange_submit: 'OKX 提交',
+        exchange_confirm: '成交确认',
+        local_sync: '本地同步',
+    };
+    return labels[stage] || stage || '-';
+}
+
+function stateStatusLabel(status) {
+    const labels = {
+        pending: '处理中',
+        passed: '通过',
+        blocked: '拦截',
+        failed: '失败',
+        skipped: '跳过',
+        completed: '完成',
+    };
+    return labels[status] || status || '-';
+}
+
+function confidenceZh(value) {
+    const labels = { high: '高', medium: '中', low: '低' };
+    return labels[String(value || '').toLowerCase()] || '中';
+}
+
+function renderProfitAttributionRecords(data) {
+    const tbody = document.getElementById('profit-attribution-tbody');
+    const paginationEl = document.getElementById('profit-attribution-record-pagination');
+    if (!tbody) return;
+    const rows = Array.isArray(data.records) ? data.records : [];
+    if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="profit-attribution-empty">暂无归因数据</td></tr>';
+        if (paginationEl) paginationEl.style.display = 'none';
+        return;
+    }
+    const total = rows.length;
+    const totalPages = Math.max(Math.ceil(total / PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE), 1);
+    const page = Math.min(Math.max(Number(state.profitAttributionRecordPage || 1), 1), totalPages);
+    state.profitAttributionRecordPage = page;
+    const start = (page - 1) * PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE;
+    const pageRows = rows.slice(start, start + PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE);
+    tbody.innerHTML = pageRows.map(row => {
+        const pnl = Number(row.realized_pnl || 0);
+        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const stateSummary = row.decision_state?.summary || {};
+        const stateText = stateSummary.final_stage
+            ? `${stateStageLabel(stateSummary.final_stage)} / ${stateStatusLabel(stateSummary.final_status)}`
+            : '无状态机记录';
+        return `
+            <tr>
+                <td><span class="profit-attribution-time">${toBeijingTime(row.closed_at)}</span></td>
+                <td><strong class="profit-attribution-symbol">${escHtml(row.symbol || '-')}</strong></td>
+                <td><span class="profit-attribution-side ${sideTone(row.side)}">${escHtml(row.side_label || sideZh(row.side))}</span></td>
+                <td class="profit-attribution-pnl" style="color:${pnlColor};">${signedMoney(pnl)} U</td>
+                <td class="profit-attribution-hold">${Number(row.hold_minutes || 0).toFixed(1)} 分钟</td>
+                <td>${renderProfitAttributionReason(row)}</td>
+                <td class="profit-attribution-evidence-cell">${renderProfitAttributionEvidence(row)}</td>
+                <td>${renderProfitAttributionChain(stateText, stateSummary.final_reason || '')}</td>
+            </tr>`;
+    }).join('');
+    renderPagination('profit-attribution-record-pagination', page, totalPages, total, 'changeProfitAttributionRecordPage');
+}
+
+function renderProfitAttributionReason(row) {
+    const notes = Array.isArray(row.notes) ? row.notes.filter(Boolean) : [];
+    const visibleNotes = notes.slice(0, 2);
+    const extra = notes.length > visibleNotes.length ? `<span>+${notes.length - visibleNotes.length}</span>` : '';
+    const noteHtml = visibleNotes.length || extra
+        ? `<div class="profit-attribution-note-list">${visibleNotes.map(note => `<span>${escHtml(profitAttributionShortText(note, 28))}</span>`).join('')}${extra}</div>`
+        : '';
+    return `
+        <div class="profit-attribution-reason-cell">
+            <strong class="profit-attribution-main-reason">${escHtml(row.main_reason || '-')}</strong>
+            ${noteHtml}
+            <em>置信度 ${confidenceZh(row.attribution_confidence)}</em>
+        </div>`;
+}
+
+function profitAttributionEvidenceScoreChip(score) {
+    if (!score || typeof score !== 'object') return null;
+    const rawScore = Number(score.score);
+    const effective = Number(score.effective_score);
+    const multiplier = Number(score.size_multiplier);
+    const scoreText = Number.isFinite(rawScore) ? rawScore.toFixed(0) : '-';
+    const effectiveText = Number.isFinite(effective) ? effective.toFixed(0) : '-';
+    const multiplierText = Number.isFinite(multiplier) ? `x${multiplier.toFixed(2)}` : 'x-';
+    const title = `证据分 ${scoreText} / 有效 ${effectiveText} / 仓位 ${multiplierText}`;
+    const tone = score.hard_block ? 'bad' : effective >= 80 ? 'good' : effective >= 60 ? 'warn' : 'muted';
+    return {
+        tone,
+        text: title,
+        html: `<span class="profit-attribution-evidence-chip evidence-score profit-attribution-evidence-score ${tone}" title="${escHtml(title)}"><b>证据</b><em>${escHtml(scoreText)}</em><small>${escHtml(multiplierText)}</small></span>`,
+    };
+}
+
+function profitAttributionEvidenceChip(label, side, options = {}) {
+    const main = options.main || sideZh(side);
+    const visibleSub = compactProfitAttributionMetric(options.sub);
+    const hasMain = Boolean(main && main !== '-');
+    const hasEvidence = options.available !== false && (hasMain || visibleSub);
+    if (!hasEvidence) return '';
+    const tone = sideTone(side || main);
+    const visibleSide = compactProfitAttributionSide(hasMain ? main : '未知');
+    const sub = visibleSub ? `<small>${escHtml(visibleSub)}</small>` : '';
+    const text = [label, main, options.sub && options.sub !== '-' ? options.sub : ''].filter(Boolean).join(' ');
+    const typeClass = options.type ? ` evidence-${String(options.type).replace(/[^a-z0-9_-]/gi, '')}` : '';
+    return {
+        tone,
+        text,
+        html: `<span class="profit-attribution-evidence-chip${typeClass} ${tone}" title="${escHtml(text)}"><b>${escHtml(label)}</b><em>${escHtml(visibleSide)}</em>${sub}</span>`,
+    };
+}
+
+function compactProfitAttributionSide(value) {
+    const text = String(value || '').toLowerCase();
+    if (text.includes('close_long') || text.includes('平多')) return '平多';
+    if (text.includes('close_short') || text.includes('平空')) return '平空';
+    if (text.includes('long') || text.includes('做多')) return '多';
+    if (text.includes('short') || text.includes('做空')) return '空';
+    if (text.includes('hold') || text.includes('观望')) return '观望';
+    if (text.includes('观察')) return '观察';
+    return String(value || '-');
+}
+
+function compactProfitAttributionMetric(value) {
+    const text = String(value || '').trim();
+    if (!text || text === '-') return '';
+    const compact = text
+        .replace(/%/g, '')
+        .replace(/\s*\/\s*/g, '/')
+        .replace(/([+-]?\d+\.\d{2})\d+/g, (match) => {
+            const num = Number(match);
+            if (!Number.isFinite(num)) return match;
+            return num.toFixed(Math.abs(num) >= 10 ? 1 : 2).replace(/0+$/, '').replace(/\.$/, '');
+        });
+    return compact.length > 13 ? `${compact.slice(0, 12)}…` : compact;
+}
+
+// Final profit-attribution evidence renderer. It uses the backend
+// evidence_status object so the cell shows source coverage instead of going
+// blank when AI/ML/shadow samples are not matched.
+function renderProfitAttributionEvidence(record) {
+    const entryDecision = record?.entry_decision || {};
+    const signals = record?.signals || {};
+    const shadow = record?.shadow || {};
+    const evidence = record?.evidence_status || {};
+    const aiConfidence = Number(evidence.ai?.confidence ?? entryDecision?.confidence);
+    const aiChip = profitAttributionEvidenceStatusChip('AI', evidence.ai, {
+        type: 'ai',
+        side: evidence.ai?.action || entryDecision?.action,
+        main: evidence.ai?.action_label || entryDecision?.action_label,
+        sub: Number.isFinite(aiConfidence) && aiConfidence > 0 ? aiConfidence.toFixed(2) : '',
+        available: evidence.ai?.available === true || Boolean(entryDecision?.id),
+    });
+    const mlChip = profitAttributionEvidenceStatusChip('ML', evidence.ml, {
+        type: 'ml',
+        side: signals?.ml?.side || evidence.ml?.side,
+        main: profitAttributionSideLabel(signals?.ml?.side || evidence.ml?.side),
+        sub: signedPctValueLabel(signals?.ml?.expected_return_pct ?? evidence.ml?.expected_return_pct),
+        available: signals?.ml?.available === true || evidence.ml?.available === true,
+    });
+    const shadowChip = profitAttributionEvidenceStatusChip('影子', evidence.shadow, {
+        type: 'shadow',
+        side: shadow?.best_action || evidence.shadow?.best_action,
+        main: shadow?.best_action_label || evidence.shadow?.best_action_label,
+        sub: shadow?.status === 'completed'
+            ? `多${signedPctValueLabel(shadow?.long_return_pct)}/空${signedPctValueLabel(shadow?.short_return_pct)}`
+            : (shadow?.status || evidence.shadow?.status || ''),
+        available: Boolean(shadow?.id) || evidence.shadow?.available === true,
+    });
+    const rows = [[aiChip, mlChip], [shadowChip]];
+    const supporting = [
+        profitAttributionEvidenceStatusChip('盈利', evidence.server_profit, {
+            type: 'server',
+            side: signals?.server_profit?.side || evidence.server_profit?.side,
+            main: profitAttributionSideLabel(signals?.server_profit?.side || evidence.server_profit?.side),
+            sub: signedPctValueLabel(
+                signals?.server_profit?.expected_return_pct ?? evidence.server_profit?.expected_return_pct
+            ),
+            available: signals?.server_profit?.available === true
+                || evidence.server_profit?.available === true,
+        }),
+        profitAttributionEvidenceStatusChip('时序', evidence.timeseries, {
+            type: 'timeseries',
+            side: signals?.timeseries?.side || evidence.timeseries?.side,
+            main: profitAttributionSideLabel(signals?.timeseries?.side || evidence.timeseries?.side),
+            sub: signedPctValueLabel(
+                signals?.timeseries?.expected_return_pct ?? evidence.timeseries?.expected_return_pct
+            ),
+            available: signals?.timeseries?.available === true
+                || evidence.timeseries?.available === true,
+        }),
+        profitAttributionEvidenceStatusChip('情绪', evidence.sentiment, {
+            type: 'sentiment',
+            side: signals?.sentiment?.side || evidence.sentiment?.side,
+            main: profitAttributionSideLabel(signals?.sentiment?.side || evidence.sentiment?.side),
+            sub: Number.isFinite(Number(signals?.sentiment?.score))
+                ? Number(signals.sentiment.score || 0).toFixed(3)
+                : signedPctValueLabel(
+                    signals?.sentiment?.expected_return_pct ?? evidence.sentiment?.expected_return_pct
+                ),
+            available: signals?.sentiment?.available === true
+                || evidence.sentiment?.available === true,
+        }),
+    ];
+    const scoreChip = profitAttributionEvidenceScoreChip(
+        entryDecision?.evidence_score || entryDecision?.opportunity_score?.evidence_score
+    );
+    if (scoreChip) supporting.push(scoreChip);
+    const title = rows.flat().concat(supporting).map(chip => chip.text).filter(Boolean).join('；');
+    return `
+        <div class="profit-attribution-evidence-rail" title="${escHtml(title)}">
+            ${rows.map(row => `<div class="profit-attribution-evidence-row">${row.map(chip => chip.html).join('')}</div>`).join('')}
+        </div>`;
+}
+
+function profitAttributionEvidenceStatusChip(label, status, options = {}) {
+    const sourceStatus = status || {};
+    const available = sourceStatus.available === true || options.available === true;
+    const side = options.side || sourceStatus.side || sourceStatus.action || sourceStatus.best_action || '';
+    const main = options.main || sourceStatus.action_label || sourceStatus.best_action_label
+        || profitAttributionSideLabel(side);
+    const sub = compactProfitAttributionMetric(options.sub || '');
+    const typeClass = options.type ? ` evidence-${String(options.type).replace(/[^a-z0-9_-]/gi, '')}` : '';
+    if (!available) {
+        const reason = sourceStatus.missing_reason || `${label}证据未匹配`;
+        const missingLabel = profitAttributionMissingLabel(reason);
+        return {
+            tone: 'missing',
+            text: `${label} ${reason}`,
+            html: `<span class="profit-attribution-evidence-chip${typeClass} missing" title="${escHtml(reason)}"><b>${escHtml(label)}</b><em>${escHtml(missingLabel)}</em></span>`,
+        };
+    }
+    return profitAttributionEvidenceChip(label, side, {
+        ...options,
+        main,
+        sub,
+        available: true,
+    });
+}
+
+function profitAttributionMissingLabel(reason) {
+    const text = String(reason || '');
+    if (text.includes('未保存')) return '未保存';
+    if (text.includes('未匹配')) return '未匹配';
+    if (text.includes('等待')) return '等待';
+    return '无证据';
+}
+
+function profitAttributionSideLabel(value) {
+    const text = String(value || '').toLowerCase();
+    if (text === 'long' || text === 'open_long') return '多';
+    if (text === 'short' || text === 'open_short') return '空';
+    if (text === 'close_long') return '平多';
+    if (text === 'close_short') return '平空';
+    if (text === 'hold' || text === 'wait' || text === 'observe') return '观察';
+    return String(value || '-');
+}
+
+function renderProfitAttributionChain(stateText, reason) {
+    return `
+        <div class="profit-attribution-chain">
+            <strong>${escHtml(stateText || '-')}</strong>
+            ${reason ? `<span title="${escHtml(reason)}">${escHtml(profitAttributionShortText(reason, 42))}</span>` : ''}
+        </div>`;
+}
+
+function shortText(value, maxLen = 36) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}

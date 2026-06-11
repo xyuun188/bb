@@ -9,14 +9,13 @@ No real orders are sent to the exchange.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
-from core.exceptions import InsufficientBalanceError
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
 
 logger = structlog.get_logger(__name__)
@@ -41,11 +40,12 @@ class PaperExecutor(AbstractExecutor):
 
     async def initialize(self) -> None:
         """Load virtual accounts from DB or create defaults."""
+        from sqlalchemy import func, select
+
         from db.repositories.account_repo import AccountRepository
         from db.repositories.trade_repo import TradeRepository
         from models.decision import AIDecision
         from models.trade import Order
-        from sqlalchemy import func, select
 
         names = self._model_names
         async with self._get_session() as session:
@@ -53,9 +53,7 @@ class PaperExecutor(AbstractExecutor):
             trade_repo = TradeRepository(session)
             for model_name in names:
                 initial_bal = settings.get_initial_balance(model_name)
-                account = await account_repo.get_or_create_account(
-                    model_name, initial_bal
-                )
+                account = await account_repo.get_or_create_account(model_name, initial_bal)
                 entry_fee_result = await session.execute(
                     select(func.coalesce(func.sum(Order.fee), 0.0))
                     .join(AIDecision, AIDecision.id == Order.decision_id)
@@ -71,23 +69,27 @@ class PaperExecutor(AbstractExecutor):
                 restored_positions = []
                 for p in db_positions:
                     leverage = max(float(p.leverage or 1.0), 1.0)
-                    margin_used = (float(p.quantity or 0.0) * float(p.entry_price or 0.0)) / leverage
+                    margin_used = (
+                        float(p.quantity or 0.0) * float(p.entry_price or 0.0)
+                    ) / leverage
                     open_margin += margin_used
-                    restored_positions.append({
-                        "id": str(p.id),
-                        "symbol": p.symbol,
-                        "side": p.side,
-                        "quantity": p.quantity,
-                        "entry_price": p.entry_price,
-                        "current_price": p.current_price or p.entry_price,
-                        "leverage": p.leverage,
-                        "margin_used": margin_used,
-                        "stop_loss": p.stop_loss_price,
-                        "take_profit": p.take_profit_price,
-                        "is_open": p.is_open,
-                        "opened_at": p.created_at,
-                        "unrealized_pnl": p.unrealized_pnl or 0.0,
-                    })
+                    restored_positions.append(
+                        {
+                            "id": str(p.id),
+                            "symbol": p.symbol,
+                            "side": p.side,
+                            "quantity": p.quantity,
+                            "entry_price": p.entry_price,
+                            "current_price": p.current_price or p.entry_price,
+                            "leverage": p.leverage,
+                            "margin_used": margin_used,
+                            "stop_loss": p.stop_loss_price,
+                            "take_profit": p.take_profit_price,
+                            "is_open": p.is_open,
+                            "opened_at": p.created_at,
+                            "unrealized_pnl": p.unrealized_pnl or 0.0,
+                        }
+                    )
                 # The per-model quota balance represents available margin.
                 account.current_balance = max(
                     0.0,
@@ -127,9 +129,7 @@ class PaperExecutor(AbstractExecutor):
         model_name = account_id or decision.model_name
         balance = self._balances.get(model_name, settings.get_initial_balance(model_name))
         current_price = (
-            decision.feature_snapshot.get("current_price", 0)
-            if decision.feature_snapshot
-            else 0
+            decision.feature_snapshot.get("current_price", 0) if decision.feature_snapshot else 0
         )
 
         # Apply slippage
@@ -207,7 +207,7 @@ class PaperExecutor(AbstractExecutor):
                 "stop_loss": fill_price * (1 - decision.stop_loss_pct),
                 "take_profit": fill_price * (1 + decision.take_profit_pct),
                 "is_open": True,
-                "opened_at": datetime.now(timezone.utc),
+                "opened_at": datetime.now(UTC),
                 "unrealized_pnl": 0.0,
             }
             self._positions.setdefault(model_name, []).append(position)
@@ -221,7 +221,7 @@ class PaperExecutor(AbstractExecutor):
                 price=fill_price,
                 status=OrderStatus.FILLED,
                 fee=fee,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
 
         elif decision.action == Action.SHORT:
@@ -257,7 +257,7 @@ class PaperExecutor(AbstractExecutor):
                 "stop_loss": fill_price * (1 + decision.stop_loss_pct),
                 "take_profit": fill_price * (1 - decision.take_profit_pct),
                 "is_open": True,
-                "opened_at": datetime.now(timezone.utc),
+                "opened_at": datetime.now(UTC),
                 "unrealized_pnl": 0.0,
             }
             self._positions.setdefault(model_name, []).append(position)
@@ -271,7 +271,7 @@ class PaperExecutor(AbstractExecutor):
                 price=fill_price,
                 status=OrderStatus.FILLED,
                 fee=fee,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
 
         elif decision.action in (Action.CLOSE_LONG, Action.CLOSE_SHORT):
@@ -279,7 +279,8 @@ class PaperExecutor(AbstractExecutor):
             positions = self._positions.get(model_name, [])
             target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
             to_close = [
-                p for p in positions
+                p
+                for p in positions
                 if p["symbol"] == decision.symbol and p["side"] == target_side and p["is_open"]
             ]
 
@@ -296,7 +297,7 @@ class PaperExecutor(AbstractExecutor):
                 else:
                     pnl = (pos["entry_price"] - fill_price) * pos["quantity"]
                 pos["unrealized_pnl"] = pnl
-                pos["closed_at"] = datetime.now(timezone.utc)
+                pos["closed_at"] = datetime.now(UTC)
 
                 close_value = pos["quantity"] * fill_price
                 close_fee = close_value * PAPER_FEE_RATE
@@ -322,9 +323,7 @@ class PaperExecutor(AbstractExecutor):
             )
 
             # Remove closed positions
-            self._positions[model_name] = [
-                p for p in positions if p["is_open"]
-            ]
+            self._positions[model_name] = [p for p in positions if p["is_open"]]
 
             return ExecutionResult(
                 order_id=str(uuid.uuid4())[:12],
@@ -336,7 +335,7 @@ class PaperExecutor(AbstractExecutor):
                 status=OrderStatus.FILLED,
                 fee=total_fee,
                 pnl=total_pnl - total_fee,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
 
         return ExecutionResult(
@@ -385,7 +384,9 @@ class PaperExecutor(AbstractExecutor):
                     continue
                 all_positions.append(pos_copy)
         all_positions.sort(
-            key=lambda p: (p.get("closed_at") or p.get("opened_at") or datetime(2000, 1, 1, tzinfo=timezone.utc)),
+            key=lambda p: (
+                p.get("closed_at") or p.get("opened_at") or datetime(2000, 1, 1, tzinfo=UTC)
+            ),
             reverse=True,
         )
         return all_positions
@@ -403,7 +404,7 @@ class PaperExecutor(AbstractExecutor):
 
     async def update_market_prices(self, symbol: str, price: float) -> None:
         """Update current prices and recalculate unrealized PnL for all positions."""
-        for model_name, positions in self._positions.items():
+        for _model_name, positions in self._positions.items():
             for pos in positions:
                 if pos["symbol"] == symbol and pos["is_open"]:
                     pos["current_price"] = price
@@ -416,12 +417,14 @@ class PaperExecutor(AbstractExecutor):
         """Get a summary of the virtual account for a model."""
         initial_bal = settings.get_initial_balance(model_name)
         balance = self._balances.get(model_name, initial_bal)
-        positions = [
-            p for p in self._positions.get(model_name, []) if p["is_open"]
-        ]
+        positions = [p for p in self._positions.get(model_name, []) if p["is_open"]]
         unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
         used_margin = sum(
-            p.get("margin_used", (p.get("quantity", 0) * p.get("entry_price", 0)) / max(p.get("leverage", 1) or 1, 1))
+            p.get(
+                "margin_used",
+                (p.get("quantity", 0) * p.get("entry_price", 0))
+                / max(p.get("leverage", 1) or 1, 1),
+            )
             for p in positions
         )
         wallet_balance = balance + used_margin
@@ -457,9 +460,7 @@ class PaperExecutor(AbstractExecutor):
         async with self._get_session() as session:
             repo = AccountRepository(session)
             for model_name, balance in self._balances.items():
-                positions = [
-                    p for p in self._positions.get(model_name, []) if p["is_open"]
-                ]
+                positions = [p for p in self._positions.get(model_name, []) if p["is_open"]]
                 unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
                 account = await repo.get_account(model_name)
                 if account:

@@ -8,7 +8,6 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-
 DB_PATH = Path("data/trading.db")
 MOJIBAKE_MARKERS = (
     "閿",
@@ -133,7 +132,9 @@ def repair_mojibake_fragment(value: str | None) -> str:
     for encode_errors in ("strict", "ignore", "replace"):
         for decode_errors in ("strict", "ignore", "replace"):
             try:
-                candidate = text.encode("gbk", errors=encode_errors).decode("utf-8", errors=decode_errors)
+                candidate = text.encode("gbk", errors=encode_errors).decode(
+                    "utf-8", errors=decode_errors
+                )
             except UnicodeError:
                 continue
             candidate_score = text_score(candidate)
@@ -338,6 +339,10 @@ def parse_extra(raw: object) -> dict:
 
 def safe_float(value: object, default: float = 0.0) -> float:
     try:
+        if value is None:
+            return default
+        if not isinstance(value, (int, float, str, bytes, bytearray)):
+            return default
         return float(value)
     except (TypeError, ValueError):
         return default
@@ -348,7 +353,9 @@ def shadow_return_pct(extra: dict, side: str) -> float:
     return safe_float(extra.get(key), 0.0)
 
 
-def shadow_metrics_from_pattern(pattern: str | None) -> tuple[float | None, float | None, float | None, float | None]:
+def shadow_metrics_from_pattern(
+    pattern: str | None,
+) -> tuple[float | None, float | None, float | None, float | None]:
     text = str(pattern or "")
     if "ADX=" not in text:
         return None, None, None, None
@@ -371,15 +378,21 @@ def build_shadow_memory_texts(row: sqlite3.Row | dict) -> tuple[str, str, bool]:
         return "", "", False
     extra = parse_extra(get("extra"))
     symbol = str(get("symbol") or "").strip()
-    side = str(get("side") or extra.get("best_action") or extra.get("decision_action") or "").lower()
-    if memory_type == "shadow_missed_opportunity" and str(extra.get("best_action") or "").lower() in {"long", "short"}:
+    side = str(
+        get("side") or extra.get("best_action") or extra.get("decision_action") or ""
+    ).lower()
+    if memory_type == "shadow_missed_opportunity" and str(
+        extra.get("best_action") or ""
+    ).lower() in {"long", "short"}:
         side = str(extra.get("best_action")).lower()
     if side not in {"long", "short"}:
         side = "long"
     side_label = side_zh(side)
     horizon = int(safe_float(extra.get("horizon_minutes"), 0.0))
     if horizon <= 0:
-        horizon_match = re.search(r"(\d+)\s*(?:分钟|鍒嗛挓|鐚|鍒)", str(get("market_pattern") or get("lesson") or ""))
+        horizon_match = re.search(
+            r"(\d+)\s*(?:分钟|鍒嗛挓|鐚|鍒)", str(get("market_pattern") or get("lesson") or "")
+        )
         horizon = int(horizon_match.group(1)) if horizon_match else 0
     pct = shadow_return_pct(extra, side)
     opposite = "short" if side == "long" else "long"
@@ -406,7 +419,9 @@ def build_shadow_memory_texts(row: sqlite3.Row | dict) -> tuple[str, str, bool]:
             f"{advice}"
         )
 
-    adx, volume_ratio, returns_5, imbalance = shadow_metrics_from_pattern(str(get("market_pattern") or ""))
+    adx, volume_ratio, returns_5, imbalance = shadow_metrics_from_pattern(
+        str(get("market_pattern") or "")
+    )
     pattern = f"{symbol} {side_label}影子复盘 {horizon}分钟"
     if adx is not None:
         pattern += f"，ADX={adx:.1f}，量比={volume_ratio:.2f}，5周期收益={returns_5:.2f}%，盘口倾斜={imbalance:.2f}"
@@ -426,7 +441,9 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body"))))
+        body = strip_existing_chinese_advice(
+            strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}机会曾被观望错过。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -437,7 +454,9 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body"))))
+        body = strip_existing_chinese_advice(
+            strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}机会曾被观望错过。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -448,7 +467,11 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = translate_shadow_replay_body(strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body")))))
+        body = translate_shadow_replay_body(
+            strip_existing_chinese_advice(
+                strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+            )
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}信号被影子复盘验证有效。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -459,7 +482,11 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = translate_shadow_replay_body(strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body")))))
+        body = translate_shadow_replay_body(
+            strip_existing_chinese_advice(
+                strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+            )
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}信号被影子复盘验证有效。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -470,7 +497,11 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = translate_shadow_replay_body(strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body")))))
+        body = translate_shadow_replay_body(
+            strip_existing_chinese_advice(
+                strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+            )
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}信号在影子复盘中表现偏弱。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -481,7 +512,11 @@ def translate_lesson(value: str | None, expert_name: str) -> tuple[str, bool]:
         text,
     )
     if m:
-        body = translate_shadow_replay_body(strip_existing_chinese_advice(strip_known_suffix(repair_mojibake_fragment(m.group("body")))))
+        body = translate_shadow_replay_body(
+            strip_existing_chinese_advice(
+                strip_known_suffix(repair_mojibake_fragment(m.group("body")))
+            )
+        )
         return (
             f"{m.group('symbol')} {side_zh(m.group('side'))}信号在影子复盘中表现偏弱。"
             f"{body} {expert_advice(expert_name, text)}"
@@ -540,7 +575,9 @@ def clean_reflection_text(value: str | None) -> str:
 
 def backup_db(db_path: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.stem}.backup_before_expert_memory_cleanup_{stamp}{db_path.suffix}")
+    backup_path = db_path.with_name(
+        f"{db_path.stem}.backup_before_expert_memory_cleanup_{stamp}{db_path.suffix}"
+    )
     shutil.copy2(db_path, backup_path)
     return backup_path
 
@@ -551,7 +588,7 @@ def cleanup(db_path: Path, apply: bool) -> dict[str, int | str]:
     backup_path = backup_db(db_path) if apply else None
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
-    stats = {
+    stats: dict[str, int] = {
         "memories_seen": 0,
         "memories_updated": 0,
         "memories_deactivated": 0,
@@ -597,7 +634,9 @@ def cleanup(db_path: Path, apply: bool) -> dict[str, int | str]:
             stats["reflections_seen"] += 1
             mistake = clean_reflection_text(row["mistake_summary"])
             improvement = clean_reflection_text(row["improvement_summary"])
-            if mistake == (row["mistake_summary"] or "") and improvement == (row["improvement_summary"] or ""):
+            if mistake == (row["mistake_summary"] or "") and improvement == (
+                row["improvement_summary"] or ""
+            ):
                 continue
             stats["reflections_updated"] += 1
             if apply:
@@ -607,16 +646,24 @@ def cleanup(db_path: Path, apply: bool) -> dict[str, int | str]:
                 )
         if apply:
             con.commit()
-            stats["backup_path"] = str(backup_path)
     finally:
         con.close()
-    return stats
+    result: dict[str, int | str] = dict(stats)
+    if apply:
+        result["backup_path"] = str(backup_path)
+    return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Clean expert memory mojibake and English templates.")
+    parser = argparse.ArgumentParser(
+        description="Clean expert memory mojibake and English templates."
+    )
     parser.add_argument("--db", default=str(DB_PATH), help="SQLite database path.")
-    parser.add_argument("--apply", action="store_true", help="Apply changes. Without this flag the script only reports counts.")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply changes. Without this flag the script only reports counts.",
+    )
     args = parser.parse_args()
     stats = cleanup(Path(args.db), apply=bool(args.apply))
     for key, value in stats.items():

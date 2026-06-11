@@ -51,9 +51,7 @@ class BlackSwanDetector:
     """Detect extreme market conditions from news and price action."""
 
     def __init__(self) -> None:
-        self._compiled_patterns = [
-            re.compile(kw, re.IGNORECASE) for kw in BLACK_SWAN_KEYWORDS
-        ]
+        self._compiled_patterns = [re.compile(kw, re.IGNORECASE) for kw in BLACK_SWAN_KEYWORDS]
 
     def check_sentiment(
         self, headlines: list[str], sentiment_scores: list[float]
@@ -96,9 +94,7 @@ class BlackSwanDetector:
 
         return BlackSwanResult(triggered=False)
 
-    def check_price_action(
-        self, price_change_1m: float, volume_ratio: float
-    ) -> BlackSwanResult:
+    def check_price_action(self, price_change_1m: float, volume_ratio: float) -> BlackSwanResult:
         """Detect extreme short-term moves from feature data."""
         if price_change_1m < FLASH_CRASH_THRESHOLD:
             severity = "critical" if price_change_1m < -0.25 else "warn"
@@ -136,13 +132,15 @@ class BlackSwanDetector:
     ) -> BlackSwanResult:
         sentiment_result = self.check_sentiment(headlines, sentiment_scores)
         price_result = self.check_price_action(price_change_1m, volume_ratio)
-        reason = "；".join(
-            r for r in (sentiment_result.reason, price_result.reason) if r
-        )
+        reason = "；".join(r for r in (sentiment_result.reason, price_result.reason) if r)
 
         if sentiment_result.severity == "critical" or price_result.severity == "critical":
-            source = "combined" if sentiment_result.triggered and price_result.triggered else (
-                sentiment_result.source if sentiment_result.triggered else price_result.source
+            source = (
+                "combined"
+                if sentiment_result.triggered and price_result.triggered
+                else (
+                    sentiment_result.source if sentiment_result.triggered else price_result.source
+                )
             )
             return BlackSwanResult(
                 triggered=True,
@@ -153,8 +151,12 @@ class BlackSwanDetector:
                 source=source,
             )
         if sentiment_result.triggered or price_result.triggered:
-            source = "combined" if sentiment_result.triggered and price_result.triggered else (
-                sentiment_result.source if sentiment_result.triggered else price_result.source
+            source = (
+                "combined"
+                if sentiment_result.triggered and price_result.triggered
+                else (
+                    sentiment_result.source if sentiment_result.triggered else price_result.source
+                )
             )
             return BlackSwanResult(
                 triggered=True,

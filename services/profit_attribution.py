@@ -2,30 +2,54 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from datetime import UTC, datetime
+from typing import Any
 
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.trade import Order, Position
 from services.decision_state import (
-    DecisionStage,
-    DecisionStageStatus,
     STAGE_LABELS,
     STATUS_LABELS,
+    DecisionStage,
+    DecisionStageStatus,
     decision_state_from_raw,
     summarize_decision_stages,
 )
+from services.entry_signal_extraction import extract_entry_signal_sides
 from web_dashboard.api.text_sanitize import sanitize_text
+
+ACTION_LABELS = {
+    "long": "做多",
+    "short": "做空",
+    "close_long": "平多",
+    "close_short": "平空",
+    "hold": "观望",
+}
+SIDE_LABELS = {"long": "做多", "short": "做空"}
+SIGNAL_LABELS = (
+    ("ml", "本地 ML"),
+    ("server_profit", "服务器盈利模型"),
+    ("timeseries", "时序预测"),
+    ("sentiment", "情绪模型"),
+)
+
+
+@dataclass(slots=True)
+class MatchedDecision:
+    decision: AIDecision | None
+    order: Order | None
+    confidence: str
 
 
 def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -37,6 +61,32 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _symbol_key(symbol: str | None) -> str:
+    """Normalize historical OKX/CCXT symbol variants for attribution matching."""
+    value = str(symbol or "").strip().upper().split(":")[0].replace("_", "-")
+    if not value:
+        return ""
+    if value.endswith("-SWAP"):
+        value = value.removesuffix("-SWAP")
+    if "/" not in value and "-" in value:
+        parts = [part for part in value.split("-") if part]
+        if len(parts) >= 2:
+            value = f"{parts[0]}/{parts[1]}"
+    return value
+
+
+def _action_label(action: str | None) -> str:
+    return ACTION_LABELS.get(str(action or "").lower(), str(action or "-"))
+
+
+def _side_label(side: str | None) -> str:
+    return SIDE_LABELS.get(str(side or "").lower(), str(side or "-"))
+
+
 def _side_from_action(action: str | None) -> str:
     value = str(action or "").lower()
     if "short" in value:
@@ -46,176 +96,26 @@ def _side_from_action(action: str | None) -> str:
     return ""
 
 
-def _action_label(action: str | None) -> str:
-    labels = {
-        "long": "做多",
-        "short": "做空",
-        "close_long": "平多",
-        "close_short": "平空",
-        "hold": "观望",
-    }
-    return labels.get(str(action or "").lower(), str(action or "-"))
-
-
-def _side_label(side: str | None) -> str:
-    labels = {"long": "做多", "short": "做空"}
-    return labels.get(str(side or "").lower(), str(side or "-"))
-
-
 def _order_time(order: Order) -> datetime | None:
     return _aware(order.filled_at or order.created_at)
-
-
-def _position_close_time(position: Position) -> datetime | None:
-    return _aware(position.closed_at)
 
 
 def _position_open_time(position: Position) -> datetime | None:
     return _aware(position.created_at)
 
 
+def _position_close_time(position: Position) -> datetime | None:
+    return _aware(position.closed_at)
+
+
 def _raw(decision: AIDecision | None) -> dict[str, Any]:
-    return decision.raw_llm_response if decision and isinstance(decision.raw_llm_response, dict) else {}
-
-
-def _payload_side(payload: dict[str, Any] | None, side_key: str = "best_side") -> str:
-    if not isinstance(payload, dict):
-        return ""
-    value = str(payload.get(side_key) or payload.get("side") or "").lower()
-    if value in {"long", "short"}:
-        return value
-    direction = str(payload.get("direction") or payload.get("forecast_direction") or "").lower()
-    if direction == "up":
-        return "long"
-    if direction == "down":
-        return "short"
-    label = str(payload.get("label") or payload.get("sentiment") or "").lower()
-    score = _safe_float(payload.get("score", payload.get("sentiment_score", 0.0)), 0.0)
-    if label in {"positive", "bullish"} or score > 0:
-        return "long"
-    if label in {"negative", "bearish"} or score < 0:
-        return "short"
-    return ""
-
-
-def _first_tool_payload(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
-    """Return the first model payload across legacy and current tool containers."""
-    containers = (
-        raw.get("local_ai_tools"),
-        raw.get("server_quant_tools"),
-        raw.get("quant_tools"),
-        raw.get("local_tools"),
-        raw.get("server_tools"),
-        raw,
-    )
-    for container in containers:
-        if not isinstance(container, dict):
-            continue
-        for key in keys:
-            value = container.get(key)
-            if isinstance(value, dict):
-                return value
+    if decision and isinstance(decision.raw_llm_response, dict):
+        return decision.raw_llm_response
     return {}
 
 
-def _signal_available(payload: dict[str, Any]) -> bool:
-    if not isinstance(payload, dict) or not payload:
-        return False
-    for key in ("available", "enabled", "ok"):
-        if key in payload and payload.get(key) is False:
-            return False
-    return True
-
-
-def _expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
-    side = str(side or "").lower()
-    keys: list[str] = []
-    if side in {"long", "short"}:
-        keys.extend([
-            f"expected_{side}_return_pct",
-            f"{side}_expected_return_pct",
-            f"adjusted_{side}_return_pct",
-            f"{side}_return_pct",
-        ])
-    keys.extend([
-        "expected_return_pct",
-        "best_expected_return_pct",
-        "expected_move_pct",
-        "forecast_return_pct",
-        "return_pct",
-        "expected_profit_pct",
-    ])
-    for key in keys:
-        if key in payload:
-            return _safe_float(payload.get(key), 0.0)
-    return 0.0
-
-
 def extract_signal_sides(raw: dict[str, Any]) -> dict[str, Any]:
-    ml = raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else {}
-    predictions = ml.get("predictions") if isinstance(ml.get("predictions"), list) else []
-    primary_ml = predictions[0] if predictions and isinstance(predictions[0], dict) else ml
-
-    profit = _first_tool_payload(
-        raw,
-        "profit_prediction",
-        "profit_model",
-        "server_profit",
-        "server_profit_model",
-        "profit",
-    )
-    timeseries = _first_tool_payload(
-        raw,
-        "time_series_prediction",
-        "timeseries_prediction",
-        "sequence_prediction",
-        "timeseries",
-        "time_series",
-    )
-    sentiment = _first_tool_payload(
-        raw,
-        "sentiment_analysis",
-        "sentiment_prediction",
-        "sentiment_model",
-        "sentiment",
-    )
-    profit_side = _payload_side(profit)
-    timeseries_side = _payload_side(timeseries)
-    sentiment_side = _payload_side(sentiment)
-
-    return {
-        "ml": {
-            "available": bool(ml),
-            "side": _payload_side(primary_ml),
-            "expected_return_pct": _safe_float(
-                primary_ml.get("best_expected_return_pct", ml.get("expected_return_pct", 0.0)),
-                0.0,
-            ),
-        },
-        "server_profit": {
-            "available": _signal_available(profit),
-            "side": profit_side,
-            "expected_return_pct": _expected_return_pct(profit, profit_side),
-        },
-        "timeseries": {
-            "available": _signal_available(timeseries),
-            "side": timeseries_side,
-            "expected_return_pct": _expected_return_pct(timeseries, timeseries_side),
-        },
-        "sentiment": {
-            "available": _signal_available(sentiment),
-            "side": sentiment_side,
-            "expected_return_pct": _expected_return_pct(sentiment, sentiment_side),
-            "score": _safe_float(sentiment.get("score", sentiment.get("sentiment_score", 0.0)), 0.0),
-        },
-    }
-
-
-@dataclass(slots=True)
-class MatchedDecision:
-    decision: AIDecision | None
-    order: Order | None
-    confidence: str
+    return extract_entry_signal_sides(raw)
 
 
 def _match_order(
@@ -227,28 +127,31 @@ def _match_order(
 ) -> MatchedDecision:
     target_time = _position_close_time(position) if want_exit else _position_open_time(position)
     max_gap_seconds = 45 * 60 if want_exit else 30 * 60
-    candidates: list[tuple[float, Order, AIDecision | None]] = []
     side = str(position.side or "").lower()
+    position_symbol = _symbol_key(position.symbol)
+    candidates: list[tuple[float, Order, AIDecision | None]] = []
+
     for order in orders:
-        if order.symbol != position.symbol:
+        if _symbol_key(order.symbol) != position_symbol:
             continue
         decision = decisions_by_id.get(int(order.decision_id or 0))
-        action = str(decision.action if decision else "")
+        action = str(decision.action if decision else "").lower()
         if want_exit:
             expected_action = "close_long" if side == "long" else "close_short"
             if decision and action != expected_action:
                 continue
-        else:
-            if decision and _side_from_action(action) != side:
-                continue
+        elif decision and _side_from_action(action) != side:
+            continue
+
         order_time = _order_time(order)
-        if not target_time or not order_time:
-            gap = 0.0
-        else:
+        if target_time and order_time:
             gap = abs((order_time - target_time).total_seconds())
             if gap > max_gap_seconds:
                 continue
+        else:
+            gap = 0.0
         candidates.append((gap, order, decision))
+
     if not candidates:
         return MatchedDecision(None, None, "low")
     gap, order, decision = sorted(candidates, key=lambda item: item[0])[0]
@@ -263,28 +166,31 @@ def _match_nearest_decision(
     want_exit: bool,
 ) -> MatchedDecision:
     target_time = _position_close_time(position) if want_exit else _position_open_time(position)
-    side = str(position.side or "").lower()
     max_gap_seconds = 45 * 60 if want_exit else 30 * 60
+    side = str(position.side or "").lower()
+    position_symbol = _symbol_key(position.symbol)
     candidates: list[tuple[float, AIDecision]] = []
+
     for decision in decisions:
-        if decision.symbol != position.symbol:
+        if _symbol_key(decision.symbol) != position_symbol:
             continue
         action = str(decision.action or "").lower()
         if want_exit:
             expected = "close_long" if side == "long" else "close_short"
             if action != expected:
                 continue
-        else:
-            if _side_from_action(action) != side:
-                continue
+        elif _side_from_action(action) != side:
+            continue
+
         decision_time = _aware(decision.executed_at or decision.created_at)
-        if not target_time or not decision_time:
-            gap = 0.0
-        else:
+        if target_time and decision_time:
             gap = abs((decision_time - target_time).total_seconds())
             if gap > max_gap_seconds:
                 continue
+        else:
+            gap = 0.0
         candidates.append((gap, decision))
+
     if not candidates:
         return MatchedDecision(None, None, "low")
     gap, decision = sorted(candidates, key=lambda item: item[0])[0]
@@ -297,35 +203,218 @@ def _best_shadow(
 ) -> ShadowBacktest | None:
     if not decision:
         return None
-    matches = [
-        row
-        for row in shadows
-        if row.decision_id == decision.id
-        or (
-            row.symbol == decision.symbol
-            and _aware(row.created_at)
-            and _aware(decision.created_at)
-            and abs((_aware(row.created_at) - _aware(decision.created_at)).total_seconds()) <= 600
-        )
-    ]
+    decision_time = _aware(decision.created_at)
+    decision_symbol = _symbol_key(decision.symbol)
+    matches: list[ShadowBacktest] = []
+    for row in shadows:
+        if row.decision_id == decision.id:
+            matches.append(row)
+            continue
+        row_time = _aware(row.created_at)
+        if (
+            _symbol_key(row.symbol) == decision_symbol
+            and decision_time is not None
+            and row_time is not None
+            and abs((row_time - decision_time).total_seconds()) <= 1800
+        ):
+            matches.append(row)
     if not matches:
         return None
     completed = [row for row in matches if row.status == "completed"]
     rows = completed or matches
-    return sorted(rows, key=lambda row: (row.horizon_minutes or 999, row.id), reverse=True)[0]
+    return sorted(rows, key=lambda row: (row.horizon_minutes or 0, row.id or 0), reverse=True)[0]
+
+
+def _best_shadow_for_position(
+    position: Position,
+    decision: AIDecision | None,
+    shadows: Iterable[ShadowBacktest],
+) -> ShadowBacktest | None:
+    matched = _best_shadow(decision, shadows)
+    if matched is not None:
+        return matched
+
+    opened = _position_open_time(position)
+    if not opened:
+        return None
+
+    side = str(position.side or "").lower()
+    execution_mode = str(position.execution_mode or "").lower()
+    position_symbol = _symbol_key(position.symbol)
+    candidates: list[tuple[float, ShadowBacktest]] = []
+    for row in shadows:
+        if _symbol_key(row.symbol) != position_symbol:
+            continue
+        if execution_mode and str(row.execution_mode or "").lower() != execution_mode:
+            continue
+        row_side = _side_from_action(row.decision_action)
+        if row_side in {"long", "short"} and side in {"long", "short"} and row_side != side:
+            continue
+        row_time = _aware(row.created_at)
+        if not row_time:
+            continue
+        gap = abs((row_time - opened).total_seconds())
+        if gap <= 45 * 60:
+            candidates.append((gap, row))
+
+    if not candidates:
+        return None
+    completed = [(gap, row) for gap, row in candidates if row.status == "completed"]
+    rows = completed or candidates
+    return sorted(
+        rows,
+        key=lambda item: (item[0], -(item[1].horizon_minutes or 0), -(item[1].id or 0)),
+    )[0][1]
 
 
 def _shadow_best_action(row: ShadowBacktest | None) -> str:
-    if not row:
+    if row is None:
         return ""
     value = str(row.best_action or "").lower()
     if value in {"long", "short", "hold"}:
         return value
-    long_ret = _safe_float(row.long_return_pct, 0.0)
-    short_ret = _safe_float(row.short_return_pct, 0.0)
-    if max(long_ret, short_ret) <= 0:
+    long_return = _safe_float(row.long_return_pct, 0.0)
+    short_return = _safe_float(row.short_return_pct, 0.0)
+    if max(long_return, short_return) <= 0:
         return "hold"
-    return "long" if long_ret >= short_ret else "short"
+    return "long" if long_return >= short_return else "short"
+
+
+def _decision_payload(decision: AIDecision | None, confidence: str) -> dict[str, Any] | None:
+    if decision is None:
+        return None
+    raw = _raw(decision)
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    evidence_score = _safe_dict(opportunity.get("evidence_score"))
+    created_at = _aware(decision.created_at)
+    return {
+        "id": decision.id,
+        "action": decision.action,
+        "action_label": _action_label(decision.action),
+        "confidence": _safe_float(decision.confidence, 0.0),
+        "reasoning": sanitize_text(decision.reasoning or ""),
+        "execution_reason": sanitize_text(decision.execution_reason or ""),
+        "was_executed": bool(decision.was_executed),
+        "matched_confidence": confidence,
+        "created_at": created_at.isoformat() if created_at else None,
+        "opportunity_score": opportunity,
+        "evidence_score": evidence_score,
+    }
+
+
+def _shadow_payload(row: ShadowBacktest | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    best = _shadow_best_action(row)
+    return {
+        "id": row.id,
+        "decision_id": row.decision_id,
+        "horizon_minutes": row.horizon_minutes,
+        "status": row.status,
+        "best_action": best,
+        "best_action_label": _action_label(best),
+        "long_return_pct": _safe_float(row.long_return_pct, 0.0),
+        "short_return_pct": _safe_float(row.short_return_pct, 0.0),
+        "missed_opportunity": bool(row.missed_opportunity),
+        "note": sanitize_text(row.note or ""),
+    }
+
+
+def _signal_status(
+    signals: dict[str, Any],
+    key: str,
+    label: str,
+    *,
+    entry_decision: AIDecision | None,
+) -> dict[str, Any]:
+    signal = _safe_dict(signals.get(key))
+    has_side = str(signal.get("side") or "").lower() in {"long", "short"}
+    has_expected = "expected_return_pct" in signal
+    has_score = key == "sentiment" and "score" in signal
+    available = bool(signal.get("available")) and (has_side or has_expected or has_score)
+    if entry_decision is None:
+        missing_reason = f"未匹配到开仓 AI 决策，无法读取{label}证据"
+    else:
+        missing_reason = f"开仓 AI 决策未保存{label} 证据"
+    return {
+        "available": available,
+        "label": label,
+        "side": signal.get("side") or "",
+        "expected_return_pct": _safe_float(signal.get("expected_return_pct"), 0.0),
+        "influence_enabled": signal.get("influence_enabled"),
+        "status": "matched" if available else "missing",
+        "missing_reason": "" if available else missing_reason,
+    }
+
+
+def _evidence_status(
+    entry_decision: AIDecision | None,
+    signals: dict[str, Any],
+    shadow: ShadowBacktest | None,
+) -> dict[str, Any]:
+    ai_available = entry_decision is not None
+    shadow_available = shadow is not None
+    shadow_action = _shadow_best_action(shadow)
+    return {
+        "ai": {
+            "available": ai_available,
+            "label": "AI 决策",
+            "action": entry_decision.action if entry_decision is not None else "",
+            "action_label": _action_label(entry_decision.action if entry_decision else None),
+            "confidence": _safe_float(getattr(entry_decision, "confidence", None), 0.0),
+            "status": "matched" if ai_available else "missing",
+            "missing_reason": (
+                ""
+                if ai_available
+                else "未匹配到开仓 AI 决策；已检查订单 decision_id、币种和开仓时间窗"
+            ),
+        },
+        "ml": _signal_status(signals, "ml", "本地 ML", entry_decision=entry_decision),
+        "server_profit": _signal_status(
+            signals,
+            "server_profit",
+            "服务器盈利模型",
+            entry_decision=entry_decision,
+        ),
+        "timeseries": _signal_status(
+            signals,
+            "timeseries",
+            "时序预测",
+            entry_decision=entry_decision,
+        ),
+        "sentiment": _signal_status(
+            signals,
+            "sentiment",
+            "情绪模型",
+            entry_decision=entry_decision,
+        ),
+        "shadow": {
+            "available": shadow_available,
+            "label": "影子复盘",
+            "status": shadow.status if shadow is not None else "missing",
+            "best_action": shadow_action,
+            "best_action_label": _action_label(shadow_action),
+            "horizon_minutes": shadow.horizon_minutes if shadow is not None else None,
+            "missing_reason": (
+                ""
+                if shadow_available
+                else "未匹配到影子复盘样本；已检查 decision_id、币种和开仓时间窗"
+            ),
+        },
+    }
+
+
+def _close_reason(close_decision: AIDecision | None) -> str:
+    raw_close = _raw(close_decision)
+    close_evidence = _safe_dict(raw_close.get("close_evidence"))
+    reason = str(
+        raw_close.get("execution_reason")
+        or close_evidence.get("reason")
+        or getattr(close_decision, "execution_reason", "")
+        or getattr(close_decision, "reasoning", "")
+        or ""
+    )
+    return str(sanitize_text(reason) or "")
 
 
 def _classify_record(
@@ -336,53 +425,36 @@ def _classify_record(
 ) -> tuple[str, str, str, list[str]]:
     pnl = _safe_float(position.realized_pnl, 0.0)
     side = str(position.side or "").lower()
-    raw_entry = _raw(entry_decision)
-    raw_close = _raw(close_decision)
-    signals = extract_signal_sides(raw_entry)
+    signals = extract_signal_sides(_raw(entry_decision))
     shadow_action = _shadow_best_action(shadow)
-    hold_minutes = 0.0
     opened = _position_open_time(position)
     closed = _position_close_time(position)
-    if opened and closed:
-        hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
+    hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0) if opened and closed else 0.0
 
     notes: list[str] = []
     if shadow_action in {"long", "short"} and shadow_action != side:
-        notes.append(f"影子复盘更优方向是{_side_label(shadow_action)}")
-    for key, label in (
-        ("ml", "本地ML"),
-        ("server_profit", "服务器盈利模型"),
-        ("timeseries", "时序预测"),
-        ("sentiment", "情绪模型"),
-    ):
-        signal_side = signals.get(key, {}).get("side")
+        notes.append(f"影子复盘显示更优方向是{_side_label(shadow_action)}")
+    for key, label in SIGNAL_LABELS:
+        signal_side = _safe_dict(signals.get(key)).get("side")
         if signal_side in {"long", "short"} and signal_side != side:
-            notes.append(f"{label}当时偏向{_side_label(signal_side)}")
+            notes.append(f"{label} 当时偏向{_side_label(signal_side)}")
 
-    close_evidence = raw_close.get("close_evidence") if isinstance(raw_close.get("close_evidence"), dict) else {}
-    close_reason = str(
-        raw_close.get("execution_reason")
-        or close_evidence.get("reason")
-        or getattr(close_decision, "execution_reason", "")
-        or getattr(close_decision, "reasoning", "")
-        or ""
-    )
-    close_reason = str(sanitize_text(close_reason) or "")
+    close_reason = _close_reason(close_decision)
+    lowered_close_reason = close_reason.lower()
     if close_reason:
-        lowered = close_reason.lower()
-        if "止损" in close_reason or "stop" in lowered:
+        if "止损" in close_reason or "stop" in lowered_close_reason:
             notes.append("平仓来自止损或快速风控")
-        if "锁盈" in close_reason or "止盈" in close_reason or "profit" in lowered:
+        if "锁盈" in close_reason or "止盈" in close_reason or "profit" in lowered_close_reason:
             notes.append("平仓来自锁盈/止盈")
 
     if pnl < 0:
         if shadow_action in {"long", "short"} and shadow_action != side:
-            return "ai_direction_error", "AI方向判断偏差", "high", notes
+            return "ai_direction_error", "AI 方向判断偏差", "high", notes
         if notes:
             return "model_conflict_ignored", "模型分歧未充分消化", "medium", notes
         if hold_minutes <= 5:
             return "entry_quality", "入场后快速不利", "medium", notes
-        if "止损" in close_reason or "stop" in close_reason.lower():
+        if "止损" in close_reason or "stop" in lowered_close_reason:
             return "stop_loss_or_fast_risk", "止损/快速风控亏损", "medium", notes
         return "loss_unclassified", "亏损原因待复盘", "low", notes
 
@@ -396,16 +468,72 @@ def _classify_record(
     return "flat_or_fee_churn", "盈亏接近 0", "medium", notes
 
 
+def _decision_state_or_closed_fallback(
+    raw_response: dict[str, Any],
+    position: Position,
+    decision: AIDecision | None,
+) -> dict[str, Any]:
+    machine = decision_state_from_raw(raw_response)
+    summary = _safe_dict(machine.get("summary"))
+    if summary.get("final_stage") or position.is_open or not position.closed_at:
+        return machine
+
+    at = (_position_close_time(position) or datetime.now(UTC)).isoformat()
+    reason = (
+        "历史记录已完成平仓；旧版本未写入完整状态机，"
+        "系统根据已平仓持仓和本地订单记录推断为本地同步完成。"
+    )
+    stages: list[dict[str, Any]] = []
+    if decision is not None:
+        decision_at = (
+            _aware(decision.created_at)
+            or _position_open_time(position)
+            or _position_close_time(position)
+        )
+        stages.append(
+            {
+                "stage": DecisionStage.AI_ANALYSIS,
+                "stage_label": STAGE_LABELS[DecisionStage.AI_ANALYSIS],
+                "status": DecisionStageStatus.COMPLETED,
+                "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
+                "reason": "历史 AI 决策记录存在，但旧版本未保存完整状态机。",
+                "at": decision_at.isoformat() if decision_at else at,
+                "inferred": True,
+            }
+        )
+    stages.append(
+        {
+            "stage": DecisionStage.LOCAL_SYNC,
+            "stage_label": STAGE_LABELS[DecisionStage.LOCAL_SYNC],
+            "status": DecisionStageStatus.COMPLETED,
+            "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
+            "reason": reason,
+            "at": at,
+            "inferred": True,
+        }
+    )
+    return {
+        "stages": stages,
+        "summary": {
+            **summarize_decision_stages(stages),
+            "inferred": True,
+            "final_reason": reason,
+        },
+        "inferred": True,
+    }
+
+
 def build_profit_attribution(
     positions: list[Position],
     orders: list[Order],
     decisions: list[AIDecision],
     shadows: list[ShadowBacktest],
 ) -> dict[str, Any]:
-    decisions_by_id = {int(d.id): d for d in decisions if d.id is not None}
+    decisions_by_id = {
+        int(decision.id): decision for decision in decisions if decision.id is not None
+    }
     records: list[dict[str, Any]] = []
     buckets: dict[str, dict[str, Any]] = {}
-
     total_pnl = 0.0
     wins = 0
     losses = 0
@@ -429,21 +557,24 @@ def build_profit_attribution(
         if not close_match.decision:
             close_match = _match_nearest_decision(position, decisions, want_exit=True)
 
-        shadow = _best_shadow(entry_match.decision, shadows)
+        shadow = _best_shadow_for_position(position, entry_match.decision, shadows)
         bucket_key, bucket_label, confidence, notes = _classify_record(
             position,
             entry_match.decision,
             close_match.decision,
             shadow,
         )
-        bucket = buckets.setdefault(bucket_key, {
-            "key": bucket_key,
-            "label": bucket_label,
-            "count": 0,
-            "pnl": 0.0,
-            "profit": 0.0,
-            "loss": 0.0,
-        })
+        bucket = buckets.setdefault(
+            bucket_key,
+            {
+                "key": bucket_key,
+                "label": bucket_label,
+                "count": 0,
+                "pnl": 0.0,
+                "profit": 0.0,
+                "loss": 0.0,
+            },
+        )
         bucket["count"] += 1
         bucket["pnl"] += pnl
         if pnl >= 0:
@@ -457,64 +588,90 @@ def build_profit_attribution(
         opened = _position_open_time(position)
         closed = _position_close_time(position)
         hold_minutes = (
-            max((closed - opened).total_seconds() / 60.0, 0.0)
-            if opened and closed
-            else 0.0
+            max((closed - opened).total_seconds() / 60.0, 0.0) if opened and closed else 0.0
+        )
+        records.append(
+            {
+                "position_id": position.id,
+                "symbol": position.symbol,
+                "side": position.side,
+                "side_label": _side_label(position.side),
+                "entry_at": opened.isoformat() if opened else None,
+                "closed_at": closed.isoformat() if closed else None,
+                "hold_minutes": round(hold_minutes, 2),
+                "entry_price": _safe_float(position.entry_price, 0.0),
+                "exit_price": _safe_float(position.current_price, 0.0),
+                "quantity": _safe_float(position.quantity, 0.0),
+                "realized_pnl": round(pnl, 6),
+                "bucket": bucket_key,
+                "main_reason": bucket_label,
+                "attribution_confidence": confidence,
+                "notes": notes,
+                "entry_decision": _decision_payload(entry_match.decision, entry_match.confidence),
+                "close_decision": _decision_payload(close_match.decision, close_match.confidence),
+                "signals": signals,
+                "shadow": _shadow_payload(shadow),
+                "evidence_status": _evidence_status(entry_match.decision, signals, shadow),
+                "decision_state": _decision_state_or_closed_fallback(
+                    raw_entry,
+                    position,
+                    entry_match.decision,
+                ),
+                "close_state": _decision_state_or_closed_fallback(
+                    raw_close,
+                    position,
+                    close_match.decision,
+                ),
+            }
         )
 
-        records.append({
-            "position_id": position.id,
-            "symbol": position.symbol,
-            "side": position.side,
-            "side_label": _side_label(position.side),
-            "entry_at": opened.isoformat() if opened else None,
-            "closed_at": closed.isoformat() if closed else None,
-            "hold_minutes": round(hold_minutes, 2),
-            "entry_price": _safe_float(position.entry_price, 0.0),
-            "exit_price": _safe_float(position.current_price, 0.0),
-            "quantity": _safe_float(position.quantity, 0.0),
-            "realized_pnl": round(pnl, 6),
-            "bucket": bucket_key,
-            "main_reason": bucket_label,
-            "attribution_confidence": confidence,
-            "notes": notes,
-            "entry_decision": _decision_payload(entry_match.decision, entry_match.confidence),
-            "close_decision": _decision_payload(close_match.decision, close_match.confidence),
-            "signals": signals,
-            "shadow": _shadow_payload(shadow),
-            "decision_state": _decision_state_or_closed_fallback(raw_entry, position, entry_match.decision),
-            "close_state": _decision_state_or_closed_fallback(raw_close, position, close_match.decision),
-        })
-
     trade_count = len(positions)
-    avg_win = profit / wins if wins else 0.0
-    avg_loss = loss / losses if losses else 0.0
+    evidence_coverage = {
+        key: sum(
+            1
+            for row in records
+            if _safe_dict(_safe_dict(row.get("evidence_status")).get(key)).get("available")
+        )
+        for key in ("ai", "ml", "server_profit", "shadow")
+    }
+    evidence_coverage["all_core"] = sum(
+        1
+        for row in records
+        if all(
+            _safe_dict(_safe_dict(row.get("evidence_status")).get(key)).get("available")
+            for key in ("ai", "ml", "shadow")
+        )
+    )
     summary = {
         "trade_count": trade_count,
         "total_closed_pnl": round(total_pnl, 6),
         "win_count": wins,
         "loss_count": losses,
         "win_rate": round(wins / trade_count, 4) if trade_count else 0.0,
-        "avg_win": round(avg_win, 6),
-        "avg_loss": round(avg_loss, 6),
+        "avg_win": round(profit / wins, 6) if wins else 0.0,
+        "avg_loss": round(loss / losses, 6) if losses else 0.0,
         "profit_factor": round(profit / loss, 4) if loss > 0 else (999.0 if profit > 0 else 0.0),
         "small_win_count": sum(1 for row in records if 0 < row["realized_pnl"] < 1.0),
         "large_loss_count": sum(1 for row in records if row["realized_pnl"] <= -5.0),
         "early_exit_count": sum(1 for row in records if row["bucket"] == "early_small_profit"),
         "direction_error_count": sum(1 for row in records if row["bucket"] == "ai_direction_error"),
-        "execution_issue_count": sum(1 for row in records if row["bucket"] in {"stop_loss_or_fast_risk", "flat_or_fee_churn"}),
+        "execution_issue_count": sum(
+            1 for row in records if row["bucket"] in {"stop_loss_or_fast_risk", "flat_or_fee_churn"}
+        ),
+        "evidence_coverage": evidence_coverage,
     }
-
     bucket_rows = []
     for item in buckets.values():
         count = max(int(item["count"]), 1)
-        bucket_rows.append({
-            **item,
-            "pnl": round(float(item["pnl"]), 6),
-            "profit": round(float(item["profit"]), 6),
-            "loss": round(float(item["loss"]), 6),
-            "avg_pnl": round(float(item["pnl"]) / count, 6),
-        })
+        bucket_rows.append(
+            {
+                **item,
+                "pnl": round(float(item["pnl"]), 6),
+                "profit": round(float(item["profit"]), 6),
+                "loss": round(float(item["loss"]), 6),
+                "avg_pnl": round(float(item["pnl"]) / count, 6),
+            }
+        )
     bucket_rows.sort(key=lambda item: abs(float(item["pnl"])), reverse=True)
 
     return {
@@ -524,217 +681,21 @@ def build_profit_attribution(
     }
 
 
-def _decision_payload(decision: AIDecision | None, confidence: str) -> dict[str, Any] | None:
-    if decision is None:
-        return None
-    return {
-        "id": decision.id,
-        "action": decision.action,
-        "action_label": _action_label(decision.action),
-        "confidence": _safe_float(decision.confidence, 0.0),
-        "reasoning": sanitize_text(decision.reasoning or ""),
-        "execution_reason": sanitize_text(decision.execution_reason or ""),
-        "was_executed": bool(decision.was_executed),
-        "matched_confidence": confidence,
-        "created_at": _aware(decision.created_at).isoformat() if _aware(decision.created_at) else None,
+def match_entry_decisions_for_positions(
+    positions: list[Position],
+    orders: list[Order],
+    decisions: list[AIDecision],
+) -> list[AIDecision]:
+    """Return entry decisions used by the attribution builder."""
+    decisions_by_id = {
+        int(decision.id): decision for decision in decisions if decision.id is not None
     }
-
-
-def _shadow_payload(row: ShadowBacktest | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    best = _shadow_best_action(row)
-    return {
-        "id": row.id,
-        "decision_id": row.decision_id,
-        "horizon_minutes": row.horizon_minutes,
-        "status": row.status,
-        "best_action": best,
-        "best_action_label": _action_label(best),
-        "long_return_pct": _safe_float(row.long_return_pct, 0.0),
-        "short_return_pct": _safe_float(row.short_return_pct, 0.0),
-        "missed_opportunity": bool(row.missed_opportunity),
-        "note": sanitize_text(row.note or ""),
-    }
-
-
-def _decision_state_or_closed_fallback(
-    raw_response: dict[str, Any],
-    position: Position,
-    decision: AIDecision | None,
-) -> dict[str, Any]:
-    machine = decision_state_from_raw(raw_response)
-    summary = machine.get("summary") if isinstance(machine.get("summary"), dict) else {}
-    if summary.get("final_stage"):
-        return machine
-    if position.is_open or not position.closed_at:
-        return machine
-
-    at = (_position_close_time(position) or datetime.now(timezone.utc)).isoformat()
-    reason = (
-        "历史记录已完成平仓；旧版本未写入逐阶段状态机，"
-        "系统根据已平仓持仓和本地订单记录推断为本地同步完成。"
-    )
-    stages = []
-    if decision is not None:
-        stages.append({
-            "stage": DecisionStage.AI_ANALYSIS,
-            "stage_label": STAGE_LABELS[DecisionStage.AI_ANALYSIS],
-            "status": DecisionStageStatus.COMPLETED,
-            "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
-            "reason": "历史 AI 决策记录存在，但旧版本未保存完整状态机。",
-            "at": (_aware(decision.created_at) or _position_open_time(position) or _position_close_time(position)).isoformat(),
-            "inferred": True,
-        })
-    stages.append({
-        "stage": DecisionStage.LOCAL_SYNC,
-        "stage_label": STAGE_LABELS[DecisionStage.LOCAL_SYNC],
-        "status": DecisionStageStatus.COMPLETED,
-        "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
-        "reason": reason,
-        "at": at,
-        "inferred": True,
-    })
-    return {
-        "stages": stages,
-        "summary": {
-            **summarize_decision_stages(stages),
-            "inferred": True,
-            "final_reason": reason,
-        },
-        "inferred": True,
-    }
-
-
-# Clean UTF-8 overrides.  Earlier helper definitions are kept above only to
-# avoid a high-risk full-file rewrite while this module is being refactored.
-def _action_label(action: str | None) -> str:
-    labels = {
-        "long": "做多",
-        "short": "做空",
-        "close_long": "平多",
-        "close_short": "平空",
-        "hold": "观望",
-    }
-    return labels.get(str(action or "").lower(), str(action or "-"))
-
-
-def _side_label(side: str | None) -> str:
-    labels = {"long": "做多", "short": "做空"}
-    return labels.get(str(side or "").lower(), str(side or "-"))
-
-
-def _classify_record(
-    position: Position,
-    entry_decision: AIDecision | None,
-    close_decision: AIDecision | None,
-    shadow: ShadowBacktest | None,
-) -> tuple[str, str, str, list[str]]:
-    pnl = _safe_float(position.realized_pnl, 0.0)
-    side = str(position.side or "").lower()
-    raw_entry = _raw(entry_decision)
-    raw_close = _raw(close_decision)
-    signals = extract_signal_sides(raw_entry)
-    shadow_action = _shadow_best_action(shadow)
-    hold_minutes = 0.0
-    opened = _position_open_time(position)
-    closed = _position_close_time(position)
-    if opened and closed:
-        hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
-
-    notes: list[str] = []
-    if shadow_action in {"long", "short"} and shadow_action != side:
-        notes.append(f"影子复盘显示更优方向是{_side_label(shadow_action)}")
-    for key, label in (
-        ("ml", "本地ML"),
-        ("server_profit", "服务器盈利模型"),
-        ("timeseries", "时序预测"),
-        ("sentiment", "情绪模型"),
-    ):
-        signal_side = signals.get(key, {}).get("side")
-        if signal_side in {"long", "short"} and signal_side != side:
-            notes.append(f"{label}当时偏向{_side_label(signal_side)}")
-
-    close_evidence = raw_close.get("close_evidence") if isinstance(raw_close.get("close_evidence"), dict) else {}
-    close_reason = str(
-        raw_close.get("execution_reason")
-        or close_evidence.get("reason")
-        or getattr(close_decision, "execution_reason", "")
-        or getattr(close_decision, "reasoning", "")
-        or ""
-    )
-    close_reason = str(sanitize_text(close_reason) or "")
-    lowered_close_reason = close_reason.lower()
-    if close_reason:
-        if "止损" in close_reason or "stop" in lowered_close_reason:
-            notes.append("平仓来自止损或快速风控")
-        if "锁盈" in close_reason or "止盈" in close_reason or "profit" in lowered_close_reason:
-            notes.append("平仓来自锁盈/止盈")
-
-    if pnl < 0:
-        if shadow_action in {"long", "short"} and shadow_action != side:
-            return "ai_direction_error", "AI方向判断偏差", "high", notes
-        if notes:
-            return "model_conflict_ignored", "模型分歧未充分消化", "medium", notes
-        if hold_minutes <= 5:
-            return "entry_quality", "入场后快速不利", "medium", notes
-        if "止损" in close_reason or "stop" in lowered_close_reason:
-            return "stop_loss_or_fast_risk", "止损/快速风控亏损", "medium", notes
-        return "loss_unclassified", "亏损原因待复盘", "low", notes
-
-    if pnl > 0:
-        if hold_minutes <= 5 and pnl < 1.0:
-            return "early_small_profit", "小盈快跑", "medium", notes
-        if close_reason and ("锁盈" in close_reason or "止盈" in close_reason):
-            return "profit_locked", "利润保护生效", "medium", notes
-        return "profitable_exit", "盈利兑现", "medium", notes
-
-    return "flat_or_fee_churn", "盈亏接近 0", "medium", notes
-
-
-def _decision_state_or_closed_fallback(
-    raw_response: dict[str, Any],
-    position: Position,
-    decision: AIDecision | None,
-) -> dict[str, Any]:
-    machine = decision_state_from_raw(raw_response)
-    summary = machine.get("summary") if isinstance(machine.get("summary"), dict) else {}
-    if summary.get("final_stage"):
-        return machine
-    if position.is_open or not position.closed_at:
-        return machine
-
-    at = (_position_close_time(position) or datetime.now(timezone.utc)).isoformat()
-    reason = (
-        "历史记录已完成平仓；旧版本未写入完整逐阶段状态机，"
-        "系统根据已平仓持仓和本地订单记录推断为本地同步完成。"
-    )
-    stages = []
-    if decision is not None:
-        stages.append({
-            "stage": DecisionStage.AI_ANALYSIS,
-            "stage_label": STAGE_LABELS[DecisionStage.AI_ANALYSIS],
-            "status": DecisionStageStatus.COMPLETED,
-            "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
-            "reason": "历史 AI 决策记录存在，但旧版本未保存完整状态机。",
-            "at": (_aware(decision.created_at) or _position_open_time(position) or _position_close_time(position)).isoformat(),
-            "inferred": True,
-        })
-    stages.append({
-        "stage": DecisionStage.LOCAL_SYNC,
-        "stage_label": STAGE_LABELS[DecisionStage.LOCAL_SYNC],
-        "status": DecisionStageStatus.COMPLETED,
-        "status_label": STATUS_LABELS[DecisionStageStatus.COMPLETED],
-        "reason": reason,
-        "at": at,
-        "inferred": True,
-    })
-    return {
-        "stages": stages,
-        "summary": {
-            **summarize_decision_stages(stages),
-            "inferred": True,
-            "final_reason": reason,
-        },
-        "inferred": True,
-    }
+    matched: dict[int, AIDecision] = {}
+    for position in positions:
+        entry_match = _match_order(position, orders, decisions_by_id, want_exit=False)
+        if not entry_match.decision:
+            entry_match = _match_nearest_decision(position, decisions, want_exit=False)
+        decision = entry_match.decision
+        if decision and decision.id is not None:
+            matched[int(decision.id)] = decision
+    return list(matched.values())

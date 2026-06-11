@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import pandas as pd
 
 
 def calculate_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.02) -> float:

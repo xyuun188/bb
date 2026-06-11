@@ -9,7 +9,7 @@ trade.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
@@ -100,43 +100,49 @@ class TradingAgentSkillBook:
         if decision.is_entry:
             balance = self._to_float(override_balance, 0.0)
             if balance <= 0:
-                skills.append(SkillResult(
-                    name="execution_margin_guard",
-                    label="执行前保证金检查",
-                    status="blocked",
-                    decision="block_entry",
-                    blocks_entry=True,
-                    reason=(
-                        "执行前没有可用于本次订单的 USDT 保证金，订单不会提交到 OKX。"
-                        "通常是持仓或挂单占用过高、账户可用余额不足，或本轮仓位过大。"
-                    ),
-                    data={
-                        "mode": model_mode,
-                        "override_balance": balance,
-                    },
-                ))
+                skills.append(
+                    SkillResult(
+                        name="execution_margin_guard",
+                        label="执行前保证金检查",
+                        status="blocked",
+                        decision="block_entry",
+                        blocks_entry=True,
+                        reason=(
+                            "执行前没有可用于本次订单的 USDT 保证金，订单不会提交到 OKX。"
+                            "通常是持仓或挂单占用过高、账户可用余额不足，或本轮仓位过大。"
+                        ),
+                        data={
+                            "mode": model_mode,
+                            "override_balance": balance,
+                        },
+                    )
+                )
             else:
-                skills.append(SkillResult(
-                    name="execution_margin_guard",
-                    label="执行前保证金检查",
-                    status="passed",
-                    decision="allow",
-                    reason="执行前仍有可分配保证金，本次允许进入 OKX 下单流程。",
-                    data={
-                        "mode": model_mode,
-                        "override_balance": balance,
-                    },
-                ))
+                skills.append(
+                    SkillResult(
+                        name="execution_margin_guard",
+                        label="执行前保证金检查",
+                        status="passed",
+                        decision="allow",
+                        reason="执行前仍有可分配保证金，本次允许进入 OKX 下单流程。",
+                        data={
+                            "mode": model_mode,
+                            "override_balance": balance,
+                        },
+                    )
+                )
         return skills
 
     def block_reason(self, skills: list[SkillResult], *, for_entry: bool = True) -> str | None:
         blockers = [
-            skill for skill in skills
-            if (skill.blocks_entry if for_entry else skill.blocks_exit)
+            skill for skill in skills if (skill.blocks_entry if for_entry else skill.blocks_exit)
         ]
         if not blockers:
             return None
-        return "；".join(skill.reason for skill in blockers if skill.reason) or "Agent/Skills 守门拒绝本次动作。"
+        return (
+            "；".join(skill.reason for skill in blockers if skill.reason)
+            or "Agent/Skills 守门拒绝本次动作。"
+        )
 
     def attach(
         self,
@@ -147,11 +153,13 @@ class TradingAgentSkillBook:
         note: str | None = None,
     ) -> dict[str, Any]:
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        existing = raw.get("agent_skills") if isinstance(raw.get("agent_skills"), dict) else {}
-        phases = existing.get("phases") if isinstance(existing.get("phases"), dict) else {}
+        existing_raw = raw.get("agent_skills")
+        existing = existing_raw if isinstance(existing_raw, dict) else {}
+        phases_raw = existing.get("phases")
+        phases = phases_raw if isinstance(phases_raw, dict) else {}
         phases[phase] = {
             "phase": phase,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "recorded_at": datetime.now(UTC).isoformat(),
             "note": note or "",
             "skills": [skill.to_dict() for skill in skills],
         }
@@ -223,8 +231,12 @@ class TradingAgentSkillBook:
                 reason="本轮没有拿到本地 ML 盈亏质量预测。",
             )
         ready = bool(signal.get("ready") or signal.get("available"))
-        side = str(signal.get("best_side") or signal.get("side") or signal.get("direction") or "").lower()
-        expected = self._first_number(signal, "expected_return_pct", "expected_pct", "profit_edge_pct")
+        side = str(
+            signal.get("best_side") or signal.get("side") or signal.get("direction") or ""
+        ).lower()
+        expected = self._first_number(
+            signal, "expected_return_pct", "expected_pct", "profit_edge_pct"
+        )
         if side not in {"long", "short"} or expected is None:
             predictions = signal.get("predictions")
             if isinstance(predictions, list) and predictions:
@@ -232,7 +244,9 @@ class TradingAgentSkillBook:
                 if side not in {"long", "short"}:
                     side = str(first.get("best_side") or first.get("side") or "").lower()
                 if expected is None:
-                    expected = self._first_number(first, "best_expected_return_pct", "expected_return_pct", "profit_edge_pct")
+                    expected = self._first_number(
+                        first, "best_expected_return_pct", "expected_return_pct", "profit_edge_pct"
+                    )
         decision = side if side in {"long", "short"} else "neutral"
         if not ready:
             status = "learning"
@@ -250,10 +264,20 @@ class TradingAgentSkillBook:
             decision=decision,
             confidence=self._first_number(signal, "confidence", "score"),
             reason=reason,
-            data=self._compact(signal, [
-                "ready", "available", "best_side", "side", "expected_return_pct",
-                "profit_edge_pct", "loss_probability", "confidence", "suggestion",
-            ]),
+            data=self._compact(
+                signal,
+                [
+                    "ready",
+                    "available",
+                    "best_side",
+                    "side",
+                    "expected_return_pct",
+                    "profit_edge_pct",
+                    "loss_probability",
+                    "confidence",
+                    "suggestion",
+                ],
+            ),
         )
 
     def _server_profit_skill(self, tools: dict[str, Any] | None) -> SkillResult:
@@ -268,8 +292,14 @@ class TradingAgentSkillBook:
             )
         available = profit.get("available", True) is not False and not profit.get("error")
         side = str(profit.get("best_side") or profit.get("side") or "").lower()
-        expected = self._first_number(profit, "expected_return_pct", "expected_net_return_pct", "profit_edge_pct")
-        status = "supported" if available and expected is not None and expected > 0 else ("warning" if available else "unavailable")
+        expected = self._first_number(
+            profit, "expected_return_pct", "expected_net_return_pct", "profit_edge_pct"
+        )
+        status = (
+            "supported"
+            if available and expected is not None and expected > 0
+            else ("warning" if available else "unavailable")
+        )
         reason = (
             f"服务器盈利模型给出 {side or '中性'}，预期收益 {expected:.4f}%."
             if expected is not None
@@ -282,11 +312,21 @@ class TradingAgentSkillBook:
             decision=side if side in {"long", "short"} else "neutral",
             confidence=self._first_number(profit, "confidence", "score"),
             reason=reason,
-            data=self._compact(profit, [
-                "available", "model", "backend", "best_side", "side",
-                "expected_return_pct", "expected_net_return_pct", "loss_probability",
-                "confidence", "recommendation",
-            ]),
+            data=self._compact(
+                profit,
+                [
+                    "available",
+                    "model",
+                    "backend",
+                    "best_side",
+                    "side",
+                    "expected_return_pct",
+                    "expected_net_return_pct",
+                    "loss_probability",
+                    "confidence",
+                    "recommendation",
+                ],
+            ),
         )
 
     def _timeseries_skill(self, tools: dict[str, Any] | None) -> SkillResult:
@@ -312,10 +352,19 @@ class TradingAgentSkillBook:
                 if expected is not None
                 else "时序模型未给出明确收益方向。"
             ),
-            data=self._compact(series, [
-                "available", "model", "best_side", "side", "direction",
-                "expected_return_pct", "expected_move_pct", "confidence",
-            ]),
+            data=self._compact(
+                series,
+                [
+                    "available",
+                    "model",
+                    "best_side",
+                    "side",
+                    "direction",
+                    "expected_return_pct",
+                    "expected_move_pct",
+                    "confidence",
+                ],
+            ),
         )
 
     def _sentiment_skill(self, tools: dict[str, Any] | None) -> SkillResult:
@@ -341,10 +390,21 @@ class TradingAgentSkillBook:
                 if score is not None
                 else "情绪模型未给出明确分数。"
             ),
-            data=self._compact(sentiment, [
-                "available", "model", "best_side", "side", "label", "sentiment",
-                "score", "sentiment_score", "risk_level", "confidence",
-            ]),
+            data=self._compact(
+                sentiment,
+                [
+                    "available",
+                    "model",
+                    "best_side",
+                    "side",
+                    "label",
+                    "sentiment",
+                    "score",
+                    "sentiment_score",
+                    "risk_level",
+                    "confidence",
+                ],
+            ),
         )
 
     def _exit_advice_skill(self, tools: dict[str, Any] | None) -> SkillResult | None:
@@ -366,10 +426,21 @@ class TradingAgentSkillBook:
             decision=display_advice["action_label"],
             confidence=self._first_number(advice, "confidence", "score"),
             reason=reason[:240],
-            data=self._compact(display_advice, [
-                "available", "model", "action", "action_label", "recommendation", "confidence",
-                "expected_net_pnl", "expected_return_pct", "reason", "note",
-            ]),
+            data=self._compact(
+                display_advice,
+                [
+                    "available",
+                    "model",
+                    "action",
+                    "action_label",
+                    "recommendation",
+                    "confidence",
+                    "expected_net_pnl",
+                    "expected_return_pct",
+                    "reason",
+                    "note",
+                ],
+            ),
         )
 
     def _humanize_exit_action(self, action: str) -> str:
@@ -427,10 +498,18 @@ class TradingAgentSkillBook:
                 if active and is_focus
                 else "组合赢家管理未要求该持仓插队深度复盘。"
             ),
-            data=self._compact(context, [
-                "active", "is_focus", "total_unrealized_pnl", "symbol_unrealized_pnl",
-                "contribution_share", "focus_rank", "reason",
-            ]),
+            data=self._compact(
+                context,
+                [
+                    "active",
+                    "is_focus",
+                    "total_unrealized_pnl",
+                    "symbol_unrealized_pnl",
+                    "contribution_share",
+                    "focus_rank",
+                    "reason",
+                ],
+            ),
         )
 
     def _market_regime_skill(
@@ -446,11 +525,28 @@ class TradingAgentSkillBook:
             label="整体行情方向过滤",
             status="active" if regime or strategy else "unavailable",
             decision=str(strategy.get("strategy") or regime.get("mode") or "neutral"),
-            confidence=self._first_number(strategy, "confidence") or self._first_number(regime, "confidence"),
-            reason=str(strategy.get("reason") or regime.get("reason") or "整体行情只做方向背景，不直接强制所有币同向开仓。")[:260],
+            confidence=self._first_number(strategy, "confidence")
+            or self._first_number(regime, "confidence"),
+            reason=str(
+                strategy.get("reason")
+                or regime.get("reason")
+                or "整体行情只做方向背景，不直接强制所有币同向开仓。"
+            )[:260],
             data={
-                "regime": self._compact(regime, ["mode", "confidence", "avoid_long", "avoid_short", "reason"]),
-                "strategy": self._compact(strategy, ["strategy", "posture", "allow_long", "allow_short", "blocked_directions", "reason"]),
+                "regime": self._compact(
+                    regime, ["mode", "confidence", "avoid_long", "avoid_short", "reason"]
+                ),
+                "strategy": self._compact(
+                    strategy,
+                    [
+                        "strategy",
+                        "posture",
+                        "allow_long",
+                        "allow_short",
+                        "blocked_directions",
+                        "reason",
+                    ],
+                ),
                 "blocked_directions": blocked,
             },
         )

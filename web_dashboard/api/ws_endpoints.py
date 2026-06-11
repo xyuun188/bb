@@ -8,9 +8,10 @@ import asyncio
 import json
 from typing import Any
 
+import structlog
 from fastapi import WebSocket
 
-import structlog
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
 
@@ -55,7 +56,11 @@ class WebSocketManager:
         for ws in connections:
             try:
                 await ws.send_text(payload)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "ws send failed; marking connection dead",
+                    error=safe_error_text(exc),
+                )
                 dead.add(ws)
 
         if dead:
@@ -70,8 +75,8 @@ class WebSocketManager:
             for ws in self._connections.copy():
                 try:
                     await ws.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("ws close failed", error=safe_error_text(exc))
             self._connections.clear()
 
     @property

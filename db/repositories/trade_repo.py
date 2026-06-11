@@ -20,8 +20,12 @@ class TradeRepository(BaseRepository):
         return order
 
     async def update_order_status(
-        self, order_id: int, status: str, exchange_order_id: str | None = None,
-        filled_at: datetime | None = None, fee: float | None = None
+        self,
+        order_id: int,
+        status: str,
+        exchange_order_id: str | None = None,
+        filled_at: datetime | None = None,
+        fee: float | None = None,
     ) -> Order | None:
         order = await self.get(order_id)
         if order:
@@ -55,9 +59,12 @@ class TradeRepository(BaseRepository):
         limit: int = 50,
         offset: int = 0,
     ) -> list[Order]:
-        stmt = select(Order).order_by(Order.created_at.desc()).offset(
-            max(int(offset or 0), 0)
-        ).limit(limit)
+        stmt = (
+            select(Order)
+            .order_by(Order.created_at.desc())
+            .offset(max(int(offset or 0), 0))
+            .limit(limit)
+        )
         if model_name:
             stmt = stmt.where(Order.model_name == model_name)
         if symbol:
@@ -91,7 +98,7 @@ class TradeRepository(BaseRepository):
     async def get_open_positions(
         self, model_name: str | None = None, symbol: str | None = None
     ) -> list[Position]:
-        stmt = select(Position).where(Position.is_open == True)
+        stmt = select(Position).where(Position.is_open.is_(True))
         if model_name:
             stmt = stmt.where(Position.model_name == model_name)
         if symbol:
@@ -111,7 +118,7 @@ class TradeRepository(BaseRepository):
             Position.symbol == symbol,
             Position.side == side,
             Position.execution_mode == execution_mode,
-            Position.is_open == True,
+            Position.is_open.is_(True),
         )
         result = await self.session.execute(stmt.order_by(Position.created_at.asc()))
         return list(result.scalars().all())
@@ -133,11 +140,15 @@ class TradeRepository(BaseRepository):
         if symbol:
             stmt = stmt.where(Position.symbol == symbol)
         if is_open is not None:
-            stmt = stmt.where(Position.is_open == is_open)
-        stmt = stmt.order_by(
-            Position.closed_at.desc().nullslast(),
-            Position.created_at.desc(),
-        ).offset(max(int(offset or 0), 0)).limit(limit)
+            stmt = stmt.where(Position.is_open.is_(is_open))
+        stmt = (
+            stmt.order_by(
+                Position.closed_at.desc().nullslast(),
+                Position.created_at.desc(),
+            )
+            .offset(max(int(offset or 0), 0))
+            .limit(limit)
+        )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
         return rows
@@ -157,7 +168,7 @@ class TradeRepository(BaseRepository):
         if symbol:
             stmt = stmt.where(Position.symbol == symbol)
         if is_open is not None:
-            stmt = stmt.where(Position.is_open == is_open)
+            stmt = stmt.where(Position.is_open.is_(is_open))
         result = await self.session.execute(stmt)
         return result.scalar() or 0
 
@@ -195,6 +206,7 @@ class TradeRepository(BaseRepository):
     async def delete_all(self) -> int:
         """Delete all order records. Returns count of deleted rows."""
         from sqlalchemy import delete
+
         result = await self.session.execute(delete(Order))
         await self.session.flush()
         return result.rowcount
@@ -206,7 +218,7 @@ class TradeRepository(BaseRepository):
             select(func.coalesce(func.sum(Position.realized_pnl), 0.0)).where(
                 Position.model_name == model_name,
                 Position.closed_at >= today,
-                Position.is_open == False,
+                Position.is_open.is_(False),
             )
         )
         return result.scalar() or 0.0

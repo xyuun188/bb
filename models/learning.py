@@ -48,6 +48,7 @@ class TradeReflection(Base, TimestampMixin):
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     fee_estimate: Mapped[float] = mapped_column(Float, default=0.0)
     hold_minutes: Mapped[float] = mapped_column(Float, default=0.0)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     outcome: Mapped[str] = mapped_column(String(20), default="flat")
     mistake_summary: Mapped[str] = mapped_column(Text, default="")
     improvement_summary: Mapped[str] = mapped_column(Text, default="")

@@ -21,7 +21,7 @@ async def main():
     print("Creating database tables...")
     await init_db()
     print("Database initialized successfully.")
-    print(f"SQLite DB at: data/trading.db")
+    print("SQLite DB at: data/trading.db")
 
 
 if __name__ == "__main__":

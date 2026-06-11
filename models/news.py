@@ -17,12 +17,8 @@ class NewsArticle(Base, TimestampMixin):
     url: Mapped[str] = mapped_column(Text, unique=True)
     sentiment_score: Mapped[float] = mapped_column(Float, default=0.0)
     symbols_mentioned: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    published_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    fetched_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow
-    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 
 class SocialPost(Base, TimestampMixin):
@@ -35,6 +31,4 @@ class SocialPost(Base, TimestampMixin):
     sentiment_score: Mapped[float] = mapped_column(Float, default=0.0)
     engagement_count: Mapped[int] = mapped_column(Integer, default=0)
     symbols: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    posted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

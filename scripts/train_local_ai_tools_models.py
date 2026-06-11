@@ -6,7 +6,8 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,16 @@ from sqlalchemy import select
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings
+from core.safe_output import safe_error_text, safe_print, safe_response_error_text
+from core.url_safety import normalize_http_base_url
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Position
+
+_AUTH_FAILURE_STATUS_CODES = {401, 403}
+_ERROR_EXCERPT_LIMIT = 700
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -36,8 +42,8 @@ def _as_utc(value: Any) -> datetime | None:
     if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _snapshot(value: Any) -> dict[str, Any]:
@@ -50,6 +56,82 @@ def _snapshot(value: Any) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
+
+def _normalize_base_url(raw_base_url: str) -> str:
+    """Validate the configured local AI tools API base URL."""
+    if not str(raw_base_url or "").strip():
+        raise RuntimeError(
+            "LOCAL_AI_TOOLS_API_BASE is empty; configure local_ai_tools_api_base "
+            "or pass --base-url before training local AI tools."
+        )
+    try:
+        return normalize_http_base_url(
+            raw_base_url,
+            field_name="LOCAL_AI_TOOLS_API_BASE",
+        )
+    except ValueError as exc:
+        raise RuntimeError(safe_error_text(exc)) from exc
+
+
+def _build_auth_headers(api_key: str | None = None) -> dict[str, str]:
+    key = str(settings.local_ai_tools_api_key if api_key is None else api_key or "").strip()
+    if not key:
+        return {}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _response_error_excerpt(response: httpx.Response) -> str:
+    return safe_response_error_text(response, limit=_ERROR_EXCERPT_LIMIT)
+
+
+def _raise_for_training_response(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+
+    detail = _response_error_excerpt(response)
+    if response.status_code in _AUTH_FAILURE_STATUS_CODES:
+        message = (
+            f"Local AI tools training request was rejected with HTTP {response.status_code}. "
+            "Check that LOCAL_AI_TOOLS_API_KEY in /data/trade_ai/local_ai_tools.env "
+            "matches local_ai_tools_api_key on this app side. The key itself is never printed."
+        )
+    else:
+        message = f"Local AI tools training request failed with HTTP {response.status_code}."
+
+    if detail:
+        message = f"{message} Service response: {detail}"
+    raise RuntimeError(message)
+
+
+async def _post_training_payload(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    request_timeout: float,
+    auth_token: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    normalized_base_url = _normalize_base_url(base_url)
+    headers = _build_auth_headers(auth_token)
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout, transport=transport) as client:
+            response = await client.post(
+                f"{normalized_base_url}/train",
+                json=payload,
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Local AI tools training request could not reach the service: {safe_error_text(exc)}"
+        ) from exc
+
+    _raise_for_training_response(response)
+    try:
+        parsed = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Local AI tools training response was not valid JSON.") from exc
+    return dict(parsed) if isinstance(parsed, Mapping) else {"value": parsed}
 
 
 async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
@@ -74,19 +156,21 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
         features.setdefault("symbol", row.symbol)
         features.setdefault("decision_confidence", _as_float(row.decision_confidence))
         features.setdefault("horizon_minutes", int(row.horizon_minutes or 10))
-        samples.append({
-            "id": int(row.id or 0),
-            "symbol": row.symbol,
-            "analysis_type": row.analysis_type,
-            "decision_action": row.decision_action,
-            "decision_confidence": _as_float(row.decision_confidence),
-            "horizon_minutes": int(row.horizon_minutes or 10),
-            "features": features,
-            "long_return_pct": _as_float(row.long_return_pct),
-            "short_return_pct": _as_float(row.short_return_pct),
-            "best_action": row.best_action,
-            "missed_opportunity": bool(row.missed_opportunity),
-        })
+        samples.append(
+            {
+                "id": int(row.id or 0),
+                "symbol": row.symbol,
+                "analysis_type": row.analysis_type,
+                "decision_action": row.decision_action,
+                "decision_confidence": _as_float(row.decision_confidence),
+                "horizon_minutes": int(row.horizon_minutes or 10),
+                "features": features,
+                "long_return_pct": _as_float(row.long_return_pct),
+                "short_return_pct": _as_float(row.short_return_pct),
+                "best_action": row.best_action,
+                "missed_opportunity": bool(row.missed_opportunity),
+            }
+        )
     samples.reverse()
     return samples
 
@@ -94,30 +178,30 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
 async def _load_trade_reflection_samples(limit: int) -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         result = await session.execute(
-            select(TradeReflection)
-            .order_by(TradeReflection.id.desc())
-            .limit(max(int(limit), 1))
+            select(TradeReflection).order_by(TradeReflection.id.desc()).limit(max(int(limit), 1))
         )
         rows = list(result.scalars().all())
 
     samples: list[dict[str, Any]] = []
     for row in rows:
-        samples.append({
-            "source": "trade_reflection",
-            "id": int(row.id or 0),
-            "position_id": int(row.position_id or 0),
-            "model_name": row.model_name,
-            "execution_mode": row.execution_mode,
-            "symbol": row.symbol,
-            "side": row.side,
-            "entry_price": _as_float(row.entry_price),
-            "exit_price": _as_float(row.exit_price),
-            "quantity": _as_float(row.quantity),
-            "realized_pnl": _as_float(row.realized_pnl),
-            "fee_estimate": _as_float(row.fee_estimate),
-            "hold_minutes": _as_float(row.hold_minutes),
-            "outcome": row.outcome,
-        })
+        samples.append(
+            {
+                "source": "trade_reflection",
+                "id": int(row.id or 0),
+                "position_id": int(row.position_id or 0),
+                "model_name": row.model_name,
+                "execution_mode": row.execution_mode,
+                "symbol": row.symbol,
+                "side": row.side,
+                "entry_price": _as_float(row.entry_price),
+                "exit_price": _as_float(row.exit_price),
+                "quantity": _as_float(row.quantity),
+                "realized_pnl": _as_float(row.realized_pnl),
+                "fee_estimate": _as_float(row.fee_estimate),
+                "hold_minutes": _as_float(row.hold_minutes),
+                "outcome": row.outcome,
+            }
+        )
     samples.reverse()
     return samples
 
@@ -126,7 +210,7 @@ async def _load_closed_position_samples(limit: int) -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         result = await session.execute(
             select(Position)
-            .where(Position.is_open == False, Position.closed_at.is_not(None))
+            .where(Position.is_open.is_(False), Position.closed_at.is_not(None))
             .order_by(Position.closed_at.desc(), Position.id.desc())
             .limit(max(int(limit), 1))
         )
@@ -139,21 +223,27 @@ async def _load_closed_position_samples(limit: int) -> list[dict[str, Any]]:
         hold_minutes = 0.0
         if opened and closed:
             hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
-        samples.append({
-            "source": "closed_position",
-            "id": int(row.id or 0),
-            "position_id": int(row.id or 0),
-            "model_name": row.model_name,
-            "execution_mode": row.execution_mode,
-            "symbol": row.symbol,
-            "side": row.side,
-            "entry_price": _as_float(row.entry_price),
-            "exit_price": _as_float(row.current_price),
-            "quantity": _as_float(row.quantity),
-            "realized_pnl": _as_float(row.realized_pnl),
-            "hold_minutes": hold_minutes,
-            "outcome": "profit" if _as_float(row.realized_pnl) > 0 else "loss" if _as_float(row.realized_pnl) < 0 else "flat",
-        })
+        samples.append(
+            {
+                "source": "closed_position",
+                "id": int(row.id or 0),
+                "position_id": int(row.id or 0),
+                "model_name": row.model_name,
+                "execution_mode": row.execution_mode,
+                "symbol": row.symbol,
+                "side": row.side,
+                "entry_price": _as_float(row.entry_price),
+                "exit_price": _as_float(row.current_price),
+                "quantity": _as_float(row.quantity),
+                "realized_pnl": _as_float(row.realized_pnl),
+                "hold_minutes": hold_minutes,
+                "outcome": (
+                    "profit"
+                    if _as_float(row.realized_pnl) > 0
+                    else "loss" if _as_float(row.realized_pnl) < 0 else "flat"
+                ),
+            }
+        )
     samples.reverse()
     return samples
 
@@ -182,20 +272,24 @@ async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
         volumes = [_as_float(r.volume) for r in ordered]
         for idx in range(30, len(ordered) - 1):
             start = max(0, idx - 59)
-            base = closes[start: idx + 1]
+            base = closes[start : idx + 1]
             if len(base) < 30 or base[-1] <= 0:
                 continue
             future = closes[idx + 1]
             move_pct = (future - base[-1]) / base[-1] * 100.0
-            samples.append({
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "open_time": ordered[idx].open_time.isoformat() if ordered[idx].open_time else None,
-                "close_sequence": base,
-                "volume_sequence": volumes[start: idx + 1],
-                "future_return_pct": move_pct,
-            })
-    return samples[-max(int(limit), 1):]
+            samples.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "open_time": (
+                        ordered[idx].open_time.isoformat() if ordered[idx].open_time else None
+                    ),
+                    "close_sequence": base,
+                    "volume_sequence": volumes[start : idx + 1],
+                    "future_return_pct": move_pct,
+                }
+            )
+    return samples[-max(int(limit), 1) :]
 
 
 def _symbols_from_json(value: Any) -> list[str]:
@@ -226,37 +320,41 @@ async def _load_text_sentiment_samples(limit: int) -> list[dict[str, Any]]:
         social_rows = list(social_result.scalars().all())
 
     samples: list[dict[str, Any]] = []
-    for row in news_rows:
-        text = " ".join(part for part in [row.title, row.summary] if part)
+    for news_row in news_rows:
+        text = " ".join(part for part in [news_row.title, news_row.summary] if part)
         if not text.strip():
             continue
-        samples.append({
-            "source": "news",
-            "platform": row.source,
-            "text": text[:1200],
-            "sentiment_score": _as_float(row.sentiment_score),
-            "symbols": _symbols_from_json(row.symbols_mentioned),
-            "created_at": row.published_at.isoformat() if row.published_at else None,
-        })
-    for row in social_rows:
-        text = str(row.content or "").strip()
+        samples.append(
+            {
+                "source": "news",
+                "platform": news_row.source,
+                "text": text[:1200],
+                "sentiment_score": _as_float(news_row.sentiment_score),
+                "symbols": _symbols_from_json(news_row.symbols_mentioned),
+                "created_at": news_row.published_at.isoformat() if news_row.published_at else None,
+            }
+        )
+    for social_row in social_rows:
+        text = str(social_row.content or "").strip()
         if not text:
             continue
-        samples.append({
-            "source": "social",
-            "platform": row.platform,
-            "text": text[:1200],
-            "sentiment_score": _as_float(row.sentiment_score),
-            "engagement_count": int(row.engagement_count or 0),
-            "symbols": _symbols_from_json(row.symbols),
-            "created_at": row.posted_at.isoformat() if row.posted_at else None,
-        })
+        samples.append(
+            {
+                "source": "social",
+                "platform": social_row.platform,
+                "text": text[:1200],
+                "sentiment_score": _as_float(social_row.sentiment_score),
+                "engagement_count": int(social_row.engagement_count or 0),
+                "symbols": _symbols_from_json(social_row.symbols),
+                "created_at": social_row.posted_at.isoformat() if social_row.posted_at else None,
+            }
+        )
     return samples[-row_limit:]
 
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train server-side local AI quant tools")
-    parser.add_argument("--base-url", default=settings.local_ai_tools_api_base.rstrip("/"))
+    parser.add_argument("--base-url", default=settings.local_ai_tools_api_base)
     parser.add_argument("--shadow-limit", type=int, default=20000)
     parser.add_argument("--trade-limit", type=int, default=8000)
     parser.add_argument("--sequence-limit", type=int, default=12000)
@@ -277,13 +375,12 @@ async def _main() -> None:
         "sequence_samples": sequence_samples,
         "text_sentiment_samples": text_sentiment_samples,
     }
-    headers = {}
-    if settings.local_ai_tools_api_key:
-        headers["Authorization"] = f"Bearer {settings.local_ai_tools_api_key}"
-    async with httpx.AsyncClient(timeout=args.timeout) as client:
-        response = await client.post(f"{args.base_url}/train", json=payload, headers=headers)
-        response.raise_for_status()
-        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+    result = await _post_training_payload(
+        args.base_url,
+        payload,
+        request_timeout=args.timeout,
+    )
+    safe_print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -20,7 +20,9 @@ from services.ml_signal_service import (
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train local ML signal model")
-    parser.add_argument("--limit", type=int, default=20000, help="Max completed shadow samples to load")
+    parser.add_argument(
+        "--limit", type=int, default=20000, help="Max completed shadow samples to load"
+    )
     parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
     args = parser.parse_args()
 

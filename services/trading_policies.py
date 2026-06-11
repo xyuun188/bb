@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.exit_arbitrator import ExitArbitrationResult, ExitArbitrator
+from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 
 
 @dataclass(slots=True)
@@ -21,7 +23,7 @@ class PolicyGateResult:
     data: dict[str, Any] | None = None
 
     @classmethod
-    def allow(cls, data: dict[str, Any] | None = None) -> "PolicyGateResult":
+    def allow(cls, data: dict[str, Any] | None = None) -> PolicyGateResult:
         return cls(True, data=data or {})
 
     @classmethod
@@ -30,23 +32,45 @@ class PolicyGateResult:
         blocker: str,
         reason: str,
         data: dict[str, Any] | None = None,
-    ) -> "PolicyGateResult":
+    ) -> PolicyGateResult:
         return cls(False, blocker=blocker, reason=reason, data=data or {})
 
 
 class EntryPolicy:
-    def __init__(self, orchestrator: Any) -> None:
-        self.orchestrator = orchestrator
+    def __init__(
+        self,
+        *,
+        decision_freshness: Any | None = None,
+        entry_priority: Any | None = None,
+        entry_opportunity_score: Any | None = None,
+        entry_profit_risk_sizing: Any | None = None,
+        abnormal_wick_guard: Any | None = None,
+        entry_price_guard: Any | None = None,
+        entry_opportunity_gate: Any | None = None,
+        high_risk_review_gate: Any | None = None,
+    ) -> None:
+        self.decision_freshness = decision_freshness
+        self.entry_priority = entry_priority
+        self.entry_opportunity_score = entry_opportunity_score
+        self.entry_profit_risk_sizing = entry_profit_risk_sizing
+        self.abnormal_wick_guard = abnormal_wick_guard
+        self.entry_price_guard = entry_price_guard
+        self.entry_opportunity_gate = entry_opportunity_gate
+        self.high_risk_review_gate_policy = high_risk_review_gate
 
     def score_candidate(
         self,
         decision: DecisionOutput,
         strategy: dict[str, Any] | None = None,
     ) -> float:
-        return self.orchestrator._candidate_opportunity_score(decision, strategy)
+        if self.entry_opportunity_score is not None:
+            return self.entry_opportunity_score.score_candidate(decision, strategy)
+        raise RuntimeError("EntryPolicy requires entry_opportunity_score dependency")
 
     def immediate_execution_reason(self, decision: DecisionOutput) -> str | None:
-        return self.orchestrator._entry_immediate_execution_reason(decision)
+        if self.entry_priority is None:
+            return None
+        return self.entry_priority.immediate_execution_reason(decision)
 
     def wait_sort_reason(
         self,
@@ -55,17 +79,33 @@ class EntryPolicy:
         rank: int | None = None,
         candidate_count: int | None = None,
     ) -> str:
-        return self.orchestrator._entry_wait_sort_reason(
+        if self.entry_priority is None:
+            return "已进入开仓执行检查。"
+        return self.entry_priority.wait_sort_reason(
             decision,
             rank=rank,
             candidate_count=candidate_count,
         )
 
     def gate_reason(self, decision: DecisionOutput) -> str | None:
-        return self.orchestrator._entry_opportunity_gate_reason(decision)
+        if self.entry_opportunity_gate is not None:
+            return self.entry_opportunity_gate.gate_reason(decision)
+        raise RuntimeError("EntryPolicy requires entry_opportunity_gate dependency")
+
+    def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
+        if self.decision_freshness is not None:
+            return self.decision_freshness.stale_decision_reason(decision)
+        return None
+
+    def abnormal_wick_guard_reason(self, decision: DecisionOutput) -> str | None:
+        if self.abnormal_wick_guard is not None:
+            return self.abnormal_wick_guard.guard_reason(decision)
+        return None
 
     async def pre_execution_price_guard_reason(self, decision: DecisionOutput) -> str | None:
-        return await self.orchestrator._pre_execution_price_guard_reason(decision)
+        if self.entry_price_guard is None:
+            return None
+        return await self.entry_price_guard.guard_reason(decision)
 
     async def apply_profit_risk_sizing(
         self,
@@ -73,11 +113,14 @@ class EntryPolicy:
         model_mode: str,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> None:
-        await self.orchestrator._apply_entry_profit_risk_sizing(
-            decision,
-            model_mode,
-            open_positions=open_positions or [],
-        )
+        if self.entry_profit_risk_sizing is not None:
+            await self.entry_profit_risk_sizing.apply(
+                decision,
+                model_mode,
+                open_positions=open_positions or [],
+            )
+            return
+        raise RuntimeError("EntryPolicy requires entry_profit_risk_sizing dependency")
 
     async def high_risk_review_gate(
         self,
@@ -85,7 +128,9 @@ class EntryPolicy:
         model_mode: str,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> str | None:
-        return await self.orchestrator._high_risk_review_gate(
+        if self.high_risk_review_gate_policy is None:
+            return None
+        return await self.high_risk_review_gate_policy.evaluate(
             decision,
             model_mode,
             open_positions or [],
@@ -98,20 +143,40 @@ class EntryPolicy:
         model_mode: str,
         open_positions: list[dict[str, Any]] | None,
     ) -> PolicyGateResult:
+        context = EntryPipelineContext.from_inputs(
+            decision=decision,
+            model_name=model_name,
+            model_mode=model_mode,
+            open_positions=open_positions,
+        )
         if not decision.is_entry:
-            return PolicyGateResult.allow({"intent": "not_entry"})
+            return PolicyGateResult.allow(
+                {"intent": "not_entry", "pipeline_context": context.public_data()}
+            )
 
-        stale_reason = self.orchestrator._stale_decision_reason(decision)
+        stale_reason = self.stale_decision_reason(decision)
         if stale_reason:
-            return PolicyGateResult.block("stale_decision", stale_reason)
+            return PolicyGateResult.block(
+                "stale_decision",
+                stale_reason,
+                {"pipeline_context": context.public_data()},
+            )
 
-        abnormal_wick_reason = self.orchestrator._abnormal_wick_entry_guard_reason(decision)
+        abnormal_wick_reason = self.abnormal_wick_guard_reason(decision)
         if abnormal_wick_reason:
-            return PolicyGateResult.block("abnormal_wick_entry_guard", abnormal_wick_reason)
+            return PolicyGateResult.block(
+                "abnormal_wick_entry_guard",
+                abnormal_wick_reason,
+                {"pipeline_context": context.public_data()},
+            )
 
         price_guard_reason = await self.pre_execution_price_guard_reason(decision)
         if price_guard_reason:
-            return PolicyGateResult.block("pre_execution_price_guard", price_guard_reason)
+            return PolicyGateResult.block(
+                "pre_execution_price_guard",
+                price_guard_reason,
+                {"pipeline_context": context.public_data()},
+            )
 
         await self.apply_profit_risk_sizing(
             decision,
@@ -124,14 +189,38 @@ class EntryPolicy:
             open_positions or [],
         )
         if high_risk_reason:
-            return PolicyGateResult.block("high_risk_review", high_risk_reason)
+            return PolicyGateResult.block(
+                "high_risk_review",
+                high_risk_reason,
+                {"pipeline_context": context.public_data()},
+            )
 
-        return PolicyGateResult.allow({"intent": "entry"})
+        return PolicyGateResult.allow(
+            {"intent": "entry", "pipeline_context": context.public_data()}
+        )
 
 
 class ExitPolicy:
-    def __init__(self, orchestrator: Any) -> None:
-        self.orchestrator = orchestrator
+    def __init__(
+        self,
+        *,
+        exit_cooldown: Any | None = None,
+        decision_freshness: Any | None = None,
+        exit_position_matcher: Any | None = None,
+        exit_partial_guard: Any | None = None,
+        exit_position_snapshot: Any | None = None,
+        exit_profit_precheck: Any | None = None,
+        exit_fee_churn_guard: Any | None = None,
+        exit_arbitrator: Any | None = None,
+    ) -> None:
+        self.exit_cooldown = exit_cooldown
+        self.decision_freshness = decision_freshness
+        self.exit_position_matcher = exit_position_matcher
+        self.exit_partial_guard = exit_partial_guard
+        self.exit_position_snapshot = exit_position_snapshot
+        self.exit_profit_precheck = exit_profit_precheck
+        self.exit_fee_churn_guard = exit_fee_churn_guard
+        self.exit_arbitrator = exit_arbitrator or ExitArbitrator()
 
     def has_matching_position(
         self,
@@ -139,26 +228,15 @@ class ExitPolicy:
         model_name: str,
         decision: DecisionOutput,
     ) -> bool:
-        if not decision.is_exit:
-            return True
-        target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-        target_symbol = self.orchestrator._normalize_position_symbol(decision.symbol)
-        for pos in positions or []:
-            if str(pos.get("model_name") or "") != model_name:
-                continue
-            if self.orchestrator._normalize_position_symbol(pos.get("symbol")) != target_symbol:
-                continue
-            if str(pos.get("side") or "").lower() != target_side:
-                continue
-            if pos.get("is_open", True) is False:
-                continue
-            try:
-                quantity = float(pos.get("quantity", pos.get("contracts", 0)) or 0)
-            except (TypeError, ValueError):
-                quantity = 0.0
-            if quantity > 0:
+        if self.exit_position_matcher is None:
+            if not decision.is_exit:
                 return True
-        return False
+            raise RuntimeError("ExitPolicy requires exit_position_matcher dependency")
+        return self.exit_position_matcher.has_matching_position(
+            positions,
+            model_name,
+            decision,
+        )
 
     def no_matching_position_reason(self, decision: DecisionOutput) -> str:
         side_label = "多单" if decision.action == Action.CLOSE_LONG else "空单"
@@ -170,7 +248,9 @@ class ExitPolicy:
         decision: DecisionOutput,
         open_positions: list[dict[str, Any]] | None,
     ) -> str | None:
-        return self.orchestrator._loss_partial_exit_guard_reason(
+        if self.exit_partial_guard is None:
+            return None
+        return self.exit_partial_guard.guard_reason(
             model_name,
             decision,
             open_positions,
@@ -181,78 +261,150 @@ class ExitPolicy:
         model_name: str,
         decision: DecisionOutput,
     ) -> str | None:
-        return self.orchestrator._recent_exit_cooldown_reason(model_name, decision)
+        if self.exit_cooldown is not None:
+            return self.exit_cooldown.recent_exit_cooldown_reason(model_name, decision)
+        if not decision.is_exit:
+            return None
+        raise RuntimeError("ExitPolicy requires exit_cooldown dependency")
+
+    def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
+        if self.decision_freshness is not None:
+            return self.decision_freshness.stale_decision_reason(decision)
+        return None
 
     async def pre_execution_profit_guard_reason(
         self,
         decision: DecisionOutput,
         open_positions: list[dict[str, Any]] | None,
     ) -> str | None:
-        return await self.orchestrator._pre_execution_profit_exit_guard_reason(
-            decision,
-            open_positions,
-        )
+        if self.exit_profit_precheck is None:
+            return None
+        return await self.exit_profit_precheck.guard_reason(decision, open_positions)
 
     async def fee_churn_guard_reason(
         self,
         model_name: str,
         decision: DecisionOutput,
     ) -> str | None:
-        return await self.orchestrator._exit_fee_churn_guard_reason(model_name, decision)
+        if self.exit_fee_churn_guard is None:
+            return None
+        return await self.exit_fee_churn_guard.guard_reason(model_name, decision)
+
+    def arbitrate_exit(self, decision: DecisionOutput) -> ExitArbitrationResult:
+        if self.exit_arbitrator is None:
+            return ExitArbitrator().arbitrate(decision)
+        return self.exit_arbitrator.arbitrate(decision)
 
     async def evaluate(
         self,
         decision: DecisionOutput,
         model_name: str,
         open_positions: list[dict[str, Any]] | None,
+        *,
+        refresh_positions: bool = True,
     ) -> PolicyGateResult:
+        context = ExitPipelineContext.from_inputs(
+            decision=decision,
+            model_name=model_name,
+            open_positions=open_positions,
+        )
         if not decision.is_exit:
-            return PolicyGateResult.allow({"intent": "not_exit"})
+            return PolicyGateResult.allow(
+                {"intent": "not_exit", "pipeline_context": context.public_data()}
+            )
 
-        await self.orchestrator.okx_sync_service.reconcile_positions("exit precheck")
-        exit_positions = await self.orchestrator.okx_sync_service.get_open_positions_context()
-        if open_positions is not None:
-            open_positions[:] = exit_positions
+        arbitration = self.arbitrate_exit(decision)
+        arbitration_data = arbitration.to_dict()
+        context = context.with_arbitration(arbitration_data)
+
+        def gate_data() -> dict[str, Any]:
+            return {
+                "pipeline_context": context.public_data(),
+                "exit_arbitration": arbitration_data,
+            }
+
+        exit_positions = open_positions or []
+        if refresh_positions and self.exit_position_snapshot is not None:
+            exit_positions = await self.exit_position_snapshot.refresh_positions(open_positions)
+        context = context.with_refreshed_positions(exit_positions)
 
         if not self.has_matching_position(exit_positions, model_name, decision):
-            exchange_has_position = await self.orchestrator.okx_sync_service.has_matching_exchange_exit_position(
-                model_name,
-                decision,
-            )
-            if not exchange_has_position:
+            exchange_has_position = False
+            if self.exit_position_snapshot is not None:
+                exchange_has_position = (
+                    await self.exit_position_snapshot.has_matching_exchange_position(
+                        model_name,
+                        decision,
+                    )
+                )
+            if exchange_has_position is None:
+                return PolicyGateResult.block(
+                    "exchange_position_snapshot_unavailable",
+                    (
+                        "OKX 持仓状态暂时查询失败，系统不能确认是否仍有可平仓仓位；"
+                        "本轮不提交新的平仓单，等待下一轮同步确认。"
+                    ),
+                    gate_data(),
+                )
+            if exchange_has_position is False:
                 return PolicyGateResult.block(
                     "no_matching_exit_position",
                     self.no_matching_position_reason(decision),
+                    gate_data(),
                 )
 
-        loss_partial_reason = self.loss_partial_guard_reason(
-            model_name,
-            decision,
-            exit_positions,
-        )
-        if loss_partial_reason:
-            return PolicyGateResult.block("loss_partial_exit_guard", loss_partial_reason)
+        if not arbitration.bypass_partial_guard:
+            loss_partial_reason = self.loss_partial_guard_reason(
+                model_name,
+                decision,
+                exit_positions,
+            )
+            if loss_partial_reason:
+                return PolicyGateResult.block(
+                    "loss_partial_exit_guard",
+                    loss_partial_reason,
+                    gate_data(),
+                )
 
-        recent_exit_reason = self.recent_exit_cooldown_reason(model_name, decision)
-        if recent_exit_reason:
-            return PolicyGateResult.block("recent_exit_cooldown", recent_exit_reason)
+        if not arbitration.bypass_cooldown:
+            recent_exit_reason = self.recent_exit_cooldown_reason(model_name, decision)
+            if recent_exit_reason:
+                return PolicyGateResult.block(
+                    "recent_exit_cooldown",
+                    recent_exit_reason,
+                    gate_data(),
+                )
 
-        profit_exit_guard_reason = await self.pre_execution_profit_guard_reason(
-            decision,
-            exit_positions,
-        )
-        if profit_exit_guard_reason:
-            return PolicyGateResult.block("profit_exit_precheck", profit_exit_guard_reason)
+        if not arbitration.bypass_profit_precheck:
+            profit_exit_guard_reason = await self.pre_execution_profit_guard_reason(
+                decision,
+                exit_positions,
+            )
+            if profit_exit_guard_reason:
+                return PolicyGateResult.block(
+                    "profit_exit_precheck",
+                    profit_exit_guard_reason,
+                    gate_data(),
+                )
 
-        guard_reason = await self.fee_churn_guard_reason(model_name, decision)
-        if guard_reason:
-            return PolicyGateResult.block("exit_fee_churn_guard", guard_reason)
+        if not arbitration.bypass_fee_churn_guard:
+            guard_reason = await self.fee_churn_guard_reason(model_name, decision)
+            if guard_reason:
+                return PolicyGateResult.block(
+                    "exit_fee_churn_guard",
+                    guard_reason,
+                    gate_data(),
+                )
 
-        stale_reason = self.orchestrator._stale_decision_reason(decision)
+        stale_reason = self.stale_decision_reason(decision)
         if stale_reason:
-            return PolicyGateResult.block("stale_decision", stale_reason)
+            return PolicyGateResult.block("stale_decision", stale_reason, gate_data())
 
-        return PolicyGateResult.allow({
-            "intent": "exit",
-            "target_side": "long" if decision.action == Action.CLOSE_LONG else "short",
-        })
+        return PolicyGateResult.allow(
+            {
+                "intent": "exit",
+                "target_side": "long" if decision.action == Action.CLOSE_LONG else "short",
+                "pipeline_context": context.public_data(),
+                "exit_arbitration": arbitration_data,
+            }
+        )

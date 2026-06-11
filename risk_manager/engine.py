@@ -13,22 +13,15 @@ Flow:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
 
 import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
-from core.exceptions import (
-    BlackSwanTriggered,
-    CircuitBreakerTripped,
-    DailyLossLimitReached,
-    PositionLimitExceeded,
-)
 from risk_manager.black_swan import BlackSwanDetector, BlackSwanResult
-from risk_manager.circuit_breaker import BreakerState, CircuitBreaker
-from risk_manager.position_limits import LimitCheckResult, PositionLimitChecker
-from risk_manager.stop_loss import StopLossManager, StopLossResult, StopLossType
+from risk_manager.circuit_breaker import CircuitBreaker
+from risk_manager.position_limits import PositionLimitChecker
+from risk_manager.stop_loss import StopLossManager, StopLossResult
 
 logger = structlog.get_logger(__name__)
 
@@ -104,7 +97,8 @@ class RiskEngine:
             )
             if bs_result.triggered and bs_result.severity == "critical":
                 matching_positions = [
-                    pos for pos in current_positions
+                    pos
+                    for pos in current_positions
                     if pos.get("symbol") == decision.symbol and pos.get("is_open", True)
                 ]
                 if not matching_positions:
@@ -154,7 +148,9 @@ class RiskEngine:
                 # fresh entries or forces a close.
                 if False and decision.is_entry:
                     decision.position_size_pct = min(float(decision.position_size_pct or 0.0), 0.03)
-                    decision.suggested_leverage = min(float(decision.suggested_leverage or 1.0), 1.0)
+                    decision.suggested_leverage = min(
+                        float(decision.suggested_leverage or 1.0), 1.0
+                    )
                     decision.reasoning = (
                         f"{decision.reasoning} [风控预警：检测到 warning 级别黑天鹅线索，"
                         "已自动降为小仓位 1x 试单。]"
@@ -168,7 +164,11 @@ class RiskEngine:
                     symbol=pos["symbol"],
                     side=pos["side"],
                     entry_price=pos["entry_price"],
-                    current_price=decision.feature_snapshot.get("close", 0) if decision.feature_snapshot else 0,
+                    current_price=(
+                        decision.feature_snapshot.get("close", 0)
+                        if decision.feature_snapshot
+                        else 0
+                    ),
                 )
                 if sl_result.triggered:
                     stop_result = sl_result
@@ -192,10 +192,13 @@ class RiskEngine:
 
         # === 3. Position size checks (only for entries) ===
         if decision.is_entry:
-            model_open_positions = [p for p in current_positions if p.get("model_name") == decision.model_name]
+            model_open_positions = [
+                p for p in current_positions if p.get("model_name") == decision.model_name
+            ]
             decision_side = "long" if decision.action == Action.LONG else "short"
             same_symbol_positions = [
-                p for p in model_open_positions
+                p
+                for p in model_open_positions
                 if p.get("side") == decision_side and p.get("symbol") == decision.symbol
             ]
             is_same_symbol_add = bool(same_symbol_positions)
@@ -214,7 +217,9 @@ class RiskEngine:
                     ),
                 )
 
-            min_confidence = max(float(settings.confidence_threshold or 0.0), MIN_ENTRY_CONFIDENCE_AFTER_FEES)
+            min_confidence = max(
+                float(settings.confidence_threshold or 0.0), MIN_ENTRY_CONFIDENCE_AFTER_FEES
+            )
             if False and float(decision.confidence or 0.0) < min_confidence:
                 return RiskAssessment(
                     approved=False,
@@ -289,9 +294,7 @@ class RiskEngine:
             leverage_cap = self._max_allowed_leverage(decision, volume_ratio, trend_adx)
             if False and decision.suggested_leverage > leverage_cap:
                 decision.suggested_leverage = leverage_cap
-                warnings.append(
-                    f"杠杆已按置信度和过滤条件限制为 {leverage_cap:.1f}x。"
-                )
+                warnings.append(f"杠杆已按置信度和过滤条件限制为 {leverage_cap:.1f}x。")
 
             # Leverage check
             lev_check = self.position_checker.check_leverage(decision.suggested_leverage)
@@ -336,11 +339,16 @@ class RiskEngine:
             return base_cap
 
         filters_pass = (
-            sum(1 for ok in (
-                volume_ratio >= settings.min_entry_volume_ratio,
-                trend_adx >= settings.min_entry_adx,
-                self._trend_aligned(decision),
-            ) if ok) >= 2
+            sum(
+                1
+                for ok in (
+                    volume_ratio >= settings.min_entry_volume_ratio,
+                    trend_adx >= settings.min_entry_adx,
+                    self._trend_aligned(decision),
+                )
+                if ok
+            )
+            >= 2
         )
         if not filters_pass:
             return base_cap

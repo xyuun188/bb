@@ -6,9 +6,14 @@ Queries the exchange or paper executor on startup to sync state.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+from core.safe_output import safe_error_text
+
+if TYPE_CHECKING:
+    from executor.base_executor import AbstractExecutor
 
 logger = structlog.get_logger(__name__)
 
@@ -26,30 +31,40 @@ class PositionTracker:
         self._positions: dict[str, list[dict]] = {}  # model_name -> positions
         self._price_cache: dict[str, float] = {}  # symbol -> last price
 
-    async def sync_from_executor(self, executor: "AbstractExecutor", model_name: str = "default") -> None:
+    async def sync_from_executor(
+        self, executor: AbstractExecutor, model_name: str = "default"
+    ) -> None:
         """Load current positions from the executor."""
         try:
             positions = await executor.get_positions()
             self._positions[model_name] = []
             for pos in positions:
-                self._positions[model_name].append({
-                    "symbol": pos.get("symbol", ""),
-                    "side": pos.get("side", "long"),
-                    "quantity": pos.get("contracts", pos.get("quantity", 0)),
-                    "entry_price": pos.get("entryPrice", pos.get("entry_price", 0)),
-                    "leverage": pos.get("leverage", 1.0),
-                    "unrealized_pnl": pos.get("unrealizedPnl", 0),
-                    "is_open": True,
-                })
-            logger.info("positions synced", model=model_name, count=len(self._positions[model_name]))
+                self._positions[model_name].append(
+                    {
+                        "symbol": pos.get("symbol", ""),
+                        "side": pos.get("side", "long"),
+                        "quantity": pos.get("contracts", pos.get("quantity", 0)),
+                        "entry_price": pos.get("entryPrice", pos.get("entry_price", 0)),
+                        "leverage": pos.get("leverage", 1.0),
+                        "unrealized_pnl": pos.get("unrealizedPnl", 0),
+                        "is_open": True,
+                    }
+                )
+            logger.info(
+                "positions synced", model=model_name, count=len(self._positions[model_name])
+            )
         except Exception as e:
-            logger.error("position sync failed", model=model_name, error=str(e))
+            logger.error(
+                "position sync failed",
+                model=model_name,
+                error=safe_error_text(e),
+            )
 
     def update_price(self, symbol: str, price: float) -> None:
         """Update the cached price and recalculate all PnLs."""
         self._price_cache[symbol] = price
 
-        for model_name, positions in self._positions.items():
+        for _model_name, positions in self._positions.items():
             for pos in positions:
                 if pos["symbol"] == symbol and pos["is_open"]:
                     entry = pos["entry_price"]
@@ -78,14 +93,12 @@ class PositionTracker:
         positions = self._positions.get(model_name, [])
         return sum(
             abs(p["quantity"] * self._price_cache.get(p["symbol"], p["entry_price"]))
-            for p in positions if p["is_open"]
+            for p in positions
+            if p["is_open"]
         )
 
     def get_total_unrealized_pnl(self, model_name: str) -> float:
-        return sum(
-            p.get("unrealized_pnl", 0)
-            for p in self._positions.get(model_name, [])
-        )
+        return sum(p.get("unrealized_pnl", 0) for p in self._positions.get(model_name, []))
 
     def check_stop_triggers(self, model_name: str) -> list[dict]:
         """Find positions that have breached stop-loss or take-profit levels."""
@@ -106,9 +119,13 @@ class PositionTracker:
 
             if take_profit:
                 if pos["side"] == "long" and current >= take_profit:
-                    triggered.append({**pos, "trigger": "take_profit", "trigger_price": take_profit})
+                    triggered.append(
+                        {**pos, "trigger": "take_profit", "trigger_price": take_profit}
+                    )
                 elif pos["side"] == "short" and current <= take_profit:
-                    triggered.append({**pos, "trigger": "take_profit", "trigger_price": take_profit})
+                    triggered.append(
+                        {**pos, "trigger": "take_profit", "trigger_price": take_profit}
+                    )
 
         return triggered
 
@@ -117,7 +134,7 @@ class PositionTracker:
 
     def remove_position(self, model_name: str, position_id: str) -> bool:
         positions = self._positions.get(model_name, [])
-        for i, pos in enumerate(positions):
+        for _i, pos in enumerate(positions):
             if pos.get("id") == position_id:
                 pos["is_open"] = False
                 return True

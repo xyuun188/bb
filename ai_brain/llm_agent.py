@@ -11,27 +11,39 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.prompts import (
-    build_user_prompt,
-    build_expert_user_prompt,
+    DECISION_MAKER_SYSTEM_PROMPT,
+    build_batch_experts_user_prompt,
     build_close_prompt,
     build_decision_maker_user_prompt,
-    build_batch_experts_user_prompt,
-    DECISION_MAKER_SYSTEM_PROMPT,
+    build_expert_user_prompt,
+    build_user_prompt,
     get_compact_role_system_prompt,
     get_role_system_prompt,
 )
 from config.settings import settings
 from core.exceptions import LLMResponseParseError, ModelInferenceError
+from core.model_runtime import (
+    completion_token_limit,
+    ensure_no_think_text,
+    is_openai_reasoning_model,
+    is_qwen3_model,
+    non_thinking_extra_body,
+    uses_thinking_tags,
+)
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from data_feed.feature_vector import FeatureVector
 
 # Global semaphore limits active LLM calls. A single local 32B model cannot
 # reliably answer five expert prompts at once, so the default is intentionally
@@ -189,7 +201,9 @@ def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]
 
 def _format_expert_memories(memories: list[dict[str, Any]]) -> str:
     lines = ["专家长期记忆：只作为风险教训和筛选参考，不是强制交易指令。"]
-    for idx, item in enumerate(memories[: max(int(settings.expert_memory_per_prompt or 4), 1)], start=1):
+    for idx, item in enumerate(
+        memories[: max(int(settings.expert_memory_per_prompt or 4), 1)], start=1
+    ):
         lesson = str(item.get("lesson") or "").strip()
         pattern = str(item.get("market_pattern") or "").strip()
         action = str(item.get("recommended_action") or "reduce_risk").strip()
@@ -210,25 +224,6 @@ def _format_expert_memories(memories: list[dict[str, Any]]) -> str:
             parts.append(f"证据={int(evidence)}")
         lines.append(f"{idx}. " + "；".join(parts))
     return "\n".join(lines)
-
-
-def _format_daily_target(target: dict[str, Any]) -> str:
-    target_usdt = float(target.get("target_usdt") or 0.0)
-    target_currency = str(target.get("target_currency") or "USDT").upper()
-    target_cny = float(target.get("target_cny") or 0.0)
-    today = float(target.get("today_realized_pnl") or 0.0)
-    gap = float(target.get("gap_usdt") or 0.0)
-    target_label = (
-        f"{target_usdt:.2f} USDT"
-        if target_currency == "USDT"
-        else f"{target_cny:.0f} CNY / {target_usdt:.2f} USDT"
-    )
-    return (
-        "每日目标上下文："
-        f"目标约 {target_label}，"
-        f"今日已实现 {today:.2f} USDT，差距 {gap:.2f} USDT。"
-        "此目标只能帮助优先选择高质量机会，不能放松风控、追单或无依据提高杠杆。"
-    )
 
 
 def _format_market_regime(regime: dict[str, Any]) -> str:
@@ -356,6 +351,9 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         item = evidence.get(side)
         if not isinstance(item, dict):
             return f"{side}=unavailable"
+        review = (
+            item.get("review_feedback") if isinstance(item.get("review_feedback"), dict) else {}
+        )
         return (
             f"{side}: score={_fmt_num(item.get('score'), 3)}, "
             f"min_ref={_fmt_num(item.get('min_score_reference'), 3)}, "
@@ -363,6 +361,10 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
             f"loss_prob={_fmt_num(float(item.get('loss_probability') or 0) * 100, 1)}%, "
             f"profit_quality={_fmt_num(item.get('profit_quality_ratio'), 3)}, "
             f"tail_risk={_fmt_num(item.get('tail_risk_score'), 3)}, "
+            f"memory_bonus={_fmt_num(item.get('memory_candidate_score_bonus'), 3)}, "
+            f"memory_bias={review.get('action_bias') or 'neutral'}, "
+            f"missed={review.get('missed_opportunity_count') or 0}, "
+            f"memory_risk={review.get('risk_evidence_count') or 0}, "
             f"high_profit={bool(item.get('high_profit_potential'))}, "
             f"history={str(item.get('historical_reason') or '')[:90]}, "
             f"recommendation={item.get('recommendation') or 'unknown'}"
@@ -373,8 +375,11 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         f"preferred_side_by_evidence={evidence.get('preferred_side_by_evidence') or 'neutral'}, "
         f"feature_score={_fmt_num(evidence.get('feature_opportunity_score'), 2)}. "
         f"{side_line('long')} | {side_line('short')}. "
+        f"memory_preferred={((evidence.get('memory_feedback') or {}).get('preferred_side_by_memory') if isinstance(evidence.get('memory_feedback'), dict) else 'neutral')}. "
         "This evidence is for AI judgment, not a hard execution veto. Compare long/short expected net profit, "
         "loss probability, payoff quality, realized history and tail risk before choosing action, size and leverage. "
+        "If review memory shows repeated missed opportunities and current EV is positive, consider a small/probe entry instead of passive hold. "
+        "If realized-loss memory dominates, require stronger confirmation or reduce size/leverage. "
         "If high_profit=true and the thesis is clear, larger size and higher leverage are allowed; otherwise keep risk small."
     )
 
@@ -382,8 +387,10 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
 def _format_portfolio_profit_protection(context: dict[str, Any]) -> str:
     if not isinstance(context, dict) or not context.get("active"):
         return ""
-    current = context.get("current_group") if isinstance(context.get("current_group"), dict) else {}
-    top_groups = context.get("top_groups") if isinstance(context.get("top_groups"), list) else []
+    raw_current = context.get("current_group")
+    current = raw_current if isinstance(raw_current, dict) else {}
+    raw_top_groups = context.get("top_groups")
+    top_groups = raw_top_groups if isinstance(raw_top_groups, list) else []
     top_text = "; ".join(
         f"{item.get('symbol')} pnl={_fmt_num(item.get('unrealized_pnl'), 2)}U share={_fmt_num(float(item.get('profit_share') or 0) * 100, 1)}%"
         for item in top_groups[:3]
@@ -429,8 +436,10 @@ def _apply_aggressive_hold_policy(
             decision.position_size_pct = 1.0
             decision.confidence = max(decision.confidence, 0.62)
             decision.reasoning += " [进攻型改写：观望但多头反转信号较强，改为平空]"
-        elif ((current_side == "long" and edge_action == Action.LONG)
-              or (current_side == "short" and edge_action == Action.SHORT)) and edge >= 5:
+        elif (
+            (current_side == "long" and edge_action == Action.LONG)
+            or (current_side == "short" and edge_action == Action.SHORT)
+        ) and edge >= 5:
             decision.action = edge_action
             decision.position_size_pct = 0.03
             decision.confidence = max(decision.confidence, 0.55)
@@ -440,7 +449,9 @@ def _apply_aggressive_hold_policy(
     decision.action = edge_action
     decision.confidence = max(decision.confidence, 0.52 + min(edge, 5) * 0.03)
     decision.position_size_pct = 0.04 if edge < 4 else 0.07
-    decision.suggested_leverage = 5.0 if decision.confidence < 0.68 else (10.0 if decision.confidence >= 0.78 else 7.0)
+    decision.suggested_leverage = (
+        5.0 if decision.confidence < 0.68 else (10.0 if decision.confidence >= 0.78 else 7.0)
+    )
     decision.stop_loss_pct = min(max(decision.stop_loss_pct or 0.03, 0.02), 0.06)
     decision.take_profit_pct = max(decision.take_profit_pct or 0.06, decision.stop_loss_pct * 1.6)
     decision.reasoning += (
@@ -487,6 +498,62 @@ def _apply_entry_leverage_policy(decision: DecisionOutput) -> None:
             decision.reasoning += " [杠杆规则：强信号最低 10x，最高使用系统最大杠杆]"
 
 
+def _strip_trailing_json_commas(text: str) -> str:
+    return re.sub(r",\s*([}\]])", r"\1", text)
+
+
+def _complete_json_tail(text: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in ("}", "]"):
+            if not stack or stack[-1] != char:
+                return None
+            stack.pop()
+    if in_string or not stack:
+        return None
+    trimmed = re.sub(r",\s*$", "", text.strip())
+    return f"{trimmed}{''.join(reversed(stack))}"
+
+
+def _parse_json_candidate(candidate: str) -> dict | None:
+    variants: list[str] = []
+    base = candidate.strip()
+    if base:
+        variants.extend([base, _strip_trailing_json_commas(base)])
+        completed = _complete_json_tail(base)
+        if completed:
+            variants.extend([completed, _strip_trailing_json_commas(completed)])
+
+    seen: set[str] = set()
+    for variant in variants:
+        if not variant or variant in seen:
+            continue
+        seen.add(variant)
+        try:
+            parsed = json.loads(variant)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _extract_json(text: str) -> dict:
     """Robust JSON extraction from LLM output that may contain markdown or extra text.
 
@@ -499,28 +566,29 @@ def _extract_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s*```$", "", text).strip()
 
-    # Strategy 1: direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    # Strategy 1: direct parse, plus conservative tail repair.
+    parsed = _parse_json_candidate(text)
+    if parsed is not None:
+        return parsed
 
     # Strategy 2: extract from code fence
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence_match:
-        try:
-            return json.loads(fence_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+        parsed = _parse_json_candidate(fence_match.group(1).strip())
+        if parsed is not None:
+            return parsed
 
     # Strategy 3: find outermost braces
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            pass
+        parsed = _parse_json_candidate(text[start : end + 1])
+        if parsed is not None:
+            return parsed
+    if start != -1:
+        parsed = _parse_json_candidate(text[start:])
+        if parsed is not None:
+            return parsed
 
     raise LLMResponseParseError(f"Could not extract valid JSON from: {text[:300]}")
 
@@ -559,25 +627,23 @@ def _normalize_cross_check(value: Any, own_role: str) -> dict[str, str] | None:
     return {"target": target, "question": question[:500]}
 
 
-def _fmt_num(value: Any, digits: int = 4) -> str: 
-    try: 
-        return f"{float(value):.{digits}f}" 
-    except (TypeError, ValueError): 
-        return "0" 
+def _fmt_num(value: Any, digits: int = 4) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 def _is_reasoning_model(model: str | None) -> bool:
-    name = str(model or "").lower()
-    return name.startswith(("o1", "o3", "o4"))
+    return is_openai_reasoning_model(model)
 
 
 def _is_qwen3_model(model: str | None) -> bool:
-    return "qwen3" in str(model or "").lower()
+    return is_qwen3_model(model)
 
 
 def _uses_thinking_tags(model: str | None) -> bool:
-    name = str(model or "").lower()
-    return "qwen3" in name or "deepseek-r1" in name
+    return uses_thinking_tags(model)
 
 
 def _backup_model_names(model: str | None) -> list[str]:
@@ -587,6 +653,20 @@ def _backup_model_names(model: str | None) -> list[str]:
         return []
     candidates = ["qwen3-max", "deepseek-v3", "claude-opus-4-7"]
     return [m for m in candidates if m and m != current][:2]
+
+
+def _messages_for_model(
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None,
+) -> list[SystemMessage | HumanMessage]:
+    """Build chat messages with runtime controls matched to the invoked model."""
+    return [
+        SystemMessage(content=system_prompt),
+        HumanMessage(
+            content=ensure_no_think_text(user_prompt) if _uses_thinking_tags(model) else user_prompt
+        ),
+    ]
 
 
 def _message_content_text(response: Any) -> str:
@@ -608,15 +688,16 @@ def _strip_qwen_thinking(text: str) -> str:
     """Remove Qwen3 thinking blocks before JSON parsing."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
     if cleaned.startswith("<think>") and "{" in cleaned:
-        cleaned = cleaned[cleaned.find("{"):].strip()
+        cleaned = cleaned[cleaned.find("{") :].strip()
     return cleaned
 
 
-def _sentiment_signal_is_empty(features: "FeatureVector") -> bool:
+def _sentiment_signal_is_empty(features: FeatureVector) -> bool:
     """True when the sentiment expert has no actual sentiment evidence to analyze."""
     headlines = getattr(features, "recent_headlines", None) or []
     news_items = [
-        item for item in (getattr(features, "recent_news_items", None) or [])
+        item
+        for item in (getattr(features, "recent_news_items", None) or [])
         if isinstance(item, dict) and item.get("title")
     ]
     sources = getattr(features, "news_sources", None) or []
@@ -641,11 +722,12 @@ def _sentiment_signal_is_empty(features: "FeatureVector") -> bool:
     )
 
 
-def _news_availability_note(features: "FeatureVector") -> str:
+def _news_availability_note(features: FeatureVector) -> str:
     direct_count = int(getattr(features, "direct_news_item_count", 0) or 0)
     market_count = int(getattr(features, "market_news_item_count", 0) or 0)
     direct_items = [
-        item for item in (getattr(features, "recent_news_items", None) or [])
+        item
+        for item in (getattr(features, "recent_news_items", None) or [])
         if isinstance(item, dict) and item.get("direct_match") is True and item.get("title")
     ]
     if direct_items and direct_count <= 0:
@@ -665,7 +747,7 @@ def _news_availability_note(features: "FeatureVector") -> str:
     return "direct_news=0; market_background_news=0; news_policy=no news, treat sentiment as neutral; do not block entry if technical/ML/time-series edge is strong"
 
 
-def _build_compact_feature_context(features: "FeatureVector", role: str) -> str:
+def _build_compact_feature_context(features: FeatureVector, role: str) -> str:
     """Role-filtered feature text to reduce expert prompt tokens."""
     base = (
         f"symbol={features.symbol}; price={_fmt_num(features.current_price)}; "
@@ -750,12 +832,15 @@ def _build_compact_feature_context(features: "FeatureVector", role: str) -> str:
     return features.to_llm_context()
 
 
-def _calibrate_sentiment_decision(features: "FeatureVector", decision: DecisionOutput) -> DecisionOutput:
+def _calibrate_sentiment_decision(
+    features: FeatureVector, decision: DecisionOutput
+) -> DecisionOutput:
     """Keep sentiment text consistent with structured direct-news fields."""
     if decision.model_name != "sentiment_expert":
         return decision
     direct_items = [
-        item for item in (getattr(features, "recent_news_items", None) or [])
+        item
+        for item in (getattr(features, "recent_news_items", None) or [])
         if isinstance(item, dict) and item.get("direct_match") is True and item.get("title")
     ]
     direct_count = int(getattr(features, "direct_news_item_count", 0) or 0)
@@ -772,7 +857,11 @@ def _calibrate_sentiment_decision(features: "FeatureVector", decision: DecisionO
     news_sentiment = float(getattr(features, "news_sentiment_avg", 0.0) or 0.0)
     social_sentiment = float(getattr(features, "social_sentiment_avg", 0.0) or 0.0)
     titles = "；".join(str(item.get("title") or "")[:28] for item in direct_items[:2])
-    direction = "偏利好" if news_sentiment > 0.12 else ("偏利空/风险" if news_sentiment < -0.12 else "整体中性")
+    direction = (
+        "偏利好"
+        if news_sentiment > 0.12
+        else ("偏利空/风险" if news_sentiment < -0.12 else "整体中性")
+    )
     calibrated = (
         f"有{direct_count}条直接相关新闻，新闻情绪{news_sentiment:.2f}，社媒{social_sentiment:.2f}，"
         f"影响{direction}；代表新闻：{titles or '见新闻明细'}。"
@@ -790,7 +879,7 @@ def _calibrate_sentiment_decision(features: "FeatureVector", decision: DecisionO
 BATCH_EXPERT_SYSTEM_PROMPT = """You are a five-expert crypto trading committee in one local model call.
 Return ONLY one complete compact JSON object with key "experts".
 No markdown, no code fences, no <think>, no prose outside JSON.
-Each reasoning field must be concise but useful: 45-80 Chinese characters covering evidence, main risk, profit quality, and action rationale."""
+Each reasoning field must be concise but useful: 12-32 Chinese characters covering evidence, main risk, profit quality, and action rationale."""
 
 
 class LLMAgent(AbstractAIModel):
@@ -804,34 +893,38 @@ class LLMAgent(AbstractAIModel):
 
     name: str = "llm_agent"  # default, overridable per instance
 
-    def __init__(self, name: str | None = None, api_config: dict | None = None) -> None: 
-        if name is not None: 
-            self.name = name 
-        self._api_config = api_config  # {"api_base": ..., "api_key": ..., "model": ...} 
-        self._role = (api_config or {}).get("role", "") 
-        self._label = (api_config or {}).get("label", self.name) 
-        self.weight = float((api_config or {}).get("weight", 1.0) or 1.0) 
-        self._base_url = "" 
-        self._api_key = "" 
-        self._model_name = "" 
-        self._llm: ChatOpenAI | None = None 
-        self._max_retries = 1 
+    def __init__(self, name: str | None = None, api_config: dict | None = None) -> None:
+        if name is not None:
+            self.name = name
+        self._api_config = api_config  # {"api_base": ..., "api_key": ..., "model": ...}
+        self._role = (api_config or {}).get("role", "")
+        self._label = (api_config or {}).get("label", self.name)
+        self.weight = float((api_config or {}).get("weight", 1.0) or 1.0)
+        self._base_url = ""
+        self._api_key = ""
+        self._model_name = ""
+        self._llm: ChatOpenAI | None = None
+        self._max_retries = 1
 
-    async def initialize(self) -> None: 
-        if self._api_config: 
-            self._base_url = self._api_config.get("api_base") or settings.ai_api_base 
-            self._api_key = self._api_config.get("api_key") or settings.ai_api_key 
-            self._model_name = self._api_config.get("model") or settings.ai_model 
-        else: 
-            # Backward-compatible fallback to global settings 
-            self._base_url = settings.ai_api_base 
-            self._api_key = settings.ai_api_key 
-            self._model_name = settings.ai_model 
+    async def initialize(self) -> None:
+        if self._api_config:
+            self._base_url = self._api_config.get("api_base") or settings.ai_api_base
+            self._api_key = self._api_config.get("api_key") or settings.ai_api_key
+            self._model_name = self._api_config.get("model") or settings.ai_model
+        else:
+            # Backward-compatible fallback to global settings
+            self._base_url = settings.ai_api_base
+            self._api_key = settings.ai_api_key
+            self._model_name = settings.ai_model
 
-        self._llm = self._create_llm(self._model_name) 
-        logger.info("llm agent initialized", name=self.name, model=self._model_name, base=self._base_url) 
+        self._llm = self._create_llm(self._model_name)
+        logger.info(
+            "llm agent initialized", name=self.name, model=self._model_name, base=self._base_url
+        )
 
-    def _create_llm(self, model: str, max_completion_tokens_override: int | None = None) -> ChatOpenAI:
+    def _create_llm(
+        self, model: str, max_completion_tokens_override: int | None = None
+    ) -> ChatOpenAI:
         reasoning_model = _is_reasoning_model(model)
         configured_timeout = (
             settings.ai_decision_maker_timeout_seconds
@@ -847,7 +940,16 @@ class LLMAgent(AbstractAIModel):
             if self._role == "final_decision"
             else settings.ai_expert_max_completion_tokens
         )
-        max_completion_tokens = max(int(max_completion_tokens_override or configured_max_tokens or 0), 180)
+        token_stage = (
+            "batch_expert"
+            if max_completion_tokens_override is not None
+            else ("decision_maker" if self._role == "final_decision" else "expert")
+        )
+        max_completion_tokens = completion_token_limit(
+            token_stage,
+            int(max_completion_tokens_override or configured_max_tokens or 0),
+            floor=180,
+        )
         kwargs: dict[str, Any] = {
             "base_url": self._base_url,
             "api_key": self._api_key,
@@ -863,19 +965,12 @@ class LLMAgent(AbstractAIModel):
             kwargs["temperature"] = 0.2 if self._role else 0.3
             kwargs["max_tokens"] = max_completion_tokens
         if _uses_thinking_tags(model):
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            kwargs["extra_body"] = non_thinking_extra_body()
         return ChatOpenAI(**kwargs)
 
-    async def decide(
-        self, features: "FeatureVector", context: dict[str, Any]
-    ) -> DecisionOutput:
+    async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
         expert_mode = bool(context.get("expert_mode"))
         decision_maker_mode = bool(context.get("decision_maker_mode"))
-        usage_stage = (
-            "decision_maker"
-            if decision_maker_mode
-            else ("expert" if expert_mode else "direct_decision")
-        )
         if (
             expert_mode
             and not decision_maker_mode
@@ -904,8 +999,7 @@ class LLMAgent(AbstractAIModel):
         if open_positions:
             lines = []
             relevant_positions = [
-                p for p in open_positions
-                if p.get("symbol") == features.symbol
+                p for p in open_positions if p.get("symbol") == features.symbol
             ] or open_positions[:3]
             for pos in relevant_positions[:3]:
                 lines.append(
@@ -921,15 +1015,6 @@ class LLMAgent(AbstractAIModel):
         expert_memories = (context.get("expert_memories") or {}).get(self.name, [])
         if expert_mode and expert_memories:
             memories_text = _format_expert_memories(expert_memories)
-        target_text = ""
-        daily_target = context.get("daily_target") if isinstance(context, dict) else {}
-        if (
-            expert_mode
-            and isinstance(daily_target, dict)
-            and daily_target.get("enabled") is not False
-            and float(daily_target.get("target_usdt") or 0.0) > 0
-        ):
-            target_text = _format_daily_target(daily_target)
         regime_text = ""
         if expert_mode and context.get("market_regime"):
             regime_text = _format_market_regime(context.get("market_regime") or {})
@@ -969,35 +1054,35 @@ class LLMAgent(AbstractAIModel):
             user_prompt = build_expert_user_prompt(
                 self._role,
                 feature_text,
-                "\n".join(part for part in (
-                    positions_text,
-                    memories_text,
-                    target_text,
-                    regime_text,
-                    strategy_text,
-                    entry_candidate_text,
-                    local_tools_text,
-                    portfolio_profit_text,
-                ) if part),
+                "\n".join(
+                    part
+                    for part in (
+                        positions_text,
+                        memories_text,
+                        regime_text,
+                        strategy_text,
+                        entry_candidate_text,
+                        local_tools_text,
+                        portfolio_profit_text,
+                    )
+                    if part
+                ),
                 settings.confidence_threshold,
             )
         else:
-            user_prompt = build_user_prompt(feature_text, positions_text, settings.confidence_threshold)
+            user_prompt = build_user_prompt(
+                feature_text, positions_text, settings.confidence_threshold
+            )
 
-        messages = [
-            SystemMessage(
-                content=(
-                    DECISION_MAKER_SYSTEM_PROMPT
-                    if decision_maker_mode
-                    else (
-                        get_compact_role_system_prompt(self._role)
-                        if expert_mode
-                        else get_role_system_prompt(self._role, settings.confidence_threshold)
-                    )
-                )
-            ),
-            HumanMessage(content=(f"{user_prompt}\n/no_think" if _uses_thinking_tags(self._model_name) else user_prompt)),
-        ]
+        system_prompt = (
+            DECISION_MAKER_SYSTEM_PROMPT
+            if decision_maker_mode
+            else (
+                get_compact_role_system_prompt(self._role)
+                if expert_mode
+                else get_role_system_prompt(self._role, settings.confidence_threshold)
+            )
+        )
 
         # Retry configured model first. In expert mode, try provider-compatible
         # backup AI models before falling back to conservative local rules.
@@ -1009,8 +1094,11 @@ class LLMAgent(AbstractAIModel):
         primary_model = self._model_name
         for model_name in models_to_try:
             llm = self._llm if model_name == primary_model else self._create_llm(model_name)
+            if llm is None:
+                raise RuntimeError(f"LLM client for {model_name} is not initialized")
             for attempt in range(self._max_retries + 1):
                 try:
+                    messages = _messages_for_model(system_prompt, user_prompt, model_name)
                     async with _LLM_SEMAPHORE:
                         if _LLM_CALL_DELAY:
                             await asyncio.sleep(_LLM_CALL_DELAY)
@@ -1026,7 +1114,9 @@ class LLMAgent(AbstractAIModel):
 
                     decision = self._decision_from_parsed(parsed, features, context)
                     if model_name != primary_model:
-                        decision.reasoning += f" [备用模型：{primary_model} 无有效输出，改用 {model_name}]"
+                        decision.reasoning += (
+                            f" [备用模型：{primary_model} 无有效输出，改用 {model_name}]"
+                        )
 
                     if not context.get("expert_mode") and not decision_maker_mode:
                         _apply_aggressive_hold_policy(decision, symbol_positions)
@@ -1042,7 +1132,7 @@ class LLMAgent(AbstractAIModel):
                     return decision
 
                 except LLMResponseParseError as e:
-                    last_error = str(e)
+                    last_error = safe_error_text(e)
                     logger.warning(
                         "llm parse error",
                         name=self.name,
@@ -1051,8 +1141,12 @@ class LLMAgent(AbstractAIModel):
                         error=last_error,
                     )
                 except Exception as e:
-                    err_msg = str(e)
-                    if "model_dump" in err_msg or "JSONDecodeError" in err_msg or "Expecting value" in err_msg:
+                    err_msg = safe_error_text(e)
+                    if (
+                        "model_dump" in err_msg
+                        or "JSONDecodeError" in err_msg
+                        or "Expecting value" in err_msg
+                    ):
                         err_msg = f"API proxy returned empty or invalid response (模型名 '{model_name}' 可能不被该代理支持)"
                     last_error = err_msg
                     logger.error(
@@ -1069,7 +1163,7 @@ class LLMAgent(AbstractAIModel):
 
     async def decide_batch_experts(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
@@ -1087,10 +1181,11 @@ class LLMAgent(AbstractAIModel):
         }
         feature_text = _build_compact_feature_context(features, "final_decision")
         user_prompt = build_batch_experts_user_prompt(feature_text, context)
-        messages = [
-            SystemMessage(content=BATCH_EXPERT_SYSTEM_PROMPT),
-            HumanMessage(content=(f"{user_prompt}\n/no_think" if _uses_thinking_tags(self._model_name) else user_prompt)),
-        ]
+        messages = _messages_for_model(
+            BATCH_EXPERT_SYSTEM_PROMPT,
+            user_prompt,
+            self._model_name,
+        )
 
         async with _LLM_SEMAPHORE:
             if _LLM_CALL_DELAY:
@@ -1110,7 +1205,9 @@ class LLMAgent(AbstractAIModel):
         for name in expert_names:
             payload = experts_payload.get(name)
             if not isinstance(payload, dict):
-                fallback = self._local_expert_fallback(features, {**context, "expert_mode": True}, f"batch missing {name}")
+                fallback = self._local_expert_fallback(
+                    features, {**context, "expert_mode": True}, f"batch missing {name}"
+                )
                 fallback.model_name = name
                 fallback.raw_response = {
                     **(fallback.raw_response or {}),
@@ -1134,13 +1231,19 @@ class LLMAgent(AbstractAIModel):
                 action=Action.from_string(str(payload.get("action", "hold"))),
                 confidence=min(max(float(payload.get("confidence", 0.5) or 0.5), 0.0), 1.0),
                 reasoning=str(payload.get("reasoning") or "暂无分析内容。")[:150],
-                position_size_pct=min(max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0),
+                position_size_pct=min(
+                    max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
+                ),
                 suggested_leverage=min(
                     max(float(payload.get("suggested_leverage", 1.0) or 1.0), 1.0),
                     settings.max_leverage,
                 ),
-                stop_loss_pct=min(max(float(payload.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15),
-                take_profit_pct=min(max(float(payload.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50),
+                stop_loss_pct=min(
+                    max(float(payload.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15
+                ),
+                take_profit_pct=min(
+                    max(float(payload.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
+                ),
                 cross_check_for=payload.get("cross_check_for"),
                 raw_response=payload,
                 feature_snapshot=features.to_dict(),
@@ -1149,9 +1252,7 @@ class LLMAgent(AbstractAIModel):
             decisions[name] = decision
         return decisions
 
-        raise ModelInferenceError(f"LLM agent {self.name} failed: {last_error or 'unknown error'}")
-
-    def _empty_sentiment_fast_path(self, features: "FeatureVector") -> DecisionOutput:
+    def _empty_sentiment_fast_path(self, features: FeatureVector) -> DecisionOutput:
         """Return immediately when sentiment/news data is genuinely empty."""
         snapshot = features.to_dict()
         reason = (
@@ -1189,7 +1290,7 @@ class LLMAgent(AbstractAIModel):
     def _decision_from_parsed(
         self,
         parsed: dict[str, Any],
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
     ) -> DecisionOutput:
         cross_check_for = _normalize_cross_check(
@@ -1211,9 +1312,7 @@ class LLMAgent(AbstractAIModel):
                 max(float(parsed.get("suggested_leverage", 1.0) or 1.0), 1.0),
                 settings.max_leverage,
             ),
-            stop_loss_pct=min(
-                max(float(parsed.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15
-            ),
+            stop_loss_pct=min(max(float(parsed.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15),
             take_profit_pct=min(
                 max(float(parsed.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
             ),
@@ -1235,7 +1334,7 @@ class LLMAgent(AbstractAIModel):
 
     def _local_expert_fallback(
         self,
-        features: "FeatureVector",
+        features: FeatureVector,
         context: dict[str, Any],
         error: str,
     ) -> DecisionOutput:
@@ -1256,7 +1355,10 @@ class LLMAgent(AbstractAIModel):
         abnormal_wick_count = int(_snapshot_float(snapshot, "abnormal_wick_count_72h"))
         abnormal_wick_max = _snapshot_float(snapshot, "abnormal_wick_max_pct")
         abnormal_wick_recent = _snapshot_float(snapshot, "abnormal_wick_recent_hours", 9999.0)
-        sentiment = (_snapshot_float(snapshot, "news_sentiment_avg") + _snapshot_float(snapshot, "social_sentiment_avg")) / 2
+        sentiment = (
+            _snapshot_float(snapshot, "news_sentiment_avg")
+            + _snapshot_float(snapshot, "social_sentiment_avg")
+        ) / 2
 
         if self._role in {"technical_trend", "trend_direction"}:
             confidence = min(0.42 + edge * 0.04, 0.62)
@@ -1276,7 +1378,9 @@ class LLMAgent(AbstractAIModel):
                 action = Action.LONG
                 confidence = 0.52
                 size = 0.03
-            elif returns_1 < 0 and returns_5 < 0 and volume_ratio >= settings.min_entry_volume_ratio:
+            elif (
+                returns_1 < 0 and returns_5 < 0 and volume_ratio >= settings.min_entry_volume_ratio
+            ):
                 action = Action.SHORT
                 confidence = 0.52
                 size = 0.03
@@ -1305,8 +1409,7 @@ class LLMAgent(AbstractAIModel):
             }
         elif self._role in {"position_manager", "position_exit"}:
             symbol_positions = [
-                p for p in context.get("open_positions", [])
-                if p.get("symbol") == features.symbol
+                p for p in context.get("open_positions", []) if p.get("symbol") == features.symbol
             ]
             if symbol_positions:
                 side = symbol_positions[0].get("side")
@@ -1341,13 +1444,21 @@ class LLMAgent(AbstractAIModel):
             if volatility > 0.05:
                 risk_flags.append("波动偏高")
             if abnormal_wick_count > 0 and abnormal_wick_max >= 80 and abnormal_wick_recent <= 96:
-                risk_flags.append(f"近72小时异常插针{abnormal_wick_count}次，最大{abnormal_wick_max:.1f}%")
+                risk_flags.append(
+                    f"近72小时异常插针{abnormal_wick_count}次，最大{abnormal_wick_max:.1f}%"
+                )
             confidence = 0.62 if risk_flags else 0.40
-            reason = f"风控规则兜底：{('、'.join(risk_flags) if risk_flags else '未发现硬性否决项')}。"
-            cross_check_for = {
-                "target": "sentiment",
-                "question": "请核实是否存在会放大风险的新闻或情绪冲击。",
-            } if risk_flags else None
+            reason = (
+                f"风控规则兜底：{('、'.join(risk_flags) if risk_flags else '未发现硬性否决项')}。"
+            )
+            cross_check_for = (
+                {
+                    "target": "sentiment",
+                    "question": "请核实是否存在会放大风险的新闻或情绪冲击。",
+                }
+                if risk_flags
+                else None
+            )
 
         raw = {
             "local_fallback": True,
@@ -1370,7 +1481,7 @@ class LLMAgent(AbstractAIModel):
             feature_snapshot=snapshot,
         )
 
-    async def reinitialize(self) -> None: 
+    async def reinitialize(self) -> None:
         """Recreate the ChatOpenAI instance with current config."""
         self._llm = None
         await self.initialize()

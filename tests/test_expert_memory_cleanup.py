@@ -35,8 +35,14 @@ def test_expert_memory_cleanup_translates_trade_pattern():
     assert "BTC/USDT 做空" in lesson
     assert "结果为亏损" in lesson
     assert "不只看胜率" in lesson
-    assert translate_market_pattern("BTC/USDT short, short_term, 5.0x, large_loss") == "BTC/USDT 做空，短线持仓，5.0x，大亏"
-    assert translate_market_pattern("ETH/USDT 做空, longer_hold, 3.0x, 盈利") == "ETH/USDT 做空，较长持仓，3.0x，盈利"
+    assert (
+        translate_market_pattern("BTC/USDT short, short_term, 5.0x, large_loss")
+        == "BTC/USDT 做空，短线持仓，5.0x，大亏"
+    )
+    assert (
+        translate_market_pattern("ETH/USDT 做空, longer_hold, 3.0x, 盈利")
+        == "ETH/USDT 做空，较长持仓，3.0x，盈利"
+    )
 
 
 def test_memory_repository_rejects_damaged_or_mojibake_memory_text():

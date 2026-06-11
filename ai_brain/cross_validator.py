@@ -9,10 +9,10 @@ uses the configured trend expert model to arbitrate major conflicts.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
 import re
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -21,6 +21,16 @@ from langchain_openai import ChatOpenAI
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import DECISION_MAKER_NAME, settings
+from core.model_runtime import (
+    completion_token_limit,
+    ensure_no_think_text,
+    is_openai_reasoning_model,
+    is_qwen3_model,
+    non_thinking_extra_body,
+    uses_thinking_tags,
+)
+from core.safe_output import safe_error_text
+from core.secret_utils import secret_fingerprint
 
 logger = structlog.get_logger(__name__)
 
@@ -60,28 +70,26 @@ BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
 
 def _is_reasoning_model(model: str | None) -> bool:
-    name = str(model or "").lower()
-    return name.startswith(("o1", "o3", "o4"))
+    return is_openai_reasoning_model(model)
 
 
 def _is_local_qwen3_trade_model(model: str | None) -> bool:
     name = str(model or "").lower()
-    return name.startswith("qwen3-") and (name.endswith("-trade") or name.endswith("-risk-review"))
+    return name.startswith("qwen3-") and name.endswith("-trade")
 
 
 def _is_qwen3_model(model: str | None) -> bool:
-    return "qwen3" in str(model or "").lower()
+    return is_qwen3_model(model)
 
 
 def _uses_thinking_tags(model: str | None) -> bool:
-    name = str(model or "").lower()
-    return "qwen3" in name or "deepseek-r1" in name
+    return uses_thinking_tags(model)
 
 
 def _strip_qwen_thinking(text: str) -> str:
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
     if cleaned.startswith("<think>") and "{" in cleaned:
-        cleaned = cleaned[cleaned.find("{"):].strip()
+        cleaned = cleaned[cleaned.find("{") :].strip()
     return cleaned
 
 
@@ -110,7 +118,7 @@ class CrossValidator:
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         validations: list[dict[str, Any]] = []
         seen_pairs: set[tuple[str, str, str]] = set()
-        cross_started_at = datetime.now(timezone.utc)
+        cross_started_at = datetime.now(UTC)
         cross_perf_started = time.perf_counter()
 
         for source_name, source in opinions.items():
@@ -118,33 +126,35 @@ class CrossValidator:
             if not isinstance(request, dict):
                 continue
 
-            target_name = EXPERT_ALIASES.get(str(request.get("target", "")).strip().lower()) 
-            question = str(request.get("question", "")).strip() 
-            if not target_name or target_name == source_name: 
-                continue 
-            if not question: 
-                continue 
-
-            key = (source_name, target_name, question) 
-            if key in seen_pairs: 
-                continue 
-            seen_pairs.add(key) 
-            if target_name not in opinions:
-                validations.append({
-                    "expert_pair": [source_name, target_name],
-                    "question": question,
-                    "consistency": "neutral",
-                    "confidence_adjustment": -10,
-                    "conflict_note": f"{self._expert_label(target_name)} 本轮没有返回，无法完成这次交叉验证。",
-                    "validation_note": f"{self._expert_label(target_name)} 本轮没有返回，无法回答这个核实问题。",
-                    "checked_evidence": [],
-                    "major_conflict": False,
-                    "validation_status": "target_missing",
-                })
+            target_name = EXPERT_ALIASES.get(str(request.get("target", "")).strip().lower())
+            question = str(request.get("question", "")).strip()
+            if not target_name or target_name == source_name:
                 continue
-            validations.append( 
-                self.validate_pair( 
-                    source_name, 
+            if not question:
+                continue
+
+            key = (source_name, target_name, question)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            if target_name not in opinions:
+                validations.append(
+                    {
+                        "expert_pair": [source_name, target_name],
+                        "question": question,
+                        "consistency": "neutral",
+                        "confidence_adjustment": -10,
+                        "conflict_note": f"{self._expert_label(target_name)} 本轮没有返回，无法完成这次交叉验证。",
+                        "validation_note": f"{self._expert_label(target_name)} 本轮没有返回，无法回答这个核实问题。",
+                        "checked_evidence": [],
+                        "major_conflict": False,
+                        "validation_status": "target_missing",
+                    }
+                )
+                continue
+            validations.append(
+                self.validate_pair(
+                    source_name,
                     source,
                     target_name,
                     opinions[target_name],
@@ -162,26 +172,26 @@ class CrossValidator:
                 "duration_sec": cross_duration,
                 "requested": sum(1 for v in validations if v.get("question")),
                 "completed": sum(
-                    1 for v in validations
-                    if v.get("validation_status", "completed") == "completed"
+                    1 for v in validations if v.get("validation_status", "completed") == "completed"
                 ),
                 "unavailable": sum(
-                    1 for v in validations
-                    if v.get("validation_status") == "target_missing"
+                    1 for v in validations if v.get("validation_status") == "target_missing"
                 ),
                 "major_conflicts": sum(1 for v in validations if v.get("major_conflict")),
             }
 
-        consultation_started_at = datetime.now(timezone.utc)
+        consultation_started_at = datetime.now(UTC)
         consultation_perf_started = time.perf_counter()
-        consultation_timeout = max(float(settings.ai_decision_maker_timeout_seconds or 20.0) + 45.0, 60.0)
+        consultation_timeout = max(
+            float(settings.ai_decision_maker_timeout_seconds or 20.0) + 45.0, 60.0
+        )
         major_conflicts = [v for v in validations if v.get("major_conflict")]
         try:
             consultation = await asyncio.wait_for(
                 self.consult_if_needed(opinions, validations),
                 timeout=consultation_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "deep consultation timed out; using fallback",
                 timeout=consultation_timeout,
@@ -234,10 +244,10 @@ class CrossValidator:
             consistency = "aligned"
             adjustment = 10
             note = None
-        elif source_dir and target_dir and source_dir != target_dir: 
-            consistency = "divergent" 
-            high_conflict = source.confidence >= 0.60 and target.confidence >= 0.60 
-            adjustment = -40 if high_conflict else -25 
+        elif source_dir and target_dir and source_dir != target_dir:
+            consistency = "divergent"
+            high_conflict = source.confidence >= 0.60 and target.confidence >= 0.60
+            adjustment = -40 if high_conflict else -25
             note = validation_note
         elif question_result == "supports" and source_dir:
             consistency = "aligned"
@@ -255,18 +265,18 @@ class CrossValidator:
             adjustment = 0
             note = None
 
-        return { 
-            "expert_pair": [source_name, target_name], 
-            "question": question, 
-            "consistency": consistency, 
-            "confidence_adjustment": max(min(adjustment, 50), -50), 
-            "conflict_note": note, 
+        return {
+            "expert_pair": [source_name, target_name],
+            "question": question,
+            "consistency": consistency,
+            "confidence_adjustment": max(min(adjustment, 50), -50),
+            "conflict_note": note,
             "validation_note": validation_note,
             "checked_evidence": checked_evidence,
             "needs_resolution": consistency == "divergent",
-            "major_conflict": self._is_major_conflict(source, target, consistency, adjustment), 
+            "major_conflict": self._is_major_conflict(source, target, consistency, adjustment),
             "validation_status": "completed",
-        } 
+        }
 
     def _is_major_conflict(
         self,
@@ -340,7 +350,9 @@ class CrossValidator:
                     return "challenges"
             return "neutral"
 
-        if any(word in q for word in ("风险", "止损", "波动", "回撤", "滑点", "过热", "插针", "尾部")):
+        if any(
+            word in q for word in ("风险", "止损", "波动", "回撤", "滑点", "过热", "插针", "尾部")
+        ):
             volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
             volatility = float(snapshot.get("volatility_20") or 0.0)
             day_change = abs(float(snapshot.get("change_24h_pct") or 0.0))
@@ -351,7 +363,11 @@ class CrossValidator:
                 volume_ratio < settings.min_entry_volume_ratio
                 or volatility > 0.08
                 or day_change > 18
-                or (abnormal_wick_count > 0 and abnormal_wick_max >= 80 and abnormal_wick_recent <= 96)
+                or (
+                    abnormal_wick_count > 0
+                    and abnormal_wick_max >= 80
+                    and abnormal_wick_recent <= 96
+                )
             ):
                 return "challenges"
             return "neutral"
@@ -460,20 +476,22 @@ class CrossValidator:
             model = (model or settings.ai_model or "").strip()
             if not api_key or not model:
                 return
-            identity = (api_base, model, api_key[:8])
+            identity = (api_base, model, secret_fingerprint(api_key))
             for existing in candidates:
                 if existing.get("_identity") == identity:
                     return
-            candidates.append({
-                "name": name,
-                "label": label,
-                "api_base": api_base,
-                "api_key": api_key,
-                "model": model,
-                "retries": max(int(retries or 1), 1),
-                "source": source,
-                "_identity": identity,
-            })
+            candidates.append(
+                {
+                    "name": name,
+                    "label": label,
+                    "api_base": api_base,
+                    "api_key": api_key,
+                    "model": model,
+                    "retries": max(int(retries or 1), 1),
+                    "source": source,
+                    "_identity": identity,
+                }
+            )
 
         add_candidate(
             name="trend_expert",
@@ -581,19 +599,38 @@ class CrossValidator:
             "model": model,
             "timeout": 60 if reasoning_model else 45,
             "max_retries": 0,
-            "max_completion_tokens": 1400 if reasoning_model else 700,
+            "max_completion_tokens": completion_token_limit(
+                "consultation",
+                1400 if reasoning_model else 700,
+                floor=160,
+            ),
         }
         if reasoning_model:
             llm_kwargs["temperature"] = None
             llm_kwargs["reasoning_effort"] = "low"
         else:
             llm_kwargs["temperature"] = 0.1
+        invoke_messages = messages
         if _uses_thinking_tags(model):
-            llm_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            llm_kwargs["extra_body"] = non_thinking_extra_body()
+            invoke_messages = self._consultation_messages_for_model(messages, model)
         llm = ChatOpenAI(**llm_kwargs)
         async with _CONSULTATION_SEMAPHORE:
-            response = await llm.ainvoke(messages)
+            response = await llm.ainvoke(invoke_messages)
         return response, _message_content_text(response).strip()
+
+    @staticmethod
+    def _consultation_messages_for_model(messages: list[Any], model: str | None) -> list[Any]:
+        """Return consultation messages with /no_think for Qwen3/R1-style models."""
+        if not _uses_thinking_tags(model):
+            return messages
+        copied = list(messages)
+        for index in range(len(copied) - 1, -1, -1):
+            message = copied[index]
+            if isinstance(message, HumanMessage):
+                copied[index] = HumanMessage(content=ensure_no_think_text(message.content))
+                break
+        return copied
 
     async def consult_if_needed(
         self,
@@ -630,15 +667,15 @@ class CrossValidator:
             "major_conflicts": major,
         }
         messages = [
-            SystemMessage( 
-                content=( 
+            SystemMessage(
+                content=(
                     "你是行情方向专家，也是本轮加密合约交易会诊主持人。"
                     "只处理 listed major_conflicts 中的专家矛盾，结论必须简洁中文。"
                     "只返回严格 JSON，字段为："
                     "recommended_action, confidence_adjustment (-50..50), conflict_note, should_trade。"
                     "conflict_note 必须用中文说明是否继续交易以及原因。"
-                ) 
-            ), 
+                )
+            ),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
         ]
 
@@ -654,37 +691,45 @@ class CrossValidator:
                         timeout=call_timeout,
                     )
                     if not content:
-                        attempts.append(self._consultation_attempt(
-                            candidate,
-                            attempt_no,
-                            "empty_response",
-                            "模型返回空内容，未拿到可解析的会诊结论。",
-                            response=response,
-                        ))
+                        attempts.append(
+                            self._consultation_attempt(
+                                candidate,
+                                attempt_no,
+                                "empty_response",
+                                "模型返回空内容，未拿到可解析的会诊结论。",
+                                response=response,
+                            )
+                        )
                         continue
                     try:
                         parsed = self._extract_json(content)
                     except Exception:
-                        attempts.append(self._consultation_attempt(
-                            candidate,
-                            attempt_no,
-                            "invalid_json",
-                            "模型返回内容不是有效 JSON。",
-                            raw_content=content,
-                            response=response,
-                        ))
+                        attempts.append(
+                            self._consultation_attempt(
+                                candidate,
+                                attempt_no,
+                                "invalid_json",
+                                "模型返回内容不是有效 JSON。",
+                                raw_content=content,
+                                response=response,
+                            )
+                        )
                         continue
 
-                    attempts.append(self._consultation_attempt(
-                        candidate,
-                        attempt_no,
-                        "completed",
-                        "会诊完成。",
-                        response=response,
-                    ))
+                    attempts.append(
+                        self._consultation_attempt(
+                            candidate,
+                            attempt_no,
+                            "completed",
+                            "会诊完成。",
+                            response=response,
+                        )
+                    )
                     parsed["model"] = candidate.get("model")
                     parsed["consultation_expert"] = candidate.get("name") or "trend_expert"
-                    parsed["consultation_expert_label"] = candidate.get("label") or candidate.get("name")
+                    parsed["consultation_expert_label"] = candidate.get("label") or candidate.get(
+                        "name"
+                    )
                     parsed["primary_consultation_expert"] = "trend_expert"
                     parsed["status"] = "completed"
                     parsed["major_conflicts"] = major
@@ -693,7 +738,13 @@ class CrossValidator:
                     parsed["should_trade"] = self._as_bool(parsed.get("should_trade"))
                     if parsed["should_trade"] is None:
                         action = str(parsed.get("recommended_action") or "").strip().lower()
-                        parsed["should_trade"] = action not in {"hold", "no_trade", "skip", "观望", "不交易"}
+                        parsed["should_trade"] = action not in {
+                            "hold",
+                            "no_trade",
+                            "skip",
+                            "观望",
+                            "不交易",
+                        }
                     try:
                         adjustment = float(parsed.get("confidence_adjustment", 0) or 0)
                         parsed["confidence_adjustment"] = max(min(adjustment, 50), -50)
@@ -701,19 +752,22 @@ class CrossValidator:
                         parsed["confidence_adjustment"] = 0
                     return parsed
                 except Exception as exc:
+                    error_text = safe_error_text(exc)
                     logger.warning(
                         "deep consultation attempt failed",
                         expert=candidate.get("name"),
                         model=candidate.get("model"),
                         attempt=attempt_no,
-                        error=str(exc),
+                        error=error_text,
                     )
-                    attempts.append(self._consultation_attempt(
-                        candidate,
-                        attempt_no,
-                        "call_failed",
-                        str(exc) or exc.__class__.__name__,
-                    ))
+                    attempts.append(
+                        self._consultation_attempt(
+                            candidate,
+                            attempt_no,
+                            "call_failed",
+                            error_text,
+                        )
+                    )
 
         return self._fallback_consultation(
             major,
@@ -732,7 +786,7 @@ class CrossValidator:
             start = text.find("{")
             end = text.rfind("}")
             if start >= 0 and end > start:
-                return json.loads(text[start:end + 1])
+                return json.loads(text[start : end + 1])
             raise
 
     def _fallback_consultation(
@@ -744,9 +798,7 @@ class CrossValidator:
         attempts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Use a conservative structured result when the LLM cannot return JSON."""
-        note = (
-            f"{reason}，系统已按保守规则处理：重大矛盾未解除，本轮不新增开仓。"
-        )
+        note = f"{reason}，系统已按保守规则处理：重大矛盾未解除，本轮不新增开仓。"
         result = {
             "model": model,
             "consultation_expert": "trend_expert",
@@ -768,15 +820,15 @@ class CrossValidator:
         clean = " ".join(str(text or "").split())
         return clean[:limit]
 
-    def _as_bool(self, value: Any) -> bool | None: 
-        if isinstance(value, bool): 
-            return value 
-        if isinstance(value, str): 
-            normalized = value.strip().lower() 
+    def _as_bool(self, value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
             if normalized in {"true", "yes", "1", "trade"}:
                 return True
             if normalized in {"false", "no", "0", "hold", "skip"}:
-                return False 
+                return False
         return None
 
     def _expert_label(self, name: str) -> str:

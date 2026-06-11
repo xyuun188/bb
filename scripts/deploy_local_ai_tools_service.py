@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import re
+import sys
 import textwrap
 from pathlib import Path
 
-import paramiko
-
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.safe_output import safe_print  # noqa: E402
 
 SERVICE_CODE = r'''
 from __future__ import annotations
@@ -18,14 +19,15 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 import joblib
 import numpy as np
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestRegressor
@@ -35,12 +37,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
 
 
-MAIN_LLM_BASE = "http://127.0.0.1:8000/v1"
-MAIN_LLM_MODEL = "deepseek-r1-distill-qwen-14b-trade"
-SERVED_REVIEW_MODEL = "online-high-risk-review-configured-in-trading-app"
 MODEL_DIR = Path("/data/trade_ai/models")
 BUNDLE_PATH = MODEL_DIR / "local_quant_models.joblib"
 METADATA_PATH = MODEL_DIR / "local_quant_models_metadata.json"
+LOCAL_REVIEW_DISABLED_DETAIL = (
+    "Local AI tools do not provide high-risk trade review. "
+    "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
+)
 
 FEATURE_KEYS = [
     "change_24h_pct", "spread_pct", "rsi_14", "rsi_7", "macd", "macd_signal",
@@ -54,15 +57,82 @@ FEATURE_KEYS = [
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 ROUND_TRIP_COST_PCT = 0.12
 TAIL_LOSS_THRESHOLD_PCT = 0.18
+LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
+ERROR_TEXT_LIMIT = 180
+SECRET_TEXT_RE = re.compile(
+    r"(Authorization\s*:\s*Bearer\s+)[^\s,;\"']+"
+    r"|((?:api[_-]?key|secret|password|passphrase|token|webhook)"
+    r"\s*[:=]\s*)[^\s,;\"']+",
+    re.IGNORECASE,
+)
+LOCAL_AI_TOOLS_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "LOCAL_AI_TOOLS_CORS_ORIGINS",
+        "http://127.0.0.1:8002,http://localhost:8002",
+    ).split(",")
+    if origin.strip()
+]
+ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
+    "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _BUNDLE_CACHE: dict[str, Any] | None = None
 _BUNDLE_MTIME: float | None = None
 
-app = FastAPI(title="Trade Local AI Tools", version="1.0.0")
+
+def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        auth_prefix = match.group(1)
+        key_prefix = match.group(2)
+        if auth_prefix:
+            return auth_prefix + "***"
+        if key_prefix:
+            return key_prefix + "***"
+        return "***"
+
+    redacted = SECRET_TEXT_RE.sub(repl, text)
+    if limit and len(redacted) > limit:
+        return redacted[:limit] + "..."
+    return redacted
+
+
+def _is_loopback_request(request: Request) -> bool:
+    client_host = (request.client.host if request.client else "") or ""
+    return client_host in {"127.0.0.1", "::1", "localhost"}
+
+
+def require_api_key(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    if LOCAL_AI_TOOLS_API_KEY:
+        expected = f"Bearer {LOCAL_AI_TOOLS_API_KEY}"
+        if authorization == expected:
+            return
+        raise HTTPException(status_code=401, detail="Invalid local AI tools API key.")
+    if ALLOW_UNAUTHENTICATED_LOOPBACK and _is_loopback_request(request):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="LOCAL_AI_TOOLS_API_KEY is required for non-loopback access.",
+    )
+
+
+app = FastAPI(
+    title="Trade Local AI Tools",
+    version="1.0.0",
+    dependencies=[Depends(require_api_key)],
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=LOCAL_AI_TOOLS_CORS_ORIGINS,
+    allow_credentials=bool(LOCAL_AI_TOOLS_API_KEY),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -180,6 +250,48 @@ def _make_classifier(y: list[int]) -> Pipeline:
     ])
 
 
+def _trusted_model_artifact_path(path: Path) -> Path:
+    root = MODEL_DIR.resolve(strict=False)
+    if not root.is_absolute():
+        raise ValueError("Model directory must be absolute.")
+    target = Path(path).resolve(strict=False)
+    if target.suffix != ".joblib":
+        raise ValueError("Model artifact must use .joblib suffix.")
+    if not target.is_relative_to(root):
+        raise ValueError("Model artifact path escapes trusted model directory.")
+    return target
+
+
+def load_trusted_joblib_bundle(path: Path) -> dict[str, Any]:
+    target = _trusted_model_artifact_path(path)
+    value = joblib.load(target)
+    if not isinstance(value, dict):
+        raise ValueError("Model artifact must contain a dictionary bundle.")
+    return value
+
+
+def dump_trusted_joblib_bundle(bundle: dict[str, Any], path: Path) -> Path:
+    if not isinstance(bundle, dict):
+        raise ValueError("Model artifact must be a dictionary bundle.")
+    target = _trusted_model_artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{target.stem}.",
+            suffix=".tmp",
+            dir=str(target.parent),
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        joblib.dump(bundle, tmp_path)
+        os.replace(tmp_path, target)
+        return target
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
 def load_bundle() -> dict[str, Any] | None:
     global _BUNDLE_CACHE, _BUNDLE_MTIME
     try:
@@ -188,7 +300,7 @@ def load_bundle() -> dict[str, Any] | None:
         mtime = BUNDLE_PATH.stat().st_mtime
         if _BUNDLE_CACHE is not None and _BUNDLE_MTIME == mtime:
             return _BUNDLE_CACHE
-        _BUNDLE_CACHE = joblib.load(BUNDLE_PATH)
+        _BUNDLE_CACHE = load_trusted_joblib_bundle(BUNDLE_PATH)
         _BUNDLE_MTIME = mtime
         return _BUNDLE_CACHE
     except Exception:
@@ -394,7 +506,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         import torch
         from torch import nn
     except Exception as exc:
-        return {"available": False, "reason": f"torch_unavailable: {str(exc)[:120]}"}
+        return {"available": False, "reason": f"torch_unavailable: {safe_error(exc, 120)}"}
 
     rows = []
     for sample in samples or []:
@@ -505,7 +617,7 @@ def _probe_transformers_sentiment_backend() -> dict[str, Any]:
             "mode": "optional_runtime_backend",
         }
     except Exception as exc:
-        return {"available": False, "reason": f"transformers_unavailable: {str(exc)[:120]}"}
+        return {"available": False, "reason": f"transformers_unavailable: {safe_error(exc, 120)}"}
 
 
 def _public_torch_patch_status(model_info: dict[str, Any] | None) -> dict[str, Any]:
@@ -526,16 +638,16 @@ def health() -> dict[str, Any]:
     metadata = {}
     if bundle and isinstance(bundle.get("metadata"), dict):
         metadata = bundle["metadata"]
-    return {
-        "ok": True,
-        "service": "trade-local-ai-tools",
-        "tools": ["profit", "timeseries", "sentiment", "exit", "train", "openai-compatible-risk-review"],
-        "trained_models_available": bool(bundle),
-        "trained_at": metadata.get("trained_at"),
-        "shadow_sample_count": metadata.get("shadow_sample_count", 0),
-        "trade_sample_count": metadata.get("trade_sample_count", 0),
-        "review_backend": "online_configured_in_trading_app",
-    }
+        return {
+            "ok": True,
+            "service": "trade-local-ai-tools",
+            "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
+            "trained_models_available": bool(bundle),
+            "trained_at": metadata.get("trained_at"),
+            "shadow_sample_count": metadata.get("shadow_sample_count", 0),
+            "trade_sample_count": metadata.get("trade_sample_count", 0),
+            "review_backend": "disabled_use_trading_app_online_model",
+        }
 
 
 @app.get("/models/status")
@@ -692,7 +804,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "profiles": profiles,
     }
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, BUNDLE_PATH)
+    dump_trusted_joblib_bundle(bundle, BUNDLE_PATH)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     global _BUNDLE_CACHE, _BUNDLE_MTIME
     _BUNDLE_CACHE = bundle
@@ -747,7 +859,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "note": "Trained profit-first model: expected return and loss probability drive the score; win rate is not the objective.",
             }
         except Exception as exc:
-            fallback_error = str(exc)[:180]
+            fallback_error = safe_error(exc)
     else:
         fallback_error = None
 
@@ -1069,84 +1181,47 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
 def models() -> dict[str, Any]:
     return {
         "object": "list",
-        "data": [
-            {
-                "id": SERVED_REVIEW_MODEL,
-                "object": "model",
-                "owned_by": "local-tools",
-                "root": MAIN_LLM_MODEL,
-            }
-        ],
+        "data": [],
+        "disabled": LOCAL_REVIEW_DISABLED_DETAIL,
     }
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(payload: dict[str, Any]) -> Any:
-    forwarded = dict(payload)
-    forwarded["model"] = MAIN_LLM_MODEL
-    forwarded.setdefault("chat_template_kwargs", {"enable_thinking": False})
-    backend = "deepseek-32b-main"
-    async with httpx.AsyncClient(timeout=75.0) as client:
-        response = await client.post(f"{MAIN_LLM_BASE}/chat/completions", json=forwarded)
-        response.raise_for_status()
-        data = response.json()
-    if isinstance(data, dict):
-        data["model"] = SERVED_REVIEW_MODEL
-        data["local_review_backend"] = backend
-    return data
+def chat_completions(_payload: dict[str, Any]) -> Any:
+    raise HTTPException(status_code=410, detail=LOCAL_REVIEW_DISABLED_DETAIL)
 '''
 
 
-def parse_server_info() -> dict[str, str | int]:
-    text = (ROOT / "服务器资料.txt").read_text(encoding="utf-8")
-    return {
-        "host": re.search(r"公网IP：([0-9.]+)", text).group(1),
-        "port": int(re.search(r"端口:\s*(\d+)", text).group(1)),
-        "username": re.search(r"账号:\s*(\S+)", text).group(1),
-        "password": re.search(r"密码:\s*(\S+)", text).group(1),
-    }
-
-
-def run(ssh: paramiko.SSHClient, command: str) -> str:
-    stdin, stdout, stderr = ssh.exec_command(command, timeout=120)
-    out = stdout.read().decode("utf-8", "replace")
-    err = stderr.read().decode("utf-8", "replace")
-    status = stdout.channel.recv_exit_status()
-    if status != 0:
-        raise RuntimeError(f"command failed ({status}): {command}\n{out}\n{err}")
-    return out + err
-
-
 def main() -> None:
-    info = parse_server_info()
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(
-        str(info["host"]),
-        port=int(info["port"]),
-        username=str(info["username"]),
-        password=str(info["password"]),
-        timeout=15,
-    )
+    ssh = connect_remote_ssh(ROOT, timeout=15)
     try:
-        run(ssh, "mkdir -p /data/trade_ai/tools /data/trade_ai/logs")
+        run_remote_text(
+            ssh,
+            "mkdir -p /data/trade_ai/tools /data/trade_ai/logs /data/trade_ai/systemd && "
+            "touch /data/trade_ai/local_ai_tools.env && chmod 600 /data/trade_ai/local_ai_tools.env",
+            timeout=120,
+        )
         sftp = ssh.open_sftp()
         with sftp.file("/data/trade_ai/tools/local_ai_tools_api.py", "w") as remote:
             remote.write(SERVICE_CODE)
         sftp.close()
         python_bin = "/home/linux/anaconda3/envs/trade_ml/bin/python"
         env_bin = "/home/linux/anaconda3/envs/trade_ml/bin"
-        service = textwrap.dedent(
-            """
+        service = (
+            textwrap.dedent(
+                """
             [Unit]
             Description=Trade Local AI Tools API
-            After=network-online.target deepseek-14b-main.service
+            After=network-online.target qwen3-32b-main.service
             Wants=network-online.target
 
             [Service]
             User=linux
             WorkingDirectory=/data/trade_ai/tools
             Environment=PATH=__ENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
+            Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002
+            EnvironmentFile=-/data/trade_ai/local_ai_tools.env
             ExecStart=__PYTHON_BIN__ -m uvicorn local_ai_tools_api:app --host 0.0.0.0 --port 8001
             Restart=always
             RestartSec=5
@@ -1156,17 +1231,31 @@ def main() -> None:
             [Install]
             WantedBy=multi-user.target
             """
-        ).strip().replace("__ENV_BIN__", env_bin).replace("__PYTHON_BIN__", python_bin) + "\n"
-        with ssh.open_sftp().file("/tmp/local-ai-tools.service", "w") as remote:
+            )
+            .strip()
+            .replace("__ENV_BIN__", env_bin)
+            .replace("__PYTHON_BIN__", python_bin)
+            + "\n"
+        )
+        remote_service_path = "/data/trade_ai/systemd/local-ai-tools.service"
+        with ssh.open_sftp().file(remote_service_path, "w") as remote:
             remote.write(service)
-        run(
+        run_remote_text(
             ssh,
-            "sudo mv /tmp/local-ai-tools.service /etc/systemd/system/local-ai-tools.service && "
+            f"sudo install -m 0644 {remote_service_path} /etc/systemd/system/local-ai-tools.service && "
             "sudo systemctl daemon-reload && "
             "sudo systemctl enable local-ai-tools.service && "
             "sudo systemctl restart local-ai-tools.service",
+            timeout=120,
         )
-        print(run(ssh, "systemctl is-active local-ai-tools.service && sleep 2 && curl -s http://127.0.0.1:8001/health"))
+        safe_print(
+            run_remote_text(
+                ssh,
+                "systemctl is-active local-ai-tools.service && "
+                "sleep 2 && curl -s http://127.0.0.1:8001/health",
+                timeout=120,
+            )
+        )
     finally:
         ssh.close()
 

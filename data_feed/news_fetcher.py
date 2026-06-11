@@ -9,24 +9,52 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
-from xml.etree import ElementTree
 
 import httpx
 import structlog
+from defusedxml import ElementTree
 
 from config.settings import settings
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
 
 # Known crypto symbol patterns for extraction
 CRYPTO_KEYWORDS = [
-    "BTC", "Bitcoin", "ETH", "Ethereum", "SOL", "Solana", "BNB", "XRP",
-    "DOGE", "Dogecoin", "ADA", "Cardano", "AVAX", "Avalanche", "DOT",
-    "Polkadot", "MATIC", "Polygon", "LINK", "Chainlink", "UNI", "Uniswap",
-    "USDT", "USDC", "DAI", "APT", "SUI", "ARB", "OP", "PEPE", "WIF",
+    "BTC",
+    "Bitcoin",
+    "ETH",
+    "Ethereum",
+    "SOL",
+    "Solana",
+    "BNB",
+    "XRP",
+    "DOGE",
+    "Dogecoin",
+    "ADA",
+    "Cardano",
+    "AVAX",
+    "Avalanche",
+    "DOT",
+    "Polkadot",
+    "MATIC",
+    "Polygon",
+    "LINK",
+    "Chainlink",
+    "UNI",
+    "Uniswap",
+    "USDT",
+    "USDC",
+    "DAI",
+    "APT",
+    "SUI",
+    "ARB",
+    "OP",
+    "PEPE",
+    "WIF",
 ]
 
 SYMBOL_ALIASES: dict[str, list[str]] = {
@@ -73,7 +101,12 @@ RSS_FEEDS = [
 
 EVENT_RULES: list[tuple[str, tuple[str, ...], float, int]] = [
     ("security", ("hack", "exploit", "drain", "stolen", "breach", "key compromise"), -0.85, 5),
-    ("regulatory", ("sec sues", "lawsuit", "ban", "charges", "settlement", "investigation"), -0.55, 4),
+    (
+        "regulatory",
+        ("sec sues", "lawsuit", "ban", "charges", "settlement", "investigation"),
+        -0.55,
+        4,
+    ),
     ("listing", ("listing", "will list", "new trading pairs", "launchpool", "launchpad"), 0.60, 4),
     ("delisting", ("delist", "remove trading", "suspend trading"), -0.75, 5),
     ("unlock", ("token unlock", "unlock schedule", "vesting"), -0.35, 3),
@@ -114,8 +147,7 @@ class NewsFetcher:
         self._articles: list[dict] = []
         self._max_cache = 500
         self._symbol_aliases: dict[str, set[str]] = {
-            base: {base, *aliases}
-            for base, aliases in SYMBOL_ALIASES.items()
+            base: {base, *aliases} for base, aliases in SYMBOL_ALIASES.items()
         }
         for keyword in CRYPTO_KEYWORDS:
             base = keyword.upper()
@@ -188,7 +220,8 @@ class NewsFetcher:
             "source": source,
             "title": title,
             "summary": summary[:500],
-            "symbols_mentioned": item.get("symbols_mentioned") or self._extract_symbols(f"{title} {summary}"),
+            "symbols_mentioned": item.get("symbols_mentioned")
+            or self._extract_symbols(f"{title} {summary}"),
             "sentiment_score": sentiment,
             "event_type": event["event_type"],
             "impact_level": event["impact_level"],
@@ -197,7 +230,7 @@ class NewsFetcher:
         }
 
     def _dedup_key(self, title: str) -> str:
-        return hashlib.md5(title.strip().lower().encode()).hexdigest()
+        return hashlib.sha256(title.strip().lower().encode()).hexdigest()
 
     async def fetch_cryptopanic(self) -> list[dict]:
         """Fetch news from CryptoPanic free API.
@@ -205,7 +238,7 @@ class NewsFetcher:
         CryptoPanic free tier provides recent news without an API key,
         but with rate limits. If API key present, use authenticated endpoint.
         """
-        articles = []
+        articles: list[dict[str, Any]] = []
         try:
             client = await self._get_client()
             # Public API endpoint for recent posts
@@ -218,7 +251,7 @@ class NewsFetcher:
             if not token:
                 return articles
             params["auth_token"] = token
-            headers = {}
+            headers: dict[str, str] = {}
             # Note: CryptoPanic free tier has an auth_token from their web app
             # For production, get a proper API key at cryptopanic.com/developers
 
@@ -236,23 +269,28 @@ class NewsFetcher:
                     currencies = post.get("currencies", [])
                     symbols = [c.get("code", "") for c in currencies] if currencies else []
 
-                    articles.append(self._normalize_article({
-                        "title": title,
-                        "summary": post.get("body", "")[:500] if post.get("body") else "",
-                        "url": post.get("url", ""),
-                        "symbols_mentioned": symbols or self._extract_symbols(title),
-                        "published_at": post.get("published_at"),
-                    }, "cryptopanic"))
+                    articles.append(
+                        self._normalize_article(
+                            {
+                                "title": title,
+                                "summary": post.get("body", "")[:500] if post.get("body") else "",
+                                "url": post.get("url", ""),
+                                "symbols_mentioned": symbols or self._extract_symbols(title),
+                                "published_at": post.get("published_at"),
+                            },
+                            "cryptopanic",
+                        )
+                    )
             else:
                 logger.debug("cryptopanic fetch failed", status=resp.status_code)
         except Exception as e:
-            logger.debug("cryptopanic error", error=str(e))
+            logger.debug("cryptopanic error", error=safe_error_text(e))
 
         return articles
 
     async def fetch_rss(self, feed_url: str) -> list[dict]:
         """Fetch and parse an RSS feed."""
-        articles = []
+        articles: list[dict[str, Any]] = []
         try:
             client = await self._get_client()
             resp = await client.get(feed_url)
@@ -285,16 +323,21 @@ class NewsFetcher:
                     continue
 
                 source_name = feed_url.split("//")[-1].split("/")[0]
-                articles.append(self._normalize_article({
-                    "title": title,
-                    "summary": description,
-                    "url": link,
-                    "symbols_mentioned": self._extract_symbols(f"{title} {description}"),
-                    "published_at": pub_date,
-                }, source_name))
+                articles.append(
+                    self._normalize_article(
+                        {
+                            "title": title,
+                            "summary": description,
+                            "url": link,
+                            "symbols_mentioned": self._extract_symbols(f"{title} {description}"),
+                            "published_at": pub_date,
+                        },
+                        source_name,
+                    )
+                )
 
         except Exception as e:
-            logger.debug("rss fetch error", url=feed_url, error=str(e))
+            logger.debug("rss fetch error", url=feed_url, error=safe_error_text(e))
 
         return articles
 
@@ -322,10 +365,7 @@ class NewsFetcher:
                     if not isinstance(item, dict):
                         continue
                     title = str(
-                        item.get("title")
-                        or item.get("annTitle")
-                        or item.get("detailsTitle")
-                        or ""
+                        item.get("title") or item.get("annTitle") or item.get("detailsTitle") or ""
                     ).strip()
                     if not title:
                         continue
@@ -342,17 +382,24 @@ class NewsFetcher:
                         or item.get("createdTime")
                         or item.get("created")
                     )
-                    summary = str(item.get("summary") or item.get("desc") or item.get("content") or "")[:500]
-                    articles.append(self._normalize_article({
-                        "title": title,
-                        "summary": summary,
-                        "url": url,
-                        "symbols_mentioned": self._extract_symbols(f"{title} {summary}"),
-                        "published_at": self._parse_millis_time(published),
-                        "event_type": item.get("annType") or "okx_announcement",
-                    }, "okx_announcements"))
+                    summary = str(
+                        item.get("summary") or item.get("desc") or item.get("content") or ""
+                    )[:500]
+                    articles.append(
+                        self._normalize_article(
+                            {
+                                "title": title,
+                                "summary": summary,
+                                "url": url,
+                                "symbols_mentioned": self._extract_symbols(f"{title} {summary}"),
+                                "published_at": self._parse_millis_time(published),
+                                "event_type": item.get("annType") or "okx_announcement",
+                            },
+                            "okx_announcements",
+                        )
+                    )
         except Exception as e:
-            logger.debug("okx announcements error", error=str(e))
+            logger.debug("okx announcements error", error=safe_error_text(e))
         return articles
 
     async def fetch_coinmarketcal(self) -> list[dict]:
@@ -363,8 +410,8 @@ class NewsFetcher:
         articles: list[dict] = []
         try:
             client = await self._get_client()
-            since = datetime.now(timezone.utc).date().isoformat()
-            until = (datetime.now(timezone.utc) + timedelta(days=14)).date().isoformat()
+            since = datetime.now(UTC).date().isoformat()
+            until = (datetime.now(UTC) + timedelta(days=14)).date().isoformat()
             resp = await client.get(
                 "https://developers.coinmarketcal.com/v1/events",
                 headers={"x-api-key": token, "Accept": "application/json"},
@@ -396,15 +443,21 @@ class NewsFetcher:
                 key = url or self._dedup_key(f"coinmarketcal:{title}:{','.join(symbols)}")
                 if not self._remember_dedup(key):
                     continue
-                articles.append(self._normalize_article({
-                    "title": f"[Event] {title}",
-                    "summary": summary,
-                    "url": url,
-                    "symbols_mentioned": symbols or self._extract_symbols(f"{title} {summary}"),
-                    "published_at": item.get("date_event") or item.get("created_date"),
-                }, "coinmarketcal"))
+                articles.append(
+                    self._normalize_article(
+                        {
+                            "title": f"[Event] {title}",
+                            "summary": summary,
+                            "url": url,
+                            "symbols_mentioned": symbols
+                            or self._extract_symbols(f"{title} {summary}"),
+                            "published_at": item.get("date_event") or item.get("created_date"),
+                        },
+                        "coinmarketcal",
+                    )
+                )
         except Exception as e:
-            logger.debug("coinmarketcal error", error=str(e))
+            logger.debug("coinmarketcal error", error=safe_error_text(e))
         return articles
 
     async def fetch_newsapi_crypto(self) -> list[dict]:
@@ -437,15 +490,24 @@ class NewsFetcher:
                 if not self._remember_dedup(url or self._dedup_key(f"newsapi:{title}")):
                     continue
                 source = item.get("source") if isinstance(item.get("source"), dict) else {}
-                articles.append(self._normalize_article({
-                    "title": title,
-                    "summary": str(item.get("description") or item.get("content") or "")[:500],
-                    "url": url,
-                    "symbols_mentioned": self._extract_symbols(f"{title} {item.get('description') or ''}"),
-                    "published_at": item.get("publishedAt"),
-                }, f"newsapi:{source.get('name') or 'unknown'}"))
+                articles.append(
+                    self._normalize_article(
+                        {
+                            "title": title,
+                            "summary": str(item.get("description") or item.get("content") or "")[
+                                :500
+                            ],
+                            "url": url,
+                            "symbols_mentioned": self._extract_symbols(
+                                f"{title} {item.get('description') or ''}"
+                            ),
+                            "published_at": item.get("publishedAt"),
+                        },
+                        f"newsapi:{source.get('name') or 'unknown'}",
+                    )
+                )
         except Exception as e:
-            logger.debug("newsapi error", error=str(e))
+            logger.debug("newsapi error", error=safe_error_text(e))
         return articles
 
     async def fetch_all(self) -> list[dict]:
@@ -455,9 +517,7 @@ class NewsFetcher:
             self.fetch_okx_announcements(),
             self.fetch_coinmarketcal(),
             self.fetch_newsapi_crypto(),
-        ] + [
-            self.fetch_rss(url) for url in RSS_FEEDS
-        ]
+        ] + [self.fetch_rss(url) for url in RSS_FEEDS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_articles = []
@@ -497,15 +557,39 @@ class NewsFetcher:
             number = float(value)
             if number > 1_000_000_000_000:
                 number /= 1000.0
-            return datetime.fromtimestamp(number, tz=timezone.utc).isoformat()
+            return datetime.fromtimestamp(number, tz=UTC).isoformat()
         except (TypeError, ValueError, OSError):
             return str(value)
 
     def _lexicon_sentiment(self, text: str) -> float:
         lower = str(text or "").lower()
-        positive = ("surge", "rally", "gain", "bull", "breakout", "record", "approval", "partnership", "launch", "up")
-        negative = ("crash", "hack", "lawsuit", "bear", "dump", "plunge", "ban", "exploit", "down", "liquidation")
-        score = sum(1 for word in positive if word in lower) - sum(1 for word in negative if word in lower)
+        positive = (
+            "surge",
+            "rally",
+            "gain",
+            "bull",
+            "breakout",
+            "record",
+            "approval",
+            "partnership",
+            "launch",
+            "up",
+        )
+        negative = (
+            "crash",
+            "hack",
+            "lawsuit",
+            "bear",
+            "dump",
+            "plunge",
+            "ban",
+            "exploit",
+            "down",
+            "liquidation",
+        )
+        score = sum(1 for word in positive if word in lower) - sum(
+            1 for word in negative if word in lower
+        )
         if score == 0:
             return 0.0
         return max(min(score / 4.0, 1.0), -1.0)

@@ -7,12 +7,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from data_feed.feature_vector import FeatureVector
 
 
-class Action(str, Enum):
+class Action(StrEnum):
     LONG = "long"
     SHORT = "short"
     CLOSE_LONG = "close_long"
@@ -62,7 +65,7 @@ class DecisionOutput:
     stop_loss_pct: float = 0.05
     take_profit_pct: float = 0.10
     cross_check_for: dict[str, Any] | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     raw_response: dict | None = None  # for debugging LLM models
     feature_snapshot: dict | None = None  # features at decision time
 
@@ -109,7 +112,7 @@ class AbstractAIModel(ABC):
         """Load models, connect to APIs, warm up caches."""
 
     @abstractmethod
-    async def decide(self, features: "FeatureVector", context: dict[str, Any]) -> DecisionOutput:
+    async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
         """Given current market state and context, produce a trading decision.
 
         Args:

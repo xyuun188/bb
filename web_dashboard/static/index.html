@@ -17,7 +17,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260605attribution-layout">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260609server-monitor">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -709,8 +709,16 @@
                     <span class="card-title">风控告警</span>
                     <span class="card-subtitle" id="alert-count">0</span>
                 </div>
-                <div id="risk-alerts">
-                    <div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无告警</div>
+                <div class="risk-alert-panel">
+                    <div class="risk-alert-summary" id="risk-alert-summary"></div>
+                    <div class="risk-alert-list-head">
+                        <span>最近风险事件</span>
+                        <em>按时间倒序显示，保留最近 50 条，每页 10 条</em>
+                    </div>
+                    <div class="risk-alert-list" id="risk-alerts" role="list">
+                        <div class="risk-alert-empty">暂无告警</div>
+                    </div>
+                    <div class="pagination risk-alert-pagination" id="risk-alert-pagination" style="display:none;"></div>
                 </div>
             </div>
         </div>
@@ -1101,11 +1109,21 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">工具服务地址</label>
-                            <input type="text" class="form-input" id="cfg-local-ai-tools-api-base" placeholder="http://175.155.64.171:31841">
+                            <input type="text" class="form-input" id="cfg-local-ai-tools-api-base" placeholder="例如：http://127.0.0.1:8001 或你的服务器地址">
                         </div>
                         <div class="form-group" style="margin-top:10px;">
                             <label class="form-label">单项超时秒数</label>
                             <input type="number" class="form-input" id="cfg-local-ai-tools-timeout" min="0.2" max="15" step="0.1" placeholder="2.5">
+                        </div>
+                        <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:10px;">
+                            <div class="form-group">
+                                <label class="form-label">熔断失败次数</label>
+                                <input type="number" class="form-input" id="cfg-local-ai-tools-breaker-failures" min="1" max="20" step="1" placeholder="3">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">熔断冷却秒数</label>
+                                <input type="number" class="form-input" id="cfg-local-ai-tools-breaker-cooldown" min="5" max="3600" step="5" placeholder="45">
+                            </div>
                         </div>
                     </div>
                     <div class="settings-panel">
@@ -1122,7 +1140,7 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">复核 API Base</label>
-                            <input type="text" class="form-input" id="cfg-high-risk-review-api-base" placeholder="http://175.155.64.171:31841/v1">
+                            <input type="text" class="form-input" id="cfg-high-risk-review-api-base" placeholder="线上模型 API Base">
                         </div>
                         <div class="form-group" style="margin-top:10px;">
                             <label class="form-label">复核 API Key</label>
@@ -1130,7 +1148,27 @@
                         </div>
                         <div class="form-group" style="margin-top:10px;">
                             <label class="form-label">复核模型名</label>
-                            <input type="text" class="form-input" id="cfg-high-risk-review-model" placeholder="deepseek-r1-distill-qwen-32b-trade">
+                            <input type="text" class="form-input" id="cfg-high-risk-review-model" placeholder="deepseek-reasoner">
+                        </div>
+                        <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:10px;">
+                            <div class="form-group">
+                                <label class="form-label">复核超时秒数</label>
+                                <input type="number" class="form-input" id="cfg-high-risk-review-timeout" min="5" max="120" step="1" placeholder="30">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">最大输出 Token</label>
+                                <input type="number" class="form-input" id="cfg-high-risk-review-max-tokens" min="160" max="600" step="20" placeholder="480">
+                            </div>
+                        </div>
+                        <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:10px;">
+                            <div class="form-group">
+                                <label class="form-label">熔断失败次数</label>
+                                <input type="number" class="form-input" id="cfg-high-risk-review-breaker-failures" min="1" max="20" step="1" placeholder="2">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">熔断冷却秒数</label>
+                                <input type="number" class="form-input" id="cfg-high-risk-review-breaker-cooldown" min="5" max="3600" step="5" placeholder="120">
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1205,6 +1243,6 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-<script src="/static/js/dashboard.js?v=20260605attribution"></script>
+<script src="/static/js/dashboard.js?v=20260609evidence-gate-probe"></script>
 </body>
 </html>

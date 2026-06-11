@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
+from core.safe_output import safe_error_text
+
+if TYPE_CHECKING:
+    from data_feed.feature_vector import FeatureVector
 
 logger = structlog.get_logger(__name__)
 
@@ -41,17 +45,24 @@ class FinBERTSentimentAnalyzer:
             self._available = True
             logger.info("finbert model loaded", model=self._model_name)
         except Exception as e:
-            logger.warning("finbert model not available, using cached sentiment", error=str(e))
+            logger.warning(
+                "finbert model not available, using cached sentiment",
+                error=safe_error_text(e),
+            )
             self._available = False
 
     def _load_model(self) -> None:
-        from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
         tokenizer = AutoTokenizer.from_pretrained(self._model_name)
         model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
-        self._pipeline = pipeline(
-            "sentiment-analysis", model=model, tokenizer=tokenizer,
-            truncation=True, max_length=512,
+        pipeline_factory = cast(Any, pipeline)
+        self._pipeline = pipeline_factory(
+            "sentiment-analysis",
+            model=model,
+            tokenizer=tokenizer,
+            truncation=True,
+            max_length=512,
         )
 
     def _score_text(self, text: str) -> float:
@@ -108,11 +119,14 @@ class FinBERTDecisionModel(AbstractAIModel):
             self._analyzer = FinBERTSentimentAnalyzer()
             await self._analyzer.initialize()
         except Exception as e:
-            logger.warning("finbert init failed, using cached sentiment", error=str(e))
+            logger.warning(
+                "finbert init failed, using cached sentiment",
+                error=safe_error_text(e),
+            )
             self._analyzer = None
         self._initialized = True
 
-    async def decide(self, features: "FeatureVector", context: dict[str, Any]) -> DecisionOutput:
+    async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
         news_sent = features.news_sentiment_avg
         social_sent = features.social_sentiment_avg
         mention_count = features.social_mention_count
@@ -136,7 +150,9 @@ class FinBERTDecisionModel(AbstractAIModel):
         elif mention_count > 50 and abs(news_sent) < 0.1:
             reasoning = f"High social activity ({mention_count} mentions) but neutral. Holding."
         else:
-            reasoning = f"Neutral sentiment (news={news_sent:.2f}, social={social_sent:.2f}). Holding."
+            reasoning = (
+                f"Neutral sentiment (news={news_sent:.2f}, social={social_sent:.2f}). Holding."
+            )
 
         abs_sent = (abs(news_sent) + abs(social_sent)) / 2
         position_size = min(abs_sent * 0.3, 0.15)

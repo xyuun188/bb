@@ -9,24 +9,28 @@ Run: python scripts/run_live_trading.py
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import structlog
 import uvicorn
 
+from ai_brain.model_factory import create_models_from_config
+from ai_brain.model_registry import ModelRegistry
 from config.settings import settings
 from core.logging_config import setup_logging
+from core.safe_output import safe_error_text
+from core.secret_utils import secret_state
 from core.trading_mode import mode_manager
-from db.session import init_db, close_db
-from web_dashboard.app import app
-from web_dashboard.api.dashboard import set_services
-
-from ai_brain.model_registry import ModelRegistry
-from ai_brain.model_factory import create_models_from_config
+from db.session import close_db, init_db
+from services.competition_service import CompetitionService
 from services.data_service import DataService
 from services.trading_service import TradingService
-from services.competition_service import CompetitionService
-from services.notification_service import NotificationService
+from web_dashboard.api.dashboard import set_services
+from web_dashboard.app import app
+
+logger = structlog.get_logger("live_trading")
 
 
 async def main():
@@ -39,8 +43,8 @@ async def main():
     # Confirm before proceeding
     if not settings.okx_demo:
         print("\n*** WARNING: LIVE TRADING MODE (REAL FUNDS) ***")
-        print(f"OKX API Key: {settings.okx_api_key[:8]}...")
-        confirm = input("Type 'YES' to confirm live trading: ")
+        print(f"OKX API Key: {secret_state(settings.okx_api_key)}")
+        confirm = await asyncio.to_thread(input, "Type 'YES' to confirm live trading: ")
         if confirm != "YES":
             print("Aborted.")
             return
@@ -80,15 +84,17 @@ async def main():
         mode_manager._live_model_name = "llm_agent"
         await mode_manager.switch_to_live("llm_agent")
 
-    notification_service = NotificationService()
-
     # Redis
-    redis = None
+    redis: Any = None
     try:
         import fakeredis.aioredis
-        redis = await fakeredis.aioredis.create_redis_pool()
-    except Exception:
-        pass
+
+        redis = fakeredis.aioredis.FakeRedis()
+    except Exception as exc:
+        logger.warning(
+            "fakeredis unavailable; continuing without redis",
+            error=safe_error_text(exc),
+        )
 
     trading_service = TradingService(
         model_registry=model_registry,
@@ -108,14 +114,15 @@ async def main():
             try:
                 await competition_service.evaluate_all_models()
             except Exception as e:
-                import structlog
-                structlog.get_logger("live_trading").error("periodic eval failed", error=str(e))
+                logger.error("periodic eval failed", error=safe_error_text(e))
             await asyncio.sleep(3600)
 
     eval_task = asyncio.create_task(periodic_evaluation())
 
     print(f"\nDashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
-    config = uvicorn.Config(app, host=settings.dashboard_host, port=settings.dashboard_port, log_level="info")
+    config = uvicorn.Config(
+        app, host=settings.dashboard_host, port=settings.dashboard_port, log_level="info"
+    )
     server = uvicorn.Server(config)
 
     try:

@@ -8,7 +8,7 @@ exchange confirm -> local sync.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -87,13 +87,13 @@ def append_decision_stage(
     if not isinstance(stages, list):
         stages = []
 
-    event = {
+    event: dict[str, Any] = {
         "stage": stage,
         "stage_label": STAGE_LABELS.get(stage, stage),
         "status": status,
         "status_label": STATUS_LABELS.get(status, status),
         "reason": str(reason or "").strip(),
-        "at": (at or datetime.now(timezone.utc)).isoformat(),
+        "at": (at or datetime.now(UTC)).isoformat(),
     }
     if data:
         event["data"] = data
@@ -142,14 +142,16 @@ def summarize_decision_stages(stages: list[dict[str, Any]] | None) -> dict[str, 
     for stage in ordered:
         event = latest_by_stage[stage]
         status = str(event.get("status") or "")
-        by_stage.append({
-            "stage": stage,
-            "stage_label": event.get("stage_label") or STAGE_LABELS.get(stage, stage),
-            "status": status,
-            "status_label": event.get("status_label") or STATUS_LABELS.get(status, status),
-            "reason": event.get("reason") or "",
-            "at": event.get("at"),
-        })
+        by_stage.append(
+            {
+                "stage": stage,
+                "stage_label": event.get("stage_label") or STAGE_LABELS.get(stage, stage),
+                "status": status,
+                "status_label": event.get("status_label") or STATUS_LABELS.get(status, status),
+                "reason": event.get("reason") or "",
+                "at": event.get("at"),
+            }
+        )
         if status in {DecisionStageStatus.PASSED, DecisionStageStatus.COMPLETED}:
             summary["completed_stage_count"] += 1
         if status == DecisionStageStatus.BLOCKED:

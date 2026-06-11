@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -17,15 +17,15 @@ def beijing_day_bounds(now: datetime | None = None) -> tuple[str, datetime, date
     """Return Beijing date, Beijing midnight, and the same instant in UTC."""
     now_local = now.astimezone(BEIJING_TZ) if now else datetime.now(BEIJING_TZ)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_local.date().isoformat(), start_local, start_local.astimezone(timezone.utc)
+    return start_local.date().isoformat(), start_local, start_local.astimezone(UTC)
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 async def apply_daily_equity_baseline(

@@ -4,14 +4,19 @@ System control API endpoints — mode switching, pause/resume, model selection.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config.settings import ENSEMBLE_TRADER_NAME
-from core.trading_mode import TradingMode, mode_manager
+from core.safe_output import safe_error_text
+from core.trading_mode import mode_manager
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 
 class ModeSwitchRequest(BaseModel):
@@ -64,8 +69,6 @@ def _symbol_to_okx_inst_id(symbol: str, inst_type: str = "SWAP") -> str:
 
 async def _fetch_okx_public_klines(symbol: str, bar: str, limit: int) -> list[dict]:
     """Fetch OKX public candles directly so charts work without the data service."""
-    from datetime import datetime, timezone
-
     import httpx
 
     inst_id = _symbol_to_okx_inst_id(symbol, inst_type="SWAP")
@@ -85,7 +88,7 @@ async def _fetch_okx_public_klines(symbol: str, bar: str, limit: int) -> list[di
     rows = sorted(rows, key=lambda c: int(c[0]))
     return [
         {
-            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc).isoformat(),
+            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=UTC).isoformat(),
             "open": float(c[1]),
             "high": float(c[2]),
             "low": float(c[3]),
@@ -113,9 +116,9 @@ async def switch_mode(req: ModeSwitchRequest):
         }
     else:
         # Live mode uses the unified ensemble execution account.
-        if not mode_manager.live_model_name:
-            mode_manager._live_model_name = ENSEMBLE_TRADER_NAME
-        await mode_manager.switch_to_live(mode_manager.live_model_name)
+        live_model = mode_manager.live_model_name or ENSEMBLE_TRADER_NAME
+        mode_manager._live_model_name = live_model
+        await mode_manager.switch_to_live(live_model)
         return {
             "status": "ok",
             "message": f"Switched to live trading mode (model: {mode_manager.live_model_name})",
@@ -194,12 +197,15 @@ async def manual_trade(req: ManualTradeRequest):
     # Broadcast result via WebSocket
     try:
         from web_dashboard.app import ws_manager
-        await ws_manager.broadcast({
-            "type": "manual_trade_result",
-            **result,
-        })
-    except Exception:
-        pass
+
+        await ws_manager.broadcast(
+            {
+                "type": "manual_trade_result",
+                **result,
+            }
+        )
+    except Exception as exc:
+        logger.debug("manual trade websocket broadcast failed", error=safe_error_text(exc))
 
     return result
 
@@ -207,36 +213,41 @@ async def manual_trade(req: ManualTradeRequest):
 @router.get("/market/klines/{symbol:path}")
 async def get_klines(symbol: str, timeframe: str = "1H", limit: int = 100):
     """Get recent kline data for charting via OKX official SDK."""
-    import structlog
-    log = structlog.get_logger(__name__)
-
     bar = _normalize_okx_bar(timeframe)
     ccxt_timeframe = _okx_bar_to_ccxt_timeframe(bar)
 
     data = []
     try:
         from data_feed.okx_sdk_client import fetch_klines
+
         data = await fetch_klines(symbol, bar=bar, limit=limit, inst_type="SWAP")
-    except Exception as e:
-        log.warning("failed to fetch klines from OKX SDK", symbol=symbol, error=str(e))
+    except Exception as exc:
+        logger.warning(
+            "failed to fetch klines from OKX SDK",
+            symbol=symbol,
+            error=safe_error_text(exc),
+        )
 
     # Public OKX REST fallback works even when the trading/data services are stopped.
     if not data:
         try:
             data = await _fetch_okx_public_klines(symbol, bar=bar, limit=limit)
-        except Exception as e:
-            log.warning("failed to fetch klines from OKX public REST", symbol=symbol, error=str(e))
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch klines from OKX public REST",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
 
     # Fallback to CCXT if SDK fails
     if not data and _dash._data_service and _dash._data_service.rest_client:
-        from datetime import datetime, timezone
         try:
             raw_klines = await _dash._data_service.rest_client.fetch_ohlcv(
                 symbol, ccxt_timeframe, limit
             )
             data = [
                 {
-                    "time": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc).isoformat(),
+                    "time": datetime.fromtimestamp(k[0] / 1000, tz=UTC).isoformat(),
                     "open": k[1],
                     "high": k[2],
                     "low": k[3],
@@ -245,8 +256,12 @@ async def get_klines(symbol: str, timeframe: str = "1H", limit: int = 100):
                 }
                 for k in raw_klines
             ]
-        except Exception as e:
-            log.warning("failed to fetch klines from CCXT fallback", symbol=symbol, error=str(e))
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch klines from CCXT fallback",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
 
     # Final fallback: DB cache
     if not data:
@@ -271,8 +286,12 @@ async def get_klines(symbol: str, timeframe: str = "1H", limit: int = 100):
                 }
                 for k in klines
             ]
-        except Exception as e:
-            log.warning("failed to fetch klines from DB fallback", symbol=symbol, error=str(e))
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch klines from DB fallback",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
 
     return {
         "symbol": symbol,

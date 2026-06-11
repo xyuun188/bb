@@ -6,12 +6,12 @@ Computes decision accuracy by tracking whether executed decisions were profitabl
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
+from core.safe_output import safe_error_text
 from db.repositories.decision_repo import DecisionRepository
-from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 
 logger = structlog.get_logger(__name__)
@@ -39,7 +39,7 @@ class ModelEvaluator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("evaluation error", error=str(e))
+                logger.error("evaluation error", error=safe_error_text(e))
 
             await asyncio.sleep(300)  # Every 5 minutes
 
@@ -53,7 +53,7 @@ class ModelEvaluator:
             decision_repo = DecisionRepository(session)
 
             # Get recent executed decisions without outcomes
-            cutoff = datetime.now(timezone.utc) - self._evaluation_gap
+            cutoff = datetime.now(UTC) - self._evaluation_gap
             decisions = await decision_repo.find_by(
                 was_executed=True,
                 outcome=None,
@@ -65,14 +65,15 @@ class ModelEvaluator:
                     continue
 
                 # Simple evaluation: if decision was "long" and price went up, it's a profit
-                if (
-                    decision.feature_snapshot
-                    and decision.execution_price
-                    and self._price_provider
-                ):
+                if decision.feature_snapshot and decision.execution_price and self._price_provider:
                     try:
                         current_price = await self._price_provider(decision.symbol)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug(
+                            "price provider failed during model evaluation",
+                            symbol=decision.symbol,
+                            error=safe_error_text(exc),
+                        )
                         continue
 
                     if current_price is None:

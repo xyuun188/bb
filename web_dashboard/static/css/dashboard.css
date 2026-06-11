@@ -1151,7 +1151,7 @@ body {
     border-bottom: 1px solid var(--border);
 }
 .profit-attribution-table {
-    min-width: 1040px;
+    min-width: 1240px;
     table-layout: fixed;
 }
 .profit-attribution-table thead th {
@@ -1160,23 +1160,31 @@ body {
     z-index: 1;
 }
 .profit-attribution-table th:nth-child(1),
-.profit-attribution-table td:nth-child(1) { width: 92px; }
+.profit-attribution-table td:nth-child(1) { width: 104px; }
 .profit-attribution-table th:nth-child(2),
-.profit-attribution-table td:nth-child(2) { width: 92px; }
+.profit-attribution-table td:nth-child(2) { width: 94px; }
 .profit-attribution-table th:nth-child(3),
-.profit-attribution-table td:nth-child(3) { width: 64px; }
+.profit-attribution-table td:nth-child(3) { width: 66px; }
 .profit-attribution-table th:nth-child(4),
-.profit-attribution-table td:nth-child(4) { width: 92px; }
+.profit-attribution-table td:nth-child(4) { width: 90px; }
 .profit-attribution-table th:nth-child(5),
-.profit-attribution-table td:nth-child(5) { width: 72px; }
+.profit-attribution-table td:nth-child(5) { width: 74px; }
+.profit-attribution-table th:nth-child(6),
+.profit-attribution-table td:nth-child(6) { width: 238px; }
+.profit-attribution-table th:nth-child(7),
+.profit-attribution-table td:nth-child(7) { width: 440px; }
+.profit-attribution-table th:nth-child(8),
+.profit-attribution-table td:nth-child(8) { width: 190px; }
 .profit-attribution-table td {
-    vertical-align: top;
-    line-height: 1.55;
-    overflow-wrap: anywhere;
+    vertical-align: middle;
+    line-height: 1.15;
+    padding-top: 5px;
+    padding-bottom: 5px;
+    overflow-wrap: normal;
 }
 .profit-attribution-main-reason {
     display: block;
-    margin-bottom: 4px;
+    margin-bottom: 0;
     color: var(--text);
 }
 .profit-attribution-note {
@@ -1198,6 +1206,204 @@ body {
     padding: 10px 0 0;
 }
 
+.profit-attribution-time,
+.profit-attribution-symbol,
+.profit-attribution-side,
+.profit-attribution-main-reason {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.profit-attribution-side {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 700;
+}
+.profit-attribution-side.long {
+    color: var(--green);
+}
+.profit-attribution-side.short {
+    color: var(--red);
+}
+.profit-attribution-pnl {
+    font-weight: 700;
+    white-space: nowrap;
+}
+.profit-attribution-hold {
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+.profit-attribution-reason-cell {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+.profit-attribution-reason-cell em {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-style: normal;
+    line-height: 1.2;
+}
+.profit-attribution-note-list {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: 0;
+    overflow: hidden;
+}
+.profit-attribution-note-list span {
+    max-width: 112px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.profit-attribution-evidence-cell {
+    padding-right: 6px;
+    line-height: 1;
+    height: 38px;
+}
+.profit-attribution-evidence-list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 5px;
+    max-width: 100%;
+}
+.profit-attribution-evidence-rail {
+    display: grid;
+    grid-template-rows: repeat(2, 16px);
+    gap: 2px;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: hidden;
+    overflow-y: hidden;
+}
+.profit-attribution-evidence-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    height: 16px;
+}
+.profit-attribution-evidence-count {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+.profit-attribution-evidence-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 0 auto;
+    max-width: 82px;
+    height: 16px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    line-height: 1;
+}
+.profit-attribution-evidence-chip.evidence-shadow {
+    max-width: 112px;
+}
+.profit-attribution-evidence-chip.evidence-score {
+    max-width: 88px;
+}
+.profit-attribution-evidence-chip b,
+.profit-attribution-evidence-chip em,
+.profit-attribution-evidence-chip small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.profit-attribution-evidence-chip b {
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: 600;
+}
+.profit-attribution-evidence-chip em {
+    color: var(--text);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 700;
+}
+.profit-attribution-evidence-chip small {
+    color: var(--text-dim);
+    font-size: 9px;
+    max-width: 34px;
+}
+.profit-attribution-evidence-chip.long em {
+    color: var(--green);
+}
+.profit-attribution-evidence-chip.short em {
+    color: var(--red);
+}
+.profit-attribution-evidence-chip.hold em {
+    color: var(--yellow);
+}
+.profit-attribution-evidence-chip.profit-attribution-evidence-score {
+    max-width: 86px;
+}
+.profit-attribution-evidence-score.good {
+    color: var(--green);
+}
+.profit-attribution-evidence-score.good em {
+    color: var(--green);
+}
+.profit-attribution-evidence-score.warn {
+    color: var(--yellow);
+}
+.profit-attribution-evidence-score.warn em {
+    color: var(--yellow);
+}
+.profit-attribution-evidence-score.bad {
+    color: var(--red);
+}
+.profit-attribution-evidence-score.bad em {
+    color: var(--red);
+}
+.profit-attribution-no-evidence {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+.profit-attribution-chain {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+.profit-attribution-chain strong {
+    color: var(--text);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.profit-attribution-chain span {
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .trade-reflection-table-wrap {
     max-height: none;
     overflow: auto;
@@ -1207,7 +1413,7 @@ body {
     table-layout: fixed;
 }
 .trade-reflection-table th:nth-child(1),
-.trade-reflection-table td:nth-child(1) { width: 92px; }
+.trade-reflection-table td:nth-child(1) { width: 72px; }
 .trade-reflection-table th:nth-child(2),
 .trade-reflection-table td:nth-child(2) { width: 96px; }
 .trade-reflection-table th:nth-child(3),
@@ -1227,8 +1433,20 @@ body {
 }
 .trade-reflection-time {
     font-size: 10px;
+    line-height: 1.2;
     color: var(--text-muted);
+    white-space: normal;
+    font-variant-numeric: tabular-nums;
+}
+.trade-reflection-time span,
+.trade-reflection-time em {
+    display: block;
     white-space: nowrap;
+}
+.trade-reflection-time em {
+    margin-top: 2px;
+    color: var(--text-dim);
+    font-style: normal;
 }
 @media (max-width: 1180px) {
     .profit-attribution-summary .opening-funnel-kpis {
@@ -1625,6 +1843,225 @@ select.form-input { cursor: pointer; }
 .toggle input:checked + .toggle-slider::before { background: #fff; transform: translateX(16px); }
 
 /* ── Alert ── */
+.risk-alert-panel {
+    display: grid;
+    gap: 12px;
+}
+
+.risk-alert-summary {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.risk-alert-kpi {
+    min-height: 64px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-panel);
+}
+
+.risk-alert-kpi span {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.risk-alert-kpi strong {
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1.2;
+}
+
+.risk-alert-kpi-critical {
+    border-color: rgba(239,68,68,0.34);
+    background: var(--red-dim);
+}
+
+.risk-alert-kpi-warning {
+    border-color: rgba(245,158,11,0.34);
+    background: var(--accent-dim);
+}
+
+.risk-alert-list-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 2px;
+}
+
+.risk-alert-list-head span {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.risk-alert-list-head em {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: normal;
+}
+
+.risk-alert-list {
+    display: grid;
+    gap: 8px;
+}
+
+.risk-alert-empty {
+    padding: 28px 12px;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-panel);
+}
+
+.risk-alert-item {
+    display: grid;
+    gap: 9px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-muted);
+    border-radius: var(--radius);
+    background: var(--bg-panel);
+}
+
+.risk-alert-critical {
+    border-left-color: var(--red);
+    background: linear-gradient(90deg, var(--red-dim), var(--bg-panel) 44%);
+}
+
+.risk-alert-warning {
+    border-left-color: var(--accent);
+    background: linear-gradient(90deg, var(--accent-dim), var(--bg-panel) 44%);
+}
+
+.risk-alert-info {
+    border-left-color: var(--blue);
+}
+
+.risk-alert-head,
+.risk-alert-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.risk-alert-head {
+    justify-content: space-between;
+}
+
+.risk-alert-title {
+    flex-wrap: wrap;
+}
+
+.risk-alert-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--accent);
+}
+
+.risk-alert-critical .risk-alert-dot { background: var(--red); }
+.risk-alert-info .risk-alert-dot { background: var(--blue); }
+
+.risk-alert-title strong {
+    color: var(--text);
+    font-size: 14px;
+}
+
+.risk-alert-title span,
+.risk-alert-title em,
+.risk-alert-head time {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: normal;
+}
+
+.risk-alert-title em {
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-input);
+}
+
+.risk-alert-metrics {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(92px, 1fr));
+    gap: 6px;
+}
+
+.risk-alert-metric {
+    min-height: 46px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+}
+
+.risk-alert-metric span,
+.risk-alert-flow span {
+    display: block;
+    margin-bottom: 3px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.risk-alert-metric strong,
+.risk-alert-flow strong {
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.25;
+}
+
+.risk-alert-metric-good strong { color: var(--green); }
+.risk-alert-metric-bad strong { color: var(--red); }
+
+.risk-alert-flow {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+}
+
+.risk-alert-flow div {
+    min-width: 0;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-input) 70%, transparent);
+}
+
+.risk-alert-reason {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+}
+
+.risk-alert-reason span,
+.risk-alert-result {
+    min-width: 0;
+    padding: 8px;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.45;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-input) 72%, transparent);
+    overflow-wrap: anywhere;
+}
+
+.risk-alert-reason em {
+    display: inline-block;
+    margin-right: 6px;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-style: normal;
+}
+
 .alert-item {
     padding: 8px 12px; margin: 3px 0;
     border-radius: 5px; font-size: 12px;
@@ -1634,6 +2071,14 @@ select.form-input { cursor: pointer; }
 }
 .alert-critical { background: var(--red-dim); border-left-color: var(--red); color: #fca5a5; }
 .alert-warning { background: var(--accent-dim); border-left-color: var(--accent); color: #fde68a; }
+
+.trade-reflection-subtime {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.3;
+    white-space: normal;
+}
 
 /* ── Trade Mode Tabs ── */
 .trade-tabs {
@@ -2107,6 +2552,23 @@ select.form-input { cursor: pointer; }
         margin-bottom: 0;
         padding: 7px 9px;
     }
+    .risk-alert-summary,
+    .risk-alert-metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .risk-alert-flow,
+    .risk-alert-reason {
+        grid-template-columns: 1fr;
+    }
+    .risk-alert-head {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    .risk-alert-list-head {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+    }
     .main { padding: 12px; } 
     .exec-status-grid,
     .account-kv-grid { grid-template-columns: 1fr; }
@@ -2137,4 +2599,150 @@ select.form-input { cursor: pointer; }
     .opening-funnel-symbol-panel,
     .opening-funnel-symbol-panel .opening-funnel-list { max-height: none; overflow: visible; }
     .opening-funnel-table-wrap { max-height: 360px; flex: none; }
+}
+
+/* Profit attribution evidence column: compact two-line evidence rail. */
+.profit-attribution-empty {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px;
+}
+.profit-attribution-table {
+    min-width: 1180px;
+}
+.profit-attribution-table th:nth-child(6),
+.profit-attribution-table td:nth-child(6) { width: 218px; }
+.profit-attribution-table th:nth-child(7),
+.profit-attribution-table td:nth-child(7) { width: 390px; }
+.profit-attribution-table th:nth-child(8),
+.profit-attribution-table td:nth-child(8) { width: 176px; }
+.profit-attribution-evidence-cell {
+    height: 36px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    padding-right: 6px;
+    line-height: 1;
+    vertical-align: middle;
+}
+.profit-attribution-evidence-rail {
+    display: grid;
+    grid-template-rows: repeat(2, 16px);
+    gap: 2px;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+}
+.profit-attribution-evidence-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+    height: 16px;
+    overflow: hidden;
+}
+.profit-attribution-evidence-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 84px;
+    height: 16px;
+    padding: 0 5px;
+    line-height: 1;
+}
+.profit-attribution-evidence-chip.evidence-shadow {
+    max-width: 132px;
+}
+.profit-attribution-evidence-chip.evidence-score {
+    max-width: 92px;
+}
+.profit-attribution-evidence-chip b,
+.profit-attribution-evidence-chip em,
+.profit-attribution-evidence-chip small {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.profit-attribution-evidence-chip b {
+    flex: 0 0 auto;
+}
+.profit-attribution-evidence-chip em {
+    flex: 0 1 auto;
+}
+.profit-attribution-evidence-chip small {
+    flex: 0 1 auto;
+    max-width: 42px;
+}
+
+/* Final record-table polish: stable columns and dense two-line evidence. */
+.profit-attribution-table {
+    width: 100%;
+    min-width: 1060px;
+    table-layout: fixed;
+}
+.profit-attribution-table th,
+.profit-attribution-table td {
+    vertical-align: middle;
+}
+.profit-attribution-table th:nth-child(1),
+.profit-attribution-table td:nth-child(1) { width: 132px; }
+.profit-attribution-table th:nth-child(2),
+.profit-attribution-table td:nth-child(2) { width: 104px; }
+.profit-attribution-table th:nth-child(3),
+.profit-attribution-table td:nth-child(3) { width: 64px; }
+.profit-attribution-table th:nth-child(4),
+.profit-attribution-table td:nth-child(4) { width: 112px; }
+.profit-attribution-table th:nth-child(5),
+.profit-attribution-table td:nth-child(5) { width: 82px; }
+.profit-attribution-table th:nth-child(6),
+.profit-attribution-table td:nth-child(6) { width: 230px; }
+.profit-attribution-table th:nth-child(7),
+.profit-attribution-table td:nth-child(7) { width: 286px; }
+.profit-attribution-table th:nth-child(8),
+.profit-attribution-table td:nth-child(8) { width: 166px; }
+.profit-attribution-evidence-cell {
+    height: 37px;
+    max-height: 37px;
+    padding: 3px 6px 3px 0;
+}
+.profit-attribution-evidence-rail {
+    grid-template-rows: repeat(2, 17px);
+    gap: 2px;
+}
+.profit-attribution-evidence-row {
+    height: 17px;
+    gap: 4px;
+}
+.profit-attribution-evidence-chip {
+    max-width: 96px;
+    height: 17px;
+    border-radius: 6px;
+}
+.profit-attribution-evidence-chip.evidence-ai,
+.profit-attribution-evidence-chip.evidence-ml {
+    max-width: 108px;
+}
+.profit-attribution-evidence-chip.evidence-shadow {
+    max-width: 190px;
+}
+.profit-attribution-evidence-chip.evidence-server,
+.profit-attribution-evidence-chip.evidence-timeseries,
+.profit-attribution-evidence-chip.evidence-sentiment {
+    max-width: 82px;
+}
+.profit-attribution-evidence-chip.missing {
+    max-width: 108px;
+    border-style: dashed;
+    border-color: var(--border);
+    background: transparent;
+    color: var(--text-muted);
+}
+.profit-attribution-evidence-chip.missing em {
+    color: var(--text-muted);
+}
+.profit-attribution-evidence-chip.missing small {
+    display: none;
 }

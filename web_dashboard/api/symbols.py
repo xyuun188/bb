@@ -4,13 +4,16 @@ Symbol management API — list available, add/remove monitored symbols.
 
 from __future__ import annotations
 
+import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config.settings import settings
+from core.safe_output import safe_error_text
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 
 class SymbolsUpdateRequest(BaseModel):
@@ -27,19 +30,20 @@ async def get_available_symbols():
     # Primary: OKX official SDK
     try:
         from data_feed.okx_sdk_client import get_available_symbols as sdk_symbols
+
         symbols = await sdk_symbols()
         if symbols:
             return {"count": len(symbols), "symbols": symbols}
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("OKX SDK available symbols fallback", error=safe_error_text(exc))
 
     # Fallback: DataService (CCXT)
     if _dash._data_service:
         try:
             symbols = await _dash._data_service.get_available_symbols()
             return {"count": len(symbols), "symbols": symbols}
-        except Exception as e:
-            return {"count": 0, "symbols": [], "error": str(e)}
+        except Exception as exc:
+            return {"count": 0, "symbols": [], "error": safe_error_text(exc)}
     return {"count": 0, "symbols": [], "error": "Data service not initialized"}
 
 
@@ -68,14 +72,14 @@ async def update_symbols(req: SymbolsUpdateRequest):
         for sym in new_symbols - old_symbols:
             try:
                 await ws.subscribe_symbol(sym)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("symbol subscribe failed", symbol=sym, error=safe_error_text(exc))
         # Unsubscribe from removed symbols
         for sym in old_symbols - new_symbols:
             try:
                 await ws.unsubscribe_symbol(sym)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("symbol unsubscribe failed", symbol=sym, error=safe_error_text(exc))
 
     return {"status": "ok", "symbols": settings.symbols}
 
@@ -93,8 +97,12 @@ async def add_symbol(req: SymbolRequest):
     if _dash._data_service:
         try:
             await _dash._data_service.ws_client.subscribe_symbol(req.symbol)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "symbol subscribe failed",
+                symbol=req.symbol,
+                error=safe_error_text(exc),
+            )
 
     return {"status": "ok", "symbols": settings.symbols}
 
@@ -115,7 +123,11 @@ async def remove_symbol(req: SymbolRequest):
     if _dash._data_service:
         try:
             await _dash._data_service.ws_client.unsubscribe_symbol(req.symbol)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "symbol unsubscribe failed",
+                symbol=req.symbol,
+                error=safe_error_text(exc),
+            )
 
     return {"status": "ok", "symbols": settings.symbols}

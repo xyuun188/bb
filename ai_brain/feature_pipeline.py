@@ -6,40 +6,64 @@ for models that require structured numerical input (XGBoost, RL).
 
 from __future__ import annotations
 
-import pickle
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from sklearn.preprocessing import RobustScaler
 
 from config.settings import settings
+from core.model_artifact_safety import dump_trusted_pickle, load_trusted_pickle
 
 # Columns that should be present in the feature vector
 TECHNICAL_FEATURE_COLS = [
-    "rsi_14", "rsi_7", "macd", "macd_signal", "macd_diff", "stoch_k",
-    "adx_14", "bb_pct", "bb_width", "atr_14",
-    "volume_ratio", "returns_1", "returns_5", "returns_20",
-    "volatility_20", "price_vs_sma20", "price_vs_sma50",
+    "rsi_14",
+    "rsi_7",
+    "macd",
+    "macd_signal",
+    "macd_diff",
+    "stoch_k",
+    "adx_14",
+    "bb_pct",
+    "bb_width",
+    "atr_14",
+    "volume_ratio",
+    "returns_1",
+    "returns_5",
+    "returns_20",
+    "volatility_20",
+    "price_vs_sma20",
+    "price_vs_sma50",
 ]
 
 SENTIMENT_FEATURE_COLS = [
-    "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
+    "news_sentiment_avg",
+    "social_sentiment_avg",
+    "social_mention_count",
 ]
 
 ALL_FEATURE_COLS = TECHNICAL_FEATURE_COLS + SENTIMENT_FEATURE_COLS
 
 # Default values for missing features
 DEFAULT_VALUES = {
-    "rsi_14": 50.0, "rsi_7": 50.0,
-    "macd": 0.0, "macd_signal": 0.0, "macd_diff": 0.0,
-    "stoch_k": 50.0, "adx_14": 20.0,
-    "bb_pct": 0.5, "bb_width": 0.01, "atr_14": 0.001,
+    "rsi_14": 50.0,
+    "rsi_7": 50.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
+    "macd_diff": 0.0,
+    "stoch_k": 50.0,
+    "adx_14": 20.0,
+    "bb_pct": 0.5,
+    "bb_width": 0.01,
+    "atr_14": 0.001,
     "volume_ratio": 1.0,
-    "returns_1": 0.0, "returns_5": 0.0, "returns_20": 0.0,
+    "returns_1": 0.0,
+    "returns_5": 0.0,
+    "returns_20": 0.0,
     "volatility_20": 0.02,
-    "price_vs_sma20": 0.0, "price_vs_sma50": 0.0,
-    "news_sentiment_avg": 0.0, "social_sentiment_avg": 0.0,
+    "price_vs_sma20": 0.0,
+    "price_vs_sma50": 0.0,
+    "news_sentiment_avg": 0.0,
+    "social_sentiment_avg": 0.0,
     "social_mention_count": 0,
 }
 
@@ -91,13 +115,19 @@ class FeaturePipeline:
 
     def save(self) -> None:
         if self._scaler:
-            with open(self._scaler_path, "wb") as f:
-                pickle.dump(self._scaler, f)
+            dump_trusted_pickle(
+                self._scaler,
+                self._scaler_path,
+                trusted_root=settings.data_dir,
+            )
 
     def load(self) -> bool:
         if self._scaler_path.exists():
-            with open(self._scaler_path, "rb") as f:
-                self._scaler = pickle.load(f)
+            self._scaler = load_trusted_pickle(
+                self._scaler_path,
+                trusted_root=settings.data_dir,
+                expected_type=RobustScaler,
+            )
             self._fitted = True
             return True
         return False

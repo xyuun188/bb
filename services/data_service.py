@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -16,6 +16,8 @@ import structlog
 from sqlalchemy import select
 
 from config.settings import settings
+from core.safe_output import safe_error_text
+from core.url_safety import normalize_external_http_url
 from data_feed.feature_vector import FeatureVector, build_feature_vector
 from data_feed.news_fetcher import NewsFetcher
 from data_feed.okx_rest_client import OKXRestClient
@@ -77,9 +79,14 @@ class DataService:
             available = await self.rest_client.get_available_symbols()
             all_symbols = [s["symbol"] for s in available]
             self.ws_client._subscribe_symbols = all_symbols if all_symbols else settings.symbols
-            logger.info("ws subscribing to all symbols", count=len(self.ws_client._subscribe_symbols))
+            logger.info(
+                "ws subscribing to all symbols", count=len(self.ws_client._subscribe_symbols)
+            )
         except Exception as e:
-            logger.warning("fetch available symbols failed, using defaults", error=str(e))
+            logger.warning(
+                "fetch available symbols failed, using defaults",
+                error=safe_error_text(e),
+            )
             self.ws_client._subscribe_symbols = settings.symbols
 
         await self.ws_client.connect()
@@ -97,19 +104,21 @@ class DataService:
     async def refresh_sentiment(self, symbols: list[str] | None = None) -> None:
         """Fetch latest news/social sentiment and cache it for requested symbols."""
         target_symbols = self._normalize_symbols(symbols or settings.symbols)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if (
             self._last_sentiment_update
-            and (now - self._last_sentiment_update).total_seconds() < self._sentiment_update_interval
+            and (now - self._last_sentiment_update).total_seconds()
+            < self._sentiment_update_interval
             and all(symbol in self._sentiment_cache for symbol in target_symbols)
         ):
             return
 
         async with self._sentiment_lock:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             if (
                 self._last_sentiment_update
-                and (now - self._last_sentiment_update).total_seconds() < self._sentiment_update_interval
+                and (now - self._last_sentiment_update).total_seconds()
+                < self._sentiment_update_interval
                 and all(symbol in self._sentiment_cache for symbol in target_symbols)
             ):
                 return
@@ -122,11 +131,14 @@ class DataService:
 
             fresh_enough = (
                 self._last_sentiment_update
-                and (now - self._last_sentiment_update).total_seconds() < self._sentiment_update_interval
+                and (now - self._last_sentiment_update).total_seconds()
+                < self._sentiment_update_interval
                 and (self._last_articles or self._last_social_posts)
             )
             if fresh_enough:
-                self._build_sentiment_cache(symbols_to_refresh, self._last_articles, self._last_social_posts)
+                self._build_sentiment_cache(
+                    symbols_to_refresh, self._last_articles, self._last_social_posts
+                )
                 return
 
         try:
@@ -145,7 +157,7 @@ class DataService:
             logger.info("sentiment refreshed", symbols=len(self._sentiment_cache))
 
         except Exception as e:
-            logger.error("sentiment refresh failed", error=str(e))
+            logger.error("sentiment refresh failed", error=safe_error_text(e))
 
     def _normalize_symbols(self, symbols: list[str]) -> list[str]:
         normalized: list[str] = []
@@ -178,29 +190,32 @@ class DataService:
         for symbol in self._normalize_symbols(symbols):
             base = self._symbol_base(symbol)
             symbol_articles = [
-                a for a in articles
+                a
+                for a in articles
                 if self._mentions_symbol(a, base, fields=("symbols_mentioned", "title", "summary"))
             ]
             symbol_posts = [
-                p for p in social_posts
+                p
+                for p in social_posts
                 if self._mentions_symbol(p, base, fields=("symbols", "title", "content"))
             ]
 
-            news_items = [self._news_item_summary(a, base, direct_match=True) for a in symbol_articles]
+            news_items = [
+                self._news_item_summary(a, base, direct_match=True) for a in symbol_articles
+            ]
             headlines = [a.get("title", "") for a in symbol_articles if a.get("title")]
             if not headlines:
                 headlines = [
-                    f"[全市场] {a.get('title', '')}"
-                    for a in articles[:5]
-                    if a.get("title")
+                    f"[全市场] {a.get('title', '')}" for a in articles[:5] if a.get("title")
                 ]
-                news_items = [self._news_item_summary(a, base, direct_match=False) for a in articles[:5]]
-            news_scores = [
-                self._weighted_news_score(a)
-                for a in symbol_articles
-            ]
+                news_items = [
+                    self._news_item_summary(a, base, direct_match=False) for a in articles[:5]
+                ]
+            news_scores = [self._weighted_news_score(a) for a in symbol_articles]
             social_scores = [
-                self._safe_score(p.get("sentiment_score"), f"{p.get('title', '')} {p.get('content', '')}")
+                self._safe_score(
+                    p.get("sentiment_score"), f"{p.get('title', '')} {p.get('content', '')}"
+                )
                 for p in symbol_posts
             ]
             news_items = sorted(
@@ -218,7 +233,9 @@ class DataService:
             direct_items = [item for item in news_items if item.get("direct_match")]
             self._sentiment_cache[symbol] = {
                 "news_sentiment": sum(news_scores) / len(news_scores) if news_scores else 0.0,
-                "social_sentiment": sum(social_scores) / len(social_scores) if social_scores else 0.0,
+                "social_sentiment": (
+                    sum(social_scores) / len(social_scores) if social_scores else 0.0
+                ),
                 "mention_count": len(symbol_posts),
                 "article_count": len(symbol_articles) if symbol_articles else len(news_items),
                 "direct_article_count": len(symbol_articles),
@@ -226,12 +243,20 @@ class DataService:
                 "sentiment_data_available": bool(symbol_articles or symbol_posts or news_items),
                 "direct_sentiment_data_available": bool(symbol_articles or symbol_posts),
                 "news_sources": (
-                    sorted({str(a.get("source") or "") for a in symbol_articles if a.get("source")})[:5]
+                    sorted(
+                        {str(a.get("source") or "") for a in symbol_articles if a.get("source")}
+                    )[:5]
                     if symbol_articles
-                    else sorted({str(item.get("source") or "") for item in news_items if item.get("source")})[:5]
+                    else sorted(
+                        {str(item.get("source") or "") for item in news_items if item.get("source")}
+                    )[:5]
                 ),
-                "direct_news_sources": sorted({str(a.get("source") or "") for a in symbol_articles if a.get("source")})[:5],
-                "market_news_item_count": len([item for item in news_items if not item.get("direct_match")]),
+                "direct_news_sources": sorted(
+                    {str(a.get("source") or "") for a in symbol_articles if a.get("source")}
+                )[:5],
+                "market_news_item_count": len(
+                    [item for item in news_items if not item.get("direct_match")]
+                ),
                 "direct_news_item_count": len(direct_items),
                 "news_items": news_items[:20],
             }
@@ -249,7 +274,9 @@ class DataService:
         return False
 
     def _weighted_news_score(self, item: dict) -> float:
-        score = self._safe_score(item.get("sentiment_score"), f"{item.get('title', '')} {item.get('summary', '')}")
+        score = self._safe_score(
+            item.get("sentiment_score"), f"{item.get('title', '')} {item.get('summary', '')}"
+        )
         impact = max(min(self._safe_float(item.get("impact_level"), 1.0), 5.0), 1.0)
         source_weight = max(min(self._safe_float(item.get("source_weight"), 0.55), 1.0), 0.2)
         return max(min(score * (0.7 + impact * 0.08) * source_weight, 1.0), -1.0)
@@ -270,7 +297,7 @@ class DataService:
             "source": str(item.get("source") or "unknown")[:80],
             "title": title[:240],
             "summary": summary[:360],
-            "url": str(item.get("url") or "")[:500],
+            "url": self._safe_external_url(item.get("url")),
             "published_at": str(item.get("published_at") or ""),
             "symbols": [str(s).upper() for s in symbols if s][:12],
             "sentiment_score": round(self._weighted_news_score(item), 4),
@@ -280,6 +307,16 @@ class DataService:
             "direct_match": direct_match,
             "match_reason": match_reason,
         }
+
+    def _safe_external_url(self, value: Any) -> str:
+        try:
+            return normalize_external_http_url(
+                str(value or ""),
+                field_name="news source URL",
+                max_length=500,
+            )
+        except ValueError:
+            return ""
 
     def _safe_score(self, value: Any, text: str) -> float:
         try:
@@ -313,52 +350,92 @@ class DataService:
             except Exception:
                 return None
 
-    async def _persist_sentiment_samples(self, articles: list[dict], social_posts: list[dict]) -> None:
+    async def _persist_sentiment_samples(
+        self, articles: list[dict], social_posts: list[dict]
+    ) -> None:
         try:
             async with get_session_ctx() as session:
                 for item in articles[:500]:
                     title = str(item.get("title") or "").strip()
-                    url = str(item.get("url") or "").strip() or f"local-news:{hash(title)}"
+                    url = self._safe_external_url(item.get("url")) or f"local-news:{hash(title)}"
                     if not title:
                         continue
-                    exists = await session.execute(select(NewsArticle.id).where(NewsArticle.url == url).limit(1))
+                    exists = await session.execute(
+                        select(NewsArticle.id).where(NewsArticle.url == url).limit(1)
+                    )
                     if exists.scalar_one_or_none() is not None:
                         continue
-                    session.add(NewsArticle(
-                        source=str(item.get("source") or "unknown")[:50],
-                        title=title,
-                        summary=str(item.get("summary") or "")[:2000] or None,
-                        url=url,
-                        sentiment_score=self._safe_score(item.get("sentiment_score"), f"{title} {item.get('summary', '')}"),
-                        symbols_mentioned=item.get("symbols_mentioned") or [],
-                        published_at=self._parse_datetime(item.get("published_at")),
-                    ))
+                    session.add(
+                        NewsArticle(
+                            source=str(item.get("source") or "unknown")[:50],
+                            title=title,
+                            summary=str(item.get("summary") or "")[:2000] or None,
+                            url=url,
+                            sentiment_score=self._safe_score(
+                                item.get("sentiment_score"), f"{title} {item.get('summary', '')}"
+                            ),
+                            symbols_mentioned=item.get("symbols_mentioned") or [],
+                            published_at=self._parse_datetime(item.get("published_at")),
+                        )
+                    )
                 for item in social_posts[:500]:
                     post_id = str(item.get("post_id") or item.get("url") or hash(str(item)))[:100]
                     content = str(item.get("content") or item.get("title") or "").strip()
                     if not content:
                         continue
-                    exists = await session.execute(select(SocialPost.id).where(SocialPost.post_id == post_id).limit(1))
+                    exists = await session.execute(
+                        select(SocialPost.id).where(SocialPost.post_id == post_id).limit(1)
+                    )
                     if exists.scalar_one_or_none() is not None:
                         continue
-                    session.add(SocialPost(
-                        platform=str(item.get("platform") or "unknown")[:20],
-                        post_id=post_id,
-                        content=content[:2000],
-                        sentiment_score=self._safe_score(item.get("sentiment_score"), content),
-                        engagement_count=int(self._safe_float(item.get("engagement_count") or item.get("score"), 0.0)),
-                        symbols=item.get("symbols") or [],
-                        posted_at=self._parse_datetime(item.get("posted_at")),
-                    ))
+                    session.add(
+                        SocialPost(
+                            platform=str(item.get("platform") or "unknown")[:20],
+                            post_id=post_id,
+                            content=content[:2000],
+                            sentiment_score=self._safe_score(item.get("sentiment_score"), content),
+                            engagement_count=int(
+                                self._safe_float(
+                                    item.get("engagement_count") or item.get("score"), 0.0
+                                )
+                            ),
+                            symbols=item.get("symbols") or [],
+                            posted_at=self._parse_datetime(item.get("posted_at")),
+                        )
+                    )
                 await session.flush()
         except Exception as exc:
-            logger.debug("persist sentiment samples failed", error=str(exc))
+            logger.debug("persist sentiment samples failed", error=safe_error_text(exc))
 
     def _lexicon_sentiment(self, text: str) -> float:
         lower = str(text or "").lower()
-        positive = ("surge", "rally", "gain", "bull", "breakout", "record", "approval", "partnership", "launch", "up")
-        negative = ("crash", "hack", "lawsuit", "bear", "dump", "plunge", "ban", "exploit", "down", "liquidation")
-        score = sum(1 for word in positive if word in lower) - sum(1 for word in negative if word in lower)
+        positive = (
+            "surge",
+            "rally",
+            "gain",
+            "bull",
+            "breakout",
+            "record",
+            "approval",
+            "partnership",
+            "launch",
+            "up",
+        )
+        negative = (
+            "crash",
+            "hack",
+            "lawsuit",
+            "bear",
+            "dump",
+            "plunge",
+            "ban",
+            "exploit",
+            "down",
+            "liquidation",
+        )
+        score = sum(1 for word in positive if word in lower) - sum(
+            1 for word in negative if word in lower
+        )
         if score == 0:
             return 0.0
         return max(min(score / 4.0, 1.0), -1.0)
@@ -370,12 +447,13 @@ class DataService:
         ticker_task = asyncio.create_task(self._get_ticker_snapshot(symbol))
         indicators_task = asyncio.create_task(self._get_indicator_snapshot(symbol))
         derivatives_task = asyncio.create_task(self._get_derivatives_snapshot(symbol))
-        ticker_result, indicators_result, derivatives_result = await asyncio.gather(
+        gather_results: tuple[Any, Any, Any] = await asyncio.gather(
             ticker_task,
             indicators_task,
             derivatives_task,
             return_exceptions=True,
         )
+        ticker_result, indicators_result, derivatives_result = gather_results
         ticker = ticker_result if isinstance(ticker_result, dict) else {}
         indicators = indicators_result if isinstance(indicators_result, dict) else {}
         derivatives = derivatives_result if isinstance(derivatives_result, dict) else {}
@@ -401,11 +479,12 @@ class DataService:
 
     async def _ensure_sentiment_for_analysis(self, symbol: str) -> None:
         """Refresh sentiment without blocking every trading decision."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cached = symbol in self._sentiment_cache
         stale = (
             self._last_sentiment_update is None
-            or (now - self._last_sentiment_update).total_seconds() >= self._sentiment_update_interval
+            or (now - self._last_sentiment_update).total_seconds()
+            >= self._sentiment_update_interval
         )
         if cached:
             if stale:
@@ -421,10 +500,16 @@ class DataService:
                 asyncio.shield(task),
                 timeout=max(float(settings.sentiment_blocking_timeout_seconds or 0.0), 0.0),
             )
-        except asyncio.TimeoutError:
-            logger.info("sentiment refresh still running; continue with neutral cache", symbol=symbol)
+        except TimeoutError:
+            logger.info(
+                "sentiment refresh still running; continue with neutral cache", symbol=symbol
+            )
         except Exception as e:
-            logger.debug("sentiment refresh unavailable for analysis", symbol=symbol, error=str(e))
+            logger.debug(
+                "sentiment refresh unavailable for analysis",
+                symbol=symbol,
+                error=safe_error_text(e),
+            )
 
     def _start_background_sentiment_refresh(self, symbols: list[str]) -> None:
         if self._sentiment_refresh_task and not self._sentiment_refresh_task.done():
@@ -458,7 +543,7 @@ class DataService:
                 "spread_pct": ((ask - bid) / mid * 100) if mid and ask and bid else 0,
             }
         except Exception as e:
-            logger.debug("failed to fetch ticker", symbol=symbol, error=str(e))
+            logger.debug("failed to fetch ticker", symbol=symbol, error=safe_error_text(e))
             return {}
 
     async def _get_indicator_snapshot(self, symbol: str) -> dict[str, float]:
@@ -477,7 +562,7 @@ class DataService:
             features.update(self._kline_anomaly_snapshot(df))
             return features
         except Exception as e:
-            logger.debug("failed to compute indicators", symbol=symbol, error=str(e))
+            logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))
             return {}
 
     def _kline_anomaly_snapshot(self, df: pd.DataFrame) -> dict[str, float]:
@@ -506,16 +591,23 @@ class DataService:
                 }
             abnormal_ratios = max_ratio.loc[abnormal.index]
             latest_ts = abnormal["timestamp"].max()
-            recent_hours = (now - latest_ts).total_seconds() / 3600.0 if latest_ts is not None else 9999.0
+            recent_hours = (
+                (now - latest_ts).total_seconds() / 3600.0 if latest_ts is not None else 9999.0
+            )
             if not math.isfinite(recent_hours):
                 recent_hours = 9999.0
             return {
                 "abnormal_wick_count_72h": int(len(abnormal)),
-                "abnormal_wick_max_pct": round(max(float(abnormal_ratios.max() - 1.0), 0.0) * 100.0, 6),
+                "abnormal_wick_max_pct": round(
+                    max(float(abnormal_ratios.max() - 1.0), 0.0) * 100.0, 6
+                ),
                 "abnormal_wick_recent_hours": round(max(recent_hours, 0.0), 4),
             }
         except Exception as exc:
-            logger.debug("failed to compute kline anomaly snapshot", error=str(exc))
+            logger.debug(
+                "failed to compute kline anomaly snapshot",
+                error=safe_error_text(exc),
+            )
             return {}
 
     async def _persist_klines(self, symbol: str, timeframe: str, klines: list) -> None:
@@ -526,7 +618,7 @@ class DataService:
                 for row in klines[-300:]:
                     try:
                         ts, open_, high, low, close, volume = row[:6]
-                        open_time = datetime.fromtimestamp(float(ts) / 1000.0, tz=timezone.utc)
+                        open_time = datetime.fromtimestamp(float(ts) / 1000.0, tz=UTC)
                         await repo.upsert_kline(
                             normalized,
                             timeframe,
@@ -539,14 +631,20 @@ class DataService:
                                 "volume": self._safe_float(volume),
                             },
                         )
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug(
+                            "skip invalid kline row",
+                            symbol=normalized,
+                            timeframe=timeframe,
+                            error=safe_error_text(exc),
+                        )
                         continue
                 await repo.clean_old_klines(normalized, timeframe, keep=2000)
         except Exception as exc:
-            logger.debug("persist klines failed", symbol=symbol, error=str(exc))
+            logger.debug("persist klines failed", symbol=symbol, error=safe_error_text(exc))
 
     async def _get_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cached = self._derivatives_cache.get(symbol)
         if cached:
             updated_at = cached.get("updated_at")
@@ -559,7 +657,11 @@ class DataService:
         try:
             data = await self.rest_client.fetch_derivatives_snapshot(symbol)
         except Exception as e:
-            logger.debug("failed to fetch derivatives snapshot", symbol=symbol, error=str(e))
+            logger.debug(
+                "failed to fetch derivatives snapshot",
+                symbol=symbol,
+                error=safe_error_text(e),
+            )
             data = {}
 
         self._derivatives_cache[symbol] = {
@@ -574,11 +676,15 @@ class DataService:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         fvs = {}
-        for symbol, result in zip(settings.symbols, results):
+        for symbol, result in zip(settings.symbols, results, strict=False):
             if isinstance(result, FeatureVector):
                 fvs[symbol] = result
             else:
-                logger.error("feature vector build failed", symbol=symbol, error=str(result))
+                logger.error(
+                    "feature vector build failed",
+                    symbol=symbol,
+                    error=safe_error_text(result),
+                )
         return fvs
 
     async def get_available_symbols(self) -> list[dict[str, Any]]:

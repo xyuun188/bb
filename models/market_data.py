@@ -19,9 +19,7 @@ class Kline(Base, TimestampMixin):
     close: Mapped[float] = mapped_column(Float)
     volume: Mapped[float] = mapped_column(Float)
 
-    __table_args__ = (
-        UniqueConstraint("symbol", "timeframe", "open_time", name="uq_kline"),
-    )
+    __table_args__ = (UniqueConstraint("symbol", "timeframe", "open_time", name="uq_kline"),)
 
 
 class Ticker(Base, TimestampMixin):

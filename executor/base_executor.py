@@ -7,12 +7,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai_brain.base_model import DecisionOutput
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     PENDING = "pending"
     OPEN = "open"
     FILLED = "filled"
@@ -33,7 +36,7 @@ class ExecutionResult:
     fee: float = 0.0
     pnl: float = 0.0
     exchange_order_id: str | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     raw_response: dict | None = None
 
 
@@ -42,7 +45,7 @@ class AbstractExecutor(ABC):
 
     @abstractmethod
     async def place_order(
-        self, decision: "DecisionOutput", account_id: str | None = None
+        self, decision: DecisionOutput, account_id: str | None = None
     ) -> ExecutionResult:
         """Execute a trading decision and return the result."""
 
@@ -58,9 +61,17 @@ class AbstractExecutor(ABC):
     async def get_positions(self, symbol: str | None = None) -> list[dict]:
         """Get current open positions."""
 
+    async def get_positions_strict(self, symbol: str | None = None) -> list[dict]:
+        """Get positions and propagate failures for safety-critical callers."""
+        return await self.get_positions(symbol)
+
     @abstractmethod
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         """Get currently open orders."""
+
+    async def get_open_orders_strict(self, symbol: str | None = None) -> list[dict]:
+        """Get open orders and propagate failures for safety-critical callers."""
+        return await self.get_open_orders(symbol)
 
     @abstractmethod
     async def initialize(self) -> None:

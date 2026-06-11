@@ -6,12 +6,12 @@ Ranks models by profitability, Sharpe ratio, win rate, and selects the best.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
-from config.settings import settings
+from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.account_repo import AccountRepository
 from db.repositories.decision_repo import DecisionRepository
@@ -41,14 +41,14 @@ class CompetitionService:
 
     async def evaluate_all_models(self, force: bool = False) -> list[dict]:
         """Evaluate all models and return rankings."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if not force and (
             self._last_evaluation
             and (now - self._last_evaluation).total_seconds() < self._evaluation_interval
         ):
             return self._rankings
 
-        rankings = []
+        rankings: list[dict[str, Any]] = []
         try:
             async with get_session_ctx() as session:
                 account_repo = AccountRepository(session)
@@ -66,16 +66,12 @@ class CompetitionService:
                     model_name = account.model_name
 
                     # Get trade statistics
-                    all_orders = await trade_repo.get_recent_orders(model_name, limit=10000)
-                    filled_orders = [
-                        o for o in all_orders
-                        if hasattr(o, "status") and o.status == "filled"
-                    ]
-
                     # Basic metrics — include unrealized PnL from open positions
                     unrealized = getattr(account, "unrealized_pnl", 0.0) or 0.0
                     total_pnl = (account.realized_pnl or 0.0) + unrealized
-                    pnl_pct = total_pnl / account.initial_balance if account.initial_balance > 0 else 0.0
+                    pnl_pct = (
+                        total_pnl / account.initial_balance if account.initial_balance > 0 else 0.0
+                    )
                     win_rate = account.win_rate or 0.0
                     total_trades = account.total_trades or 0
 
@@ -83,9 +79,7 @@ class CompetitionService:
                     decision_accuracy = await decision_repo.get_decision_accuracy(model_name)
 
                     # Calculate Sharpe ratio from PnL history
-                    sharpe = await self._calculate_sharpe(
-                        trade_repo, decision_repo, model_name
-                    )
+                    sharpe = await self._calculate_sharpe(trade_repo, decision_repo, model_name)
 
                     # Max drawdown approximation
                     max_dd = await self._calculate_max_drawdown(
@@ -94,45 +88,46 @@ class CompetitionService:
 
                     # Composite score
                     score = (
-                        pnl_pct * 0.40
-                        + sharpe * 0.25
-                        + win_rate * 0.20
-                        + decision_accuracy * 0.15
+                        pnl_pct * 0.40 + sharpe * 0.25 + win_rate * 0.20 + decision_accuracy * 0.15
                     )
 
-                    rankings.append({
-                        "model_name": model_name,
-                        "total_pnl": round(total_pnl, 2),
-                        "pnl_pct": round(pnl_pct * 100, 2),
-                        "sharpe_ratio": round(sharpe, 2),
-                        "max_drawdown": round(max_dd * 100, 2),
-                        "win_rate": round(win_rate * 100, 2),
-                        "total_trades": total_trades,
-                        "decision_accuracy": round(decision_accuracy * 100, 2),
-                        "composite_score": round(score, 4),
-                    })
+                    rankings.append(
+                        {
+                            "model_name": model_name,
+                            "total_pnl": round(total_pnl, 2),
+                            "pnl_pct": round(pnl_pct * 100, 2),
+                            "sharpe_ratio": round(sharpe, 2),
+                            "max_drawdown": round(max_dd * 100, 2),
+                            "win_rate": round(win_rate * 100, 2),
+                            "total_trades": total_trades,
+                            "decision_accuracy": round(decision_accuracy * 100, 2),
+                            "composite_score": round(score, 4),
+                        }
+                    )
 
                 # Sort by composite score descending
-                rankings.sort(key=lambda r: r["composite_score"], reverse=True)
+                rankings.sort(key=lambda r: float(r["composite_score"]), reverse=True)
                 for i, r in enumerate(rankings):
                     r["rank"] = i + 1
 
                 # Save snapshots to DB
                 for r in rankings:
-                    await risk_repo.save_performance_snapshot({
-                        "model_name": r["model_name"],
-                        "total_pnl": r["total_pnl"],
-                        "pnl_pct": r["pnl_pct"] / 100,
-                        "sharpe_ratio": r["sharpe_ratio"],
-                        "max_drawdown": r["max_drawdown"] / 100,
-                        "win_rate": r["win_rate"] / 100,
-                        "total_trades": r["total_trades"],
-                        "decision_accuracy": r["decision_accuracy"] / 100,
-                        "rank": r["rank"],
-                    })
+                    await risk_repo.save_performance_snapshot(
+                        {
+                            "model_name": r["model_name"],
+                            "total_pnl": r["total_pnl"],
+                            "pnl_pct": float(r["pnl_pct"]) / 100,
+                            "sharpe_ratio": r["sharpe_ratio"],
+                            "max_drawdown": float(r["max_drawdown"]) / 100,
+                            "win_rate": float(r["win_rate"]) / 100,
+                            "total_trades": r["total_trades"],
+                            "decision_accuracy": float(r["decision_accuracy"]) / 100,
+                            "rank": r["rank"],
+                        }
+                    )
 
-        except Exception as e:
-            logger.error("model evaluation failed", error=str(e))
+        except Exception as exc:
+            logger.error("model evaluation failed", error=safe_error_text(exc))
             return self._rankings  # Return last known rankings
 
         self._rankings = rankings
@@ -184,7 +179,12 @@ class CompetitionService:
             # Assume decisions are roughly daily; annualize
             return (mean_ret / std_ret) * math.sqrt(365)
 
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "model sharpe calculation failed",
+                model_name=model_name,
+                error=safe_error_text(exc),
+            )
             return 0.0
 
     async def _calculate_max_drawdown(
@@ -219,7 +219,12 @@ class CompetitionService:
 
             return max_dd
 
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "model max drawdown calculation failed",
+                model_name=model_name,
+                error=safe_error_text(exc),
+            )
             return 0.0
 
     def set_active_models(self, names: list[str]) -> None:
@@ -237,8 +242,10 @@ class CompetitionService:
 
     async def get_rankings_live(self) -> list[dict]:
         """Get rankings, auto-refreshing if older than 5 minutes."""
-        if (self._last_evaluation is None or
-            (datetime.now(timezone.utc) - self._last_evaluation).total_seconds() > 300):
+        if (
+            self._last_evaluation is None
+            or (datetime.now(UTC) - self._last_evaluation).total_seconds() > 300
+        ):
             await self.evaluate_all_models(force=True)
         return self.get_rankings()
 

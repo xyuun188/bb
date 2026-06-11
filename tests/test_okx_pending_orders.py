@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -37,7 +39,7 @@ class FakeCcxt:
             "info": {"state": "live", "ordId": "entry-1", "side": "buy", "ordType": "market"},
         }
         self.confirmed_order = confirmed_order or self.created_order
-        self.create_calls = []
+        self.create_calls: list[tuple[Any, ...]] = []
 
     def market(self, symbol):
         return {
@@ -76,7 +78,7 @@ def _executor(fake_ccxt: FakeCcxt) -> OKXExecutor:
             "okx_max_leverage": 10.0,
         }
 
-    executor._set_leverage_if_needed = fake_leverage
+    executor._set_leverage_if_needed = fake_leverage  # type: ignore[method-assign]
     return executor
 
 
@@ -95,6 +97,7 @@ async def test_open_entry_order_is_not_treated_as_filled_position():
     assert result.status == OrderStatus.OPEN
     assert result.quantity == 0.0
     assert result.exchange_order_id == "entry-1"
+    assert result.raw_response is not None
     assert result.raw_response["entry_tracking"] is True
     assert "尚未确认成交" in result.raw_response["message"]
 
@@ -125,5 +128,6 @@ async def test_existing_active_entry_order_blocks_duplicate_submit():
     assert result.status == OrderStatus.OPEN
     assert result.quantity == 0.0
     assert result.exchange_order_id == "existing-entry"
+    assert result.raw_response is not None
     assert result.raw_response["existing_entry_order"] is True
     assert "不会重复提交新的开仓单" in result.raw_response["message"]

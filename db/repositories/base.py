@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,9 @@ class BaseRepository(Generic[ModelType]):
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    def _id_column(self, model: type[ModelType] | None = None) -> Any:
+        return cast(Any, model or self.model).id
+
     async def add(self, instance: ModelType) -> ModelType:
         self.session.add(instance)
         await self.session.flush()
@@ -33,7 +36,7 @@ class BaseRepository(Generic[ModelType]):
 
     async def get_all(self, limit: int = 100, offset: int = 0) -> list[ModelType]:
         result = await self.session.execute(
-            select(self.model).order_by(self.model.id.desc()).limit(limit).offset(offset)
+            select(self.model).order_by(self._id_column().desc()).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
 
@@ -49,16 +52,20 @@ class BaseRepository(Generic[ModelType]):
         result = await self.session.execute(stmt)
         return result.scalar() or 0
 
-    async def find_by(self, _model: type[ModelType] | None = None, **kwargs: Any) -> list[ModelType]:
+    async def find_by(
+        self, _model: type[ModelType] | None = None, **kwargs: Any
+    ) -> list[ModelType]:
         model = _model or self.model
         stmt = select(model)
         for key, value in kwargs.items():
             if hasattr(model, key):
                 stmt = stmt.where(getattr(model, key) == value)
-        result = await self.session.execute(stmt.order_by(model.id.desc()))
+        result = await self.session.execute(stmt.order_by(self._id_column(model).desc()))
         return list(result.scalars().all())
 
-    async def find_one_by(self, _model: type[ModelType] | None = None, **kwargs: Any) -> ModelType | None:
+    async def find_one_by(
+        self, _model: type[ModelType] | None = None, **kwargs: Any
+    ) -> ModelType | None:
         model = _model or self.model
         stmt = select(model)
         for key, value in kwargs.items():

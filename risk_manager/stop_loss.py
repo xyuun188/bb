@@ -6,8 +6,8 @@ Evaluated on every tick for open positions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 import structlog
@@ -17,7 +17,7 @@ from config.settings import settings
 logger = structlog.get_logger(__name__)
 
 
-class StopLossType(str, Enum):
+class StopLossType(StrEnum):
     NONE = "none"
     HARD = "hard"
     TRAILING = "trailing"
@@ -40,10 +40,10 @@ class TrailingStopState:
     side: str  # long or short
     entry_price: float
     highest_price: float  # highest seen since entry (for longs)
-    lowest_price: float   # lowest seen since entry (for shorts)
+    lowest_price: float  # lowest seen since entry (for shorts)
     activation_price: float  # price at which trailing stop activates
     stop_price: float
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class StopLossManager:

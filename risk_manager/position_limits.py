@@ -10,7 +10,6 @@ from dataclasses import dataclass
 import structlog
 
 from config.settings import settings
-from core.exceptions import PositionLimitExceeded
 
 logger = structlog.get_logger(__name__)
 
@@ -297,7 +296,8 @@ class PositionLimitChecker:
         return notional * float(settings.hard_stop_loss_pct or 0.05)
 
     def _position_notional(self, pos: dict, quantity: float, entry_price: float) -> float:
-        info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+        info_raw = pos.get("info")
+        info = info_raw if isinstance(info_raw, dict) else {}
         direct = self._safe_float(
             pos.get("notional")
             or pos.get("notional_usd")
@@ -311,19 +311,24 @@ class PositionLimitChecker:
         if direct > 0:
             return abs(direct)
         contract_size = self._safe_float(
-            pos.get("contract_size")
-            or pos.get("contractSize")
-            or info.get("ctVal"),
+            pos.get("contract_size") or pos.get("contractSize") or info.get("ctVal"),
             1.0,
         )
-        if contract_size > 0 and contract_size != 1.0 and (
-            pos.get("contracts") is not None or pos.get("contractSize") is not None or info.get("ctVal") is not None
+        if (
+            contract_size > 0
+            and contract_size != 1.0
+            and (
+                pos.get("contracts") is not None
+                or pos.get("contractSize") is not None
+                or info.get("ctVal") is not None
+            )
         ):
             return abs(quantity * contract_size * entry_price)
         return abs(quantity * entry_price)
 
     def _position_margin(self, pos: dict, notional: float, leverage: float) -> float:
-        info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+        info_raw = pos.get("info")
+        info = info_raw if isinstance(info_raw, dict) else {}
         computed = abs(notional) / max(leverage, 1.0)
         direct = self._safe_float(
             pos.get("margin")

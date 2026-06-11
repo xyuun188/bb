@@ -8,36 +8,49 @@ Then open: http://localhost:8002
 """
 
 import asyncio
+import importlib
+import os
 import sys
 from pathlib import Path
-import os
+from typing import Any, TextIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import structlog
 import uvicorn
 
+from ai_brain.model_factory import create_models_from_config
+from ai_brain.model_registry import ModelRegistry
 from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.logging_config import setup_logging
-from core.trading_mode import mode_manager
-from db.session import init_db, close_db
-from web_dashboard.app import app, ws_manager
+from core.safe_output import safe_error_text
+from db.session import close_db, init_db
+from services.competition_service import CompetitionService
+from services.data_service import DataService
+from services.notification_service import NotificationService
+from services.trading_service import TradingService
 from web_dashboard.api.dashboard import (
     _build_tickers_for_open_positions,
     _get_open_position_symbols,
     set_services,
 )
+from web_dashboard.app import app, ws_manager
 
-# Service imports
-from ai_brain.model_registry import ModelRegistry
-from ai_brain.model_factory import create_models_from_config
-from services.data_service import DataService
-from services.trading_service import TradingService
-from services.competition_service import CompetitionService
-from services.notification_service import NotificationService
-
+logger = structlog.get_logger(__name__)
 
 LOCK_FILE = Path(__file__).resolve().parent.parent / "data" / "paper_trading.lock"
-_lock_handle = None
+_lock_handle: TextIO | None = None
+
+
+def _lock_file(handle: TextIO) -> None:
+    """Acquire a non-blocking advisory lock on the current platform."""
+    if os.name == "nt":
+        msvcrt = importlib.import_module("msvcrt")
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+
+    fcntl = importlib.import_module("fcntl")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def acquire_single_instance_lock() -> None:
@@ -46,17 +59,12 @@ def acquire_single_instance_lock() -> None:
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     _lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+        _lock_file(_lock_handle)
+    except OSError as exc:
         raise SystemExit(
             "Another paper trading instance is already running. "
             "Stop the existing process before starting a new one."
-        )
+        ) from exc
     _lock_handle.seek(0)
     _lock_handle.truncate()
     _lock_handle.write(str(os.getpid()))
@@ -70,7 +78,9 @@ async def main():
     print("AI CRYPTO TRADING SYSTEM - PAPER TRADING MODE")
     print("=" * 60)
     print(f"Symbols: {settings.symbols}")
-    model_names = [m.get("name", "llm_agent") for m in settings.get_fixed_ai_models(include_empty=False)]
+    model_names = [
+        m.get("name", "llm_agent") for m in settings.get_fixed_ai_models(include_empty=False)
+    ]
     print(f"AI Expert Models: {', '.join(model_names)} ({len(model_names)} models)")
     print(f"Execution Model: {ENSEMBLE_TRADER_NAME}")
     print(f"Default Virtual Balance: ${settings.initial_virtual_balance:,.0f}")
@@ -103,12 +113,16 @@ async def main():
     notification_service = NotificationService()
 
     # Redis (fakeredis)
-    redis = None
+    redis: Any = None
     try:
         import fakeredis.aioredis
-        redis = await fakeredis.aioredis.create_redis_pool()
-    except Exception:
-        pass
+
+        redis = fakeredis.aioredis.FakeRedis()
+    except Exception as exc:
+        logger.warning(
+            "fakeredis initialization failed; continuing without redis",
+            error=safe_error_text(exc),
+        )
 
     # Trading service
     print("[4/5] Starting trading service...")
@@ -123,7 +137,9 @@ async def main():
     print("  Evaluating initial model rankings...")
     rankings = await competition_service.evaluate_all_models()
     if rankings:
-        print(f"  Top model: {rankings[0]['model_name']} (score: {rankings[0].get('composite_score', 0):.4f})")
+        print(
+            f"  Top model: {rankings[0]['model_name']} (score: {rankings[0].get('composite_score', 0):.4f})"
+        )
 
     # Wire services to API
     set_services(trading_service, data_service, competition_service)
@@ -139,7 +155,11 @@ async def main():
                 await competition_service.evaluate_all_models()
             except Exception as e:
                 import structlog
-                structlog.get_logger("paper_trading").error("periodic eval failed", error=str(e))
+
+                structlog.get_logger("paper_trading").error(
+                    "periodic eval failed",
+                    error=safe_error_text(e),
+                )
             await asyncio.sleep(3600)
 
     eval_task = asyncio.create_task(periodic_evaluation())
@@ -147,6 +167,7 @@ async def main():
     # Periodic WebSocket push for real-time dashboard updates
     async def periodic_ws_push():
         import structlog
+
         ws_log = structlog.get_logger("ws_push")
         await asyncio.sleep(2)  # Wait for dashboard to start
         snapshot_interval = 0
@@ -172,21 +193,24 @@ async def main():
                 tickers = await _build_tickers_for_open_positions(open_symbols, tickers)
 
                 stats = trading_service.get_stats()
-                await ws_manager.broadcast({
-                    "type": "ticker_update",
-                    "symbols": tickers,
-                })
-                await ws_manager.broadcast({
-                    "type": "trading_round",
-                    "decisions": stats.get("recent_decisions", []),
-                    "executions": stats.get("recent_executions", []),
-                    "stats": stats,
-                })
+                await ws_manager.broadcast(
+                    {
+                        "type": "ticker_update",
+                        "symbols": tickers,
+                    }
+                )
+                await ws_manager.broadcast(
+                    {
+                        "type": "trading_round",
+                        "decisions": stats.get("recent_decisions", []),
+                        "executions": stats.get("recent_executions", []),
+                        "stats": stats,
+                    }
+                )
             except Exception as e:
-                ws_log.error("ws push failed", error=str(e))
+                ws_log.error("ws push failed", error=safe_error_text(e))
             await asyncio.sleep(2)
 
-    from datetime import datetime, timezone
     ws_push_task = asyncio.create_task(periodic_ws_push())
 
     # Start dashboard
@@ -225,6 +249,7 @@ async def main():
 
     await data_service.stop()
     await model_registry.shutdown_all()
+    await notification_service.close()
     await close_db()
     print("Shutdown complete.")
 

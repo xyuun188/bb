@@ -8,10 +8,11 @@ from __future__ import annotations
 import asyncio
 
 import structlog
+from sqlalchemy import text
 
+from core.safe_output import safe_error_text
 from data_feed.news_fetcher import NewsFetcher
 from data_feed.sentiment_scraper import SentimentScraper
-from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
 
 logger = structlog.get_logger(__name__)
@@ -61,7 +62,7 @@ class DataCollectorWorker:
                         for article in articles:
                             existing = await session.execute(
                                 # Check by URL for dedup
-                                f"SELECT id FROM news_articles WHERE url = :url",
+                                text("SELECT id FROM news_articles WHERE url = :url"),
                                 {"url": article["url"]},
                             )
                             if existing.first():
@@ -83,7 +84,7 @@ class DataCollectorWorker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("news collection error", error=str(e))
+                logger.error("news collection error", error=safe_error_text(e))
 
             await asyncio.sleep(300)  # 5 minutes
 
@@ -98,7 +99,7 @@ class DataCollectorWorker:
 
                         for post in posts:
                             existing = await session.execute(
-                                f"SELECT id FROM social_posts WHERE post_id = :pid",
+                                text("SELECT id FROM social_posts WHERE post_id = :pid"),
                                 {"pid": post["post_id"]},
                             )
                             if existing.first():
@@ -120,6 +121,6 @@ class DataCollectorWorker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("sentiment collection error", error=str(e))
+                logger.error("sentiment collection error", error=safe_error_text(e))
 
             await asyncio.sleep(600)  # 10 minutes

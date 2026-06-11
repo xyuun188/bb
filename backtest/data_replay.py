@@ -51,16 +51,18 @@ async def load_historical_from_db(
         logger.warning("no historical data in DB, fetching from OKX")
         return await load_historical_from_okx(symbol, timeframe, limit)
 
-    df = pd.DataFrame([
-        {
-            "timestamp": k.open_time,
-            "open": k.open,
-            "high": k.high,
-            "low": k.low,
-            "close": k.close,
-            "volume": k.volume,
-        }
-        for k in klines
-    ])
+    df = pd.DataFrame(
+        [
+            {
+                "timestamp": k.open_time,
+                "open": k.open,
+                "high": k.high,
+                "low": k.low,
+                "close": k.close,
+                "volume": k.volume,
+            }
+            for k in klines
+        ]
+    )
     df = df.set_index("timestamp")
     return df

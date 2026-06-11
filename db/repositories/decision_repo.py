@@ -31,9 +31,12 @@ class DecisionRepository(BaseRepository):
         was_executed: bool | None = None,
         is_paper: bool | None = None,
     ) -> list[AIDecision]:
-        stmt = select(AIDecision).order_by(AIDecision.created_at.desc()).offset(
-            max(int(offset or 0), 0)
-        ).limit(limit)
+        stmt = (
+            select(AIDecision)
+            .order_by(AIDecision.created_at.desc())
+            .offset(max(int(offset or 0), 0))
+            .limit(limit)
+        )
         if model_name:
             stmt = stmt.where(AIDecision.model_name == model_name)
         if symbol:
@@ -51,9 +54,7 @@ class DecisionRepository(BaseRepository):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def mark_executed(
-        self, decision_id: int, execution_price: float
-    ) -> AIDecision | None:
+    async def mark_executed(self, decision_id: int, execution_price: float) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
             decision.was_executed = True
@@ -81,14 +82,12 @@ class DecisionRepository(BaseRepository):
             await self.session.flush()
         return decision
 
-    async def fill_missing_execution_reasons(
-        self, decision_ids: list[int], reason: str
-    ) -> int:
+    async def fill_missing_execution_reasons(self, decision_ids: list[int], reason: str) -> int:
         if not decision_ids:
             return 0
         stmt = select(AIDecision).where(
             AIDecision.id.in_(decision_ids),
-            AIDecision.was_executed == False,
+            AIDecision.was_executed.is_(False),
             or_(
                 AIDecision.execution_reason.is_(None),
                 AIDecision.execution_reason == "",
@@ -121,7 +120,7 @@ class DecisionRepository(BaseRepository):
         """Calculate what fraction of executed decisions were profitable."""
         stmt = select(func.count(AIDecision.id)).where(
             AIDecision.model_name == model_name,
-            AIDecision.was_executed == True,
+            AIDecision.was_executed.is_(True),
         )
         if since:
             stmt = stmt.where(AIDecision.created_at >= since)
@@ -162,6 +161,7 @@ class DecisionRepository(BaseRepository):
     async def delete_all(self) -> int:
         """Delete all AI decision records. Returns count of deleted rows."""
         from sqlalchemy import delete
+
         result = await self.session.execute(delete(AIDecision))
         await self.session.flush()
         return result.rowcount

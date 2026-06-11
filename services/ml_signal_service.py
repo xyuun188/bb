@@ -10,22 +10,25 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
+import structlog
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 
+from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
+from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 
+logger = structlog.get_logger(__name__)
 
 MODEL_DIR = Path("data/ml_signal")
 MODEL_PATH = MODEL_DIR / "winrate_model.joblib"
@@ -88,7 +91,7 @@ def _parse_json(value: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except (TypeError, json.JSONDecodeError):
         return {}
 
 
@@ -102,6 +105,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return result
     except (TypeError, ValueError):
         return default
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _feature_row_from_snapshot(
@@ -137,7 +144,9 @@ def _feature_row_from_snapshot(
         "price_vs_sma50": _safe_float(snapshot.get("price_vs_sma50")),
         "funding_rate": _safe_float(snapshot.get("funding_rate")),
         "log_volume_24h": math.log10(max(_safe_float(snapshot.get("volume_24h")), 0.0) + 1.0),
-        "log_open_interest_value": math.log10(max(_safe_float(snapshot.get("open_interest_value")), 0.0) + 1.0),
+        "log_open_interest_value": math.log10(
+            max(_safe_float(snapshot.get("open_interest_value")), 0.0) + 1.0
+        ),
         "orderbook_imbalance": _safe_float(snapshot.get("orderbook_imbalance")),
         "orderbook_depth_ratio": (bid_depth - ask_depth) / depth_total,
         "news_sentiment_avg": _safe_float(snapshot.get("news_sentiment_avg")),
@@ -176,10 +185,12 @@ def _make_classifier(y: pd.Series) -> Pipeline:
             random_state=42,
             n_jobs=-1,
         )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", estimator),
-    ])
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", estimator),
+        ]
+    )
 
 
 def _make_regressor(y: pd.Series) -> Pipeline:
@@ -193,10 +204,12 @@ def _make_regressor(y: pd.Series) -> Pipeline:
             random_state=42,
             n_jobs=-1,
         )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", estimator),
-    ])
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", estimator),
+        ]
+    )
 
 
 def _positive_proba(model: Pipeline, x: pd.DataFrame) -> np.ndarray:
@@ -213,7 +226,7 @@ def _safe_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
         if int(pd.Series(y_true).nunique()) < 2:
             return None
         return float(roc_auc_score(y_true, y_score))
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -253,7 +266,7 @@ def _net_return_pct(raw_return_pct: float) -> float:
 
 
 def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any]:
-    metrics = metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {}
+    metrics = _safe_dict(metadata.get("metrics"))
     sample_count = int(metadata.get("sample_count") or 0)
     test_count = int(metadata.get("test_count") or 0)
     auc = _safe_float(metrics.get(f"{side}_auc"), 0.0)
@@ -273,7 +286,9 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     if accuracy < ML_INFLUENCE_MIN_ACCURACY:
         reasons.append(f"准确率 {accuracy:.3f} < {ML_INFLUENCE_MIN_ACCURACY:.2f}")
     if top_return <= ML_INFLUENCE_MIN_TOP_RETURN_PCT:
-        reasons.append(f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%")
+        reasons.append(
+            f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%"
+        )
     if top_win <= bottom_win:
         reasons.append(f"高分组胜率 {top_win:.3f} 未优于低分组 {bottom_win:.3f}")
 
@@ -327,28 +342,34 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             continue
         long_return = _net_return_pct(_safe_float(raw_long_return))
         short_return = _net_return_pct(_safe_float(raw_short_return))
-        feature_row = _feature_row_from_snapshot(
-            snapshot,
-            decision_confidence=_safe_float(getattr(row, "decision_confidence", 0.0)),
-            horizon_minutes=int(getattr(row, "horizon_minutes", 10) or 10),
+        feature_row: dict[str, Any] = dict(
+            _feature_row_from_snapshot(
+                snapshot,
+                decision_confidence=_safe_float(getattr(row, "decision_confidence", 0.0)),
+                horizon_minutes=int(getattr(row, "horizon_minutes", 10) or 10),
+            )
         )
-        feature_row.update({
-            "id": int(getattr(row, "id", 0) or 0),
-            "symbol": str(getattr(row, "symbol", "") or ""),
-            "raw_long_return_pct": _safe_float(raw_long_return),
-            "raw_short_return_pct": _safe_float(raw_short_return),
-            "long_return_pct": long_return,
-            "short_return_pct": short_return,
-            "long_tail_loss": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
-            "short_tail_loss": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
-            "long_win": int(long_return > WIN_RETURN_THRESHOLD_PCT),
-            "short_win": int(short_return > WIN_RETURN_THRESHOLD_PCT),
-        })
+        feature_row.update(
+            {
+                "id": int(getattr(row, "id", 0) or 0),
+                "symbol": str(getattr(row, "symbol", "") or ""),
+                "raw_long_return_pct": _safe_float(raw_long_return),
+                "raw_short_return_pct": _safe_float(raw_short_return),
+                "long_return_pct": long_return,
+                "short_return_pct": short_return,
+                "long_tail_loss": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
+                "short_tail_loss": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
+                "long_win": int(long_return > WIN_RETURN_THRESHOLD_PCT),
+                "short_win": int(short_return > WIN_RETURN_THRESHOLD_PCT),
+            }
+        )
         data.append(feature_row)
     return pd.DataFrame(data)
 
 
-def train_from_frame(frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAMPLES) -> dict[str, Any]:
+def train_from_frame(
+    frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAMPLES
+) -> dict[str, Any]:
     if len(frame) < min_samples:
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
 
@@ -379,7 +400,7 @@ def train_from_frame(frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAM
     long_pred = (long_scores >= 0.50).astype(int)
     short_pred = (short_scores >= 0.50).astype(int)
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     metadata = {
         "version": now,
         "trained_at": now,
@@ -401,14 +422,26 @@ def train_from_frame(frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAM
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
             "short_auc": _safe_auc(test["short_win"], short_scores),
-            "long_accuracy": float(accuracy_score(test["long_win"], long_pred)) if len(test) else None,
-            "short_accuracy": float(accuracy_score(test["short_win"], short_pred)) if len(test) else None,
-            "top_long_avg_return_pct": _bucket_return(test["long_return_pct"], long_expected_scores, top=True),
-            "bottom_long_avg_return_pct": _bucket_return(test["long_return_pct"], long_expected_scores, top=False),
+            "long_accuracy": (
+                float(accuracy_score(test["long_win"], long_pred)) if len(test) else None
+            ),
+            "short_accuracy": (
+                float(accuracy_score(test["short_win"], short_pred)) if len(test) else None
+            ),
+            "top_long_avg_return_pct": _bucket_return(
+                test["long_return_pct"], long_expected_scores, top=True
+            ),
+            "bottom_long_avg_return_pct": _bucket_return(
+                test["long_return_pct"], long_expected_scores, top=False
+            ),
             "top_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=True),
             "bottom_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=False),
-            "top_short_avg_return_pct": _bucket_return(test["short_return_pct"], short_expected_scores, top=True),
-            "bottom_short_avg_return_pct": _bucket_return(test["short_return_pct"], short_expected_scores, top=False),
+            "top_short_avg_return_pct": _bucket_return(
+                test["short_return_pct"], short_expected_scores, top=True
+            ),
+            "bottom_short_avg_return_pct": _bucket_return(
+                test["short_return_pct"], short_expected_scores, top=False
+            ),
             "top_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=True),
             "bottom_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=False),
         },
@@ -425,8 +458,7 @@ def train_from_frame(frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAM
         "metadata": metadata,
         "feature_keys": FEATURE_KEYS,
     }
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, MODEL_PATH)
+    dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata
 
@@ -457,17 +489,22 @@ class MLSignalService:
                 "message": "本地 ML 盈亏质量模型尚未训练。",
                 **auto_status,
             }
-        metadata = self._bundle.get("metadata") or {}
-        influence = _influence_policy(metadata if isinstance(metadata, dict) else {})
-        model_note = metadata.get("note") if isinstance(metadata, dict) else None
+        metadata = _safe_dict(self._bundle.get("metadata"))
+        influence = _influence_policy(metadata)
+        model_note = metadata.get("note")
         training_count = int(metadata.get("sample_count") or 0)
         return {
             "available": True,
             "model_path": str(self.model_path),
             **metadata,
-            "training_shadow_sample_count": int(metadata.get("training_shadow_sample_count") or training_count),
-            "training_shadow_sample_limit": int(metadata.get("training_shadow_sample_limit") or 20000),
-            "training_sample_note": metadata.get("training_sample_note") or "sample_count is the latest training window, not the all-time total.",
+            "training_shadow_sample_count": int(
+                metadata.get("training_shadow_sample_count") or training_count
+            ),
+            "training_shadow_sample_limit": int(
+                metadata.get("training_shadow_sample_limit") or 20000
+            ),
+            "training_sample_note": metadata.get("training_sample_note")
+            or "sample_count is the latest training window, not the all-time total.",
             "status": "ready" if influence.get("enabled") else "learning_only",
             "mode": influence.get("mode"),
             "influence_enabled": bool(influence.get("enabled")),
@@ -491,14 +528,16 @@ class MLSignalService:
             }
 
         async with self._train_lock:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             self._last_check_at = now.isoformat()
             self._next_check_at = None
             try:
                 completed_count = await self._completed_shadow_sample_count()
                 metadata = self._current_metadata()
                 last_sample_count = int(metadata.get("sample_count") or 0)
-                trained_at = self._parse_datetime(metadata.get("trained_at") or metadata.get("version"))
+                trained_at = self._parse_datetime(
+                    metadata.get("trained_at") or metadata.get("version")
+                )
                 age_seconds = (
                     (now - trained_at).total_seconds()
                     if trained_at is not None
@@ -527,7 +566,7 @@ class MLSignalService:
                     return result
 
                 self._training = True
-                self._last_train_started_at = datetime.now(timezone.utc).isoformat()
+                self._last_train_started_at = datetime.now(UTC).isoformat()
                 rows = await load_shadow_training_rows(limit=20000)
                 frame = build_training_frame(rows)
                 trained_metadata = await asyncio.to_thread(train_from_frame, frame)
@@ -542,27 +581,28 @@ class MLSignalService:
                     "new_sample_count": new_samples,
                     "sample_count": int(trained_metadata.get("sample_count") or 0),
                     "trained_at": trained_metadata.get("trained_at"),
-                "message": "本地 ML 盈亏质量模型已自动完成训练并热加载。",
+                    "message": "本地 ML 盈亏质量模型已自动完成训练并热加载。",
                 }
                 self._last_train_result = result
                 return result
-            except Exception as e:
+            except Exception as exc:
+                error = safe_error_text(exc, limit=160)
                 result = {
                     "trained": False,
                     "reason": "error",
-                    "error": str(e),
-                    "message": f"本地 ML 自动训练失败，继续使用上一版模型：{str(e)[:160]}",
+                    "error": error,
+                    "message": f"本地 ML 自动训练失败，继续使用上一版模型：{error}",
                 }
                 self._last_train_result = result
                 return result
             finally:
-                finished = datetime.now(timezone.utc)
+                finished = datetime.now(UTC)
                 if self._training:
                     self._last_train_finished_at = finished.isoformat()
                 self._training = False
                 self._next_check_at = datetime.fromtimestamp(
                     finished.timestamp() + AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
-                    tz=timezone.utc,
+                    tz=UTC,
                 ).isoformat()
 
     def predict(self, features: Any, *, horizons: tuple[int, ...] = (10, 30)) -> dict[str, Any]:
@@ -573,8 +613,8 @@ class MLSignalService:
                 "status": "no_model",
                 "message": "本地 ML 盈亏质量模型尚未训练，当前分析不使用 ML 辅助信号。",
             }
-        metadata = self._bundle.get("metadata") or {}
-        influence = _influence_policy(metadata if isinstance(metadata, dict) else {})
+        metadata = _safe_dict(self._bundle.get("metadata"))
+        influence = _influence_policy(metadata)
 
         predictions = []
         for horizon in horizons:
@@ -589,35 +629,36 @@ class MLSignalService:
             best_expected = long_expected if best_side == "long" else short_expected
             profit_edge = abs(long_expected - short_expected)
             profit_quality = _profit_quality_score(best_expected, best_win, profit_edge)
+            side_influence = _safe_dict(influence.get(best_side))
             risk_score = _clamp(
                 max(-best_expected, 0.0) / max(WIN_RETURN_THRESHOLD_PCT, 1e-9)
                 + max(MIN_PROFIT_SIGNAL_WIN_RATE - best_win, 0.0)
             )
-            predictions.append({
-                "horizon_minutes": int(horizon),
-                "long_win_rate": round(long_win_rate, 4),
-                "short_win_rate": round(short_win_rate, 4),
-                "long_expected_return_pct": round(long_expected, 4),
-                "short_expected_return_pct": round(short_expected, 4),
-                "best_side": best_side,
-                "best_win_rate": round(best_win, 4),
-                "best_expected_return_pct": round(best_expected, 4),
-                "profit_edge_pct": round(profit_edge, 4),
-                "profit_quality_score": round(profit_quality, 4),
-                "profit_signal": bool(
-                    influence.get("enabled")
-                    and (influence.get(best_side, {}) or {}).get("enabled")
-                    and
-                    best_expected > WIN_RETURN_THRESHOLD_PCT
-                    and profit_edge >= MIN_PROFIT_EDGE_PCT
-                    and best_win >= MIN_PROFIT_SIGNAL_WIN_RATE
-                ),
-                "risk_score": round(risk_score, 4),
-                "ml_influence_enabled": bool(
-                    influence.get("enabled")
-                    and (influence.get(best_side, {}) or {}).get("enabled")
-                ),
-            })
+            predictions.append(
+                {
+                    "horizon_minutes": int(horizon),
+                    "long_win_rate": round(long_win_rate, 4),
+                    "short_win_rate": round(short_win_rate, 4),
+                    "long_expected_return_pct": round(long_expected, 4),
+                    "short_expected_return_pct": round(short_expected, 4),
+                    "best_side": best_side,
+                    "best_win_rate": round(best_win, 4),
+                    "best_expected_return_pct": round(best_expected, 4),
+                    "profit_edge_pct": round(profit_edge, 4),
+                    "profit_quality_score": round(profit_quality, 4),
+                    "profit_signal": bool(
+                        influence.get("enabled")
+                        and side_influence.get("enabled")
+                        and best_expected > WIN_RETURN_THRESHOLD_PCT
+                        and profit_edge >= MIN_PROFIT_EDGE_PCT
+                        and best_win >= MIN_PROFIT_SIGNAL_WIN_RATE
+                    ),
+                    "risk_score": round(risk_score, 4),
+                    "ml_influence_enabled": bool(
+                        influence.get("enabled") and side_influence.get("enabled")
+                    ),
+                }
+            )
 
         primary = predictions[0] if predictions else {}
         return {
@@ -626,8 +667,8 @@ class MLSignalService:
             "mode": "entry_profit_filter" if influence.get("enabled") else "learning_only",
             "influence_enabled": bool(influence.get("enabled")),
             "influence_policy": influence,
-            "model_version": metadata.get("version") if isinstance(metadata, dict) else None,
-            "trained_sample_count": int((metadata or {}).get("sample_count") or 0),
+            "model_version": metadata.get("version"),
+            "trained_sample_count": int(metadata.get("sample_count") or 0),
             "primary_horizon_minutes": primary.get("horizon_minutes"),
             "long_win_rate": primary.get("long_win_rate"),
             "short_win_rate": primary.get("short_win_rate"),
@@ -654,9 +695,18 @@ class MLSignalService:
             mtime = self.model_path.stat().st_mtime
             if self._bundle is not None and self._loaded_mtime == mtime:
                 return
-            self._bundle = joblib.load(self.model_path)
+            self._bundle = load_trusted_joblib(
+                self.model_path,
+                trusted_root=MODEL_DIR,
+                expected_type=dict,
+            )
             self._loaded_mtime = mtime
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "failed to load ML signal model",
+                path=str(self.model_path),
+                error=safe_error_text(exc),
+            )
             self._bundle = None
             self._loaded_mtime = None
 
@@ -684,8 +734,12 @@ class MLSignalService:
             if METADATA_PATH.exists():
                 parsed = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
                 return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "failed to read ML signal metadata",
+                path=str(METADATA_PATH),
+                error=safe_error_text(exc),
+            )
         return {}
 
     async def _completed_shadow_sample_count(self) -> int:
@@ -693,15 +747,20 @@ class MLSignalService:
             repo = MemoryRepository(session)
             return await repo.count_shadow_backtests(status="completed")
 
+    async def completed_shadow_sample_count(self) -> int:
+        """Return completed shadow samples through a public dashboard boundary."""
+
+        return await self._completed_shadow_sample_count()
+
     def _parse_datetime(self, value: Any) -> datetime | None:
         if not value:
             return None
         try:
             parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
-        except Exception:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
+        except ValueError:
             return None
 
     def _suggestion(self, primary: dict[str, Any], influence: dict[str, Any] | None = None) -> str:
@@ -713,7 +772,11 @@ class MLSignalService:
         expected = float(primary.get("best_expected_return_pct") or 0.0)
         edge = float(primary.get("profit_edge_pct") or 0.0)
         side = "做多" if primary.get("best_side") == "long" else "做空"
-        if expected > WIN_RETURN_THRESHOLD_PCT and edge >= MIN_PROFIT_EDGE_PCT and win >= MIN_PROFIT_SIGNAL_WIN_RATE:
+        if (
+            expected > WIN_RETURN_THRESHOLD_PCT
+            and edge >= MIN_PROFIT_EDGE_PCT
+            and win >= MIN_PROFIT_SIGNAL_WIN_RATE
+        ):
             return f"ML 盈亏期望支持{side}，胜率仅作辅助；可作为开仓质量加分。"
         if expected <= 0:
             return "ML 预期盈亏为负，后续可用于提高入场门槛。"

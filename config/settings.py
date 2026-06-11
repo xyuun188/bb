@@ -6,16 +6,21 @@ All modules import settings from here. Single source of truth.
 from __future__ import annotations
 
 import json
-from enum import Enum
+import os
+import re
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
 ENSEMBLE_TRADER_NAME = "ensemble_trader"
 DECISION_MAKER_NAME = "decision_maker"
+ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -63,9 +68,16 @@ FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
 ]
 
 
-class TradingMode(str, Enum):
+class TradingMode(StrEnum):
     PAPER = "paper"
     LIVE = "live"
+
+
+def _format_env_value(value: str) -> str:
+    """Format one-line dotenv values without changing simple existing output."""
+    if value == "" or ENV_SIMPLE_VALUE_RE.fullmatch(value):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 class Settings(BaseSettings):
@@ -97,17 +109,23 @@ class Settings(BaseSettings):
     # Each element: {"name": "gpt-5.4", "api_base": "...", "api_key": "...", "model": "...", "balance": 1000}
     ai_models: list[dict] = Field(default_factory=list)
     # Backward compatibility: fallback for single-model setups
-    ai_api_base: str = "http://175.155.64.171:31840/v1"
-    ai_api_key: str = "local"
-    ai_model: str = "deepseek-r1-distill-qwen-32b-trade"
-    local_ai_tools_enabled: bool = True
-    local_ai_tools_api_base: str = "http://175.155.64.171:31841"
+    ai_api_base: str = ""
+    ai_api_key: str = ""
+    ai_model: str = "qwen3-32b-trade"
+    local_ai_tools_enabled: bool = False
+    local_ai_tools_api_base: str = ""
     local_ai_tools_api_key: str = ""
     local_ai_tools_timeout_seconds: float = 2.5
+    local_ai_tools_circuit_breaker_failures: int = 3
+    local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
     high_risk_review_enabled: bool = True
-    high_risk_review_api_base: str = "http://175.155.64.171:31841/v1"
-    high_risk_review_api_key: str = "local"
-    high_risk_review_model: str = "deepseek-r1-distill-qwen-32b-trade"
+    high_risk_review_api_base: str = ""
+    high_risk_review_api_key: str = ""
+    high_risk_review_model: str = "deepseek-reasoner"
+    high_risk_review_timeout_seconds: float = 30.0
+    high_risk_review_max_tokens: int = 480
+    high_risk_review_circuit_breaker_failures: int = 2
+    high_risk_review_circuit_breaker_cooldown_seconds: float = 120.0
 
     # --- Database ---
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"
@@ -148,12 +166,13 @@ class Settings(BaseSettings):
     ai_llm_call_delay_seconds: float = 0.15
     ai_expert_timeout_seconds: float = 30.0
     ai_decision_maker_timeout_seconds: float = 20.0
-    ai_expert_max_completion_tokens: int = 520
-    ai_decision_maker_max_completion_tokens: int = 720
+    ai_expert_max_completion_tokens: int = 360
+    ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
-    ai_batch_expert_max_completion_tokens: int = 1100
+    ai_batch_expert_max_completion_tokens: int = 900
     ai_batch_expert_timeout_seconds: float = 90.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
+    ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
     ai_market_fast_prefilter_enabled: bool = True
     ai_market_fast_prefilter_min_expected_return_pct: float = 0.03
     ai_market_fast_prefilter_max_loss_probability: float = 0.58
@@ -174,7 +193,9 @@ class Settings(BaseSettings):
 
     # --- Web Dashboard ---
     dashboard_port: int = 8002
-    dashboard_host: str = "0.0.0.0"
+    dashboard_host: str = "127.0.0.1"
+    dashboard_cors_origins: list[str] = Field(default_factory=list)
+    dashboard_admin_api_key: str = ""
 
     # --- Notifications ---
     telegram_bot_token: str = ""
@@ -240,6 +261,34 @@ class Settings(BaseSettings):
             except (json.JSONDecodeError, TypeError):
                 return [s.strip() for s in v.split(",")]
         return v
+
+    @field_validator("dashboard_cors_origins", mode="before")
+    @classmethod
+    def parse_dashboard_cors_origins(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            if not v.strip():
+                return []
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except (json.JSONDecodeError, TypeError):
+                return [item.strip() for item in v.split(",") if item.strip()]
+        if isinstance(v, list):
+            return [str(item).strip() for item in v if str(item).strip()]
+        return []
+
+    def dashboard_allowed_origins(self) -> list[str]:
+        """Return explicit Dashboard CORS origins without wildcard credentials."""
+        if self.dashboard_cors_origins:
+            return list(dict.fromkeys(self.dashboard_cors_origins))
+        port = int(self.dashboard_port or 8002)
+        host = str(self.dashboard_host or "127.0.0.1").strip()
+        origins = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
+        wildcard_hosts = {"0.0.0.0", "::"}  # noqa: S104 - rejected, not bound.
+        if host and host not in {"127.0.0.1", "localhost"} and host not in wildcard_hosts:
+            origins.append(f"http://{host}:{port}")
+        return list(dict.fromkeys(origins))
 
     @field_validator("model_initial_balances", mode="before")
     @classmethod
@@ -343,7 +392,9 @@ class Settings(BaseSettings):
             "role": slot["role"],
             "label": slot["label"],
             "weight": slot["weight"],
-            "api_base": str(updates.get("api_base", existing.get("api_base", self.ai_api_base)) or "").strip(),
+            "api_base": str(
+                updates.get("api_base", existing.get("api_base", self.ai_api_base)) or ""
+            ).strip(),
             "api_key": str(updates.get("api_key", existing.get("api_key", "")) or "").strip(),
             "model": str(updates.get("model", existing.get("model", self.ai_model)) or "").strip(),
             "enabled": bool(updates.get("enabled", existing.get("enabled", True))),
@@ -368,9 +419,7 @@ class Settings(BaseSettings):
                 "paper",
                 self.model_initial_balances.get(model_name, self.initial_virtual_balance),
             )
-        return self.model_initial_balances.get(
-            model_name, self.initial_virtual_balance
-        )
+        return self.model_initial_balances.get(model_name, self.initial_virtual_balance)
 
     def get_execution_account_config(self, mode: str = "paper") -> dict[str, Any]:
         """Return the mode-specific execution account quota and risk settings."""
@@ -396,34 +445,28 @@ class Settings(BaseSettings):
 
     def to_safe_dict(self) -> dict[str, Any]:
         """Export settings with secrets masked, for logging/debugging."""
-        d = self.model_dump()
-        for key in ("okx_api_secret", "okx_api_key", "okx_paper_api_key", "okx_paper_api_secret",
-                     "okx_live_api_key", "okx_live_api_secret",
-                     "ai_api_key", "local_ai_tools_api_key", "high_risk_review_api_key",
-                     "telegram_bot_token", "dingtalk_webhook_url"):
-            if d.get(key):
-                d[key] = d[key][:8] + "***" if len(d[key]) > 8 else "***"
-        # Mask api_key in each ai_models entry
-        if d.get("ai_models"):
-            safe_models = []
-            for m in d["ai_models"]:
-                mc = dict(m)
-                if mc.get("api_key") and len(mc["api_key"]) > 8:
-                    mc["api_key"] = mc["api_key"][:8] + "***"
-                elif mc.get("api_key"):
-                    mc["api_key"] = "***"
-                safe_models.append(mc)
-            d["ai_models"] = safe_models
-        return d
+        return redact_mapping(self.model_dump())
 
     def update_env_file(self, updates: dict[str, Any]) -> None:
         """Write key=value updates to the .env file, preserving existing lines."""
         env_path = self.project_root / ".env"
-        if not env_path.exists():
+
+        updates_str: dict[str, str] = {}
+        for raw_key, raw_value in updates.items():
+            key = str(raw_key or "").strip()
+            value = "" if raw_value is None else str(raw_value)
+            if not ENV_KEY_RE.fullmatch(key):
+                raise ValueError(f"Invalid .env key: {key!r}")
+            if "\n" in value or "\r" in value:
+                raise ValueError(f"Invalid newline in .env value for {key}")
+            if is_sensitive_key(key) and is_masked_secret(value):
+                continue
+            updates_str[key] = value
+        if not updates_str:
             return
 
-        updates_str = {str(k): str(v) for k, v in updates.items()}
-        lines = env_path.read_text(encoding="utf-8").splitlines()
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
         updated_keys = set()
         new_lines = []
 
@@ -435,7 +478,7 @@ class Settings(BaseSettings):
             if "=" in stripped:
                 key = stripped.split("=", 1)[0].strip()
                 if key in updates_str:
-                    new_lines.append(f"{key}={updates_str[key]}")
+                    new_lines.append(f"{key}={_format_env_value(updates_str[key])}")
                     updated_keys.add(key)
                     continue
             new_lines.append(line)
@@ -443,9 +486,11 @@ class Settings(BaseSettings):
         # Append keys not found in existing file
         for k, v in updates_str.items():
             if k not in updated_keys:
-                new_lines.append(f"{k}={v}")
+                new_lines.append(f"{k}={_format_env_value(v)}")
 
-        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        tmp_path = env_path.with_name(f"{env_path.name}.tmp")
+        tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        os.replace(tmp_path, env_path)
 
     def update_symbols(self, new_symbols: list[str]) -> None:
         """Update symbols at runtime and persist to .env."""

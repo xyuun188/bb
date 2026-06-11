@@ -10,13 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import structlog
 import websockets
 
 from config.settings import settings
 from core.exceptions import WebSocketConnectionError
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
 
@@ -38,11 +40,11 @@ class OKXWebSocketClient:
 
     def __init__(self) -> None:
         self._ws_url = WS_PUBLIC_URL  # Public data always from ws.okx.com
-        self._ws = None
+        self._ws: Any = None
         self._running = False
-        self._ticker_callbacks: list[Callable] = []
-        self._kline_callbacks: list[Callable] = []
-        self._latest_tickers: dict[str, dict] = {}
+        self._ticker_callbacks: list[Callable[..., Any]] = []
+        self._kline_callbacks: list[Callable[..., Any]] = []
+        self._latest_tickers: dict[str, dict[str, Any]] = {}
         self._latest_klines: dict[str, list[dict]] = {}
         self._message_count = 0
         self._last_message_time = 0.0
@@ -81,18 +83,19 @@ class OKXWebSocketClient:
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5,
-                max_size=2 ** 20,
+                max_size=2**20,
             )
             logger.info("OKX WebSocket connected")
             await self._subscribe()
         except Exception as e:
-            logger.error("OKX WebSocket connection failed", error=str(e))
+            error_text = safe_error_text(e)
+            logger.error("OKX WebSocket connection failed", error=error_text)
             self._running = False
-            raise WebSocketConnectionError(f"Failed to connect: {e}") from e
+            raise WebSocketConnectionError(f"Failed to connect: {error_text}") from e
 
     async def _subscribe(self) -> None:
         """Subscribe to ticker channels for configured symbols."""
-        symbols = getattr(self, '_subscribe_symbols', settings.symbols)
+        symbols = getattr(self, "_subscribe_symbols", settings.symbols)
         ticker_channels = []
         for symbol in symbols:
             inst_id = self._to_ws_inst_id(symbol)
@@ -144,29 +147,40 @@ class OKXWebSocketClient:
                 for cb in self._ticker_callbacks:
                     try:
                         cb(symbol, parsed)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "ticker callback failed",
+                            symbol=symbol,
+                            error=safe_error_text(exc),
+                        )
 
         elif channel and channel.startswith("candle"):
             timeframe = channel.replace("candle", "")
             candles = []
             for candle in data["data"]:
-                candles.append({
-                    "open_time": int(candle[0]),
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4]),
-                    "volume": float(candle[5]),
-                })
+                candles.append(
+                    {
+                        "open_time": int(candle[0]),
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4]),
+                        "volume": float(candle[5]),
+                    }
+                )
             symbol = inst_id.replace("-SWAP", "").replace("-", "/")
             key = f"{symbol}:{timeframe}"
             self._latest_klines[key] = candles
             for cb in self._kline_callbacks:
                 try:
                     cb(symbol, timeframe, candles)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "kline callback failed",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        error=safe_error_text(exc),
+                    )
 
     async def listen(self) -> None:
         """Main message loop. Blocks until disconnected or stopped."""
@@ -175,11 +189,9 @@ class OKXWebSocketClient:
 
         while self._running:
             try:
-                raw = await asyncio.wait_for(
-                    self._ws.recv(), timeout=30
-                )
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
                 await self._handle_message(raw)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Send ping to keep alive
                 try:
                     await self._ws.send("ping")
@@ -190,7 +202,7 @@ class OKXWebSocketClient:
                 logger.warning("websocket closed", code=e.code, reason=e.reason)
                 break
             except Exception as e:
-                logger.error("unexpected error in listen loop", error=str(e))
+                logger.error("unexpected error in listen loop", error=safe_error_text(e))
                 break
 
         # Auto-reconnect
@@ -215,12 +227,9 @@ class OKXWebSocketClient:
         """Resubscribe to a new list of symbols (unsub old, sub new)."""
         old_ids = [
             {"channel": "tickers", "instId": self._to_ws_inst_id(s)}
-            for s in getattr(self, '_subscribe_symbols', settings.symbols)
+            for s in getattr(self, "_subscribe_symbols", settings.symbols)
         ]
-        new_ids = [
-            {"channel": "tickers", "instId": self._to_ws_inst_id(s)}
-            for s in symbols
-        ]
+        new_ids = [{"channel": "tickers", "instId": self._to_ws_inst_id(s)} for s in symbols]
         if not self._ws or not self._running:
             self._subscribe_symbols = symbols
             return
@@ -228,7 +237,7 @@ class OKXWebSocketClient:
         if old_ids:
             await self._ws.send(json.dumps({"op": "unsubscribe", "args": old_ids}))
         # Clear old tickers
-        old_symbols = set(getattr(self, '_subscribe_symbols', []))
+        old_symbols = set(getattr(self, "_subscribe_symbols", []))
         for sym in old_symbols:
             self._latest_tickers.pop(sym, None)
         # Subscribe to new
@@ -254,8 +263,8 @@ class OKXWebSocketClient:
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("OKX WebSocket close failed", error=safe_error_text(exc))
             self._ws = None
         logger.info("OKX WebSocket disconnected")
 

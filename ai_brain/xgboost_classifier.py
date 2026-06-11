@@ -10,10 +10,7 @@ and has no external API dependency.
 from __future__ import annotations
 
 import asyncio
-import pickle
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import structlog
@@ -22,16 +19,36 @@ from sklearn.preprocessing import StandardScaler
 
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from config.settings import settings
+from core.model_artifact_safety import dump_trusted_pickle, load_trusted_pickle
+from core.safe_output import safe_error_text
+
+if TYPE_CHECKING:
+    from data_feed.feature_vector import FeatureVector
 
 logger = structlog.get_logger(__name__)
 
 # Feature columns used by XGBoost (subset of FeatureVector fields)
 FEATURE_COLUMNS = [
-    "rsi_14", "rsi_7", "macd", "macd_signal", "macd_diff", "stoch_k",
-    "adx_14", "bb_pct", "bb_width", "atr_14",
-    "volume_ratio", "returns_1", "returns_5", "returns_20",
-    "volatility_20", "price_vs_sma20", "price_vs_sma50",
-    "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
+    "rsi_14",
+    "rsi_7",
+    "macd",
+    "macd_signal",
+    "macd_diff",
+    "stoch_k",
+    "adx_14",
+    "bb_pct",
+    "bb_width",
+    "atr_14",
+    "volume_ratio",
+    "returns_1",
+    "returns_5",
+    "returns_20",
+    "volatility_20",
+    "price_vs_sma20",
+    "price_vs_sma50",
+    "news_sentiment_avg",
+    "social_sentiment_avg",
+    "social_mention_count",
 ]
 
 # Action labels: 0=hold, 1=long, 2=short, 3=close_long, 4=close_short
@@ -73,11 +90,17 @@ class XGBoostModel(AbstractAIModel):
             try:
                 self._model = xgb.XGBClassifier()
                 self._model.load_model(str(self._model_path))
-                with open(self._scaler_path, "rb") as f:
-                    self._scaler = pickle.load(f)
+                self._scaler = load_trusted_pickle(
+                    self._scaler_path,
+                    trusted_root=settings.data_dir,
+                    expected_type=StandardScaler,
+                )
                 logger.info("xgboost model loaded from disk")
             except Exception as e:
-                logger.warning("failed to load xgboost model, creating seed", error=str(e))
+                logger.warning(
+                    "failed to load xgboost model, creating seed",
+                    error=safe_error_text(e),
+                )
                 self._create_seed_model()
         else:
             self._create_seed_model()
@@ -101,15 +124,26 @@ class XGBoostModel(AbstractAIModel):
             returns_5 = np.random.uniform(-0.05, 0.05)
 
             X[i] = [
-                rsi, rsi - np.random.uniform(-5, 5), macd, macd * 0.5, macd * 0.3,
-                np.random.uniform(20, 80), np.random.uniform(10, 40),
-                np.random.uniform(0.2, 0.8), np.random.uniform(0.01, 0.1),
+                rsi,
+                rsi - np.random.uniform(-5, 5),
+                macd,
+                macd * 0.5,
+                macd * 0.3,
+                np.random.uniform(20, 80),
+                np.random.uniform(10, 40),
+                np.random.uniform(0.2, 0.8),
+                np.random.uniform(0.01, 0.1),
                 np.random.uniform(0.001, 0.01),
                 vol_ratio,
-                returns_5 * 0.2, returns_5, returns_5 * 4,
+                returns_5 * 0.2,
+                returns_5,
+                returns_5 * 4,
                 np.random.uniform(0.01, 0.05),
-                np.random.uniform(-0.03, 0.03), np.random.uniform(-0.05, 0.05),
-                sentiment, sentiment * 0.7, np.random.randint(0, 100),
+                np.random.uniform(-0.03, 0.03),
+                np.random.uniform(-0.05, 0.05),
+                sentiment,
+                sentiment * 0.7,
+                np.random.randint(0, 100),
             ]
 
             # Simple heuristic labeling
@@ -135,7 +169,7 @@ class XGBoostModel(AbstractAIModel):
         self._model.fit(X_scaled, y)
         logger.info("xgboost seed model trained")
 
-    def _features_to_array(self, features: "FeatureVector") -> np.ndarray:
+    def _features_to_array(self, features: FeatureVector) -> np.ndarray:
         """Extract feature values into numpy array."""
         d = features.to_dict()
         values = []
@@ -146,21 +180,24 @@ class XGBoostModel(AbstractAIModel):
             values.append(float(val))
         return np.array([values])
 
-    async def decide(self, features: "FeatureVector", context: dict[str, Any]) -> DecisionOutput:
-        if self._model is None:
+    async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
+        if self._model is None or self._scaler is None:
             await self.initialize()
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._decide_sync, features, context)
 
-    def _decide_sync(
-        self, features: "FeatureVector", context: dict
-    ) -> DecisionOutput:
+    def _decide_sync(self, features: FeatureVector, context: dict) -> DecisionOutput:
+        if self._model is None or self._scaler is None:
+            raise RuntimeError("xgboost model is not initialized")
+        model = self._model
+        scaler = self._scaler
+
         X = self._features_to_array(features)
-        X_scaled = self._scaler.transform(X)
+        X_scaled = scaler.transform(X)
 
         # Get probability distribution over all classes
-        proba = self._model.predict_proba(X_scaled)[0]
+        proba = model.predict_proba(X_scaled)[0]
         predicted_label = int(np.argmax(proba))
         confidence = float(proba[predicted_label])
 
@@ -187,7 +224,7 @@ class XGBoostModel(AbstractAIModel):
         )
 
     def _build_reasoning(
-        self, proba: np.ndarray, action: Action, confidence: float, features: "FeatureVector"
+        self, proba: np.ndarray, action: Action, confidence: float, features: FeatureVector
     ) -> str:
         """Generate a human-readable reasoning trace."""
         top_3 = np.argsort(proba)[-3:][::-1]
@@ -248,15 +285,20 @@ class XGBoostModel(AbstractAIModel):
             logger.warning("not enough class diversity for retraining")
             return
 
-        X_scaled = self._scaler.transform(X)
+        if self._model is None or self._scaler is None:
+            await self.initialize()
+        if self._model is None or self._scaler is None:
+            raise RuntimeError("xgboost model is not initialized")
+        model = self._model
+        scaler = self._scaler
+
+        X_scaled = scaler.transform(X)
 
         # Incremental fit (warm start from existing model)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
-            lambda: self._model.fit(
-                X_scaled, y, xgb_model=self._model.get_booster()
-            ),
+            lambda: model.fit(X_scaled, y, xgb_model=model.get_booster()),
         )
 
         # Save to disk
@@ -267,8 +309,11 @@ class XGBoostModel(AbstractAIModel):
         if self._model:
             self._model.save_model(str(self._model_path))
         if self._scaler:
-            with open(self._scaler_path, "wb") as f:
-                pickle.dump(self._scaler, f)
+            dump_trusted_pickle(
+                self._scaler,
+                self._scaler_path,
+                trusted_root=settings.data_dir,
+            )
 
     async def shutdown(self) -> None:
         if self._model:

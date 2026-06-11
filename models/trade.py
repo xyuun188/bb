@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -21,9 +21,7 @@ class Order(Base, TimestampMixin):
     fee: Mapped[float] = mapped_column(Float, default=0.0)
     decision_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    filled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Position(Base, TimestampMixin):
@@ -43,6 +41,4 @@ class Position(Base, TimestampMixin):
     stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
-    closed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

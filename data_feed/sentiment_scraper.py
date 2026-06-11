@@ -6,16 +6,16 @@ Twitter/X requires paid API access; placeholder for future integration.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 import re
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
-from xml.etree import ElementTree
 
 import httpx
 import structlog
+from defusedxml import ElementTree
 
-from config.settings import settings
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
 
@@ -67,9 +67,7 @@ class SentimentScraper:
             )
         return self._client
 
-    async def fetch_reddit_mentions(
-        self, subreddit: str, limit: int = 25
-    ) -> list[dict]:
+    async def fetch_reddit_mentions(self, subreddit: str, limit: int = 25) -> list[dict]:
         """Fetch recent posts from a subreddit and extract crypto mentions."""
         posts = []
         try:
@@ -95,25 +93,28 @@ class SentimentScraper:
                         mentions.append(base)
 
                 if mentions:
-                    posts.append({
-                        "platform": "reddit",
-                        "subreddit": subreddit,
-                        "post_id": post_data.get("id", ""),
-                        "title": title,
-                        "content": selftext[:500],
-                        "symbols": mentions,
-                        "score": post_data.get("score", 0),
-                        "sentiment_score": self._lexicon_sentiment(combined),
-                        "num_comments": post_data.get("num_comments", 0),
-                        "engagement_count": post_data.get("score", 0) + post_data.get("num_comments", 0),
-                        "posted_at": datetime.fromtimestamp(
-                            post_data.get("created_utc", 0), tz=timezone.utc
-                        ),
-                        "url": f"https://reddit.com{permalink}",
-                    })
+                    posts.append(
+                        {
+                            "platform": "reddit",
+                            "subreddit": subreddit,
+                            "post_id": post_data.get("id", ""),
+                            "title": title,
+                            "content": selftext[:500],
+                            "symbols": mentions,
+                            "score": post_data.get("score", 0),
+                            "sentiment_score": self._lexicon_sentiment(combined),
+                            "num_comments": post_data.get("num_comments", 0),
+                            "engagement_count": post_data.get("score", 0)
+                            + post_data.get("num_comments", 0),
+                            "posted_at": datetime.fromtimestamp(
+                                post_data.get("created_utc", 0), tz=UTC
+                            ),
+                            "url": f"https://reddit.com{permalink}",
+                        }
+                    )
 
         except Exception as e:
-            logger.debug("reddit error", subreddit=subreddit, error=str(e))
+            logger.debug("reddit error", subreddit=subreddit, error=safe_error_text(e))
 
         return posts
 
@@ -125,12 +126,15 @@ class SentimentScraper:
             url = f"https://www.reddit.com/r/{subreddit}/new/.rss"
             resp = await client.get(url, params={"limit": limit})
             if resp.status_code != 200:
-                logger.debug("reddit rss fetch failed", subreddit=subreddit, status=resp.status_code)
+                logger.debug(
+                    "reddit rss fetch failed", subreddit=subreddit, status=resp.status_code
+                )
                 return posts
 
             root = ElementTree.fromstring(resp.text)
             entries = [
-                item for item in root.iter()
+                item
+                for item in root.iter()
                 if item.tag.lower().endswith("entry") or item.tag.lower().endswith("item")
             ]
             for entry in entries[:limit]:
@@ -166,22 +170,24 @@ class SentimentScraper:
                         mentions.append(base)
                 if not mentions:
                     continue
-                posts.append({
-                    "platform": "reddit_rss",
-                    "subreddit": subreddit,
-                    "post_id": post_id or link or f"{subreddit}:{hash(combined)}",
-                    "title": title,
-                    "content": content,
-                    "symbols": mentions,
-                    "score": 0,
-                    "sentiment_score": self._lexicon_sentiment(combined),
-                    "num_comments": 0,
-                    "engagement_count": 0,
-                    "posted_at": posted_at or datetime.now(timezone.utc),
-                    "url": link,
-                })
+                posts.append(
+                    {
+                        "platform": "reddit_rss",
+                        "subreddit": subreddit,
+                        "post_id": post_id or link or f"{subreddit}:{hash(combined)}",
+                        "title": title,
+                        "content": content,
+                        "symbols": mentions,
+                        "score": 0,
+                        "sentiment_score": self._lexicon_sentiment(combined),
+                        "num_comments": 0,
+                        "engagement_count": 0,
+                        "posted_at": posted_at or datetime.now(UTC),
+                        "url": link,
+                    }
+                )
         except Exception as e:
-            logger.debug("reddit rss error", subreddit=subreddit, error=str(e))
+            logger.debug("reddit rss error", subreddit=subreddit, error=safe_error_text(e))
         return posts
 
     def _contains_alias(self, text: str, alias: str) -> bool:
@@ -190,9 +196,33 @@ class SentimentScraper:
 
     def _lexicon_sentiment(self, text: str) -> float:
         lower = str(text or "").lower()
-        positive = ("surge", "rally", "gain", "bull", "breakout", "record", "approval", "partnership", "launch", "up")
-        negative = ("crash", "hack", "lawsuit", "bear", "dump", "plunge", "ban", "exploit", "down", "liquidation")
-        score = sum(1 for word in positive if word in lower) - sum(1 for word in negative if word in lower)
+        positive = (
+            "surge",
+            "rally",
+            "gain",
+            "bull",
+            "breakout",
+            "record",
+            "approval",
+            "partnership",
+            "launch",
+            "up",
+        )
+        negative = (
+            "crash",
+            "hack",
+            "lawsuit",
+            "bear",
+            "dump",
+            "plunge",
+            "ban",
+            "exploit",
+            "down",
+            "liquidation",
+        )
+        score = sum(1 for word in positive if word in lower) - sum(
+            1 for word in negative if word in lower
+        )
         if score == 0:
             return 0.0
         return max(min(score / 4.0, 1.0), -1.0)
@@ -216,8 +246,7 @@ class SentimentScraper:
         """Get mention count and average score for a symbol across recent posts."""
         posts = await self.fetch_all_reddit()
         symbol_posts = [
-            p for p in posts
-            if symbol.upper() in [s.upper() for s in p.get("symbols", [])]
+            p for p in posts if symbol.upper() in [s.upper() for s in p.get("symbols", [])]
         ]
         total_engagement = sum(p.get("engagement_count", 0) for p in symbol_posts)
         return {
@@ -226,7 +255,8 @@ class SentimentScraper:
             "total_engagement": total_engagement,
             "avg_score": (
                 sum(p.get("score", 0) for p in symbol_posts) / len(symbol_posts)
-                if symbol_posts else 0
+                if symbol_posts
+                else 0
             ),
         }
 

@@ -5,15 +5,11 @@ Uses Backtrader for event-driven backtesting with historical data.
 
 from __future__ import annotations
 
-import datetime
 from typing import Any
 
 import backtrader as bt
 import pandas as pd
 import structlog
-
-from config.settings import settings
-from data_feed.technical_indicators import compute_all_indicators
 
 logger = structlog.get_logger(__name__)
 

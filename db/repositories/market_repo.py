@@ -23,7 +23,9 @@ class MarketRepository(BaseRepository):
         await self.session.flush()
         return ticker
 
-    async def upsert_kline(self, symbol: str, timeframe: str, open_time: datetime, data: dict) -> Kline:
+    async def upsert_kline(
+        self, symbol: str, timeframe: str, open_time: datetime, data: dict
+    ) -> Kline:
         kline = await self.find_one_by(
             Kline, symbol=symbol, timeframe=timeframe, open_time=open_time
         )
@@ -44,9 +46,7 @@ class MarketRepository(BaseRepository):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_klines(
-        self, symbol: str, timeframe: str = "1h", limit: int = 100
-    ) -> list[Kline]:
+    async def get_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> list[Kline]:
         result = await self.session.execute(
             select(Kline)
             .where(Kline.symbol == symbol, Kline.timeframe == timeframe)

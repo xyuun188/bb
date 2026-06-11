@@ -49,9 +49,7 @@ class AccountRepository(BaseRepository):
             await self.session.flush()
         return account
 
-    async def record_trade_result(
-        self, model_name: str, is_win: bool
-    ) -> VirtualAccount | None:
+    async def record_trade_result(self, model_name: str, is_win: bool) -> VirtualAccount | None:
         account = await self.get_account(model_name)
         if account:
             account.total_trades += 1

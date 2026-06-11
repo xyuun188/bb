@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
-
 
 MEMORY_MOJIBAKE_MARKERS = (
     "閿",
@@ -65,7 +64,7 @@ class MemoryRepository(BaseRepository):
             select(ExpertMemory)
             .where(
                 ExpertMemory.expert_name == expert_name,
-                ExpertMemory.is_active == True,
+                ExpertMemory.is_active.is_(True),
                 or_(ExpertMemory.symbol.is_(None), ExpertMemory.symbol == symbol),
             )
             .order_by(
@@ -82,19 +81,13 @@ class MemoryRepository(BaseRepository):
         symbol_norm = _norm_symbol(symbol)
         side_norm = str(side or "").lower()
         filtered = [
-            row for row in rows
-            if (
-                not row.symbol
-                or _norm_symbol(row.symbol) == symbol_norm
-            )
-            and (
-                not row.side
-                or not side_norm
-                or str(row.side or "").lower() == side_norm
-            )
+            row
+            for row in rows
+            if (not row.symbol or _norm_symbol(row.symbol) == symbol_norm)
+            and (not row.side or not side_norm or str(row.side or "").lower() == side_norm)
             and _memory_row_usable(row)
         ]
-        return filtered[:max(int(limit or 4), 1)]
+        return filtered[: max(int(limit or 4), 1)]
 
     async def mark_memories_used(self, memory_ids: list[int]) -> None:
         if not memory_ids:
@@ -102,7 +95,7 @@ class MemoryRepository(BaseRepository):
         result = await self.session.execute(
             select(ExpertMemory).where(ExpertMemory.id.in_(memory_ids))
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for memory in result.scalars().all():
             memory.hit_count = int(memory.hit_count or 0) + 1
             memory.last_used_at = now
@@ -124,29 +117,43 @@ class MemoryRepository(BaseRepository):
             existing = result.scalar_one_or_none()
 
         if existing:
-            existing.evidence_count = int(existing.evidence_count or 0) + int(data.get("evidence_count", 1) or 1)
-            existing.success_count = int(existing.success_count or 0) + int(data.get("success_count", 0) or 0)
-            existing.failure_count = int(existing.failure_count or 0) + int(data.get("failure_count", 0) or 0)
+            existing.evidence_count = int(existing.evidence_count or 0) + int(
+                data.get("evidence_count", 1) or 1
+            )
+            existing.success_count = int(existing.success_count or 0) + int(
+                data.get("success_count", 0) or 0
+            )
+            existing.failure_count = int(existing.failure_count or 0) + int(
+                data.get("failure_count", 0) or 0
+            )
             existing.confidence_adjustment = _blend(
                 float(existing.confidence_adjustment or 0.0),
                 float(data.get("confidence_adjustment", existing.confidence_adjustment) or 0.0),
             )
             existing.position_size_multiplier = min(
                 float(existing.position_size_multiplier or 1.0),
-                float(data.get("position_size_multiplier", existing.position_size_multiplier) or 1.0),
+                float(
+                    data.get("position_size_multiplier", existing.position_size_multiplier) or 1.0
+                ),
             )
             existing.confidence_score = min(
                 0.95,
                 max(0.10, float(existing.confidence_score or 0.5) + 0.05),
             )
             existing.lesson = str(data.get("lesson") or existing.lesson or "")
-            existing.market_pattern = str(data.get("market_pattern") or existing.market_pattern or "")
-            existing.recommended_action = str(data.get("recommended_action") or existing.recommended_action or "")
-            existing.source_position_id = data.get("source_position_id") or existing.source_position_id
+            existing.market_pattern = str(
+                data.get("market_pattern") or existing.market_pattern or ""
+            )
+            existing.recommended_action = str(
+                data.get("recommended_action") or existing.recommended_action or ""
+            )
+            existing.source_position_id = (
+                data.get("source_position_id") or existing.source_position_id
+            )
             existing.extra = data.get("extra") or existing.extra
             if data.get("is_active") is False:
                 existing.is_active = False
-            existing.updated_at = datetime.now(timezone.utc)
+            existing.updated_at = datetime.now(UTC)
             await self.session.flush()
             return existing
 
@@ -159,9 +166,7 @@ class MemoryRepository(BaseRepository):
         position_id = int(data.get("position_id") or 0)
         if position_id:
             result = await self.session.execute(
-                select(TradeReflection)
-                .where(TradeReflection.position_id == position_id)
-                .limit(1)
+                select(TradeReflection).where(TradeReflection.position_id == position_id).limit(1)
             )
             existing = result.scalar_one_or_none()
             if existing:
@@ -178,7 +183,7 @@ class MemoryRepository(BaseRepository):
         return row
 
     async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stmt = (
             select(ShadowBacktest)
             .where(
@@ -209,7 +214,7 @@ class MemoryRepository(BaseRepository):
         row.missed_opportunity = missed_opportunity
         row.note = note
         row.status = "completed"
-        row.updated_at = datetime.now(timezone.utc)
+        row.updated_at = datetime.now(UTC)
         await self.session.flush()
         return row
 
@@ -254,16 +259,21 @@ class MemoryRepository(BaseRepository):
         limit: int = 200,
         offset: int = 0,
     ) -> list[ExpertMemory]:
-        stmt = select(ExpertMemory).order_by(
-            ExpertMemory.updated_at.desc().nullslast(),
-            ExpertMemory.created_at.desc(),
-        ).offset(max(int(offset or 0), 0)).limit(max(int(limit or 200), 1))
+        stmt = (
+            select(ExpertMemory)
+            .order_by(
+                ExpertMemory.updated_at.desc().nullslast(),
+                ExpertMemory.created_at.desc(),
+            )
+            .offset(max(int(offset or 0), 0))
+            .limit(max(int(limit or 200), 1))
+        )
         if expert_name:
             stmt = stmt.where(ExpertMemory.expert_name == expert_name)
         if symbol:
             stmt = stmt.where(ExpertMemory.symbol == symbol)
         if active_only:
-            stmt = stmt.where(ExpertMemory.is_active == True)
+            stmt = stmt.where(ExpertMemory.is_active.is_(True))
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
@@ -279,7 +289,7 @@ class MemoryRepository(BaseRepository):
         if symbol:
             stmt = stmt.where(ExpertMemory.symbol == symbol)
         if active_only:
-            stmt = stmt.where(ExpertMemory.is_active == True)
+            stmt = stmt.where(ExpertMemory.is_active.is_(True))
         result = await self.session.execute(stmt)
         return int(result.scalar() or 0)
 
@@ -291,7 +301,11 @@ class MemoryRepository(BaseRepository):
     ) -> list[TradeReflection]:
         stmt = (
             select(TradeReflection)
-            .order_by(TradeReflection.created_at.desc())
+            .order_by(
+                TradeReflection.closed_at.desc().nullslast(),
+                TradeReflection.created_at.desc(),
+                TradeReflection.id.desc(),
+            )
             .offset(max(int(offset or 0), 0))
             .limit(max(int(limit or 100), 1))
         )
@@ -330,13 +344,17 @@ def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
         value = data.get(key)
         if value is not None:
             data[key] = str(value)
-    if not _memory_text_usable(data.get("lesson")) or not _memory_text_usable(data.get("market_pattern")):
+    if not _memory_text_usable(data.get("lesson")) or not _memory_text_usable(
+        data.get("market_pattern")
+    ):
         data["is_active"] = False
     return data
 
 
 def _memory_row_usable(row: ExpertMemory) -> bool:
-    return _memory_text_usable(getattr(row, "lesson", None)) and _memory_text_usable(getattr(row, "market_pattern", None))
+    return _memory_text_usable(getattr(row, "lesson", None)) and _memory_text_usable(
+        getattr(row, "market_pattern", None)
+    )
 
 
 def _memory_text_usable(value: Any) -> bool:

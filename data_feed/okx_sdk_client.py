@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC
+from typing import Any
 
 import structlog
 
 from config.settings import settings
+from core.exceptions import ConfigError, ExchangeAPIError
+from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
 
@@ -35,7 +39,14 @@ def _is_suspicious_contract_base(base: str | None) -> bool:
     value = str(base or "").upper()
     return bool(value and any(token in value for token in SUSPICIOUS_CONTRACT_BASE_TOKENS))
 
-def _make_market_api(mode: str) -> "okx.MarketData.MarketAPI":
+
+def _raise_okx_api_error(result: dict[str, Any], fallback: str = "OKX API error") -> None:
+    code = safe_error_text(result.get("code") or "unknown", limit=40)
+    message = safe_error_text(result.get("msg") or fallback, limit=240)
+    raise ExchangeAPIError(f"OKX API error [{code}]: {message}")
+
+
+def _make_market_api(mode: str) -> Any:
     """Create a MarketAPI instance for the given mode.
 
     NOTE: flag='1' means simulated/demo in the x-simulated-trading header.
@@ -46,7 +57,7 @@ def _make_market_api(mode: str) -> "okx.MarketData.MarketAPI":
     return MarketData.MarketAPI(flag=flag, debug=False)
 
 
-def _make_account_api(mode: str) -> "okx.Account.AccountAPI":
+def _make_account_api(mode: str) -> Any:
     """Create an AccountAPI instance for the given mode.
 
     NOTE: The python-okx SDK maps flag directly to the x-simulated-trading header,
@@ -68,7 +79,10 @@ def _make_account_api(mode: str) -> "okx.Account.AccountAPI":
 
 
 async def fetch_klines(
-    symbol: str, bar: str = "1H", limit: int = 100, mode: str = "paper",
+    symbol: str,
+    bar: str = "1H",
+    limit: int = 100,
+    mode: str = "paper",
     inst_type: str = "SWAP",
 ) -> list[dict]:
     """
@@ -76,7 +90,7 @@ async def fetch_klines(
     Defaults to perpetual swap (SWAP) for accurate pricing.
     Returns list of {time, open, high, low, close, volume} in chronological order.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     base = symbol.split("/")[0]
     if inst_type == "SWAP":
@@ -88,15 +102,13 @@ async def fetch_klines(
         api = _make_market_api(mode)
         result = api.get_candlesticks(instId=instId, bar=bar, limit=limit)
         if result.get("code") != "0":
-            raise Exception(result.get("msg", "OKX API error"))
+            _raise_okx_api_error(result)
         raw = result.get("data", [])
         # OKX returns newest first; reverse to chronological order (left to right)
         raw.reverse()
         return [
             {
-                "time": datetime.fromtimestamp(
-                    int(c[0]) / 1000, tz=timezone.utc
-                ).isoformat(),
+                "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=UTC).isoformat(),
                 "open": float(c[1]),
                 "high": float(c[2]),
                 "low": float(c[3]),
@@ -115,14 +127,14 @@ async def fetch_usdt_balance(mode: str = "paper") -> float | None:
     def _sync():
         creds = settings.get_okx_credentials(mode)
         if not creds.get("api_key") or not creds.get("api_secret"):
-            raise Exception("未配置OKX API密钥")
+            raise ConfigError("OKX API credentials are not configured")
         if not creds.get("passphrase"):
-            raise Exception("未配置OKX Passphrase（请在.env中设置OKX_PASSPHRASE）")
+            raise ConfigError("OKX API passphrase is not configured")
 
         api = _make_account_api(mode)
         result = api.get_account_balance(ccy="USDT")
         if result.get("code") != "0":
-            raise Exception(f"OKX API错误 [{result.get('code')}]: {result.get('msg')}")
+            _raise_okx_api_error(result)
         data = result.get("data", [])
         if data:
             inner_details = data[0].get("details", [])
@@ -133,7 +145,7 @@ async def fetch_usdt_balance(mode: str = "paper") -> float | None:
     try:
         return await asyncio.to_thread(_sync)
     except Exception as e:
-        logger.warning("fetch USDT balance failed", mode=mode, error=str(e))
+        logger.warning("fetch USDT balance failed", mode=mode, error=safe_error_text(e))
         return None
 
 
@@ -144,7 +156,7 @@ async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
         api = _make_market_api(mode)
         result = api.get_tickers(instType=instType)
         if result.get("code") != "0":
-            raise Exception(result.get("msg", "OKX API error"))
+            _raise_okx_api_error(result)
         tickers = {}
         for t in result.get("data", []):
             symbol = t.get("instId", "").replace("-", "/")
@@ -172,7 +184,7 @@ async def get_available_symbols(mode: str = "paper") -> list[dict[str, str]]:
         resp = requests.get(url, timeout=10, proxies=_requests_proxies())
         data = resp.json()
         if data.get("code") != "0":
-            raise Exception(data.get("msg", "OKX API error"))
+            _raise_okx_api_error(data)
         symbols = []
         for inst in data.get("data", []):
             inst_id = inst.get("instId", "")
@@ -185,19 +197,33 @@ async def get_available_symbols(mode: str = "paper") -> list[dict[str, str]]:
                 base = inst_id.removesuffix("-USDT-SWAP")
                 if _is_suspicious_contract_base(base):
                     continue
-                symbols.append({
-                    "symbol": f"{base}/USDT",
-                    "base": base,
-                    "quote": "USDT",
-                    "type": "swap",
-                    "id": inst_id,
-                    "ccxt_symbol": f"{base}/USDT:USDT",
-                })
+                symbols.append(
+                    {
+                        "symbol": f"{base}/USDT",
+                        "base": base,
+                        "quote": "USDT",
+                        "type": "swap",
+                        "id": inst_id,
+                        "ccxt_symbol": f"{base}/USDT:USDT",
+                    }
+                )
 
         priority = {
-            "BTC": 0, "ETH": 1, "SOL": 2, "XRP": 3, "BNB": 4,
-            "DOGE": 5, "ADA": 6, "AVAX": 7, "LINK": 8, "SUI": 9,
-            "LTC": 10, "BCH": 11, "DOT": 12, "TRX": 13, "TON": 14,
+            "BTC": 0,
+            "ETH": 1,
+            "SOL": 2,
+            "XRP": 3,
+            "BNB": 4,
+            "DOGE": 5,
+            "ADA": 6,
+            "AVAX": 7,
+            "LINK": 8,
+            "SUI": 9,
+            "LTC": 10,
+            "BCH": 11,
+            "DOT": 12,
+            "TRX": 13,
+            "TON": 14,
         }
         return sorted(symbols, key=lambda x: (priority.get(x["base"], 1000), x["symbol"]))
 

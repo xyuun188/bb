@@ -6,11 +6,22 @@ Handles paper/live mode switching with thread-safe state.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
+from inspect import isawaitable
+from typing import Any
+
+import structlog
+
+from core.safe_output import safe_error_text
+
+logger = structlog.get_logger(__name__)
+
+ModeSubscriber = Callable[["TradingModeManager"], Awaitable[None] | None]
 
 
-class TradingMode(str, Enum):
+class TradingMode(StrEnum):
     PAPER = "paper"
     LIVE = "live"
 
@@ -31,7 +42,7 @@ class TradingModeManager:
         self._scan_mode: str = "auto"  # "auto" or "manual"
         self._live_model_name: str | None = None
         self._mode_changed_at: datetime = datetime.utcnow()
-        self._subscribers: list[callable] = []
+        self._subscribers: list[ModeSubscriber] = []
 
     @classmethod
     def get_instance(cls) -> TradingModeManager:
@@ -100,21 +111,20 @@ class TradingModeManager:
         self._mode_changed_at = datetime.utcnow()
         await self._notify()
 
-    def subscribe(self, callback: callable) -> None:
+    def subscribe(self, callback: ModeSubscriber) -> None:
         """Register a callback invoked on mode/pause changes."""
         self._subscribers.append(callback)
 
     async def _notify(self) -> None:
         for cb in self._subscribers:
             try:
-                if asyncio.iscoroutinefunction(cb):
-                    await cb(self)
-                else:
-                    cb(self)
-            except Exception:
-                pass
+                result = cb(self)
+                if isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.warning("trading mode subscriber failed", error=safe_error_text(exc))
 
-    def get_state(self) -> dict:
+    def get_state(self) -> dict[str, Any]:
         return {
             "mode": self._mode.value,
             "paused": self._paused,
