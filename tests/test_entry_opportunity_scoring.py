@@ -113,3 +113,63 @@ def test_entry_opportunity_scoring_does_not_relax_stale_winner() -> None:
     assert winner_decay["side_decay_weight"] == 0.0
     assert winner_decay["side_effective_pnl"] == 0.0
     assert opportunity["symbol_tier_score_adjustment"] == 0.0
+
+
+def test_entry_opportunity_scoring_turns_memory_habit_into_probe_cap() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.raw_response["memory_feedback"] = {
+        "decision_habit": {
+            "by_side": {
+                "long": {
+                    "stance": "probe_when_ev_ok",
+                    "proactive_level": 0.6,
+                    "probe_budget_pct": 0.015,
+                    "min_expected_net_pct": 0.12,
+                    "max_loss_probability": 0.58,
+                    "max_tail_risk": 0.98,
+                }
+            }
+        }
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    habit = decision.raw_response["opportunity_score"]["memory_habit_adjustment"]
+    assert habit["applied"] is True
+    assert habit["stance"] == "probe_when_ev_ok"
+    assert habit["quality_ok"] is True
+    assert habit["score_adjustment"] > 0
+    assert habit["adjusted_position_size"] == 0.015
+    assert decision.position_size_pct == 0.015
+
+
+def test_entry_opportunity_scoring_tightens_degraded_side_quality() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+
+    _policy(now).score_candidate(
+        decision,
+        {
+            "min_opportunity_score": 0.95,
+            "side_quality": {
+                "long": {
+                    "state": "degraded",
+                    "score_adjustment": -0.25,
+                    "min_score_delta": 0.22,
+                    "size_multiplier": 0.65,
+                    "reason": "long side realized performance is weak",
+                }
+            },
+        },
+    )
+
+    opportunity = decision.raw_response["opportunity_score"]
+    side_quality = opportunity["side_quality_adjustment"]
+    assert side_quality["applied"] is True
+    assert side_quality["state"] == "degraded"
+    assert side_quality["score_adjustment"] < 0
+    assert side_quality["min_score_delta"] > 0
+    assert opportunity["min_score_required"] >= 0.85
+    assert side_quality["adjusted_position_size"] < side_quality["original_position_size"]
+    assert decision.position_size_pct < 0.04

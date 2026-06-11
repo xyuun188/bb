@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.exit_intent import classify_exit_intent
 from services.trading_params import attach_trading_parameter_snapshot
 from services.trading_policies import PolicyGateResult
 
@@ -73,6 +74,15 @@ class ExitExecutionPipeline:
         *,
         refresh_positions: bool = True,
     ) -> PolicyGateResult:
+        intent = classify_exit_intent(decision) if decision.is_exit else None
+        if intent is not None:
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw["exit_pipeline"] = {
+                "intent": intent.value,
+                "stage": "pre_policy",
+                "structured": True,
+            }
+            decision.raw_response = raw
         payload = attach_trading_parameter_snapshot(
             decision,
             scope="exit_execution",

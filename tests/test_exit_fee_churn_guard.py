@@ -209,3 +209,30 @@ async def test_small_partial_profit_lock_is_blocked_when_planned_net_is_too_smal
     assert "碎片化小额平仓" in reason
     guard = decision.raw_response["small_profit_lock_guard"]
     assert guard["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_winner_run_guard_blocks_ordinary_full_close_when_trend_still_valid() -> None:
+    decision = _decision(
+        current_price=104.0,
+        confidence=0.72,
+        reasoning="普通锁盈全平",
+        position_size_pct=1.0,
+    )
+    positions = [
+        _position(
+            entry_price=100.0,
+            current_price=104.0,
+            created_at=datetime.now(UTC) - timedelta(minutes=20),
+        )
+    ]
+
+    reason = await _policy(positions).guard_reason("ensemble_trader", decision)
+
+    assert reason is not None
+    assert "赢家持仓保护" in reason
+    guard = decision.raw_response["winner_run_guard"]
+    assert guard["applied"] is True
+    assert guard["close_pct"] == 1.0
+    assert guard["trend_still_valid"] is True
+    assert guard["strong_lock"] is False

@@ -53,3 +53,39 @@ def test_exit_intent_keeps_loss_repair_separate_from_predictive_exit() -> None:
     )
 
     assert classify_exit_intent(decision) == ExitIntent.LOSS_REPAIR
+
+
+def test_exit_intent_does_not_treat_profit_drawdown_fast_trigger_as_hard_risk() -> None:
+    decision = _decision(
+        {
+            "fast_risk_exit": True,
+            "fast_risk_trigger": "profit_drawdown_close",
+        }
+    )
+
+    assert classify_exit_intent(decision) == ExitIntent.PROFIT_DRAWDOWN
+    assert decision.raw_response["exit_intent"] == "profit_drawdown"
+
+
+def test_exit_intent_does_not_treat_take_profit_fast_trigger_as_hard_risk() -> None:
+    decision = _decision(
+        {
+            "fast_risk_exit": True,
+            "fast_risk_trigger": "take_profit",
+        }
+    )
+
+    assert classify_exit_intent(decision) == ExitIntent.PROFIT_PROTECTION
+    assert decision.raw_response["exit_intent"] == "profit_protection"
+
+
+def test_exit_intent_keeps_fast_adverse_move_as_hard_risk() -> None:
+    decision = _decision(
+        {
+            "fast_risk_exit": True,
+            "fast_risk_trigger": "fast_adverse_move",
+        }
+    )
+
+    assert classify_exit_intent(decision) == ExitIntent.HARD_RISK
+    assert decision.raw_response["exit_intent"] == "hard_risk"

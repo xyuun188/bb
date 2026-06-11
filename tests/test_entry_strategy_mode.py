@@ -83,6 +83,40 @@ def test_strategy_mode_keeps_global_direction_as_soft_bias() -> None:
     assert result["soft_avoided_directions"] == ["short"]
 
 
+def test_strategy_mode_marks_realized_losing_side_as_degraded() -> None:
+    result = EntryStrategyModeContextPolicy().build(
+        **_base_kwargs(
+            side_performance={
+                "long": {
+                    "count": 4,
+                    "wins": 0,
+                    "losses": 4,
+                    "pnl": -18.0,
+                    "avg_pnl": -4.5,
+                    "win_rate": 0.0,
+                },
+                "short": {
+                    "count": 4,
+                    "wins": 3,
+                    "losses": 1,
+                    "pnl": 9.0,
+                    "avg_pnl": 2.25,
+                    "win_rate": 0.75,
+                },
+            },
+        )
+    )
+
+    long_quality = result["side_quality"]["long"]
+    short_quality = result["side_quality"]["short"]
+    assert long_quality["state"] == "degraded"
+    assert long_quality["score_adjustment"] < 0
+    assert long_quality["min_score_delta"] > 0
+    assert long_quality["size_multiplier"] < 1.0
+    assert short_quality["state"] == "working"
+    assert short_quality["score_adjustment"] > 0
+
+
 def test_strategy_mode_waits_in_choppy_market() -> None:
     result = EntryStrategyModeContextPolicy().build(
         **_base_kwargs(

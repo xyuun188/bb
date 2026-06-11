@@ -474,6 +474,43 @@ class ExitFeeChurnGuardPolicy:
                 if profit_protection["allow"]:
                     close_pct = min(max(float(decision.position_size_pct or 1.0), 0.0), 1.0)
                     planned_lock_net = net_now * close_pct
+                    ordinary_profit_intent = exit_intent in {
+                        ExitIntent.PROFIT_PROTECTION,
+                        ExitIntent.CAPITAL_ROTATION,
+                        ExitIntent.ORDINARY,
+                    }
+                    if (
+                        close_pct >= 0.999
+                        and ordinary_profit_intent
+                        and continuation_valid
+                        and drawdown_ratio < PROFIT_DRAWDOWN_PARTIAL_RETRACE
+                        and not profit_protection.get("strong_lock")
+                        and not protective_downside_exit_intent
+                    ):
+                        raw = (
+                            decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                        )
+                        raw["execution_profit_protection"] = profit_protection
+                        raw["winner_run_guard"] = {
+                            "applied": True,
+                            "close_pct": round(close_pct, 4),
+                            "net_profit_after_fee": round(net_now, 8),
+                            "drawdown_from_peak_ratio": round(drawdown_ratio, 6),
+                            "trend_still_valid": bool(continuation_valid),
+                            "strong_lock": bool(profit_protection.get("strong_lock")),
+                            "exit_intent": exit_intent.value,
+                            "reason": (
+                                "ordinary full close would realize only an early winner while "
+                                "continuation is still valid"
+                            ),
+                        }
+                        decision.raw_response = raw
+                        return (
+                            f"赢家持仓保护：{decision.symbol} 当前扣费后盈利 {net_now:.4f}U，"
+                            f"峰值回撤 {drawdown_ratio:.0%}，趋势尚未确认失效，且未达到强锁盈线。"
+                            "本次不执行普通全平，继续让优势仓位运行；若后续出现明显回撤、趋势失效、"
+                            "硬风险或交易所止盈止损触发，再允许平仓。"
+                        )
                     meaningful_partial_lock = max(
                         PROFIT_PROTECTION_MIN_NET_USDT,
                         fee_buffer * max(PROFIT_PROTECTION_MIN_FEE_MULTIPLE, 6.0),

@@ -107,7 +107,7 @@ async def test_exit_policy_can_skip_snapshot_refresh_for_fast_local_paths() -> N
     )
 
     result = await policy.evaluate(
-        _decision({"fast_risk_exit": True}),
+        _decision({"fast_risk_exit": True, "fast_risk_trigger": "fast_adverse_move"}),
         "ensemble_trader",
         [{"symbol": "BTC/USDT", "side": "long", "quantity": 1.0}],
         refresh_positions=False,

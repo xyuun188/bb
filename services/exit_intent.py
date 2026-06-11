@@ -140,11 +140,18 @@ def classify_exit_intent(
 
         hard_risk = bool(
             raw.get("forced_exit")
-            or raw.get("fast_risk_exit")
             or close_evidence.get("hard_risk")
             or close_evidence.get("raw_hard_risk")
             or close_evidence.get("forced_exit")
-            or fast_trigger in {"stop_loss", "hard_adverse_move"}
+            or fast_trigger
+            in {"stop_loss", "hard_adverse_move", "near_stop_progress", "fast_adverse_move"}
+            or (
+                raw.get("fast_risk_exit")
+                and fast_trigger
+                and not (
+                    fast_trigger.startswith("profit_drawdown") or fast_trigger == "take_profit"
+                )
+            )
             or decision.model_name == "risk_engine"
         )
         trend_failure = bool(

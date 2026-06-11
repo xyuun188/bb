@@ -264,6 +264,9 @@ class EntryCandidateEvidencePolicy:
         return {
             "enabled": bool(feedback.get("enabled")),
             "preferred_side_by_memory": feedback.get("preferred_side_by_memory"),
+            "decision_habit": EntryCandidateEvidencePolicy._compact_decision_habit(
+                _safe_dict(feedback.get("decision_habit"))
+            ),
             "long": EntryCandidateEvidencePolicy._compact_side_feedback(
                 _safe_dict(by_side.get("long"))
             ),
@@ -285,6 +288,37 @@ class EntryCandidateEvidencePolicy:
             "risk_evidence_count": _safe_int(item.get("risk_evidence_count"), 0),
             "candidate_score_bonus": round(_safe_float(item.get("candidate_score_bonus"), 0.0), 6),
             "max_probe_size_pct": round(_safe_float(item.get("max_probe_size_pct"), 0.0), 6),
+        }
+
+    @staticmethod
+    def _compact_decision_habit(item: dict[str, Any]) -> dict[str, Any]:
+        if not item:
+            return {}
+        by_side = _safe_dict(item.get("by_side"))
+        return {
+            "posture": item.get("posture"),
+            "preferred_side": item.get("preferred_side"),
+            "active_probe_sides": item.get("active_probe_sides") or [],
+            "conservative_sides": item.get("conservative_sides") or [],
+            "long": EntryCandidateEvidencePolicy._compact_side_habit(
+                _safe_dict(by_side.get("long"))
+            ),
+            "short": EntryCandidateEvidencePolicy._compact_side_habit(
+                _safe_dict(by_side.get("short"))
+            ),
+        }
+
+    @staticmethod
+    def _compact_side_habit(item: dict[str, Any]) -> dict[str, Any]:
+        if not item:
+            return {}
+        return {
+            "stance": item.get("stance"),
+            "proactive_level": round(_safe_float(item.get("proactive_level"), 0.0), 6),
+            "probe_budget_pct": round(_safe_float(item.get("probe_budget_pct"), 0.0), 6),
+            "min_expected_net_pct": round(_safe_float(item.get("min_expected_net_pct"), 0.0), 6),
+            "max_loss_probability": round(_safe_float(item.get("max_loss_probability"), 0.0), 6),
+            "max_tail_risk": round(_safe_float(item.get("max_tail_risk"), 0.0), 6),
         }
 
     @staticmethod

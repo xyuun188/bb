@@ -69,6 +69,11 @@ async def test_exit_execution_pipeline_attaches_parameter_snapshot() -> None:
 
     assert calls == [("BTC/USDT", "ensemble_trader", 1, False)]
     assert result.data["strategy_parameters"]["scope"] == "exit_execution"
+    assert decision.raw_response["exit_pipeline"] == {
+        "intent": "ordinary",
+        "stage": "pre_policy",
+        "structured": True,
+    }
     assert decision.raw_response["strategy_parameters"]["snapshot"]["version"]
 
 

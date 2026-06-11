@@ -36,6 +36,10 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
 
@@ -66,10 +70,12 @@ class MemoryFeedbackPolicy:
             for side, side_memories in side_rows.items()
         }
         preferred = self._preferred_side(by_side)
+        habit = self._decision_habit(by_side, preferred)
         return {
             "enabled": bool(memories),
             "preferred_side_by_memory": preferred,
             "by_side": by_side,
+            "decision_habit": habit,
             "policy": (
                 "Review feedback is advisory evidence from shadow backtests, trade reflections, "
                 "and expert long-term memory. Use it to choose small probes or stricter "
@@ -156,6 +162,92 @@ class MemoryFeedbackPolicy:
             "action_bias": action_bias,
             "max_probe_size_pct": round(max_probe_size_pct, 6),
             "top_reasons": top_reasons,
+        }
+
+    def _decision_habit(
+        self,
+        by_side: dict[str, dict[str, Any]],
+        preferred_side: str,
+    ) -> dict[str, Any]:
+        """Summarize review memory as an explicit LLM behavior contract."""
+
+        side_habits = {side: self._side_habit(_safe_dict(by_side.get(side))) for side in SIDES}
+        active_probe_sides = [
+            side for side, habit in side_habits.items() if habit.get("stance") == "probe_when_ev_ok"
+        ]
+        conservative_sides = [
+            side for side, habit in side_habits.items() if habit.get("stance") == "strict_confirm"
+        ]
+        if active_probe_sides:
+            posture = "selective_probe"
+        elif conservative_sides:
+            posture = "defensive_selective"
+        else:
+            posture = "neutral"
+        return {
+            "posture": posture,
+            "preferred_side": preferred_side,
+            "active_probe_sides": active_probe_sides,
+            "conservative_sides": conservative_sides,
+            "by_side": side_habits,
+            "rule": (
+                "Act slightly earlier only for sides with repeated missed opportunities, "
+                "positive current EV and controlled tail risk; tighten confirmation and size "
+                "for sides dominated by realized losses."
+            ),
+        }
+
+    @staticmethod
+    def _side_habit(item: dict[str, Any]) -> dict[str, Any]:
+        missed = _safe_int(item.get("missed_opportunity_count"), 0)
+        positive = _safe_int(item.get("positive_evidence_count"), 0)
+        risk = _safe_int(item.get("risk_evidence_count"), 0)
+        score_adjustment = _safe_float(item.get("score_adjustment"), 0.0)
+        candidate_bonus = _safe_float(item.get("candidate_score_bonus"), 0.0)
+        max_probe_size = _safe_float(item.get("max_probe_size_pct"), 0.0)
+        if risk >= positive + 2 and score_adjustment < 0:
+            return {
+                "stance": "strict_confirm",
+                "proactive_level": 0.0,
+                "probe_budget_pct": 0.0,
+                "min_expected_net_pct": 0.35,
+                "max_loss_probability": 0.42,
+                "max_tail_risk": 0.82,
+                "score_adjustment": round(candidate_bonus, 6),
+                "reason": "realized or shadow losses dominate this side",
+            }
+        if missed >= 2 and positive >= max(risk, 1) and score_adjustment >= 0.035:
+            proactive_level = _clamp(0.25 + missed * 0.055 + score_adjustment, 0.30, 0.85)
+            return {
+                "stance": "probe_when_ev_ok",
+                "proactive_level": round(proactive_level, 6),
+                "probe_budget_pct": round(max(max_probe_size, 0.012), 6),
+                "min_expected_net_pct": 0.12,
+                "max_loss_probability": 0.58,
+                "max_tail_risk": 0.98,
+                "score_adjustment": round(candidate_bonus, 6),
+                "reason": "shadow or trade reviews show repeated missed opportunities",
+            }
+        if score_adjustment > 0.02:
+            return {
+                "stance": "slightly_support",
+                "proactive_level": round(_clamp(score_adjustment * 2.5, 0.05, 0.30), 6),
+                "probe_budget_pct": round(max_probe_size, 6),
+                "min_expected_net_pct": 0.20,
+                "max_loss_probability": 0.54,
+                "max_tail_risk": 0.92,
+                "score_adjustment": round(candidate_bonus, 6),
+                "reason": "positive review evidence is present but not repeated enough",
+            }
+        return {
+            "stance": "neutral",
+            "proactive_level": 0.0,
+            "probe_budget_pct": 0.0,
+            "min_expected_net_pct": 0.25,
+            "max_loss_probability": 0.50,
+            "max_tail_risk": 0.90,
+            "score_adjustment": round(candidate_bonus, 6),
+            "reason": "no strong review habit adjustment",
         }
 
     @staticmethod

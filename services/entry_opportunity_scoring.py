@@ -82,6 +82,150 @@ class EntryOpportunityScoringPolicy:
     def _safe_float(value: Any, default: float = 0.0) -> float:
         return _safe_float(value, default)
 
+    def _memory_habit_adjustment(
+        self,
+        raw: dict[str, Any],
+        *,
+        side: str,
+        expected_net_return_pct: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        profit_quality_ratio: float,
+        base_min_score_required: float,
+    ) -> dict[str, Any]:
+        feedback = self._safe_dict(raw.get("memory_feedback"))
+        habit = self._safe_dict(feedback.get("decision_habit"))
+        by_side = self._safe_dict(habit.get("by_side"))
+        side_habit = self._safe_dict(by_side.get(side))
+        if not side_habit:
+            legacy_side = self._safe_dict(self._safe_dict(feedback.get("by_side")).get(side))
+            action_bias = str(legacy_side.get("action_bias") or "")
+            if action_bias == "prefer_small_probe_when_current_ev_positive":
+                side_habit = {
+                    "stance": "probe_when_ev_ok",
+                    "proactive_level": 0.35,
+                    "probe_budget_pct": legacy_side.get("max_probe_size_pct", 0.015),
+                    "min_expected_net_pct": 0.12,
+                    "max_loss_probability": 0.58,
+                    "max_tail_risk": 0.98,
+                }
+            elif action_bias == "require_stronger_confirmation":
+                side_habit = {
+                    "stance": "strict_confirm",
+                    "proactive_level": 0.0,
+                    "probe_budget_pct": 0.0,
+                    "min_expected_net_pct": 0.35,
+                    "max_loss_probability": 0.42,
+                    "max_tail_risk": 0.82,
+                }
+        stance = str(side_habit.get("stance") or "neutral")
+        if stance == "probe_when_ev_ok":
+            min_expected = self._safe_float(side_habit.get("min_expected_net_pct"), 0.12)
+            max_loss_probability = self._safe_float(side_habit.get("max_loss_probability"), 0.58)
+            max_tail_risk = self._safe_float(side_habit.get("max_tail_risk"), 0.98)
+            quality_ok = bool(
+                expected_net_return_pct >= min_expected
+                and loss_probability <= max_loss_probability
+                and tail_risk_score <= max_tail_risk
+                and profit_quality_ratio > 0
+            )
+            proactive_level = min(
+                max(self._safe_float(side_habit.get("proactive_level"), 0.35), 0.0),
+                1.0,
+            )
+            if quality_ok:
+                score_adjustment = min(0.30, 0.08 + proactive_level * 0.18)
+                relaxed_min = max(
+                    0.35,
+                    base_min_score_required - min(0.22, 0.08 + proactive_level * 0.10),
+                )
+                return {
+                    "applied": True,
+                    "stance": stance,
+                    "quality_ok": True,
+                    "score_adjustment": round(score_adjustment, 6),
+                    "min_score_required": round(relaxed_min, 6),
+                    "max_size_pct": round(
+                        self._safe_float(side_habit.get("probe_budget_pct"), 0.015), 6
+                    ),
+                    "reason": (
+                        "review memory shows repeated missed opportunities; current EV and "
+                        "tail risk allow a small probe"
+                    ),
+                }
+            return {
+                "applied": False,
+                "stance": stance,
+                "quality_ok": False,
+                "score_adjustment": 0.0,
+                "reason": "missed-opportunity memory exists but current quality gates failed",
+            }
+        if stance == "strict_confirm":
+            return {
+                "applied": True,
+                "stance": stance,
+                "quality_ok": False,
+                "score_adjustment": -0.28,
+                "min_score_required": round(max(base_min_score_required + 0.22, 1.05), 6),
+                "max_size_pct": 0.0,
+                "reason": "review memory says realized or shadow losses dominate this side",
+            }
+        return {
+            "applied": False,
+            "stance": stance,
+            "quality_ok": False,
+            "score_adjustment": 0.0,
+            "reason": "no memory habit adjustment",
+        }
+
+    def _side_quality_adjustment(
+        self,
+        strategy: dict[str, Any],
+        *,
+        side: str,
+        strong_aligned_profit_evidence: bool,
+    ) -> dict[str, Any]:
+        side_quality = self._safe_dict(strategy.get("side_quality"))
+        item = self._safe_dict(side_quality.get(side))
+        state = str(item.get("state") or "neutral")
+        if state == "degraded":
+            raw_score = self._safe_float(item.get("score_adjustment"), -0.25)
+            raw_delta = self._safe_float(item.get("min_score_delta"), 0.22)
+            raw_size = self._safe_float(item.get("size_multiplier"), 0.65)
+            score_adjustment = (
+                max(raw_score, -0.12) if strong_aligned_profit_evidence else raw_score
+            )
+            min_score_delta = min(raw_delta, 0.10) if strong_aligned_profit_evidence else raw_delta
+            size_multiplier = max(raw_size, 0.82) if strong_aligned_profit_evidence else raw_size
+            return {
+                "applied": True,
+                "state": state,
+                "score_adjustment": round(score_adjustment, 6),
+                "min_score_delta": round(min_score_delta, 6),
+                "size_multiplier": round(size_multiplier, 6),
+                "strong_current_evidence_relief": bool(strong_aligned_profit_evidence),
+                "reason": item.get("reason") or "side realized performance is weak",
+            }
+        if state == "working":
+            return {
+                "applied": True,
+                "state": state,
+                "score_adjustment": round(self._safe_float(item.get("score_adjustment"), 0.08), 6),
+                "min_score_delta": round(self._safe_float(item.get("min_score_delta"), -0.05), 6),
+                "size_multiplier": round(self._safe_float(item.get("size_multiplier"), 1.05), 6),
+                "strong_current_evidence_relief": False,
+                "reason": item.get("reason") or "side realized performance is positive",
+            }
+        return {
+            "applied": False,
+            "state": state,
+            "score_adjustment": 0.0,
+            "min_score_delta": 0.0,
+            "size_multiplier": 1.0,
+            "strong_current_evidence_relief": False,
+            "reason": "no side-quality adjustment",
+        }
+
     def score_candidate(
         self,
         decision: DecisionOutput,
@@ -608,6 +752,54 @@ class EntryOpportunityScoringPolicy:
         capital_efficiency_score = (
             expected_net_return_pct * max(leverage, 1.0) / max(size * 100.0, 1.0)
         )
+        memory_habit_adjustment = self._memory_habit_adjustment(
+            raw,
+            side=side,
+            expected_net_return_pct=expected_net_return_pct,
+            loss_probability=local_loss_probability,
+            tail_risk_score=tail_risk_score,
+            profit_quality_ratio=profit_quality_ratio,
+            base_min_score_required=base_min_score_required,
+        )
+        habit_score_adjustment = self._safe_float(
+            memory_habit_adjustment.get("score_adjustment"), 0.0
+        )
+        habit_min_score = memory_habit_adjustment.get("min_score_required")
+        if habit_min_score is not None:
+            min_score_required = self._safe_float(habit_min_score, min_score_required)
+        habit_size_cap = self._safe_float(memory_habit_adjustment.get("max_size_pct"), 0.0)
+        if (
+            habit_size_cap > 0
+            and memory_habit_adjustment.get("stance") == "probe_when_ev_ok"
+            and size > habit_size_cap
+        ):
+            original_size = size
+            size = habit_size_cap
+            decision.position_size_pct = size
+            memory_habit_adjustment["original_position_size"] = round(original_size, 6)
+            memory_habit_adjustment["adjusted_position_size"] = round(size, 6)
+        side_quality_adjustment = self._side_quality_adjustment(
+            strategy,
+            side=side,
+            strong_aligned_profit_evidence=strong_aligned_profit_evidence,
+        )
+        side_quality_score_adjustment = self._safe_float(
+            side_quality_adjustment.get("score_adjustment"), 0.0
+        )
+        side_quality_min_delta = self._safe_float(
+            side_quality_adjustment.get("min_score_delta"), 0.0
+        )
+        if side_quality_min_delta:
+            min_score_required = max(0.35, min_score_required + side_quality_min_delta)
+        side_quality_size_multiplier = self._safe_float(
+            side_quality_adjustment.get("size_multiplier"), 1.0
+        )
+        if side_quality_size_multiplier < 0.999 and size > 0:
+            original_size = size
+            size = max(min(size * side_quality_size_multiplier, 1.0), 0.0)
+            decision.position_size_pct = size
+            side_quality_adjustment["original_position_size"] = round(original_size, 6)
+            side_quality_adjustment["adjusted_position_size"] = round(size, 6)
         score = (
             expected_net_return_pct * 2.35
             + profit_quality_ratio * 1.20
@@ -630,6 +822,8 @@ class EntryOpportunityScoringPolicy:
             - direction_conflict_penalty
             + historical_adjustment
             + contribution_score_adjustment
+            + habit_score_adjustment
+            + side_quality_score_adjustment
         )
         if historical_block:
             score -= 0.20 if strong_current_profit_support else 0.45
@@ -712,6 +906,8 @@ class EntryOpportunityScoringPolicy:
             "model_contribution_adjustment": contribution_adjustment,
             "model_contribution_sources": contribution_sources,
             "model_contribution_score_adjustment": round(contribution_score_adjustment, 6),
+            "memory_habit_adjustment": memory_habit_adjustment,
+            "side_quality_adjustment": side_quality_adjustment,
             "portfolio_roster": portfolio_roster,
             "historical_adjustment_cap": round(historical_adjustment_cap, 6),
             "strong_current_profit_support": bool(strong_current_profit_support),

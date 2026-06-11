@@ -105,6 +105,7 @@ class EntryStrategyModeContextPolicy:
 
         long_pnl = _safe_float(_safe_dict(side_performance.get("long")).get("pnl"), 0.0)
         short_pnl = _safe_float(_safe_dict(side_performance.get("short")).get("pnl"), 0.0)
+        side_quality = self._side_quality(side_performance)
         if short_pnl < 0 and abs(short_pnl) > max(abs(long_pnl), 1e-9) * 1.5:
             avoid_short = True
         if long_pnl < 0 and abs(long_pnl) > max(abs(short_pnl), 1e-9) * 1.5:
@@ -206,6 +207,7 @@ class EntryStrategyModeContextPolicy:
             "loss_pause_usdt": round(loss_pause, 4),
             "market_regime": market_regime,
             "side_performance": side_performance,
+            "side_quality": side_quality,
             "symbol_side_performance": symbol_side_performance,
             "model_contribution_performance": model_contribution_performance,
             "position_exposure": position_exposure,
@@ -234,3 +236,48 @@ class EntryStrategyModeContextPolicy:
                 "optimize for win rate."
             ),
         }
+
+    @staticmethod
+    def _side_quality(side_performance: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for side in ("long", "short"):
+            bucket = _safe_dict(side_performance.get(side))
+            count = int(_safe_float(bucket.get("count"), 0.0))
+            wins = int(_safe_float(bucket.get("wins"), 0.0))
+            losses = int(_safe_float(bucket.get("losses"), 0.0))
+            pnl = _safe_float(bucket.get("pnl"), 0.0)
+            avg_pnl = _safe_float(bucket.get("avg_pnl"), 0.0)
+            win_rate = _safe_float(bucket.get("win_rate"), 0.0)
+            state = "neutral"
+            score_adjustment = 0.0
+            min_score_delta = 0.0
+            size_multiplier = 1.0
+            reason = "no strong realized side feedback"
+            if count >= 2 and pnl < 0 and (losses >= wins + 2 or win_rate <= 0.35):
+                state = "degraded"
+                score_adjustment = -0.25
+                min_score_delta = 0.22
+                size_multiplier = 0.65
+                reason = "today realized side performance is weak; require stronger proof"
+            elif count >= 3 and pnl > 0 and win_rate >= 0.55 and avg_pnl > 0:
+                state = "working"
+                score_adjustment = 0.08
+                min_score_delta = -0.05
+                size_multiplier = 1.05
+                reason = (
+                    "today realized side performance is positive; allow small confidence support"
+                )
+            result[side] = {
+                "state": state,
+                "count": count,
+                "wins": wins,
+                "losses": losses,
+                "pnl": round(pnl, 6),
+                "avg_pnl": round(avg_pnl, 6),
+                "win_rate": round(win_rate, 6),
+                "score_adjustment": round(score_adjustment, 6),
+                "min_score_delta": round(min_score_delta, 6),
+                "size_multiplier": round(size_multiplier, 6),
+                "reason": reason,
+            }
+        return result

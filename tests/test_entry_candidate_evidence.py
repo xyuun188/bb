@@ -144,6 +144,22 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
     memory_feedback = {
         "enabled": True,
         "preferred_side_by_memory": "long",
+        "decision_habit": {
+            "posture": "selective_probe",
+            "preferred_side": "long",
+            "active_probe_sides": ["long"],
+            "conservative_sides": [],
+            "by_side": {
+                "long": {
+                    "stance": "probe_when_ev_ok",
+                    "proactive_level": 0.5,
+                    "probe_budget_pct": 0.015,
+                    "min_expected_net_pct": 0.12,
+                    "max_loss_probability": 0.58,
+                    "max_tail_risk": 0.98,
+                }
+            },
+        },
         "by_side": {
             "long": {
                 "side": "long",
@@ -177,6 +193,9 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
 
     assert evidence["preferred_side_by_evidence"] == "long"
     assert evidence["memory_feedback"]["preferred_side_by_memory"] == "long"
+    assert evidence["memory_feedback"]["decision_habit"]["posture"] == "selective_probe"
+    assert evidence["memory_feedback"]["decision_habit"]["long"]["stance"] == "probe_when_ev_ok"
+    assert evidence["memory_feedback"]["decision_habit"]["long"]["probe_budget_pct"] == 0.015
     assert evidence["long"]["score_before_memory_feedback"] == 0.52
     assert evidence["long"]["score"] == 0.70
     assert evidence["long"]["expected_net_return_pct"] == 0.35
