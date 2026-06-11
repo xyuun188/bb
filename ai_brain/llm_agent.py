@@ -1167,6 +1167,73 @@ class LLMAgent(AbstractAIModel):
         context: dict[str, Any],
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
+        def _fallback_decision(name: str, error: str) -> DecisionOutput:
+            fallback = self._local_expert_fallback(
+                features, {**context, "expert_mode": True}, error
+            )
+            fallback.model_name = name
+            fallback.raw_response = {
+                **(fallback.raw_response or {}),
+                "provider_model": self._model_name,
+                "batch_expert_fallback": True,
+            }
+            return fallback
+
+        def _decision_from_batch_payload(name: str, payload: dict[str, Any]) -> DecisionOutput:
+            payload = dict(payload)
+            payload["provider_model"] = self._model_name
+            payload["batch_expert"] = True
+            payload["batch_source_model"] = self.name
+            payload["cross_check_for"] = _normalize_cross_check(
+                payload.get("cross_check_for"),
+                role_by_name.get(name, ""),
+            )
+            decision = DecisionOutput(
+                model_name=name,
+                symbol=features.symbol,
+                action=Action.from_string(str(payload.get("action", "hold"))),
+                confidence=min(max(float(payload.get("confidence", 0.5) or 0.5), 0.0), 1.0),
+                reasoning=str(payload.get("reasoning") or "暂无分析内容。")[:150],
+                position_size_pct=min(
+                    max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
+                ),
+                suggested_leverage=min(
+                    max(float(payload.get("suggested_leverage", 1.0) or 1.0), 1.0),
+                    settings.max_leverage,
+                ),
+                stop_loss_pct=min(
+                    max(float(payload.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15
+                ),
+                take_profit_pct=min(
+                    max(float(payload.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
+                ),
+                cross_check_for=payload.get("cross_check_for"),
+                raw_response=payload,
+                feature_snapshot=features.to_dict(),
+            )
+            return _calibrate_sentiment_decision(features, decision)
+
+        async def _invoke_batch(prompt: str, *, repair: bool = False) -> dict[str, Any]:
+            messages = _messages_for_model(
+                BATCH_EXPERT_SYSTEM_PROMPT,
+                prompt,
+                self._model_name,
+            )
+            async with _LLM_SEMAPHORE:
+                if _LLM_CALL_DELAY:
+                    await asyncio.sleep(_LLM_CALL_DELAY)
+                batch_llm = self._create_llm(
+                    self._model_name,
+                    max_completion_tokens_override=settings.ai_batch_expert_max_completion_tokens,
+                )
+                response = await batch_llm.ainvoke(messages)
+            parsed = _extract_json(_message_content_text(response))
+            experts = parsed.get("experts") if isinstance(parsed, dict) else None
+            if not isinstance(experts, dict):
+                kind = "repair" if repair else "batch"
+                raise LLMResponseParseError(f"{kind} experts response missing experts object")
+            return experts
+
         if self._llm is None:
             await self.initialize()
         if self._llm is None:
@@ -1180,41 +1247,55 @@ class LLMAgent(AbstractAIModel):
             "risk_expert": "risk_anomaly",
         }
         feature_text = _build_compact_feature_context(features, "final_decision")
-        user_prompt = build_batch_experts_user_prompt(feature_text, context)
-        messages = _messages_for_model(
-            BATCH_EXPERT_SYSTEM_PROMPT,
-            user_prompt,
-            self._model_name,
-        )
+        user_prompt = build_batch_experts_user_prompt(feature_text, context, expert_names)
+        repair_error = ""
+        try:
+            experts_payload = await _invoke_batch(user_prompt)
+        except LLMResponseParseError as exc:
+            repair_error = safe_error_text(exc, limit=180)
+            experts_payload = {}
 
-        async with _LLM_SEMAPHORE:
-            if _LLM_CALL_DELAY:
-                await asyncio.sleep(_LLM_CALL_DELAY)
-            batch_llm = self._create_llm(
-                self._model_name,
-                max_completion_tokens_override=settings.ai_batch_expert_max_completion_tokens,
+        missing_names = [
+            name for name in expert_names if not isinstance(experts_payload.get(name), dict)
+        ]
+        if missing_names:
+            repair_prompt = build_batch_experts_user_prompt(
+                feature_text,
+                {**context, "batch_repair_retry": True},
+                missing_names,
             )
-            response = await batch_llm.ainvoke(messages)
-        content = _message_content_text(response)
-        parsed = _extract_json(content)
-        experts_payload = parsed.get("experts") if isinstance(parsed, dict) else None
-        if not isinstance(experts_payload, dict):
-            raise LLMResponseParseError("batch experts response missing experts object")
+            repair_prompt += (
+                "\nRepair retry: previous batch output was incomplete or truncated. "
+                "Return ONLY the missing required experts listed above. "
+                "Use short Chinese reasoning and complete valid JSON."
+            )
+            try:
+                repaired_payload = await _invoke_batch(repair_prompt, repair=True)
+            except LLMResponseParseError as exc:
+                error_text = safe_error_text(exc, limit=180)
+                context.setdefault("_model_failures", []).append(
+                    {
+                        "expert_name": "batch_experts_repair",
+                        "provider_model": self._model_name,
+                        "experts": missing_names,
+                        "reason": error_text,
+                    }
+                )
+            else:
+                for name in missing_names:
+                    repaired = repaired_payload.get(name)
+                    if isinstance(repaired, dict):
+                        repaired = dict(repaired)
+                        repaired["batch_repair_retry"] = True
+                        if repair_error:
+                            repaired["batch_repair_reason"] = repair_error
+                        experts_payload[name] = repaired
 
         decisions: dict[str, DecisionOutput] = {}
         for name in expert_names:
             payload = experts_payload.get(name)
             if not isinstance(payload, dict):
-                fallback = self._local_expert_fallback(
-                    features, {**context, "expert_mode": True}, f"batch missing {name}"
-                )
-                fallback.model_name = name
-                fallback.raw_response = {
-                    **(fallback.raw_response or {}),
-                    "provider_model": self._model_name,
-                    "batch_expert_fallback": True,
-                }
-                decisions[name] = fallback
+                decisions[name] = _fallback_decision(name, f"batch missing {name}")
                 continue
 
             payload = dict(payload)

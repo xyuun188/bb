@@ -78,6 +78,31 @@ def _provider_model_name(model: object | None) -> str | None:
     return str(value) if value else None
 
 
+def _provider_group_key(model: object) -> tuple[str, str]:
+    """Group batchable experts by actual provider endpoint and model id."""
+
+    return (
+        str(getattr(model, "_base_url", "") or ""),
+        str(getattr(model, "_model_name", "") or ""),
+    )
+
+
+def _group_batchable_models_by_provider(
+    active_models: list[AbstractAIModel],
+) -> list[list[AbstractAIModel]]:
+    """Return stable groups so different provider models do not fake one consensus."""
+
+    groups: dict[tuple[str, str], list[AbstractAIModel]] = {}
+    order: list[tuple[str, str]] = []
+    for model in active_models:
+        key = _provider_group_key(model)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(model)
+    return [groups[key] for key in order]
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     return (
         isinstance(exc, TimeoutError | asyncio.TimeoutError)
@@ -126,8 +151,8 @@ class ModelRegistry:
         self._models: dict[str, AbstractAIModel] = {}
         self._live_model_name: str | None = None
         self._initialized = False
-        self._batch_expert_disabled_until: float = 0.0
-        self._batch_expert_last_error: str = ""
+        self._batch_expert_disabled_until_by_provider: dict[tuple[str, str], float] = {}
+        self._batch_expert_last_error_by_provider: dict[tuple[str, str], str] = {}
 
     def register(self, model: AbstractAIModel) -> None:
         """Register a model instance. Must have a unique name."""
@@ -323,121 +348,151 @@ class ModelRegistry:
             and len(active_models) >= 3
             and {model.name for model in active_models}.issubset(batchable_names)
         ):
-            batch_model = next(
-                (model for model in active_models if _batch_expert_decider(model) is not None),
-                active_models[0],
-            )
-            started_at = datetime.now(UTC)
-            perf_started = time.perf_counter()
-            now_perf = time.perf_counter()
-            if self._batch_expert_disabled_until > now_perf:
-                reason = (
-                    "batch expert circuit breaker active after recent timeout: "
-                    f"{self._batch_expert_last_error or 'recent batch expert failure'}"
+            grouped_models = _group_batchable_models_by_provider(active_models)
+            all_decisions: dict[str, DecisionOutput] = {}
+            all_timings: list[dict[str, Any]] = []
+            for provider_group in grouped_models:
+                batch_model = next(
+                    (model for model in provider_group if _batch_expert_decider(model) is not None),
+                    provider_group[0],
                 )
-                logger.warning(
-                    "batch expert circuit breaker active, using local fallback", reason=reason
+                provider_key = _provider_group_key(batch_model)
+                expert_names = [model.name for model in provider_group]
+                started_at = datetime.now(UTC)
+                perf_started = time.perf_counter()
+                now_perf = time.perf_counter()
+                disabled_until = self._batch_expert_disabled_until_by_provider.get(
+                    provider_key, 0.0
                 )
-                return self._batch_local_fallback_decisions(
-                    features,
-                    context,
-                    active_models,
-                    batch_model,
-                    started_at,
-                    round(time.perf_counter() - perf_started, 3),
-                    reason,
-                    status="circuit_breaker_fallback",
-                )
-            try:
-                batch_decider = _batch_expert_decider(batch_model)
-                if batch_decider is not None:
-                    result = await asyncio.wait_for(
-                        batch_decider(features, context, [model.name for model in active_models]),
-                        timeout=max(float(settings.ai_batch_expert_timeout_seconds or 18.0), 8.0),
+                if disabled_until > now_perf:
+                    reason = (
+                        "batch expert circuit breaker active after recent timeout: "
+                        f"{self._batch_expert_last_error_by_provider.get(provider_key) or 'recent batch expert failure'}"
                     )
-                else:
-                    raise RuntimeError("batch expert model does not expose decide_batch_experts")
-                self._batch_expert_disabled_until = 0.0
-                self._batch_expert_last_error = ""
-                duration = round(time.perf_counter() - perf_started, 3)
-                timings: list[dict[str, Any]] = []
-                for model in active_models:
-                    batch_decision = result.get(model.name)
-                    timings.append(
+                    logger.warning(
+                        "batch expert circuit breaker active, using local fallback",
+                        reason=reason,
+                    )
+                    fallback, fallback_timings = self._batch_local_fallback_decisions(
+                        features,
+                        context,
+                        provider_group,
+                        batch_model,
+                        started_at,
+                        round(time.perf_counter() - perf_started, 3),
+                        reason,
+                        status="circuit_breaker_fallback",
+                    )
+                    all_decisions.update(fallback)
+                    all_timings.extend(fallback_timings)
+                    continue
+                try:
+                    batch_decider = _batch_expert_decider(batch_model)
+                    if batch_decider is not None:
+                        result = await asyncio.wait_for(
+                            batch_decider(features, context, expert_names),
+                            timeout=max(
+                                float(settings.ai_batch_expert_timeout_seconds or 18.0),
+                                8.0,
+                            ),
+                        )
+                    else:
+                        raise RuntimeError(
+                            "batch expert model does not expose decide_batch_experts"
+                        )
+                    self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
+                    self._batch_expert_last_error_by_provider.pop(provider_key, None)
+                    duration = round(time.perf_counter() - perf_started, 3)
+                    for model in provider_group:
+                        batch_decision = result.get(model.name)
+                        all_timings.append(
+                            {
+                                "stage": "expert_initial",
+                                "name": model.name,
+                                "status": self._batch_timing_status(batch_decision),
+                                "started_at": started_at.isoformat(),
+                                "duration_sec": duration,
+                                "batch_expert": True,
+                                "shared_batch_call": True,
+                                "batch_model_count": len(provider_group),
+                                "batch_provider_group_count": len(grouped_models),
+                                "duration_kind": "shared_wall_time",
+                                "action": (
+                                    batch_decision.action.value
+                                    if isinstance(batch_decision, DecisionOutput)
+                                    else None
+                                ),
+                                "confidence": (
+                                    batch_decision.confidence
+                                    if isinstance(batch_decision, DecisionOutput)
+                                    else None
+                                ),
+                                "provider_model": (
+                                    batch_decision.raw_response.get("provider_model")
+                                    if isinstance(batch_decision, DecisionOutput)
+                                    and isinstance(batch_decision.raw_response, dict)
+                                    else _provider_model_name(batch_model)
+                                ),
+                            }
+                        )
+                    group_decisions = {
+                        name: decision
+                        for name, decision in result.items()
+                        if isinstance(decision, DecisionOutput)
+                    }
+                    all_decisions.update(group_decisions)
+                except Exception as exc:
+                    duration = round(time.perf_counter() - perf_started, 3)
+                    error_text = safe_error_text(exc, limit=240)
+                    breaker_seconds = _batch_failure_breaker_seconds(exc, error_text)
+                    self._batch_expert_last_error_by_provider[provider_key] = error_text
+                    if breaker_seconds > 0:
+                        self._batch_expert_disabled_until_by_provider[provider_key] = (
+                            time.perf_counter() + breaker_seconds
+                        )
+                    else:
+                        self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
+                    logger.warning(
+                        "batch expert decide failed, using fast local expert fallback",
+                        provider_model=_provider_model_name(batch_model),
+                        experts=expert_names,
+                        error=error_text,
+                    )
+                    context["_model_failures"].append(
                         {
-                            "stage": "expert_initial",
-                            "name": model.name,
-                            "status": self._batch_timing_status(batch_decision),
-                            "started_at": started_at.isoformat(),
-                            "duration_sec": duration,
-                            "batch_expert": True,
-                            "shared_batch_call": True,
-                            "batch_model_count": len(active_models),
-                            "duration_kind": "shared_wall_time",
-                            "action": (
-                                batch_decision.action.value
-                                if isinstance(batch_decision, DecisionOutput)
-                                else None
-                            ),
-                            "confidence": (
-                                batch_decision.confidence
-                                if isinstance(batch_decision, DecisionOutput)
-                                else None
-                            ),
-                            "provider_model": (
-                                batch_decision.raw_response.get("provider_model")
-                                if isinstance(batch_decision, DecisionOutput)
-                                and isinstance(batch_decision.raw_response, dict)
-                                else _provider_model_name(batch_model)
-                            ),
+                            "expert_name": "batch_experts",
+                            "provider_model": _provider_model_name(batch_model),
+                            "experts": expert_names,
+                            "reason": error_text,
                         }
                     )
-                decisions = {
-                    name: decision
-                    for name, decision in result.items()
-                    if isinstance(decision, DecisionOutput)
-                }
-                diversity_review = review_batch_expert_consensus(features, context, decisions)
-                context["_expert_diversity_policy"] = diversity_review.to_dict()
-                if diversity_review.should_retry:
-                    retry_decisions, retry_timings = await self._retry_independent_experts(
-                        features=features,
-                        context=context,
-                        active_models=active_models,
-                        original_decisions=decisions,
-                        review=diversity_review,
+                    fallback, fallback_timings = self._batch_local_fallback_decisions(
+                        features,
+                        context,
+                        provider_group,
+                        batch_model,
+                        started_at,
+                        duration,
+                        f"batch expert failed: {error_text}",
+                        status="batch_fallback",
                     )
-                    decisions.update(retry_decisions)
-                    timings.extend(retry_timings)
-                context["_model_timings"] = timings
-                return decisions
-            except Exception as exc:
-                duration = round(time.perf_counter() - perf_started, 3)
-                error_text = safe_error_text(exc, limit=240)
-                self._batch_expert_last_error = error_text
-                breaker_seconds = _batch_failure_breaker_seconds(exc, error_text)
-                self._batch_expert_disabled_until = (
-                    time.perf_counter() + breaker_seconds if breaker_seconds > 0 else 0.0
+                    all_decisions.update(fallback)
+                    all_timings.extend(fallback_timings)
+
+            diversity_review = review_batch_expert_consensus(features, context, all_decisions)
+            context["_expert_diversity_policy"] = diversity_review.to_dict()
+            if diversity_review.should_retry:
+                retry_decisions, retry_timings = await self._retry_independent_experts(
+                    features=features,
+                    context=context,
+                    active_models=active_models,
+                    original_decisions=all_decisions,
+                    review=diversity_review,
                 )
-                logger.warning(
-                    "batch expert decide failed, using fast local expert fallback", error=error_text
-                )
-                context["_model_failures"].append(
-                    {
-                        "expert_name": "batch_experts",
-                        "reason": error_text,
-                    }
-                )
-                return self._batch_local_fallback_decisions(
-                    features,
-                    context,
-                    active_models,
-                    batch_model,
-                    started_at,
-                    duration,
-                    f"batch expert failed: {error_text}",
-                    status="batch_fallback",
-                )
+                all_decisions.update(retry_decisions)
+                all_timings.extend(retry_timings)
+            context["_model_timings"] = all_timings
+            return all_decisions
 
         def _timeout_fallback_decision(
             model: AbstractAIModel,
@@ -691,7 +746,7 @@ class ModelRegistry:
         reason: str,
         *,
         status: str,
-    ) -> dict[str, DecisionOutput]:
+    ) -> tuple[dict[str, DecisionOutput], list[dict[str, Any]]]:
         fallback_decisions: dict[str, DecisionOutput] = {}
         fallback_timings: list[dict[str, Any]] = []
         for model in active_models:
@@ -747,8 +802,7 @@ class ModelRegistry:
                     "reason": reason[:240],
                 }
             )
-        context["_model_timings"] = fallback_timings
-        return fallback_decisions
+        return fallback_decisions, fallback_timings
 
     @staticmethod
     def _batch_timing_status(batch_decision: Any) -> str:

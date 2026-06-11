@@ -443,9 +443,34 @@ JSON:"""
 请只输出 JSON："""
 
 
-def build_batch_experts_user_prompt(feature_context: str, context: dict) -> str:
-    """Build one prompt that asks the local LLM to return all five expert opinions."""
+def build_batch_experts_user_prompt(
+    feature_context: str,
+    context: dict,
+    expert_names: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Build one provider-scoped prompt for batched expert opinions."""
     import json
+
+    supported_experts = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    )
+    requested_experts = [
+        str(name) for name in (expert_names or supported_experts) if str(name) in supported_experts
+    ]
+    if not requested_experts:
+        requested_experts = list(supported_experts)
+    requested_schema = ",".join(f'"{name}":{{...}}' for name in requested_experts)
+    requested_list = ", ".join(requested_experts)
+    omitted_experts = [name for name in supported_experts if name not in requested_experts]
+    omitted_rule = (
+        f"Do not include these omitted experts: {', '.join(omitted_experts)}.\n"
+        if omitted_experts
+        else ""
+    )
 
     payload = {
         "entry_candidate_evidence": context.get("entry_candidate_evidence") or {},
@@ -488,7 +513,10 @@ def build_batch_experts_user_prompt(feature_context: str, context: dict) -> str:
     return f"""STRICT_COMPACT_BATCH_JSON_V4
 Return ONLY valid minified JSON. No markdown, no prose, no <think>, no extra keys.
 Root schema exactly:
-{{"experts":{{"trend_expert":{{...}},"momentum_expert":{{...}},"sentiment_expert":{{...}},"position_expert":{{...}},"risk_expert":{{...}}}}}}
+{{"experts":{{{requested_schema}}}}}
+Required experts for THIS call: {requested_list}.
+Every required expert above must appear exactly once under experts.
+{omitted_rule.rstrip()}
 Each expert object must have exactly:
 {{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文8到24字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}}
 Do not copy one expert's conclusion into all experts. Each expert must judge only its role.

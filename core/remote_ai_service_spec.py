@@ -29,10 +29,13 @@ LEGACY_LLM_SCRIPT_PATHS = (
     f"{REMOTE_AI_ROOT}/scripts/start_deepseek_14b_main.sh",
     f"{REMOTE_AI_ROOT}/scripts/start_deepseek_32b_main.sh",
     f"{REMOTE_AI_ROOT}/scripts/start_qwen3_14b.sh",
+    f"{REMOTE_AI_ROOT}/scripts/start_qwen3_14b_main.sh",
+    f"{REMOTE_AI_ROOT}/scripts/start_qwen3_32b_main.sh",
     f"{REMOTE_AI_ROOT}/scripts/start_qwen3_32b_review.sh",
 )
 QWEN3_MAIN_REMOTE_MODEL_CLEANUP_PATHS = (
     f"{REMOTE_MODEL_ROOT}/DeepSeek/DeepSeek-R1-Distill-Qwen-32B-AWQ",
+    f"{REMOTE_MODEL_ROOT}/Qwen/Qwen3-32B-AWQ",
 )
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 SAFE_SYSTEMD_SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
@@ -111,6 +114,9 @@ class RemoteVllmServiceSpec:
     enable_chunked_prefill: bool = True
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 8192
+    use_modelscope: bool = True
+    download_max_workers: int = 8
+    hf_mirror_direct_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("start_script_name", "download_script_name", "log_name"):
@@ -136,6 +142,10 @@ class RemoteVllmServiceSpec:
             raise ValueError("max_num_seqs must be positive.")
         if self.max_num_batched_tokens < self.max_model_len:
             raise ValueError("max_num_batched_tokens must cover max_model_len.")
+        if self.download_max_workers < 1:
+            raise ValueError("download_max_workers must be positive.")
+        for file_name in self.hf_mirror_direct_files:
+            _validate_safe_filename(file_name, field_name="hf_mirror_direct_files")
 
         paths = (
             self.model_dir,
@@ -282,6 +292,79 @@ class RemoteVllmServiceSpec:
         model_dir_literal = json.dumps(self.model_dir)
         modelscope_model_literal = json.dumps(self.modelscope_model)
         model_repo_literal = json.dumps(self.model_repo)
+        if self.hf_mirror_direct_files:
+            aria_worker_count = max(int(self.download_max_workers), 1)
+            aria_download_count = 2 if len(self.hf_mirror_direct_files) > 1 else 1
+            aria_input = "\n".join(
+                f"https://hf-mirror.com/{self.model_repo}/resolve/main/{name}\n"
+                f"  dir={self.model_dir}\n"
+                f"  out={name}"
+                for name in self.hf_mirror_direct_files
+            )
+            python_bin = "$(command -v python3 || command -v python)"
+            verify_script = textwrap.dedent(f"""\
+                import json
+                from pathlib import Path
+                target = Path({model_dir_literal})
+                index_path = target / "model.safetensors.index.json"
+                if not index_path.exists():
+                    raise RuntimeError(f"missing model index: {{index_path}}")
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                required = set((index.get("weight_map") or {{}}).values())
+                missing = [name for name in sorted(required) if not (target / name).exists()]
+                if missing:
+                    raise RuntimeError(f"missing model shards: {{missing}}")
+                print("model downloaded:", target)
+                """)
+            return (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"mkdir -p {shell_quote(self.model_dir)} {shell_quote(self.hf_cache_dir)}\n"
+                f"cat > {shell_quote(self.download_script_path)}.urls <<'EOF_URLS'\n"
+                f"{aria_input}\n"
+                "EOF_URLS\n"
+                "aria2c --continue=true --allow-overwrite=true --auto-file-renaming=false \\\n"
+                "  --retry-wait=15 --max-tries=0 --timeout=120 --connect-timeout=30 \\\n"
+                "  --lowest-speed-limit=1K --summary-interval=30 "
+                f"--max-concurrent-downloads={aria_download_count} \\\n"
+                f"  --split={aria_worker_count} --max-connection-per-server={aria_worker_count} --min-split-size=64M \\\n"
+                f"  --file-allocation=none --input-file={shell_quote(self.download_script_path)}.urls\n"
+                f"{python_bin} - <<'PY'\n"
+                f"{verify_script}"
+                "PY\n"
+            )
+        if self.use_modelscope:
+            modelscope_prefetch = textwrap.dedent(f"""\
+                if command -v modelscope >/dev/null 2>&1; then
+                    modelscope download \\
+                    --model {shell_quote(self.modelscope_model)} \\
+                    --local_dir {shell_quote(self.model_dir)} \\
+                    --max-workers {self.download_max_workers} || \\
+                    echo "modelscope cli download failed; Python fallback will retry"
+                else
+                  echo "modelscope cli not found; falling back to huggingface_hub"
+                fi
+                """).rstrip()
+            python_modelscope_fallback = textwrap.dedent(f"""\
+                    try:
+                        subprocess.check_call([
+                            "modelscope",
+                            "download",
+                            "--model",
+                            {modelscope_model_literal},
+                            "--local_dir",
+                            str(target),
+                            "--max-workers",
+                            {str(self.download_max_workers)!r},
+                        ])
+                    except Exception as exc:
+                        print("modelscope download failed, falling back to huggingface_hub:", exc)
+                """).rstrip()
+        else:
+            modelscope_prefetch = 'echo "skipping modelscope for HuggingFace-only model repo"'
+            python_modelscope_fallback = (
+                '    print("skipping modelscope Python fallback for HuggingFace-only model repo")'
+            )
         return textwrap.dedent(f"""\
             #!/usr/bin/env bash
             set -euo pipefail
@@ -289,17 +372,10 @@ class RemoteVllmServiceSpec:
             export HF_HUB_CACHE={shell_quote(self.hf_cache_dir)}/hub
             export TRANSFORMERS_CACHE={shell_quote(self.hf_cache_dir)}/transformers
             export HF_ENDPOINT=https://hf-mirror.com
+            export HF_HUB_DOWNLOAD_TIMEOUT=60
             source ~/anaconda3/etc/profile.d/conda.sh
             conda activate {shell_quote(self.conda_env)}
-            if command -v modelscope >/dev/null 2>&1; then
-              modelscope download \\
-                --model {shell_quote(self.modelscope_model)} \\
-                --local_dir {shell_quote(self.model_dir)} \\
-                --max-workers 8 || \\
-                echo "modelscope cli download failed; Python fallback will retry"
-            else
-              echo "modelscope cli not found; falling back to huggingface_hub"
-            fi
+            {modelscope_prefetch}
             python - <<'PY'
             import json
             import shutil
@@ -332,19 +408,7 @@ class RemoteVllmServiceSpec:
                 if target.exists():
                     shutil.rmtree(target)
                 target.mkdir(parents=True, exist_ok=True)
-                try:
-                    subprocess.check_call([
-                        "modelscope",
-                        "download",
-                        "--model",
-                        {modelscope_model_literal},
-                        "--local_dir",
-                        str(target),
-                        "--max-workers",
-                        "8",
-                    ])
-                except Exception as exc:
-                    print("modelscope download failed, falling back to huggingface_hub:", exc)
+            {python_modelscope_fallback}
                 try:
                     from huggingface_hub import snapshot_download
                 except Exception:
@@ -365,6 +429,7 @@ class RemoteVllmServiceSpec:
                         local_dir=str(target),
                         local_dir_use_symlinks=False,
                         resume_download=True,
+                        max_workers={self.download_max_workers},
                         endpoint=os.environ.get("HF_ENDPOINT"),
                     )
                 if not model_complete(target):
@@ -387,6 +452,56 @@ QWEN3_32B_MAIN_SERVICE = RemoteVllmServiceSpec(
 )
 
 
+QWEN3_14B_TRADE_SERVICE = RemoteVllmServiceSpec(
+    model_repo="Qwen/Qwen3-14B-AWQ",
+    modelscope_model="Qwen/Qwen3-14B-AWQ",
+    model_dir=f"{REMOTE_MODEL_ROOT}/Qwen/Qwen3-14B-AWQ",
+    served_model_name="qwen3-14b-trade",
+    service_name="qwen3-14b-trade.service",
+    description="Qwen3 14B AWQ vLLM trade experts API",
+    start_script_name="start_qwen3_14b_trade.sh",
+    download_script_name="download_qwen3_14b_awq.sh",
+    log_name="qwen3_14b_trade.log",
+    port=8000,
+    max_model_len=8192,
+    gpu_memory_utilization=0.34,
+    max_num_seqs=4,
+    max_num_batched_tokens=8192,
+)
+
+DEEPSEEK_R1_14B_RISK_SERVICE = RemoteVllmServiceSpec(
+    model_repo="casperhansen/deepseek-r1-distill-qwen-14b-awq",
+    modelscope_model="casperhansen/deepseek-r1-distill-qwen-14b-awq",
+    model_dir=f"{REMOTE_MODEL_ROOT}/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
+    served_model_name="deepseek-r1-14b-risk",
+    service_name="deepseek-r1-14b-risk.service",
+    description="DeepSeek R1 Distill Qwen 14B vLLM risk experts API",
+    start_script_name="start_deepseek_r1_14b_risk.sh",
+    download_script_name="download_deepseek_r1_14b.sh",
+    log_name="deepseek_r1_14b_risk.log",
+    port=8003,
+    max_model_len=4096,
+    gpu_memory_utilization=0.62,
+    quantization="awq_marlin",
+    max_num_seqs=2,
+    max_num_batched_tokens=4096,
+    use_modelscope=False,
+    download_max_workers=16,
+    hf_mirror_direct_files=(
+        ".gitattributes",
+        "README.md",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ),
+)
+
+
 def qwen3_main_cleanup_command() -> str:
     """Stop older LLM services and remove only known obsolete remote model paths."""
     services = " ".join(shell_quote(service) for service in LEGACY_MAIN_LLM_SERVICES)
@@ -399,12 +514,13 @@ def qwen3_main_cleanup_command() -> str:
         shell_quote(path)
         for path in (
             f"{REMOTE_MODEL_ROOT}/Qwen",
+            f"{REMOTE_MODEL_ROOT}/DeepSeek",
             *REMOTE_RUNTIME_DIRS,
         )
     )
     return (
         f"{data_disk_guard_command()}; "
-        f"sudo systemctl stop {services} local-ai-tools.service 2>/dev/null || true; "
+        f"sudo systemctl stop {services} 2>/dev/null || true; "
         f"sudo systemctl disable {services} 2>/dev/null || true; "
         f"sudo rm -f {service_files}; "
         "pkill -f '[v]llm.entrypoints.openai.api_server|[d]ownload_deepseek|"

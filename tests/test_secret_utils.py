@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -125,6 +126,55 @@ def test_settings_defaults_do_not_hardcode_remote_model_endpoints() -> None:
     assert cfg.local_ai_tools_api_base == ""
     assert cfg.high_risk_review_api_base == ""
     assert cfg.high_risk_review_api_key == ""
+
+
+def test_fixed_ai_models_fall_back_to_global_api_key_for_slot_routing() -> None:
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        ai_api_key="shared-secret-key",
+        ai_models=[
+            {
+                "name": "trend_expert",
+                "api_base": "http://127.0.0.1:8000/v1",
+                "api_key": "",
+                "model": "qwen3-14b-trade",
+            }
+        ],
+    )
+
+    trend = next(
+        item
+        for item in cfg.get_fixed_ai_models(include_empty=False)
+        if item["name"] == "trend_expert"
+    )
+
+    assert trend["api_key"] == "shared-secret-key"
+    assert trend["api_base"] == "http://127.0.0.1:8000/v1"
+    assert trend["model"] == "qwen3-14b-trade"
+
+
+def test_dual_14b_config_script_generates_fixed_slot_routing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts.configure_dual_14b_ai_models import build_dual_14b_ai_models, main
+
+    models = build_dual_14b_ai_models(host="10.0.0.5")
+    by_name = {item["name"]: item for item in models}
+
+    assert by_name["trend_expert"]["api_base"] == "http://10.0.0.5:8000/v1"
+    assert by_name["momentum_expert"]["model"] == "qwen3-14b-trade"
+    assert by_name["decision_maker"]["model"] == "qwen3-14b-trade"
+    assert by_name["sentiment_expert"]["api_base"] == "http://10.0.0.5:8003/v1"
+    assert by_name["position_expert"]["model"] == "deepseek-r1-14b-risk"
+    assert by_name["risk_expert"]["model"] == "deepseek-r1-14b-risk"
+    assert all(item["api_key"] == "" for item in models)
+
+    main(["--host", "10.0.0.5"])
+    out = capsys.readouterr().out.strip()
+    assert out.startswith("AI_MODELS=")
+    payload = json.loads(out.split("=", 1)[1])
+    assert payload == models
+    assert "shared-secret-key" not in out
 
 
 def test_dashboard_cors_defaults_are_local_and_explicit() -> None:

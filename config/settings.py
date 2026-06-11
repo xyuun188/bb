@@ -352,7 +352,7 @@ class Settings(BaseSettings):
             merged = {
                 **slot,
                 "api_base": cfg.get("api_base", self.ai_api_base),
-                "api_key": cfg.get("api_key", ""),
+                "api_key": cfg.get("api_key") or self.ai_api_key,
                 "model": cfg.get("model", self.ai_model),
                 "enabled": bool(cfg.get("enabled", True)),
             }
