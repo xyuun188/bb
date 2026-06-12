@@ -29,6 +29,7 @@ from executor.okx_executor import OKXExecutor
 from executor.paper_executor import PaperExecutor
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
+from models.trade import Position
 from risk_manager.engine import RiskEngine
 from services.account_accounting_service import (
     AccountAccountingService,
@@ -175,6 +176,7 @@ from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
+from services.strategy_learning import StrategyLearningService
 from services.symbol_side_performance import SymbolSidePerformanceService
 from services.sync_service import OkxSyncService
 from services.trade_order_log_service import TradeOrderLogService
@@ -644,6 +646,7 @@ class TradingService:
         )
         self.entry_direction_competition = EntryDirectionCompetitionPolicy()
         self.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
+        self.strategy_learning_service = StrategyLearningService()
         self.entry_suspicious_symbol = EntrySuspiciousSymbolPolicy(self._normalize_position_symbol)
         self.entry_feature_ranker = EntryFeatureRankerPolicy(
             suspicious_symbol_reason=self.entry_suspicious_symbol.reason,
@@ -1858,7 +1861,7 @@ class TradingService:
         position_exposure = self.entry_position_exposure.context(open_positions or [])
         position_group_count = self.entry_symbol_universe.open_position_group_count(open_positions)
         account_equity = await self.allocated_order_balance(selected_mode)
-        return self._entry_strategy_mode_context_policy().build(
+        context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
             daily_state=daily_state,
             side_performance=side_perf,
@@ -1870,6 +1873,23 @@ class TradingService:
             account_equity=account_equity,
             account_config=settings.get_execution_account_config(selected_mode),
         )
+        strategy_learning = getattr(self, "strategy_learning_service", None)
+        if strategy_learning is None:
+            return context
+        try:
+            return await strategy_learning.apply_to_strategy_context(
+                mode=selected_mode,
+                strategy_context=context,
+                open_positions=open_positions or [],
+                max_open_positions=int(settings.max_open_positions_per_model or 20),
+            )
+        except Exception as exc:
+            logger.warning(
+                "strategy learning context failed; using baseline strategy context",
+                error=safe_error_text(exc),
+            )
+            context["strategy_learning_error"] = safe_error_text(exc, limit=160)
+            return context
 
     def _position_exposure_context(
         self,
@@ -2784,6 +2804,7 @@ class TradingService:
                     model_name=model_name,
                     open_positions=open_positions,
                     feature_vector=fv,
+                    strategy_mode_context=strategy_mode_context,
                 )
 
                 if not assessment.approved:
@@ -2853,6 +2874,7 @@ class TradingService:
                             model_name=model_name,
                             open_positions=open_positions,
                             feature_vector=fv,
+                            strategy_mode_context=strategy_mode_context,
                         )
 
                         if not assessment.approved:
@@ -3546,6 +3568,405 @@ class TradingService:
         )
         result.update(execution_update)
         return result
+
+    async def manual_close_position(
+        self,
+        position_id: int,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Close one open position directly through OKX without AI/risk persistence."""
+        async with get_session_ctx() as session:
+            position = await session.get(Position, int(position_id))
+            if position is None:
+                return {
+                    "approved": False,
+                    "position_id": int(position_id),
+                    "rejection_reason": "持仓记录不存在。",
+                }
+            if not position.is_open:
+                return {
+                    "approved": False,
+                    "position_id": position.id,
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "rejection_reason": "该持仓已经平仓。",
+                }
+            payload = self._manual_close_position_payload(position)
+
+        return await self._execute_direct_manual_close_payload(payload, reason=reason)
+
+    async def manual_close_all_positions(
+        self,
+        *,
+        mode: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Close every open position in the selected execution mode."""
+        selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            rows = await repo.get_position_records(
+                execution_mode=selected_mode,
+                limit=5000,
+                offset=0,
+                is_open=True,
+            )
+            payloads = [self._manual_close_position_payload(position) for position in rows]
+
+        results = []
+        for payload in payloads:
+            results.append(await self._execute_direct_manual_close_payload(payload, reason=reason))
+        closed = sum(1 for item in results if item.get("approved") and item.get("closed"))
+        failed = len(results) - closed
+        return {
+            "approved": failed == 0,
+            "mode": selected_mode,
+            "requested": len(results),
+            "closed": closed,
+            "failed": failed,
+            "results": results,
+        }
+
+    @staticmethod
+    def _manual_close_position_payload(position: Position) -> dict[str, Any]:
+        return {
+            "id": position.id,
+            "model_name": position.model_name,
+            "mode": position.execution_mode,
+            "symbol": position.symbol,
+            "side": position.side,
+            "quantity": position.quantity,
+            "entry_price": position.entry_price,
+            "current_price": position.current_price,
+            "leverage": position.leverage,
+            "unrealized_pnl": position.unrealized_pnl,
+        }
+
+    @staticmethod
+    def _manual_close_exchange_order_id(result: ExecutionResult) -> str:
+        raw_order_id = str(result.exchange_order_id or result.order_id or "").strip()
+        if raw_order_id.startswith("manual_close:"):
+            return raw_order_id
+        return f"manual_close:{raw_order_id or 'unknown'}"
+
+    @staticmethod
+    def _manual_close_order_side(result: ExecutionResult, action: Action) -> str:
+        raw_side = str(result.side or "").lower().strip()
+        if raw_side in {"buy", "sell"}:
+            return raw_side
+        return "sell" if action == Action.CLOSE_LONG else "buy"
+
+    def _manual_close_exchange_base_quantity(self, exchange_position: dict[str, Any]) -> float:
+        info = self._safe_dict(exchange_position.get("info"))
+        quantity = self._safe_float(exchange_position.get("quantity"), 0.0)
+        if quantity > 0:
+            return abs(quantity)
+        contracts = self._safe_float(
+            exchange_position.get("contracts")
+            or exchange_position.get("size")
+            or exchange_position.get("positionAmt")
+            or info.get("pos")
+            or info.get("qty"),
+            0.0,
+        )
+        contract_size = self._safe_float(
+            exchange_position.get("contractSize")
+            or exchange_position.get("contract_size")
+            or info.get("ctVal"),
+            1.0,
+        )
+        return abs(contracts * (contract_size if contract_size > 0 else 1.0))
+
+    async def _manual_close_fraction_for_position(
+        self,
+        executor: OKXExecutor,
+        position: dict[str, Any],
+    ) -> float:
+        local_qty = self._safe_float(position.get("quantity"), 0.0)
+        if local_qty <= 0:
+            return 1.0
+        side = str(position.get("side") or "").lower()
+        symbol = str(position.get("symbol") or "")
+        try:
+            exchange_positions = await asyncio.wait_for(
+                executor.get_positions_strict(symbol),
+                timeout=15.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "manual close could not fetch exchange position size; closing full matching side",
+                symbol=symbol,
+                side=side,
+                error=safe_error_text(exc),
+            )
+            return 1.0
+        exchange_qty = sum(
+            self._manual_close_exchange_base_quantity(item)
+            for item in exchange_positions or []
+            if str(item.get("side") or "").lower() == side
+        )
+        if exchange_qty <= 0:
+            return 1.0
+        return min(max(local_qty / exchange_qty, 1e-9), 1.0)
+
+    async def _persist_manual_close_result(
+        self,
+        position_payload: dict[str, Any],
+        result: ExecutionResult,
+        action: Action,
+        *,
+        model_name: str,
+        execution_mode: str,
+    ) -> dict[str, Any]:
+        if result.quantity <= 0 or result.price <= 0:
+            return {"closed": False, "realized_pnl": 0.0, "close_quantity": 0.0}
+
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            position = await session.get(Position, int(position_payload.get("id") or 0))
+            if position is None or not position.is_open:
+                return {"closed": False, "realized_pnl": 0.0, "close_quantity": 0.0}
+
+            position_qty = self._safe_float(position.quantity, 0.0)
+            close_qty = min(self._safe_float(result.quantity, 0.0), position_qty)
+            if close_qty <= 0 or position_qty <= 0:
+                return {"closed": False, "realized_pnl": 0.0, "close_quantity": 0.0}
+
+            close_fee = self.entry_fee_provider.proportional_fee(
+                result.fee,
+                close_qty,
+                result.quantity,
+            )
+            entry_fee = await self.entry_fee_provider.entry_fee_for_position(
+                session,
+                position,
+                close_qty,
+            )
+            if str(position.side or "").lower() == "short":
+                gross_pnl = (position.entry_price - result.price) * close_qty
+            else:
+                gross_pnl = (result.price - position.entry_price) * close_qty
+            realized_pnl = gross_pnl - entry_fee - close_fee
+            tolerance = max(position_qty * 1e-9, 1e-8)
+            closes_position = position_qty - close_qty <= tolerance
+
+            await repo.create_order(
+                {
+                    "model_name": model_name,
+                    "execution_mode": execution_mode,
+                    "symbol": result.symbol or position.symbol,
+                    "side": self._manual_close_order_side(result, action),
+                    "order_type": result.order_type or "market",
+                    "quantity": close_qty,
+                    "price": result.price,
+                    "status": result.status.value,
+                    "fee": close_fee,
+                    "decision_id": None,
+                    "exchange_order_id": self._manual_close_exchange_order_id(result),
+                    "filled_at": result.timestamp,
+                }
+            )
+
+            if closes_position:
+                position.is_open = False
+                position.current_price = result.price
+                position.unrealized_pnl = 0.0
+                position.realized_pnl = realized_pnl
+                position.closed_at = result.timestamp
+                try:
+                    self.position_profit_peaks.remove(model_name, position.symbol, position.side)
+                except Exception as exc:
+                    logger.debug(
+                        "manual close failed to remove position peak",
+                        error=safe_error_text(exc),
+                    )
+            else:
+                position.quantity = position_qty - close_qty
+                position.current_price = result.price
+                if str(position.side or "").lower() == "short":
+                    position.unrealized_pnl = (
+                        position.entry_price - result.price
+                    ) * position.quantity
+                else:
+                    position.unrealized_pnl = (
+                        result.price - position.entry_price
+                    ) * position.quantity
+                await repo.open_position(
+                    {
+                        "model_name": model_name,
+                        "execution_mode": execution_mode,
+                        "symbol": position.symbol,
+                        "side": position.side,
+                        "quantity": close_qty,
+                        "entry_price": position.entry_price,
+                        "current_price": result.price,
+                        "leverage": position.leverage,
+                        "unrealized_pnl": 0.0,
+                        "realized_pnl": realized_pnl,
+                        "stop_loss_price": position.stop_loss_price,
+                        "take_profit_price": position.take_profit_price,
+                        "is_open": False,
+                        "closed_at": result.timestamp,
+                        "created_at": position.created_at,
+                    }
+                )
+            await session.flush()
+
+        result.pnl = realized_pnl
+        try:
+            await self.account_accounting_service.persist_account_update(
+                model_name,
+                model_name,
+                result,
+            )
+        except Exception as exc:
+            logger.warning(
+                "manual close failed to persist account update",
+                error=safe_error_text(exc),
+            )
+        try:
+            self.increment_trade_count()
+        except Exception as exc:
+            logger.debug("manual close trade counter update failed", error=safe_error_text(exc))
+        return {
+            "closed": closes_position,
+            "realized_pnl": realized_pnl,
+            "close_quantity": close_qty,
+        }
+
+    async def _execute_direct_manual_close_payload(
+        self,
+        position: dict[str, Any],
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        side = str(position.get("side") or "").lower()
+        action = (
+            Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT if side == "short" else None
+        )
+        if action is None:
+            return {
+                "approved": False,
+                "position_id": position.get("id"),
+                "symbol": position.get("symbol"),
+                "side": side,
+                "rejection_reason": "持仓方向无效，无法手动平仓。",
+            }
+
+        symbol = str(position.get("symbol") or "")
+        model_name = str(position.get("model_name") or ENSEMBLE_TRADER_NAME)
+        execution_mode = "live" if str(position.get("mode") or "").lower() == "live" else "paper"
+        current_price = self._safe_float(position.get("current_price"), 0.0) or self._safe_float(
+            position.get("entry_price"),
+            0.0,
+        )
+        executor = await self.get_okx_executor_for_mode(execution_mode)
+        close_fraction = await self._manual_close_fraction_for_position(executor, position)
+        reasoning = str(reason or "用户手动平仓")
+        decision = DecisionOutput(
+            model_name=model_name,
+            symbol=symbol,
+            action=action,
+            confidence=1.0,
+            reasoning=reasoning,
+            position_size_pct=close_fraction,
+            suggested_leverage=self._safe_float(position.get("leverage"), 1.0),
+            stop_loss_pct=0.0,
+            take_profit_pct=0.0,
+            raw_response={
+                "manual_close": True,
+                "manual_close_position_id": position.get("id"),
+                "manual_close_reason": reasoning,
+                "close_fraction": close_fraction,
+                "exclude_from_training": True,
+            },
+            feature_snapshot={
+                "current_price": current_price,
+                "entry_price": self._safe_float(position.get("entry_price"), 0.0),
+                "position_current_price": current_price,
+                "quantity": self._safe_float(position.get("quantity"), 0.0),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        try:
+            async with self._execution_lock:
+                execution_result = await asyncio.wait_for(
+                    executor.place_order(decision, account_id=model_name),
+                    timeout=90.0,
+                )
+        except TimeoutError:
+            return {
+                "approved": False,
+                "position_id": position.get("id"),
+                "symbol": symbol,
+                "side": side,
+                "rejection_reason": "OKX 手动平仓接口超时，未确认成交。请刷新持仓后再确认。",
+            }
+        except Exception as exc:
+            return {
+                "approved": False,
+                "position_id": position.get("id"),
+                "symbol": symbol,
+                "side": side,
+                "rejection_reason": f"OKX 手动平仓失败：{safe_error_text(exc)}",
+            }
+
+        execution_completed = (
+            execution_result.status == OrderStatus.FILLED
+            and self._safe_float(execution_result.quantity, 0.0) > 0
+            and self._safe_float(execution_result.price, 0.0) > 0
+        )
+        if not execution_completed:
+            return {
+                "approved": False,
+                "position_id": position.get("id"),
+                "symbol": symbol,
+                "side": side,
+                "rejection_reason": self.execution_reason_from_result(execution_result),
+                "execution": {
+                    "order_id": execution_result.order_id,
+                    "status": execution_result.status.value,
+                    "quantity": execution_result.quantity,
+                    "price": execution_result.price,
+                    "pnl": execution_result.pnl,
+                },
+            }
+
+        persisted = await self._persist_manual_close_result(
+            position,
+            execution_result,
+            action,
+            model_name=model_name,
+            execution_mode=execution_mode,
+        )
+        execution_result.pnl = self._safe_float(persisted.get("realized_pnl"), execution_result.pnl)
+        return {
+            "approved": True,
+            "closed": bool(persisted.get("closed")),
+            "position_id": position.get("id"),
+            "symbol": symbol,
+            "side": side,
+            "manual_close": True,
+            "exclude_from_training": True,
+            "execution": {
+                "order_id": execution_result.order_id,
+                "exchange_order_id": self._manual_close_exchange_order_id(execution_result),
+                "status": execution_result.status.value,
+                "quantity": persisted.get("close_quantity", execution_result.quantity),
+                "price": execution_result.price,
+                "pnl": execution_result.pnl,
+            },
+        }
+
+    async def _execute_manual_close_payload(
+        self,
+        position: dict[str, Any],
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._execute_direct_manual_close_payload(position, reason=reason)
 
     async def _refresh_db_position_prices(self, feature_vectors: dict) -> None:
         return await self.okx_sync_service.refresh_position_prices(feature_vectors)

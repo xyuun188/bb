@@ -15,6 +15,10 @@ POSITION_REVIEW_MAX_GROUPS_PER_ROUND = 6
 POSITION_REVIEW_PRIORITY_MAX_GROUPS_PER_ROUND = 4
 POSITION_REVIEW_HIGH_RISK_MAX_GROUPS_PER_ROUND = 8
 POSITION_REVIEW_URGENT_EXIT_MAX_GROUPS_PER_ROUND = 14
+POSITION_REVIEW_MEDIUM_LOAD_GROUP_THRESHOLD = 13
+POSITION_REVIEW_HIGH_LOAD_GROUP_THRESHOLD = 25
+POSITION_REVIEW_MEDIUM_LOAD_MAX_GROUPS_PER_ROUND = 10
+POSITION_REVIEW_HIGH_LOAD_MAX_GROUPS_PER_ROUND = 14
 POSITION_REVIEW_FAST_EXIT_SCORE = 70.0
 POSITION_REVIEW_FAST_ADD_SCORE = 62.0
 POSITION_REVIEW_URGENT_EXIT_MARKERS = (
@@ -52,6 +56,12 @@ class AnalysisBudgetConfig:
     position_urgent_exit_max_groups_per_round: int = (
         POSITION_REVIEW_URGENT_EXIT_MAX_GROUPS_PER_ROUND
     )
+    position_medium_load_group_threshold: int = POSITION_REVIEW_MEDIUM_LOAD_GROUP_THRESHOLD
+    position_high_load_group_threshold: int = POSITION_REVIEW_HIGH_LOAD_GROUP_THRESHOLD
+    position_medium_load_max_groups_per_round: int = (
+        POSITION_REVIEW_MEDIUM_LOAD_MAX_GROUPS_PER_ROUND
+    )
+    position_high_load_max_groups_per_round: int = POSITION_REVIEW_HIGH_LOAD_MAX_GROUPS_PER_ROUND
     position_fast_exit_score: float = POSITION_REVIEW_FAST_EXIT_SCORE
     position_fast_add_score: float = POSITION_REVIEW_FAST_ADD_SCORE
     market_min_exploration_symbols: int = MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS
@@ -132,6 +142,7 @@ class AnalysisBudgetPolicy:
             feature_vectors,
             portfolio_profit_context,
         )
+        dynamic_position_max_groups = self._dynamic_position_max_groups(len(grouped_items))
 
         forced_exit = [
             scan
@@ -149,12 +160,13 @@ class AnalysisBudgetPolicy:
         ]
 
         risk_level = "low"
-        position_max_groups = self.config.position_max_groups_per_round
+        position_max_groups = dynamic_position_max_groups
         market_limit = base_market_limit if run_market_analysis else 0
         if high_exit or len(forced_exit) >= 3:
             risk_level = "high"
             position_max_groups = max(
                 self.config.position_high_risk_max_groups_per_round,
+                dynamic_position_max_groups,
                 min(
                     len(grouped_items),
                     self.config.position_urgent_exit_max_groups_per_round,
@@ -175,7 +187,7 @@ class AnalysisBudgetPolicy:
         elif forced_exit or len(priority) >= 3:
             risk_level = "medium"
             position_max_groups = max(
-                self.config.position_max_groups_per_round,
+                dynamic_position_max_groups,
                 min(len(priority) + 2, self.config.position_high_risk_max_groups_per_round),
             )
             market_limit = min(
@@ -235,6 +247,21 @@ class AnalysisBudgetPolicy:
             if model and symbol:
                 grouped.setdefault((model, symbol), []).append(pos)
         return list(grouped.items())
+
+    def _dynamic_position_max_groups(self, total_groups: int) -> int:
+        base = max(1, int(self.config.position_max_groups_per_round))
+        total = max(0, int(total_groups or 0))
+        if total >= int(self.config.position_high_load_group_threshold):
+            return max(
+                base,
+                min(total, int(self.config.position_high_load_max_groups_per_round)),
+            )
+        if total >= int(self.config.position_medium_load_group_threshold):
+            return max(
+                base,
+                min(total, int(self.config.position_medium_load_max_groups_per_round)),
+            )
+        return base
 
     def _result(
         self,

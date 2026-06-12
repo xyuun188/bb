@@ -32,6 +32,15 @@ class ManualTradeRequest(BaseModel):
     model_name: str | None = None
 
 
+class ManualClosePositionRequest(BaseModel):
+    reason: str | None = None
+
+
+class ManualCloseAllPositionsRequest(BaseModel):
+    mode: str | None = None
+    reason: str | None = None
+
+
 class ScanModeRequest(BaseModel):
     mode: str  # "auto" or "manual"
 
@@ -207,6 +216,36 @@ async def manual_trade(req: ManualTradeRequest):
     except Exception as exc:
         logger.debug("manual trade websocket broadcast failed", error=safe_error_text(exc))
 
+    return result
+
+
+@router.post("/positions/{position_id}/close")
+async def manual_close_position(position_id: int, req: ManualClosePositionRequest):
+    """Manually close one open position directly through OKX."""
+    if not _dash._trading_service:
+        raise HTTPException(status_code=503, detail="Trading service not initialized")
+
+    result = await _dash._trading_service.manual_close_position(
+        position_id,
+        reason=req.reason,
+    )
+    return result
+
+
+@router.post("/positions/close-all")
+async def manual_close_all_positions(req: ManualCloseAllPositionsRequest):
+    """Manually close all open positions in the selected execution mode."""
+    if not _dash._trading_service:
+        raise HTTPException(status_code=503, detail="Trading service not initialized")
+
+    mode = req.mode or mode_manager.mode.value
+    if str(mode).lower() not in {"paper", "live"}:
+        raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+
+    result = await _dash._trading_service.manual_close_all_positions(
+        mode=mode,
+        reason=req.reason,
+    )
     return result
 
 

@@ -63,6 +63,9 @@
             <button class="nav-item" data-page="profit-attribution">
                 <span class="nav-icon">◎</span> 策略复盘
             </button>
+            <button class="nav-item" data-page="strategy-learning">
+                <span class="nav-icon">⚙</span> 策略调度
+            </button>
             <button class="nav-item" data-page="ml-signal">
                 <span class="nav-icon">📡</span> 本地ML
             </button>
@@ -342,6 +345,7 @@
                 <div class="card-header">
                     <span class="card-title">持仓记录</span>
                     <span class="card-subtitle" id="positions-mode-label">模拟盘</span>
+                    <button class="btn btn-sm" id="close-all-positions-btn" onclick="closeAllOpenPositions()" style="margin-left:auto;color:var(--red);border-color:var(--red);">一键平仓</button>
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -357,10 +361,11 @@
                                 <th>止盈价</th>
                                 <th>止损价</th>
                                 <th>开仓时间</th>
+                                <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="positions-tbody">
-                            <tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">加载持仓记录中...</td></tr>
+                            <tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">加载持仓记录中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -665,6 +670,68 @@
         </div>
 
         <!-- ═══════ PAGE: ANALYSIS RECORDS ═══════ -->
+        <!-- ═══════ PAGE: STRATEGY LEARNING ═══════ -->
+        <div class="page-section" id="page-strategy-learning">
+            <div class="card strategy-learning-card">
+                <div class="card-header">
+                    <span class="card-title">策略生成 / 调度控制台</span>
+                    <div class="opening-funnel-controls">
+                        <span class="card-subtitle" id="strategy-learning-updated">等待刷新</span>
+                        <select class="form-input" id="strategy-learning-hours" onchange="fetchStrategyLearning()">
+                            <option value="24">最近 24 小时</option>
+                            <option value="72">最近 3 天</option>
+                            <option value="168" selected>最近 7 天</option>
+                            <option value="720">最近 30 天</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="fetchStrategyLearning()">刷新</button>
+                        <button class="btn btn-sm" onclick="rollbackStrategyLearning()">回滚基线</button>
+                    </div>
+                </div>
+                <div class="strategy-learning-body">
+                    <div class="strategy-learning-summary" id="strategy-learning-summary">
+                        <div class="opening-funnel-empty">加载中...</div>
+                    </div>
+                    <div class="strategy-learning-grid">
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">问题归因</span>
+                                <span class="analysis-section-subtitle">不开仓、亏损、满仓、fallback</span>
+                            </div>
+                            <div id="strategy-learning-problems" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">多空表现</span>
+                                <span class="analysis-section-subtitle">真实平仓反馈</span>
+                            </div>
+                            <div id="strategy-learning-sides" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">满仓释放候选</span>
+                                <span class="analysis-section-subtitle">优先复盘低质量亏损仓</span>
+                            </div>
+                            <div id="strategy-learning-release" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">专家稳定性</span>
+                                <span class="analysis-section-subtitle">fallback 与完整性保护</span>
+                            </div>
+                            <div id="strategy-learning-experts" class="opening-funnel-list"></div>
+                        </div>
+                    </div>
+                    <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel">
+                        <div class="analysis-section-head">
+                            <span class="analysis-section-title">候选策略 / 回测 / 影子验证 / 探针</span>
+                            <span class="analysis-section-subtitle">只允许受控参数，不生成交易代码</span>
+                        </div>
+                        <div id="strategy-learning-profiles" class="strategy-learning-profile-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="page-section" id="page-analysis">
             <div class="card">
                 <div class="card-header">
@@ -1243,6 +1310,6 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-<script src="/static/js/dashboard.js?v=20260609evidence-gate-probe"></script>
+<script src="/static/js/dashboard.js?v=20260612manual-close-fix"></script>
 </body>
 </html>

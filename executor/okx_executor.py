@@ -410,8 +410,13 @@ class OKXExecutor(AbstractExecutor):
                 ]
                 if matching:
                     pre_exit_contracts = self._position_contracts(matching[0])
+                    manual_close = bool(
+                        isinstance(decision.raw_response, dict)
+                        and decision.raw_response.get("manual_close")
+                    )
+                    min_exit_fraction = 1e-9 if manual_close else 0.05
                     requested_exit_fraction = min(
-                        max(float(decision.position_size_pct or 1.0), 0.05),
+                        max(float(decision.position_size_pct or 1.0), min_exit_fraction),
                         1.0,
                     )
                     order_quantity = pre_exit_contracts * requested_exit_fraction

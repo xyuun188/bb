@@ -126,6 +126,41 @@ def test_analysis_budget_medium_risk_keeps_limited_entry_exploration() -> None:
     assert result["priority_groups"] == 3
 
 
+def test_analysis_budget_raises_position_review_budget_when_positions_are_crowded() -> None:
+    policy, _scans_seen = _policy(config=AnalysisBudgetConfig(target_position_groups=3))
+    open_positions = [_position(f"SYM{i}/USDT") for i in range(13)]
+
+    result = policy.context(
+        open_positions,
+        {},
+        base_market_limit=20,
+        run_position_analysis=True,
+        run_market_analysis=True,
+    )
+
+    assert result["risk_level"] == "low"
+    assert result["position_max_groups"] == 10
+    assert result["total_position_groups"] == 13
+
+
+def test_analysis_budget_high_load_position_review_budget_overrides_static_high_risk_cap() -> None:
+    symbols = [f"SYM{i}/USDT" for i in range(25)]
+    fast_scan = {("ensemble_trader", symbols[0]): {"exit_score": 92.0, "priority_score": 92.0}}
+    policy, _scans_seen = _policy(fast_scan, config=AnalysisBudgetConfig(target_position_groups=3))
+
+    result = policy.context(
+        [_position(symbol) for symbol in symbols],
+        {},
+        base_market_limit=20,
+        run_position_analysis=True,
+        run_market_analysis=True,
+    )
+
+    assert result["risk_level"] == "high"
+    assert result["position_max_groups"] == 14
+    assert result["total_position_groups"] == 25
+
+
 def test_analysis_budget_new_pair_pause_zeroes_market_scan_budget() -> None:
     policy, _scans_seen = _policy(
         config=AnalysisBudgetConfig(target_position_groups=3, roster_fill_market_symbol_min=7)

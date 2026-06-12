@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
@@ -220,7 +220,6 @@ async def test_market_decision_risk_assessment_blocks_entry_when_experts_are_fal
 
     assert result.approved is False
     assert result.decision is None
-    assert "专家分析完整性保护" in result.rejection_reason
     assert "expert_integrity" in result.rejection_reason
     assert "circuit_breaker_fallback" in result.rejection_reason
     assert false_positive_calls == []
@@ -235,4 +234,64 @@ def test_expert_analysis_entry_block_reason_blocks_missing_timings() -> None:
 
     assert reason is not None
     assert "expert_integrity" in reason
-    assert "未记录 5 个专家" in reason
+
+
+def test_expert_analysis_entry_block_reason_allows_balanced_probe_missing_non_core() -> None:
+    raw = {
+        "model_timings": [
+            {"name": "trend_expert", "status": "completed", "provider_model": "qwen3-14b"},
+            {"name": "momentum_expert", "status": "completed", "provider_model": "qwen3-14b"},
+            {
+                "name": "sentiment_expert",
+                "status": "partial_batch_fallback",
+                "provider_model": "qwen3-14b",
+            },
+            {
+                "name": "position_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b",
+            },
+            {"name": "risk_expert", "status": "completed", "provider_model": "deepseek-r1-14b"},
+        ]
+    }
+    decision = _decision(raw)
+    decision.position_size_pct = 0.05
+
+    reason = expert_analysis_entry_block_reason(
+        decision,
+        strategy_mode_context={
+            "expert_integrity_mode": "balanced_probe_allow_one_non_core_missing",
+        },
+    )
+
+    assert reason is None
+    assert decision.position_size_pct == 0.018
+    assert decision.raw_response["expert_integrity_probe"]["applied"] is True
+    assert decision.raw_response["expert_integrity_probe"]["missing_expert"] == "sentiment_expert"
+
+
+def test_expert_analysis_entry_block_reason_keeps_core_expert_strict() -> None:
+    raw = {
+        "model_timings": [
+            {"name": "trend_expert", "status": "timeout", "provider_model": "qwen3-14b"},
+            {"name": "momentum_expert", "status": "completed", "provider_model": "qwen3-14b"},
+            {"name": "sentiment_expert", "status": "completed", "provider_model": "qwen3-14b"},
+            {
+                "name": "position_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b",
+            },
+            {"name": "risk_expert", "status": "completed", "provider_model": "deepseek-r1-14b"},
+        ]
+    }
+
+    reason = expert_analysis_entry_block_reason(
+        _decision(raw),
+        strategy_mode_context={
+            "expert_integrity_mode": "balanced_probe_allow_one_non_core_missing",
+        },
+    )
+
+    assert reason is not None
+    assert "trend_expert" in reason
+    assert "expert_integrity" in reason

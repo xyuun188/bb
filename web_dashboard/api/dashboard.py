@@ -20,6 +20,7 @@ from config.settings import (
 )
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.server_monitor_status import get_server_monitor_status_sync
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -1896,6 +1897,8 @@ async def get_positions(
                         }
 
                 def status_from_order_decision(order) -> tuple[str | None, str | None]:
+                    if is_manual_close_order(order):
+                        return "manual", MANUAL_CLOSE_LABEL
                     meta = _safe_dict(decision_meta.get(order.decision_id or -1))
                     raw = _safe_dict(meta.get("raw"))
                     close_evidence = _safe_dict(raw.get("close_evidence"))
@@ -2149,7 +2152,11 @@ async def get_positions(
             )
             if order_based_status:
                 group["close_status_source"] = "order"
-                if group.get("close_status") == "partial" or item.get("close_status") == "partial":
+                if group.get("close_status") == "manual" or item.get("close_status") == "manual":
+                    group["close_status"] = "manual"
+                elif (
+                    group.get("close_status") == "partial" or item.get("close_status") == "partial"
+                ):
                     group["close_status"] = "partial"
                 elif group.get("close_status") == "full" or item.get("close_status") == "full":
                     group["close_status"] = "full"
@@ -2165,6 +2172,8 @@ async def get_positions(
                 if group.get("close_status") == "partial"
                 else group.get("close_status_label")
             )
+            if group.get("close_status") == "manual":
+                group["close_status_label"] = MANUAL_CLOSE_LABEL
             if group.get("close_status") == "full":
                 group["close_status_label"] = "全部平仓"
             group["position_status"] = group["close_status_label"]
@@ -3002,6 +3011,72 @@ async def get_analysis_records(
         "page_size": effective_page_size,
         "total_pages": total_pages,
     }
+
+
+@router.get("/strategy-learning")
+async def get_strategy_learning(
+    mode: str | None = None,
+    hours: int = 168,
+    limit: int = 3000,
+):
+    """Return the active strategy-learning feedback and scheduler state."""
+    from services.strategy_learning import StrategyLearningService
+
+    selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    service = getattr(_trading_service, "strategy_learning_service", None)
+    if service is None:
+        service = StrategyLearningService()
+    payload = await service.dashboard_payload(
+        mode=selected_mode,
+        hours=max(1, min(int(hours or 168), 24 * 90)),
+        limit=max(100, min(int(limit or 3000), 20000)),
+        max_open_positions=int(settings.max_open_positions_per_model or 20),
+    )
+    return sanitize_payload(payload)
+
+
+@router.post("/strategy-learning/profiles/{profile_id}/disabled")
+async def set_strategy_learning_profile_disabled(
+    profile_id: str,
+    disabled: bool = True,
+    reason: str | None = None,
+):
+    """Disable or re-enable one strategy profile."""
+    from services.strategy_learning import StrategyLearningService
+
+    service = getattr(_trading_service, "strategy_learning_service", None)
+    if service is None:
+        service = StrategyLearningService()
+    state = service.set_profile_disabled(
+        profile_id,
+        disabled=bool(disabled),
+        reason=reason or "dashboard_manual_control",
+    )
+    return sanitize_payload({"profile_id": profile_id, "disabled": bool(disabled), "state": state})
+
+
+@router.post("/strategy-learning/profiles/{profile_id}/activate")
+async def activate_strategy_learning_profile(profile_id: str):
+    """Manually select a strategy profile until rollback or another selection."""
+    from services.strategy_learning import StrategyLearningService
+
+    service = getattr(_trading_service, "strategy_learning_service", None)
+    if service is None:
+        service = StrategyLearningService()
+    state = service.set_manual_active_profile(profile_id)
+    return sanitize_payload({"profile_id": profile_id, "state": state})
+
+
+@router.post("/strategy-learning/rollback")
+async def rollback_strategy_learning_profile():
+    """Rollback the scheduler to the baseline strategy profile."""
+    from services.strategy_learning import StrategyLearningService
+
+    service = getattr(_trading_service, "strategy_learning_service", None)
+    if service is None:
+        service = StrategyLearningService()
+    state = service.rollback_to_baseline()
+    return sanitize_payload({"profile_id": "baseline_current", "state": state})
 
 
 @router.get("/profit-attribution")

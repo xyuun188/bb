@@ -17,6 +17,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
+from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
 
@@ -429,6 +430,8 @@ async def get_trades(
         return False
 
     def close_status_for_order(order) -> tuple[str | None, str | None]:
+        if is_manual_close_order(order):
+            return "manual", MANUAL_CLOSE_LABEL
         action = display_action(order)
         if action not in {"close_long", "close_short"}:
             return None, None
@@ -446,6 +449,8 @@ async def get_trades(
         return "full", "全部平仓"
 
     def display_execution_source(order) -> tuple[str, str]:
+        if is_manual_close_order(order):
+            return "manual", MANUAL_CLOSE_LABEL
         meta = decision_meta.get(order.decision_id) or {}
         raw = meta.get("raw_llm_response") or {}
         snapshot = meta.get("feature_snapshot") or {}
@@ -492,6 +497,8 @@ async def get_trades(
         p = matching_closed_position(order)
         if p:
             close_price = order.price or p.current_price or 0
+            if is_manual_close_order(order):
+                return f"用户手动平仓，成交价 {close_price:g}，实现盈亏 {float(p.realized_pnl or 0):.4f}。"
             sl = p.stop_loss_price or 0
             tp = p.take_profit_price or 0
             tolerance = max(abs(close_price) * 0.002, 1e-12)

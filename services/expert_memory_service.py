@@ -16,6 +16,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.manual_close_marker import position_has_manual_close_order
 from services.memory_feedback import MemoryFeedbackPolicy
 
 logger = structlog.get_logger(__name__)
@@ -156,6 +157,29 @@ class ExpertMemoryService:
                     }
                     return {}
 
+                symbols = {pos.symbol for pos in positions if pos.symbol}
+                manual_close_orders = []
+                if symbols:
+                    manual_close_result = await session.execute(
+                        select(Order).where(
+                            Order.model_name == self.ensemble_model_name,
+                            Order.status == "filled",
+                            Order.symbol.in_(symbols),
+                            Order.exchange_order_id.like("manual_close:%"),
+                        )
+                    )
+                    manual_close_orders = list(manual_close_result.scalars().all())
+                positions = [
+                    pos
+                    for pos in positions
+                    if not position_has_manual_close_order(pos, manual_close_orders)
+                ]
+                if not positions:
+                    self._realized_weight_cache = {
+                        "expires_at": now + timedelta(minutes=15),
+                        "weights": {},
+                    }
+                    return {}
                 symbols = {pos.symbol for pos in positions if pos.symbol}
                 order_symbol_filter = Order.symbol.in_(symbols) if symbols else Order.id == -1
                 orders_result = await session.execute(
@@ -340,8 +364,23 @@ class ExpertMemoryService:
                     is_open=False,
                     limit=200,
                 )
+                symbols = {pos.symbol for pos in rows if pos.symbol}
+                manual_close_orders = []
+                if symbols:
+                    manual_close_result = await session.execute(
+                        select(Order).where(
+                            Order.model_name == self.ensemble_model_name,
+                            Order.execution_mode == execution_mode,
+                            Order.status == "filled",
+                            Order.symbol.in_(symbols),
+                            Order.exchange_order_id.like("manual_close:%"),
+                        )
+                    )
+                    manual_close_orders = list(manual_close_result.scalars().all())
                 for pos in rows:
                     if not pos.closed_at:
+                        continue
+                    if position_has_manual_close_order(pos, manual_close_orders):
                         continue
                     await self.record_trade_reflection_in_session(
                         session,

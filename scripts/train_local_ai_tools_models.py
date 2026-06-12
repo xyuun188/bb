@@ -23,7 +23,8 @@ from db.session import get_session_ctx
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
-from models.trade import Position
+from models.trade import Order, Position
+from services.manual_close_marker import position_has_manual_close_order
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
@@ -215,9 +216,21 @@ async def _load_closed_position_samples(limit: int) -> list[dict[str, Any]]:
             .limit(max(int(limit), 1))
         )
         rows = list(result.scalars().all())
+        symbols = {row.symbol for row in rows if row.symbol}
+        manual_orders = []
+        if symbols:
+            manual_order_result = await session.execute(
+                select(Order).where(
+                    Order.symbol.in_(symbols),
+                    Order.exchange_order_id.like("manual_close:%"),
+                )
+            )
+            manual_orders = list(manual_order_result.scalars().all())
 
     samples: list[dict[str, Any]] = []
     for row in rows:
+        if position_has_manual_close_order(row, manual_orders):
+            continue
         opened = _as_utc(row.created_at)
         closed = _as_utc(row.closed_at)
         hold_minutes = 0.0

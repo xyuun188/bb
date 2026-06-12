@@ -20,6 +20,7 @@ from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.manual_close_marker import position_has_manual_close_order
 
 SessionFactory = Callable[[], Any]
 
@@ -141,6 +142,30 @@ class ModelContributionPerformanceService:
                     }
                     return stats
 
+                symbols = {p.symbol for p in positions if p.symbol}
+                manual_close_orders = []
+                if symbols:
+                    manual_close_result = await session.execute(
+                        select(Order).where(
+                            Order.model_name == self._model_name,
+                            Order.execution_mode == selected_mode,
+                            Order.status == "filled",
+                            Order.symbol.in_(symbols),
+                            Order.exchange_order_id.like("manual_close:%"),
+                        )
+                    )
+                    manual_close_orders = list(manual_close_result.scalars().all())
+                positions = [
+                    pos
+                    for pos in positions
+                    if not position_has_manual_close_order(pos, manual_close_orders)
+                ]
+                if not positions:
+                    self._cache = {
+                        "expires_at": now + timedelta(minutes=15),
+                        "stats": stats,
+                    }
+                    return stats
                 symbols = {p.symbol for p in positions if p.symbol}
                 symbol_filter = Order.symbol.in_(symbols) if symbols else Order.id == -1
                 orders_result = await session.execute(

@@ -112,6 +112,8 @@ const FIXED_AI_EXPERT_FALLBACKS = [
 let recentDecisionsRefreshTimer = null;
 const okxTickerCache = {};
 let positionsRequestToken = 0;
+const closingPositionIds = new Set();
+let closingAllPositions = false;
 const THEME_STORAGE_KEY = 'dashboardTheme';
 
 function isPageActive(page) {
@@ -127,6 +129,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initSidebarNav();
     initTradeTabs();
     initScanModeButtons();
+    initPositionActions();
     fetchDashboardSummary();
     fetchPnlHistory();
     fetchRecentDecisions();
@@ -291,6 +294,19 @@ async function fetchJSON(url) {
         console.error(`Fetch failed: ${url}`, e);
         return null;
     }
+}
+
+async function postJSON(url, body = {}) {
+    const res = await fetch(url, dashboardWriteOptions({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(data.detail || data.rejection_reason || res.statusText || '请求失败');
+    }
+    return data;
 }
 
 async function fetchDashboardSummary() {
@@ -1304,6 +1320,7 @@ function initSidebarNav() {
             if (page === 'decisions') { populateDecisionModelFilter(); fetchAllDecisions(); }
             if (page === 'opening-funnel') fetchOpeningFunnel();
             if (page === 'profit-attribution') fetchProfitAttribution();
+            if (page === 'strategy-learning') fetchStrategyLearning();
             if (page === 'analysis') fetchAnalysisRecords();
             if (page === 'alerts') fetchRiskEvents();
             if (page === 'expert-memory') fetchExpertMemories();
@@ -1347,6 +1364,7 @@ function initModeButtons() {
             fetchAnalysisRecords();
             if (isPageActive('opening-funnel')) fetchOpeningFunnel();
             if (isPageActive('profit-attribution')) fetchProfitAttribution();
+            if (isPageActive('strategy-learning')) fetchStrategyLearning();
             if (isPageActive('expert-memory')) fetchExpertMemories();
             fetchPositions();
             fetchPositionHistory();
@@ -4293,13 +4311,24 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
     const pagination = document.getElementById('positions-pagination');
     if (!tbody) return;
     if (!positions.length) {
-        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">暂无正在持仓数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">暂无正在持仓数据</td></tr>';
         if (pagination) pagination.style.display = 'none';
         return;
     }
     tbody.innerHTML = positions.map(p => {
         const pnl = Number(p.unrealized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const positionId = Number(p.id || 0);
+        const closeDisabled = closingAllPositions || closingPositionIds.has(positionId);
+        const closeLabel = closingPositionIds.has(positionId) ? '平仓中...' : '平仓';
+        const closeButtonAttrs = [
+            'class="btn btn-sm js-close-position"',
+            closeDisabled ? 'disabled' : '',
+            `data-position-id="${escHtml(String(positionId))}"`,
+            `data-symbol="${escHtml(p.symbol || '')}"`,
+            `data-side="${escHtml(p.side || '')}"`,
+            'title="手动平掉该持仓"',
+        ].filter(Boolean).join(' ');
         return `
         <tr>
             <td>${escHtml(p.symbol || '-')}</td>
@@ -4312,24 +4341,26 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             <td>${p.take_profit ? fmtPrice(p.take_profit) : '-'}</td>
             <td>${p.stop_loss ? fmtPrice(p.stop_loss) : '-'}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.opened_at)}</td>
+            <td><button ${closeButtonAttrs}>${closeLabel}</button></td>
         </tr>`;
     }).join('');
     renderPagination('positions-pagination', page, totalPages, totalItems, 'changePositionsPage');
 }
+
 
 function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalItems = 0) {
     const tbody = document.getElementById('position-history-tbody');
     const pagination = document.getElementById('position-history-pagination');
     if (!tbody) return;
     if (!positions.length) {
-        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">暂无历史持仓数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">\u6682\u65e0\u5386\u53f2\u6301\u4ed3\u6570\u636e</td></tr>';
         if (pagination) pagination.style.display = 'none';
         return;
     }
     tbody.innerHTML = positions.map(p => {
         const pnl = Number(p.realized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-        const statusLabel = p.close_status_label || p.position_status || (p.close_status === 'partial' ? '部分平仓' : '全部平仓');
+        const statusLabel = p.close_status_label || p.position_status || (p.close_status === 'partial' ? '\u90e8\u5206\u5e73\u4ed3' : '\u5168\u90e8\u5e73\u4ed3');
         const statusColor = p.close_status === 'partial' ? 'var(--accent-light)' : 'var(--text-muted)';
         return `
         <tr>
@@ -4346,6 +4377,82 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
         </tr>`;
     }).join('');
     renderPagination('position-history-pagination', page, totalPages, totalItems, 'changePositionHistoryPage');
+}
+
+function initPositionActions() {
+    const tbody = document.getElementById('positions-tbody');
+    if (!tbody || tbody.dataset.closeHandlerAttached === '1') return;
+    tbody.dataset.closeHandlerAttached = '1';
+    tbody.addEventListener('click', (event) => {
+        const button = event.target?.closest?.('.js-close-position');
+        if (!button || !tbody.contains(button)) return;
+        event.preventDefault();
+        closeOpenPosition(
+            Number(button.dataset.positionId || 0),
+            button.dataset.symbol || '',
+            button.dataset.side || ''
+        );
+    });
+}
+
+async function closeOpenPosition(positionId, symbol, side) {
+    if (!positionId || closingPositionIds.has(positionId) || closingAllPositions) return;
+    const sideText = sideLabel(side);
+    if (!confirm(`\u786e\u8ba4\u624b\u52a8\u5e73\u4ed3 ${symbol || '-'} ${sideText} \u5417\uff1f`)) return;
+    closingPositionIds.add(positionId);
+    fetchPositions();
+    try {
+        const data = await postJSON(`/api/positions/${positionId}/close`, {
+            reason: '\u7528\u6237\u5728\u6301\u4ed3\u8bb0\u5f55\u9875\u9762\u624b\u52a8\u70b9\u51fb\u5e73\u4ed3\u3002',
+        });
+        if (!data.approved) {
+            alert('\u5e73\u4ed3\u672a\u6267\u884c: ' + (data.rejection_reason || '\u672a\u77e5\u539f\u56e0'));
+        }
+    } catch (err) {
+        alert('\u5e73\u4ed3\u5931\u8d25: ' + (err.message || '\u672a\u77e5\u9519\u8bef'));
+    } finally {
+        closingPositionIds.delete(positionId);
+        await fetchPositions();
+        fetchTrades();
+        fetchDashboardSummary();
+    }
+}
+
+async function closeAllOpenPositions() {
+    if (closingAllPositions) return;
+    const count = Number(state.positionsTotal || 0);
+    const suffix = count > 0 ? `\u5f53\u524d\u7ea6 ${count} \u6761\u6301\u4ed3\u3002` : '';
+    const modeLabel = state.mode === 'live' ? '\u5b9e\u76d8' : '\u6a21\u62df\u76d8';
+    if (!confirm(`\u786e\u8ba4\u4e00\u952e\u5e73\u6389\u5f53\u524d${modeLabel}\u5168\u90e8\u6301\u4ed3\u5417\uff1f${suffix}`)) return;
+    closingAllPositions = true;
+    const btn = document.getElementById('close-all-positions-btn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '\u5e73\u4ed3\u4e2d...';
+    }
+    fetchPositions();
+    try {
+        const data = await postJSON('/api/positions/close-all', {
+            mode: state.mode || 'paper',
+            reason: '\u7528\u6237\u5728\u6301\u4ed3\u8bb0\u5f55\u9875\u9762\u70b9\u51fb\u4e00\u952e\u5e73\u4ed3\u3002',
+        });
+        if (data.failed > 0) {
+            alert(`\u4e00\u952e\u5e73\u4ed3\u5b8c\u6210 ${data.closed || 0} \u6761\uff0c\u5931\u8d25 ${data.failed} \u6761\u3002`);
+        } else {
+            alert(`\u4e00\u952e\u5e73\u4ed3\u5df2\u63d0\u4ea4 ${data.closed || 0} \u6761\u3002`);
+        }
+    } catch (err) {
+        alert('\u4e00\u952e\u5e73\u4ed3\u5931\u8d25: ' + (err.message || '\u672a\u77e5\u9519\u8bef'));
+    } finally {
+        closingAllPositions = false;
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '一键平仓';
+        }
+        await fetchPositions();
+        fetchTrades();
+        fetchDashboardSummary();
+    }
 }
 
 function leverageDetailCell(item) {
@@ -5840,6 +5947,165 @@ function renderProfitAttributionChain(stateText, reason) {
             <strong>${escHtml(stateText || '-')}</strong>
             ${reason ? `<span title="${escHtml(reason)}">${escHtml(profitAttributionShortText(reason, 42))}</span>` : ''}
         </div>`;
+}
+
+async function fetchStrategyLearning() {
+    const hoursEl = document.getElementById('strategy-learning-hours');
+    const hours = Number(hoursEl?.value || 168);
+    try {
+        const data = await fetchJSON(`/api/strategy-learning?mode=${state.mode || 'paper'}&hours=${hours}&limit=3000`);
+        state.strategyLearning = data;
+        renderStrategyLearning(data);
+    } catch (err) {
+        const summary = document.getElementById('strategy-learning-summary');
+        if (summary) {
+            summary.innerHTML = `<div class="opening-funnel-verdict opening-funnel-warn"><strong>策略调度加载失败</strong><span>${escHtml(err.message || err)}</span></div>`;
+        }
+    }
+}
+
+function renderStrategyLearning(data) {
+    renderStrategyLearningSummary(data || {});
+    renderStrategyLearningProblems(data || {});
+    renderStrategyLearningSides(data || {});
+    renderStrategyLearningRelease(data || {});
+    renderStrategyLearningExperts(data || {});
+    renderStrategyLearningProfiles(data || {});
+    const updated = document.getElementById('strategy-learning-updated');
+    if (updated) updated.textContent = `${data.mode === 'live' ? '实盘' : '模拟盘'} · 最近 ${data.window_hours || 168} 小时 · ${new Date().toLocaleTimeString()}`;
+}
+
+function renderStrategyLearningSummary(data) {
+    const el = document.getElementById('strategy-learning-summary');
+    if (!el) return;
+    const feedback = data.feedback || {};
+    const totals = feedback.totals || {};
+    const schedule = data.schedule || {};
+    const profile = schedule.active_profile || data.active_profile || {};
+    const pnl = Number(totals.net_pnl || 0);
+    const tone = pnl > 0 ? 'good' : pnl < 0 ? 'warn' : 'muted';
+    el.innerHTML = `
+        <div class="opening-funnel-verdict opening-funnel-${tone}">
+            <strong>${escHtml(profile.label || profile.id || '当前基线')}</strong>
+            <span>${escHtml(schedule.reason || '使用当前策略调度结果。')}</span>
+        </div>
+        <div class="opening-funnel-kpis strategy-learning-kpis">
+            <div><span>训练交易数</span><strong>${Number(totals.training_trade_count || 0)} / ${Number(totals.trade_count_target || 0)}</strong></div>
+            <div><span>净收益</span><strong style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(pnl)} U</strong></div>
+            <div><span>胜率</span><strong>${pctLabel(totals.win_rate || 0, 1)}</strong></div>
+            <div><span>低交易量惩罚</span><strong>${totals.low_trade_count_penalty ? '已启用' : '未触发'}</strong></div>
+        </div>`;
+}
+
+function renderStrategyLearningProblems(data) {
+    const el = document.getElementById('strategy-learning-problems');
+    if (!el) return;
+    const problems = data.feedback?.problems || [];
+    if (!problems.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂未发现需要调度介入的主要问题。</div>';
+        return;
+    }
+    el.innerHTML = problems.map(item => `
+        <div class="opening-funnel-row strategy-learning-problem ${escHtml(item.severity || 'medium')}">
+            <div><strong>${escHtml(item.label || item.key || '-')}</strong><span>${escHtml(item.key || '')}</span></div>
+            <em>${escHtml(item.severity || '')}</em>
+        </div>`).join('');
+}
+
+function renderStrategyLearningSides(data) {
+    const el = document.getElementById('strategy-learning-sides');
+    if (!el) return;
+    const sides = data.feedback?.side_performance || {};
+    el.innerHTML = ['long', 'short'].map(side => {
+        const row = sides[side] || {};
+        const pnl = Number(row.pnl || 0);
+        return `
+            <div class="opening-funnel-row opening-funnel-symbol-row">
+                <div><strong>${side === 'long' ? '多单' : '空单'} · ${escHtml(row.state || 'neutral')}</strong><span>${Number(row.count || 0)} 笔，胜率 ${pctLabel(row.win_rate || 0, 1)}</span></div>
+                <div class="opening-funnel-bar"><span style="width:${Math.max(4, Math.min(Math.abs(pnl), 100))}%;background:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};"></span></div>
+                <em style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(pnl)} U</em>
+            </div>`;
+    }).join('');
+}
+
+function renderStrategyLearningRelease(data) {
+    const el = document.getElementById('strategy-learning-release');
+    if (!el) return;
+    const pressure = data.feedback?.open_position_pressure || {};
+    const candidates = pressure.release_candidates || [];
+    const header = `<div class="opening-funnel-row"><div><strong>仓位占用 ${Number(pressure.open_count || 0)} / ${Number(pressure.max_open_positions || 0)}</strong><span>亏损仓 ${Number(pressure.losing_open_count || 0)}，浮亏 ${signedMoney(pressure.losing_unrealized_pnl || 0)} U</span></div><em>${pressure.full_position_pressure ? '满仓压力' : '正常'}</em></div>`;
+    if (!candidates.length) {
+        el.innerHTML = header + '<div class="opening-funnel-empty">暂无释放候选。</div>';
+        return;
+    }
+    el.innerHTML = header + candidates.map(row => `
+        <div class="opening-funnel-row opening-funnel-symbol-row">
+            <div><strong>${escHtml(row.symbol || '-')} · ${escHtml(row.side || '-')}</strong><span>${escHtml(row.model_name || '')}</span></div>
+            <em style="color:${Number(row.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.unrealized_pnl || 0)} U</em>
+        </div>`).join('');
+}
+
+function renderStrategyLearningExperts(data) {
+    const el = document.getElementById('strategy-learning-experts');
+    if (!el) return;
+    const quality = data.feedback?.decision_quality || {};
+    const statuses = quality.model_timing_status_counts || {};
+    const missing = quality.missing_expert_counts || {};
+    const statusRows = Object.entries(statuses).slice(0, 6).map(([key, count]) => `<span>${escHtml(key)}: ${Number(count || 0)}</span>`).join('');
+    const missingRows = Object.entries(missing).slice(0, 6).map(([key, count]) => `<span>${escHtml(key)}: ${Number(count || 0)}</span>`).join('');
+    el.innerHTML = `
+        <div class="opening-funnel-row"><div><strong>完整性拦截 ${Number(quality.expert_integrity_blocks || 0)}</strong><span>fallback 开仓率 ${pctLabel(quality.fallback_entry_rate || 0, 1)}</span></div><em>${Number(quality.entry_signals || 0)} 信号</em></div>
+        <div class="strategy-learning-chip-row">${statusRows || '<span>暂无状态异常</span>'}</div>
+        <div class="strategy-learning-chip-row">${missingRows || '<span>暂无缺失专家</span>'}</div>`;
+}
+
+function renderStrategyLearningProfiles(data) {
+    const el = document.getElementById('strategy-learning-profiles');
+    if (!el) return;
+    const schedule = data.schedule || {};
+    const activeId = schedule.active_profile?.id || data.active_profile?.id;
+    const candidates = schedule.candidates || [];
+    const backtestRows = schedule.backtest?.rows || [];
+    const shadowRows = schedule.shadow_validation?.rows || [];
+    const disabled = new Set(schedule.disabled_profiles || []);
+    if (!candidates.length) {
+        el.innerHTML = '<div class="opening-funnel-empty">暂无策略候选。</div>';
+        return;
+    }
+    el.innerHTML = candidates.map(profile => {
+        const bt = backtestRows.find(row => row.profile_id === profile.id) || {};
+        const sh = shadowRows.find(row => row.profile_id === profile.id) || {};
+        const isActive = profile.id === activeId;
+        const isDisabled = disabled.has(profile.id);
+        const profileIdArg = JSON.stringify(String(profile.id || ''));
+        return `
+            <div class="strategy-learning-profile ${isActive ? 'active' : ''} ${isDisabled ? 'disabled' : ''}">
+                <div class="strategy-learning-profile-head"><strong>${escHtml(profile.label || profile.id)}</strong><span>${isActive ? '当前启用' : escHtml(profile.status || '候选')}</span></div>
+                <p>${escHtml(profile.description || '')}</p>
+                <div class="strategy-learning-profile-metrics">
+                    <span>回测 ${Number(bt.score || 0).toFixed(2)}</span><span>交易 ${Number(bt.trade_count || 0)} / ${Number(bt.trade_count_target || 0)}</span><span>低量惩罚 ${Number(bt.low_trade_count_penalty || 0).toFixed(2)}</span><span>影子 ${Number(sh.shadow_score || 0).toFixed(2)}</span><span>探针 ${Number(profile.params?.probe_fraction || 0) ? pctLabel(profile.params.probe_fraction, 1) : '-'}</span>
+                </div>
+                <div class="strategy-learning-profile-actions">
+                    <button class="btn btn-sm" onclick='activateStrategyLearningProfile(${profileIdArg})'>启用</button>
+                    <button class="btn btn-sm" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '启用候选' : '禁用候选'}</button>
+                </div>
+            </div>`;
+    }).join('');
+}
+
+async function setStrategyLearningProfileDisabled(profileId, disabled) {
+    await fetch(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' }));
+    await fetchStrategyLearning();
+}
+
+async function activateStrategyLearningProfile(profileId) {
+    await fetch(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' }));
+    await fetchStrategyLearning();
+}
+
+async function rollbackStrategyLearning() {
+    await fetch('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
+    await fetchStrategyLearning();
 }
 
 function shortText(value, maxLen = 36) {

@@ -1,11 +1,16 @@
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import services.trading_service as trading_module
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_trade_risk_assessment import ManualTradeRiskAssessmentPolicy
 from services.trading_service import TradingService
 
@@ -135,6 +140,7 @@ def _manual_service(
     service.ml_signal_service = FakeMlSignal()
     service.ensemble = FakeEnsemble()
     service.risk_engine = FakeRiskEngine()
+    service.execution_result_classifier = ExecutionResultClassifier()
     service.manual_trade_risk_assessment = ManualTradeRiskAssessmentPolicy(service.risk_engine)
     service._local_ai_tools_context = local_ai_tools_context
     service._market_regime_context = lambda feature_vectors: {"market_regime": "ok"}
@@ -202,3 +208,213 @@ async def test_manual_trade_hold_does_not_enter_execution_pipeline() -> None:
 
 async def _async_value(value: Any) -> Any:
     return value
+
+
+@pytest.mark.asyncio
+async def test_manual_close_bypasses_ai_risk_and_persists_manual_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, state = _manual_close_service(monkeypatch, _execution_result_for_manual_close())
+
+    result = await service._execute_manual_close_payload(
+        _manual_close_payload(position_id=7, side="long"),
+        reason="manual close test",
+    )
+
+    assert result["approved"] is True
+    assert result["closed"] is True
+    assert result["manual_close"] is True
+    assert result["exclude_from_training"] is True
+    assert state["risk_calls"] == 0
+    assert state["log_decision_calls"] == 0
+    assert state["execute_candidate_calls"] == 0
+    assert state["executor_decisions"][0].action == Action.CLOSE_LONG
+    assert state["executor_decisions"][0].raw_response["exclude_from_training"] is True
+    assert state["orders"][0]["decision_id"] is None
+    assert state["orders"][0]["exchange_order_id"] == "manual_close:okx-manual-1"
+    assert state["orders"][0]["side"] == "sell"
+    assert state["db_position"].is_open is False
+    assert state["db_position"].realized_pnl == pytest.approx(9.7)
+    assert state["account_updates"] == [pytest.approx(9.7)]
+
+
+def _manual_close_payload(position_id: int, side: str) -> dict[str, Any]:
+    return {
+        "id": position_id,
+        "model_name": ENSEMBLE_TRADER_NAME,
+        "mode": "paper",
+        "symbol": "BTC/USDT",
+        "side": side,
+        "quantity": 2.0,
+        "entry_price": 100.0,
+        "current_price": 99.0,
+        "leverage": 3.0,
+        "unrealized_pnl": -2.0,
+    }
+
+
+def _execution_result_for_manual_close(
+    status: OrderStatus = OrderStatus.FILLED,
+    quantity: float = 2.0,
+) -> ExecutionResult:
+    return ExecutionResult(
+        order_id="local-manual-1",
+        exchange_order_id="okx-manual-1",
+        symbol="BTC/USDT",
+        side="sell",
+        order_type="market",
+        quantity=quantity,
+        price=105.0,
+        status=status,
+        fee=0.1,
+        timestamp=datetime(2026, 6, 12, 1, 2, 3, tzinfo=UTC),
+    )
+
+
+class _ManualClosePosition:
+    id = 7
+    model_name = ENSEMBLE_TRADER_NAME
+    execution_mode = "paper"
+    symbol = "BTC/USDT"
+    side = "long"
+    quantity = 2.0
+    entry_price = 100.0
+    current_price = 99.0
+    leverage = 3.0
+    unrealized_pnl = -2.0
+    realized_pnl = 0.0
+    stop_loss_price = None
+    take_profit_price = None
+    is_open = True
+    created_at = datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC)
+    closed_at = None
+
+
+def _manual_close_service(
+    monkeypatch: pytest.MonkeyPatch,
+    execution_result: ExecutionResult,
+) -> tuple[TradingService, dict[str, Any]]:
+    service = TradingService.__new__(TradingService)
+    db_position = _ManualClosePosition()
+    state: dict[str, Any] = {
+        "orders": [],
+        "executor_decisions": [],
+        "account_updates": [],
+        "risk_calls": 0,
+        "log_decision_calls": 0,
+        "execute_candidate_calls": 0,
+        "db_position": db_position,
+    }
+
+    class FakeExecutor:
+        async def get_positions_strict(self, symbol: str) -> list[dict[str, Any]]:
+            assert symbol == "BTC/USDT"
+            return [{"side": "long", "quantity": 2.0}]
+
+        async def place_order(
+            self,
+            decision_arg: DecisionOutput,
+            account_id: str | None = None,
+        ) -> ExecutionResult:
+            assert account_id == ENSEMBLE_TRADER_NAME
+            state["executor_decisions"].append(decision_arg)
+            return execution_result
+
+    class FakeRepo:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        async def create_order(self, payload: dict[str, Any]) -> Any:
+            state["orders"].append(payload)
+            return SimpleNamespace(id=len(state["orders"]), **payload)
+
+        async def open_position(self, payload: dict[str, Any]) -> Any:
+            state.setdefault("split_positions", []).append(payload)
+            return SimpleNamespace(id=99, **payload)
+
+    class FakeSession:
+        async def get(self, model: Any, key: int) -> Any:
+            assert key in {7, 8}
+            db_position.id = key
+            return db_position
+
+        async def flush(self) -> None:
+            state["flushed"] = True
+
+        async def execute(self, *_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    class FakeEntryFeeProvider:
+        @staticmethod
+        def proportional_fee(fee: float | None, close_qty: float, total_qty: float) -> float:
+            return float(fee or 0.0) * close_qty / total_qty
+
+        async def entry_fee_for_position(
+            self,
+            _session: Any,
+            _position: Any,
+            _close_qty: float,
+        ) -> float:
+            return 0.2
+
+    class FakeAccountAccounting:
+        async def persist_account_update(
+            self,
+            _model_name: str,
+            _decision_model_name: str,
+            result: ExecutionResult,
+        ) -> None:
+            state["account_updates"].append(result.pnl)
+
+    class FakeRiskEngine:
+        def assess(self, *_args: Any, **_kwargs: Any) -> Any:
+            state["risk_calls"] += 1
+            raise AssertionError("manual close must bypass risk")
+
+    async def log_decision(*_args: Any, **_kwargs: Any) -> int:
+        state["log_decision_calls"] += 1
+        raise AssertionError("manual close must not log an AI decision")
+
+    async def execute_candidate(*_args: Any, **_kwargs: Any) -> ExecutionResult:
+        state["execute_candidate_calls"] += 1
+        raise AssertionError("manual close must bypass AI execution pipeline")
+
+    monkeypatch.setattr(trading_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(trading_module, "TradeRepository", FakeRepo)
+    service.get_okx_executor_for_mode = lambda _mode: _async_value(FakeExecutor())
+    service._execution_lock = asyncio.Lock()
+    service.entry_fee_provider = FakeEntryFeeProvider()
+    service.account_accounting_service = FakeAccountAccounting()
+    service.position_profit_peaks = SimpleNamespace(remove=lambda *_args: None)
+    service.execution_result_classifier = ExecutionResultClassifier()
+    service.risk_engine = FakeRiskEngine()
+    service._log_decision = log_decision
+    service._execute_candidate = execute_candidate
+    service._trade_count = 0
+    return service, state
+
+
+@pytest.mark.asyncio
+async def test_manual_close_rejected_execution_does_not_persist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected = _execution_result_for_manual_close(status=OrderStatus.REJECTED, quantity=0.0)
+    service, state = _manual_close_service(monkeypatch, rejected)
+
+    result = await service._execute_manual_close_payload(
+        _manual_close_payload(position_id=8, side="short"),
+        reason="manual close test",
+    )
+
+    assert result["approved"] is False
+    assert result["position_id"] == 8
+    assert result["execution"]["status"] == "rejected"
+    assert state["orders"] == []
+    assert state["db_position"].is_open is True
+    assert state["risk_calls"] == 0
+    assert state["log_decision_calls"] == 0
+    assert state["execute_candidate_calls"] == 0
