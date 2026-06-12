@@ -18,6 +18,7 @@
         })();
     </script>
     <link rel="stylesheet" href="/static/css/dashboard.css?v=20260609server-monitor">
+    <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260613-auto-layout">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -684,7 +685,7 @@
                             <option value="720">最近 30 天</option>
                         </select>
                         <button class="btn btn-sm" onclick="fetchStrategyLearning()">刷新</button>
-                        <button class="btn btn-sm" onclick="rollbackStrategyLearning()">回滚基线</button>
+                        <button class="btn btn-sm" onclick="rollbackStrategyLearning()">恢复自动调度</button>
                     </div>
                 </div>
                 <div class="strategy-learning-body">
@@ -1341,6 +1342,6 @@
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
 <script src="/static/js/dashboard.js?v=20260612manual-close-fix"></script>
-<script src="/static/js/strategy_learning_view.js?v=20260613-reflection-feedback"></script>
+<script src="/static/js/strategy_learning_view.js?v=20260613-auto-layout"></script>
 </body>
 </html>

@@ -3069,14 +3069,14 @@ async def activate_strategy_learning_profile(profile_id: str):
 
 @router.post("/strategy-learning/rollback")
 async def rollback_strategy_learning_profile():
-    """Rollback the scheduler to the baseline strategy profile."""
+    """Clear manual profile selection so the scheduler resumes automatic switching."""
     from services.strategy_learning import StrategyLearningService
 
     service = getattr(_trading_service, "strategy_learning_service", None)
     if service is None:
         service = StrategyLearningService()
     state = service.rollback_to_baseline()
-    return sanitize_payload({"profile_id": "baseline_current", "state": state})
+    return sanitize_payload({"profile_id": "auto", "state": state})
 
 
 @router.get("/profit-attribution")

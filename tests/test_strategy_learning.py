@@ -375,7 +375,7 @@ def test_strategy_learning_runtime_guard_rolls_back_bad_candidate(tmp_path) -> N
     guard = service._runtime_guard(payload, mutate=True)
     state = state_store.load()
     assert guard["should_rollback"] is True
-    assert state["manual_active_profile"] == "baseline_current"
+    assert state["manual_active_profile"] == ""
     assert "balanced_probe" in state["disabled_profiles"]
 
 
@@ -409,3 +409,51 @@ def test_strategy_learning_runtime_guard_read_only_does_not_mutate_state(tmp_pat
     assert guard["mutated"] is False
     assert state["manual_active_profile"] == "balanced_probe"
     assert "balanced_probe" not in state.get("disabled_profiles", {})
+
+
+def test_strategy_learning_baseline_manual_state_uses_auto_scheduler(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    state_store.set_manual_active_profile("baseline_current")
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(side="long", pnl=-4.0, position_id=41),
+            _position(side="long", pnl=-5.0, position_id=42),
+        ],
+        open_positions=[
+            _open_position("BTC/USDT", "long", -8.0),
+            _open_position("ETH/USDT", "long", -3.0),
+        ],
+        orders=[],
+        decisions=[_decision("hold")],
+        shadows=[],
+        memories=[],
+        reflections=[
+            _reflection(
+                position_id=41,
+                pnl=-4.2,
+                hold_minutes=260.0,
+                mistake="loss hold too long",
+            )
+        ],
+        max_open_positions=2,
+    )
+
+    assert state_store.load()["manual_active_profile"] == ""
+    assert payload["schedule"]["scheduler_mode"] == "auto"
+    assert payload["schedule"]["manual_profile_id"] == ""
+    assert payload["schedule"]["active_profile"]["id"] == "loss_release"
+
+
+def test_strategy_learning_rollback_clears_manual_lock(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+    state_store.set_manual_active_profile("balanced_probe")
+
+    state = service.rollback_to_baseline()
+
+    assert state["manual_active_profile"] == ""

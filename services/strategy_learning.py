@@ -296,6 +296,8 @@ class StrategySchedule:
     shadow_validation: dict[str, Any]
     probe: dict[str, Any]
     disabled_profiles: list[str]
+    scheduler_mode: str
+    manual_profile_id: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -308,6 +310,8 @@ class StrategySchedule:
             "shadow_validation": self.shadow_validation,
             "probe": self.probe,
             "disabled_profiles": self.disabled_profiles,
+            "scheduler_mode": self.scheduler_mode,
+            "manual_profile_id": self.manual_profile_id,
         }
 
 
@@ -321,7 +325,13 @@ class StrategyLearningStateStore:
         if not self.path.exists():
             return {"disabled_profiles": {}, "manual_active_profile": ""}
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return {"disabled_profiles": {}, "manual_active_profile": ""}
+            if state.get("manual_active_profile") == "baseline_current":
+                state = dict(state)
+                state["manual_active_profile"] = ""
+            return state
         except (OSError, json.JSONDecodeError) as exc:
             logger.debug("strategy learning state load failed", error=safe_error_text(exc))
             return {"disabled_profiles": {}, "manual_active_profile": ""}
@@ -356,7 +366,7 @@ class StrategyLearningStateStore:
                 "updated_at": datetime.now(UTC).isoformat(),
             }
             if state.get("manual_active_profile") == profile_id:
-                state["manual_active_profile"] = "baseline_current"
+                state["manual_active_profile"] = ""
         else:
             disabled_profiles.pop(profile_id, None)
         self.save(state)
@@ -364,7 +374,8 @@ class StrategyLearningStateStore:
 
     def set_manual_active_profile(self, profile_id: str | None) -> dict[str, Any]:
         state = self.load()
-        state["manual_active_profile"] = profile_id or ""
+        normalized_profile_id = "" if profile_id in {None, "", "baseline_current"} else str(profile_id)
+        state["manual_active_profile"] = normalized_profile_id
         self.save(state)
         return state
 
@@ -1612,12 +1623,15 @@ class StrategyScheduler:
         by_id = {profile.profile_id: profile for profile in available}
         state = self.state_store.load()
         manual_profile_id = str(state.get("manual_active_profile") or "")
+        if manual_profile_id == "baseline_current":
+            manual_profile_id = ""
+        manual_lock_active = bool(manual_profile_id and manual_profile_id in by_id)
 
         selected = by_id.get("baseline_current") or StrategyCandidateGenerator.baseline()
         reason = "默认使用当前基线。"
         problem_keys = {item["key"] for item in feedback.problems}
 
-        if manual_profile_id and manual_profile_id in by_id:
+        if manual_lock_active:
             selected = by_id[manual_profile_id]
             reason = f"人工指定策略画像 {manual_profile_id}。"
         elif (
@@ -1668,6 +1682,13 @@ class StrategyScheduler:
             selected = by_id.get("baseline_current", StrategyCandidateGenerator.baseline())
             reason = "候选画像未通过交易数量/历史评分约束，自动回滚到当前基线。"
 
+        reason = self._readable_schedule_reason(
+            selected_profile_id=selected.profile_id,
+            manual_lock_active=manual_lock_active,
+            manual_profile_id=manual_profile_id,
+            problem_keys=problem_keys,
+            score_failed=selected_score.get("pass") is False,
+        )
         runtime = self._runtime(selected, feedback)
         rollback = self._rollback(selected, feedback, selected_score)
         return StrategySchedule(
@@ -1680,7 +1701,36 @@ class StrategyScheduler:
             shadow_validation=self._shadow_validation(profiles, feedback),
             probe=self._probe(selected, feedback),
             disabled_profiles=disabled_ids,
+            scheduler_mode="manual" if manual_lock_active else "auto",
+            manual_profile_id=manual_profile_id if manual_lock_active else "",
         )
+
+    @staticmethod
+    def _readable_schedule_reason(
+        *,
+        selected_profile_id: str,
+        manual_lock_active: bool,
+        manual_profile_id: str,
+        problem_keys: set[str],
+        score_failed: bool,
+    ) -> str:
+        if score_failed and selected_profile_id == "baseline_current":
+            return "候选策略未通过交易数量或历史评分约束，自动回退到当前基线。"
+        if manual_lock_active:
+            return f"人工锁定策略画像 {manual_profile_id}，自动调度暂不覆盖。"
+        if selected_profile_id == "loss_release":
+            if {"full_position_loss_pressure", "max_position_blocks"} & problem_keys:
+                return "检测到满仓压力或亏损仓占位，自动调度到亏损释放画像。"
+            return "策略复盘显示费后亏损或亏损仓拖延过久，自动调度到亏损释放画像。"
+        if selected_profile_id.endswith("_side_recovery"):
+            side = selected_profile_id.replace("_side_recovery", "")
+            side_label = "多单" if side == "long" else "空单" if side == "short" else side
+            return f"{side_label}方向近期表现退化，自动调度到方向恢复画像。"
+        if selected_profile_id == "balanced_probe":
+            return "开仓样本不足、专家 fallback 拦截或影子复盘错过机会偏多，自动调度到平衡探针画像。"
+        if selected_profile_id == "winner_hold":
+            return "盈利仓小盈过多且大亏存在，自动调度到赢家持仓优化画像。"
+        return "自动调度未发现需要切换的高优先级问题，使用当前基线。"
 
     def _runtime(self, profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
         params = profile.params
@@ -1870,6 +1920,8 @@ class StrategyLearningEngine:
             "rollback": schedule.get("rollback", {}),
             "feedback_summary": self._compact_feedback(_safe_dict(payload.get("feedback"))),
             "candidate_count": len(_safe_list(schedule.get("candidates"))),
+            "scheduler_mode": schedule.get("scheduler_mode", "auto"),
+            "manual_profile_id": schedule.get("manual_profile_id", ""),
             "low_trade_count_penalized": True,
             "manual_close_excluded_from_training": True,
         }
@@ -1988,7 +2040,7 @@ class StrategyLearningService:
         return self.state_store.set_profile_disabled(profile_id, disabled=disabled, reason=reason)
 
     def rollback_to_baseline(self) -> dict[str, Any]:
-        return self.state_store.set_manual_active_profile("baseline_current")
+        return self.state_store.set_manual_active_profile(None)
 
     def set_manual_active_profile(self, profile_id: str | None) -> dict[str, Any]:
         return self.state_store.set_manual_active_profile(profile_id)
@@ -2537,7 +2589,7 @@ class StrategyLearningService:
                 disabled=True,
                 reason="auto_runtime_guard:" + ",".join(reasons),
             )
-            self.state_store.set_manual_active_profile("baseline_current")
+            self.state_store.set_manual_active_profile(None)
         return {
             "profile_id": profile_id,
             "should_rollback": bool(should_rollback),
