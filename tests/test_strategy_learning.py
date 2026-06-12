@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from services.strategy_learning import StrategyLearningEngine, StrategyLearningStateStore
+from services.strategy_learning import (
+    StrategyLearningEngine,
+    StrategyLearningService,
+    StrategyLearningStateStore,
+)
 
 
 def _position(
@@ -60,6 +64,60 @@ def _decision(action: str, *, executed: bool = False, reason: str = "") -> Simpl
     )
 
 
+def _strategy_event(
+    event_type: str,
+    *,
+    status: str = "recorded",
+    profile_id: str = "balanced_probe",
+    reason: str = "",
+    exclude: bool = False,
+    order_id: int | None = None,
+    position_id: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=1,
+        created_at=datetime.now(UTC),
+        event_type=event_type,
+        event_status=status,
+        severity="warn" if status in {"blocked", "failed", "rejected"} else "info",
+        symbol="BTC/USDT",
+        side="long",
+        action="long",
+        order_id=order_id,
+        position_id=position_id,
+        profile_id=profile_id,
+        reason=reason,
+        attribution={"blocker": reason},
+        exclude_from_training=exclude,
+    )
+
+
+def _reflection(
+    *,
+    position_id: int,
+    pnl: float,
+    hold_minutes: float = 60.0,
+    outcome: str | None = None,
+    mistake: str = "",
+    improvement: str = "",
+    source: str = "system",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=position_id,
+        position_id=position_id,
+        closed_at=datetime.now(UTC),
+        symbol="BTC/USDT",
+        side="long",
+        realized_pnl=pnl,
+        fee_estimate=0.08,
+        hold_minutes=hold_minutes,
+        outcome=outcome or ("win" if pnl > 0 else "loss" if pnl < 0 else "flat"),
+        mistake_summary=mistake,
+        improvement_summary=improvement,
+        source=source,
+    )
+
+
 def test_strategy_learning_builds_full_feedback_and_schedules_loss_release(tmp_path) -> None:
     state_store = StrategyLearningStateStore(tmp_path / "state.json")
     engine = StrategyLearningEngine(scheduler=None)
@@ -94,7 +152,15 @@ def test_strategy_learning_builds_full_feedback_and_schedules_loss_release(tmp_p
             )
         ],
         memories=[SimpleNamespace(is_active=True, memory_type="shadow_missed_opportunity")],
-        reflections=[],
+        reflections=[
+            _reflection(
+                position_id=1,
+                pnl=-4.2,
+                hold_minutes=260.0,
+                mistake="亏损仓拖延过久",
+                improvement="满仓时优先释放低质量亏损仓",
+            )
+        ],
         max_open_positions=3,
     )
 
@@ -106,6 +172,9 @@ def test_strategy_learning_builds_full_feedback_and_schedules_loss_release(tmp_p
     assert "long_side_degraded" in problem_keys
     assert "full_position_loss_pressure" in problem_keys
     assert feedback["training_policy"]["manual_close_excluded"] is True
+    assert feedback["reflection_feedback"]["training_count"] == 1
+    assert feedback["reflection_feedback"]["avg_loss_hold_minutes"] == 260.0
+    assert "reflection_loss_hold_too_long" in problem_keys
     assert schedule["active_profile"]["id"] == "loss_release"
     assert schedule["runtime"]["full_position_release"] is True
     assert schedule["backtest"]["rows"]
@@ -147,3 +216,196 @@ def test_strategy_learning_context_applies_profile_overrides(tmp_path) -> None:
     assert context["min_opportunity_score"] < 1.0
     assert context["expert_integrity_mode"] == "balanced_probe_allow_one_non_core_missing"
     assert context["strategy_learning"]["low_trade_count_penalized"] is True
+
+
+def test_strategy_learning_compiles_events_and_full_score_metrics(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(side="long", pnl=-4.0, position_id=10),
+            _position(side="short", pnl=2.0, position_id=11),
+            _position(side="short", pnl=-1.0, position_id=12),
+        ],
+        open_positions=[_open_position("BTC/USDT", "long", -5.0)],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback")],
+        shadows=[
+            SimpleNamespace(
+                status="completed",
+                missed_opportunity=True,
+                decision_action="hold",
+                long_return_pct=0.9,
+                short_return_pct=-0.2,
+            )
+        ],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "capacity_block",
+                status="blocked",
+                reason="max_position capacity reached",
+            ),
+            _strategy_event(
+                "manual_close",
+                status="executed",
+                reason="user manual close",
+                exclude=True,
+                order_id=88,
+                position_id=12,
+            ),
+        ],
+        reflections=[],
+        max_open_positions=1,
+    )
+
+    feedback = payload["feedback"]
+    event_feedback = feedback["event_feedback"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    assert event_feedback["max_position_blocks"] == 1
+    assert event_feedback["manual_close_events"] == 1
+    assert event_feedback["attribution_coverage"] == 1.0
+    manual_event = next(
+        row for row in event_feedback["recent_events"] if row["event_type"] == "manual_close"
+    )
+    assert manual_event["order_id"] == 88
+    assert manual_event["position_id"] == 12
+    assert manual_event["exclude_from_training"] is True
+    assert "max_position_blocks" in problem_keys
+    assert payload["schedule"]["active_profile"]["id"] == "loss_release"
+    score = payload["schedule"]["backtest"]["rows"][0]
+    assert "fee_adjusted_pnl" in score
+    assert "max_drawdown" in score
+    assert "consecutive_losses" in score
+    assert "position_occupancy" in score
+
+
+def test_strategy_learning_uses_trade_reflections_and_excludes_manual_samples(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-2.0, position_id=100)],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        reflections=[
+            _reflection(
+                position_id=100,
+                pnl=-3.5,
+                hold_minutes=240.0,
+                mistake="止损太晚",
+                improvement="亏损释放要更主动",
+            ),
+            _reflection(
+                position_id=101,
+                pnl=0.4,
+                hold_minutes=25.0,
+                mistake="小盈过早平仓",
+                improvement="优势仓位允许多跑一点",
+            ),
+            _reflection(
+                position_id=102,
+                pnl=-8.0,
+                hold_minutes=10.0,
+                mistake="手动平仓样本",
+                source="manual_close",
+            ),
+        ],
+        max_open_positions=14,
+    )
+
+    feedback = payload["feedback"]
+    reflection = feedback["reflection_feedback"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    assert reflection["total_count"] == 3
+    assert reflection["training_count"] == 2
+    assert reflection["excluded_manual_count"] == 1
+    assert reflection["fee_adjusted_pnl"] < 0
+    assert reflection["top_mistakes"][0]["summary"] == "止损太晚"
+    assert "reflection_negative_pnl" in problem_keys
+    assert "reflection_loss_hold_too_long" in problem_keys
+    assert "trade_reflection_mistakes" in problem_keys
+    assert payload["schedule"]["active_profile"]["id"] == "loss_release"
+    assert any(
+        "reflection_loss_hold_too_long" in row["matched_fixes"]
+        for row in payload["schedule"]["backtest"]["rows"]
+        if row["profile_id"] == "loss_release"
+    )
+
+
+def test_strategy_learning_runtime_guard_rolls_back_bad_candidate(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    service = StrategyLearningService(engine=engine, state_store=state_store)
+    state_store.set_manual_active_profile("balanced_probe")
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(side="long", pnl=-9.0, position_id=21),
+            _position(side="short", pnl=-2.0, position_id=22),
+        ],
+        open_positions=[],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback")],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+        ],
+        max_open_positions=14,
+    )
+
+    guard = service._runtime_guard(payload, mutate=True)
+    state = state_store.load()
+    assert guard["should_rollback"] is True
+    assert state["manual_active_profile"] == "baseline_current"
+    assert "balanced_probe" in state["disabled_profiles"]
+
+
+def test_strategy_learning_runtime_guard_read_only_does_not_mutate_state(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    service = StrategyLearningService(engine=engine, state_store=state_store)
+    state_store.set_manual_active_profile("balanced_probe")
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-9.0, position_id=31)],
+        open_positions=[],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback")],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+            _strategy_event("execution_error", status="failed", reason="execution failed"),
+        ],
+        max_open_positions=14,
+    )
+
+    guard = service._runtime_guard(payload, mutate=False)
+    state = state_store.load()
+    assert guard["should_rollback"] is True
+    assert guard["mutated"] is False
+    assert state["manual_active_profile"] == "balanced_probe"
+    assert "balanced_probe" not in state.get("disabled_profiles", {})

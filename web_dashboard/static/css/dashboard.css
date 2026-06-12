@@ -1217,13 +1217,16 @@ body {
 }
 .strategy-learning-summary .opening-funnel-kpis,
 .strategy-learning-kpis {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
 }
 .strategy-learning-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: 10px;
     align-items: start;
+}
+.strategy-learning-grid-wide {
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
 }
 .strategy-learning-panel {
     padding: 12px;
@@ -1307,6 +1310,48 @@ body {
     flex-wrap: wrap;
     gap: 6px;
     margin-top: 10px;
+}
+.strategy-learning-event-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+}
+.strategy-learning-event-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 10px;
+    background: var(--card-bg);
+    min-width: 0;
+}
+.strategy-learning-event-row.warn {
+    border-color: rgba(245, 158, 11, 0.45);
+}
+.strategy-learning-event-row.error {
+    border-color: rgba(239, 68, 68, 0.5);
+}
+.strategy-learning-event-row strong,
+.strategy-learning-event-row span,
+.strategy-learning-event-row p {
+    overflow-wrap: anywhere;
+}
+.strategy-learning-event-row span,
+.strategy-learning-event-row p,
+.strategy-learning-event-row em {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+.strategy-learning-event-row p {
+    grid-column: 1 / -1;
+    margin: 0;
+    line-height: 1.45;
+}
+.strategy-learning-event-row em {
+    white-space: nowrap;
+    align-self: start;
 }
 
 .profit-attribution-time,

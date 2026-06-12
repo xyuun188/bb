@@ -236,6 +236,13 @@ async def test_manual_close_bypasses_ai_risk_and_persists_manual_order(
     assert state["db_position"].is_open is False
     assert state["db_position"].realized_pnl == pytest.approx(9.7)
     assert state["account_updates"] == [pytest.approx(9.7)]
+    executed_event = next(
+        row for row in state["strategy_events"] if row["event_status"] == "executed"
+    )
+    assert executed_event["event_type"] == "manual_close"
+    assert executed_event["order_id"] == 1
+    assert executed_event["position_id"] == 7
+    assert executed_event["exclude_from_training"] is True
 
 
 def _manual_close_payload(position_id: int, side: str) -> dict[str, Any]:
@@ -300,6 +307,7 @@ def _manual_close_service(
         "orders": [],
         "executor_decisions": [],
         "account_updates": [],
+        "strategy_events": [],
         "risk_calls": 0,
         "log_decision_calls": 0,
         "execute_candidate_calls": 0,
@@ -383,6 +391,9 @@ def _manual_close_service(
         state["execute_candidate_calls"] += 1
         raise AssertionError("manual close must bypass AI execution pipeline")
 
+    async def record_strategy_event(**kwargs: Any) -> None:
+        state["strategy_events"].append(kwargs)
+
     monkeypatch.setattr(trading_module, "get_session_ctx", fake_session_ctx)
     monkeypatch.setattr(trading_module, "TradeRepository", FakeRepo)
     service.get_okx_executor_for_mode = lambda _mode: _async_value(FakeExecutor())
@@ -394,6 +405,7 @@ def _manual_close_service(
     service.risk_engine = FakeRiskEngine()
     service._log_decision = log_decision
     service._execute_candidate = execute_candidate
+    service._record_strategy_learning_event = record_strategy_event  # type: ignore[method-assign]
     service._trade_count = 0
     return service, state
 

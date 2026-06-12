@@ -678,9 +678,9 @@
                     <div class="opening-funnel-controls">
                         <span class="card-subtitle" id="strategy-learning-updated">等待刷新</span>
                         <select class="form-input" id="strategy-learning-hours" onchange="fetchStrategyLearning()">
-                            <option value="24">最近 24 小时</option>
+                            <option value="24" selected>最近 24 小时</option>
                             <option value="72">最近 3 天</option>
-                            <option value="168" selected>最近 7 天</option>
+                            <option value="168">最近 7 天</option>
                             <option value="720">最近 30 天</option>
                         </select>
                         <button class="btn btn-sm" onclick="fetchStrategyLearning()">刷新</button>
@@ -720,6 +720,13 @@
                             </div>
                             <div id="strategy-learning-experts" class="opening-funnel-list"></div>
                         </div>
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">策略复盘反馈</span>
+                                <span class="analysis-section-subtitle">错误模式、改进建议、训练排除</span>
+                            </div>
+                            <div id="strategy-learning-reflections" class="opening-funnel-list"></div>
+                        </div>
                     </div>
                     <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel">
                         <div class="analysis-section-head">
@@ -727,6 +734,29 @@
                             <span class="analysis-section-subtitle">只允许受控参数，不生成交易代码</span>
                         </div>
                         <div id="strategy-learning-profiles" class="strategy-learning-profile-list"></div>
+                    </div>
+                    <div class="strategy-learning-grid strategy-learning-grid-wide">
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">事件归因覆盖</span>
+                                <span class="analysis-section-subtitle">决策、拦截、执行、手动平仓</span>
+                            </div>
+                            <div id="strategy-learning-events" class="opening-funnel-list"></div>
+                        </div>
+                        <div class="opening-funnel-panel strategy-learning-panel">
+                            <div class="analysis-section-head">
+                                <span class="analysis-section-title">自动回滚护栏</span>
+                                <span class="analysis-section-subtitle">亏损、fallback、执行异常</span>
+                            </div>
+                            <div id="strategy-learning-guard" class="opening-funnel-list"></div>
+                        </div>
+                    </div>
+                    <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel">
+                        <div class="analysis-section-head">
+                            <span class="analysis-section-title">最近策略事件</span>
+                            <span class="analysis-section-subtitle">用于回答为什么不开仓、为什么回滚、手动平仓是否排除训练</span>
+                        </div>
+                        <div id="strategy-learning-recent-events" class="strategy-learning-event-list"></div>
                     </div>
                 </div>
             </div>
@@ -1311,5 +1341,6 @@
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
 <script src="/static/js/dashboard.js?v=20260612manual-close-fix"></script>
+<script src="/static/js/strategy_learning_view.js?v=20260613-reflection-feedback"></script>
 </body>
 </html>

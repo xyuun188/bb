@@ -23,13 +23,13 @@ from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
 from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from executor.base_executor import ExecutionResult, OrderStatus
 from executor.okx_executor import OKXExecutor
 from executor.paper_executor import PaperExecutor
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
-from models.trade import Position
+from models.trade import Order, Position
 from risk_manager.engine import RiskEngine
 from services.account_accounting_service import (
     AccountAccountingService,
@@ -1891,6 +1891,149 @@ class TradingService:
             context["strategy_learning_error"] = safe_error_text(exc, limit=160)
             return context
 
+    def _attach_strategy_learning_context(
+        self,
+        decision: DecisionOutput,
+        strategy_mode_context: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(strategy_mode_context, dict):
+            return
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["strategy_learning_context"] = {
+            "strategy_profile_id": strategy_mode_context.get("strategy_profile_id"),
+            "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
+            "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
+            "expert_integrity_mode": strategy_mode_context.get("expert_integrity_mode"),
+            "strategy_learning": strategy_mode_context.get("strategy_learning"),
+        }
+        decision.raw_response = raw
+
+    async def _record_strategy_learning_event(
+        self,
+        *,
+        mode: str,
+        model_name: str = ENSEMBLE_TRADER_NAME,
+        symbol: str | None = None,
+        decision: DecisionOutput | None = None,
+        action: str | None = None,
+        event_type: str,
+        event_status: str = "recorded",
+        reason: str | None = None,
+        severity: str = "info",
+        decision_id: int | None = None,
+        order_id: int | None = None,
+        position_id: int | None = None,
+        strategy_context: dict[str, Any] | None = None,
+        market_state: dict[str, Any] | None = None,
+        attribution: dict[str, Any] | None = None,
+        exclude_from_training: bool = False,
+    ) -> None:
+        service = getattr(self, "strategy_learning_service", None)
+        if service is None:
+            return
+        raw_response = decision.raw_response if decision is not None else None
+        if strategy_context is None and isinstance(raw_response, dict):
+            maybe_context = raw_response.get("strategy_learning_context")
+            if isinstance(maybe_context, dict):
+                strategy_context = dict(maybe_context)
+        event_action = action or (decision.action.value if decision is not None else None)
+        event_symbol = symbol or (decision.symbol if decision is not None else None)
+        try:
+            await service.record_event(
+                mode=mode,
+                model_name=model_name,
+                symbol=event_symbol,
+                action=event_action,
+                event_type=event_type,
+                event_status=event_status,
+                reason=reason,
+                severity=severity,
+                decision_id=decision_id,
+                order_id=order_id,
+                position_id=position_id,
+                strategy_context=strategy_context,
+                raw_response=raw_response,
+                market_state=market_state,
+                attribution=attribution,
+                exclude_from_training=exclude_from_training,
+            )
+        except Exception as exc:
+            logger.debug(
+                "strategy learning event recording failed",
+                event_type=event_type,
+                symbol=event_symbol,
+                error=safe_error_text(exc),
+            )
+
+    async def _strategy_learning_execution_links(
+        self,
+        *,
+        mode: str,
+        model_name: str,
+        symbol: str | None,
+        decision: DecisionOutput,
+        decision_id: int | None,
+        result: ExecutionResult | None,
+    ) -> dict[str, Any]:
+        """Resolve local order/position ids for strategy-learning attribution."""
+        payload: dict[str, Any] = {
+            "order_id": getattr(result, "order_id", None),
+            "exchange_order_id": getattr(result, "exchange_order_id", None),
+            "quantity": getattr(result, "quantity", None),
+            "price": getattr(result, "price", None),
+        }
+        if result is None:
+            return payload
+        normalized_symbol = self._normalize_position_symbol(symbol or result.symbol)
+        if not normalized_symbol:
+            return payload
+        try:
+            async with get_read_session_ctx() as session:
+                order_stmt = select(Order).where(
+                    Order.model_name == model_name,
+                    Order.execution_mode == mode,
+                )
+                exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
+                if exchange_order_id:
+                    order_stmt = order_stmt.where(Order.exchange_order_id == exchange_order_id)
+                elif decision_id is not None:
+                    order_stmt = order_stmt.where(Order.decision_id == decision_id)
+                else:
+                    order_stmt = order_stmt.where(Order.symbol == normalized_symbol)
+                order_result = await session.execute(
+                    order_stmt.order_by(Order.created_at.desc()).limit(1)
+                )
+                order = order_result.scalar_one_or_none()
+                if order is not None:
+                    payload["local_order_id"] = int(order.id)
+                side = "long" if decision.action in {Action.LONG, Action.CLOSE_LONG} else "short"
+                position_stmt = select(Position).where(
+                    Position.model_name == model_name,
+                    Position.execution_mode == mode,
+                    Position.symbol == normalized_symbol,
+                    Position.side == side,
+                )
+                if decision.action in {Action.LONG, Action.SHORT}:
+                    position_stmt = position_stmt.where(Position.is_open.is_(True))
+                elif decision.action in {Action.CLOSE_LONG, Action.CLOSE_SHORT}:
+                    position_stmt = position_stmt.where(Position.is_open.is_(False))
+                position_result = await session.execute(
+                    position_stmt.order_by(
+                        Position.closed_at.desc().nullslast(),
+                        Position.created_at.desc(),
+                    ).limit(1)
+                )
+                position = position_result.scalar_one_or_none()
+                if position is not None:
+                    payload["local_position_id"] = int(position.id)
+        except Exception as exc:
+            logger.debug(
+                "strategy learning execution link lookup failed",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+        return payload
+
     def _position_exposure_context(
         self,
         open_positions: list[dict] | None,
@@ -2718,6 +2861,7 @@ class TradingService:
                         raw_response=quick_raw,
                         feature_snapshot=fv.to_dict() if hasattr(fv, "to_dict") else {},
                     )
+                    self._attach_strategy_learning_context(quick_decision, strategy_mode_context)
                     decision_db_id = await self._log_decision(
                         quick_decision, is_paper=(model_mode == "paper")
                     )
@@ -2761,6 +2905,7 @@ class TradingService:
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
                     )
+                self._attach_strategy_learning_context(decision, strategy_mode_context)
                 self._attach_decision_timing(decision, analysis_started, "market")
                 self.agent_skills.attach(
                     decision,
@@ -2857,6 +3002,7 @@ class TradingService:
                         probe_source_label = "服务器盈利模型"
                     if probe_decision is not None:
                         executed = probe_decision
+                        self._attach_strategy_learning_context(executed, strategy_mode_context)
                         if decision_db_id is not None:
                             await self._mark_decision_reason(
                                 decision_db_id,
@@ -3407,7 +3553,22 @@ class TradingService:
         open_positions: list[dict] | None = None,
         refresh_exit_positions: bool = True,
     ) -> ExecutionResult | None:
-        return await self.execution_service.execute_candidate(
+        model_mode = self._get_model_execution_mode(model_name)
+        await self._record_strategy_learning_event(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            event_type="execution_attempt",
+            event_status="pending",
+            reason="decision entered execution pipeline",
+            decision_id=decision_db_id,
+            attribution={
+                "source": "execute_candidate",
+                "refresh_exit_positions": refresh_exit_positions,
+            },
+        )
+        result = await self.execution_service.execute_candidate(
             symbol,
             model_name,
             decision,
@@ -3417,6 +3578,43 @@ class TradingService:
             open_positions=open_positions,
             refresh_exit_positions=refresh_exit_positions,
         )
+        status = result.status.value if result is not None else "missing_result"
+        exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        event_status = "executed" if exchange_confirmed else "rejected"
+        severity = "info" if exchange_confirmed else "warn"
+        if result is None:
+            event_status = "failed"
+            severity = "error"
+        execution_links = await self._strategy_learning_execution_links(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            decision_id=decision_db_id,
+            result=result,
+        )
+        await self._record_strategy_learning_event(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            event_type="execution_result",
+            event_status=event_status,
+            reason=(
+                self.execution_reason_from_result(result) if result else "missing execution result"
+            ),
+            severity=severity,
+            decision_id=decision_db_id,
+            order_id=self._safe_int(execution_links.get("local_order_id"), 0) or None,
+            position_id=self._safe_int(execution_links.get("local_position_id"), 0) or None,
+            attribution={
+                "source": "execute_candidate",
+                "status": status,
+                **execution_links,
+                "exchange_confirmed": exchange_confirmed,
+            },
+        )
+        return result
 
     async def _execute_candidate_locked(
         self,
@@ -3429,7 +3627,19 @@ class TradingService:
         open_positions: list[dict] | None = None,
         refresh_exit_positions: bool = True,
     ) -> ExecutionResult | None:
-        return await self.execution_service.execute_candidate_locked(
+        model_mode = self._get_model_execution_mode(model_name)
+        await self._record_strategy_learning_event(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            event_type="execution_attempt",
+            event_status="pending",
+            reason="decision entered locked execution pipeline",
+            decision_id=decision_db_id,
+            attribution={"source": "execute_candidate_locked"},
+        )
+        result = await self.execution_service.execute_candidate_locked(
             symbol,
             model_name,
             decision,
@@ -3439,6 +3649,42 @@ class TradingService:
             open_positions=open_positions,
             refresh_exit_positions=refresh_exit_positions,
         )
+        exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        event_status = "executed" if exchange_confirmed else "rejected"
+        severity = "info" if exchange_confirmed else "warn"
+        if result is None:
+            event_status = "failed"
+            severity = "error"
+        execution_links = await self._strategy_learning_execution_links(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            decision_id=decision_db_id,
+            result=result,
+        )
+        await self._record_strategy_learning_event(
+            mode=model_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            event_type="execution_result",
+            event_status=event_status,
+            reason=(
+                self.execution_reason_from_result(result) if result else "missing execution result"
+            ),
+            severity=severity,
+            decision_id=decision_db_id,
+            order_id=self._safe_int(execution_links.get("local_order_id"), 0) or None,
+            position_id=self._safe_int(execution_links.get("local_position_id"), 0) or None,
+            attribution={
+                "source": "execute_candidate_locked",
+                "status": result.status.value if result is not None else "missing_result",
+                **execution_links,
+                "exchange_confirmed": exchange_confirmed,
+            },
+        )
+        return result
 
     def _is_no_exchange_position_error(self, message: Any) -> bool:
         return self.execution_result_classifier.is_no_exchange_position_error(message)
@@ -3751,7 +3997,7 @@ class TradingService:
             tolerance = max(position_qty * 1e-9, 1e-8)
             closes_position = position_qty - close_qty <= tolerance
 
-            await repo.create_order(
+            order = await repo.create_order(
                 {
                     "model_name": model_name,
                     "execution_mode": execution_mode,
@@ -3833,6 +4079,8 @@ class TradingService:
             "closed": closes_position,
             "realized_pnl": realized_pnl,
             "close_quantity": close_qty,
+            "order_id": int(order.id) if getattr(order, "id", None) is not None else None,
+            "position_id": int(position.id) if getattr(position, "id", None) is not None else None,
         }
 
     async def _execute_direct_manual_close_payload(
@@ -3846,6 +4094,19 @@ class TradingService:
             Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT if side == "short" else None
         )
         if action is None:
+            await self._record_strategy_learning_event(
+                mode=str(position.get("mode") or mode_manager.mode.value),
+                model_name=str(position.get("model_name") or ENSEMBLE_TRADER_NAME),
+                symbol=str(position.get("symbol") or ""),
+                action="manual_close",
+                event_type="manual_close",
+                event_status="rejected",
+                reason="invalid position side for manual close",
+                severity="warn",
+                position_id=self._safe_int(position.get("id"), 0) or None,
+                attribution={"source": "manual_close", "manual": True},
+                exclude_from_training=True,
+            )
             return {
                 "approved": False,
                 "position_id": position.get("id"),
@@ -3880,6 +4141,11 @@ class TradingService:
                 "manual_close_reason": reasoning,
                 "close_fraction": close_fraction,
                 "exclude_from_training": True,
+                "strategy_learning_context": {
+                    "manual_close": True,
+                    "exclude_from_training": True,
+                    "scheduler_reason": "user manual close bypasses AI risk and training",
+                },
             },
             feature_snapshot={
                 "current_price": current_price,
@@ -3897,6 +4163,19 @@ class TradingService:
                     timeout=90.0,
                 )
         except TimeoutError:
+            await self._record_strategy_learning_event(
+                mode=execution_mode,
+                model_name=model_name,
+                symbol=symbol,
+                decision=decision,
+                event_type="manual_close",
+                event_status="failed",
+                reason="manual close OKX timeout",
+                severity="error",
+                position_id=self._safe_int(position.get("id"), 0) or None,
+                attribution={"source": "manual_close", "manual": True, "error": "timeout"},
+                exclude_from_training=True,
+            )
             return {
                 "approved": False,
                 "position_id": position.get("id"),
@@ -3905,6 +4184,23 @@ class TradingService:
                 "rejection_reason": "OKX 手动平仓接口超时，未确认成交。请刷新持仓后再确认。",
             }
         except Exception as exc:
+            await self._record_strategy_learning_event(
+                mode=execution_mode,
+                model_name=model_name,
+                symbol=symbol,
+                decision=decision,
+                event_type="manual_close",
+                event_status="failed",
+                reason=f"manual close OKX failed: {safe_error_text(exc)}",
+                severity="error",
+                position_id=self._safe_int(position.get("id"), 0) or None,
+                attribution={
+                    "source": "manual_close",
+                    "manual": True,
+                    "error": safe_error_text(exc),
+                },
+                exclude_from_training=True,
+            )
             return {
                 "approved": False,
                 "position_id": position.get("id"),
@@ -3919,6 +4215,24 @@ class TradingService:
             and self._safe_float(execution_result.price, 0.0) > 0
         )
         if not execution_completed:
+            await self._record_strategy_learning_event(
+                mode=execution_mode,
+                model_name=model_name,
+                symbol=symbol,
+                decision=decision,
+                event_type="manual_close",
+                event_status="rejected",
+                reason=self.execution_reason_from_result(execution_result),
+                severity="warn",
+                position_id=self._safe_int(position.get("id"), 0) or None,
+                attribution={
+                    "source": "manual_close",
+                    "manual": True,
+                    "order_id": execution_result.order_id,
+                    "status": execution_result.status.value,
+                },
+                exclude_from_training=True,
+            )
             return {
                 "approved": False,
                 "position_id": position.get("id"),
@@ -3942,6 +4256,32 @@ class TradingService:
             execution_mode=execution_mode,
         )
         execution_result.pnl = self._safe_float(persisted.get("realized_pnl"), execution_result.pnl)
+        await self._record_strategy_learning_event(
+            mode=execution_mode,
+            model_name=model_name,
+            symbol=symbol,
+            decision=decision,
+            event_type="manual_close",
+            event_status="executed",
+            reason=reasoning,
+            severity="info",
+            order_id=self._safe_int(persisted.get("order_id"), 0) or None,
+            position_id=self._safe_int(persisted.get("position_id"), 0)
+            or self._safe_int(position.get("id"), 0)
+            or None,
+            attribution={
+                "source": "manual_close",
+                "manual": True,
+                "closed": bool(persisted.get("closed")),
+                "realized_pnl": execution_result.pnl,
+                "quantity": persisted.get("close_quantity", execution_result.quantity),
+                "price": execution_result.price,
+                "local_order_id": persisted.get("order_id"),
+                "local_position_id": persisted.get("position_id"),
+                "exchange_order_id": self._manual_close_exchange_order_id(execution_result),
+            },
+            exclude_from_training=True,
+        )
         return {
             "approved": True,
             "closed": bool(persisted.get("closed")),
@@ -5300,6 +5640,14 @@ class TradingService:
         except (TypeError, ValueError):
             return default
 
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
     def _safe_dict(self, value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
 
@@ -5372,7 +5720,23 @@ class TradingService:
         return self.execution_result_factory.rejected(decision, error)
 
     async def _log_decision(self, decision: DecisionOutput, is_paper: bool) -> int | None:
-        return await self.decision_persistence.log_decision(decision, is_paper)
+        decision_id = await self.decision_persistence.log_decision(decision, is_paper)
+        if decision_id is not None:
+            await self._record_strategy_learning_event(
+                mode="paper" if is_paper else "live",
+                model_name=decision.model_name or ENSEMBLE_TRADER_NAME,
+                symbol=decision.symbol,
+                decision=decision,
+                event_type="decision_logged",
+                event_status="recorded",
+                reason=decision.reasoning,
+                decision_id=decision_id,
+                attribution={
+                    "source": "ai_decision",
+                    "analysis_type": self._safe_dict(decision.raw_response).get("analysis_type"),
+                },
+            )
+        return decision_id
 
     def _json_safe_payload(self, value: Any) -> Any:
         """Return a JSON-column-safe copy of model/feature payloads."""
@@ -5489,12 +5853,74 @@ class TradingService:
             data=data,
         )
 
+    async def _record_decision_reason_strategy_event(
+        self,
+        decision_id: int,
+        reason: str | None,
+    ) -> None:
+        try:
+            async with get_session_ctx() as session:
+                row = await session.get(AIDecision, int(decision_id))
+                if row is None:
+                    return
+                raw = self._safe_dict(row.raw_llm_response)
+                strategy_context = self._safe_dict(raw.get("strategy_learning_context"))
+                text = str(reason or "")
+                lower = text.lower()
+                status = "skipped"
+                severity = "info"
+                event_type = "decision_reason"
+                if any(
+                    token in lower
+                    for token in ("reject", "rejected", "拒绝", "拦截", "block", "blocked")
+                ):
+                    status = "blocked"
+                    severity = "warn"
+                    event_type = "decision_blocked"
+                if any(
+                    token in lower for token in ("expert_integrity", "fallback", "partial_batch")
+                ):
+                    event_type = "expert_fallback"
+                    severity = "warn"
+                if any(
+                    token in lower for token in ("capacity", "max_position", "仓位", "满仓", "限制")
+                ):
+                    event_type = "capacity_block"
+                    severity = "warn"
+                if any(
+                    token in lower
+                    for token in ("error", "failed", "异常", "失败", "timeout", "超时")
+                ):
+                    status = "failed"
+                    severity = "error"
+                await self._record_strategy_learning_event(
+                    mode="paper" if bool(row.is_paper) else "live",
+                    model_name=row.model_name or ENSEMBLE_TRADER_NAME,
+                    symbol=row.symbol,
+                    action=row.action,
+                    event_type=event_type,
+                    event_status=status,
+                    reason=text,
+                    severity=severity,
+                    decision_id=decision_id,
+                    strategy_context=strategy_context,
+                    raw_response=raw,
+                    attribution={"source": "decision_reason", "execution_reason": text},
+                )
+        except Exception as exc:
+            logger.debug(
+                "failed to record strategy decision reason event",
+                decision_id=decision_id,
+                error=safe_error_text(exc),
+            )
+
     async def _mark_decision_reason(self, decision_id: int, reason: str | None) -> None:
         await self.decision_persistence.mark_reason(
             decision_id,
             reason,
             reason_recoverer=self._recover_execution_reason_from_decision_row,
         )
+        await self._record_decision_reason_strategy_event(decision_id, reason)
 
     async def _mark_decision_pending_execution(self, decision_id: int, reason: str) -> None:
         """Mark an entry as in-flight without letting final-round fallback overwrite it."""

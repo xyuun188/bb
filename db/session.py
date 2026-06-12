@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -24,12 +24,27 @@ async def get_engine():
         is_sqlite = "sqlite" in settings.database_url
         engine_kwargs: dict[str, Any] = {"echo": False}
         if is_sqlite:
-            engine_kwargs["connect_args"] = {"check_same_thread": False}
+            engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30.0}
         else:
             engine_kwargs["pool_size"] = 5
             engine_kwargs["max_overflow"] = 10
         _engine = create_async_engine(settings.database_url, **engine_kwargs)
+        if is_sqlite:
+            _configure_sqlite_engine(_engine)
     return _engine
+
+
+def _configure_sqlite_engine(engine: Any) -> None:
+    """Apply SQLite pragmas to every pooled connection."""
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout = 30000")
+            cursor.execute("PRAGMA journal_mode = WAL")
+        finally:
+            cursor.close()
 
 
 async def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
@@ -63,6 +78,18 @@ async def get_session_ctx() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
+@asynccontextmanager
+async def get_read_session_ctx() -> AsyncGenerator[AsyncSession, None]:
+    """Open a session for read-only dashboard queries without committing."""
+    maker = await get_sessionmaker()
+    async with maker() as session:
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
+
+
 async def init_db() -> None:
     """Create all tables. Called at application startup."""
     import models.account  # noqa: F401 - register account tables in metadata
@@ -74,6 +101,8 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         if "sqlite" in settings.database_url:
+            await conn.execute(text("PRAGMA busy_timeout = 30000"))
+            await conn.execute(text("PRAGMA journal_mode = WAL"))
             result = await conn.execute(text("PRAGMA table_info(ai_decisions)"))
             columns = {row[1] for row in result.fetchall()}
             if "execution_reason" not in columns:
@@ -84,9 +113,7 @@ async def init_db() -> None:
                 await conn.execute(
                     text("ALTER TABLE ai_decisions ADD COLUMN analysis_type VARCHAR(20)")
                 )
-            await conn.execute(
-                text(
-                    """
+            await conn.execute(text("""
                     UPDATE ai_decisions
                     SET execution_reason = CASE
                         WHEN action = 'hold' THEN 'AI 选择观望，未提交订单。'
@@ -94,12 +121,8 @@ async def init_db() -> None:
                     END
                     WHERE was_executed = 0
                       AND (execution_reason IS NULL OR execution_reason = '')
-                    """
-                )
-            )
-            await conn.execute(
-                text(
-                    """
+                    """))
+            await conn.execute(text("""
                     UPDATE ai_decisions
                     SET analysis_type = CASE
                         WHEN lower(coalesce(json_extract(raw_llm_response, '$.analysis_type'), '')) IN
@@ -116,16 +139,14 @@ async def init_db() -> None:
                     END
                     WHERE model_name = 'ensemble_trader'
                       AND (analysis_type IS NULL OR analysis_type = '')
-                    """
-                )
-            )
+                    """))
             result = await conn.execute(text("PRAGMA table_info(trade_reflections)"))
             reflection_columns = {row[1] for row in result.fetchall()}
             if "closed_at" not in reflection_columns:
-                await conn.execute(text("ALTER TABLE trade_reflections ADD COLUMN closed_at DATETIME"))
-            await conn.execute(
-                text(
-                    """
+                await conn.execute(
+                    text("ALTER TABLE trade_reflections ADD COLUMN closed_at DATETIME")
+                )
+            await conn.execute(text("""
                     UPDATE trade_reflections
                     SET closed_at = (
                         SELECT positions.closed_at
@@ -134,9 +155,7 @@ async def init_db() -> None:
                     )
                     WHERE closed_at IS NULL
                       AND position_id IS NOT NULL
-                    """
-                )
-            )
+                    """))
             for ddl in [
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created ON ai_decisions (is_paper, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_model_mode_created ON ai_decisions (model_name, is_paper, created_at DESC)",
@@ -148,6 +167,12 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_closed_created ON positions (execution_mode, is_open, closed_at DESC, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_symbol_side ON positions (execution_mode, symbol, side)",
                 "CREATE INDEX IF NOT EXISTS idx_trade_reflections_closed_created ON trade_reflections (closed_at DESC, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_events_mode_created ON strategy_learning_events (execution_mode, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_events_profile_created ON strategy_learning_events (profile_id, execution_mode, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_events_type_status ON strategy_learning_events (event_type, event_status, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_events_symbol_action ON strategy_learning_events (symbol, action, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_profile_snapshots_profile ON strategy_profile_snapshots (execution_mode, profile_id, version)",
+                "CREATE INDEX IF NOT EXISTS idx_strategy_profile_snapshots_active ON strategy_profile_snapshots (execution_mode, is_active, created_at DESC)",
             ]:
                 await conn.execute(text(ddl))
 

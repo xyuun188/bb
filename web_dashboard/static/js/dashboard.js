@@ -5952,145 +5952,24 @@ function renderProfitAttributionChain(stateText, reason) {
 async function fetchStrategyLearning() {
     const hoursEl = document.getElementById('strategy-learning-hours');
     const hours = Number(hoursEl?.value || 168);
+    const limit = hours <= 24 ? 500 : hours <= 72 ? 800 : 1000;
     try {
-        const data = await fetchJSON(`/api/strategy-learning?mode=${state.mode || 'paper'}&hours=${hours}&limit=3000`);
+        const data = await fetchJSON(`/api/strategy-learning?mode=${state.mode || 'paper'}&hours=${hours}&limit=${limit}`);
         state.strategyLearning = data;
         renderStrategyLearning(data);
     } catch (err) {
         const summary = document.getElementById('strategy-learning-summary');
         if (summary) {
-            summary.innerHTML = `<div class="opening-funnel-verdict opening-funnel-warn"><strong>策略调度加载失败</strong><span>${escHtml(err.message || err)}</span></div>`;
+            summary.innerHTML = `<div class="opening-funnel-verdict opening-funnel-warn"><strong>\u7b56\u7565\u8c03\u5ea6\u52a0\u8f7d\u5931\u8d25</strong><span>${escHtml(err.message || err)}</span></div>`;
         }
     }
 }
 
 function renderStrategyLearning(data) {
-    renderStrategyLearningSummary(data || {});
-    renderStrategyLearningProblems(data || {});
-    renderStrategyLearningSides(data || {});
-    renderStrategyLearningRelease(data || {});
-    renderStrategyLearningExperts(data || {});
-    renderStrategyLearningProfiles(data || {});
-    const updated = document.getElementById('strategy-learning-updated');
-    if (updated) updated.textContent = `${data.mode === 'live' ? '实盘' : '模拟盘'} · 最近 ${data.window_hours || 168} 小时 · ${new Date().toLocaleTimeString()}`;
-}
-
-function renderStrategyLearningSummary(data) {
-    const el = document.getElementById('strategy-learning-summary');
-    if (!el) return;
-    const feedback = data.feedback || {};
-    const totals = feedback.totals || {};
-    const schedule = data.schedule || {};
-    const profile = schedule.active_profile || data.active_profile || {};
-    const pnl = Number(totals.net_pnl || 0);
-    const tone = pnl > 0 ? 'good' : pnl < 0 ? 'warn' : 'muted';
-    el.innerHTML = `
-        <div class="opening-funnel-verdict opening-funnel-${tone}">
-            <strong>${escHtml(profile.label || profile.id || '当前基线')}</strong>
-            <span>${escHtml(schedule.reason || '使用当前策略调度结果。')}</span>
-        </div>
-        <div class="opening-funnel-kpis strategy-learning-kpis">
-            <div><span>训练交易数</span><strong>${Number(totals.training_trade_count || 0)} / ${Number(totals.trade_count_target || 0)}</strong></div>
-            <div><span>净收益</span><strong style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(pnl)} U</strong></div>
-            <div><span>胜率</span><strong>${pctLabel(totals.win_rate || 0, 1)}</strong></div>
-            <div><span>低交易量惩罚</span><strong>${totals.low_trade_count_penalty ? '已启用' : '未触发'}</strong></div>
-        </div>`;
-}
-
-function renderStrategyLearningProblems(data) {
-    const el = document.getElementById('strategy-learning-problems');
-    if (!el) return;
-    const problems = data.feedback?.problems || [];
-    if (!problems.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂未发现需要调度介入的主要问题。</div>';
-        return;
-    }
-    el.innerHTML = problems.map(item => `
-        <div class="opening-funnel-row strategy-learning-problem ${escHtml(item.severity || 'medium')}">
-            <div><strong>${escHtml(item.label || item.key || '-')}</strong><span>${escHtml(item.key || '')}</span></div>
-            <em>${escHtml(item.severity || '')}</em>
-        </div>`).join('');
-}
-
-function renderStrategyLearningSides(data) {
-    const el = document.getElementById('strategy-learning-sides');
-    if (!el) return;
-    const sides = data.feedback?.side_performance || {};
-    el.innerHTML = ['long', 'short'].map(side => {
-        const row = sides[side] || {};
-        const pnl = Number(row.pnl || 0);
-        return `
-            <div class="opening-funnel-row opening-funnel-symbol-row">
-                <div><strong>${side === 'long' ? '多单' : '空单'} · ${escHtml(row.state || 'neutral')}</strong><span>${Number(row.count || 0)} 笔，胜率 ${pctLabel(row.win_rate || 0, 1)}</span></div>
-                <div class="opening-funnel-bar"><span style="width:${Math.max(4, Math.min(Math.abs(pnl), 100))}%;background:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};"></span></div>
-                <em style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(pnl)} U</em>
-            </div>`;
-    }).join('');
-}
-
-function renderStrategyLearningRelease(data) {
-    const el = document.getElementById('strategy-learning-release');
-    if (!el) return;
-    const pressure = data.feedback?.open_position_pressure || {};
-    const candidates = pressure.release_candidates || [];
-    const header = `<div class="opening-funnel-row"><div><strong>仓位占用 ${Number(pressure.open_count || 0)} / ${Number(pressure.max_open_positions || 0)}</strong><span>亏损仓 ${Number(pressure.losing_open_count || 0)}，浮亏 ${signedMoney(pressure.losing_unrealized_pnl || 0)} U</span></div><em>${pressure.full_position_pressure ? '满仓压力' : '正常'}</em></div>`;
-    if (!candidates.length) {
-        el.innerHTML = header + '<div class="opening-funnel-empty">暂无释放候选。</div>';
-        return;
-    }
-    el.innerHTML = header + candidates.map(row => `
-        <div class="opening-funnel-row opening-funnel-symbol-row">
-            <div><strong>${escHtml(row.symbol || '-')} · ${escHtml(row.side || '-')}</strong><span>${escHtml(row.model_name || '')}</span></div>
-            <em style="color:${Number(row.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.unrealized_pnl || 0)} U</em>
-        </div>`).join('');
-}
-
-function renderStrategyLearningExperts(data) {
-    const el = document.getElementById('strategy-learning-experts');
-    if (!el) return;
-    const quality = data.feedback?.decision_quality || {};
-    const statuses = quality.model_timing_status_counts || {};
-    const missing = quality.missing_expert_counts || {};
-    const statusRows = Object.entries(statuses).slice(0, 6).map(([key, count]) => `<span>${escHtml(key)}: ${Number(count || 0)}</span>`).join('');
-    const missingRows = Object.entries(missing).slice(0, 6).map(([key, count]) => `<span>${escHtml(key)}: ${Number(count || 0)}</span>`).join('');
-    el.innerHTML = `
-        <div class="opening-funnel-row"><div><strong>完整性拦截 ${Number(quality.expert_integrity_blocks || 0)}</strong><span>fallback 开仓率 ${pctLabel(quality.fallback_entry_rate || 0, 1)}</span></div><em>${Number(quality.entry_signals || 0)} 信号</em></div>
-        <div class="strategy-learning-chip-row">${statusRows || '<span>暂无状态异常</span>'}</div>
-        <div class="strategy-learning-chip-row">${missingRows || '<span>暂无缺失专家</span>'}</div>`;
-}
-
-function renderStrategyLearningProfiles(data) {
-    const el = document.getElementById('strategy-learning-profiles');
-    if (!el) return;
-    const schedule = data.schedule || {};
-    const activeId = schedule.active_profile?.id || data.active_profile?.id;
-    const candidates = schedule.candidates || [];
-    const backtestRows = schedule.backtest?.rows || [];
-    const shadowRows = schedule.shadow_validation?.rows || [];
-    const disabled = new Set(schedule.disabled_profiles || []);
-    if (!candidates.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂无策略候选。</div>';
-        return;
-    }
-    el.innerHTML = candidates.map(profile => {
-        const bt = backtestRows.find(row => row.profile_id === profile.id) || {};
-        const sh = shadowRows.find(row => row.profile_id === profile.id) || {};
-        const isActive = profile.id === activeId;
-        const isDisabled = disabled.has(profile.id);
-        const profileIdArg = JSON.stringify(String(profile.id || ''));
-        return `
-            <div class="strategy-learning-profile ${isActive ? 'active' : ''} ${isDisabled ? 'disabled' : ''}">
-                <div class="strategy-learning-profile-head"><strong>${escHtml(profile.label || profile.id)}</strong><span>${isActive ? '当前启用' : escHtml(profile.status || '候选')}</span></div>
-                <p>${escHtml(profile.description || '')}</p>
-                <div class="strategy-learning-profile-metrics">
-                    <span>回测 ${Number(bt.score || 0).toFixed(2)}</span><span>交易 ${Number(bt.trade_count || 0)} / ${Number(bt.trade_count_target || 0)}</span><span>低量惩罚 ${Number(bt.low_trade_count_penalty || 0).toFixed(2)}</span><span>影子 ${Number(sh.shadow_score || 0).toFixed(2)}</span><span>探针 ${Number(profile.params?.probe_fraction || 0) ? pctLabel(profile.params.probe_fraction, 1) : '-'}</span>
-                </div>
-                <div class="strategy-learning-profile-actions">
-                    <button class="btn btn-sm" onclick='activateStrategyLearningProfile(${profileIdArg})'>启用</button>
-                    <button class="btn btn-sm" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '启用候选' : '禁用候选'}</button>
-                </div>
-            </div>`;
-    }).join('');
+    const summary = document.getElementById('strategy-learning-summary');
+    if (!summary) return;
+    const profile = data?.schedule?.active_profile || data?.active_profile || {};
+    summary.innerHTML = `<div class="opening-funnel-empty">\u7b56\u7565\u63a7\u5236\u53f0\u6570\u636e\u5df2\u52a0\u8f7d\uff1a${escHtml(profile.label || profile.id || '\u5f53\u524d\u57fa\u7ebf')}</div>`;
 }
 
 async function setStrategyLearningProfileDisabled(profileId, disabled) {
@@ -6106,9 +5985,4 @@ async function activateStrategyLearningProfile(profileId) {
 async function rollbackStrategyLearning() {
     await fetch('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
     await fetchStrategyLearning();
-}
-
-function shortText(value, maxLen = 36) {
-    const text = String(value || '').replace(/\s+/g, ' ').trim();
-    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
 }

@@ -1,7 +1,13 @@
 from models.account import ExecutionEquitySnapshot, VirtualAccount
 from models.base import Base, TimestampMixin
 from models.decision import AIDecision
-from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
+from models.learning import (
+    ExpertMemory,
+    ShadowBacktest,
+    StrategyLearningEvent,
+    StrategyProfileSnapshot,
+    TradeReflection,
+)
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.risk import ModelPerformanceSnapshot, RiskEvent
@@ -21,6 +27,8 @@ __all__ = [
     "AIDecision",
     "ExpertMemory",
     "ShadowBacktest",
+    "StrategyLearningEvent",
+    "StrategyProfileSnapshot",
     "TradeReflection",
     "RiskEvent",
     "ModelPerformanceSnapshot",

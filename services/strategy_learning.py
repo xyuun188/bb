@@ -8,6 +8,7 @@ shadow-validated, probed, scheduled, disabled, and rolled back.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -15,14 +16,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import structlog
 from sqlalchemy import select
 
 from config.settings import ENSEMBLE_TRADER_NAME, settings
+from core.model_runtime import apply_non_thinking_request_controls, completion_token_limit
 from core.safe_output import safe_error_text
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from models.decision import AIDecision
-from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
+from models.learning import (
+    ExpertMemory,
+    ShadowBacktest,
+    StrategyLearningEvent,
+    StrategyProfileSnapshot,
+    TradeReflection,
+)
 from models.trade import Order, Position
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
@@ -50,6 +59,42 @@ NON_CORE_ENTRY_EXPERTS = REQUIRED_ENTRY_EXPERTS - CORE_ENTRY_EXPERTS
 DEFAULT_MIN_TRADE_TARGET = 8
 DEFAULT_LOOKBACK_HOURS = 168
 STATE_FILE_NAME = "strategy_learning_state.json"
+PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS = 600
+LLM_CANDIDATE_CACHE_SECONDS = 6 * 60 * 60
+LLM_CANDIDATE_MAX_COUNT = 3
+ALLOWED_CANDIDATE_PARAM_KEYS = {
+    "global_min_score_delta",
+    "position_size_multiplier",
+    "probe_fraction",
+    "min_trade_count_target",
+    "expert_integrity_mode",
+    "max_probe_size_pct",
+    "fallback_tolerance",
+    "loss_exit_aggressiveness",
+    "full_position_release",
+    "position_review_priority_boost",
+    "release_losing_positions_first",
+    "winner_hold_extension",
+    "profit_lock_min_usdt_multiplier",
+    "pullback_lock_enabled",
+    "side_overrides",
+    "side_weights",
+}
+BOUNDED_FLOAT_PARAM_RANGES = {
+    "global_min_score_delta": (-0.25, 0.35),
+    "position_size_multiplier": (0.10, 1.25),
+    "probe_fraction": (0.0, 0.10),
+    "max_probe_size_pct": (0.0, 0.03),
+    "position_review_priority_boost": (0.70, 1.80),
+    "profit_lock_min_usdt_multiplier": (0.80, 1.80),
+}
+ALLOWED_EXPERT_INTEGRITY_MODES = {
+    "strict_all_required",
+    "balanced_probe_allow_one_non_core_missing",
+    "core_experts_required_probe_only",
+}
+ALLOWED_AGGRESSIVENESS = {"low", "normal", "high"}
+ALLOWED_WINNER_HOLD = {"normal", "high"}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -79,12 +124,40 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _action_side(action: Any) -> str:
+    text = _action(action)
+    if text in {"long", "close_long"}:
+        return "long"
+    if text in {"short", "close_short"}:
+        return "short"
+    return "unknown"
+
+
 def _aware(value: Any) -> datetime | None:
     if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _aware(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _aware(parsed)
 
 
 def _hours_between(start: Any, end: Any) -> float:
@@ -184,6 +257,8 @@ class StrategyFeedback:
     shadow_feedback: dict[str, Any]
     expert_memory: dict[str, Any]
     manual_intervention: dict[str, Any]
+    reflection_feedback: dict[str, Any]
+    event_feedback: dict[str, Any]
     problems: list[dict[str, Any]]
     root_causes: list[str]
     training_policy: dict[str, Any]
@@ -200,6 +275,8 @@ class StrategyFeedback:
             "shadow_feedback": self.shadow_feedback,
             "expert_memory": self.expert_memory,
             "manual_intervention": self.manual_intervention,
+            "reflection_feedback": self.reflection_feedback,
+            "event_feedback": self.event_feedback,
             "problems": self.problems,
             "root_causes": self.root_causes,
             "training_policy": self.training_policy,
@@ -291,6 +368,23 @@ class StrategyLearningStateStore:
         self.save(state)
         return state
 
+    def mark_profile_snapshot_persisted(
+        self,
+        *,
+        mode: str,
+        signature: str,
+        active_profile_id: str,
+    ) -> dict[str, Any]:
+        state = self.load()
+        state["last_profile_snapshot"] = {
+            "mode": mode,
+            "signature": signature,
+            "active_profile_id": active_profile_id,
+            "persisted_at": datetime.now(UTC).isoformat(),
+        }
+        self.save(state)
+        return state
+
 
 class StrategyFeedbackCompiler:
     """Compile existing records into a single strategy feedback report."""
@@ -306,6 +400,7 @@ class StrategyFeedbackCompiler:
         decisions: list[Any],
         shadows: list[Any],
         memories: list[Any],
+        strategy_events: list[Any] | None = None,
         reflections: list[Any] | None = None,
         max_open_positions: int = 20,
     ) -> StrategyFeedback:
@@ -323,6 +418,10 @@ class StrategyFeedbackCompiler:
         decision_quality = self._decision_quality(decisions)
         shadow_feedback = self._shadow_feedback(shadows)
         expert_memory = self._expert_memory(memories)
+        event_feedback = self._event_feedback(strategy_events or [])
+        reflection_feedback = self._reflection_feedback(
+            reflections or [], excluded_position_ids=manual_position_ids
+        )
         manual_intervention = {
             "manual_close_orders": len(manual_orders),
             "manual_closed_positions": len(manual_position_ids),
@@ -363,6 +462,8 @@ class StrategyFeedbackCompiler:
             small_win_count=small_win_count,
             large_loss_count=large_loss_count,
             avg_loss_hold_hours=avg_loss_hold_hours,
+            event_feedback=event_feedback,
+            reflection_feedback=reflection_feedback,
         )
         totals = {
             "closed_trade_count": len(positions),
@@ -377,7 +478,8 @@ class StrategyFeedbackCompiler:
             "avg_loss_hold_hours": round(avg_loss_hold_hours, 4),
             "trade_count_target": DEFAULT_MIN_TRADE_TARGET,
             "low_trade_count_penalty": trade_count < DEFAULT_MIN_TRADE_TARGET,
-            "reflection_count": len(reflections or []),
+            "reflection_count": reflection_feedback.get("training_count", 0),
+            "reflection_total_count": reflection_feedback.get("total_count", 0),
         }
         return StrategyFeedback(
             mode=mode,
@@ -390,6 +492,8 @@ class StrategyFeedbackCompiler:
             shadow_feedback=shadow_feedback,
             expert_memory=expert_memory,
             manual_intervention=manual_intervention,
+            reflection_feedback=reflection_feedback,
+            event_feedback=event_feedback,
             problems=problems,
             root_causes=root_causes,
             training_policy={
@@ -640,6 +744,210 @@ class StrategyFeedbackCompiler:
             "bad_signal_lessons": by_type.get("shadow_bad_signal", 0),
         }
 
+    def _reflection_feedback(
+        self,
+        reflections: list[Any],
+        *,
+        excluded_position_ids: set[int],
+    ) -> dict[str, Any]:
+        rows = list(reflections or [])
+        training_rows: list[Any] = []
+        excluded_rows: list[Any] = []
+        for row in rows:
+            position_id = _safe_int(getattr(row, "position_id", None), 0)
+            source = str(getattr(row, "source", "") or "").lower()
+            if position_id in excluded_position_ids or "manual" in source:
+                excluded_rows.append(row)
+                continue
+            training_rows.append(row)
+
+        outcome_counts: dict[str, int] = {}
+        mistake_counts: dict[str, int] = {}
+        improvement_counts: dict[str, int] = {}
+        loss_hold_minutes: list[float] = []
+        win_hold_minutes: list[float] = []
+        total_hold_minutes = 0.0
+        net_pnl = 0.0
+        fee_estimate = 0.0
+        small_win_count = 0
+        large_loss_count = 0
+        recent: list[dict[str, Any]] = []
+
+        for row in training_rows:
+            outcome = str(getattr(row, "outcome", "flat") or "flat").lower()
+            pnl = _safe_float(getattr(row, "realized_pnl", None), 0.0)
+            fee = _safe_float(getattr(row, "fee_estimate", None), 0.0)
+            hold_minutes = _safe_float(getattr(row, "hold_minutes", None), 0.0)
+            mistake = str(getattr(row, "mistake_summary", "") or "").strip()
+            improvement = str(getattr(row, "improvement_summary", "") or "").strip()
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            net_pnl += pnl
+            fee_estimate += fee
+            total_hold_minutes += hold_minutes
+            if 0 < pnl <= 1.0:
+                small_win_count += 1
+            if pnl <= -3.0:
+                large_loss_count += 1
+            if pnl < 0:
+                loss_hold_minutes.append(hold_minutes)
+            elif pnl > 0:
+                win_hold_minutes.append(hold_minutes)
+            if mistake:
+                key = mistake[:160]
+                mistake_counts[key] = mistake_counts.get(key, 0) + 1
+            if improvement:
+                key = improvement[:160]
+                improvement_counts[key] = improvement_counts.get(key, 0) + 1
+            if len(recent) < 20:
+                recent.append(
+                    {
+                        "id": getattr(row, "id", None),
+                        "position_id": getattr(row, "position_id", None),
+                        "closed_at": getattr(row, "closed_at", None),
+                        "symbol": getattr(row, "symbol", None),
+                        "side": _position_side(getattr(row, "side", None)),
+                        "outcome": outcome,
+                        "realized_pnl": round(pnl, 6),
+                        "fee_estimate": round(fee, 6),
+                        "hold_minutes": round(hold_minutes, 2),
+                        "mistake_summary": mistake[:240],
+                        "improvement_summary": improvement[:240],
+                        "source": getattr(row, "source", None),
+                        "exclude_from_training": False,
+                    }
+                )
+
+        count = len(training_rows)
+        top_mistakes = sorted(mistake_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+        top_improvements = sorted(
+            improvement_counts.items(), key=lambda item: item[1], reverse=True
+        )[:8]
+        return {
+            "total_count": len(rows),
+            "training_count": count,
+            "excluded_manual_count": len(excluded_rows),
+            "outcome_counts": dict(
+                sorted(outcome_counts.items(), key=lambda item: item[1], reverse=True)
+            ),
+            "win_count": sum(
+                1
+                for row in training_rows
+                if _safe_float(getattr(row, "realized_pnl", None), 0.0) > 0
+            ),
+            "loss_count": sum(
+                1
+                for row in training_rows
+                if _safe_float(getattr(row, "realized_pnl", None), 0.0) < 0
+            ),
+            "net_reflection_pnl": round(net_pnl, 6),
+            "fee_estimate": round(fee_estimate, 6),
+            "fee_adjusted_pnl": round(net_pnl - fee_estimate, 6),
+            "avg_hold_minutes": round(total_hold_minutes / count, 2) if count else 0.0,
+            "avg_loss_hold_minutes": (
+                round(sum(loss_hold_minutes) / len(loss_hold_minutes), 2)
+                if loss_hold_minutes
+                else 0.0
+            ),
+            "avg_win_hold_minutes": (
+                round(sum(win_hold_minutes) / len(win_hold_minutes), 2) if win_hold_minutes else 0.0
+            ),
+            "small_win_count": small_win_count,
+            "large_loss_count": large_loss_count,
+            "mistake_count": sum(mistake_counts.values()),
+            "improvement_count": sum(improvement_counts.values()),
+            "top_mistakes": [{"summary": key, "count": value} for key, value in top_mistakes],
+            "top_improvements": [
+                {"summary": key, "count": value} for key, value in top_improvements
+            ],
+            "recent_reflections": recent,
+            "policy": "manual close reflections are excluded from training feedback",
+        }
+
+    def _event_feedback(self, events: list[Any]) -> dict[str, Any]:
+        type_counts: dict[str, int] = {}
+        status_counts: dict[str, int] = {}
+        profile_counts: dict[str, int] = {}
+        block_reasons: dict[str, int] = {}
+        manual_close_count = 0
+        max_position_blocks = 0
+        fallback_blocks = 0
+        execution_errors = 0
+        covered = 0
+        missing_profile = 0
+        recent: list[dict[str, Any]] = []
+        for row in events or []:
+            event_type = str(getattr(row, "event_type", "") or "unknown")
+            status = str(getattr(row, "event_status", "") or "recorded")
+            profile_id = str(getattr(row, "profile_id", "") or "")
+            reason = str(getattr(row, "reason", "") or "")
+            attribution = _safe_dict(getattr(row, "attribution", None))
+            type_counts[event_type] = type_counts.get(event_type, 0) + 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if profile_id:
+                covered += 1
+                profile_counts[profile_id] = profile_counts.get(profile_id, 0) + 1
+            else:
+                missing_profile += 1
+            if event_type == "manual_close":
+                manual_close_count += 1
+            lower_text = f"{event_type} {status} {reason}".lower()
+            if any(
+                token in lower_text
+                for token in ("max_position", "capacity", "满仓", "仓位已满", "限制")
+            ):
+                max_position_blocks += 1
+            if any(
+                token in lower_text for token in ("fallback", "expert_integrity", "partial_batch")
+            ):
+                fallback_blocks += 1
+            if status in {"error", "failed", "rejected"} or event_type == "execution_error":
+                execution_errors += 1
+            if status in {"blocked", "skipped", "rejected", "failed"}:
+                key = str(attribution.get("blocker") or reason or event_type)[:120]
+                if key:
+                    block_reasons[key] = block_reasons.get(key, 0) + 1
+            if len(recent) < 40:
+                recent.append(
+                    {
+                        "id": getattr(row, "id", None),
+                        "created_at": getattr(row, "created_at", None),
+                        "event_type": event_type,
+                        "event_status": status,
+                        "severity": getattr(row, "severity", "info"),
+                        "symbol": getattr(row, "symbol", None),
+                        "side": getattr(row, "side", None),
+                        "action": getattr(row, "action", None),
+                        "profile_id": profile_id,
+                        "order_id": getattr(row, "order_id", None),
+                        "position_id": getattr(row, "position_id", None),
+                        "reason": reason,
+                        "exclude_from_training": bool(getattr(row, "exclude_from_training", False)),
+                    }
+                )
+        total = len(events or [])
+        coverage = covered / total if total else 0.0
+        top_blocks = sorted(block_reasons.items(), key=lambda item: item[1], reverse=True)[:8]
+        return {
+            "total_events": total,
+            "type_counts": dict(
+                sorted(type_counts.items(), key=lambda item: item[1], reverse=True)
+            ),
+            "status_counts": dict(
+                sorted(status_counts.items(), key=lambda item: item[1], reverse=True)
+            ),
+            "profile_counts": dict(
+                sorted(profile_counts.items(), key=lambda item: item[1], reverse=True)
+            ),
+            "attribution_coverage": round(coverage, 6),
+            "missing_profile_events": missing_profile,
+            "manual_close_events": manual_close_count,
+            "max_position_blocks": max_position_blocks,
+            "fallback_blocks": fallback_blocks,
+            "execution_errors": execution_errors,
+            "top_block_reasons": [{"reason": key, "count": count} for key, count in top_blocks],
+            "recent_events": recent,
+        }
+
     def _problems(
         self,
         *,
@@ -652,11 +960,32 @@ class StrategyFeedbackCompiler:
         small_win_count: int,
         large_loss_count: int,
         avg_loss_hold_hours: float,
+        event_feedback: dict[str, Any],
+        reflection_feedback: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[str]]:
         problems: list[dict[str, Any]] = []
         root_causes: list[str] = []
 
         def add(key: str, severity: str, label: str, evidence: dict[str, Any]) -> None:
+            label_overrides = {
+                "reflection_negative_pnl": (
+                    "\u7b56\u7565\u590d\u76d8\u7684\u8d39\u540e\u51c0\u6536\u76ca\u4e3a\u8d1f\uff0c"
+                    "\u9700\u8981\u628a\u5f00\u4ed3\u8d28\u91cf\u548c\u5e73\u4ed3\u65f6\u673a\u5206\u5f00\u5f52\u56e0\u3002"
+                ),
+                "reflection_loss_hold_too_long": (
+                    "\u7b56\u7565\u590d\u76d8\u663e\u793a\u4e8f\u635f\u4ed3\u62d6\u5ef6\u8fc7\u4e45\uff0c"
+                    "\u6ee1\u4ed3\u65f6\u8981\u4f18\u5148\u91ca\u653e\u4f4e\u8d28\u91cf\u4e8f\u635f\u4ed3\u3002"
+                ),
+                "reflection_small_wins_large_losses": (
+                    "\u7b56\u7565\u590d\u76d8\u540c\u6837\u6307\u5411\u5c0f\u76c8\u8fc7\u591a\u3001\u5927\u4e8f\u5b58\u5728\uff0c"
+                    "\u8d62\u5bb6\u6301\u4ed3\u548c\u56de\u64a4\u4fdd\u62a4\u9700\u8981\u540c\u6b65\u4f18\u5316\u3002"
+                ),
+                "trade_reflection_mistakes": (
+                    "\u7b56\u7565\u590d\u76d8\u5df2\u805a\u5408\u51fa\u91cd\u590d\u9519\u8bef\uff0c"
+                    "\u5019\u9009\u7b56\u7565\u751f\u6210\u5fc5\u987b\u5438\u6536\u8fd9\u4e9b\u6539\u8fdb\u5efa\u8bae\u3002"
+                ),
+            }
+            label = label_overrides.get(key, label)
             problems.append(
                 {"key": key, "severity": severity, "label": label, "evidence": evidence}
             )
@@ -708,6 +1037,41 @@ class StrategyFeedbackCompiler:
                 "影子复盘显示观望错过机会，需要让错过机会反馈影响后续开仓",
                 shadow_feedback,
             )
+        if (
+            reflection_feedback.get("training_count", 0)
+            and reflection_feedback.get("fee_adjusted_pnl", 0.0) < 0
+        ):
+            add(
+                "reflection_negative_pnl",
+                "high",
+                "策略复盘的费后净收益为负，需要把开仓质量和平仓时机分开归因。",
+                reflection_feedback,
+            )
+        if reflection_feedback.get(
+            "avg_loss_hold_minutes", 0.0
+        ) >= 180.0 and reflection_feedback.get("large_loss_count", 0):
+            add(
+                "reflection_loss_hold_too_long",
+                "high",
+                "策略复盘显示亏损仓拖延过久，满仓时要优先释放低质量亏损仓。",
+                reflection_feedback,
+            )
+        if reflection_feedback.get("small_win_count", 0) >= max(
+            2, reflection_feedback.get("large_loss_count", 0)
+        ) and reflection_feedback.get("large_loss_count", 0):
+            add(
+                "reflection_small_wins_large_losses",
+                "high",
+                "策略复盘同样指向小盈过多、大亏存在，赢家持仓和回撤保护需要同步优化。",
+                reflection_feedback,
+            )
+        if reflection_feedback.get("mistake_count", 0) >= 2:
+            add(
+                "trade_reflection_mistakes",
+                "medium",
+                "策略复盘已聚合出重复错误，候选策略生成必须吸收这些改进建议。",
+                reflection_feedback,
+            )
         if small_win_count >= max(2, large_loss_count) and large_loss_count:
             add(
                 "small_wins_large_losses",
@@ -722,6 +1086,37 @@ class StrategyFeedbackCompiler:
                 "亏损仓平均持有过久，平仓检查和亏损释放需要更主动",
                 {"avg_loss_hold_hours": round(avg_loss_hold_hours, 4)},
             )
+        if event_feedback.get("max_position_blocks"):
+            add(
+                "max_position_blocks",
+                "high",
+                "\u8fd1\u671f\u5f00\u4ed3\u673a\u4f1a\u88ab\u4ed3\u4f4d\u5bb9\u91cf\u963b\u65ad\uff0c\u9700\u8981\u4f18\u5148\u91ca\u653e\u4f4e\u8d28\u91cf\u4e8f\u635f\u4ed3\u518d\u627f\u63a5\u65b0\u98ce\u9669\u3002",
+                event_feedback,
+            )
+        if event_feedback.get("fallback_blocks"):
+            add(
+                "event_fallback_blocks",
+                "medium",
+                "\u4e13\u5bb6 fallback \u6b63\u5728\u963b\u65ad\u6216\u964d\u7ea7\u51b3\u7b56\uff0c\u53ea\u80fd\u5728\u6838\u5fc3\u4e13\u5bb6\u53ef\u4fe1\u65f6\u4f7f\u7528\u63a2\u9488\u4ed3\u4f4d\u3002",
+                event_feedback,
+            )
+        if event_feedback.get("execution_errors"):
+            add(
+                "execution_errors",
+                "high",
+                "\u6267\u884c\u5931\u8d25\u4e5f\u5c5e\u4e8e\u7b56\u7565\u53cd\u9988\uff0c\u9700\u8981\u548c AI \u5f00\u4ed3\u8d28\u91cf\u95ee\u9898\u5206\u5f00\u5f52\u56e0\u3002",
+                event_feedback,
+            )
+        if (
+            event_feedback.get("total_events")
+            and event_feedback.get("attribution_coverage", 0.0) < 0.85
+        ):
+            add(
+                "strategy_attribution_gap",
+                "medium",
+                "\u90e8\u5206\u7b56\u7565\u4e8b\u4ef6\u7f3a\u5c11\u753b\u50cf\u5f52\u56e0\uff0c\u5728\u4fe1\u4efb\u8c03\u5ea6\u7ed3\u8bba\u524d\u9700\u8981\u6301\u7eed\u8865\u9f50\u8bb0\u5f55\u4e0a\u4e0b\u6587\u3002",
+                event_feedback,
+            )
         return problems, root_causes
 
 
@@ -730,6 +1125,11 @@ class StrategyCandidateGenerator:
 
     def generate(self, feedback: StrategyFeedback) -> list[StrategyProfile]:
         profiles = [self.baseline()]
+        profiles.extend(self.rule_based_candidates(feedback))
+        return self._dedupe(profiles)
+
+    def rule_based_candidates(self, feedback: StrategyFeedback) -> list[StrategyProfile]:
+        profiles: list[StrategyProfile] = []
         problem_keys = {item["key"] for item in feedback.problems}
         open_pressure = feedback.open_position_pressure
         totals = feedback.totals
@@ -737,16 +1137,21 @@ class StrategyCandidateGenerator:
         if (
             "expert_fallback_overblocking" in problem_keys
             or "missed_opportunities" in problem_keys
+            or "trade_reflection_mistakes" in problem_keys
             or totals.get("training_trade_count", 0) < DEFAULT_MIN_TRADE_TARGET
         ):
             profiles.append(
                 StrategyProfile(
                     profile_id="balanced_probe",
                     version=1,
-                    label="平衡探针",
+                    label="\u5e73\u8861\u63a2\u9488",
                     status="candidate",
                     source="feedback_generator",
-                    description="允许有限非核心专家缺失，用更小仓位恢复有效开仓样本。",
+                    description=(
+                        "\u5141\u8bb8\u6709\u9650\u975e\u6838\u5fc3\u4e13\u5bb6\u7f3a\u5931\uff0c"
+                        "\u7528\u5c0f\u4ed3\u63a2\u9488\u6062\u590d\u6709\u6548\u5f00\u4ed3\u6837\u672c\uff0c"
+                        "\u9632\u6b62\u7cfb\u7edf\u5b66\u6210\u4e0d\u5f00\u4ed3\u6700\u5b89\u5168\u3002"
+                    ),
                     params={
                         "global_min_score_delta": -0.08,
                         "position_size_multiplier": 0.62,
@@ -762,15 +1167,23 @@ class StrategyCandidateGenerator:
                     },
                 )
             )
-        if open_pressure.get("full_position_pressure") or "loss_hold_too_long" in problem_keys:
+        if (
+            open_pressure.get("full_position_pressure")
+            or "loss_hold_too_long" in problem_keys
+            or "reflection_loss_hold_too_long" in problem_keys
+            or "reflection_negative_pnl" in problem_keys
+        ):
             profiles.append(
                 StrategyProfile(
                     profile_id="loss_release",
                     version=1,
-                    label="亏损释放",
+                    label="\u4e8f\u635f\u91ca\u653e",
                     status="candidate",
                     source="feedback_generator",
-                    description="满仓或亏损仓占用时，提高持仓复盘和低质量亏损仓释放优先级。",
+                    description=(
+                        "\u6ee1\u4ed3\u6216\u4e8f\u635f\u4ed3\u5360\u7528\u65f6\uff0c"
+                        "\u63d0\u9ad8\u6301\u4ed3\u590d\u76d8\u548c\u4f4e\u8d28\u91cf\u4e8f\u635f\u4ed3\u91ca\u653e\u4f18\u5148\u7ea7\u3002"
+                    ),
                     params={
                         "global_min_score_delta": 0.02,
                         "loss_exit_aggressiveness": "high",
@@ -781,15 +1194,21 @@ class StrategyCandidateGenerator:
                     },
                 )
             )
-        if "small_wins_large_losses" in problem_keys:
+        if (
+            "small_wins_large_losses" in problem_keys
+            or "reflection_small_wins_large_losses" in problem_keys
+        ):
             profiles.append(
                 StrategyProfile(
                     profile_id="winner_hold",
                     version=1,
-                    label="赢家持仓优化",
+                    label="\u8d62\u5bb6\u6301\u4ed3\u4f18\u5316",
                     status="candidate",
                     source="feedback_generator",
-                    description="减少优势仓位过早小盈平仓，同时继续保护回撤。",
+                    description=(
+                        "\u51cf\u5c11\u4f18\u52bf\u4ed3\u4f4d\u8fc7\u65e9\u5c0f\u76c8\u5e73\u4ed3\uff0c"
+                        "\u540c\u65f6\u7ee7\u7eed\u4fdd\u62a4\u56de\u64a4\u3002"
+                    ),
                     params={
                         "global_min_score_delta": 0.0,
                         "winner_hold_extension": "high",
@@ -806,10 +1225,13 @@ class StrategyCandidateGenerator:
                     StrategyProfile(
                         profile_id=f"{side}_side_recovery",
                         version=1,
-                        label=f"{side} 方向恢复",
+                        label=f"{side} \u65b9\u5411\u6062\u590d",
                         status="candidate",
                         source="feedback_generator",
-                        description=f"{side} 侧真实表现退化，降低该方向仓位和通过门槛弹性。",
+                        description=(
+                            f"{side} \u4fa7\u771f\u5b9e\u8868\u73b0\u9000\u5316\uff0c"
+                            "\u964d\u4f4e\u8be5\u65b9\u5411\u4ed3\u4f4d\u5e76\u63d0\u9ad8\u901a\u8fc7\u95e8\u69db\u3002"
+                        ),
                         params={
                             "global_min_score_delta": 0.04,
                             "side_overrides": {
@@ -839,15 +1261,176 @@ class StrategyCandidateGenerator:
                 )
         return profiles
 
+    def from_structured_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        feedback: StrategyFeedback,
+    ) -> list[StrategyProfile]:
+        profiles: list[StrategyProfile] = []
+        for index, item in enumerate(candidates[:LLM_CANDIDATE_MAX_COUNT], start=1):
+            if not isinstance(item, dict):
+                continue
+            params = self._sanitize_params(_safe_dict(item.get("params")))
+            if not params:
+                continue
+            profile_id = self._sanitize_profile_id(
+                item.get("profile_id") or item.get("id"), default=f"llm_candidate_{index}"
+            )
+            profiles.append(
+                StrategyProfile(
+                    profile_id=profile_id,
+                    version=max(1, _safe_int(item.get("version"), 1)),
+                    label=str(item.get("label") or f"LLM\u5019\u9009{index}")[:80],
+                    status="candidate",
+                    source="llm_structured_candidate",
+                    description=str(
+                        item.get("description")
+                        or "\u5927\u6a21\u578b\u6839\u636e\u7ed3\u6784\u5316\u53cd\u9988\u751f\u6210\u7684\u53d7\u63a7\u53c2\u6570\u5019\u9009\u3002"
+                    )[:500],
+                    params={
+                        **params,
+                        "min_trade_count_target": max(
+                            DEFAULT_MIN_TRADE_TARGET,
+                            _safe_int(
+                                params.get("min_trade_count_target"),
+                                _safe_int(
+                                    feedback.totals.get("trade_count_target"),
+                                    DEFAULT_MIN_TRADE_TARGET,
+                                ),
+                            ),
+                        ),
+                    },
+                    promotion=_safe_dict(item.get("promotion")),
+                )
+            )
+        return self._dedupe(profiles)
+
+    @staticmethod
+    def _sanitize_profile_id(value: Any, *, default: str) -> str:
+        text = str(value or default).strip().lower().replace(" ", "_")
+        allowed = "".join(ch for ch in text if ch.isalnum() or ch in {"_", "-"})
+        if not allowed:
+            return default
+        return allowed[:80]
+
+    def _sanitize_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        clean: dict[str, Any] = {}
+        for key, value in params.items():
+            if key not in ALLOWED_CANDIDATE_PARAM_KEYS:
+                continue
+            if key in BOUNDED_FLOAT_PARAM_RANGES:
+                low, high = BOUNDED_FLOAT_PARAM_RANGES[key]
+                clean[key] = round(min(max(_safe_float(value, 0.0), low), high), 6)
+            elif key == "min_trade_count_target":
+                clean[key] = max(DEFAULT_MIN_TRADE_TARGET, min(_safe_int(value), 80))
+            elif key == "expert_integrity_mode":
+                mode = str(value or "")
+                if mode in ALLOWED_EXPERT_INTEGRITY_MODES:
+                    clean[key] = mode
+            elif key == "loss_exit_aggressiveness":
+                level = str(value or "")
+                if level in ALLOWED_AGGRESSIVENESS:
+                    clean[key] = level
+            elif key == "winner_hold_extension":
+                level = str(value or "")
+                if level in ALLOWED_WINNER_HOLD:
+                    clean[key] = level
+            elif key in {
+                "full_position_release",
+                "release_losing_positions_first",
+                "pullback_lock_enabled",
+            }:
+                clean[key] = bool(value)
+            elif key == "fallback_tolerance":
+                clean[key] = self._sanitize_fallback_tolerance(_safe_dict(value))
+            elif key == "side_overrides":
+                sanitized = self._sanitize_side_overrides(_safe_dict(value))
+                if sanitized:
+                    clean[key] = sanitized
+            elif key == "side_weights":
+                sanitized_weights = self._sanitize_side_weights(_safe_dict(value))
+                if sanitized_weights:
+                    clean[key] = sanitized_weights
+        if _safe_float(clean.get("probe_fraction"), 0.0) > 0:
+            clean.setdefault("position_size_multiplier", 0.62)
+            clean.setdefault("max_probe_size_pct", 0.018)
+        return clean
+
+    @staticmethod
+    def _sanitize_fallback_tolerance(value: dict[str, Any]) -> dict[str, Any]:
+        allowed_missing = max(0, min(_safe_int(value.get("allow_missing_non_core_experts"), 0), 2))
+        core = [
+            name
+            for name in _safe_list(value.get("core_experts_required"))
+            if name in CORE_ENTRY_EXPERTS
+        ]
+        non_core = [
+            name
+            for name in _safe_list(value.get("non_core_experts"))
+            if name in NON_CORE_ENTRY_EXPERTS
+        ]
+        return {
+            "allow_missing_non_core_experts": allowed_missing,
+            "core_experts_required": sorted(set(core or CORE_ENTRY_EXPERTS)),
+            "non_core_experts": sorted(set(non_core or NON_CORE_ENTRY_EXPERTS)),
+        }
+
+    @staticmethod
+    def _sanitize_side_overrides(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for side in ("long", "short"):
+            row = _safe_dict(value.get(side))
+            if not row:
+                continue
+            result[side] = {
+                "state": str(row.get("state") or "neutral")[:24],
+                "score_adjustment": round(
+                    min(max(_safe_float(row.get("score_adjustment"), 0.0), -0.35), 0.20),
+                    6,
+                ),
+                "min_score_delta": round(
+                    min(max(_safe_float(row.get("min_score_delta"), 0.0), -0.12), 0.35),
+                    6,
+                ),
+                "size_multiplier": round(
+                    min(max(_safe_float(row.get("size_multiplier"), 1.0), 0.10), 1.25),
+                    6,
+                ),
+                "reason": str(row.get("reason") or "")[:240],
+            }
+        return result
+
+    @staticmethod
+    def _sanitize_side_weights(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for side in ("long", "short"):
+            if side in value:
+                result[side] = round(min(max(_safe_float(value.get(side), 1.0), 0.25), 1.40), 6)
+        return result
+
+    @staticmethod
+    def _dedupe(profiles: list[StrategyProfile]) -> list[StrategyProfile]:
+        result: list[StrategyProfile] = []
+        seen: set[str] = set()
+        for profile in profiles:
+            if profile.profile_id in seen:
+                continue
+            result.append(profile)
+            seen.add(profile.profile_id)
+        return result
+
     @staticmethod
     def baseline() -> StrategyProfile:
         return StrategyProfile(
             profile_id="baseline_current",
             version=1,
-            label="当前基线",
+            label="\u5f53\u524d\u57fa\u7ebf",
             status="baseline",
             source="current_system",
-            description="保持现有策略，只做归因记录和低交易量惩罚评估。",
+            description=(
+                "\u4fdd\u6301\u73b0\u6709\u7b56\u7565\uff0c"
+                "\u53ea\u505a\u5f52\u56e0\u8bb0\u5f55\u548c\u4f4e\u4ea4\u6613\u91cf\u60e9\u7f5a\u8bc4\u4f30\u3002"
+            ),
             params={
                 "global_min_score_delta": 0.0,
                 "position_size_multiplier": 1.0,
@@ -870,6 +1453,32 @@ class StrategyBacktester:
         )
         trade_gap = max(target - trade_count, 0)
         low_trade_penalty = trade_gap * 1.25
+        fee_estimate = max(trade_count * 0.08, abs(net_pnl) * 0.015)
+        fee_adjusted_pnl = net_pnl - fee_estimate
+        side_values = [_safe_dict(row) for row in feedback.side_performance.values()]
+        losses = _safe_int(totals.get("loss_count"), 0)
+        wins = _safe_int(totals.get("win_count"), 0)
+        avg_pnl = net_pnl / trade_count if trade_count else 0.0
+        avg_winner = (
+            sum(_safe_float(row.get("profit"), 0.0) for row in side_values) / max(wins, 1)
+            if wins
+            else 0.0
+        )
+        avg_loser = (
+            sum(_safe_float(row.get("loss"), 0.0) for row in side_values) / max(losses, 1)
+            if losses
+            else 0.0
+        )
+        side_pnls = [_safe_float(row.get("pnl"), 0.0) for row in side_values]
+        max_drawdown = abs(min([0.0, net_pnl, *side_pnls]))
+        consecutive_losses = max(
+            (_safe_int(row.get("losses"), 0) for row in side_values), default=0
+        )
+        occupancy = _safe_float(feedback.open_position_pressure.get("usage_ratio"), 0.0)
+        reflection = feedback.reflection_feedback
+        missed_opportunity_reduction = 0.0
+        loss_release_speed = 0.0
+        winner_avg_profit = avg_winner
         problem_keys = {item["key"] for item in feedback.problems}
         estimated_delta = 0.0
         matched_fixes: list[str] = []
@@ -884,7 +1493,14 @@ class StrategyBacktester:
                 estimated_delta += (
                     feedback.shadow_feedback.get("missed_opportunity_count", 0) * 0.18
                 )
+                missed_opportunity_reduction = (
+                    _safe_float(feedback.shadow_feedback.get("missed_opportunity_count"), 0.0)
+                    * 0.18
+                )
                 matched_fixes.append("missed_opportunities")
+            if "trade_reflection_mistakes" in problem_keys:
+                estimated_delta += min(_safe_int(reflection.get("mistake_count"), 0), 8) * 0.12
+                matched_fixes.append("trade_reflection_mistakes")
             if trade_count < target:
                 estimated_delta += (target - trade_count) * 0.42
                 matched_fixes.append("low_trade_count")
@@ -902,12 +1518,32 @@ class StrategyBacktester:
                 matched_fixes.append("full_position_loss_pressure")
             if "loss_hold_too_long" in problem_keys:
                 estimated_delta += 1.4
+                loss_release_speed = 1.0
                 matched_fixes.append("loss_hold_too_long")
+            if "reflection_loss_hold_too_long" in problem_keys:
+                estimated_delta += min(
+                    _safe_float(reflection.get("avg_loss_hold_minutes"), 0.0) / 180.0, 3.0
+                )
+                loss_release_speed = max(loss_release_speed, 1.0)
+                matched_fixes.append("reflection_loss_hold_too_long")
+            if "reflection_negative_pnl" in problem_keys:
+                estimated_delta += min(
+                    abs(_safe_float(reflection.get("fee_adjusted_pnl"), 0.0)) * 0.10, 2.5
+                )
+                matched_fixes.append("reflection_negative_pnl")
             low_trade_penalty = 0.0
         elif profile.profile_id == "winner_hold":
             if "small_wins_large_losses" in problem_keys:
                 estimated_delta += max(_safe_int(totals.get("small_win_count"), 0), 1) * 0.25
+                winner_avg_profit = avg_winner * 1.15 if avg_winner else 0.0
                 matched_fixes.append("small_wins_large_losses")
+            if "reflection_small_wins_large_losses" in problem_keys:
+                estimated_delta += max(_safe_int(reflection.get("small_win_count"), 0), 1) * 0.22
+                winner_avg_profit = max(
+                    winner_avg_profit,
+                    avg_winner * 1.12 if avg_winner else 0.0,
+                )
+                matched_fixes.append("reflection_small_wins_large_losses")
         elif profile.profile_id.endswith("_side_recovery"):
             side = profile.profile_id.removesuffix("_side_recovery")
             side_bucket = feedback.side_performance.get(side, {})
@@ -916,7 +1552,11 @@ class StrategyBacktester:
                 matched_fixes.append(f"{side}_side_degraded")
 
         score = net_pnl + estimated_delta - low_trade_penalty
-        pass_gate = score >= net_pnl - 0.5 and (
+        score -= fee_estimate * 0.35
+        score -= max_drawdown * 0.10
+        score -= max(consecutive_losses - 3, 0) * 0.7
+        score -= max(occupancy - 0.85, 0.0) * 2.0
+        pass_gate = score >= fee_adjusted_pnl - 0.75 and (
             trade_count >= max(2, int(target * 0.35)) or profile.profile_id == "balanced_probe"
         )
         if profile.profile_id in {"loss_release", "winner_hold"} and matched_fixes:
@@ -934,6 +1574,17 @@ class StrategyBacktester:
             "trade_count_target": target,
             "low_trade_count_penalty": round(low_trade_penalty, 6),
             "matched_fixes": matched_fixes,
+            "fee_estimate": round(fee_estimate, 6),
+            "fee_adjusted_pnl": round(fee_adjusted_pnl, 6),
+            "max_drawdown": round(max_drawdown, 6),
+            "consecutive_losses": consecutive_losses,
+            "avg_pnl": round(avg_pnl, 6),
+            "avg_winner": round(avg_winner, 6),
+            "avg_loser": round(avg_loser, 6),
+            "position_occupancy": round(occupancy, 6),
+            "missed_opportunity_reduction": round(missed_opportunity_reduction, 6),
+            "loss_release_speed": round(loss_release_speed, 6),
+            "winner_avg_profit": round(winner_avg_profit, 6),
             "pass": bool(pass_gate),
             "notes": (
                 "low trade count is penalized; a profile cannot win by refusing trades"
@@ -969,9 +1620,17 @@ class StrategyScheduler:
         if manual_profile_id and manual_profile_id in by_id:
             selected = by_id[manual_profile_id]
             reason = f"人工指定策略画像 {manual_profile_id}。"
-        elif "full_position_loss_pressure" in problem_keys and "loss_release" in by_id:
+        elif (
+            "full_position_loss_pressure" in problem_keys or "max_position_blocks" in problem_keys
+        ) and "loss_release" in by_id:
             selected = by_id["loss_release"]
             reason = "检测到满仓和亏损仓占位，优先调度亏损释放画像。"
+        elif (
+            "reflection_loss_hold_too_long" in problem_keys
+            or "reflection_negative_pnl" in problem_keys
+        ) and "loss_release" in by_id:
+            selected = by_id["loss_release"]
+            reason = "策略复盘显示费后亏损或亏损仓拖延过久，调度亏损释放画像。"
         else:
             degraded_sides = [
                 side
@@ -987,12 +1646,17 @@ class StrategyScheduler:
             else:
                 if (
                     "expert_fallback_overblocking" in problem_keys
+                    or "event_fallback_blocks" in problem_keys
                     or "missed_opportunities" in problem_keys
+                    or "trade_reflection_mistakes" in problem_keys
                     or feedback.totals.get("training_trade_count", 0) < DEFAULT_MIN_TRADE_TARGET
                 ) and "balanced_probe" in by_id:
                     selected = by_id["balanced_probe"]
                     reason = "开仓样本不足或专家 fallback 拦截偏多，调度平衡探针画像。"
-                elif "small_wins_large_losses" in problem_keys and "winner_hold" in by_id:
+                elif (
+                    "small_wins_large_losses" in problem_keys
+                    or "reflection_small_wins_large_losses" in problem_keys
+                ) and "winner_hold" in by_id:
                     selected = by_id["winner_hold"]
                     reason = "盈利仓小盈过多且大亏存在，调度赢家持仓优化画像。"
 
@@ -1132,8 +1796,10 @@ class StrategyLearningEngine:
         decisions: list[Any],
         shadows: list[Any],
         memories: list[Any],
+        strategy_events: list[Any] | None = None,
         reflections: list[Any] | None = None,
         max_open_positions: int = 20,
+        extra_profiles: list[StrategyProfile] | None = None,
     ) -> dict[str, Any]:
         feedback = self.compiler.compile(
             mode=mode,
@@ -1144,10 +1810,21 @@ class StrategyLearningEngine:
             decisions=decisions,
             shadows=shadows,
             memories=memories,
+            strategy_events=strategy_events or [],
             reflections=reflections,
             max_open_positions=max_open_positions,
         )
+        return self.build_from_feedback(feedback, extra_profiles=extra_profiles)
+
+    def build_from_feedback(
+        self,
+        feedback: StrategyFeedback,
+        *,
+        extra_profiles: list[StrategyProfile] | None = None,
+    ) -> dict[str, Any]:
         profiles = self.generator.generate(feedback)
+        if extra_profiles:
+            profiles = self.generator._dedupe([*profiles, *extra_profiles])
         backtest_rows = [self.backtester.score(profile, feedback) for profile in profiles]
         schedule = self.scheduler.schedule(profiles, feedback, backtest_rows)
         return {
@@ -1208,6 +1885,7 @@ class StrategyLearningEngine:
         totals = _safe_dict(feedback.get("totals"))
         decision_quality = _safe_dict(feedback.get("decision_quality"))
         open_pressure = _safe_dict(feedback.get("open_position_pressure"))
+        reflection = _safe_dict(feedback.get("reflection_feedback"))
         return {
             "training_trade_count": totals.get("training_trade_count", 0),
             "net_pnl": totals.get("net_pnl", 0.0),
@@ -1215,6 +1893,8 @@ class StrategyLearningEngine:
             "expert_integrity_blocks": decision_quality.get("expert_integrity_blocks", 0),
             "fallback_entry_rate": decision_quality.get("fallback_entry_rate", 0.0),
             "full_position_pressure": open_pressure.get("full_position_pressure", False),
+            "reflection_fee_adjusted_pnl": reflection.get("fee_adjusted_pnl", 0.0),
+            "reflection_mistake_count": reflection.get("mistake_count", 0),
             "problem_keys": [item.get("key") for item in _safe_list(feedback.get("problems"))],
         }
 
@@ -1242,17 +1922,16 @@ class StrategyLearningService:
         max_open_positions: int | None = None,
     ) -> dict[str, Any]:
         rows = await self._load_rows(mode=mode, hours=hours, limit=limit)
-        payload = self.engine.build(
+        feedback = self._compile_feedback(
             mode=mode,
-            window_hours=hours,
-            positions=rows["closed_positions"],
+            hours=hours,
+            rows=rows,
             open_positions=rows["open_positions"],
-            orders=rows["orders"],
-            decisions=rows["decisions"],
-            shadows=rows["shadows"],
-            memories=rows["memories"],
-            reflections=rows["reflections"],
-            max_open_positions=max_open_positions or int(settings.max_open_positions_per_model),
+            max_open_positions=max_open_positions,
+        )
+        payload = self._build_payload_from_feedback(
+            feedback,
+            extra_profiles=self._cached_llm_profiles(feedback),
         )
         payload.update(
             {
@@ -1262,6 +1941,7 @@ class StrategyLearningService:
                 "state": self.state_store.load(),
             }
         )
+        payload["runtime_guard"] = self._runtime_guard(payload, mutate=False)
         return payload
 
     async def apply_to_strategy_context(
@@ -1276,18 +1956,26 @@ class StrategyLearningService:
     ) -> dict[str, Any]:
         rows = await self._load_rows(mode=mode, hours=hours, limit=limit)
         runtime_open_positions: list[Any] = list(open_positions or []) or rows["open_positions"]
-        payload = self.engine.build(
+        feedback = self._compile_feedback(
             mode=mode,
-            window_hours=hours,
-            positions=rows["closed_positions"],
+            hours=hours,
+            rows=rows,
             open_positions=runtime_open_positions,
-            orders=rows["orders"],
-            decisions=rows["decisions"],
-            shadows=rows["shadows"],
-            memories=rows["memories"],
-            reflections=rows["reflections"],
-            max_open_positions=max_open_positions or int(settings.max_open_positions_per_model),
+            max_open_positions=max_open_positions,
         )
+        payload = await self._build_runtime_payload(
+            mode=mode,
+            feedback=feedback,
+        )
+        guard = self._runtime_guard(payload, mutate=True)
+        if guard.get("should_rollback"):
+            payload = self._build_payload_from_feedback(
+                feedback,
+                extra_profiles=self._cached_llm_profiles(feedback),
+            )
+            guard = self._runtime_guard(payload, mutate=False)
+        payload["runtime_guard"] = guard
+        await self._persist_profile_snapshots(mode, payload)
         return self.engine.apply_to_context(strategy_context, payload)
 
     def set_profile_disabled(
@@ -1305,13 +1993,585 @@ class StrategyLearningService:
     def set_manual_active_profile(self, profile_id: str | None) -> dict[str, Any]:
         return self.state_store.set_manual_active_profile(profile_id)
 
+    def _compile_feedback(
+        self,
+        *,
+        mode: str,
+        hours: int,
+        rows: dict[str, list[Any]],
+        open_positions: list[Any],
+        max_open_positions: int | None,
+    ) -> StrategyFeedback:
+        return self.engine.compiler.compile(
+            mode=mode,
+            window_hours=hours,
+            positions=rows["closed_positions"],
+            open_positions=open_positions,
+            orders=rows["orders"],
+            decisions=rows["decisions"],
+            shadows=rows["shadows"],
+            memories=rows["memories"],
+            strategy_events=rows["strategy_events"],
+            reflections=rows["reflections"],
+            max_open_positions=max_open_positions or int(settings.max_open_positions_per_model),
+        )
+
+    def _build_payload_from_feedback(
+        self,
+        feedback: StrategyFeedback,
+        *,
+        extra_profiles: list[StrategyProfile] | None = None,
+    ) -> dict[str, Any]:
+        payload = self.engine.build_from_feedback(feedback, extra_profiles=extra_profiles)
+        payload["llm_candidate_status"] = self._llm_candidate_status(feedback)
+        return payload
+
+    async def _build_runtime_payload(
+        self,
+        *,
+        mode: str,
+        feedback: StrategyFeedback,
+    ) -> dict[str, Any]:
+        extra_profiles = self._cached_llm_profiles(feedback)
+        if self._should_refresh_llm_candidates(feedback):
+            refreshed = await self._generate_llm_profiles(mode=mode, feedback=feedback)
+            if refreshed:
+                extra_profiles = refreshed
+        return self._build_payload_from_feedback(feedback, extra_profiles=extra_profiles)
+
+    def _feedback_signature(self, feedback: StrategyFeedback) -> str:
+        data = {
+            "totals": feedback.totals,
+            "side_performance": feedback.side_performance,
+            "open_position_pressure": feedback.open_position_pressure,
+            "decision_quality": feedback.decision_quality,
+            "shadow_feedback": feedback.shadow_feedback,
+            "event_feedback": {
+                key: feedback.event_feedback.get(key)
+                for key in (
+                    "total_events",
+                    "max_position_blocks",
+                    "fallback_blocks",
+                    "execution_errors",
+                    "attribution_coverage",
+                )
+            },
+            "reflection_feedback": {
+                key: feedback.reflection_feedback.get(key)
+                for key in (
+                    "training_count",
+                    "fee_adjusted_pnl",
+                    "avg_loss_hold_minutes",
+                    "small_win_count",
+                    "large_loss_count",
+                    "mistake_count",
+                )
+            },
+            "problems": [item.get("key") for item in feedback.problems],
+        }
+        raw = json.dumps(_json_safe(data), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _llm_candidate_status(self, feedback: StrategyFeedback) -> dict[str, Any]:
+        state = self.state_store.load()
+        entry = _safe_dict(state.get("llm_candidate_cache"))
+        candidates = _safe_list(entry.get("candidates"))
+        return {
+            "enabled": bool(getattr(settings, "strategy_learning_llm_candidates_enabled", True)),
+            "signature": self._feedback_signature(feedback),
+            "cached_signature": entry.get("signature"),
+            "cached_at": entry.get("generated_at"),
+            "candidate_count": len(candidates),
+            "last_error": entry.get("last_error", ""),
+            "source": entry.get("source", "llm_structured_candidate" if candidates else "none"),
+        }
+
+    def _cached_llm_profiles(self, feedback: StrategyFeedback) -> list[StrategyProfile]:
+        entry = _safe_dict(self.state_store.load().get("llm_candidate_cache"))
+        if entry.get("signature") != self._feedback_signature(feedback):
+            return []
+        return self.engine.generator.from_structured_candidates(
+            _safe_list(entry.get("candidates")),
+            feedback,
+        )
+
+    def _should_refresh_llm_candidates(self, feedback: StrategyFeedback) -> bool:
+        if not bool(getattr(settings, "strategy_learning_llm_candidates_enabled", True)):
+            return False
+        api_base, api_key, model = self._llm_candidate_config()
+        if not api_base or not api_key or not model:
+            return False
+        problem_keys = {str(item.get("key") or "") for item in feedback.problems}
+        if not problem_keys:
+            return False
+        signature = self._feedback_signature(feedback)
+        entry = _safe_dict(self.state_store.load().get("llm_candidate_cache"))
+        generated_at = _parse_iso_datetime(entry.get("generated_at"))
+        interval = max(
+            300,
+            _safe_int(
+                getattr(settings, "strategy_learning_llm_candidate_interval_seconds", 21600),
+                LLM_CANDIDATE_CACHE_SECONDS,
+            ),
+        )
+        fresh = bool(generated_at and (datetime.now(UTC) - generated_at).total_seconds() < interval)
+        return not (fresh and entry.get("signature") == signature)
+
+    def _llm_candidate_config(self) -> tuple[str, str, str]:
+        configs = [cfg for cfg in settings.get_fixed_ai_models(False) if isinstance(cfg, dict)]
+        cfg = next((item for item in configs if item.get("name") == "decision_maker"), {})
+        if not cfg:
+            cfg = next((item for item in configs if item.get("api_key")), {})
+        api_base = str(cfg.get("api_base") or settings.ai_api_base or "").rstrip("/")
+        api_key = str(cfg.get("api_key") or settings.ai_api_key or "")
+        model = str(cfg.get("model") or settings.ai_model or "")
+        return api_base, api_key, model
+
+    async def _generate_llm_profiles(
+        self,
+        *,
+        mode: str,
+        feedback: StrategyFeedback,
+    ) -> list[StrategyProfile]:
+        api_base, api_key, model = self._llm_candidate_config()
+        signature = self._feedback_signature(feedback)
+        try:
+            candidates = await self._call_llm_candidate_model(
+                api_base=api_base,
+                api_key=api_key,
+                model=model,
+                feedback=feedback,
+            )
+        except Exception as exc:
+            self._store_llm_candidate_cache(
+                mode=mode,
+                signature=signature,
+                candidates=[],
+                error=safe_error_text(exc, limit=200),
+            )
+            logger.debug(
+                "strategy learning llm candidate generation failed", error=safe_error_text(exc)
+            )
+            return []
+        profiles = self.engine.generator.from_structured_candidates(candidates, feedback)
+        self._store_llm_candidate_cache(
+            mode=mode,
+            signature=signature,
+            candidates=[profile.to_dict() for profile in profiles],
+            error="",
+        )
+        return profiles
+
+    async def _call_llm_candidate_model(
+        self,
+        *,
+        api_base: str,
+        api_key: str,
+        model: str,
+        feedback: StrategyFeedback,
+    ) -> list[dict[str, Any]]:
+        prompt = {
+            "task": "generate_bounded_strategy_profile_candidates",
+            "language": "zh-CN",
+            "rules": [
+                "只返回 JSON 对象，不要 Markdown。",
+                "不能生成 Python 代码、SQL、shell 或任意可执行逻辑。",
+                "只能设置白名单参数，候选必须先小仓探针，不允许全量接管。",
+                "低交易量策略必须被惩罚，不能用不开仓来提高胜率。",
+            ],
+            "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
+            "feedback": {
+                "totals": feedback.totals,
+                "side_performance": feedback.side_performance,
+                "open_position_pressure": feedback.open_position_pressure,
+                "decision_quality": feedback.decision_quality,
+                "shadow_feedback": feedback.shadow_feedback,
+                "event_feedback": {
+                    key: feedback.event_feedback.get(key)
+                    for key in (
+                        "total_events",
+                        "attribution_coverage",
+                        "manual_close_events",
+                        "max_position_blocks",
+                        "fallback_blocks",
+                        "execution_errors",
+                    )
+                },
+                "reflection_feedback": {
+                    key: feedback.reflection_feedback.get(key)
+                    for key in (
+                        "training_count",
+                        "excluded_manual_count",
+                        "outcome_counts",
+                        "fee_adjusted_pnl",
+                        "avg_loss_hold_minutes",
+                        "small_win_count",
+                        "large_loss_count",
+                        "top_mistakes",
+                        "top_improvements",
+                    )
+                },
+                "problems": feedback.problems,
+                "training_policy": feedback.training_policy,
+            },
+            "response_schema": {
+                "candidates": [
+                    {
+                        "profile_id": "string",
+                        "label": "string",
+                        "description": "string",
+                        "params": {"only_allowed_keys": sorted(ALLOWED_CANDIDATE_PARAM_KEYS)},
+                    }
+                ]
+            },
+        }
+        max_tokens = completion_token_limit(
+            "proxy",
+            _safe_int(getattr(settings, "strategy_learning_llm_candidate_max_tokens", 600), 600),
+            floor=160,
+        )
+        body = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是量化交易策略参数编译器，只能输出受控 JSON 参数，不允许输出代码。",
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "stream": False,
+        }
+        body = apply_non_thinking_request_controls(model, body)
+        timeout = max(
+            5.0,
+            _safe_float(
+                getattr(settings, "strategy_learning_llm_candidate_timeout_seconds", 20.0),
+                20.0,
+            ),
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{api_base}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+        if not response.is_success:
+            raise RuntimeError(
+                f"strategy candidate request failed with HTTP {response.status_code}"
+            )
+        payload = response.json()
+        content = self._extract_llm_content(payload)
+        parsed = self._parse_json_object(content)
+        return _safe_list(parsed.get("candidates"))[:LLM_CANDIDATE_MAX_COUNT]
+
+    @staticmethod
+    def _extract_llm_content(payload: dict[str, Any]) -> str:
+        choices = payload.get("choices") if isinstance(payload, dict) else []
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        message = _safe_dict(_safe_dict(choice).get("message"))
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(str(item.get("text") or item.get("content") or ""))
+            return "\n".join(part for part in parts if part).strip()
+        return ""
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any]:
+        stripped = str(text or "").strip()
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`")
+            if stripped.lower().startswith("json"):
+                stripped = stripped[4:].strip()
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("strategy candidate response was not a JSON object")
+        return parsed
+
+    def _store_llm_candidate_cache(
+        self,
+        *,
+        mode: str,
+        signature: str,
+        candidates: list[dict[str, Any]],
+        error: str,
+    ) -> None:
+        state = self.state_store.load()
+        state["llm_candidate_cache"] = {
+            "mode": "live" if str(mode).lower() == "live" else "paper",
+            "signature": signature,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "candidates": _json_safe(candidates),
+            "last_error": error,
+            "source": "llm_structured_candidate" if candidates else "none",
+        }
+        self.state_store.save(state)
+
+    async def record_event(
+        self,
+        *,
+        mode: str,
+        model_name: str = ENSEMBLE_TRADER_NAME,
+        symbol: str | None = None,
+        action: str | None = None,
+        side: str | None = None,
+        event_type: str,
+        event_status: str = "recorded",
+        reason: str | None = None,
+        severity: str = "info",
+        decision_id: int | None = None,
+        order_id: int | None = None,
+        position_id: int | None = None,
+        strategy_context: dict[str, Any] | None = None,
+        raw_response: dict[str, Any] | None = None,
+        market_state: dict[str, Any] | None = None,
+        attribution: dict[str, Any] | None = None,
+        exclude_from_training: bool = False,
+    ) -> int | None:
+        selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+        context = _safe_dict(strategy_context)
+        learning = _safe_dict(context.get("strategy_learning"))
+        active_profile = _safe_dict(learning.get("active_profile"))
+        runtime = _safe_dict(learning.get("runtime"))
+        profile_id = str(
+            context.get("strategy_profile_id")
+            or active_profile.get("id")
+            or runtime.get("profile_id")
+            or ""
+        )
+        profile_version = _safe_int(
+            context.get("strategy_profile_version")
+            or active_profile.get("version")
+            or runtime.get("profile_version"),
+            0,
+        )
+        event_side = side or _action_side(action)
+        raw = _safe_dict(raw_response)
+        event = StrategyLearningEvent(
+            model_name=model_name or ENSEMBLE_TRADER_NAME,
+            execution_mode=selected_mode,
+            symbol=symbol,
+            side=None if event_side == "unknown" else event_side,
+            action=action,
+            event_type=event_type,
+            event_status=event_status,
+            severity=severity,
+            reason=str(reason or "")[:2000],
+            decision_id=decision_id,
+            order_id=order_id,
+            position_id=position_id,
+            profile_id=profile_id or None,
+            profile_version=profile_version or None,
+            scheduler_reason=str(context.get("scheduler_reason") or learning.get("reason") or "")[
+                :2000
+            ],
+            strategy_snapshot=_json_safe(
+                {
+                    "active_profile": active_profile,
+                    "runtime": runtime,
+                    "feedback_summary": learning.get("feedback_summary"),
+                    "rollback": learning.get("rollback"),
+                }
+            ),
+            market_state=_json_safe(market_state or context.get("market_regime") or {}),
+            side_weights=_json_safe(
+                runtime.get("side_weights") or _safe_dict(context.get("side_quality"))
+            ),
+            expert_integrity=_json_safe(self._expert_integrity_event_payload(raw, context)),
+            attribution=_json_safe(attribution or {}),
+            exclude_from_training=bool(exclude_from_training),
+        )
+        try:
+            async with get_session_ctx() as session:
+                session.add(event)
+                await session.flush()
+                return int(event.id)
+        except Exception as exc:
+            logger.debug(
+                "failed to record strategy learning event",
+                event_type=event_type,
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+            return None
+
+    async def _persist_profile_snapshots(self, mode: str, payload: dict[str, Any]) -> None:
+        schedule = _safe_dict(payload.get("schedule"))
+        active_id = str(_safe_dict(schedule.get("active_profile")).get("id") or "")
+        candidates = _safe_list(schedule.get("candidates"))
+        if not candidates:
+            return
+        selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+        signature = self._profile_snapshot_signature(selected_mode, schedule)
+        if not self._should_persist_profile_snapshots(selected_mode, signature, active_id):
+            return
+        backtest_rows = {
+            str(row.get("profile_id")): row
+            for row in _safe_list(_safe_dict(schedule.get("backtest")).get("rows"))
+            if isinstance(row, dict)
+        }
+        shadow_rows = {
+            str(row.get("profile_id")): row
+            for row in _safe_list(_safe_dict(schedule.get("shadow_validation")).get("rows"))
+            if isinstance(row, dict)
+        }
+        probe = _safe_dict(schedule.get("probe"))
+        disabled = set(_safe_list(schedule.get("disabled_profiles")))
+        try:
+            async with get_session_ctx() as session:
+                for profile in candidates:
+                    if not isinstance(profile, dict):
+                        continue
+                    profile_id = str(profile.get("id") or "")
+                    if not profile_id:
+                        continue
+                    session.add(
+                        StrategyProfileSnapshot(
+                            execution_mode=selected_mode,
+                            profile_id=profile_id,
+                            version=_safe_int(profile.get("version"), 1),
+                            label=str(profile.get("label") or ""),
+                            status=str(profile.get("status") or "candidate"),
+                            source=str(profile.get("source") or "feedback_generator"),
+                            description=str(profile.get("description") or ""),
+                            params=_json_safe(_safe_dict(profile.get("params"))),
+                            promotion=_json_safe(_safe_dict(profile.get("promotion"))),
+                            backtest_metrics=_json_safe(backtest_rows.get(profile_id, {})),
+                            shadow_validation=_json_safe(shadow_rows.get(profile_id, {})),
+                            probe_state=_json_safe(
+                                probe if probe.get("profile_id") == profile_id else {}
+                            ),
+                            scheduler_reason=str(schedule.get("reason") or "")[:2000],
+                            is_active=profile_id == active_id,
+                            is_disabled=profile_id in disabled,
+                        )
+                    )
+            self.state_store.mark_profile_snapshot_persisted(
+                mode=selected_mode,
+                signature=signature,
+                active_profile_id=active_id,
+            )
+        except Exception as exc:
+            logger.debug(
+                "failed to persist strategy profile snapshots",
+                error=safe_error_text(exc),
+            )
+
+    @staticmethod
+    def _profile_snapshot_signature(mode: str, schedule: dict[str, Any]) -> str:
+        data = {
+            "mode": mode,
+            "active_profile": _safe_dict(schedule.get("active_profile")),
+            "candidate_ids": [
+                str(profile.get("id") or "")
+                for profile in _safe_list(schedule.get("candidates"))
+                if isinstance(profile, dict)
+            ],
+            "disabled_profiles": _safe_list(schedule.get("disabled_profiles")),
+            "backtest": _safe_dict(schedule.get("backtest")).get("rows", []),
+            "shadow": _safe_dict(schedule.get("shadow_validation")).get("rows", []),
+        }
+        raw = json.dumps(_json_safe(data), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _should_persist_profile_snapshots(
+        self,
+        mode: str,
+        signature: str,
+        active_profile_id: str,
+    ) -> bool:
+        entry = _safe_dict(self.state_store.load().get("last_profile_snapshot"))
+        if entry.get("mode") != mode:
+            return True
+        if entry.get("signature") != signature:
+            return True
+        if entry.get("active_profile_id") != active_profile_id:
+            return True
+        persisted_at = _parse_iso_datetime(entry.get("persisted_at"))
+        if not persisted_at:
+            return True
+        elapsed = (datetime.now(UTC) - persisted_at).total_seconds()
+        return elapsed >= PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS
+
+    def _runtime_guard(
+        self,
+        payload: dict[str, Any],
+        *,
+        mutate: bool = False,
+    ) -> dict[str, Any]:
+        schedule = _safe_dict(payload.get("schedule"))
+        feedback = _safe_dict(payload.get("feedback"))
+        active = _safe_dict(schedule.get("active_profile"))
+        profile_id = str(active.get("id") or "baseline_current")
+        totals = _safe_dict(feedback.get("totals"))
+        decision_quality = _safe_dict(feedback.get("decision_quality"))
+        event_feedback = _safe_dict(feedback.get("event_feedback"))
+        reasons: list[str] = []
+        should_rollback = False
+        if profile_id != "baseline_current":
+            if _safe_float(totals.get("net_pnl"), 0.0) <= -8.0:
+                should_rollback = True
+                reasons.append("recent_net_pnl_guard")
+            if _safe_int(totals.get("training_trade_count"), 0) < max(
+                2, DEFAULT_MIN_TRADE_TARGET // 3
+            ):
+                reasons.append("insufficient_trade_samples")
+            if _safe_float(decision_quality.get("fallback_entry_rate"), 0.0) >= 0.55:
+                should_rollback = True
+                reasons.append("fallback_dependency_guard")
+            if _safe_int(event_feedback.get("execution_errors"), 0) >= 3:
+                should_rollback = True
+                reasons.append("execution_error_guard")
+        if should_rollback and mutate:
+            self.state_store.set_profile_disabled(
+                profile_id,
+                disabled=True,
+                reason="auto_runtime_guard:" + ",".join(reasons),
+            )
+            self.state_store.set_manual_active_profile("baseline_current")
+        return {
+            "profile_id": profile_id,
+            "should_rollback": bool(should_rollback),
+            "mutated": bool(should_rollback and mutate),
+            "reasons": reasons,
+            "rules": [
+                "\u63a2\u9488\u6216\u5019\u9009\u7b56\u7565\u8fd1\u671f\u51c0\u6536\u76ca\u663e\u8457\u6076\u5316\u65f6\u81ea\u52a8\u56de\u6eda",
+                "fallback \u4f9d\u8d56\u6216\u6267\u884c\u5f02\u5e38\u5360\u4e3b\u5bfc\u65f6\u81ea\u52a8\u56de\u6eda",
+                "\u4f4e\u4ea4\u6613\u91cf\u4f1a\u88ab\u60e9\u7f5a\uff0c\u8c03\u5ea6\u5668\u4e0d\u80fd\u7528\u4e0d\u5f00\u4ed3\u6765\u5236\u9020\u5b89\u5168\u611f",
+            ],
+        }
+
+    def _expert_integrity_event_payload(
+        self,
+        raw_response: dict[str, Any],
+        strategy_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        compiler = getattr(self.engine, "compiler", None) or StrategyFeedbackCompiler()
+        fallback, zero_second, missing = compiler._expert_integrity_flags(raw_response)
+        return {
+            "fallback_or_untrusted": bool(fallback),
+            "zero_second_expert": bool(zero_second),
+            "missing_experts": missing,
+            "mode": strategy_context.get("expert_integrity_mode"),
+            "model_timing_count": len(_safe_list(raw_response.get("model_timings"))),
+        }
+
     async def _load_rows(self, *, mode: str, hours: int, limit: int) -> dict[str, list[Any]]:
         selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
         is_paper = selected_mode == "paper"
         capped_hours = max(1, min(int(hours or DEFAULT_LOOKBACK_HOURS), 24 * 90))
         capped_limit = max(100, min(int(limit or 3000), 20000))
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             closed_result = await session.execute(
                 select(Position)
                 .where(
@@ -1382,6 +2642,16 @@ class StrategyLearningService:
                 .order_by(TradeReflection.closed_at.desc().nullslast())
                 .limit(capped_limit)
             )
+            strategy_event_result = await session.execute(
+                select(StrategyLearningEvent)
+                .where(
+                    StrategyLearningEvent.model_name == ENSEMBLE_TRADER_NAME,
+                    StrategyLearningEvent.execution_mode == selected_mode,
+                    StrategyLearningEvent.created_at >= since,
+                )
+                .order_by(StrategyLearningEvent.created_at.desc())
+                .limit(capped_limit * 3)
+            )
             return {
                 "closed_positions": list(closed_result.scalars().all()),
                 "open_positions": list(open_result.scalars().all()),
@@ -1390,4 +2660,5 @@ class StrategyLearningService:
                 "shadows": list(shadow_result.scalars().all()),
                 "memories": list(memory_result.scalars().all()),
                 "reflections": list(reflection_result.scalars().all()),
+                "strategy_events": list(strategy_event_result.scalars().all()),
             }

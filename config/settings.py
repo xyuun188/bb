@@ -173,6 +173,10 @@ class Settings(BaseSettings):
     ai_batch_expert_timeout_seconds: float = 90.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
+    strategy_learning_llm_candidates_enabled: bool = True
+    strategy_learning_llm_candidate_interval_seconds: int = 21600
+    strategy_learning_llm_candidate_timeout_seconds: float = 20.0
+    strategy_learning_llm_candidate_max_tokens: int = 600
     ai_market_fast_prefilter_enabled: bool = True
     ai_market_fast_prefilter_min_expected_return_pct: float = 0.03
     ai_market_fast_prefilter_max_loss_probability: float = 0.58

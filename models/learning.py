@@ -85,3 +85,55 @@ class ShadowBacktest(Base, TimestampMixin):
     best_action: Mapped[str | None] = mapped_column(String(20), nullable=True)
     missed_opportunity: Mapped[bool] = mapped_column(Boolean, default=False)
     note: Mapped[str] = mapped_column(Text, default="")
+
+
+class StrategyProfileSnapshot(Base, TimestampMixin):
+    """Versioned strategy profile snapshot used by scheduler attribution."""
+
+    __tablename__ = "strategy_profile_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_mode: Mapped[str] = mapped_column(String(10), default="paper", index=True)
+    profile_id: Mapped[str] = mapped_column(String(80), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    label: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(30), default="candidate", index=True)
+    source: Mapped[str] = mapped_column(String(60), default="feedback_generator")
+    description: Mapped[str] = mapped_column(Text, default="")
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    promotion: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    backtest_metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    shadow_validation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    probe_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    scheduler_reason: Mapped[str] = mapped_column(Text, default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_disabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class StrategyLearningEvent(Base, TimestampMixin):
+    """Auditable event for decisions, blocks, executions, and manual closes."""
+
+    __tablename__ = "strategy_learning_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_name: Mapped[str] = mapped_column(String(50), index=True)
+    execution_mode: Mapped[str] = mapped_column(String(10), default="paper", index=True)
+    symbol: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    side: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    action: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    event_status: Mapped[str] = mapped_column(String(30), default="recorded", index=True)
+    severity: Mapped[str] = mapped_column(String(12), default="info")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    decision_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    order_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    profile_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    profile_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheduler_reason: Mapped[str] = mapped_column(Text, default="")
+    strategy_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    market_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    side_weights: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    expert_integrity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    attribution: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    exclude_from_training: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
