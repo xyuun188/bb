@@ -135,6 +135,31 @@ function strategyLearningProfileMetric(label, value, tone = '') {
     return `<span class="strategy-learning-profile-stat ${strategyLearningEsc(tone)}"><b>${strategyLearningEsc(label)}</b>${value}</span>`;
 }
 
+function strategyLearningSourceLabel(source) {
+    const value = String(source || '').trim();
+    if (value === 'current_system') return '当前系统';
+    if (value === 'feedback_generator') return '反馈生成';
+    if (value === 'llm_structured_candidate') return 'LLM结构化候选';
+    return value || '-';
+}
+
+function strategyLearningFixChips(items) {
+    const rows = Array.isArray(items) ? items.slice(0, 4) : [];
+    if (!rows.length) return '<span>暂无命中反馈</span>';
+    return rows.map(item => `<span>${strategyLearningEsc(strategyLearningText(item))}</span>`).join('');
+}
+
+function strategyLearningShadowChips(row) {
+    const flags = [];
+    if (row?.would_increase_entries) flags.push('增加开仓');
+    if (row?.would_reduce_blocks) flags.push('减少拦截');
+    if (row?.would_release_losers) flags.push('释放亏损');
+    if (row?.would_hold_winners) flags.push('拿住赢家');
+    if (!flags.length) flags.push('维持基线');
+    flags.push(row?.fallback_safety === 'probe_core_required' ? '核心专家必须可信' : row?.fallback_safety === 'too_loose' ? 'fallback过宽' : '严格专家');
+    return flags.map(flag => `<span>${strategyLearningEsc(flag)}</span>`).join('');
+}
+
 function strategyLearningTime(value) {
     if (!value) return '-';
     const date = new Date(value);
@@ -332,52 +357,54 @@ function renderStrategyLearningProfiles(data) {
         return;
     }
     el.innerHTML = `
-        <div class="strategy-learning-profile-table-wrap">
-            <table class="strategy-learning-profile-table">
-                <thead>
-                    <tr>
-                        <th>策略</th><th>状态</th><th>评分</th><th>费后</th><th>回撤</th><th>交易</th><th>影子</th><th>探针</th><th>操作</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${candidates.map(profile => {
-                        const bt = backtestRows.find(row => row.profile_id === profile.id) || {};
-                        const sh = shadowRows.find(row => row.profile_id === profile.id) || {};
-                        const isActive = profile.id === activeId;
-                        const isDisabled = disabled.has(profile.id);
-                        const profileIdArg = JSON.stringify(String(profile.id || ''));
-                        const fee = Number(bt.fee_adjusted_pnl || 0);
-                        const score = Number(bt.score || 0);
-                        const pass = bt.pass !== false;
-                        const rowClass = [isActive ? 'active' : '', isDisabled ? 'disabled' : '', pass ? '' : 'failed'].filter(Boolean).join(' ');
-                        const activeLabel = isActive ? (manualLocked ? '手动启用' : '自动启用') : (isDisabled ? '已禁用' : (pass ? '候选' : '未通过'));
-                        const actionButton = profile.id === 'baseline_current'
-                            ? `<button class="btn btn-sm" onclick="rollbackStrategyLearning()">恢复自动</button>`
-                            : `<button class="btn btn-sm" ${isActive && manualLocked ? 'disabled' : ''} onclick='activateStrategyLearningProfile(${profileIdArg})'>${isActive && manualLocked ? '已锁定' : '手动启用'}</button>`;
-                        return `
-                            <tr class="${strategyLearningEsc(rowClass)}">
-                                <td class="strategy-learning-profile-name">
-                                    <strong>${strategyLearningEsc(profile.label || strategyLearningText(profile.id) || profile.id)}</strong>
-                                    <span>${strategyLearningEsc(profile.id || '-')} · ${strategyLearningEsc(profile.source || '')}</span>
-                                    <p>${strategyLearningEsc(strategyLearningShort(profile.description || '', 82))}</p>
-                                </td>
-                                <td><span class="strategy-learning-table-pill ${isActive ? 'good' : isDisabled ? 'bad' : pass ? 'neutral' : 'warn'}">${strategyLearningEsc(activeLabel)}</span></td>
-                                <td>${strategyLearningProfileMetric('score', score.toFixed(2), score >= 0 ? 'good' : 'bad')}</td>
-                                <td>${strategyLearningProfileMetric('pnl', `${strategyLearningMoney(fee)} U`, fee >= 0 ? 'good' : 'bad')}</td>
-                                <td>${strategyLearningProfileMetric('max', `${strategyLearningMoney(bt.max_drawdown || 0)} U`)}</td>
-                                <td>${strategyLearningProfileMetric('count', `${Number(bt.trade_count || 0)} / ${Number(bt.trade_count_target || 0)}`)}</td>
-                                <td>${strategyLearningProfileMetric('shadow', Number(sh.shadow_score || 0).toFixed(2))}</td>
-                                <td>${strategyLearningProfileMetric('size', Number(profile.params?.probe_fraction || 0) ? strategyLearningPct(profile.params.probe_fraction, 1) : '-')}</td>
-                                <td>
-                                    <div class="strategy-learning-profile-actions">
-                                        ${actionButton}
-                                        <button class="btn btn-sm" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '恢复' : '禁用'}</button>
-                                    </div>
-                                </td>
-                            </tr>`;
-                    }).join('')}
-                </tbody>
-            </table>
+        <div class="strategy-learning-profile-board">
+            ${candidates.map(profile => {
+                const bt = backtestRows.find(row => row.profile_id === profile.id) || {};
+                const sh = shadowRows.find(row => row.profile_id === profile.id) || {};
+                const isActive = profile.id === activeId;
+                const isDisabled = disabled.has(profile.id);
+                const profileIdArg = JSON.stringify(String(profile.id || ''));
+                const fee = Number(bt.fee_adjusted_pnl || 0);
+                const score = Number(bt.score || 0);
+                const shadowScore = Number(sh.shadow_score || 0);
+                const pass = bt.pass !== false;
+                const shadowOk = sh.eligible !== false;
+                const probePct = Number(profile.params?.probe_fraction || 0);
+                const cardClass = [isActive ? 'active' : '', isDisabled ? 'disabled' : '', pass && shadowOk ? '' : 'failed'].filter(Boolean).join(' ');
+                const activeLabel = isActive ? (manualLocked ? '手动锁定' : '自动启用') : (isDisabled ? '已禁用' : (pass && shadowOk ? '候选可用' : '未通过'));
+                const statusTone = isActive ? 'good' : isDisabled ? 'bad' : pass && shadowOk ? 'neutral' : 'warn';
+                const actionButton = profile.id === 'baseline_current'
+                    ? `<button class="btn btn-sm" onclick="rollbackStrategyLearning()">恢复自动</button>`
+                    : `<button class="btn btn-sm" ${isActive && manualLocked ? 'disabled' : ''} onclick='activateStrategyLearningProfile(${profileIdArg})'>${isActive && manualLocked ? '已锁定' : '手动启用'}</button>`;
+                return `
+                    <article class="strategy-learning-profile-card ${strategyLearningEsc(cardClass)}">
+                        <div class="strategy-learning-profile-card-head">
+                            <div>
+                                <strong>${strategyLearningEsc(profile.label || strategyLearningText(profile.id) || profile.id)}</strong>
+                                <span>${strategyLearningEsc(profile.id || '-')} · ${strategyLearningEsc(strategyLearningSourceLabel(profile.source))}</span>
+                            </div>
+                            <span class="strategy-learning-table-pill ${statusTone}">${strategyLearningEsc(activeLabel)}</span>
+                        </div>
+                        <p>${strategyLearningEsc(strategyLearningShort(profile.description || '', 128))}</p>
+                        <div class="strategy-learning-profile-card-stats">
+                            ${strategyLearningProfileMetric('回测评分', score.toFixed(2), score >= 0 ? 'good' : 'bad')}
+                            ${strategyLearningProfileMetric('费后收益', `${strategyLearningMoney(fee)} U`, fee >= 0 ? 'good' : 'bad')}
+                            ${strategyLearningProfileMetric('最大回撤', `${strategyLearningMoney(bt.max_drawdown || 0)} U`)}
+                            ${strategyLearningProfileMetric('交易数量', `${Number(bt.trade_count || 0)} / ${Number(bt.trade_count_target || 0)}`, Number(bt.low_trade_count_penalty || 0) ? 'warn' : '')}
+                            ${strategyLearningProfileMetric('影子评分', shadowScore.toFixed(2), shadowOk ? 'good' : 'bad')}
+                            ${strategyLearningProfileMetric('探针仓位', probePct ? strategyLearningPct(probePct, 1) : '-')}
+                        </div>
+                        <div class="strategy-learning-chip-row strategy-learning-profile-chips">${strategyLearningShadowChips(sh)}</div>
+                        <div class="strategy-learning-chip-row muted strategy-learning-profile-chips">${strategyLearningFixChips(bt.matched_fixes)}</div>
+                        <div class="strategy-learning-profile-footer">
+                            <span>${pass ? '回测通过' : '回测未通过'} · ${shadowOk ? '影子通过' : '影子未通过'} · ${sh.trade_count_guard?.low_trade_count ? '低交易量惩罚中' : '交易量约束正常'}</span>
+                            <div class="strategy-learning-profile-actions">
+                                ${actionButton}
+                                <button class="btn btn-sm" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '恢复' : '禁用'}</button>
+                            </div>
+                        </div>
+                    </article>`;
+            }).join('')}
         </div>`;
 }
 

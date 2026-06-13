@@ -62,6 +62,7 @@ STATE_FILE_NAME = "strategy_learning_state.json"
 PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS = 600
 LLM_CANDIDATE_CACHE_SECONDS = 6 * 60 * 60
 LLM_CANDIDATE_MAX_COUNT = 3
+AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS = 6 * 60 * 60
 ALLOWED_CANDIDATE_PARAM_KEYS = {
     "global_min_score_delta",
     "position_size_multiplier",
@@ -346,7 +347,35 @@ class StrategyLearningStateStore:
     def disabled_profiles(self) -> dict[str, Any]:
         state = self.load()
         disabled = state.get("disabled_profiles")
-        return disabled if isinstance(disabled, dict) else {}
+        if not isinstance(disabled, dict):
+            return {}
+        now = datetime.now(UTC)
+        active: dict[str, Any] = {}
+        expired: list[str] = []
+        for profile_id, meta in disabled.items():
+            row = _safe_dict(meta)
+            reason = str(row.get("reason") or "")
+            is_auto = bool(row.get("auto")) or reason.startswith("auto_runtime_guard:")
+            disabled_until = _parse_iso_datetime(row.get("disabled_until"))
+            updated_at = _parse_iso_datetime(row.get("updated_at"))
+            reconsider_at = disabled_until
+            if is_auto and reconsider_at is None and updated_at is not None:
+                reconsider_at = updated_at + timedelta(
+                    seconds=AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS
+                )
+            if is_auto and reconsider_at is None:
+                expired.append(str(profile_id))
+                continue
+            if is_auto and reconsider_at <= now:
+                expired.append(str(profile_id))
+                continue
+            active[str(profile_id)] = row
+        if expired:
+            for profile_id in expired:
+                disabled.pop(profile_id, None)
+            state["disabled_profiles"] = disabled
+            self.save(state)
+        return active
 
     def set_profile_disabled(
         self,
@@ -361,9 +390,18 @@ class StrategyLearningStateStore:
             disabled_profiles = {}
             state["disabled_profiles"] = disabled_profiles
         if disabled:
+            now = datetime.now(UTC)
+            is_auto = reason.startswith("auto_runtime_guard:")
+            disabled_until = (
+                now + timedelta(seconds=AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS)
+                if is_auto
+                else None
+            )
             disabled_profiles[profile_id] = {
                 "reason": reason or "manual_disable",
-                "updated_at": datetime.now(UTC).isoformat(),
+                "updated_at": now.isoformat(),
+                "auto": bool(is_auto),
+                "disabled_until": disabled_until.isoformat() if disabled_until else "",
             }
             if state.get("manual_active_profile") == profile_id:
                 state["manual_active_profile"] = ""
@@ -374,7 +412,9 @@ class StrategyLearningStateStore:
 
     def set_manual_active_profile(self, profile_id: str | None) -> dict[str, Any]:
         state = self.load()
-        normalized_profile_id = "" if profile_id in {None, "", "baseline_current"} else str(profile_id)
+        normalized_profile_id = (
+            "" if profile_id in {None, "", "baseline_current"} else str(profile_id)
+        )
         state["manual_active_profile"] = normalized_profile_id
         self.save(state)
         return state
@@ -1456,6 +1496,12 @@ class StrategyBacktester:
 
     def score(self, profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
         totals = feedback.totals
+        known_profiles = {
+            "baseline_current",
+            "balanced_probe",
+            "loss_release",
+            "winner_hold",
+        }
         net_pnl = _safe_float(totals.get("net_pnl"), 0.0)
         trade_count = _safe_int(totals.get("training_trade_count"), 0)
         target = _safe_int(
@@ -1561,6 +1607,12 @@ class StrategyBacktester:
             if side_bucket.get("state") == "degraded":
                 estimated_delta += abs(_safe_float(side_bucket.get("pnl"), 0.0)) * 0.12
                 matched_fixes.append(f"{side}_side_degraded")
+        elif profile.profile_id not in known_profiles:
+            for fix_key, delta in self._generic_candidate_deltas(profile, feedback, problem_keys):
+                estimated_delta += delta
+                matched_fixes.append(fix_key)
+            if "controlled_entry_recovery" in matched_fixes:
+                low_trade_penalty = max(low_trade_penalty - trade_gap * 0.95, 0.0)
 
         score = net_pnl + estimated_delta - low_trade_penalty
         score -= fee_estimate * 0.35
@@ -1571,6 +1623,8 @@ class StrategyBacktester:
             trade_count >= max(2, int(target * 0.35)) or profile.profile_id == "balanced_probe"
         )
         if profile.profile_id in {"loss_release", "winner_hold"} and matched_fixes:
+            pass_gate = True
+        if profile.profile_id not in {"baseline_current", "balanced_probe"} and matched_fixes:
             pass_gate = True
         if profile.profile_id == "baseline_current":
             pass_gate = True
@@ -1604,6 +1658,103 @@ class StrategyBacktester:
             ),
         }
 
+    @staticmethod
+    def _generic_candidate_deltas(
+        profile: StrategyProfile,
+        feedback: StrategyFeedback,
+        problem_keys: set[str],
+    ) -> list[tuple[str, float]]:
+        """Estimate bounded LLM candidate impact from allowed parameters only."""
+
+        params = profile.params
+        deltas: list[tuple[str, float]] = []
+        trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
+        target = _safe_int(params.get("min_trade_count_target"), DEFAULT_MIN_TRADE_TARGET)
+        trade_gap = max(target - trade_count, 0)
+        opens_more = (
+            _safe_float(params.get("global_min_score_delta"), 0.0) < 0
+            or _safe_float(params.get("probe_fraction"), 0.0) > 0
+            or _safe_float(params.get("position_size_multiplier"), 1.0) > 1.0
+        )
+        if opens_more and (
+            problem_keys
+            & {
+                "low_trade_count",
+                "missed_opportunities",
+                "expert_fallback_overblocking",
+                "event_fallback_blocks",
+            }
+        ):
+            missed = _safe_int(feedback.shadow_feedback.get("missed_opportunity_count"), 0)
+            blocks = _safe_int(
+                feedback.decision_quality.get("expert_integrity_blocks"), 0
+            ) + _safe_int(feedback.event_feedback.get("fallback_blocks"), 0)
+            deltas.append(
+                (
+                    "controlled_entry_recovery",
+                    min(trade_gap * 0.32 + missed * 0.18 + blocks * 0.16, 4.0),
+                )
+            )
+        releases_losers = (
+            bool(
+                params.get("full_position_release") or params.get("release_losing_positions_first")
+            )
+            or str(params.get("loss_exit_aggressiveness") or "") == "high"
+        )
+        if releases_losers and (
+            problem_keys
+            & {
+                "full_position_loss_pressure",
+                "max_position_blocks",
+                "loss_hold_too_long",
+                "reflection_loss_hold_too_long",
+                "reflection_negative_pnl",
+            }
+        ):
+            loss_pnl = abs(
+                _safe_float(feedback.open_position_pressure.get("losing_unrealized_pnl"), 0.0)
+            )
+            loss_minutes = _safe_float(
+                feedback.reflection_feedback.get("avg_loss_hold_minutes"), 0.0
+            )
+            deltas.append(
+                (
+                    "loss_release_from_candidate",
+                    min(loss_pnl * 0.12 + loss_minutes / 240.0, 4.0),
+                )
+            )
+        holds_winners = (
+            str(params.get("winner_hold_extension") or "") == "high"
+            or _safe_float(params.get("profit_lock_min_usdt_multiplier"), 1.0) > 1.05
+        )
+        if holds_winners and (
+            problem_keys & {"small_wins_large_losses", "reflection_small_wins_large_losses"}
+        ):
+            deltas.append(
+                (
+                    "winner_hold_from_candidate",
+                    min(
+                        _safe_int(feedback.totals.get("small_win_count"), 0) * 0.20
+                        + _safe_int(feedback.reflection_feedback.get("small_win_count"), 0) * 0.15,
+                        3.0,
+                    ),
+                )
+            )
+        side_overrides = _safe_dict(params.get("side_overrides"))
+        for side, override in side_overrides.items():
+            bucket = _safe_dict(feedback.side_performance.get(str(side)))
+            if (
+                bucket.get("state") == "degraded"
+                and _safe_float(_safe_dict(override).get("size_multiplier"), 1.0) < 1.0
+            ):
+                deltas.append(
+                    (
+                        f"{side}_side_candidate_recovery",
+                        min(abs(_safe_float(bucket.get("pnl"), 0.0)) * 0.10, 3.0),
+                    )
+                )
+        return [(key, round(max(delta, 0.0), 6)) for key, delta in deltas if delta > 0]
+
 
 class StrategyScheduler:
     """Choose the active profile and runtime overrides."""
@@ -1631,7 +1782,15 @@ class StrategyScheduler:
         reason = "默认使用当前基线。"
         problem_keys = {item["key"] for item in feedback.problems}
 
+        shadow_validation = self._shadow_validation(profiles, feedback)
+        shadow_by_id = {
+            str(row.get("profile_id")): row
+            for row in _safe_list(shadow_validation.get("rows"))
+            if isinstance(row, dict)
+        }
+
         if manual_lock_active:
+
             selected = by_id[manual_profile_id]
             reason = f"人工指定策略画像 {manual_profile_id}。"
         elif (
@@ -1674,20 +1833,40 @@ class StrategyScheduler:
                     selected = by_id["winner_hold"]
                     reason = "盈利仓小盈过多且大亏存在，调度赢家持仓优化画像。"
 
+        if not manual_lock_active:
+            structured = self._best_structured_candidate(
+                available=available,
+                selected=selected,
+                backtest_rows=backtest_rows,
+                shadow_validation=shadow_validation,
+            )
+            if structured is not None:
+                selected = structured
+
         selected_score = next(
             (row for row in backtest_rows if row.get("profile_id") == selected.profile_id),
             {},
         )
-        if selected.profile_id != "baseline_current" and selected_score.get("pass") is False:
+        selected_shadow = _safe_dict(shadow_by_id.get(selected.profile_id))
+        selection_failed = (
+            selected_score.get("pass") is False or selected_shadow.get("eligible") is False
+        )
+        if selected.profile_id != "baseline_current" and selection_failed:
             selected = by_id.get("baseline_current", StrategyCandidateGenerator.baseline())
             reason = "候选画像未通过交易数量/历史评分约束，自动回滚到当前基线。"
+            selected_score = next(
+                (row for row in backtest_rows if row.get("profile_id") == selected.profile_id),
+                {},
+            )
 
         reason = self._readable_schedule_reason(
             selected_profile_id=selected.profile_id,
             manual_lock_active=manual_lock_active,
             manual_profile_id=manual_profile_id,
             problem_keys=problem_keys,
-            score_failed=selected_score.get("pass") is False,
+            score_failed=bool(selection_failed),
+            selected_source=selected.source,
+            matched_fixes=_safe_list(selected_score.get("matched_fixes")),
         )
         runtime = self._runtime(selected, feedback)
         rollback = self._rollback(selected, feedback, selected_score)
@@ -1698,12 +1877,52 @@ class StrategyScheduler:
             rollback=rollback,
             candidates=[profile.to_dict() for profile in profiles],
             backtest={"rows": backtest_rows},
-            shadow_validation=self._shadow_validation(profiles, feedback),
+            shadow_validation=shadow_validation,
             probe=self._probe(selected, feedback),
             disabled_profiles=disabled_ids,
             scheduler_mode="manual" if manual_lock_active else "auto",
             manual_profile_id=manual_profile_id if manual_lock_active else "",
         )
+
+    @staticmethod
+    def _best_structured_candidate(
+        *,
+        available: list[StrategyProfile],
+        selected: StrategyProfile,
+        backtest_rows: list[dict[str, Any]],
+        shadow_validation: dict[str, Any],
+    ) -> StrategyProfile | None:
+        """Allow bounded LLM-generated profiles to enter auto scheduling after validation."""
+
+        backtest_by_id = {
+            str(row.get("profile_id")): row for row in backtest_rows if isinstance(row, dict)
+        }
+        shadow_by_id = {
+            str(row.get("profile_id")): row
+            for row in _safe_list(_safe_dict(shadow_validation).get("rows"))
+            if isinstance(row, dict)
+        }
+        selected_score = _safe_float(
+            _safe_dict(backtest_by_id.get(selected.profile_id)).get("score"), 0.0
+        )
+        best: StrategyProfile | None = None
+        best_score = selected_score
+        for profile in available:
+            if profile.source != "llm_structured_candidate":
+                continue
+            backtest = _safe_dict(backtest_by_id.get(profile.profile_id))
+            shadow = _safe_dict(shadow_by_id.get(profile.profile_id))
+            if backtest.get("pass") is False or shadow.get("eligible") is False:
+                continue
+            if not _safe_list(backtest.get("matched_fixes")):
+                continue
+            score = _safe_float(backtest.get("score"), 0.0) + _safe_float(
+                shadow.get("shadow_score"), 0.0
+            )
+            if score > best_score + 0.15:
+                best = profile
+                best_score = score
+        return best
 
     @staticmethod
     def _readable_schedule_reason(
@@ -1713,6 +1932,8 @@ class StrategyScheduler:
         manual_profile_id: str,
         problem_keys: set[str],
         score_failed: bool,
+        selected_source: str = "",
+        matched_fixes: list[Any] | None = None,
     ) -> str:
         if score_failed and selected_profile_id == "baseline_current":
             return "候选策略未通过交易数量或历史评分约束，自动回退到当前基线。"
@@ -1727,9 +1948,15 @@ class StrategyScheduler:
             side_label = "多单" if side == "long" else "空单" if side == "short" else side
             return f"{side_label}方向近期表现退化，自动调度到方向恢复画像。"
         if selected_profile_id == "balanced_probe":
-            return "开仓样本不足、专家 fallback 拦截或影子复盘错过机会偏多，自动调度到平衡探针画像。"
+            return (
+                "开仓样本不足、专家 fallback 拦截或影子复盘错过机会偏多，自动调度到平衡探针画像。"
+            )
         if selected_profile_id == "winner_hold":
             return "盈利仓小盈过多且大亏存在，自动调度到赢家持仓优化画像。"
+        if selected_source == "llm_structured_candidate":
+            fixes = ", ".join(str(item) for item in (matched_fixes or [])[:4])
+            suffix = f"，命中反馈：{fixes}" if fixes else ""
+            return f"结构化候选已通过回测和影子验证，自动进入小仓探针调度{suffix}。"
         return "自动调度未发现需要切换的高优先级问题，使用当前基线。"
 
     def _runtime(self, profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
@@ -1779,27 +2006,116 @@ class StrategyScheduler:
         profiles: list[StrategyProfile],
         feedback: StrategyFeedback,
     ) -> dict[str, Any]:
-        rows = []
+        rows: list[dict[str, Any]] = []
         missed = _safe_int(feedback.shadow_feedback.get("missed_opportunity_count"), 0)
         bad = _safe_int(feedback.shadow_feedback.get("bad_signal_count"), 0)
+        good = _safe_int(feedback.shadow_feedback.get("good_signal_count"), 0)
+        fallback_blocks = _safe_int(feedback.event_feedback.get("fallback_blocks"), 0)
+        integrity_blocks = _safe_int(feedback.decision_quality.get("expert_integrity_blocks"), 0)
+        max_position_blocks = _safe_int(feedback.event_feedback.get("max_position_blocks"), 0)
+        losing_open_count = _safe_int(feedback.open_position_pressure.get("losing_open_count"), 0)
+        small_wins = _safe_int(feedback.totals.get("small_win_count"), 0) + _safe_int(
+            feedback.reflection_feedback.get("small_win_count"), 0
+        )
+        large_losses = _safe_int(feedback.totals.get("large_loss_count"), 0) + _safe_int(
+            feedback.reflection_feedback.get("large_loss_count"), 0
+        )
+        trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
+        baseline_score = 0.0
+
         for profile in profiles:
+            params = profile.params
+            would_increase_entries = bool(
+                profile.profile_id == "balanced_probe"
+                or _safe_float(params.get("probe_fraction"), 0.0) > 0
+                or _safe_float(params.get("global_min_score_delta"), 0.0) < 0
+                or _safe_float(params.get("position_size_multiplier"), 1.0) > 1.0
+            )
+            would_reduce_blocks = bool(
+                would_increase_entries
+                and (missed > 0 or fallback_blocks > 0 or integrity_blocks > 0)
+            )
+            would_release_losers = bool(
+                profile.profile_id == "loss_release"
+                or params.get("full_position_release")
+                or params.get("release_losing_positions_first")
+                or str(params.get("loss_exit_aggressiveness") or "") == "high"
+            )
+            would_hold_winners = bool(
+                profile.profile_id == "winner_hold"
+                or str(params.get("winner_hold_extension") or "") == "high"
+                or _safe_float(params.get("profit_lock_min_usdt_multiplier"), 1.0) > 1.05
+            )
+            side_recovery = profile.profile_id.endswith("_side_recovery") or any(
+                _safe_float(_safe_dict(item).get("size_multiplier"), 1.0) < 1.0
+                for item in _safe_dict(params.get("side_overrides")).values()
+            )
+            fallback_safety = "strict"
+            integrity_mode = str(params.get("expert_integrity_mode") or "strict_all_required")
+            tolerance = _safe_dict(params.get("fallback_tolerance"))
+            if integrity_mode == "balanced_probe_allow_one_non_core_missing":
+                fallback_safety = "probe_core_required"
+            if _safe_int(tolerance.get("allow_missing_non_core_experts"), 0) > 1:
+                fallback_safety = "too_loose"
+
             score = 0.0
-            if profile.profile_id == "balanced_probe":
-                score += missed * 0.4 - bad * 0.15
-            elif profile.profile_id.endswith("_side_recovery"):
-                score += bad * 0.25
-            elif profile.profile_id == "winner_hold":
-                score += _safe_int(feedback.totals.get("small_win_count"), 0) * 0.2
+            if would_increase_entries:
+                score += missed * 0.36 + max(DEFAULT_MIN_TRADE_TARGET - trade_count, 0) * 0.18
+            if would_reduce_blocks:
+                score += (fallback_blocks + integrity_blocks) * 0.14
+            if would_release_losers:
+                score += losing_open_count * 0.32 + max_position_blocks * 0.25
+            if would_hold_winners:
+                score += small_wins * 0.16 + good * 0.05
+            if side_recovery:
+                score += bad * 0.22 + large_losses * 0.08
+            if fallback_safety == "too_loose":
+                score -= 0.7 + fallback_blocks * 0.08
+            if would_increase_entries and bad > good + missed:
+                score -= (bad - good - missed) * 0.20
+            if profile.profile_id == "baseline_current":
+                score = 0.0
+                baseline_score = score
+
+            target = _safe_int(params.get("min_trade_count_target"), DEFAULT_MIN_TRADE_TARGET)
+            trade_count_guard = {
+                "target": target,
+                "current": trade_count,
+                "penalized_if_low": True,
+                "low_trade_count": trade_count < target,
+            }
+            eligible = profile.profile_id == "baseline_current" or (
+                score >= -0.10 and fallback_safety != "too_loose"
+            )
             rows.append(
                 {
                     "profile_id": profile.profile_id,
                     "shadow_score": round(score, 6),
-                    "eligible": profile.profile_id == "baseline_current" or score >= 0.0,
+                    "eligible": bool(eligible),
+                    "would_increase_entries": would_increase_entries,
+                    "would_reduce_blocks": would_reduce_blocks,
+                    "would_release_losers": would_release_losers,
+                    "would_hold_winners": would_hold_winners,
+                    "fallback_safety": fallback_safety,
+                    "trade_count_guard": trade_count_guard,
+                    "probe_required": profile.profile_id != "baseline_current",
                     "missed_opportunities_used": missed,
                     "bad_signals_used": bad,
+                    "good_signals_used": good,
+                    "comparison_to_baseline": round(score - baseline_score, 6),
+                    "shadow_decision_summary": {
+                        "more_entries": "yes" if would_increase_entries else "no",
+                        "release_losers": "yes" if would_release_losers else "no",
+                        "hold_winners": "yes" if would_hold_winners else "no",
+                        "block_reduction": "yes" if would_reduce_blocks else "no",
+                    },
                 }
             )
-        return {"rows": rows, "completed_count": feedback.shadow_feedback.get("completed_count", 0)}
+        return {
+            "rows": rows,
+            "completed_count": feedback.shadow_feedback.get("completed_count", 0),
+            "baseline_profile_id": "baseline_current",
+        }
 
     @staticmethod
     def _probe(profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
@@ -1922,8 +2238,16 @@ class StrategyLearningEngine:
             "candidate_count": len(_safe_list(schedule.get("candidates"))),
             "scheduler_mode": schedule.get("scheduler_mode", "auto"),
             "manual_profile_id": schedule.get("manual_profile_id", ""),
+            "disabled_profiles": _safe_list(schedule.get("disabled_profiles")),
+            "shadow_validation": schedule.get("shadow_validation", {}),
+            "probe": schedule.get("probe", {}),
+            "backtest": schedule.get("backtest", {}),
+            "dispatch_reason": schedule.get("reason", ""),
             "low_trade_count_penalized": True,
             "manual_close_excluded_from_training": True,
+            "training_policy": _safe_dict(
+                _safe_dict(payload.get("feedback")).get("training_policy")
+            ),
         }
         result["execution_policy"] = (
             str(result.get("execution_policy") or "")
@@ -2247,6 +2571,7 @@ class StrategyLearningService:
                         "max_position_blocks",
                         "fallback_blocks",
                         "execution_errors",
+                        "recent_events",
                     )
                 },
                 "reflection_feedback": {
@@ -2261,6 +2586,7 @@ class StrategyLearningService:
                         "large_loss_count",
                         "top_mistakes",
                         "top_improvements",
+                        "recent_reflections",
                     )
                 },
                 "problems": feedback.problems,
@@ -2282,6 +2608,7 @@ class StrategyLearningService:
             _safe_int(getattr(settings, "strategy_learning_llm_candidate_max_tokens", 600), 600),
             floor=160,
         )
+        prompt = _json_safe(prompt)
         body = {
             "model": model,
             "messages": [
@@ -2432,6 +2759,16 @@ class StrategyLearningService:
                     "runtime": runtime,
                     "feedback_summary": learning.get("feedback_summary"),
                     "rollback": learning.get("rollback"),
+                    "scheduler_mode": learning.get("scheduler_mode", "auto"),
+                    "manual_profile_id": learning.get("manual_profile_id", ""),
+                    "candidate_count": learning.get("candidate_count", 0),
+                    "dispatch_reason": learning.get("dispatch_reason") or learning.get("reason"),
+                    "disabled_profiles": learning.get("disabled_profiles", []),
+                    "shadow_validation": learning.get("shadow_validation", {}),
+                    "probe": learning.get("probe", {}),
+                    "backtest": learning.get("backtest", {}),
+                    "training_policy": learning.get("training_policy", {}),
+                    "exclude_from_training": bool(exclude_from_training),
                 }
             ),
             market_state=_json_safe(market_state or context.get("market_regime") or {}),
@@ -2584,17 +2921,24 @@ class StrategyLearningService:
                 should_rollback = True
                 reasons.append("execution_error_guard")
         if should_rollback and mutate:
+            disabled_until = (
+                datetime.now(UTC) + timedelta(seconds=AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS)
+            ).isoformat()
             self.state_store.set_profile_disabled(
                 profile_id,
                 disabled=True,
                 reason="auto_runtime_guard:" + ",".join(reasons),
             )
             self.state_store.set_manual_active_profile(None)
+        else:
+            disabled_until = ""
         return {
             "profile_id": profile_id,
             "should_rollback": bool(should_rollback),
             "mutated": bool(should_rollback and mutate),
             "reasons": reasons,
+            "auto_disable_reconsider_seconds": AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS,
+            "disabled_until": disabled_until,
             "rules": [
                 "\u63a2\u9488\u6216\u5019\u9009\u7b56\u7565\u8fd1\u671f\u51c0\u6536\u76ca\u663e\u8457\u6076\u5316\u65f6\u81ea\u52a8\u56de\u6eda",
                 "fallback \u4f9d\u8d56\u6216\u6267\u884c\u5f02\u5e38\u5360\u4e3b\u5bfc\u65f6\u81ea\u52a8\u56de\u6eda",

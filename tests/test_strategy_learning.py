@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 from services.strategy_learning import (
+    AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS,
     StrategyLearningEngine,
     StrategyLearningService,
     StrategyLearningStateStore,
+    StrategyProfile,
 )
 
 
@@ -457,3 +460,212 @@ def test_strategy_learning_rollback_clears_manual_lock(tmp_path) -> None:
     state = service.rollback_to_baseline()
 
     assert state["manual_active_profile"] == ""
+
+
+def test_strategy_learning_auto_schedules_valid_structured_candidate(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    llm_profile = StrategyProfile(
+        profile_id="llm_loss_probe",
+        version=1,
+        label="LLM亏损释放探针",
+        status="candidate",
+        source="llm_structured_candidate",
+        description="用受控参数同时处理开仓样本不足和亏损仓占位。",
+        params={
+            "global_min_score_delta": -0.06,
+            "probe_fraction": 0.06,
+            "position_size_multiplier": 0.65,
+            "full_position_release": True,
+            "release_losing_positions_first": True,
+            "loss_exit_aggressiveness": "high",
+            "expert_integrity_mode": "balanced_probe_allow_one_non_core_missing",
+            "fallback_tolerance": {
+                "allow_missing_non_core_experts": 1,
+                "core_experts_required": ["trend_expert", "momentum_expert", "risk_expert"],
+                "non_core_experts": ["sentiment_expert", "position_expert"],
+            },
+        },
+    )
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-4.0, position_id=51)],
+        open_positions=[_open_position("BTC/USDT", "long", -7.0)],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback")],
+        shadows=[
+            SimpleNamespace(
+                status="completed",
+                missed_opportunity=True,
+                decision_action="hold",
+                long_return_pct=0.9,
+                short_return_pct=-0.1,
+            )
+        ],
+        memories=[],
+        strategy_events=[
+            _strategy_event("capacity_block", status="blocked", reason="max_position capacity")
+        ],
+        max_open_positions=1,
+        extra_profiles=[llm_profile],
+    )
+
+    schedule = payload["schedule"]
+    assert schedule["scheduler_mode"] == "auto"
+    assert schedule["active_profile"]["id"] == "llm_loss_probe"
+    assert "结构化候选" in schedule["reason"]
+    shadow = next(
+        row
+        for row in schedule["shadow_validation"]["rows"]
+        if row["profile_id"] == "llm_loss_probe"
+    )
+    assert shadow["eligible"] is True
+    assert shadow["would_increase_entries"] is True
+    assert shadow["would_release_losers"] is True
+    assert shadow["probe_required"] is True
+    assert shadow["fallback_safety"] == "probe_core_required"
+
+
+def test_strategy_learning_auto_disabled_profiles_expire(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    old_time = datetime.now(UTC) - timedelta(seconds=AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS + 60)
+    state_store.save(
+        {
+            "manual_active_profile": "",
+            "disabled_profiles": {
+                "balanced_probe": {
+                    "reason": "auto_runtime_guard:recent_net_pnl_guard",
+                    "updated_at": old_time.isoformat(),
+                },
+                "winner_hold": {
+                    "reason": "manual_disable",
+                    "updated_at": old_time.isoformat(),
+                },
+            },
+        }
+    )
+
+    disabled = state_store.disabled_profiles()
+
+    assert "balanced_probe" not in disabled
+    assert "winner_hold" in disabled
+    persisted = state_store.load()["disabled_profiles"]
+    assert "balanced_probe" not in persisted
+
+
+def test_strategy_learning_context_and_snapshot_include_dispatch_details(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback")],
+        shadows=[],
+        memories=[],
+        max_open_positions=14,
+    )
+
+    context = engine.apply_to_context({"min_opportunity_score": 1.0}, payload)
+    learning = context["strategy_learning"]
+    snapshot = {
+        "active_profile": learning["active_profile"],
+        "runtime": learning["runtime"],
+        "feedback_summary": learning["feedback_summary"],
+        "rollback": learning["rollback"],
+        "scheduler_mode": learning["scheduler_mode"],
+        "manual_profile_id": learning["manual_profile_id"],
+        "candidate_count": learning["candidate_count"],
+        "dispatch_reason": learning["dispatch_reason"],
+        "disabled_profiles": learning["disabled_profiles"],
+        "shadow_validation": learning["shadow_validation"],
+        "probe": learning["probe"],
+        "backtest": learning["backtest"],
+        "training_policy": learning["training_policy"],
+        "exclude_from_training": True,
+    }
+
+    assert learning["scheduler_mode"] in {"auto", "manual"}
+    assert isinstance(learning["shadow_validation"].get("rows"), list)
+    assert learning["training_policy"]["manual_close_excluded"] is True
+    assert snapshot["exclude_from_training"] is True
+
+
+def test_strategy_learning_llm_candidate_prompt_accepts_datetimes(tmp_path, monkeypatch) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+    feedback = service.engine.compiler.compile(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "capacity_block",
+                status="blocked",
+                reason="max_position capacity reached",
+            )
+        ],
+        reflections=[
+            _reflection(
+                position_id=71,
+                pnl=-2.0,
+                hold_minutes=220.0,
+                mistake="loss held too long",
+            )
+        ],
+        max_open_positions=1,
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        is_success = True
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": '{"candidates": []}'}}]}
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(
+            self, url: str, headers: dict[str, str], json: dict[str, Any]
+        ) -> FakeResponse:
+            captured["body"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("services.strategy_learning.httpx.AsyncClient", FakeClient)
+
+    import asyncio
+
+    result = asyncio.run(
+        service._call_llm_candidate_model(
+            api_base="http://127.0.0.1:9",
+            api_key="test-key",
+            model="test-model",
+            feedback=feedback,
+        )
+    )
+
+    assert result == []
+    prompt = json.loads(captured["body"]["messages"][1]["content"])
+    recent_events = prompt["feedback"]["event_feedback"].get("recent_events", [])
+    assert recent_events
+    assert isinstance(recent_events[0]["created_at"], str)
