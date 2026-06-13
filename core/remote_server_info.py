@@ -1,8 +1,8 @@
-"""Safe parser for the local remote-server credential file.
+"""Safe parser for ignored local remote-server credential files.
 
-The project keeps server connection details in an ignored local text file. This
-module centralizes parsing so deployment scripts and monitoring code do not each
-carry their own fragile regexes or accidentally print secrets.
+Deployment and monitoring scripts read server connection details from ignored
+text files in the project root. This module keeps parsing strict and makes sure
+secrets are never included in diagnostics.
 """
 
 from __future__ import annotations
@@ -15,18 +15,21 @@ from pathlib import Path
 from core.secret_utils import mask_secret
 
 SERVER_INFO_CANDIDATE_NAMES = (
-    "服务器资料.txt",
+    "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt",  # platform server info
+    "\u670d\u52a1\u5668\u8d44\u6599.txt",  # server data
+    "\u670d\u52a1\u5668\u4fe1\u606f.txt",  # server info
     "server.txt",
     "server_info.txt",
 )
 
 SERVER_INFO_GLOBS = (
-    "*服务器资料*.txt",
-    "*服务器*.txt",
-    "*资料*.txt",
+    "*\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f*.txt",
+    "*\u670d\u52a1\u5668\u8d44\u6599*.txt",
+    "*\u670d\u52a1\u5668\u4fe1\u606f*.txt",
+    "*\u670d\u52a1\u5668*.txt",
+    "*\u8d44\u6599*.txt",
     "*server*info*.txt",
     "*server*.txt",
-    "*鏈嶅姟鍣*.txt",
 )
 
 FIELD_VALUE_RE = r"([^ \t\r\n]+)"
@@ -34,6 +37,25 @@ HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 INVALID_IPV4_SHAPE_RE = re.compile(r"^\d+(?:\.\d+){3}$")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 MAX_PASSWORD_LENGTH = 4096
+
+HOST_KEYS = {"host", "ip", "hostname", "server"}
+PORT_KEYS = {"port", "ssh_port"}
+USERNAME_KEYS = {"user", "username", "login", "account"}
+PASSWORD_KEYS = {"pass", "password"}
+
+CHINESE_HOST_LABELS = {
+    "\u516c\u7f51ip",
+    "\u516c\u7f51 ip",
+    "\u4e3b\u673a",
+    "\u670d\u52a1\u5668",
+    "\u5e73\u53f0\u670d\u52a1\u5668",
+}
+CHINESE_PORT_LABELS = {"\u7aef\u53e3"}
+CHINESE_USERNAME_LABELS = {"\u7528\u6237\u540d", "\u8d26\u53f7", "\u7528\u6237"}
+CHINESE_PASSWORD_LABELS = {"\u5bc6\u7801", "\u53e3\u4ee4"}
+
+KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[^:=\uff1a]+?)\s*(?:[:=]|\uff1a)\s*(?P<value>.*?)\s*$")
+IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
 def _reject_control_chars(value: str, *, field_name: str) -> None:
@@ -95,7 +117,7 @@ def _normalize_password(value: str) -> str:
 
 @dataclass(frozen=True)
 class RemoteServerInfo:
-    """Connection details loaded from the local ignored server-info file."""
+    """Connection details loaded from an ignored server-info file."""
 
     host: str
     port: int
@@ -104,7 +126,6 @@ class RemoteServerInfo:
     source_path: Path
 
     def __post_init__(self) -> None:
-        """Normalize and validate connection fields even when built directly."""
         object.__setattr__(self, "host", _normalize_host(self.host))
         object.__setattr__(self, "port", _normalize_port(self.port))
         object.__setattr__(self, "username", _normalize_username(self.username))
@@ -155,74 +176,108 @@ def _candidate_paths(project_root: Path) -> list[Path]:
 
 
 def find_server_info_file(project_root: Path) -> Path:
-    """Find the ignored server-info file without inspecting unrelated files."""
+    """Find an ignored server-info file without inspecting unrelated files."""
     for path in _candidate_paths(project_root):
         if path.exists() and path.is_file():
             return path
     raise FileNotFoundError(
-        "Could not find server info file. Expected an ignored local file such as "
-        "'服务器资料.txt' in the project root."
+        "Could not find server info file. Expected an ignored local server info file "
+        "in the project root."
     )
 
 
-def _match_field(text: str, labels: tuple[str, ...], value_pattern: str) -> str | None:
-    for label in labels:
-        if not label:
-            match = re.search(value_pattern, text, re.IGNORECASE)
-        else:
-            match = re.search(
-                rf"(?:^|[\r\n])[ \t]*{label}(?:[ \t]*[:：][ \t]*|[ \t]+)"
-                rf"{value_pattern}"
-                r"[ \t]*(?:$|[\r\n])",
-                text,
-                re.IGNORECASE,
-            )
-        if match:
-            return match.group(1).strip()
+def _field_kind(key: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", key.strip().lower())
+    if normalized in HOST_KEYS or normalized in CHINESE_HOST_LABELS:
+        return "host"
+    if normalized in PORT_KEYS or normalized in CHINESE_PORT_LABELS:
+        return "port"
+    if normalized in USERNAME_KEYS or normalized in CHINESE_USERNAME_LABELS:
+        return "username"
+    if normalized in PASSWORD_KEYS or normalized in CHINESE_PASSWORD_LABELS:
+        return "password"
+    if "ip" == normalized or normalized.endswith(" ip"):
+        return "host"
     return None
 
 
-def _has_field_label(text: str, labels: tuple[str, ...]) -> bool:
-    for label in labels:
-        if re.search(rf"(?:^|[\r\n])[ \t]*{label}[ \t]*[:：]?", text, re.IGNORECASE):
-            return True
-    return False
+def _parse_key_value_lines(text: str) -> tuple[list[tuple[str, str]], set[str]]:
+    pairs: list[tuple[str, str]] = []
+    explicit_empty_fields: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = KEY_VALUE_RE.match(line)
+        if not match:
+            continue
+        value = match.group("value").strip()
+        if not value:
+            kind = _field_kind(match.group("key"))
+            if kind:
+                explicit_empty_fields.add(kind)
+            continue
+        pairs.append((match.group("key").strip(), value))
+    return pairs, explicit_empty_fields
+
+
+def _fallback_ordered_fields(pairs: list[tuple[str, str]]) -> dict[str, str]:
+    """Handle legacy mojibake labels by using value shape and line order."""
+    result: dict[str, str] = {}
+    remaining_values = [value for _key, value in pairs]
+
+    for value in remaining_values:
+        if "host" not in result and IPV4_RE.fullmatch(value):
+            result["host"] = value
+            continue
+        if "port" not in result:
+            try:
+                port = _normalize_port(value)
+            except ValueError:
+                pass
+            else:
+                result["port"] = str(port)
+                continue
+        if "username" not in result:
+            try:
+                result["username"] = _normalize_username(value)
+            except ValueError:
+                pass
+            else:
+                continue
+        if "password" not in result:
+            result["password"] = value
+    return result
 
 
 def parse_remote_server_info(text: str, *, source_path: Path | None = None) -> RemoteServerInfo:
-    """Parse server connection details from text.
+    """Parse server connection details from text without leaking values."""
+    pairs, explicit_empty_fields = _parse_key_value_lines(text)
+    if explicit_empty_fields:
+        raise ValueError("Server info file is missing host, port, username, or password.")
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        kind = _field_kind(key)
+        if kind and kind not in values:
+            values[kind] = value
 
-    Supports the Chinese labels used by the local file plus English aliases, and
-    does not expose parsed values in exception messages.
-    """
-    host_labels = (
-        r"公网\s*IP",
-        r"公网IP",
-        r"主机",
-        r"服务器",
-        r"host",
-        r"ip",
-    )
-    host = _match_field(text, host_labels, FIELD_VALUE_RE)
-    if not host and not _has_field_label(text, host_labels):
-        host = _match_field(text, (r"",), r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})")
+    if "host" not in values:
+        match = IPV4_RE.search(text)
+        if match:
+            values["host"] = match.group(0)
 
-    port = _match_field(text, (r"端口", r"port"), FIELD_VALUE_RE)
-    username = _match_field(
-        text,
-        (r"账号", r"用户名", r"user(?:name)?", r"login"),
-        FIELD_VALUE_RE,
-    )
-    password = _match_field(text, (r"密码", r"pass(?:word)?"), FIELD_VALUE_RE)
+    fallback = _fallback_ordered_fields(pairs)
+    for key, value in fallback.items():
+        values.setdefault(key, value)
 
-    if not host or not port or not username or not password:
+    if not all(values.get(field) for field in ("host", "port", "username", "password")):
         raise ValueError("Server info file is missing host, port, username, or password.")
 
     return RemoteServerInfo(
-        host=host,
-        port=_normalize_port(port),
-        username=username,
-        password=password,
+        host=values["host"],
+        port=_normalize_port(values["port"]),
+        username=values["username"],
+        password=values["password"],
         source_path=source_path or Path("<memory>"),
     )
 

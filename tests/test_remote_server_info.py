@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.remote_server_info import RemoteServerInfo, parse_remote_server_info
+from core.remote_server_info import RemoteServerInfo, find_server_info_file, parse_remote_server_info
 from core.remote_ssh import (
     configure_ssh_host_keys,
     connect_remote_ssh,
@@ -44,6 +44,18 @@ def test_parse_remote_server_info_english_labels() -> None:
         "username": "deploy",
         "password": "example-password",
     }
+
+
+def test_parse_remote_server_info_platform_labels() -> None:
+    info = parse_remote_server_info(
+        "平台服务器信息：\nIP：45.207.197.48\n用户名：root\n密码：secret\n端口：22",
+        source_path=Path("平台服务器信息.txt"),
+    )
+
+    assert info.host == "45.207.197.48"
+    assert info.port == 22
+    assert info.username == "root"
+    assert info.password == "secret"
 
 
 def test_parse_remote_server_info_rejects_missing_fields() -> None:
@@ -97,6 +109,20 @@ def test_remote_server_info_validates_direct_construction() -> None:
             password="secret",
             source_path=Path("<test>"),
         )
+
+
+def test_find_server_info_file_prefers_platform_file(tmp_path) -> None:
+    (tmp_path / "大模型服务器信息.txt").write_text(
+        "IP：10.0.0.2\n用户名：model\n密码：secret\n端口：22",
+        encoding="utf-8",
+    )
+    platform_path = tmp_path / "平台服务器信息.txt"
+    platform_path.write_text(
+        "IP：10.0.0.1\n用户名：admin\n密码：secret\n端口：22",
+        encoding="utf-8",
+    )
+
+    assert find_server_info_file(tmp_path) == platform_path
 
 
 def test_configure_ssh_host_keys_rejects_unknown_hosts(tmp_path, monkeypatch) -> None:
