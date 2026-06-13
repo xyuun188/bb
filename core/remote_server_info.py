@@ -22,6 +22,12 @@ SERVER_INFO_CANDIDATE_NAMES = (
     "server_info.txt",
 )
 
+MODEL_SERVER_INFO_CANDIDATE_NAMES = (
+    "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt",  # large-model server info
+    "\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt",  # model server info
+    "model_server_info.txt",
+)
+
 SERVER_INFO_GLOBS = (
     "*\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f*.txt",
     "*\u670d\u52a1\u5668\u8d44\u6599*.txt",
@@ -30,6 +36,12 @@ SERVER_INFO_GLOBS = (
     "*\u8d44\u6599*.txt",
     "*server*info*.txt",
     "*server*.txt",
+)
+
+MODEL_SERVER_INFO_GLOBS = (
+    "*\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f*.txt",
+    "*\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f*.txt",
+    "*model*server*info*.txt",
 )
 
 FIELD_VALUE_RE = r"([^ \t\r\n]+)"
@@ -157,11 +169,15 @@ class RemoteServerInfo:
         return self.as_dict()
 
 
-def _candidate_paths(project_root: Path) -> list[Path]:
+def _candidate_paths(
+    project_root: Path,
+    names: tuple[str, ...] = SERVER_INFO_CANDIDATE_NAMES,
+    globs: tuple[str, ...] = SERVER_INFO_GLOBS,
+) -> list[Path]:
     candidates: list[Path] = []
-    for name in SERVER_INFO_CANDIDATE_NAMES:
+    for name in names:
         candidates.append(project_root / name)
-    for pattern in SERVER_INFO_GLOBS:
+    for pattern in globs:
         candidates.extend(project_root.glob(pattern))
 
     deduped: list[Path] = []
@@ -183,6 +199,21 @@ def find_server_info_file(project_root: Path) -> Path:
     raise FileNotFoundError(
         "Could not find server info file. Expected an ignored local server info file "
         "in the project root."
+    )
+
+
+def find_model_server_info_file(project_root: Path) -> Path:
+    """Find the ignored model-server info file used by hardware monitoring."""
+    for path in _candidate_paths(
+        project_root,
+        names=MODEL_SERVER_INFO_CANDIDATE_NAMES,
+        globs=MODEL_SERVER_INFO_GLOBS,
+    ):
+        if path.exists() and path.is_file():
+            return path
+    raise FileNotFoundError(
+        "Could not find model server info file. Expected ignored local file "
+        "'\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt' in the project root."
     )
 
 
@@ -285,5 +316,12 @@ def parse_remote_server_info(text: str, *, source_path: Path | None = None) -> R
 def load_remote_server_info(project_root: Path) -> RemoteServerInfo:
     """Load and parse server connection details from the project root."""
     path = find_server_info_file(project_root)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return parse_remote_server_info(text, source_path=path)
+
+
+def load_model_server_info(project_root: Path) -> RemoteServerInfo:
+    """Load model-server SSH details for the hardware/model monitor."""
+    path = find_model_server_info_file(project_root)
     text = path.read_text(encoding="utf-8", errors="replace")
     return parse_remote_server_info(text, source_path=path)

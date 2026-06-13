@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Any
 
 from config.settings import settings
-from core.remote_server_info import load_remote_server_info
+from core.remote_server_info import load_model_server_info
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from core.server_monitor_probe import (
@@ -52,7 +52,7 @@ class ServerMonitorStatusService:
         *,
         root_dir: Path = PROJECT_ROOT,
         model_id_provider: ModelIdProvider = primary_provider_model_id,
-        info_loader: InfoLoader = load_remote_server_info,
+        info_loader: InfoLoader = load_model_server_info,
         ssh_connector: SshConnector = connect_remote_ssh,
         command_executor: CommandExecutor = exec_remote_command,
         clock: Clock = monotonic,

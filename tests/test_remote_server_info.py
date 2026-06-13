@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.remote_server_info import RemoteServerInfo, find_server_info_file, parse_remote_server_info
+from core.remote_server_info import (
+    RemoteServerInfo,
+    find_model_server_info_file,
+    find_server_info_file,
+    parse_remote_server_info,
+)
 from core.remote_ssh import (
     configure_ssh_host_keys,
     connect_remote_ssh,
@@ -123,6 +128,20 @@ def test_find_server_info_file_prefers_platform_file(tmp_path) -> None:
     )
 
     assert find_server_info_file(tmp_path) == platform_path
+
+
+def test_find_model_server_info_file_prefers_model_file(tmp_path) -> None:
+    model_path = tmp_path / "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
+    model_path.write_text(
+        "IP\uff1a10.0.0.2\n\u7528\u6237\u540d\uff1amodel\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a22",
+        encoding="utf-8",
+    )
+    (tmp_path / "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt").write_text(
+        "IP\uff1a10.0.0.1\n\u7528\u6237\u540d\uff1aadmin\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a22",
+        encoding="utf-8",
+    )
+
+    assert find_model_server_info_file(tmp_path) == model_path
 
 
 def test_configure_ssh_host_keys_rejects_unknown_hosts(tmp_path, monkeypatch) -> None:

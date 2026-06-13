@@ -100,6 +100,14 @@ def test_server_monitor_uses_probe_timeout_budget() -> None:
     assert ssh.exec_calls[0]["timeout"] > 12
 
 
+def test_server_monitor_defaults_to_model_server_info_loader() -> None:
+    service = server_monitor_status.ServerMonitorStatusService(
+        model_id_provider=lambda: "qwen3-32b-trade",
+    )
+
+    assert service.info_loader is server_monitor_status.load_model_server_info
+
+
 def test_server_monitor_command_timeout_is_classified_and_redacted() -> None:
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     service, ssh = _build_server_monitor_service(

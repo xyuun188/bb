@@ -286,6 +286,11 @@ function dashboardWriteOptions(options = {}) {
     return { ...options, headers };
 }
 
+function apiErrorText(data, fallback = '未知错误') {
+    if (!data || typeof data !== 'object') return fallback;
+    return data.error || data.detail || data.message || data.rejection_reason || fallback;
+}
+
 async function fetchJSON(url) {
     try {
         const res = await fetch(url, { cache: 'no-store' });
@@ -4107,12 +4112,14 @@ async function testOKXConnection(mode) {
     status.textContent = '';
     status.className = '';
 
-    const res = await fetch('/api/settings/okx/test', dashboardWriteOptions({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode }),
-    }));
+    const res = await fetch('/api/settings/okx/balance', { cache: 'no-store' });
     const data = await res.json().catch(() => ({}));
+    if (data && !data.error) data.error = apiErrorText(data);
+    const modeError = data[`${mode}_error`];
+    const modeBalance = data[mode];
+    data.success = res.ok && !modeError && modeBalance !== null && modeBalance !== undefined;
+    if (!data.success) data.error = modeError || data.error || apiErrorText(data);
+    if (data.success) data.message = `可用余额 ${fmtMoney(modeBalance)} USDT`;
 
     btn.disabled = false;
     btn.textContent = '测试连接';
@@ -4142,6 +4149,7 @@ async function testModelByName(name) {
         body: JSON.stringify({ name }),
     }));
     const data = await res.json().catch(() => ({}));
+    if (data && !data.error) data.error = apiErrorText(data);
 
     if (btn && btn.tagName === 'BUTTON') {
         btn.disabled = false;
