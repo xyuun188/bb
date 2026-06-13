@@ -2,7 +2,7 @@
 
 This script replaces the old single 32B main service with:
 - Qwen3-14B-AWQ on port 8000 for trend/momentum/final decision.
-- DeepSeek-R1-Distill-Qwen-14B-AWQ on port 8003 for sentiment/position/risk.
+- DeepSeek-R1-Distill-Qwen-14B-AWQ on port 8002 for sentiment/position/risk.
 
 Use --plan-only first to review the exact known service/model paths before any
 remote cleanup command is executed.

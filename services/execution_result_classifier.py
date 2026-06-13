@@ -13,6 +13,7 @@ orchestrator.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -87,28 +88,64 @@ class ExecutionResultClassifier:
         message = str(text or "").strip()
         if not message:
             return None
-        if "51008" in message or "Insufficient USDT margin" in message:
+        okx_detail = " ".join(self._extract_okx_error_fragments(message))
+        normalized = f"{message} {okx_detail}".strip()
+        normalized_lower = normalized.lower()
+        if "51008" in normalized or "Insufficient USDT margin" in normalized:
             return (
                 "OKX 返回错误码 51008：账户可用 USDT 保证金不足，订单没有提交成功。"
                 "通常是当前持仓/挂单占用保证金过高、可用余额不足，或本轮计划仓位过大；"
                 "系统应优先处理已有持仓的平仓/减仓，不再继续加仓。"
             )
-        if "59670" in message or "more than 5 open orders" in message:
+        if "59670" in normalized or "more than 5 open orders" in normalized:
             return (
                 "OKX 拒绝调整杠杆：该交易对当前挂单超过 5 条。"
                 "系统会跳过重复杠杆设置，必要时只清理旧的非保护挂单后重试。"
             )
+        if "tptriggerpx" in normalized_lower and "error" in normalized_lower:
+            return (
+                "OKX 返回错误码 51000：保护止盈触发价 tpTriggerPx 无效，订单没有提交成功。"
+                "通常是止盈价方向、精度或与当前价距离不符合 OKX 规则；"
+                "系统需要重新计算保护止盈参数后再提交。"
+            )
         if (
-            "open interest" in message.lower()
-            and "platform" in message.lower()
-            and "limit" in message.lower()
-        ) or "has reached the platform's limit" in message:
+            "open interest" in normalized_lower
+            and "platform" in normalized_lower
+            and "limit" in normalized_lower
+        ) or "has reached the platform's limit" in normalized:
             return (
                 "OKX 拒绝开仓：该合约当前平台总持仓量已经达到 OKX 上限，"
                 "交易所暂时不允许继续增加这个合约的新仓。"
                 "这不是 AI 方向或下单数量计算错误；系统会临时跳过该币种，稍后等 OKX 限制解除再重新分析。"
             )
         return None
+
+    @staticmethod
+    def _extract_okx_error_fragments(message: str) -> list[str]:
+        start = message.find("{")
+        end = message.rfind("}")
+        if start < 0 or end <= start:
+            return []
+        try:
+            payload = json.loads(message[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            rows = [payload] if isinstance(payload, dict) else []
+        fragments: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = row.get("sCode") or row.get("code")
+            message_text = row.get("sMsg") or row.get("msg") or row.get("message")
+            if code:
+                fragments.append(str(code))
+            if message_text:
+                fragments.append(str(message_text))
+        return fragments
 
     @staticmethod
     def is_no_exchange_position_error(message: Any) -> bool:
@@ -151,7 +188,9 @@ class ExecutionResultClassifier:
         if result is None or result.status != OrderStatus.FILLED:
             return False
         order_id = str(result.exchange_order_id or "").strip()
-        return bool(order_id and order_id not in {"hold", "rejected", "no_position"})
+        if not order_id or order_id in {"hold", "rejected", "no_position"}:
+            return False
+        return bool(result.quantity > 0 and result.price > 0)
 
     def _entry_tracking_reason(
         self,

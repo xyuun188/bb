@@ -86,6 +86,33 @@ def test_crowded_side_cap_hard_ceiling() -> None:
     assert decision.raw_response["crowded_side_cap"]["mode"] == "hard_ceiling"
 
 
+def test_crowded_side_cap_hard_ceiling_allows_strict_probe_override() -> None:
+    exposure = {
+        "dominant_side": "short",
+        "net_ratio": -0.7,
+        "short_count": 14,
+        "short_count_share": 0.9,
+        "short_unrealized_pnl": -8.0,
+    }
+    exceptional_probe = {
+        "score": 9.0,
+        "min_score_required": 0.95,
+        "expected_net_return_pct": 2.0,
+        "profit_quality_ratio": 3.0,
+        "confidence": 0.95,
+        "ml_aligned": True,
+        "local_profit_aligned": True,
+        "expert_aligned": True,
+        "probe_fraction": 0.04,
+        "max_probe_size_pct": 0.012,
+    }
+    decision = _short_entry(opportunity=exceptional_probe, exposure=exposure)
+    decision.position_size_pct = 0.012
+
+    assert EntryCrowdedSideCapPolicy().block_reason(decision) is None
+    assert decision.raw_response["crowded_side_cap"]["mode"] == "hard_ceiling_probe_override"
+
+
 def test_crowded_side_cap_ignored_when_not_dominant() -> None:
     exposure = {
         "dominant_side": "neutral",

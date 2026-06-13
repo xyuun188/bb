@@ -5,6 +5,9 @@ This repository has a project-specific Hindsight memory bank:
 - Bank ID: `bb`
 - Project root: `F:\bb`
 - Scope: only memories about this project. Do not store this project's memories in `codex` or another project bank.
+- Hindsight API/MCP base: `http://45.207.197.48:18888`
+- Hindsight MCP endpoint: `http://45.207.197.48:18888/mcp/`
+- Hindsight control panel: `http://45.207.197.48:19999/zh-CN`
 
 At the beginning of a Codex session for this repository, recall project memory:
 
@@ -172,6 +175,7 @@ powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\add_project_memory
 ## Codex Automatic Hindsight Workflow
 
 For this repository, use the project-specific Hindsight bank `bb` automatically.
+Hindsight reads and writes must use `http://45.207.197.48:18888` by default; the MCP endpoint is `http://45.207.197.48:18888/mcp/`, and the control panel is `http://45.207.197.48:19999/zh-CN`.
 
 At the beginning of every Codex session for this repository, recall memory before substantive work. The default command is the fast path: it reads `PROJECT_MEMORY.md` and skips server-side live recall to avoid shell timeouts.
 

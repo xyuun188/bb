@@ -893,6 +893,132 @@ async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_priva
     assert sizing["planned_stop_loss_usdt"] > 0
 
 
+def test_entry_opportunity_gate_blocks_strategy_learning_entry_pause():
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_entry_pause": True,
+            "strategy_learning_entry_pause_reason": "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针。",
+        }
+    }
+
+    reason = EntryOpportunityGatePolicy().gate_reason(decision)
+
+    assert reason is not None
+    assert "暂停新开仓探针" in reason
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_skips_strategy_learning_when_entry_paused():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_entry_pause": True,
+            "strategy_learning_entry_pause_reason": "策略护栏暂停新探针",
+            "strategy_learning": {
+                "runtime": {
+                    "profile_id": "candidate_1",
+                    "position_size_multiplier": 0.62,
+                    "probe_fraction": 0.05,
+                    "max_probe_size_pct": 0.018,
+                }
+            },
+        },
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.8,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.15,
+            "raw_expected_return_pct": 0.8,
+            "profit_quality_ratio": 1.0,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
+    assert sizing["applied"] is False
+    assert sizing["entry_paused"] is True
+    assert sizing["reason"] == "策略护栏暂停新探针"
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.raw_response = {
+        "strategy_mode": {
+            "strategy_learning_sizing": {
+                "profile_id": "balanced_probe",
+                "position_size_multiplier": 0.8,
+                "probe_fraction": 0.08,
+                "max_probe_size_pct": 0.018,
+                "side_overrides": {"long": {"size_multiplier": 0.9, "reason": "long probe"}},
+            }
+        },
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.8,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.15,
+            "raw_expected_return_pct": 0.8,
+            "profit_quality_ratio": 1.0,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
+    assert sizing["applied"] is True
+    assert sizing["profile_id"] == "balanced_probe"
+    assert sizing["probe_cap_applied"] is True
+    assert decision.position_size_pct <= 0.018
+
+
 @pytest.mark.asyncio
 async def test_entry_policy_fails_fast_without_profit_risk_sizing_dependency():
     policy = EntryPolicy()

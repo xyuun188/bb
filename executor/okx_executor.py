@@ -11,6 +11,7 @@ import os
 import re
 import time
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import structlog
@@ -716,11 +717,30 @@ class OKXExecutor(AbstractExecutor):
                     price,
                     ticker=ticker,
                 )
+                protection = self._format_attached_sl_tp_prices(
+                    ccxt,
+                    okx_symbol,
+                    decision,
+                    stop_loss_px,
+                    take_profit_px,
+                    price,
+                )
+                if not protection.get("ok"):
+                    return ExecutionResult(
+                        order_id="rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response=protection,
+                    )
                 params["attachAlgoOrds"] = [
                     {
-                        "tpTriggerPx": str(take_profit_px),
+                        "tpTriggerPx": protection["take_profit_price"],
                         "tpOrdPx": "-1",
-                        "slTriggerPx": str(stop_loss_px),
+                        "slTriggerPx": protection["stop_loss_price"],
                         "slOrdPx": "-1",
                     }
                 ]
@@ -798,7 +818,44 @@ class OKXExecutor(AbstractExecutor):
                 order.get("status") or (order.get("info") or {}).get("state")
             )
             if decision.is_entry and status == OrderStatus.FILLED and filled_contracts <= 0:
-                filled_contracts = self._safe_float(order.get("amount") or order_quantity, 0.0)
+                info = order.get("info") or {}
+                order_id = str(order.get("id") or info.get("ordId") or "").strip()
+                logger.warning(
+                    "entry order reported filled without a filled quantity; tracking until OKX position sync confirms it",
+                    order_id=order_id,
+                    symbol=okx_symbol,
+                    requested_contracts=order_quantity,
+                    order_status=status.value,
+                )
+                return ExecutionResult(
+                    order_id=order_id or "entry_fill_quantity_missing",
+                    symbol=decision.symbol,
+                    side=side,
+                    order_type="market",
+                    quantity=0.0,
+                    price=execution_price,
+                    status=OrderStatus.PENDING,
+                    fee=self._order_fee_cost(order),
+                    exchange_order_id=order_id or None,
+                    timestamp=datetime.now(UTC),
+                    raw_response={
+                        **order,
+                        "entry_tracking": True,
+                        "fill_quantity_missing": True,
+                        "message": (
+                            "OKX 订单状态显示已完成，但没有返回大于 0 的真实成交数量；"
+                            "系统不会用下单数量冒充成交数量，也不会先创建本地持仓，"
+                            "等待下一轮 OKX 订单/仓位同步确认。"
+                        ),
+                        "request_params": params,
+                        "okx_symbol": okx_symbol,
+                        "contract_size": contract_size,
+                        "order_contracts": order_quantity,
+                        "filled_contracts": filled_contracts,
+                        "planned_base_quantity": base_quantity,
+                        "order_status": status.value,
+                    },
+                )
             filled_base_quantity = filled_contracts * contract_size
 
             if decision.is_exit and target_side:
@@ -1968,7 +2025,75 @@ class OKXExecutor(AbstractExecutor):
             if primary_ref > 0:
                 stop_loss_px = max(stop_loss_px, primary_ref + trigger_gap)
                 take_profit_px = min(take_profit_px, primary_ref - trigger_gap)
-        return round(stop_loss_px, 8), round(take_profit_px, 8)
+        return stop_loss_px, take_profit_px
+
+    def _format_attached_sl_tp_prices(
+        self,
+        ccxt,
+        okx_symbol: str,
+        decision: DecisionOutput,
+        stop_loss_px: float,
+        take_profit_px: float,
+        reference_price: float,
+    ) -> dict[str, Any]:
+        """Format attached TP/SL trigger prices with OKX market precision."""
+
+        def fmt(value: float) -> str | None:
+            if value <= 0:
+                return None
+            try:
+                text = str(ccxt.price_to_precision(okx_symbol, value))
+            except Exception as exc:
+                logger.debug(
+                    "OKX price precision failed for attached protection",
+                    symbol=okx_symbol,
+                    price=value,
+                    error=safe_error_text(exc),
+                )
+                text = format(value, ".12g")
+            try:
+                parsed = Decimal(text)
+            except (InvalidOperation, ValueError):
+                return None
+            if parsed <= 0:
+                return None
+            return format(parsed.normalize(), "f")
+
+        stop_text = fmt(stop_loss_px)
+        take_text = fmt(take_profit_px)
+        ref = self._safe_float(reference_price, 0.0)
+        stop_value = self._safe_float(stop_text, 0.0)
+        take_value = self._safe_float(take_text, 0.0)
+        valid = bool(stop_text and take_text)
+        if valid and ref > 0:
+            if decision.action == Action.LONG:
+                valid = stop_value < ref < take_value
+            else:
+                valid = take_value < ref < stop_value
+        if not valid:
+            action_label = "做多" if decision.action == Action.LONG else "做空"
+            return {
+                "ok": False,
+                "error": (
+                    f"OKX 保护单价格校验失败：{action_label}开仓的止损/止盈触发价不符合交易所精度或方向约束，"
+                    "本次未提交订单，等待下一轮行情重新计算。"
+                ),
+                "okx_symbol": okx_symbol,
+                "reference_price": ref,
+                "raw_stop_loss_price": stop_loss_px,
+                "raw_take_profit_price": take_profit_px,
+                "stop_loss_price": stop_text,
+                "take_profit_price": take_text,
+            }
+        return {
+            "ok": True,
+            "okx_symbol": okx_symbol,
+            "reference_price": ref,
+            "raw_stop_loss_price": stop_loss_px,
+            "raw_take_profit_price": take_profit_px,
+            "stop_loss_price": stop_text,
+            "take_profit_price": take_text,
+        }
 
     async def get_balance(self, asset: str = "USDT") -> float:
         ccxt = await self._get_ccxt()

@@ -185,6 +185,66 @@ class _LeverageUnknownAfterOpenOrderLimitCcxt:
         raise RuntimeError(self.error_text)
 
 
+class _PrecisionEntryCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.create_calls: list[tuple[Any, ...]] = []
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "SHIB-USDT-SWAP"},
+        }
+
+    def amount_to_precision(self, _symbol: str, amount: float) -> str:
+        return str(float(amount))
+
+    def price_to_precision(self, _symbol: str, price: float) -> str:
+        return f"{float(price):.9f}"
+
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        return {"last": 0.000008789, "bid": 0.000008788, "ask": 0.00000879}
+
+    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.create_calls.append((symbol, order_type, side, quantity, price, params))
+        return {
+            "id": "entry-shib",
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": quantity,
+            "filled": quantity,
+            "price": price or 0.000008789,
+            "average": 0.000008789,
+            "status": "closed",
+            "info": {"state": "filled", "ordId": "entry-shib", "side": side},
+        }
+
+    async def fetch_order(self, _order_id: str, _symbol: str) -> dict[str, Any]:
+        return {
+            "id": "entry-shib",
+            "filled": 1.0,
+            "average": 0.000008789,
+            "status": "closed",
+            "info": {"state": "filled", "ordId": "entry-shib"},
+        }
+
+
 def _executor(exchange: Any) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
@@ -217,6 +277,22 @@ def _entry_decision() -> DecisionOutput:
         suggested_leverage=5.0,
         raw_response={},
         feature_snapshot={"current_price": 100.0},
+    )
+
+
+def _shib_entry_decision() -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="SHIB/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test shib entry",
+        position_size_pct=0.1,
+        suggested_leverage=3.0,
+        stop_loss_pct=0.012,
+        take_profit_pct=0.024,
+        raw_response={},
+        feature_snapshot={"current_price": 0.000008789},
     )
 
 
@@ -322,6 +398,51 @@ async def test_okx_exit_after_submit_position_refresh_failure_is_tracked_unknown
     assert hidden_value not in rendered
     assert "Authorization: ***" in rendered
     assert "password=***" in rendered
+
+
+def test_okx_attached_protection_uses_market_price_precision() -> None:
+    exchange = _PrecisionEntryCcxt()
+    executor = _executor(exchange)
+    decision = _shib_entry_decision()
+    stop_loss, take_profit = executor._attached_sl_tp_prices(
+        decision,
+        0.000008789,
+        ticker={"last": 0.000008789, "bid": 0.000008788, "ask": 0.00000879},
+    )
+
+    result = executor._format_attached_sl_tp_prices(
+        exchange,
+        "SHIB/USDT:USDT",
+        decision,
+        stop_loss,
+        take_profit,
+        0.000008789,
+    )
+
+    assert result["ok"] is True
+    assert result["stop_loss_price"] == "0.000008683"
+    assert result["take_profit_price"] == "0.000009001"
+
+
+def test_okx_attached_protection_rejects_invalid_direction_after_precision() -> None:
+    class RoundedToReferenceCcxt(_PrecisionEntryCcxt):
+        def price_to_precision(self, _symbol: str, _price: float) -> str:
+            return "0.000008789"
+
+    exchange = RoundedToReferenceCcxt()
+    executor = _executor(exchange)
+    result = executor._format_attached_sl_tp_prices(
+        exchange,
+        "SHIB/USDT:USDT",
+        _shib_entry_decision(),
+        0.00000868,
+        0.000009,
+        0.000008789,
+    )
+
+    assert result["ok"] is False
+    assert result["stop_loss_price"] == "0.000008789"
+    assert result["take_profit_price"] == "0.000008789"
 
 
 @pytest.mark.asyncio

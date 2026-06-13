@@ -60,6 +60,36 @@ def test_entry_capacity_counts_staged_entries() -> None:
     assert reason is not None
 
 
+def test_entry_capacity_counts_fragmented_positions_as_one_group() -> None:
+    policy = EntryCapacityPolicy(_normalize, lambda: 2)
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("OP/USDT"),
+        [
+            {"model_name": "ensemble_trader", "symbol": "ARB/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "ARB/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "YGG/USDT", "side": "long"},
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is not None
+    assert "2" in reason
+
+
+def test_entry_capacity_reserves_same_symbol_group_once_for_model_total() -> None:
+    policy = EntryCapacityPolicy(_normalize, lambda: 3)
+    staged = policy.empty_staged_counts()
+
+    policy.reserve_slot("ensemble_trader", _decision("BTC/USDT", Action.LONG), staged)
+    policy.reserve_slot("ensemble_trader", _decision("BTC/USDT", Action.LONG), staged)
+
+    assert staged["model_totals"] == {"ensemble_trader": 1}
+    assert staged["side_totals"] == {"long": 2}
+    assert staged["symbol_side"] == {("ensemble_trader", "BTC-USDT", "long"): 2}
+
+
 def test_entry_capacity_reserves_staged_entry_slot() -> None:
     policy = EntryCapacityPolicy(_normalize, lambda: 3)
     staged = policy.empty_staged_counts()

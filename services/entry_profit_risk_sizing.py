@@ -89,6 +89,90 @@ class EntryProfitRiskSizingPolicy:
         except (TypeError, ValueError):
             return default
 
+    @classmethod
+    def _strategy_learning_sizing(cls, raw: dict[str, Any]) -> dict[str, Any]:
+        strategy_mode = cls._safe_dict(raw.get("strategy_mode"))
+        sizing = cls._safe_dict(strategy_mode.get("strategy_learning_sizing"))
+        context = cls._safe_dict(raw.get("strategy_learning_context"))
+        learning = cls._safe_dict(context.get("strategy_learning"))
+        mode_learning = cls._safe_dict(strategy_mode.get("strategy_learning"))
+        if (
+            context.get("strategy_learning_entry_pause")
+            or strategy_mode.get("strategy_learning_entry_pause")
+            or learning.get("entry_pause")
+            or mode_learning.get("entry_pause")
+        ):
+            return {
+                "entry_paused": True,
+                "reason": (
+                    context.get("strategy_learning_entry_pause_reason")
+                    or strategy_mode.get("strategy_learning_entry_pause_reason")
+                    or learning.get("entry_pause_reason")
+                    or mode_learning.get("entry_pause_reason")
+                    or "strategy learning entry pause is active"
+                ),
+            }
+        runtime = cls._safe_dict(learning.get("runtime"))
+        if runtime:
+            sizing = {**runtime, **sizing}
+        if not sizing and strategy_mode:
+            sizing = {
+                "position_size_multiplier": strategy_mode.get("position_size_multiplier"),
+                "probe_fraction": strategy_mode.get("probe_fraction"),
+                "max_probe_size_pct": strategy_mode.get("max_probe_size_pct"),
+                "side_overrides": strategy_mode.get("side_quality"),
+            }
+        return sizing
+
+    @classmethod
+    def _apply_strategy_learning_sizing(
+        cls,
+        *,
+        current_size: float,
+        action_side: str,
+        sizing: dict[str, Any],
+    ) -> dict[str, Any]:
+        if current_size <= 0 or not sizing:
+            return {"applied": False}
+        if sizing.get("entry_paused"):
+            return {
+                "applied": False,
+                "entry_paused": True,
+                "reason": str(sizing.get("reason") or "strategy learning entry pause is active")[
+                    :240
+                ],
+            }
+        global_multiplier = min(
+            max(cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.10), 1.25
+        )
+        side_overrides = cls._safe_dict(sizing.get("side_overrides"))
+        side_row = cls._safe_dict(side_overrides.get(action_side))
+        side_multiplier = min(
+            max(cls._safe_float(side_row.get("size_multiplier"), 1.0), 0.10), 1.25
+        )
+        probe_fraction = min(max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.0), 0.10)
+        max_probe_size = min(
+            max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0), 0.03
+        )
+        adjusted = min(max(current_size * global_multiplier * side_multiplier, 0.0), 1.0)
+        cap = max_probe_size if max_probe_size > 0 and probe_fraction > 0 else 0.0
+        if cap > 0:
+            adjusted = min(adjusted, cap)
+        applied = abs(adjusted - current_size) > 1e-9
+        return {
+            "applied": applied,
+            "profile_id": sizing.get("profile_id"),
+            "action_side": action_side,
+            "original_position_size_pct": round(current_size, 6),
+            "position_size_pct": round(adjusted, 6),
+            "position_size_multiplier": round(global_multiplier, 6),
+            "side_size_multiplier": round(side_multiplier, 6),
+            "probe_fraction": round(probe_fraction, 6),
+            "max_probe_size_pct": round(max_probe_size, 6),
+            "probe_cap_applied": bool(cap > 0 and adjusted <= cap + 1e-12),
+            "reason": str(sizing.get("reason") or side_row.get("reason") or "")[:240],
+        }
+
     def _missing_dependencies(self) -> list[str]:
         required = {
             "allocated_order_balance": self.allocated_order_balance,
@@ -281,6 +365,18 @@ class EntryProfitRiskSizingPolicy:
                 current_size = loser_size_cap
                 decision.position_size_pct = current_size
                 caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
+        strategy_sizing = self._strategy_learning_sizing(raw)
+        strategy_sizing_applied = self._apply_strategy_learning_sizing(
+            current_size=current_size,
+            action_side="long" if str(decision.action.value) == "long" else "short",
+            sizing=strategy_sizing,
+        )
+        if strategy_sizing_applied.get("applied"):
+            current_size = self._safe_float(
+                strategy_sizing_applied.get("position_size_pct"), current_size
+            )
+            decision.position_size_pct = current_size
+            caps.append("strategy learning bounded sizing applied")
         balance = await self.allocated_order_balance(model_mode, decision)
         if balance <= 0:
             return
@@ -590,6 +686,7 @@ class EntryProfitRiskSizingPolicy:
             "risk_budget_boost": risk_budget_boost,
             "probe_budget_guard": probe_budget_guard,
             "pnl_structure_guard": pnl_structure_guard,
+            "strategy_learning_sizing": strategy_sizing_applied,
             "notional_floor_applied": current_size > original_size_before_floor,
             "original_notional_usdt": round(original_notional, 6),
             "target_min_notional_usdt": round(target_min_notional, 6),
@@ -600,6 +697,9 @@ class EntryProfitRiskSizingPolicy:
         }
         if planned_loss > max_loss:
             decision.position_size_pct = max_size_pct
+            if strategy_sizing_applied.get("applied"):
+                strategy_sizing_applied["position_size_pct"] = round(max_size_pct, 6)
+                strategy_sizing_applied["capped_by_stop_loss_budget"] = True
             raw["profit_risk_sizing"]["capped_stop_loss_usdt"] = round(
                 balance * max_size_pct * leverage * stress_stop_loss_pct,
                 6,

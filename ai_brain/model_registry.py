@@ -370,10 +370,10 @@ class ModelRegistry:
                         f"{self._batch_expert_last_error_by_provider.get(provider_key) or 'recent batch expert failure'}"
                     )
                     logger.warning(
-                        "batch expert circuit breaker active, using local fallback",
+                        "batch expert circuit breaker active, retrying experts independently",
                         reason=reason,
                     )
-                    fallback, fallback_timings = self._batch_local_fallback_decisions(
+                    fallback, fallback_timings = await self._retry_provider_group_independently(
                         features,
                         context,
                         provider_group,
@@ -453,7 +453,7 @@ class ModelRegistry:
                     else:
                         self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
                     logger.warning(
-                        "batch expert decide failed, using fast local expert fallback",
+                        "batch expert decide failed, retrying experts independently",
                         provider_model=_provider_model_name(batch_model),
                         experts=expert_names,
                         error=error_text,
@@ -466,7 +466,7 @@ class ModelRegistry:
                             "reason": error_text,
                         }
                     )
-                    fallback, fallback_timings = self._batch_local_fallback_decisions(
+                    fallback, fallback_timings = await self._retry_provider_group_independently(
                         features,
                         context,
                         provider_group,
@@ -632,6 +632,117 @@ class ModelRegistry:
             reverse=True,
         )
         return decisions
+
+    async def _retry_provider_group_independently(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any],
+        active_models: list[AbstractAIModel],
+        batch_model: AbstractAIModel,
+        started_at: datetime,
+        duration: float,
+        reason: str,
+        *,
+        status: str,
+    ) -> tuple[dict[str, DecisionOutput], list[dict[str, Any]]]:
+        """Retry each expert with a real LLM call before using synthetic batch fallback."""
+
+        retry_context = dict(context)
+        retry_context["expert_mode"] = True
+        retry_context["_force_independent_expert"] = True
+        retry_context["_batch_failure_independent_retry"] = {
+            "status": status,
+            "reason": reason[:240],
+            "provider_model": _provider_model_name(batch_model),
+        }
+
+        async def _retry_one(
+            model: AbstractAIModel,
+        ) -> tuple[AbstractAIModel, DecisionOutput | None, dict[str, Any] | None, str]:
+            retry_started_at = datetime.now(UTC)
+            perf_started = time.perf_counter()
+            try:
+                timeout_seconds = max(float(settings.ai_expert_timeout_seconds or 30.0), 5.0)
+                result = await asyncio.wait_for(
+                    model.decide(features, retry_context),
+                    timeout=timeout_seconds,
+                )
+                retry_duration = round(time.perf_counter() - perf_started, 3)
+                if not isinstance(result, DecisionOutput):
+                    return model, None, None, "independent retry returned invalid result"
+                result.model_name = model.name
+                raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                raw["batch_failure_independent_retry"] = True
+                raw["batch_failure_status"] = status
+                raw["batch_failure_reason"] = reason[:240]
+                raw.setdefault(
+                    "provider_model",
+                    _provider_model_name(model) or _provider_model_name(batch_model),
+                )
+                result.raw_response = raw
+                return (
+                    model,
+                    result,
+                    {
+                        "stage": "expert_batch_failure_retry",
+                        "name": model.name,
+                        "status": "completed",
+                        "started_at": retry_started_at.isoformat(),
+                        "duration_sec": retry_duration,
+                        "batch_expert": False,
+                        "shared_batch_call": False,
+                        "batch_failure_status": status,
+                        "action": result.action.value,
+                        "confidence": result.confidence,
+                        "provider_model": raw.get("provider_model"),
+                        "reason": reason[:240],
+                    },
+                    "",
+                )
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=240)
+                context.setdefault("_model_failures", []).append(
+                    {
+                        "expert_name": model.name,
+                        "provider_model": _provider_model_name(model),
+                        "reason": f"batch independent retry failed: {error_text}",
+                    }
+                )
+                return model, None, None, error_text
+
+        results = await asyncio.gather(*[_retry_one(model) for model in active_models])
+        retry_decisions: dict[str, DecisionOutput] = {}
+        retry_timings: list[dict[str, Any]] = []
+        failed_models: list[AbstractAIModel] = []
+        failed_reasons: dict[str, str] = {}
+        for model, decision, timing, error_text in results:
+            if isinstance(decision, DecisionOutput) and isinstance(timing, dict):
+                retry_decisions[model.name] = decision
+                retry_timings.append(timing)
+            else:
+                failed_models.append(model)
+                failed_reasons[model.name] = error_text
+        if not failed_models:
+            return retry_decisions, retry_timings
+
+        fallback, fallback_timings = self._batch_local_fallback_decisions(
+            features,
+            context,
+            failed_models,
+            batch_model,
+            started_at,
+            duration,
+            reason,
+            status=status,
+        )
+        for row in fallback_timings:
+            name = str(row.get("name") or "")
+            row["independent_retry_failed"] = True
+            if failed_reasons.get(name):
+                row["independent_retry_error"] = failed_reasons[name][:240]
+        retry_decisions.update(fallback)
+        retry_timings.extend(fallback_timings)
+        return retry_decisions, retry_timings
 
     async def _retry_independent_experts(
         self,

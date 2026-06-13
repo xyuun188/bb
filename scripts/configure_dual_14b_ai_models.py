@@ -31,6 +31,9 @@ from core.safe_output import safe_print  # noqa: E402
 
 QWEN_EXPERT_NAMES = {"trend_expert", "momentum_expert", "decision_maker"}
 R1_EXPERT_NAMES = {"sentiment_expert", "position_expert", "risk_expert"}
+DEFAULT_PUBLIC_MODEL_HOST = "103.85.84.147"
+DEFAULT_QWEN_PUBLIC_PORT = 21840
+DEFAULT_R1_PUBLIC_PORT = 21842
 
 
 def _api_base(host: str, port: int) -> str:
@@ -40,10 +43,15 @@ def _api_base(host: str, port: int) -> str:
     return f"http://{normalized}:{port}/v1"
 
 
-def build_dual_14b_ai_models(*, host: str = "127.0.0.1") -> list[dict[str, Any]]:
+def build_dual_14b_ai_models(
+    *,
+    host: str = DEFAULT_PUBLIC_MODEL_HOST,
+    qwen_port: int = DEFAULT_QWEN_PUBLIC_PORT,
+    r1_port: int = DEFAULT_R1_PUBLIC_PORT,
+) -> list[dict[str, Any]]:
     """Return fixed-slot AI_MODELS entries for the dual-14B deployment."""
-    qwen_base = _api_base(host, QWEN3_14B_TRADE_SERVICE.port)
-    r1_base = _api_base(host, DEEPSEEK_R1_14B_RISK_SERVICE.port)
+    qwen_base = _api_base(host, qwen_port)
+    r1_base = _api_base(host, r1_port)
     models: list[dict[str, Any]] = []
     seen: set[str] = set()
     for slot in FIXED_AI_MODEL_SLOTS:
@@ -115,8 +123,20 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
+        default=DEFAULT_PUBLIC_MODEL_HOST,
         help="Host/IP used by this backend to reach the vLLM services.",
+    )
+    parser.add_argument(
+        "--qwen-port",
+        type=int,
+        default=DEFAULT_QWEN_PUBLIC_PORT,
+        help="Public port mapped to the Qwen vLLM service.",
+    )
+    parser.add_argument(
+        "--r1-port",
+        type=int,
+        default=DEFAULT_R1_PUBLIC_PORT,
+        help="Public port mapped to the DeepSeek R1 vLLM service.",
     )
     parser.add_argument(
         "--apply-dashboard",
@@ -130,7 +150,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    models = build_dual_14b_ai_models(host=args.host)
+    models = build_dual_14b_ai_models(
+        host=args.host,
+        qwen_port=args.qwen_port,
+        r1_port=args.r1_port,
+    )
     if args.apply_dashboard:
         _apply_via_dashboard(models, dashboard_url=args.dashboard_url)
         return

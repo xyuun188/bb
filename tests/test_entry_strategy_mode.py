@@ -14,6 +14,7 @@ def _base_kwargs(**overrides: Any) -> dict[str, Any]:
         "market_regime": {"mode": "uptrend_continuation", "confidence": 0.6},
         "daily_state": {"today_total_pnl": 8.0, "today_high_water_pnl": 12.0},
         "side_performance": {"long": {"pnl": 4.0}, "short": {"pnl": 1.0}},
+        "side_performance_multiday": {},
         "symbol_side_performance": {"BTC/USDT|long": {"pnl": 2.0}},
         "model_contribution_performance": {"ml_profit_model": {"pnl": 1.0}},
         "position_exposure": {"dominant_side": "neutral"},
@@ -160,6 +161,7 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
 
     service.daily_performance_service = Daily()
     service._today_side_performance = side_perf
+    service._multiday_side_performance = side_perf
     service._recent_symbol_side_performance = symbol_side_perf
     service._recent_model_contribution_performance = contribution_perf
     service.entry_position_exposure = Exposure()
@@ -169,6 +171,7 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
         target_position_groups=3,
         roster_fill_market_symbol_min=12,
     )
+    service.strategy_learning_service = None
     result = await service._strategy_mode_context(
         "paper",
         {"mode": "uptrend_continuation", "confidence": 0.6},
@@ -180,3 +183,56 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     assert result["symbol_side_performance"] == {"BTC/USDT|long": {"pnl": 1.0}}
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 1.0}}
     assert result["portfolio_roster"]["market_symbol_min"] == 12
+
+
+@pytest.mark.asyncio
+async def test_trading_service_strategy_mode_context_refreshes_empty_positions() -> None:
+    service = object.__new__(TradingService)
+
+    class Daily:
+        async def state(self, mode: str) -> dict[str, Any]:
+            return {"today_total_pnl": 5.0, "today_high_water_pnl": 6.0}
+
+    class Exposure:
+        def context(self, open_positions):
+            return {"count": len(open_positions), "dominant_side": "long"}
+
+    class Sync:
+        async def get_open_positions_context(self):
+            return [{"symbol": "BTC/USDT", "side": "long", "unrealized_pnl": -1.0}]
+
+    async def side_perf(_mode: str) -> dict[str, Any]:
+        return {"long": {"pnl": 1.0}, "short": {"pnl": 0.0}}
+
+    async def symbol_side_perf(_mode: str) -> dict[str, Any]:
+        return {}
+
+    async def contribution_perf(_mode: str) -> dict[str, Any]:
+        return {}
+
+    async def balance(_mode: str) -> float:
+        return 1_000.0
+
+    service.daily_performance_service = Daily()
+    service._today_side_performance = side_perf
+    service._multiday_side_performance = side_perf
+    service._recent_symbol_side_performance = symbol_side_perf
+    service._recent_model_contribution_performance = contribution_perf
+    service.entry_position_exposure = Exposure()
+    service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
+    service.allocated_order_balance = balance
+    service.entry_strategy_mode_context = EntryStrategyModeContextPolicy(
+        target_position_groups=3,
+        roster_fill_market_symbol_min=12,
+    )
+    service.okx_sync_service = Sync()
+    service.strategy_learning_service = None
+
+    result = await service._strategy_mode_context(
+        "paper",
+        {"mode": "uptrend_continuation", "confidence": 0.6},
+        open_positions=[],
+    )
+
+    assert result["position_exposure"]["count"] == 1
+    assert result["portfolio_roster"]["current_position_groups"] == 1

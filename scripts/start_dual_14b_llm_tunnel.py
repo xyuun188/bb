@@ -2,7 +2,7 @@
 
 The trading backend should use local OpenAI-compatible endpoints:
 - http://127.0.0.1:8000/v1 -> remote qwen3-14b-trade
-- http://127.0.0.1:8003/v1 -> remote deepseek-r1-14b-risk
+- http://127.0.0.1:8002/v1 -> remote deepseek-r1-14b-risk
 
 This keeps remote vLLM ports private while allowing the local paper-trading
 process to call them as if they were local services. Server credentials are read

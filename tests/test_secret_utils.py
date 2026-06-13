@@ -7,6 +7,11 @@ from typing import Any, cast
 import pytest
 
 from config.settings import Settings
+from tests.model_endpoint_fixtures import (
+    DEEPSEEK_PUBLIC_TEST_BASE,
+    PUBLIC_MODEL_TEST_HOST,
+    QWEN_PUBLIC_TEST_BASE,
+)
 from core.secret_utils import (
     is_masked_secret,
     mask_secret,
@@ -158,18 +163,18 @@ def test_dual_14b_config_script_generates_fixed_slot_routing(
 ) -> None:
     from scripts.configure_dual_14b_ai_models import build_dual_14b_ai_models, main
 
-    models = build_dual_14b_ai_models(host="10.0.0.5")
+    models = build_dual_14b_ai_models(host=PUBLIC_MODEL_TEST_HOST)
     by_name = {item["name"]: item for item in models}
 
-    assert by_name["trend_expert"]["api_base"] == "http://10.0.0.5:8000/v1"
+    assert by_name["trend_expert"]["api_base"] == QWEN_PUBLIC_TEST_BASE
     assert by_name["momentum_expert"]["model"] == "qwen3-14b-trade"
     assert by_name["decision_maker"]["model"] == "qwen3-14b-trade"
-    assert by_name["sentiment_expert"]["api_base"] == "http://10.0.0.5:8003/v1"
+    assert by_name["sentiment_expert"]["api_base"] == DEEPSEEK_PUBLIC_TEST_BASE
     assert by_name["position_expert"]["model"] == "deepseek-r1-14b-risk"
     assert by_name["risk_expert"]["model"] == "deepseek-r1-14b-risk"
     assert all(item["api_key"] == "" for item in models)
 
-    main(["--host", "10.0.0.5"])
+    main(["--host", PUBLIC_MODEL_TEST_HOST])
     out = capsys.readouterr().out.strip()
     assert out.startswith("AI_MODELS=")
     payload = json.loads(out.split("=", 1)[1])

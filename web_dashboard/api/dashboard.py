@@ -5,7 +5,9 @@ Dashboard API endpoints — system status, market data, account balance.
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, overload
 
@@ -37,9 +39,57 @@ _competition_service = None
 _EXCHANGE_MARK_CACHE_TTL_SECONDS = 5.0
 _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 5.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
+_DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, float]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
+_dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
+_dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+
+
+def _dashboard_heavy_cache_get(
+    key: tuple[Any, ...], ttl_seconds: float = _DASHBOARD_HEAVY_CACHE_TTL_SECONDS
+) -> Any | None:
+    cached = _dashboard_heavy_cache.get(key)
+    if cached is None:
+        return None
+    cached_at, payload = cached
+    if (datetime.now(UTC) - cached_at).total_seconds() > ttl_seconds:
+        _dashboard_heavy_cache.pop(key, None)
+        return None
+    return copy.deepcopy(payload)
+
+
+def _dashboard_heavy_cache_set(key: tuple[Any, ...], payload: Any) -> Any:
+    _dashboard_heavy_cache[key] = (datetime.now(UTC), copy.deepcopy(payload))
+    return payload
+
+
+async def _dashboard_heavy_cached(
+    key: tuple[Any, ...],
+    builder: Callable[[], Awaitable[Any]],
+    ttl_seconds: float = _DASHBOARD_HEAVY_CACHE_TTL_SECONDS,
+) -> Any:
+    cached = _dashboard_heavy_cache_get(key, ttl_seconds)
+    if cached is not None:
+        return cached
+    lock = _dashboard_heavy_cache_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = _dashboard_heavy_cache_get(key, ttl_seconds)
+        if cached is not None:
+            return cached
+        payload = await builder()
+        return _dashboard_heavy_cache_set(key, payload)
+
+
+def _clear_dashboard_heavy_cache(*names: str) -> None:
+    wanted = {name for name in names if name}
+    if not wanted:
+        _dashboard_heavy_cache.clear()
+        return
+    for key in list(_dashboard_heavy_cache):
+        if key and key[0] in wanted:
+            _dashboard_heavy_cache.pop(key, None)
 
 
 def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
@@ -75,6 +125,200 @@ def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
 def _safe_float_value(value: Any, default: float = 0.0) -> float:
     result = _safe_float(value, default)
     return default if result is None else result
+
+
+def _dashboard_position_key(symbol: Any, side: Any) -> tuple[str, str]:
+    return (_normalize_dashboard_symbol(str(symbol or "")), str(side or "").lower())
+
+
+def _exchange_snapshot_unrealized(snapshot: dict[str, Any], side: str) -> float:
+    snapshot_upl = _safe_float(snapshot.get("upl"), None)
+    if snapshot_upl is not None:
+        return snapshot_upl
+    mark_price = _safe_float(snapshot.get("mark_price"), 0.0) or 0.0
+    entry_price = _safe_float(snapshot.get("entry_price"), 0.0) or 0.0
+    quantity = _safe_float(snapshot.get("contracts"), 0.0) or 0.0
+    if mark_price <= 0 or entry_price <= 0 or quantity <= 0:
+        return 0.0
+    if side == "short":
+        return (entry_price - mark_price) * quantity
+    return (mark_price - entry_price) * quantity
+
+
+def _exchange_snapshot_margin(snapshot: dict[str, Any]) -> float:
+    return _safe_float(snapshot.get("margin_used"), 0.0) or 0.0
+
+
+def _exchange_position_totals(
+    exchange_mark_map: dict[tuple[str, str], dict[str, Any]],
+    fallback_margin_by_key: dict[tuple[str, str], float] | None = None,
+) -> dict[str, float | int]:
+    unrealized = 0.0
+    used_margin = 0.0
+    fallback_margin_by_key = fallback_margin_by_key or {}
+    for key, snapshot in exchange_mark_map.items():
+        side = key[1]
+        unrealized += _exchange_snapshot_unrealized(snapshot, side)
+        margin = _exchange_snapshot_margin(snapshot)
+        used_margin += margin if margin > 0 else fallback_margin_by_key.get(key, 0.0)
+    return {
+        "open_count": len(exchange_mark_map),
+        "unrealized_pnl": round(unrealized, 8),
+        "used_margin": round(used_margin, 8),
+    }
+
+
+def _local_position_margin(row: Any) -> float:
+    quantity = _safe_float(getattr(row, "quantity", None), 0.0) or 0.0
+    entry_price = _safe_float(getattr(row, "entry_price", None), 0.0) or 0.0
+    leverage = max(_safe_float(getattr(row, "leverage", None), 1.0) or 1.0, 1.0)
+    return (quantity * entry_price) / leverage
+
+
+def _local_group_notional(quantity: Any, entry_price: Any) -> float:
+    return (_safe_float(quantity, 0.0) or 0.0) * (_safe_float(entry_price, 0.0) or 0.0)
+
+
+def _group_open_dashboard_positions(
+    positions: list[dict[str, Any]],
+    exchange_mark_map: dict[tuple[str, str], dict[str, Any]],
+    *,
+    mode: str | None,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str, str]] = []
+
+    for item in positions:
+        key_symbol, key_side = _dashboard_position_key(item.get("symbol"), item.get("side"))
+        key = (
+            str(item.get("model_name") or ""),
+            str(item.get("mode") or mode or ""),
+            key_symbol,
+            key_side,
+        )
+        local_qty = _safe_float(item.get("local_quantity", item.get("quantity")), 0.0) or 0.0
+        local_entry = (
+            _safe_float(
+                item.get("local_entry_price", item.get("entry_price")),
+                0.0,
+            )
+            or 0.0
+        )
+        local_unrealized = (
+            _safe_float(
+                item.get("local_unrealized_pnl", item.get("unrealized_pnl")),
+                0.0,
+            )
+            or 0.0
+        )
+
+        if key not in grouped:
+            group = dict(item)
+            group["symbol"] = key_symbol or item.get("symbol")
+            group["side"] = key_side or item.get("side")
+            group["position_ids"] = [item.get("id")] if item.get("id") is not None else []
+            group["split_count"] = 1
+            group["local_quantity"] = local_qty
+            group["local_entry_price"] = local_entry
+            group["local_unrealized_pnl"] = local_unrealized
+            group["_local_notional"] = _local_group_notional(local_qty, local_entry)
+            grouped[key] = group
+            order.append(key)
+            continue
+
+        group = grouped[key]
+        if item.get("id") is not None:
+            group.setdefault("position_ids", []).append(item.get("id"))
+        group["split_count"] = int(group.get("split_count") or 1) + 1
+        group["local_quantity"] = (_safe_float(group.get("local_quantity"), 0.0) or 0.0) + local_qty
+        group["local_unrealized_pnl"] = (
+            _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
+        ) + local_unrealized
+        group["_local_notional"] = (
+            _safe_float(group.get("_local_notional"), 0.0) or 0.0
+        ) + _local_group_notional(local_qty, local_entry)
+        if group["local_quantity"]:
+            group["local_entry_price"] = group["_local_notional"] / group["local_quantity"]
+        group["leverage"] = max(
+            _safe_float(group.get("leverage"), 1.0) or 1.0,
+            _safe_float(item.get("leverage"), 1.0) or 1.0,
+        )
+
+    for (symbol, side), snapshot in exchange_mark_map.items():
+        if any(key[2] == symbol and key[3] == side for key in grouped):
+            continue
+        key = (ENSEMBLE_TRADER_NAME, "live" if mode == "live" else "paper", symbol, side)
+        grouped[key] = {
+            "id": None,
+            "model_name": ENSEMBLE_TRADER_NAME,
+            "mode": key[1],
+            "symbol": symbol,
+            "side": side,
+            "quantity": _safe_float(snapshot.get("contracts"), 0.0) or 0.0,
+            "entry_price": _safe_float(snapshot.get("entry_price"), 0.0) or 0.0,
+            "current_price": _safe_float(snapshot.get("mark_price"), 0.0) or 0.0,
+            "change_24h": 0.0,
+            "unrealized_pnl": _exchange_snapshot_unrealized(snapshot, side),
+            "pnl_source": "okx_position",
+            "local_quantity": 0.0,
+            "local_entry_price": 0.0,
+            "local_unrealized_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "leverage": 1.0,
+            "stop_loss": None,
+            "take_profit": None,
+            "is_open": True,
+            "db_is_open": False,
+            "exchange_synced": True,
+            "close_status": "open",
+            "close_status_label": "持有中",
+            "close_status_source": "exchange",
+            "position_status": "持有中",
+            "opened_at": None,
+            "closed_at": None,
+            "position_ids": [],
+            "split_count": 0,
+        }
+        order.append(key)
+
+    result: list[dict[str, Any]] = []
+    for key in order:
+        group = grouped[key]
+        symbol = key[2]
+        side = key[3]
+        local_qty = _safe_float(group.get("local_quantity"), 0.0) or 0.0
+        local_entry = _safe_float(group.get("local_entry_price"), 0.0) or 0.0
+        snapshot = exchange_mark_map.get((symbol, side))
+        if snapshot:
+            exchange_qty = _safe_float(snapshot.get("contracts"), 0.0) or 0.0
+            exchange_entry = _safe_float(snapshot.get("entry_price"), 0.0) or 0.0
+            exchange_mark = _safe_float(snapshot.get("mark_price"), 0.0) or 0.0
+            exchange_upl = _exchange_snapshot_unrealized(snapshot, side)
+            group["quantity"] = exchange_qty if exchange_qty > 0 else local_qty
+            group["entry_price"] = exchange_entry if exchange_entry > 0 else local_entry
+            if exchange_mark > 0:
+                group["current_price"] = exchange_mark
+            group["unrealized_pnl"] = exchange_upl
+            group["pnl_source"] = "okx_position"
+            group["exchange_quantity"] = exchange_qty
+            group["exchange_entry_price"] = exchange_entry
+            group["exchange_mark_price"] = exchange_mark
+            group["exchange_unrealized_pnl"] = exchange_upl
+            group["exchange_margin_used"] = _exchange_snapshot_margin(snapshot)
+        else:
+            group["quantity"] = local_qty
+            group["entry_price"] = local_entry
+            group["unrealized_pnl"] = _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
+            group["pnl_source"] = "local_group"
+        position_ids = [pid for pid in group.get("position_ids", []) if pid is not None]
+        group["position_ids"] = position_ids
+        group["id"] = min(position_ids) if position_ids else None
+        group["can_manual_close"] = (
+            len(position_ids) == 1 and int(group.get("split_count") or 0) <= 1
+        )
+        group.pop("_local_notional", None)
+        result.append(group)
+    return result
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -531,46 +775,31 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
             today_realized_profit, today_realized_loss = [
                 float(value or 0.0) for value in today_result.one()
             ]
+            fallback_margin_by_key: dict[tuple[str, str], float] = {}
+            fallback_unrealized_by_key: dict[tuple[str, str], float] = {}
+            local_open_keys: set[tuple[str, str]] = set()
             for pos in position_rows:
-                if pos.is_open:
-                    if (
-                        exchange_symbols
-                        and _normalize_dashboard_symbol(pos.symbol) not in exchange_symbols
-                    ):
-                        continue
-                    open_count += 1
-                    latest_unrealized = float(pos.unrealized_pnl or 0.0)
-                    snapshot = exchange_marks.get(
-                        (
-                            _normalize_dashboard_symbol(pos.symbol),
-                            str(pos.side or "").lower(),
-                        )
-                    )
-                    if snapshot:
-                        latest_price = float(snapshot.get("mark_price") or 0.0)
-                        snapshot_upl = _safe_float(snapshot.get("upl"), None)
-                        if snapshot_upl is not None:
-                            latest_unrealized = snapshot_upl
-                        elif latest_price > 0:
-                            entry_price = _safe_float(snapshot.get("entry_price"), 0.0) or float(
-                                pos.entry_price or 0.0
-                            )
-                            quantity = _safe_float(snapshot.get("contracts"), 0.0) or float(
-                                pos.quantity or 0.0
-                            )
-                            if pos.side == "short":
-                                latest_unrealized = (entry_price - latest_price) * quantity
-                            else:
-                                latest_unrealized = (latest_price - entry_price) * quantity
-                    unrealized_pnl += latest_unrealized
-                    snapshot_margin = _safe_float((snapshot or {}).get("margin_used"), 0.0)
-                    if snapshot_margin > 0:
-                        used_margin += snapshot_margin
-                    else:
-                        leverage = max(float(pos.leverage or 1.0), 1.0)
-                        used_margin += (
-                            float(pos.quantity or 0.0) * float(pos.entry_price or 0.0)
-                        ) / leverage
+                if not pos.is_open:
+                    continue
+                key = _dashboard_position_key(pos.symbol, pos.side)
+                if exchange_symbols and key[0] not in exchange_symbols:
+                    continue
+                local_open_keys.add(key)
+                fallback_margin_by_key[key] = fallback_margin_by_key.get(
+                    key, 0.0
+                ) + _local_position_margin(pos)
+                fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(key, 0.0) + float(
+                    pos.unrealized_pnl or 0.0
+                )
+            if exchange_marks:
+                exchange_totals = _exchange_position_totals(exchange_marks, fallback_margin_by_key)
+                open_count = int(exchange_totals["open_count"])
+                unrealized_pnl = float(exchange_totals["unrealized_pnl"])
+                used_margin = float(exchange_totals["used_margin"])
+            else:
+                open_count = len(local_open_keys)
+                unrealized_pnl = sum(fallback_unrealized_by_key.values())
+                used_margin = sum(fallback_margin_by_key.values())
     except Exception as exc:
         _log_dashboard_fallback(
             "execution pnl database summary fallback",
@@ -1686,57 +1915,30 @@ async def get_dashboard_summary():
             ]
         exchange_symbols = await _get_exchange_open_position_symbols("paper")
         exchange_mark_map = await _get_exchange_position_mark_map("paper")
-        exchange_total_upl = round(
-            sum(item.get("upl", 0.0) for item in exchange_mark_map.values()), 8
-        )
         if exchange_symbols:
             for account in account_summaries:
-                filtered_positions = [
-                    p
-                    for p in account.get("positions", [])
-                    if _normalize_dashboard_symbol(p.get("symbol")) in exchange_symbols
-                ]
-                display_unrealized = 0.0
-                display_used_margin = 0.0
-                for position in filtered_positions:
-                    side = str(position.get("side") or "").lower()
-                    snapshot = exchange_mark_map.get(
-                        (_normalize_dashboard_symbol(position.get("symbol")), side)
+                fallback_margin_by_key: dict[tuple[str, str], float] = {}
+                for position in account.get("positions", []):
+                    key = _dashboard_position_key(position.get("symbol"), position.get("side"))
+                    if key[0] not in exchange_symbols:
+                        continue
+                    leverage = max(_safe_float(position.get("leverage"), 1.0) or 1.0, 1.0)
+                    fallback_margin_by_key[key] = (
+                        fallback_margin_by_key.get(key, 0.0)
+                        + (
+                            (_safe_float(position.get("quantity"), 0.0) or 0.0)
+                            * (_safe_float(position.get("entry_price"), 0.0) or 0.0)
+                        )
+                        / leverage
                     )
-                    if snapshot:
-                        mark_price = float(snapshot.get("mark_price") or 0.0)
-                        entry_price = _safe_float(snapshot.get("entry_price"), 0.0) or float(
-                            position.get("entry_price") or 0.0
-                        )
-                        quantity = _safe_float(snapshot.get("contracts"), 0.0) or float(
-                            position.get("quantity") or 0.0
-                        )
-                        snapshot_upl = _safe_float(snapshot.get("upl"), None)
-                        if entry_price > 0:
-                            position["entry_price"] = entry_price
-                        if quantity > 0:
-                            position["quantity"] = quantity
-                        if snapshot_upl is not None:
-                            position["unrealized_pnl"] = snapshot_upl
-                        elif mark_price > 0 and entry_price > 0 and quantity > 0:
-                            position["current_price"] = mark_price
-                            if side == "short":
-                                position["unrealized_pnl"] = (entry_price - mark_price) * quantity
-                            else:
-                                position["unrealized_pnl"] = (mark_price - entry_price) * quantity
-                    display_unrealized += float(position.get("unrealized_pnl") or 0.0)
-                    snapshot_margin = _safe_float((snapshot or {}).get("margin_used"), 0.0)
-                    if snapshot_margin > 0:
-                        display_used_margin += snapshot_margin
-                    else:
-                        leverage = max(float(position.get("leverage") or 1.0), 1.0)
-                        display_used_margin += (
-                            float(position.get("quantity") or 0.0)
-                            * float(position.get("entry_price") or 0.0)
-                        ) / leverage
-
-                account["positions"] = filtered_positions
-                account["open_positions"] = len(filtered_positions)
+                exchange_totals = _exchange_position_totals(
+                    exchange_mark_map,
+                    fallback_margin_by_key,
+                )
+                display_unrealized = float(exchange_totals["unrealized_pnl"])
+                display_used_margin = float(exchange_totals["used_margin"])
+                account["positions"] = []
+                account["open_positions"] = int(exchange_totals["open_count"])
                 account["used_margin"] = round(display_used_margin, 8)
                 account["position_margin_used"] = round(display_used_margin, 8)
                 account["wallet_balance"] = (
@@ -1751,8 +1953,6 @@ async def get_dashboard_summary():
                 account["total_pnl_pct"] = (
                     ((account["total_pnl"] / initial_balance) * 100) if initial_balance > 0 else 0.0
                 )
-            if len(account_summaries) == 1 and exchange_mark_map:
-                account_summaries[0]["display_unrealized_pnl"] = exchange_total_upl
 
     okx_account = await _get_dashboard_okx_account_snapshot(mode_manager.mode.value)
 
@@ -1830,12 +2030,7 @@ async def get_positions(
         # after DB rows are loaded. Load all open rows first, filter against OKX,
         # then paginate the display list; otherwise page 1 can incorrectly cap
         # the total at 20.
-        should_paginate_after_exchange_filter = bool(
-            open_only and not closed_only and exchange_mark_map
-        )
-        should_paginate_after_display_filter = should_paginate_after_exchange_filter or bool(
-            closed_only
-        )
+        should_paginate_after_display_filter = bool(open_only or closed_only)
         total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
         page = min(page, total_pages)
         offset = 0 if should_paginate_after_display_filter else (page - 1) * page_size
@@ -2029,22 +2224,12 @@ async def get_positions(
                     latest_price = float(snapshot.get("mark_price") or 0.0)
                     if latest_price > 0:
                         current_price = latest_price
-                    exchange_entry = _safe_float(snapshot.get("entry_price"), 0.0)
-                    exchange_qty = _safe_float(snapshot.get("contracts"), 0.0)
-                    exchange_upl = _safe_float(snapshot.get("upl"), None)
-                    if exchange_entry > 0:
-                        entry_price = exchange_entry
-                    if exchange_qty > 0:
-                        quantity = exchange_qty
-                    if exchange_upl is not None:
-                        unrealized_pnl = exchange_upl
-                        pnl_source = "okx_position"
-                    elif latest_price > 0:
+                    if latest_price > 0:
                         if p.side == "short":
                             unrealized_pnl = (entry_price - latest_price) * quantity
                         else:
                             unrealized_pnl = (latest_price - entry_price) * quantity
-                        pnl_source = "okx_mark_recomputed"
+                        pnl_source = "okx_mark_local_recomputed"
                 elif market_ticker:
                     latest_price = float(
                         market_ticker.get("price") or market_ticker.get("last_price") or 0.0
@@ -2057,11 +2242,10 @@ async def get_positions(
                             unrealized_pnl = (latest_price - entry_price) * quantity
                         pnl_source = "market_ticker_recomputed"
 
-            exchange_synced = (
-                True
-                if exchange_symbols is None or not p.is_open
-                else _normalize_dashboard_symbol(p.symbol) in exchange_symbols
-            )
+            exchange_key = _dashboard_position_key(p.symbol, p.side)
+            exchange_synced = True
+            if p.is_open and exchange_symbols is not None:
+                exchange_synced = exchange_key in exchange_mark_map
             display_is_open = bool(p.is_open and exchange_synced)
             if open_only and not display_is_open:
                 continue
@@ -2189,12 +2373,15 @@ async def get_positions(
             item.pop("_entry_notional_for_avg", None)
         positions = grouped_positions
 
-    display_total = (
-        len(positions) if (open_only and exchange_symbols is not None) or closed_only else total
-    )
-    display_open_count = (
-        len(positions) if open_only and exchange_symbols is not None else open_count
-    )
+    if open_only and not closed_only:
+        positions = _group_open_dashboard_positions(
+            positions,
+            exchange_mark_map,
+            mode=mode,
+        )
+
+    display_total = len(positions) if open_only or closed_only else total
+    display_open_count = len(positions) if open_only else open_count
     display_total_pages = (
         max(1, (display_total + page_size - 1) // page_size) if display_total else 1
     )
@@ -3018,21 +3205,39 @@ async def get_strategy_learning(
     mode: str | None = None,
     hours: int = 168,
     limit: int = 3000,
+    detail: str = "summary",
 ):
     """Return the active strategy-learning feedback and scheduler state."""
     from services.strategy_learning import StrategyLearningService
 
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    selected_detail = "full" if str(detail or "").lower() == "full" else "summary"
+    capped_hours = max(1, min(int(hours or 168), 24 * 90))
+    max_limit = 20000 if selected_detail == "full" else 1500
+    capped_limit = max(100, min(int(limit or 3000), max_limit))
+    max_open_positions = int(settings.max_open_positions_per_model or 20)
+    cache_key = (
+        "strategy-learning",
+        selected_mode,
+        capped_hours,
+        capped_limit,
+        max_open_positions,
+        selected_detail,
+    )
+    cached = _dashboard_heavy_cache_get(cache_key)
+    if cached is not None:
+        return sanitize_payload(cached)
     service = getattr(_trading_service, "strategy_learning_service", None)
     if service is None:
         service = StrategyLearningService()
     payload = await service.dashboard_payload(
         mode=selected_mode,
-        hours=max(1, min(int(hours or 168), 24 * 90)),
-        limit=max(100, min(int(limit or 3000), 20000)),
-        max_open_positions=int(settings.max_open_positions_per_model or 20),
+        hours=capped_hours,
+        limit=capped_limit,
+        max_open_positions=max_open_positions,
+        detail=selected_detail,
     )
-    return sanitize_payload(payload)
+    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, payload))
 
 
 @router.post("/strategy-learning/profiles/{profile_id}/disabled")
@@ -3052,6 +3257,7 @@ async def set_strategy_learning_profile_disabled(
         disabled=bool(disabled),
         reason=reason or "dashboard_manual_control",
     )
+    _clear_dashboard_heavy_cache("strategy-learning")
     return sanitize_payload({"profile_id": profile_id, "disabled": bool(disabled), "state": state})
 
 
@@ -3064,6 +3270,7 @@ async def activate_strategy_learning_profile(profile_id: str):
     if service is None:
         service = StrategyLearningService()
     state = service.set_manual_active_profile(profile_id)
+    _clear_dashboard_heavy_cache("strategy-learning")
     return sanitize_payload({"profile_id": profile_id, "state": state})
 
 
@@ -3076,6 +3283,7 @@ async def rollback_strategy_learning_profile():
     if service is None:
         service = StrategyLearningService()
     state = service.rollback_to_baseline()
+    _clear_dashboard_heavy_cache("strategy-learning")
     return sanitize_payload({"profile_id": "auto", "state": state})
 
 
@@ -3102,6 +3310,10 @@ async def get_profit_attribution(
     capped_hours = max(1, min(int(hours or 24), 720))
     max_rows = max(20, min(int(limit or 200), 1000))
     since = datetime.now(UTC) - timedelta(hours=capped_hours)
+    cache_key = ("profit-attribution", selected_mode, capped_hours, max_rows)
+    cached = _dashboard_heavy_cache_get(cache_key)
+    if cached is not None:
+        return sanitize_payload(cached)
 
     async with get_session_ctx() as session:
         position_result = await session.execute(
@@ -3118,7 +3330,7 @@ async def get_profit_attribution(
         )
         positions = list(position_result.scalars().all())
         if not positions:
-            return {
+            empty_payload = {
                 "mode": selected_mode,
                 "window_hours": capped_hours,
                 "summary": {
@@ -3135,6 +3347,7 @@ async def get_profit_attribution(
                 "records": [],
                 "message": "最近窗口内暂无已平仓记录。",
             }
+            return sanitize_payload(_dashboard_heavy_cache_set(cache_key, empty_payload))
 
         symbols = {p.symbol for p in positions if p.symbol}
         symbol_variants = _dashboard_symbol_query_variants(symbols)
@@ -3243,16 +3456,15 @@ async def get_profit_attribution(
         shadows = list(shadows_by_id.values())
 
     payload = build_profit_attribution(positions, orders, decisions, shadows)
-    return sanitize_payload(
-        {
-            "mode": selected_mode,
-            "window_hours": capped_hours,
-            "sample_limit": max_rows,
-            "since": since.isoformat(),
-            **payload,
-            "message": "按已平仓真实盈亏，结合 AI 决策、订单、影子复盘和本地模型证据做交易级归因。",
-        }
-    )
+    result_payload = {
+        "mode": selected_mode,
+        "window_hours": capped_hours,
+        "sample_limit": max_rows,
+        "since": since.isoformat(),
+        **payload,
+        "message": "按已平仓真实盈亏，结合 AI 决策、订单、影子复盘和本地模型证据做交易级归因。",
+    }
+    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, result_payload))
 
 
 @router.get("/model-contribution/stats")
@@ -3550,6 +3762,10 @@ async def get_shadow_backtests(
     status_filter: str | None = str(status or "").strip().lower()
     if status_filter not in {"pending", "completed"}:
         status_filter = None
+    cache_key = ("shadow-backtests", size, page, status_filter or "", symbol or "")
+    cached = _dashboard_heavy_cache_get(cache_key)
+    if cached is not None:
+        return sanitize_payload(cached)
 
     async with get_session_ctx() as session:
         repo = MemoryRepository(session)
@@ -3616,7 +3832,7 @@ async def get_shadow_backtests(
             }
         )
 
-    return {
+    payload = {
         "records": records,
         "count": total,
         "pending_count": pending_total,
@@ -3628,6 +3844,7 @@ async def get_shadow_backtests(
             "total_pages": max((total + size - 1) // size, 1),
         },
     }
+    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, payload))
 
 
 def _action_label_text(action: str | None) -> str:
@@ -3796,6 +4013,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     }
     cumulative_before = 0.0
     open_unrealized = 0.0
+    fallback_open_unrealized_by_key: dict[tuple[str, str], float] = {}
 
     try:
         exchange_marks = await _get_exchange_position_mark_map(selected_mode)
@@ -3878,27 +4096,15 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             side = str(pos.side or "").lower()
             if exchange_symbols and normalized not in exchange_symbols:
                 continue
-            latest_unrealized = float(pos.unrealized_pnl or 0.0)
-            snapshot = exchange_marks.get((normalized, side))
-            if snapshot:
-                mark_price = float(snapshot.get("mark_price") or 0.0)
-                snapshot_upl = _safe_float(snapshot.get("upl"), None)
-                if snapshot_upl is not None:
-                    latest_unrealized = snapshot_upl
-                else:
-                    entry_price = _safe_float(snapshot.get("entry_price"), 0.0) or float(
-                        pos.entry_price or 0.0
-                    )
-                    quantity = _safe_float(snapshot.get("contracts"), 0.0) or float(
-                        pos.quantity or 0.0
-                    )
-                    if mark_price > 0 and entry_price > 0 and quantity > 0:
-                        latest_unrealized = (
-                            (entry_price - mark_price) * quantity
-                            if side == "short"
-                            else (mark_price - entry_price) * quantity
-                        )
-            open_unrealized += latest_unrealized
+            key = (normalized, side)
+            fallback_open_unrealized_by_key[key] = fallback_open_unrealized_by_key.get(
+                key, 0.0
+            ) + float(pos.unrealized_pnl or 0.0)
+
+    if exchange_marks:
+        open_unrealized = float(_exchange_position_totals(exchange_marks)["unrealized_pnl"])
+    else:
+        open_unrealized = sum(fallback_open_unrealized_by_key.values())
 
     cumulative = cumulative_before
     for date_key in sorted(records):

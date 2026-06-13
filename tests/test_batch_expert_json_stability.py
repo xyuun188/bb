@@ -11,6 +11,7 @@ from ai_brain.model_registry import ModelRegistry
 from ai_brain.prompts import build_batch_experts_user_prompt
 from config.settings import settings
 from data_feed.feature_vector import FeatureVector
+from tests.model_endpoint_fixtures import LOCAL_DEEPSEEK_TEST_BASE, LOCAL_QWEN_TEST_BASE
 
 
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
@@ -98,7 +99,7 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     agent = LLMAgent(
         name="sentiment_expert",
         api_config={
-            "api_base": "http://127.0.0.1:8003/v1",
+            "api_base": LOCAL_DEEPSEEK_TEST_BASE,
             "api_key": "test-key",
             "model": "deepseek-r1-14b-risk",
             "role": "short_timeseries",
@@ -160,6 +161,48 @@ class _BatchFormatFailingExpert(AbstractAIModel):
             raw_response={"local_fallback_called": True},
             feature_snapshot=features.to_dict(),
         )
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _BatchFailingIndividualSuccessExpert(AbstractAIModel):
+    batch_calls = 0
+    individual_calls = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._llm = object()
+        self._model_name = "qwen3-14b-trade"
+
+    async def initialize(self) -> None:
+        return None
+
+    async def decide(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any],
+    ) -> DecisionOutput:
+        type(self).individual_calls += 1
+        assert context.get("_force_independent_expert") is True
+        return DecisionOutput(
+            model_name=self.name,
+            symbol=features.symbol,
+            action=Action.HOLD,
+            confidence=0.55,
+            reasoning="independent retry ok",
+            raw_response={"provider_model": self._model_name},
+            feature_snapshot=features.to_dict(),
+        )
+
+    async def decide_batch_experts(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any],
+        expert_names: list[str],
+    ) -> dict[str, DecisionOutput]:
+        type(self).batch_calls += 1
+        raise RuntimeError('Could not extract valid JSON from: {"experts":')
 
     async def shutdown(self) -> None:
         return None
@@ -278,6 +321,51 @@ async def test_batch_format_failure_activates_circuit_breaker(
 
 
 @pytest.mark.asyncio
+async def test_batch_failure_retries_real_individual_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_batch_expert_circuit_breaker_seconds", 0.0)
+    monkeypatch.setattr(
+        settings,
+        "ai_batch_expert_format_failure_circuit_breaker_seconds",
+        60.0,
+    )
+    _BatchFailingIndividualSuccessExpert.batch_calls = 0
+    _BatchFailingIndividualSuccessExpert.individual_calls = 0
+    registry = ModelRegistry()
+    for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    ):
+        registry.register(_BatchFailingIndividualSuccessExpert(name))
+
+    context: dict[str, Any] = {}
+    decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
+
+    assert set(decisions) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    }
+    assert _BatchFailingIndividualSuccessExpert.batch_calls == 1
+    assert _BatchFailingIndividualSuccessExpert.individual_calls == 5
+    assert {row["status"] for row in context["_model_timings"]} == {"completed"}
+    assert all(
+        row["stage"] == "expert_batch_failure_retry" for row in context["_model_timings"]
+    )
+    assert all(
+        decision.raw_response.get("batch_failure_independent_retry")
+        for decision in decisions.values()
+    )
+
+
+@pytest.mark.asyncio
 async def test_batch_experts_are_grouped_by_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -288,7 +376,7 @@ async def test_batch_experts_are_grouped_by_provider(
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url="http://127.0.0.1:8000/v1",
+                base_url=LOCAL_QWEN_TEST_BASE,
                 model_name="qwen3-14b-trade",
             )
         )
@@ -296,7 +384,7 @@ async def test_batch_experts_are_grouped_by_provider(
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url="http://127.0.0.1:8003/v1",
+                base_url=LOCAL_DEEPSEEK_TEST_BASE,
                 model_name="deepseek-r1-14b-risk",
             )
         )
@@ -343,14 +431,14 @@ async def test_batch_expert_circuit_breaker_is_provider_scoped(
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url="http://127.0.0.1:8000/v1",
+                base_url=LOCAL_QWEN_TEST_BASE,
                 model_name="qwen3-14b-trade",
             )
         )
     registry.register(
         _ProviderBatchExpert(
             "sentiment_expert",
-            base_url="http://127.0.0.1:8003/v1",
+            base_url=LOCAL_DEEPSEEK_TEST_BASE,
             model_name="deepseek-r1-14b-risk",
             fail_batch=True,
         )
@@ -359,7 +447,7 @@ async def test_batch_expert_circuit_breaker_is_provider_scoped(
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url="http://127.0.0.1:8003/v1",
+                base_url=LOCAL_DEEPSEEK_TEST_BASE,
                 model_name="deepseek-r1-14b-risk",
             )
         )

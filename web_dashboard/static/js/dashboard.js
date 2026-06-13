@@ -317,7 +317,7 @@ async function fetchDashboardSummary() {
     updateExecutionAccountPanel(data.execution_account || {});
     updateAccounts(data.accounts || [], data.execution_account || null);
     updateMarketData(data.market || {}, data.accounts || []);
-    updateAutoStatus(data);
+    updateStats(data);
     updateDashboardDecisionCounts(data);
     updateSymbolCount();
     fetchModeCounts();
@@ -4319,7 +4319,12 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
         const pnl = Number(p.unrealized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
         const positionId = Number(p.id || 0);
-        const closeDisabled = closingAllPositions || closingPositionIds.has(positionId);
+        const splitCount = Number(p.split_count || 1);
+        const canManualClose = p.can_manual_close !== false && positionId > 0;
+        const closeDisabled = closingAllPositions || closingPositionIds.has(positionId) || !canManualClose;
+        const quantityMeta = splitCount > 1
+            ? `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${splitCount} \u4e2a\u5206\u7247</div>`
+            : '';
         const closeLabel = closingPositionIds.has(positionId) ? '平仓中...' : '平仓';
         const closeButtonAttrs = [
             'class="btn btn-sm js-close-position"',
@@ -4334,7 +4339,7 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             <td>${escHtml(p.symbol || '-')}</td>
             <td><span style="color:${p.side === 'long' ? 'var(--green)' : 'var(--red)'}">${sideLabel(p.side)}</span></td>
             <td>${Number(p.leverage || 1).toFixed(1)}x</td>
-            <td>${fmtNum(p.quantity)}</td>
+            <td>${fmtNum(p.quantity)}${quantityMeta}</td>
             <td>${fmtPrice(p.entry_price)}</td>
             <td>${fmtPrice(p.current_price || p.entry_price)}</td>
             <td style="color:${pnlColor};font-weight:600;">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
@@ -5954,7 +5959,7 @@ async function fetchStrategyLearning() {
     const hours = Number(hoursEl?.value || 168);
     const limit = hours <= 24 ? 500 : hours <= 72 ? 800 : 1000;
     try {
-        const data = await fetchJSON(`/api/strategy-learning?mode=${state.mode || 'paper'}&hours=${hours}&limit=${limit}`);
+        const data = await fetchJSON(`/api/strategy-learning?mode=${state.mode || 'paper'}&hours=${hours}&limit=${limit}&detail=summary`);
         state.strategyLearning = data;
         renderStrategyLearning(data);
     } catch (err) {
@@ -5982,7 +5987,11 @@ async function activateStrategyLearningProfile(profileId) {
     await fetchStrategyLearning();
 }
 
-async function rollbackStrategyLearning() {
+async function clearStrategyLearningManualOverride() {
     await fetch('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
     await fetchStrategyLearning();
+}
+
+async function rollbackStrategyLearning() {
+    await clearStrategyLearningManualOverride();
 }

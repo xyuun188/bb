@@ -49,10 +49,11 @@ class EntryCapacityPolicy:
         existing_same_symbol += int(staged_symbol_side.get(staged_key, 0))
         is_same_symbol_add = existing_same_symbol > 0
 
-        model_open_count = sum(
-            1 for position in open_positions if position.get("model_name") == model_name
-        )
+        model_open_count = self._model_open_group_count(model_name, open_positions)
         model_open_count += int(staged_model_totals.get(model_name, 0))
+        if not is_same_symbol_add and staged_symbol_side.get(staged_key):
+            model_open_count = max(model_open_count - 1, 0)
+            is_same_symbol_add = True
         max_open_positions = int(self.max_open_positions_per_model_provider() or 0)
         if (
             not is_same_symbol_add
@@ -60,10 +61,20 @@ class EntryCapacityPolicy:
             and model_open_count >= max_open_positions
         ):
             return (
-                "当前持仓数已达上限，暂停新开仓。"
-                f"当前 {model_open_count} 笔，限制 {max_open_positions} 笔。"
+                "当前持仓组数已达上限，暂停新开不同币种/方向仓位。"
+                f"当前 {model_open_count} 组，限制 {max_open_positions} 组。"
             )
         return None
+
+    def _model_open_group_count(self, model_name: str, open_positions: list[dict]) -> int:
+        groups: set[tuple[str | None, str]] = set()
+        for position in open_positions:
+            if position.get("model_name") != model_name:
+                continue
+            symbol_key = self.normalize_symbol(position.get("symbol"))
+            side = str(position.get("side") or "unknown").lower().strip() or "unknown"
+            groups.add((symbol_key, side))
+        return len(groups)
 
     def reserve_slot(
         self,
@@ -80,14 +91,15 @@ class EntryCapacityPolicy:
         staged_entry_counts.setdefault("symbol_side", {})
         staged_entry_counts.setdefault("side_totals", {})
 
-        staged_entry_counts["model_totals"][model_name] = (
-            int(staged_entry_counts["model_totals"].get(model_name, 0)) + 1
-        )
         side = "long" if decision.action == Action.LONG else "short"
         staged_entry_counts["side_totals"][side] = (
             int(staged_entry_counts["side_totals"].get(side, 0)) + 1
         )
         staged_key = (model_name, self.normalize_symbol(decision.symbol), side)
+        if staged_key not in staged_entry_counts["symbol_side"]:
+            staged_entry_counts["model_totals"][model_name] = (
+                int(staged_entry_counts["model_totals"].get(model_name, 0)) + 1
+            )
         staged_entry_counts["symbol_side"][staged_key] = (
             int(staged_entry_counts["symbol_side"].get(staged_key, 0)) + 1
         )

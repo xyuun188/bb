@@ -71,8 +71,33 @@ class EntryOpportunityGatePolicy:
             return None
         return self.suspicious_symbol_policy.reason(decision.symbol)
 
+    def _strategy_learning_entry_pause_reason(self, raw: dict[str, Any]) -> str | None:
+        strategy_mode = _safe_dict(raw.get("strategy_mode"))
+        context = _safe_dict(raw.get("strategy_learning_context"))
+        learning = _safe_dict(context.get("strategy_learning"))
+        mode_learning = _safe_dict(strategy_mode.get("strategy_learning"))
+        paused = bool(
+            context.get("strategy_learning_entry_pause")
+            or strategy_mode.get("strategy_learning_entry_pause")
+            or learning.get("entry_pause")
+            or mode_learning.get("entry_pause")
+        )
+        if not paused:
+            return None
+        reason = (
+            context.get("strategy_learning_entry_pause_reason")
+            or strategy_mode.get("strategy_learning_entry_pause_reason")
+            or learning.get("entry_pause_reason")
+            or mode_learning.get("entry_pause_reason")
+            or "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针，优先释放已有低质量仓位。"
+        )
+        return str(reason)[:300]
+
     def _evaluate(self, decision: DecisionOutput) -> str | None:
         raw = _safe_dict(decision.raw_response)
+        entry_pause_reason = self._strategy_learning_entry_pause_reason(raw)
+        if entry_pause_reason:
+            return entry_pause_reason
         opportunity = _safe_dict(raw.get("opportunity_score"))
         confidence = max(
             float(decision.confidence or 0.0),

@@ -167,6 +167,7 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_closed_created ON positions (execution_mode, is_open, closed_at DESC, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_positions_mode_symbol_side ON positions (execution_mode, symbol, side)",
                 "CREATE INDEX IF NOT EXISTS idx_trade_reflections_closed_created ON trade_reflections (closed_at DESC, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_model_mode_created ON shadow_backtests (model_name, execution_mode, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_strategy_events_mode_created ON strategy_learning_events (execution_mode, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_strategy_events_profile_created ON strategy_learning_events (profile_id, execution_mode, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_strategy_events_type_status ON strategy_learning_events (event_type, event_status, created_at DESC)",

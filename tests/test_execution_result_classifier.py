@@ -75,6 +75,25 @@ def test_execution_reason_translates_known_okx_errors() -> None:
     assert "账户可用 USDT 保证金不足" in policy.reason_from_result(result)
 
 
+def test_execution_reason_translates_okx_json_parameter_errors() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.REJECTED,
+        raw_response={
+            "error": (
+                'okx {"code":"1","data":[{"clOrdId":"local-1",'
+                '"ordId":"","sCode":"51000","sMsg":"Parameter tpTriggerPx error"}]}'
+            )
+        },
+        exchange_order_id=None,
+    )
+
+    reason = policy.reason_from_result(result)
+
+    assert "保护止盈触发价 tpTriggerPx 无效" in reason
+    assert "clOrdId" not in reason
+
+
 def test_execution_reason_uses_untradable_checker() -> None:
     policy = ExecutionResultClassifier(
         untradable_exchange_error_checker=lambda text: "instrument suspended" in text
@@ -109,6 +128,18 @@ def test_execution_confirmation_requires_real_exchange_order_id() -> None:
     assert (
         policy.is_exchange_confirmed_execution(
             _result(OrderStatus.FILLED, exchange_order_id="rejected")
+        )
+        is False
+    )
+    assert (
+        policy.is_exchange_confirmed_execution(
+            _result(OrderStatus.FILLED, quantity=0.0)
+        )
+        is False
+    )
+    assert (
+        policy.is_exchange_confirmed_execution(
+            _result(OrderStatus.FILLED, quantity=1.0, exchange_order_id="")
         )
         is False
     )

@@ -57,6 +57,13 @@ class EntryCrowdedSideCapPolicy:
     strong_min_expected_net_pct: float = 0.55
     strong_min_profit_quality_ratio: float = 1.4
     strong_max_loss_probability: float = 0.42
+    hard_override_score_multiple: float = 2.4
+    hard_override_score_floor: float = 4.2
+    hard_override_min_expected_net_pct: float = 0.90
+    hard_override_min_profit_quality_ratio: float = 1.8
+    hard_override_max_loss_probability: float = 0.28
+    hard_override_max_probe_fraction: float = 0.05
+    hard_override_max_size_pct: float = 0.018
 
     def block_reason(self, decision: DecisionOutput) -> str | None:
         """Return a Chinese block reason when a crowded-side entry must be rejected."""
@@ -80,6 +87,9 @@ class EntryCrowdedSideCapPolicy:
         side_unrealized = _safe_float(exposure.get(side + "_unrealized_pnl"), 0.0)
 
         if side_count >= self.hard_max_side_count:
+            if self._is_hard_ceiling_probe_override(decision, opportunity):
+                self._annotate(decision, raw, exposure, side, mode="hard_ceiling_probe_override")
+                return None
             self._annotate(decision, raw, exposure, side, mode="hard_ceiling")
             return (
                 "\u5355\u8fb9\u6577\u53e3\u786c\u4e0a\u9650[crowded_side_cap]\uff1a\u5f53\u524d"
@@ -158,6 +168,54 @@ class EntryCrowdedSideCapPolicy:
             and not opportunity.get("high_disagreement")
         )
 
+    def _is_hard_ceiling_probe_override(
+        self,
+        decision: DecisionOutput,
+        opportunity: dict[str, Any],
+    ) -> bool:
+        score = _safe_float(opportunity.get("score"), float("-inf"))
+        min_score = _safe_float(opportunity.get("min_score_required"), MIN_ENTRY_OPPORTUNITY_SCORE)
+        expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+        profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        confidence = max(
+            float(decision.confidence or 0.0),
+            _safe_float(opportunity.get("confidence"), 0.0),
+        )
+        probe_fraction = _safe_float(opportunity.get("probe_fraction"), 0.0)
+        max_probe_size_pct = _safe_float(opportunity.get("max_probe_size_pct"), 0.0)
+        if probe_fraction <= 0.0:
+            probe_fraction = _safe_float(_safe_dict(decision.raw_response).get("probe_fraction"), 0.0)
+        if max_probe_size_pct <= 0.0:
+            max_probe_size_pct = _safe_float(
+                _safe_dict(decision.raw_response).get("max_probe_size_pct"),
+                0.0,
+            )
+        size_pct = float(decision.position_size_pct or 0.0)
+        loss_probability = max(1.0 - confidence, 0.0)
+        aligned = bool(
+            opportunity.get("ml_aligned")
+            and opportunity.get("local_profit_aligned")
+            and (opportunity.get("expert_aligned") or opportunity.get("expert_consensus"))
+        )
+        probe_limited = bool(
+            0.0 < probe_fraction <= self.hard_override_max_probe_fraction
+            and 0.0 < max_probe_size_pct <= self.hard_override_max_size_pct
+            and size_pct <= self.hard_override_max_size_pct
+        )
+        strong_score = score >= max(
+            min_score * self.hard_override_score_multiple,
+            self.hard_override_score_floor,
+        )
+        return bool(
+            aligned
+            and probe_limited
+            and strong_score
+            and expected_net >= self.hard_override_min_expected_net_pct
+            and profit_quality >= self.hard_override_min_profit_quality_ratio
+            and loss_probability <= self.hard_override_max_loss_probability
+            and not opportunity.get("high_disagreement")
+        )
+
     def _annotate(
         self,
         decision: DecisionOutput,
@@ -178,6 +236,8 @@ class EntryCrowdedSideCapPolicy:
             "min_dominant_count": self.min_dominant_count,
             "dominant_count_share": self.dominant_count_share,
             "dominant_net_ratio": self.dominant_net_ratio,
+            "hard_override_max_probe_fraction": self.hard_override_max_probe_fraction,
+            "hard_override_max_size_pct": self.hard_override_max_size_pct,
         }
         decision.raw_response = raw
 

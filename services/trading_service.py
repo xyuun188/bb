@@ -1858,8 +1858,18 @@ class TradingService:
         side_perf_multiday = await self._multiday_side_performance(selected_mode)
         symbol_side_perf = await self._recent_symbol_side_performance(selected_mode)
         model_contribution_perf = await self._recent_model_contribution_performance(selected_mode)
+        if not open_positions:
+            try:
+                open_positions = await self.okx_sync_service.get_open_positions_context()
+            except Exception as exc:
+                logger.warning(
+                    "failed to refresh open positions for strategy mode context",
+                    error=safe_error_text(exc),
+                )
         position_exposure = self.entry_position_exposure.context(open_positions or [])
-        position_group_count = self.entry_symbol_universe.open_position_group_count(open_positions)
+        position_group_count = self.entry_symbol_universe.open_position_group_count(
+            open_positions or []
+        )
         account_equity = await self.allocated_order_balance(selected_mode)
         context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
@@ -1904,6 +1914,12 @@ class TradingService:
             "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
             "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
             "expert_integrity_mode": strategy_mode_context.get("expert_integrity_mode"),
+            "strategy_learning_entry_pause": strategy_mode_context.get(
+                "strategy_learning_entry_pause", False
+            ),
+            "strategy_learning_entry_pause_reason": strategy_mode_context.get(
+                "strategy_learning_entry_pause_reason", ""
+            ),
             "strategy_learning": strategy_mode_context.get("strategy_learning"),
         }
         decision.raw_response = raw

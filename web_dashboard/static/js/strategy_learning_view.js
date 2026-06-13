@@ -1,6 +1,6 @@
-function strategyLearningText(key) {
+﻿function strategyLearningText(key) {
     const labels = {
-        baseline_current: '当前基线',
+        baseline_current: '系统基线',
         balanced_probe: '平衡探针',
         loss_release: '亏损释放',
         winner_hold: '赢家持仓优化',
@@ -11,7 +11,7 @@ function strategyLearningText(key) {
         long_side_degraded: '多单侧表现退化',
         short_side_degraded: '空单侧表现退化',
         full_position_loss_pressure: '满仓且亏损仓占位',
-        expert_fallback_overblocking: '专家 fallback 过多阻断开仓',
+        expert_fallback_overblocking: '专家 fallback 过多拦截开仓',
         missed_opportunities: '影子复盘显示错过机会',
         small_wins_large_losses: '小盈多但大亏存在',
         loss_hold_too_long: '亏损仓持有过久',
@@ -28,7 +28,7 @@ function strategyLearningText(key) {
         execution_error_guard: '执行异常护栏',
         insufficient_trade_samples: '交易样本不足',
         auto: '自动调度',
-        manual: '手动锁定',
+        manual: '人工指定',
         degraded: '退化',
         healthy: '健康',
         neutral: '中性',
@@ -71,9 +71,22 @@ function strategyLearningShort(value, maxLen = 44) {
     return text.length > maxLen ? `${text.slice(0, maxLen - 1)}...` : text;
 }
 
+function strategyLearningEventReasonCategoryLabel(category) {
+    const labels = {
+        okx_execution_error: 'OKX执行',
+        execution_missing_result: '接口回报',
+        crowded_side_cap: '单边上限',
+        capacity_block: '仓位容量',
+        expert_fallback_block: '专家fallback',
+        unknown: '未记录',
+        other: '其他',
+    };
+    return labels[category] || strategyLearningText(category) || '其他';
+}
+
 function strategyLearningIsReadable(text) {
     const value = String(text || '');
-    const badTokens = ['�', '????', '锟', '榛樿', '浜哄', '鐩堝', '妫€', '绛栫暐', '璋冨害', '鍊欓'];
+    const badTokens = ['锟', '閿', '姒', '娴', '濡', '缁', '鐠', '閸'];
     return Boolean(value.trim()) && !badTokens.some(token => value.includes(token));
 }
 
@@ -89,19 +102,37 @@ function strategyLearningIsManualLocked(data) {
     return schedule.scheduler_mode === 'manual' || Boolean(strategyLearningManualProfile(data));
 }
 
+function updateStrategyLearningAutoButton(data) {
+    const button = document.getElementById('strategy-learning-auto-button');
+    if (!button) return;
+    const manualId = strategyLearningManualProfile(data);
+    if (manualId) {
+        button.disabled = false;
+        button.textContent = '取消人工指定';
+        button.title = `当前人工指定 ${manualId}，点击后恢复系统自动调度。`;
+        button.classList.add('btn-accent');
+    } else {
+        button.disabled = true;
+        button.textContent = '当前自动调度';
+        button.title = '当前没有人工指定策略，系统会根据复盘、回测、影子验证和护栏自动选择策略画像。';
+        button.classList.remove('btn-accent');
+    }
+}
+
 function strategyLearningReason(data) {
     const schedule = data?.schedule || {};
     const profile = schedule.active_profile || data?.active_profile || {};
     if (strategyLearningIsReadable(schedule.reason)) return schedule.reason;
     if (strategyLearningIsManualLocked(data)) {
-        return `人工锁定策略画像 ${strategyLearningManualProfile(data)}，自动调度暂不覆盖。`;
+        return `人工指定策略画像 ${strategyLearningManualProfile(data)}，自动调度暂不覆盖。`;
     }
     const profileId = profile.id || 'baseline_current';
-    if (profileId === 'loss_release') return '检测到满仓压力、亏损仓占位或亏损拖延，自动调度到亏损释放画像。';
-    if (profileId === 'balanced_probe') return '开仓样本不足、专家 fallback 拦截或影子复盘错过机会偏多，自动调度到平衡探针画像。';
-    if (profileId === 'winner_hold') return '盈利仓小盈过多且大亏存在，自动调度到赢家持仓优化画像。';
-    if (String(profileId).endsWith('_side_recovery')) return '某一方向近期表现退化，自动调度到方向恢复画像。';
-    return '自动调度未发现需要切换的高优先级问题，使用当前基线。';
+    if (profileId === 'loss_release') return '检测到满仓压力、亏损仓占位或亏损拖延，系统自动切到亏损释放画像。';
+    if (profileId === 'balanced_probe') return '开仓样本不足、专家 fallback 拦截或错过机会偏多，系统自动切到平衡探针画像。';
+    if (profileId === 'winner_hold') return '盈利仓小盈过多且大亏存在，系统自动切到赢家持仓优化画像。';
+    if (String(profileId).endsWith('_side_recovery')) return '某一方向近期表现退化，系统自动切到方向恢复画像。';
+    if (profile.source === 'llm_structured_candidate') return '结构化候选已通过约束，系统自动进入小仓探针调度。';
+    return '自动调度未发现需要切换的高优先级问题，使用系统基线兜底。';
 }
 
 function strategyLearningSeverityLabel(value) {
@@ -116,6 +147,29 @@ function strategyLearningStatusClass(value) {
     if (['medium', 'warn', 'blocked'].includes(String(value))) return 'warn';
     if (['good', 'ok', 'healthy', 'executed'].includes(String(value))) return 'good';
     return 'neutral';
+}
+
+function strategyLearningEventTypeLabel(value) {
+    const labels = {
+        decision_logged: '决策记录',
+        execution_attempt: '执行提交',
+        execution_result: '执行结果',
+        execution_error: '执行异常',
+        manual_close: '手动平仓',
+        risk_block: '风险阻断',
+    };
+    return labels[value] || strategyLearningText(value);
+}
+
+function strategyLearningActionLabel(value) {
+    const labels = {
+        long: '做多',
+        short: '做空',
+        close_long: '平多',
+        close_short: '平空',
+        hold: '观望',
+    };
+    return labels[value] || value || '-';
 }
 
 function strategyLearningMetric(label, value, hint = '', tone = 'neutral') {
@@ -137,9 +191,9 @@ function strategyLearningProfileMetric(label, value, tone = '') {
 
 function strategyLearningSourceLabel(source) {
     const value = String(source || '').trim();
-    if (value === 'current_system') return '当前系统';
+    if (value === 'current_system' || value === 'baseline') return '当前系统';
     if (value === 'feedback_generator') return '反馈生成';
-    if (value === 'llm_structured_candidate') return 'LLM结构化候选';
+    if (value === 'llm_structured_candidate') return 'LLM 结构化候选';
     return value || '-';
 }
 
@@ -155,8 +209,8 @@ function strategyLearningShadowChips(row) {
     if (row?.would_reduce_blocks) flags.push('减少拦截');
     if (row?.would_release_losers) flags.push('释放亏损');
     if (row?.would_hold_winners) flags.push('拿住赢家');
-    if (!flags.length) flags.push('维持基线');
-    flags.push(row?.fallback_safety === 'probe_core_required' ? '核心专家必须可信' : row?.fallback_safety === 'too_loose' ? 'fallback过宽' : '严格专家');
+    if (!flags.length) flags.push('接近基线');
+    flags.push(row?.fallback_safety === 'probe_core_required' ? '核心专家必需' : row?.fallback_safety === 'too_loose' ? 'fallback 过宽' : '专家约束正常');
     return flags.map(flag => `<span>${strategyLearningEsc(flag)}</span>`).join('');
 }
 
@@ -169,6 +223,7 @@ function strategyLearningTime(value) {
 
 function renderStrategyLearning(data) {
     data = data || {};
+    updateStrategyLearningAutoButton(data);
     renderStrategyLearningSummary(data);
     renderStrategyLearningProblems(data);
     renderStrategyLearningSides(data);
@@ -181,7 +236,7 @@ function renderStrategyLearning(data) {
     renderStrategyLearningRecentEvents(data);
     const updated = document.getElementById('strategy-learning-updated');
     if (updated) {
-        updated.textContent = `${data.mode === 'live' ? '实盘' : '模拟盘'} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString()}`;
+        updated.textContent = `${data.mode === 'live' ? '实盘' : '模拟盘'} · 最近 ${data.window_hours || 24} 小时 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
     }
 }
 
@@ -194,17 +249,27 @@ function renderStrategyLearningSummary(data) {
     const profile = schedule.active_profile || data.active_profile || {};
     const guard = data.runtime_guard || {};
     const llm = data.llm_candidate_status || {};
-    const stateInfo = data.state || {};
-    const disabled = Object.keys(stateInfo.disabled_profiles || {});
+    const disabled = Array.isArray(schedule.disabled_profiles) ? schedule.disabled_profiles : [];
     const problemCount = (feedback.problems || []).length;
     const pnl = Number(totals.net_pnl || 0);
     const manualLocked = strategyLearningIsManualLocked(data);
-    const activeName = profile.label || strategyLearningText(profile.id) || profile.id || '当前基线';
-    const modeLabel = manualLocked ? '手动锁定' : '自动调度中';
+    const activeName = profile.label || strategyLearningText(profile.id) || profile.id || '系统基线';
+    const modeLabel = manualLocked ? '人工指定中' : '自动调度中';
     const modeTone = manualLocked ? 'warn' : 'good';
     const guardTone = guard.should_rollback ? 'bad' : 'good';
     const guardLabel = guard.should_rollback ? '护栏预警' : '护栏正常';
     const source = profile.source || (profile.id === 'baseline_current' ? 'baseline' : 'feedback_generator');
+    const llmError = String(llm.last_error || '').trim();
+    const llmCached = Array.isArray(llm.cached_candidates) ? llm.cached_candidates : [];
+    const llmStateLabel = llm.cache_status === 'current'
+        ? '缓存匹配当前反馈'
+        : (llm.cache_status === 'stale' ? '缓存已过期' : '暂无缓存');
+    const llmNotice = llmError
+        ? `<div class="strategy-learning-inline-alert warn"><strong>\u52a8\u6001\u5019\u9009\u672a\u751f\u6548</strong><span>\u5019\u9009\u6a21\u578b\u672a\u8fd4\u56de\u53ef\u89e3\u6790 JSON\uff0c\u5f53\u524d\u4f7f\u7528\u5185\u7f6e\u53d7\u63a7\u7b56\u7565\u515c\u5e95\u3002</span><em>${strategyLearningEsc(strategyLearningShort(llmError, 96))}</em></div>`
+        : '';
+    const llmCacheNotice = llmCached.length
+        ? `<div class="strategy-learning-inline-alert ${llm.cache_status === 'current' ? '' : 'warn'}"><strong>LLM 结构化候选</strong><span>${strategyLearningEsc(llmStateLabel)} · ${strategyLearningEsc(llm.last_model || llm.source || '-')} · ${strategyLearningEsc(strategyLearningTime(llm.cached_at))}</span><em>${llmCached.map(item => strategyLearningEsc(item.label || item.id || '-')).join(' / ')}</em></div>`
+        : '';
 
     el.innerHTML = `
         <div class="strategy-learning-command">
@@ -217,11 +282,13 @@ function renderStrategyLearningSummary(data) {
                 <p>${strategyLearningEsc(strategyLearningReason(data))}</p>
                 <div class="strategy-learning-command-meta">
                     ${strategyLearningMeta('策略ID', profile.id || '-')}
-                    ${strategyLearningMeta('控制权', manualLocked ? strategyLearningManualProfile(data) : '系统自动')}
-                    ${strategyLearningMeta('来源', source)}
+                    ${strategyLearningMeta('控制权', manualLocked ? `人工指定 ${strategyLearningManualProfile(data)}` : '系统自动')}
+                    ${strategyLearningMeta('来源', strategyLearningSourceLabel(source))}
                     ${strategyLearningMeta('禁用候选', `${disabled.length}`)}
                     ${strategyLearningMeta('回滚护栏', guardLabel, guardTone)}
                 </div>
+                ${llmNotice}
+                ${llmCacheNotice}
             </div>
             <div class="strategy-learning-metric-grid">
                 ${strategyLearningMetric('净收益', `${strategyLearningMoney(pnl)} U`, '训练窗口', pnl >= 0 ? 'good' : 'bad')}
@@ -229,7 +296,7 @@ function renderStrategyLearningSummary(data) {
                 ${strategyLearningMetric('交易数', `${Number(totals.training_trade_count || 0)} / ${Number(totals.trade_count_target || 0)}`, totals.low_trade_count_penalty ? '低交易量惩罚' : '样本达标', totals.low_trade_count_penalty ? 'warn' : 'good')}
                 ${strategyLearningMetric('策略复盘', `${Number(totals.reflection_count || 0)} / ${Number(totals.reflection_total_count || 0)}`, '训练 / 总数', 'neutral')}
                 ${strategyLearningMetric('问题数', Number(problemCount || 0), '当前归因', problemCount ? 'warn' : 'good')}
-                ${strategyLearningMetric('LLM候选', Number(llm.candidate_count || 0), llm.last_error ? '有错误' : '结构化', llm.last_error ? 'warn' : 'neutral')}
+                ${strategyLearningMetric('LLM 候选', Number(llm.candidate_count || 0), llm.last_error ? '生成有错误' : '结构化候选', llm.last_error ? 'warn' : 'neutral')}
             </div>
         </div>`;
 }
@@ -321,6 +388,8 @@ function renderStrategyLearningReflections(data) {
     const pnl = Number(reflection.fee_adjusted_pnl || 0);
     const mistakes = reflection.top_mistakes || [];
     const improvements = reflection.top_improvements || [];
+    const lossSamples = Number(reflection.loss_sample_count || 0);
+    const winSamples = Number(reflection.win_sample_count || 0);
     const mistakeRows = mistakes.slice(0, 3).map(item => `<span>${strategyLearningEsc(strategyLearningShort(item.summary, 32))} <b>${Number(item.count || 0)}</b></span>`).join('');
     const improvementRows = improvements.slice(0, 3).map(item => `<span>${strategyLearningEsc(strategyLearningShort(item.summary, 32))} <b>${Number(item.count || 0)}</b></span>`).join('');
     if (!total) {
@@ -334,9 +403,9 @@ function renderStrategyLearningReflections(data) {
             <em>费后</em>
         </div>
         <div class="strategy-learning-split-metrics">
-            <span>亏损持有 <b>${Number(reflection.avg_loss_hold_minutes || 0).toFixed(0)}m</b></span>
-            <span>盈利持有 <b>${Number(reflection.avg_win_hold_minutes || 0).toFixed(0)}m</b></span>
-            <span>小盈 / 大亏 <b>${Number(reflection.small_win_count || 0)} / ${Number(reflection.large_loss_count || 0)}</b></span>
+            <span>亏损持有 <b>${lossSamples ? `${Number(reflection.avg_loss_hold_minutes || 0).toFixed(0)}m` : '暂无亏损样本'}</b></span>
+            <span>盈利持有 <b>${winSamples ? `${Number(reflection.avg_win_hold_minutes || 0).toFixed(0)}m` : '暂无盈利样本'}</b></span>
+            <span>小盈 / 大亏 <b>小盈 ${Number(reflection.small_win_count || 0)} · 大亏 ${Number(reflection.large_loss_count || 0)}</b></span>
         </div>
         <div class="strategy-learning-chip-row">${mistakeRows || '<span>暂无重复错误</span>'}</div>
         <div class="strategy-learning-chip-row muted">${improvementRows || '<span>暂无改进建议</span>'}</div>`;
@@ -347,10 +416,16 @@ function renderStrategyLearningProfiles(data) {
     if (!el) return;
     const schedule = data.schedule || {};
     const activeId = schedule.active_profile?.id || data.active_profile?.id;
-    const candidates = schedule.candidates || [];
+    const llm = data.llm_candidate_status || {};
+    const scheduleCandidates = Array.isArray(schedule.candidates) ? schedule.candidates : [];
+    const cachedLlmCandidates = (Array.isArray(llm.cached_candidates) ? llm.cached_candidates : [])
+        .filter(item => item && !scheduleCandidates.some(profile => profile.id === item.id))
+        .map(item => ({ ...item, status: 'cached', source: item.source || 'llm_structured_candidate', cached_only: true }));
+    const candidates = scheduleCandidates.concat(cachedLlmCandidates);
     const backtestRows = schedule.backtest?.rows || [];
     const shadowRows = schedule.shadow_validation?.rows || [];
     const disabled = new Set(schedule.disabled_profiles || []);
+    const disabledReasons = schedule.disabled_profile_reasons || {};
     const manualLocked = strategyLearningIsManualLocked(data);
     if (!candidates.length) {
         el.innerHTML = '<div class="strategy-learning-empty">暂无策略候选。</div>';
@@ -363,6 +438,8 @@ function renderStrategyLearningProfiles(data) {
                 const sh = shadowRows.find(row => row.profile_id === profile.id) || {};
                 const isActive = profile.id === activeId;
                 const isDisabled = disabled.has(profile.id);
+                const disabledReason = disabledReasons[profile.id] || {};
+                const disabledText = strategyLearningShort(disabledReason.reason || '', 96);
                 const profileIdArg = JSON.stringify(String(profile.id || ''));
                 const fee = Number(bt.fee_adjusted_pnl || 0);
                 const score = Number(bt.score || 0);
@@ -370,12 +447,30 @@ function renderStrategyLearningProfiles(data) {
                 const pass = bt.pass !== false;
                 const shadowOk = sh.eligible !== false;
                 const probePct = Number(profile.params?.probe_fraction || 0);
-                const cardClass = [isActive ? 'active' : '', isDisabled ? 'disabled' : '', pass && shadowOk ? '' : 'failed'].filter(Boolean).join(' ');
-                const activeLabel = isActive ? (manualLocked ? '手动锁定' : '自动启用') : (isDisabled ? '已禁用' : (pass && shadowOk ? '候选可用' : '未通过'));
-                const statusTone = isActive ? 'good' : isDisabled ? 'bad' : pass && shadowOk ? 'neutral' : 'warn';
-                const actionButton = profile.id === 'baseline_current'
-                    ? `<button class="btn btn-sm" onclick="rollbackStrategyLearning()">恢复自动</button>`
-                    : `<button class="btn btn-sm" ${isActive && manualLocked ? 'disabled' : ''} onclick='activateStrategyLearningProfile(${profileIdArg})'>${isActive && manualLocked ? '已锁定' : '手动启用'}</button>`;
+                const cardClass = [isActive ? 'active' : '', isDisabled ? 'disabled' : '', profile.cached_only ? 'cached' : '', pass && shadowOk ? '' : 'failed'].filter(Boolean).join(' ');
+                const activeLabel = profile.id === 'baseline_current'
+                    ? (isActive ? '自动兜底中' : '稳定兜底')
+                    : (profile.cached_only ? (llm.cache_status === 'current' ? 'LLM缓存候选' : 'LLM过期缓存') : (isActive ? (manualLocked ? '人工指定中' : '自动调度选中') : (isDisabled ? '已禁用' : (pass && shadowOk ? '候选可用' : '未通过验证'))));
+                const statusTone = isActive ? 'good' : isDisabled ? 'bad' : profile.cached_only || pass && shadowOk ? 'neutral' : 'warn';
+                let actionButton = '<button class="btn btn-sm" disabled title="系统基线只是兜底画像；没有人工指定时，调度器会在它和更合适的画像之间自动选择。">系统兜底</button>';
+                let disableButton = '<button class="btn btn-sm" disabled title="系统基线是自动调度兜底画像，不能在控制台禁用。">兜底保留</button>';
+                if (profile.id !== 'baseline_current') {
+                    const disableAction = profile.cached_only || isDisabled || (isActive && manualLocked) || !pass || !shadowOk;
+                    const actionTitle = isActive && manualLocked
+                        ? '这个策略已经被人工指定；要交回系统调度请点页面顶部“取消人工指定”。'
+                        : profile.cached_only
+                            ? '这个 LLM 候选只存在于缓存展示中，当前反馈签名刷新并通过回测/影子验证后才能人工指定。'
+                            : isDisabled
+                            ? '这个策略已被禁用，先取消禁用后才能人工指定。'
+                            : (!pass || !shadowOk)
+                                ? '这个策略还没有同时通过回测和影子验证，不能人工指定。'
+                                : '人工指定后，自动调度不会覆盖它；需要交回系统调度时点页面顶部“取消人工指定”。';
+                    const actionLabel = isActive && manualLocked ? '已人工指定' : '人工指定此策略';
+                    actionButton = `<button class="btn btn-sm" ${disableAction ? 'disabled' : ''} title="${strategyLearningEsc(actionTitle)}" onclick='activateStrategyLearningProfile(${profileIdArg})'>${actionLabel}</button>`;
+                    disableButton = profile.cached_only
+                        ? '<button class="btn btn-sm" disabled title="缓存展示候选需要刷新进入当前调度列表后才能禁用。">仅展示</button>'
+                        : `<button class="btn btn-sm" title="${isDisabled ? '允许系统重新评估这个策略。' : '临时禁用这个策略，自动调度不会选它。'}" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '取消禁用' : '禁用策略'}</button>`;
+                }
                 return `
                     <article class="strategy-learning-profile-card ${strategyLearningEsc(cardClass)}">
                         <div class="strategy-learning-profile-card-head">
@@ -386,6 +481,8 @@ function renderStrategyLearningProfiles(data) {
                             <span class="strategy-learning-table-pill ${statusTone}">${strategyLearningEsc(activeLabel)}</span>
                         </div>
                         <p>${strategyLearningEsc(strategyLearningShort(profile.description || '', 128))}</p>
+                        ${isDisabled && disabledText ? `<div class="strategy-learning-profile-note">禁用原因：${strategyLearningEsc(disabledText)}</div>` : ''}
+                        ${profile.cached_only ? `<div class="strategy-learning-profile-note">${llm.cache_status === 'current' ? '已生成但未进入当前调度列表。' : '候选签名与当前反馈不一致，等待下一次生成刷新后再参与调度。'}</div>` : ''}
                         <div class="strategy-learning-profile-card-stats">
                             ${strategyLearningProfileMetric('回测评分', score.toFixed(2), score >= 0 ? 'good' : 'bad')}
                             ${strategyLearningProfileMetric('费后收益', `${strategyLearningMoney(fee)} U`, fee >= 0 ? 'good' : 'bad')}
@@ -400,7 +497,7 @@ function renderStrategyLearningProfiles(data) {
                             <span>${pass ? '回测通过' : '回测未通过'} · ${shadowOk ? '影子通过' : '影子未通过'} · ${sh.trade_count_guard?.low_trade_count ? '低交易量惩罚中' : '交易量约束正常'}</span>
                             <div class="strategy-learning-profile-actions">
                                 ${actionButton}
-                                <button class="btn btn-sm" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '恢复' : '禁用'}</button>
+                                ${disableButton}
                             </div>
                         </div>
                     </article>`;
@@ -413,11 +510,18 @@ function renderStrategyLearningEvents(data) {
     if (!el) return;
     const ev = data.feedback?.event_feedback || {};
     const blocks = ev.top_block_reasons || [];
-    const blockRows = blocks.slice(0, 5).map(item => `<div><strong>${strategyLearningEsc(strategyLearningShort(item.reason, 46))}</strong><em>${Number(item.count || 0)}</em></div>`).join('');
+    const coverage = ev.attributable_event_coverage ?? ev.attribution_coverage ?? 0;
+    const attributableEvents = Number(ev.attributable_events || 0);
+    const missingAttributable = Number(ev.attributable_missing_profile_events || 0);
+    const nonAttributable = Number(ev.non_attributable_events || 0);
+    const blockRows = blocks.slice(0, 5).map(item => {
+        const label = item.reason || item.reason_label || '-';
+        return `<div title="${strategyLearningEsc(label)}"><strong>${strategyLearningEsc(strategyLearningShort(label, 56))}</strong><span>${strategyLearningEsc(strategyLearningEventReasonCategoryLabel(item.category || 'other'))}</span><em>${Number(item.count || 0)}</em></div>`;
+    }).join('');
     el.innerHTML = `
         <div class="strategy-learning-compact-head">
-            <strong>${strategyLearningPct(ev.attribution_coverage || 0, 1)}</strong>
-            <span>${Number(ev.total_events || 0)} 事件 · 缺画像 ${Number(ev.missing_profile_events || 0)}</span>
+            <strong>${strategyLearningPct(coverage || 0, 1)}</strong>
+            <span>${attributableEvents} 可归因事件 · 缺画像 ${missingAttributable}</span>
             <em>${Number(ev.manual_close_events || 0)} 手动</em>
         </div>
         <div class="strategy-learning-split-metrics">
@@ -425,6 +529,7 @@ function renderStrategyLearningEvents(data) {
             <span>fallback <b>${Number(ev.fallback_blocks || 0)}</b></span>
             <span>执行异常 <b>${Number(ev.execution_errors || 0)}</b></span>
         </div>
+        <div class="strategy-learning-chip-row muted"><span>总事件 ${Number(ev.total_events || 0)}</span><span>非策略观察 ${nonAttributable}</span><span>总覆盖 ${strategyLearningPct(ev.attribution_coverage || 0, 1)}</span></div>
         <div class="strategy-learning-block-list">${blockRows || '<div>暂无阻断原因统计。</div>'}</div>`;
 }
 
@@ -432,8 +537,8 @@ function renderStrategyLearningGuard(data) {
     const el = document.getElementById('strategy-learning-guard');
     if (!el) return;
     const guard = data.runtime_guard || {};
-    const stateInfo = data.state || {};
-    const disabled = Object.keys(stateInfo.disabled_profiles || {});
+    const schedule = data.schedule || {};
+    const disabled = Array.isArray(schedule.disabled_profiles) ? schedule.disabled_profiles : [];
     const reasonRows = (guard.reasons || []).map(reason => `<span>${strategyLearningEsc(strategyLearningText(reason))}</span>`).join('');
     el.innerHTML = `
         <div class="strategy-learning-guard-state ${guard.should_rollback ? 'danger' : 'ok'}">
@@ -458,20 +563,37 @@ function renderStrategyLearningRecentEvents(data) {
         return;
     }
     el.innerHTML = `
-        <div class="strategy-learning-event-table">
-            <div class="strategy-learning-event-row header">
-                <span>事件</span><span>标的 / 动作</span><span>策略</span><span>原因</span><span>训练</span>
-            </div>
+        <div class="strategy-learning-event-feed">
             ${rows.slice(0, 24).map(row => {
                 const status = row.event_status || '-';
                 const severity = strategyLearningStatusClass(row.severity || status);
+                const eventType = strategyLearningEventTypeLabel(row.event_type || '-');
+                const action = strategyLearningActionLabel(row.action || row.side || '-');
+                const profile = row.profile_id || '无画像';
+                const refs = [
+                    row.order_id ? `O${row.order_id}` : '',
+                    row.position_id ? `P${row.position_id}` : '',
+                ].filter(Boolean).join(' / ');
+                const reason = row.reason_label || row.reason || '-';
+                const rawReason = row.reason && row.reason_label && row.reason !== row.reason_label ? `原始：${row.reason}` : reason;
                 return `
-                    <div class="strategy-learning-event-row ${severity}">
-                        <span><b>${strategyLearningEsc(row.event_type || '-')}</b><em>${strategyLearningEsc(strategyLearningText(status))}</em></span>
-                        <span>${strategyLearningEsc(row.symbol || '-')} · ${strategyLearningEsc(row.action || '-')}</span>
-                        <span>${strategyLearningEsc(row.profile_id || '无画像')}</span>
-                        <p title="${strategyLearningEsc(row.reason || '')}">${strategyLearningEsc(strategyLearningShort(row.reason || '-', 88))}</p>
-                        <span>${row.exclude_from_training ? '不训练' : '可归因'} · O${row.order_id || '-'} / P${row.position_id || '-'}</span>
+                    <div class="strategy-learning-event-card ${severity}">
+                        <div class="strategy-learning-event-main">
+                            <span class="strategy-learning-event-dot"></span>
+                            <div>
+                                <div class="strategy-learning-event-title">
+                                    <strong>${strategyLearningEsc(eventType)}</strong>
+                                    <span class="strategy-learning-table-pill ${severity}">${strategyLearningEsc(strategyLearningText(status))}</span>
+                                </div>
+                                <p title="${strategyLearningEsc(rawReason)}">${strategyLearningEsc(reason)}</p>
+                            </div>
+                        </div>
+                        <div class="strategy-learning-event-aside">
+                            <span><b>${strategyLearningEsc(row.symbol || '-')}</b>${strategyLearningEsc(action)}</span>
+                            <span>${strategyLearningEsc(profile)}</span>
+                            <em>${strategyLearningEsc(strategyLearningTime(row.created_at))}</em>
+                            <em>${row.exclude_from_training ? '不训练' : '可归因'}${refs ? ` · ${strategyLearningEsc(refs)}` : ''}</em>
+                        </div>
                     </div>`;
             }).join('')}
         </div>`;

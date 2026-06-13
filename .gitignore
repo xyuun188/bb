@@ -6,6 +6,9 @@
 *.pem
 *.p12
 *.pfx
+GIT账号.txt
+.ssh/
+*服务器信息.txt
 *秘钥*.txt
 *密钥*.txt
 *服务器资料*.txt

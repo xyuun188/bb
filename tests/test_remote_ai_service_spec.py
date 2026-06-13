@@ -59,7 +59,7 @@ def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     assert r1.model_dir == "/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq"
     assert r1.served_model_name == "deepseek-r1-14b-risk"
     assert r1.service_name == "deepseek-r1-14b-risk.service"
-    assert r1.port == 8003
+    assert r1.port == 8002
     assert r1.max_model_len == 4096
     assert r1.gpu_memory_utilization == 0.62
     assert r1.max_num_seqs == 2
@@ -173,7 +173,7 @@ def test_dual_14b_start_scripts_are_short_context_awq_vllm() -> None:
 
     assert "--model /data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq" in r1_script
     assert "--served-model-name deepseek-r1-14b-risk" in r1_script
-    assert "--port 8003" in r1_script
+    assert "--port 8002" in r1_script
     assert "--max-model-len 4096" in r1_script
     assert "--gpu-memory-utilization 0.62" in r1_script
     assert "--max-num-batched-tokens 4096" in r1_script

@@ -134,6 +134,51 @@ async def test_open_entry_order_is_not_treated_as_filled_position():
 
 
 @pytest.mark.asyncio
+async def test_filled_entry_without_filled_quantity_stays_pending_tracking():
+    fake_ccxt = FakeCcxt(
+        created_order={
+            "id": "entry-missing-fill",
+            "symbol": "HOME/USDT:USDT",
+            "side": "buy",
+            "type": "market",
+            "status": "closed",
+            "amount": 30.0,
+            "filled": 0.0,
+            "price": 1.0,
+            "average": 1.0,
+            "info": {"state": "filled", "ordId": "entry-missing-fill", "side": "buy"},
+        },
+        confirmed_order={
+            "id": "entry-missing-fill",
+            "symbol": "HOME/USDT:USDT",
+            "side": "buy",
+            "type": "market",
+            "status": "closed",
+            "amount": 30.0,
+            "filled": 0.0,
+            "price": 1.0,
+            "average": 1.0,
+            "info": {"state": "filled", "ordId": "entry-missing-fill", "side": "buy"},
+        },
+    )
+    executor = _executor(fake_ccxt)
+
+    result = await executor.place_order(
+        _entry_decision(),
+        account_id="ensemble_trader",
+        override_balance=10.0,
+    )
+
+    assert result.status == OrderStatus.PENDING
+    assert result.quantity == 0.0
+    assert result.exchange_order_id == "entry-missing-fill"
+    assert result.raw_response is not None
+    assert result.raw_response["entry_tracking"] is True
+    assert result.raw_response["fill_quantity_missing"] is True
+    assert "不会用下单数量冒充成交数量" in result.raw_response["message"]
+
+
+@pytest.mark.asyncio
 async def test_existing_active_entry_order_blocks_duplicate_submit():
     existing = {
         "id": "existing-entry",
