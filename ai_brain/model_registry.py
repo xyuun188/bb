@@ -69,6 +69,9 @@ def _local_fallback_callable(model: AbstractAIModel) -> LocalExpertFallback | No
 def _batch_expert_decider(model: AbstractAIModel) -> BatchExpertDecider | None:
     if getattr(model, "_llm", None) is None:
         return None
+    model_name = str(getattr(model, "_model_name", "") or "").lower()
+    if "deepseek" in model_name or "r1" in model_name:
+        return None
     method = getattr(model, "decide_batch_experts", None)
     return method if callable(method) else None
 
@@ -123,7 +126,7 @@ def _is_batch_format_failure(exc: BaseException, error_text: str) -> bool:
 def _batch_failure_breaker_seconds(exc: BaseException, error_text: str) -> float:
     configured = max(float(settings.ai_batch_expert_circuit_breaker_seconds or 0.0), 0.0)
     if _is_timeout_error(exc):
-        return configured
+        return max(configured, 1.0)
     if _is_batch_format_failure(exc, error_text):
         format_configured = max(
             float(settings.ai_batch_expert_format_failure_circuit_breaker_seconds or 0.0),
@@ -131,6 +134,10 @@ def _batch_failure_breaker_seconds(exc: BaseException, error_text: str) -> float
         )
         return max(configured, format_configured)
     return configured
+
+
+def _positive_duration_seconds(started_at: float) -> float:
+    return max(round(time.perf_counter() - started_at, 3), 0.001)
 
 
 class ModelRegistry:
@@ -360,6 +367,30 @@ class ModelRegistry:
                 expert_names = [model.name for model in provider_group]
                 started_at = datetime.now(UTC)
                 perf_started = time.perf_counter()
+                if _batch_expert_decider(batch_model) is None:
+                    reason = "provider model does not support safe batch expert JSON"
+                    retry_context = dict(context)
+                    retry_context["expert_mode"] = True
+                    retry_context["_force_independent_expert"] = True
+                    retry_context["_force_fast_independent_expert"] = True
+                    retry_context["_provider_independent_expert_mode"] = True
+                    retry_context["_batch_not_supported_independent"] = {
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": reason[:240],
+                    }
+                    fallback, fallback_timings = await self._retry_provider_group_independently(
+                        features,
+                        retry_context,
+                        provider_group,
+                        batch_model,
+                        started_at,
+                        _positive_duration_seconds(perf_started),
+                        reason,
+                        status="batch_not_supported_independent",
+                    )
+                    all_decisions.update(fallback)
+                    all_timings.extend(fallback_timings)
+                    continue
                 now_perf = time.perf_counter()
                 disabled_until = self._batch_expert_disabled_until_by_provider.get(
                     provider_key, 0.0
@@ -650,11 +681,19 @@ class ModelRegistry:
         retry_context = dict(context)
         retry_context["expert_mode"] = True
         retry_context["_force_independent_expert"] = True
-        retry_context["_batch_failure_independent_retry"] = {
-            "status": status,
-            "reason": reason[:240],
-            "provider_model": _provider_model_name(batch_model),
-        }
+        retry_context["_force_fast_independent_expert"] = True
+        retry_context["_provider_independent_expert_mode"] = True
+        if status == "batch_not_supported_independent":
+            retry_context["_batch_not_supported_independent"] = {
+                "reason": reason[:240],
+                "provider_model": _provider_model_name(batch_model),
+            }
+        else:
+            retry_context["_batch_failure_independent_retry"] = {
+                "status": status,
+                "reason": reason[:240],
+                "provider_model": _provider_model_name(batch_model),
+            }
 
         async def _retry_one(
             model: AbstractAIModel,
@@ -662,19 +701,27 @@ class ModelRegistry:
             retry_started_at = datetime.now(UTC)
             perf_started = time.perf_counter()
             try:
-                timeout_seconds = max(float(settings.ai_expert_timeout_seconds or 30.0), 5.0)
+                timeout_seconds = min(
+                    max(float(settings.ai_expert_timeout_seconds or 30.0), 8.0),
+                    18.0,
+                )
                 result = await asyncio.wait_for(
                     model.decide(features, retry_context),
                     timeout=timeout_seconds,
                 )
-                retry_duration = round(time.perf_counter() - perf_started, 3)
+                retry_duration = _positive_duration_seconds(perf_started)
                 if not isinstance(result, DecisionOutput):
                     return model, None, None, "independent retry returned invalid result"
                 result.model_name = model.name
                 raw = result.raw_response if isinstance(result.raw_response, dict) else {}
-                raw["batch_failure_independent_retry"] = True
-                raw["batch_failure_status"] = status
-                raw["batch_failure_reason"] = reason[:240]
+                if status == "batch_not_supported_independent":
+                    raw["batch_not_supported_independent"] = True
+                    raw["batch_not_supported_reason"] = reason[:240]
+                else:
+                    raw["batch_failure_independent_retry"] = True
+                    raw["batch_failure_status"] = status
+                    raw["batch_failure_reason"] = reason[:240]
+                raw["provider_independent_expert_mode"] = True
                 raw.setdefault(
                     "provider_model",
                     _provider_model_name(model) or _provider_model_name(batch_model),
@@ -684,7 +731,7 @@ class ModelRegistry:
                     model,
                     result,
                     {
-                        "stage": "expert_batch_failure_retry",
+                        "stage": "expert_independent_provider",
                         "name": model.name,
                         "status": "completed",
                         "started_at": retry_started_at.isoformat(),
@@ -692,6 +739,7 @@ class ModelRegistry:
                         "batch_expert": False,
                         "shared_batch_call": False,
                         "batch_failure_status": status,
+                        "provider_independent_expert_mode": True,
                         "action": result.action.value,
                         "confidence": result.confidence,
                         "provider_model": raw.get("provider_model"),
@@ -700,6 +748,7 @@ class ModelRegistry:
                     "",
                 )
             except Exception as exc:
+                retry_duration = _positive_duration_seconds(perf_started)
                 error_text = safe_error_text(exc, limit=240)
                 context.setdefault("_model_failures", []).append(
                     {
@@ -708,7 +757,24 @@ class ModelRegistry:
                         "reason": f"batch independent retry failed: {error_text}",
                     }
                 )
-                return model, None, None, error_text
+                return (
+                    model,
+                    None,
+                    {
+                        "stage": "expert_independent_provider",
+                        "name": model.name,
+                        "status": "independent_provider_failed",
+                        "started_at": retry_started_at.isoformat(),
+                        "duration_sec": retry_duration,
+                        "batch_expert": False,
+                        "shared_batch_call": False,
+                        "batch_failure_status": status,
+                        "provider_independent_expert_mode": True,
+                        "provider_model": _provider_model_name(model),
+                        "reason": error_text,
+                    },
+                    error_text,
+                )
 
         results = await asyncio.gather(*[_retry_one(model) for model in active_models])
         retry_decisions: dict[str, DecisionOutput] = {}
@@ -720,6 +786,8 @@ class ModelRegistry:
                 retry_decisions[model.name] = decision
                 retry_timings.append(timing)
             else:
+                if isinstance(timing, dict):
+                    retry_timings.append(timing)
                 failed_models.append(model)
                 failed_reasons[model.name] = error_text
         if not failed_models:
@@ -733,15 +801,47 @@ class ModelRegistry:
             started_at,
             duration,
             reason,
-            status=status,
+            status="independent_provider_fallback",
         )
         for row in fallback_timings:
             name = str(row.get("name") or "")
             row["independent_retry_failed"] = True
+            row["independent_retry_status"] = "independent_provider_failed"
+            try:
+                row["duration_sec"] = max(float(row.get("duration_sec") or 0.0), 0.001)
+            except (TypeError, ValueError):
+                row["duration_sec"] = 0.001
             if failed_reasons.get(name):
                 row["independent_retry_error"] = failed_reasons[name][:240]
+                row["reason"] = failed_reasons[name][:240]
         retry_decisions.update(fallback)
-        retry_timings.extend(fallback_timings)
+        fallback_by_name = {
+            str(row.get("name") or ""): row
+            for row in fallback_timings
+            if isinstance(row, dict) and row.get("name")
+        }
+        merged_timings: list[dict[str, Any]] = []
+        replaced_names: set[str] = set()
+        for row in retry_timings:
+            name = str(row.get("name") or "")
+            if name and name in fallback_by_name:
+                fallback_row = fallback_by_name[name]
+                try:
+                    retry_duration = float(row.get("duration_sec") or 0.0)
+                except (TypeError, ValueError):
+                    retry_duration = 0.0
+                fallback_row["duration_sec"] = max(
+                    float(fallback_row.get("duration_sec") or 0.0),
+                    retry_duration,
+                )
+                merged_timings.append(fallback_row)
+                replaced_names.add(name)
+            else:
+                merged_timings.append(row)
+        for name, row in fallback_by_name.items():
+            if name not in replaced_names:
+                merged_timings.append(row)
+        retry_timings = merged_timings
         return retry_decisions, retry_timings
 
     async def _retry_independent_experts(
@@ -761,6 +861,8 @@ class ModelRegistry:
         retry_context["expert_mode"] = True
         retry_context["_batch_consensus_retry"] = review.to_dict()
         retry_context["_force_independent_expert"] = True
+        retry_context["_force_fast_independent_expert"] = True
+        retry_context["_provider_independent_expert_mode"] = True
 
         async def _retry_one(
             model: AbstractAIModel,
@@ -768,7 +870,10 @@ class ModelRegistry:
             started_at = datetime.now(UTC)
             perf_started = time.perf_counter()
             try:
-                timeout_seconds = max(float(settings.ai_expert_timeout_seconds or 30.0), 5.0)
+                timeout_seconds = min(
+                    max(float(settings.ai_expert_timeout_seconds or 30.0), 8.0),
+                    18.0,
+                )
                 result = await asyncio.wait_for(
                     model.decide(features, retry_context),
                     timeout=timeout_seconds,
@@ -793,6 +898,7 @@ class ModelRegistry:
                 raw = result.raw_response if isinstance(result.raw_response, dict) else {}
                 raw["independent_expert_retry"] = True
                 raw["batch_consensus_review"] = review.to_dict()
+                raw["provider_independent_expert_mode"] = True
                 if isinstance(original, DecisionOutput):
                     raw["batch_original"] = {
                         "action": original.action.value,
@@ -811,6 +917,7 @@ class ModelRegistry:
                     "replaces_batch_decision": True,
                     "objective_side": review.objective_evidence.side,
                     "objective_score": review.objective_evidence.score,
+                    "provider_independent_expert_mode": True,
                 }
                 if isinstance(result.raw_response, dict) and result.raw_response.get(
                     "provider_model"
@@ -920,6 +1027,8 @@ class ModelRegistry:
         if not isinstance(batch_decision, DecisionOutput):
             return "invalid"
         raw = batch_decision.raw_response
+        if isinstance(raw, dict) and raw.get("batch_not_supported_independent"):
+            return "completed"
         if isinstance(raw, dict) and raw.get("batch_expert_fallback"):
             return "partial_batch_fallback"
         return "completed"

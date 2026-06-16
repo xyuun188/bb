@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">苍鸮量化图标</title>
+  <desc id="desc">以猫头鹰眼睛和几何轮廓构成的量化图标</desc>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071426"/>
+      <stop offset="0.58" stop-color="#0a2741"/>
+      <stop offset="1" stop-color="#031d1b"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="16" y1="14" x2="48" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34D6FF"/>
+      <stop offset="1" stop-color="#6CFFB8"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="url(#bg)"/>
+  <path d="M14 24 22 14l10 7 10-7 8 10-5 22-13 8-13-8-5-22Z" fill="none" stroke="url(#stroke)" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M22 24h20M19 30l13 5 13-5M24 44l8 5 8-5" fill="none" stroke="#215777" stroke-width="1.8" stroke-linecap="round"/>
+  <g filter="url(#glow)">
+    <circle cx="24" cy="32" r="6.5" fill="#0b1b2f" stroke="#34D6FF" stroke-width="2.4"/>
+    <circle cx="40" cy="32" r="6.5" fill="#0b1b2f" stroke="#6CFFB8" stroke-width="2.4"/>
+    <circle cx="24" cy="32" r="2.4" fill="#34D6FF"/>
+    <circle cx="40" cy="32" r="2.4" fill="#6CFFB8"/>
+  </g>
+  <path d="M32 34 28.5 40h7L32 34Z" fill="#c2ffe7"/>
+</svg>

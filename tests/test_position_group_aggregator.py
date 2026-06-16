@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from services.position_group_aggregator import PositionGroupAggregator
 
 
@@ -73,3 +75,45 @@ def test_position_group_aggregator_skips_invalid_fragments() -> None:
     )
 
     assert aggregate == {}
+
+
+def test_position_group_aggregator_derives_pnl_when_reported_zero_is_stale() -> None:
+    aggregate = PositionGroupAggregator(_normalize).aggregate(
+        [
+            {
+                "side": "short",
+                "quantity": 2.0,
+                "entry_price": 100.0,
+                "current_price": 110.0,
+                "unrealized_pnl": 0.0,
+            }
+        ],
+        "ensemble_trader",
+        "SOL/USDT",
+        "short",
+    )
+
+    assert aggregate["unrealized_pnl"] == -20.0
+    assert aggregate["unrealized_pnl_source"] == "derived_from_prices"
+
+
+def test_position_group_aggregator_uses_exchange_open_time_when_created_at_missing() -> None:
+    opened_at = datetime.now(UTC) - timedelta(hours=6)
+    aggregate = PositionGroupAggregator(_normalize).aggregate(
+        [
+            {
+                "side": "long",
+                "quantity": 1.0,
+                "entry_price": 100.0,
+                "current_price": 100.1,
+                "unrealized_pnl": 0.1,
+                "info": {"cTime": str(int(opened_at.timestamp() * 1000))},
+            }
+        ],
+        "ensemble_trader",
+        "MSFT/USDT:USDT",
+        "long",
+    )
+
+    assert aggregate["symbol"] == "MSFT/USDT"
+    assert aggregate["created_at"].startswith(opened_at.isoformat(timespec="seconds")[:19])

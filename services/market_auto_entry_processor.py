@@ -75,7 +75,7 @@ class MarketAutoEntryProcessor:
 
         opportunity_reason = self.gate_reason(decision)
         if opportunity_reason:
-            reason = f"候选评分未达执行标准：{opportunity_reason}"
+            reason = self._entry_gate_skip_reason(opportunity_reason)
             await self._record_skip(
                 symbol=symbol,
                 model_name=model_name,
@@ -175,6 +175,29 @@ class MarketAutoEntryProcessor:
             execution_attempted=True,
             reason=immediate_plan.reason,
         )
+
+    @staticmethod
+    def _entry_gate_skip_reason(gate_reason: str) -> str:
+        """Preserve severe gate semantics without relabeling all skips as score failures."""
+
+        reason = str(gate_reason or "").strip()
+        if not reason:
+            return "入场执行前检查未通过，本轮不提交 OKX 订单。"
+        if any(
+            token in reason
+            for token in (
+                "动态证据不足",
+                "保持观望",
+                "极小探针",
+                "强冲突硬拦截",
+                "硬拦截",
+                "风控",
+                "暂停新开仓",
+                "持仓压力",
+            )
+        ):
+            return reason
+        return f"入场候选暂未满足执行条件：{reason}"
 
     async def _record_skip(
         self,

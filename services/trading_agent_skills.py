@@ -13,6 +13,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+)
+from services.entry_signal_extraction import (
+    first_tool_payload,
+    has_signal_evidence,
+    payload_side,
+    signal_available,
+)
 
 
 @dataclass(slots=True)
@@ -281,7 +290,14 @@ class TradingAgentSkillBook:
         )
 
     def _server_profit_skill(self, tools: dict[str, Any] | None) -> SkillResult:
-        profit = self._tool_section(tools, "profit_prediction")
+        profit = self._tool_section(
+            tools,
+            "profit_prediction",
+            "profit_model",
+            "server_profit",
+            "server_profit_model",
+            "profit",
+        )
         if not profit:
             return SkillResult(
                 name="server_profit_model",
@@ -290,11 +306,13 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到服务器盈利模型预测。",
             )
-        available = profit.get("available", True) is not False and not profit.get("error")
-        side = str(profit.get("best_side") or profit.get("side") or "").lower()
+        available = signal_available(profit)
+        side = payload_side(profit)
         expected = self._first_number(
             profit, "expected_return_pct", "expected_net_return_pct", "profit_edge_pct"
         )
+        if expected is None and has_signal_evidence(profit):
+            expected = signal_expected_return_pct(profit, side)
         status = (
             "supported"
             if available and expected is not None and expected > 0
@@ -316,12 +334,19 @@ class TradingAgentSkillBook:
                 profit,
                 [
                     "available",
+                    "status",
+                    "error",
+                    "path",
+                    "duration_sec",
+                    "latency_ms",
                     "model",
                     "backend",
+                    "endpoint",
                     "best_side",
                     "side",
                     "expected_return_pct",
                     "expected_net_return_pct",
+                    "profit_edge_pct",
                     "loss_probability",
                     "confidence",
                     "recommendation",
@@ -330,7 +355,14 @@ class TradingAgentSkillBook:
         )
 
     def _timeseries_skill(self, tools: dict[str, Any] | None) -> SkillResult:
-        series = self._tool_section(tools, "time_series_prediction")
+        series = self._tool_section(
+            tools,
+            "time_series_prediction",
+            "timeseries_prediction",
+            "sequence_prediction",
+            "timeseries",
+            "time_series",
+        )
         if not series:
             return SkillResult(
                 name="time_series_model",
@@ -339,12 +371,19 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到时序预测。",
             )
-        side = str(series.get("best_side") or series.get("side") or "").lower()
+        available = signal_available(series)
+        side = payload_side(series)
         expected = self._first_number(series, "expected_return_pct", "expected_move_pct")
+        if expected is None and has_signal_evidence(series):
+            expected = signal_expected_return_pct(series, side)
         return SkillResult(
             name="time_series_model",
             label="时序预测",
-            status="supported" if expected is not None and expected > 0 else "warning",
+            status=(
+                "supported"
+                if available and expected is not None and expected > 0
+                else ("warning" if available else "unavailable")
+            ),
             decision=side if side in {"long", "short"} else "neutral",
             confidence=self._first_number(series, "confidence", "score"),
             reason=(
@@ -356,7 +395,14 @@ class TradingAgentSkillBook:
                 series,
                 [
                     "available",
+                    "status",
+                    "error",
+                    "path",
+                    "duration_sec",
+                    "latency_ms",
                     "model",
+                    "backend",
+                    "endpoint",
                     "best_side",
                     "side",
                     "direction",
@@ -368,7 +414,13 @@ class TradingAgentSkillBook:
         )
 
     def _sentiment_skill(self, tools: dict[str, Any] | None) -> SkillResult:
-        sentiment = self._tool_section(tools, "sentiment_analysis")
+        sentiment = self._tool_section(
+            tools,
+            "sentiment_analysis",
+            "sentiment_prediction",
+            "sentiment_model",
+            "sentiment",
+        )
         if not sentiment:
             return SkillResult(
                 name="sentiment_model",
@@ -377,12 +429,18 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到情绪模型预测。",
             )
-        side = str(sentiment.get("best_side") or sentiment.get("side") or "").lower()
+        available = signal_available(sentiment)
+        side = payload_side(sentiment)
         score = self._first_number(sentiment, "score", "sentiment_score")
         return SkillResult(
             name="sentiment_model",
             label="情绪预测",
-            status="supported" if score is not None and abs(score) >= 0.05 else "warning",
+            status=(
+                "supported"
+                if available
+                and (score is not None and abs(score) >= 0.05 or side in {"long", "short"})
+                else ("warning" if available else "unavailable")
+            ),
             decision=side if side in {"long", "short"} else "neutral",
             confidence=self._first_number(sentiment, "confidence"),
             reason=(
@@ -394,7 +452,14 @@ class TradingAgentSkillBook:
                 sentiment,
                 [
                     "available",
+                    "status",
+                    "error",
+                    "path",
+                    "duration_sec",
+                    "latency_ms",
                     "model",
+                    "backend",
+                    "endpoint",
                     "best_side",
                     "side",
                     "label",
@@ -408,7 +473,13 @@ class TradingAgentSkillBook:
         )
 
     def _exit_advice_skill(self, tools: dict[str, Any] | None) -> SkillResult | None:
-        advice = self._tool_section(tools, "exit_advice")
+        advice = self._tool_section(
+            tools,
+            "exit_advice",
+            "exit_model",
+            "position_exit",
+            "exit",
+        )
         if not advice:
             return None
         action = str(advice.get("action") or advice.get("recommendation") or "hold").lower()
@@ -430,7 +501,14 @@ class TradingAgentSkillBook:
                 display_advice,
                 [
                     "available",
+                    "status",
+                    "error",
+                    "path",
+                    "duration_sec",
+                    "latency_ms",
                     "model",
+                    "backend",
+                    "endpoint",
                     "action",
                     "action_label",
                     "recommendation",
@@ -551,11 +629,10 @@ class TradingAgentSkillBook:
             },
         )
 
-    def _tool_section(self, tools: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    def _tool_section(self, tools: dict[str, Any] | None, *names: str) -> dict[str, Any]:
         if not isinstance(tools, dict):
             return {}
-        section = tools.get(name)
-        return section if isinstance(section, dict) else {}
+        return first_tool_payload(tools, *names)
 
     def _first_number(self, data: dict[str, Any], *keys: str) -> float | None:
         for key in keys:

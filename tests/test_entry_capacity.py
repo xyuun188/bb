@@ -103,3 +103,58 @@ def test_entry_capacity_reserves_staged_entry_slot() -> None:
     assert staged["model_totals"] == {"ensemble_trader": 1}
     assert staged["side_totals"] == {"long": 1}
     assert staged["symbol_side"] == {("ensemble_trader", "BTC-USDT", "long"): 1}
+
+
+def test_entry_capacity_uses_dynamic_effective_limit_from_context() -> None:
+    policy = EntryCapacityPolicy(
+        _normalize,
+        lambda: {
+            "base_limit": 20,
+            "effective_limit": 2,
+            "reason": "low_quality_pressure=6",
+            "factors": {"reason_codes": ["low_quality_pressure"]},
+        },
+    )
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("SOL/USDT"),
+        [
+            {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "ETH/USDT", "side": "long"},
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is not None
+    assert "运行上限" in reason
+    assert "低质量持仓压力较高" in reason
+
+
+def test_entry_capacity_prefers_entry_limit_when_rotation_slots_are_open() -> None:
+    policy = EntryCapacityPolicy(
+        _normalize,
+        lambda: {
+            "base_limit": 4,
+            "effective_limit": 4,
+            "entry_limit": 5,
+            "reason": "rotation_entry_expansion=1",
+            "factors": {
+                "reason_codes": ["rotation_entry_expansion", "release_rotation_slots"]
+            },
+        },
+    )
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("SOL/USDT"),
+        [
+            {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "ETH/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "XRP/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "DOGE/USDT", "side": "long"},
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is None

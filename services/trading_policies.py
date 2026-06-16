@@ -183,6 +183,34 @@ class EntryPolicy:
             model_mode,
             open_positions=open_positions or [],
         )
+        evidence_score = {}
+        opportunity = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity_data = opportunity.get("opportunity_score") if isinstance(opportunity, dict) else {}
+        if isinstance(opportunity_data, dict) and isinstance(opportunity_data.get("evidence_score"), dict):
+            evidence_score = opportunity_data["evidence_score"]
+        evidence_tier = str(evidence_score.get("tier") or "")
+        if decision.position_size_pct <= 0 and evidence_tier in {"blocked", "weak_conflict_probe", "degraded_missing_probe"}:
+            return PolicyGateResult.block(
+                "entry_evidence_wait",
+                (
+                    "动态证据不足，本轮保持观望或极小探针，未提交 OKX 订单；"
+                    "下一轮会根据最新市场与模型证据重新评估。"
+                ),
+                {
+                    "pipeline_context": context.public_data(),
+                    "stage_status": "skipped",
+                    "skip_kind": "entry_evidence_wait",
+                    "evidence_tier": evidence_tier,
+                    "evidence_score": evidence_score,
+                },
+            )
+        gate_reason = self.gate_reason(decision)
+        if gate_reason:
+            return PolicyGateResult.block(
+                "entry_opportunity_gate",
+                gate_reason,
+                {"pipeline_context": context.public_data()},
+            )
         high_risk_reason = await self.high_risk_review_gate(
             decision,
             model_mode,

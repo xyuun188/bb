@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -15,6 +17,12 @@ import structlog
 from config.settings import settings
 from core.safe_output import safe_error_text, safe_response_error_text
 from core.url_safety import normalize_http_base_url
+from services.entry_signal_extraction import (
+    enrich_signal_payload,
+    expected_return_pct,
+    payload_side,
+    unwrap_tool_payload,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -24,6 +32,7 @@ _MIN_REQUEST_TIMEOUT_SECONDS = 0.2
 _MAX_REQUEST_TIMEOUT_SECONDS = 15.0
 _MAX_CIRCUIT_BREAKER_FAILURES = 20
 _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
+_STATUS_CACHE_TTL_SECONDS = 8.0
 
 
 class LocalAIToolsClient:
@@ -38,6 +47,15 @@ class LocalAIToolsClient:
         self._circuit_open_until: datetime | None = None
         self._last_failure: str = ""
         self._last_success_at: datetime | None = None
+        self._status_cache: tuple[float, dict[str, Any]] | None = None
+
+    def _request_timeout(self) -> float:
+        return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
+
+    @staticmethod
+    def _is_soft_timeout_failure(reason: str) -> bool:
+        lowered = str(reason or "").lower()
+        return "readtimeout" in lowered or "timed out" in lowered or "timeout" in lowered
 
     def _refresh_runtime_settings(self) -> None:
         self._timeout = min(
@@ -83,19 +101,49 @@ class LocalAIToolsClient:
         payload = self._feature_payload(features)
         if isinstance(ml_signal, dict):
             payload["local_ml_signal"] = ml_signal
-        if open_positions:
-            payload["open_positions"] = open_positions
+        if include_exit_advice and open_positions:
+            payload["open_positions"] = self._position_payload(features, open_positions)
         payload = self._json_safe(payload)
+        request_timeout = self._request_timeout()
 
         started = datetime.now(UTC)
-        calls = [
-            ("profit_prediction", self._post("/profit/predict", payload)),
-            ("time_series_prediction", self._post("/timeseries/deep/predict", payload)),
-            ("sentiment_analysis", self._post("/sentiment/deep/analyze", payload)),
+        tool_specs = [
+            ("profit_prediction", "/profit/predict"),
+            ("time_series_prediction", "/timeseries/deep/predict"),
+            ("sentiment_analysis", "/sentiment/deep/analyze"),
         ]
         if include_exit_advice and open_positions:
-            calls.append(("exit_advice", self._post("/exit/advise", payload)))
-        results = await asyncio.gather(*(call for _, call in calls), return_exceptions=True)
+            tool_specs.append(("exit_advice", "/exit/advise"))
+
+        async def call_tool(name: str, path: str) -> dict[str, Any]:
+            tool_started = datetime.now(UTC)
+            try:
+                result = await self._post(path, payload, request_timeout=request_timeout)
+            except Exception as exc:
+                return {
+                    "available": False,
+                    "status": "error",
+                    "error": safe_error_text(exc, limit=180),
+                    "path": path,
+                    "duration_sec": round(
+                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
+                        4,
+                    ),
+                }
+            item = self._normalize_signal(name, result)
+            item.setdefault("available", True)
+            item.setdefault("status", "returned")
+            item.setdefault("path", path)
+            item["duration_sec"] = round(
+                max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
+                4,
+            )
+            return item
+
+        results = await asyncio.gather(
+            *(call_tool(name, path) for name, path in tool_specs),
+            return_exceptions=True,
+        )
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
@@ -104,18 +152,28 @@ class LocalAIToolsClient:
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
         }
         errors: dict[str, str] = {}
-        for (name, _), item in zip(calls, results, strict=False):
+        for (name, _path), item in zip(tool_specs, results, strict=False):
             if isinstance(item, Exception):
                 error = safe_error_text(item, limit=180)
                 errors[name] = error
-                data[name] = {"available": False, "error": error}
+                data[name] = {"available": False, "status": "error", "error": error}
             else:
-                data[name] = self._normalize_signal(name, item)
+                if item.get("status") == "error" or item.get("available") is False:
+                    errors[name] = safe_error_text(
+                        item.get("error"),
+                        limit=180,
+                        fallback="local AI tools request failed",
+                    )
+                data[name] = item
         if errors:
-            data["status"] = "partial" if len(errors) < len(calls) else "unavailable"
+            data["status"] = "partial" if len(errors) < len(tool_specs) else "unavailable"
             data["errors"] = errors
-        if errors and len(errors) == len(calls):
-            self._record_failure("; ".join(errors.values()))
+        if errors and len(errors) == len(tool_specs):
+            error_summary = "; ".join(errors.values())
+            self._record_failure(
+                error_summary,
+                open_circuit=not self._is_soft_timeout_failure(error_summary),
+            )
             data.update(self._breaker_fields())
         else:
             self._record_success()
@@ -125,8 +183,39 @@ class LocalAIToolsClient:
     def _normalize_signal(self, name: str, item: Any) -> dict[str, Any]:
         if not isinstance(item, dict):
             return {"value": item}
-        normalized = dict(item)
-        if name == "time_series_prediction":
+        normalized = enrich_signal_payload(name, unwrap_tool_payload(item) or dict(item))
+        if name == "profit_prediction":
+            side = payload_side(normalized)
+            if side not in {"long", "short"}:
+                long_expected = self._to_float(
+                    normalized.get(
+                        "adjusted_long_return_pct",
+                        normalized.get(
+                            "long_expected_return_pct", normalized.get("expected_long_return_pct")
+                        ),
+                    ),
+                    0.0,
+                )
+                short_expected = self._to_float(
+                    normalized.get(
+                        "adjusted_short_return_pct",
+                        normalized.get(
+                            "short_expected_return_pct", normalized.get("expected_short_return_pct")
+                        ),
+                    ),
+                    0.0,
+                )
+                side = "long" if long_expected >= short_expected else "short"
+            if side in {"long", "short"}:
+                normalized["best_side"] = side
+                normalized["side"] = side
+            if "expected_return_pct" not in normalized:
+                normalized["expected_return_pct"] = expected_return_pct(normalized, side)
+            if "profit_edge_pct" not in normalized:
+                long_value = expected_return_pct(normalized, "long")
+                short_value = expected_return_pct(normalized, "short")
+                normalized["profit_edge_pct"] = round(abs(long_value - short_value), 6)
+        elif name == "time_series_prediction":
             side = str(normalized.get("best_side") or normalized.get("side") or "").lower()
             direction = str(
                 normalized.get("direction")
@@ -228,20 +317,125 @@ class LocalAIToolsClient:
                 "available": False,
                 **circuit_open,
             }
+        cached = self._read_status_cache()
+        if cached is not None:
+            return cached
         try:
-            status = await self._get("/models/status")
+            status = await self._get(
+                "/models/status",
+                request_timeout=self._request_timeout(),
+            )
+            status_ok = True
+            status_error = ""
+        except Exception as exc:
+            status = {}
+            status_ok = False
+            status_error = safe_error_text(exc, limit=180)
+
+        child_endpoints = await self._probe_child_endpoints()
+        child_available = any(
+            bool(item.get("available") or item.get("ok"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        model_bundle_available = bool(status.get("available"))
+        service_available = bool(status_ok or child_available)
+
+        status["model_bundle_available"] = model_bundle_available
+        status["service_available"] = service_available
+        status["child_endpoints"] = child_endpoints
+        status["available"] = bool(model_bundle_available or child_available)
+        if status_error:
+            status["status_error"] = status_error
+        if child_available and not model_bundle_available:
+            status.setdefault(
+                "message",
+                "Local AI tools service is available; trained bundle is not ready yet.",
+            )
+            status["status"] = "heuristic_fallback_available"
+        if service_available:
             self._record_success()
             status.update(self._breaker_fields())
-            return status
-        except Exception as exc:
-            error = safe_error_text(exc, limit=180)
-            self._record_failure(error)
-            return {
+            return self._write_status_cache(status)
+
+        error = status_error or "local AI tools service is unavailable"
+        self._record_failure(error)
+        return self._write_status_cache(
+            {
                 "available": False,
                 "status": "error",
                 "error": error,
+                "model_bundle_available": False,
+                "service_available": False,
+                "child_endpoints": child_endpoints,
                 **self._breaker_fields(),
             }
+        )
+
+    async def _probe_child_endpoints(self) -> dict[str, dict[str, Any]]:
+        payload = self._json_safe(
+            {
+                "symbol": "BTC/USDT",
+                "features": {
+                    "symbol": "BTC/USDT",
+                    "current_price": 100.0,
+                    "close": 100.0,
+                    "returns_1": 0.02,
+                    "returns_5": 0.04,
+                    "returns_20": 0.08,
+                    "volume_ratio": 1.0,
+                    "volatility_20": 0.01,
+                    "spread_pct": 0.01,
+                    "adx_14": 20.0,
+                    "news_sentiment_avg": 0.0,
+                    "social_sentiment_avg": 0.0,
+                },
+                "open_positions": [
+                    {
+                        "symbol": "BTC/USDT",
+                        "side": "long",
+                        "entry_price": 100.0,
+                        "current_price": 100.2,
+                        "unrealized_pnl": 0.2,
+                        "unrealized_pnl_pct": 0.002,
+                    }
+                ],
+            }
+        )
+        specs = {
+            "profit_prediction": "/profit/predict",
+            "time_series_prediction": "/timeseries/deep/predict",
+            "sentiment_analysis": "/sentiment/deep/analyze",
+            "exit_advice": "/exit/advise",
+        }
+
+        async def probe(name: str, path: str) -> tuple[str, dict[str, Any]]:
+            started = datetime.now(UTC)
+            try:
+                result = await self._post(
+                    path,
+                    payload,
+                    request_timeout=self._request_timeout(),
+                )
+                item = self._normalize_signal(name, result)
+                item["available"] = bool(item.get("available", True))
+            except Exception as exc:
+                item = {"available": False, "error": safe_error_text(exc, limit=180)}
+            item["path"] = path
+            item["duration_sec"] = round((datetime.now(UTC) - started).total_seconds(), 3)
+            return name, item
+
+        results = await asyncio.gather(
+            *(probe(name, path) for name, path in specs.items()),
+            return_exceptions=True,
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            name, item = result
+            out[name] = item
+        return out
 
     async def train(
         self,
@@ -320,20 +514,46 @@ class LocalAIToolsClient:
             data["circuit_open_until"] = self._circuit_open_until.isoformat()
         return data
 
+    def _read_status_cache(self) -> dict[str, Any] | None:
+        if self._status_cache is None:
+            return None
+        cached_at, payload = self._status_cache
+        age = monotonic() - cached_at
+        if age > _STATUS_CACHE_TTL_SECONDS:
+            self._status_cache = None
+            return None
+        data = copy.deepcopy(payload)
+        data["status_cache"] = {
+            "hit": True,
+            "age_seconds": round(max(age, 0.0), 2),
+            "ttl_seconds": _STATUS_CACHE_TTL_SECONDS,
+        }
+        return data
+
+    def _write_status_cache(self, payload: dict[str, Any]) -> dict[str, Any]:
+        data = copy.deepcopy(payload)
+        data["status_cache"] = {
+            "hit": False,
+            "age_seconds": 0.0,
+            "ttl_seconds": _STATUS_CACHE_TTL_SECONDS,
+        }
+        self._status_cache = (monotonic(), copy.deepcopy(data))
+        return data
+
     def _record_success(self) -> None:
         self._failure_count = 0
         self._circuit_open_until = None
         self._last_failure = ""
         self._last_success_at = datetime.now(UTC)
 
-    def _record_failure(self, reason: str) -> None:
+    def _record_failure(self, reason: str, *, open_circuit: bool = True) -> None:
         self._failure_count += 1
         self._last_failure = safe_error_text(
             reason,
             limit=180,
             fallback="local AI tools request failed",
         )
-        if self._failure_count < self._failure_threshold:
+        if not open_circuit or self._failure_count < self._failure_threshold:
             return
         self._circuit_open_until = datetime.now(UTC) + timedelta(seconds=self._cooldown_seconds)
         logger.warning(
@@ -344,10 +564,10 @@ class LocalAIToolsClient:
             reason=self._last_failure,
         )
 
-    async def _get(self, path: str) -> dict[str, Any]:
+    async def _get(self, path: str, request_timeout: float | None = None) -> dict[str, Any]:
         base = self._api_base()
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=request_timeout or self._timeout) as client:
                 response = await client.get(f"{base}{path}", headers=self._auth_headers())
         except httpx.RequestError as exc:
             raise RuntimeError(
@@ -392,9 +612,10 @@ class LocalAIToolsClient:
 
     def _auth_headers(self) -> dict[str, str]:
         key = str(settings.local_ai_tools_api_key or "").strip()
-        if not key:
-            return {}
-        return {"Authorization": f"Bearer {key}"}
+        headers = {"Connection": "close"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
 
     def _parse_response(self, response: httpx.Response, path: str) -> dict[str, Any]:
         if not response.is_success:
@@ -431,6 +652,36 @@ class LocalAIToolsClient:
             "timestamp": datetime.now(UTC).isoformat(),
             "features": snapshot,
         }
+
+    def _position_payload(
+        self,
+        features: Any,
+        open_positions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        symbol = str(getattr(features, "symbol", "") or "").upper().replace("/", "-")
+        compact: list[dict[str, Any]] = []
+        for pos in open_positions:
+            if not isinstance(pos, dict):
+                continue
+            pos_symbol = str(pos.get("symbol") or "").upper().replace("/", "-")
+            if symbol and pos_symbol and pos_symbol != symbol:
+                continue
+            compact.append(
+                {
+                    "symbol": pos.get("symbol"),
+                    "side": pos.get("side"),
+                    "entry_price": pos.get("entry_price"),
+                    "current_price": pos.get("current_price"),
+                    "quantity": pos.get("quantity") or pos.get("contracts"),
+                    "leverage": pos.get("leverage"),
+                    "notional": pos.get("notional"),
+                    "margin": pos.get("margin") or pos.get("initial_margin"),
+                    "unrealized_pnl": pos.get("unrealized_pnl"),
+                    "unrealized_pnl_pct": pos.get("unrealized_pnl_pct") or pos.get("pnl_pct"),
+                    "created_at": pos.get("created_at"),
+                }
+            )
+        return compact[:4]
 
     def _json_safe(self, value: Any) -> Any:
         if isinstance(value, datetime):

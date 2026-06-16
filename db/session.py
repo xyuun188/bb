@@ -94,10 +94,12 @@ async def init_db() -> None:
     """Create all tables. Called at application startup."""
     import models.decision  # noqa: F401 - register decision tables in metadata
     import models.account  # noqa: F401 - register account tables in metadata
+    import models.dashboard_auth  # noqa: F401 - register dashboard auth tables
     import models.learning  # noqa: F401 - register learning tables in metadata
     import models.market_data  # noqa: F401 - register market tables in metadata
     import models.news  # noqa: F401 - register news/social tables in metadata
     import models.risk  # noqa: F401 - register risk tables in metadata
+    import models.secure_config  # noqa: F401 - register encrypted config tables
     import models.trade  # noqa: F401 - register trade tables in metadata
 
     engine = await get_engine()
@@ -177,6 +179,10 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_strategy_events_symbol_action ON strategy_learning_events (symbol, action, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_strategy_profile_snapshots_profile ON strategy_profile_snapshots (execution_mode, profile_id, version)",
                 "CREATE INDEX IF NOT EXISTS idx_strategy_profile_snapshots_active ON strategy_profile_snapshots (execution_mode, is_active, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_dashboard_users_username ON dashboard_users (username)",
+                "CREATE INDEX IF NOT EXISTS idx_dashboard_users_email ON dashboard_users (email)",
+                "CREATE INDEX IF NOT EXISTS idx_secure_settings_key ON secure_settings (key)",
+                "CREATE INDEX IF NOT EXISTS idx_secure_setting_audit_key_created ON secure_setting_audit (key, created_at DESC)",
             ]:
                 await conn.execute(text(ddl))
 

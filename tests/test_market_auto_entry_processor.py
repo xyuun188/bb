@@ -136,10 +136,36 @@ async def test_market_auto_entry_processor_records_gate_skip() -> None:
 
     assert result.handled is True
     assert result.execution_attempted is False
-    assert result.reason == "候选评分未达执行标准：分数不足"
+    assert result.reason == "入场候选暂未满足执行条件：分数不足"
     assert results["decisions"][0]["execution_status"] == "skipped"
-    assert ("reason", 7, "候选评分未达执行标准：分数不足") in calls
+    assert ("reason", 7, "入场候选暂未满足执行条件：分数不足") in calls
     assert not any(call[0] == "execute" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_preserves_dynamic_evidence_wait_reason() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    wait_reason = "动态证据不足，本轮保持观望或极小探针，未提交 OKX 订单。"
+
+    result = await _processor(calls, gate_reason=wait_reason).process(
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=_decision(),
+        assessment=object(),
+        decision_db_id=11,
+        results=results,
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts={},
+        strategy_mode_context=None,
+    )
+
+    assert result.handled is True
+    assert result.execution_attempted is False
+    assert result.reason == wait_reason
+    assert "候选评分未达执行标准" not in results["decisions"][0]["reason"]
+    assert ("reason", 11, wait_reason) in calls
 
 
 @pytest.mark.asyncio

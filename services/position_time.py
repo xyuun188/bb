@@ -4,6 +4,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+from services.position_open_time import parse_position_time
+
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -37,18 +39,6 @@ class PositionTimeParser:
 
     @staticmethod
     def _parse_created_at(created_at: Any) -> Any:
-        opened = created_at
-        if isinstance(opened, (int, float)):
-            value = float(opened)
-            if value > 10_000_000_000:
-                value = value / 1000.0
-            return datetime.fromtimestamp(value, tz=UTC)
-        if isinstance(opened, str):
-            stripped = opened.strip()
-            if stripped.isdigit():
-                value = float(stripped)
-                if value > 10_000_000_000:
-                    value = value / 1000.0
-                return datetime.fromtimestamp(value, tz=UTC)
-            return datetime.fromisoformat(stripped.replace("Z", "+00:00"))
-        return opened
+        if isinstance(created_at, datetime) and created_at.tzinfo is None:
+            return created_at
+        return parse_position_time(created_at)

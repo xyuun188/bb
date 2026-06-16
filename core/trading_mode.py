@@ -107,7 +107,7 @@ class TradingModeManager:
         await self._notify()
 
     async def switch_to_manual(self) -> None:
-        self._scan_mode = "manual"
+        self._scan_mode = "auto"
         self._mode_changed_at = datetime.utcnow()
         await self._notify()
 

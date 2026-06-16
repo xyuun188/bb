@@ -28,6 +28,9 @@ UNTRUSTED_EXPERT_TIMING_STATUSES = {
     "failed",
     "invalid",
     "timeout",
+    "timeout_fallback",
+    "independent_provider_fallback",
+    "independent_provider_failed",
 }
 BALANCED_PROBE_EXPERT_INTEGRITY_MODE = "balanced_probe_allow_one_non_core_missing"
 BALANCED_PROBE_MAX_POSITION_SIZE_PCT = 0.018

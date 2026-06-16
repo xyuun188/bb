@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 SERVICE_CODE = r'''
 from __future__ import annotations
@@ -638,16 +639,16 @@ def health() -> dict[str, Any]:
     metadata = {}
     if bundle and isinstance(bundle.get("metadata"), dict):
         metadata = bundle["metadata"]
-        return {
-            "ok": True,
-            "service": "trade-local-ai-tools",
-            "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
-            "trained_models_available": bool(bundle),
-            "trained_at": metadata.get("trained_at"),
-            "shadow_sample_count": metadata.get("shadow_sample_count", 0),
-            "trade_sample_count": metadata.get("trade_sample_count", 0),
-            "review_backend": "disabled_use_trading_app_online_model",
-        }
+    return {
+        "ok": True,
+        "service": "trade-local-ai-tools",
+        "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
+        "trained_models_available": bool(bundle),
+        "trained_at": metadata.get("trained_at"),
+        "shadow_sample_count": metadata.get("shadow_sample_count", 0),
+        "trade_sample_count": metadata.get("trade_sample_count", 0),
+        "review_backend": "disabled_use_trading_app_online_model",
+    }
 
 
 @app.get("/models/status")
@@ -1193,7 +1194,8 @@ def chat_completions(_payload: dict[str, Any]) -> Any:
 
 
 def main() -> None:
-    ssh = connect_remote_ssh(ROOT, timeout=15)
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=15, info=info)
     try:
         run_remote_text(
             ssh,
@@ -1222,7 +1224,8 @@ def main() -> None:
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002
             EnvironmentFile=-/data/trade_ai/local_ai_tools.env
-            ExecStart=__PYTHON_BIN__ -m uvicorn local_ai_tools_api:app --host 0.0.0.0 --port 8001
+            LimitNOFILE=65535
+            ExecStart=__PYTHON_BIN__ -m uvicorn local_ai_tools_api:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 5
             Restart=always
             RestartSec=5
             StandardOutput=append:/data/trade_ai/logs/local_ai_tools_api.log

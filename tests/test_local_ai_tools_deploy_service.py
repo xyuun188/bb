@@ -32,6 +32,17 @@ def test_local_ai_tools_generated_service_disables_local_high_risk_review() -> N
     assert "Configure HIGH_RISK_REVIEW_*" in SERVICE_CODE
 
 
+def test_local_ai_tools_health_returns_service_status_without_trained_bundle() -> None:
+    assert (
+        'if bundle and isinstance(bundle.get("metadata"), dict):\n'
+        '        metadata = bundle["metadata"]\n'
+        '    return {\n'
+        '        "ok": True,'
+    ) in SERVICE_CODE
+    assert '"trained_models_available": bool(bundle)' in SERVICE_CODE
+    assert '"review_backend": "disabled_use_trading_app_online_model"' in SERVICE_CODE
+
+
 def test_local_ai_tools_generated_service_does_not_use_wildcard_cors() -> None:
     assert 'allow_origins=["*"]' not in SERVICE_CODE
     assert "LOCAL_AI_TOOLS_CORS_ORIGINS" in SERVICE_CODE
@@ -62,6 +73,8 @@ def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
     assert "chmod 600 /data/trade_ai/local_ai_tools.env" in source
     assert "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true" in source
     assert "LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002" in source
+    assert "LimitNOFILE=65535" in source
+    assert "--timeout-keep-alive 5" in source
 
 
 def test_local_ai_tools_fix_service_uses_remote_posix_python_path() -> None:
@@ -70,8 +83,9 @@ def test_local_ai_tools_fix_service_uses_remote_posix_python_path() -> None:
     assert "Environment=PATH=/home/linux/anaconda3/envs/trade_ml/bin:" in service
     assert (
         "ExecStart=/home/linux/anaconda3/envs/trade_ml/bin/python -m uvicorn "
-        "local_ai_tools_api:app --host 0.0.0.0 --port 8001"
+        "local_ai_tools_api:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 5"
     ) in service
+    assert "LimitNOFILE=65535" in service
     assert "EnvironmentFile=-/data/trade_ai/local_ai_tools.env" in service
     assert "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true" in service
     assert "qwen3-32b-main.service" in service

@@ -56,6 +56,9 @@ ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = 1.05
 ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = 1.35
 ENTRY_BALANCED_PROBE_MAX_LOSS_USDT = 5.0
 ENTRY_STRONG_PROBE_MAX_LOSS_USDT = 9.0
+ENTRY_QUALITY_RISK_BASE_CAP_PCT = 0.008
+ENTRY_QUALITY_RISK_MAX_CAP_PCT = 0.024
+ENTRY_QUALITY_RISK_ELITE_CAP_PCT = 0.030
 
 
 def _settings_max_leverage() -> float:
@@ -93,23 +96,99 @@ class EntryProfitRiskSizingPolicy:
     def _strategy_learning_sizing(cls, raw: dict[str, Any]) -> dict[str, Any]:
         strategy_mode = cls._safe_dict(raw.get("strategy_mode"))
         sizing = cls._safe_dict(strategy_mode.get("strategy_learning_sizing"))
+        direct_sizing = cls._safe_dict(raw.get("strategy_learning_sizing"))
+        if direct_sizing:
+            sizing = {**direct_sizing, **sizing}
         context = cls._safe_dict(raw.get("strategy_learning_context"))
+        context_sizing = cls._safe_dict(context.get("strategy_learning_sizing"))
+        if context_sizing:
+            sizing = {**sizing, **context_sizing}
         learning = cls._safe_dict(context.get("strategy_learning"))
         mode_learning = cls._safe_dict(strategy_mode.get("strategy_learning"))
+        if (
+            context.get("strategy_learning_release_pressure_active")
+            or strategy_mode.get("strategy_learning_release_pressure_active")
+            or learning.get("release_pressure_active")
+            or mode_learning.get("release_pressure_active")
+        ):
+            sizing = {
+                **sizing,
+                "release_pressure_active": True,
+                "reason": (
+                    context.get("strategy_learning_release_pressure_reason")
+                    or strategy_mode.get("strategy_learning_release_pressure_reason")
+                    or learning.get("release_pressure_reason")
+                    or mode_learning.get("release_pressure_reason")
+                    or sizing.get("reason")
+                    or "strategy learning release pressure is active"
+                ),
+                "position_size_multiplier": min(
+                    max(cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.10),
+                    1.25,
+                ),
+                "probe_fraction": max(
+                    cls._safe_float(sizing.get("probe_fraction"), 0.0),
+                    0.03,
+                ),
+                "max_probe_size_pct": min(
+                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.012), 0.008),
+                    0.018,
+                ),
+            }
         if (
             context.get("strategy_learning_entry_pause")
             or strategy_mode.get("strategy_learning_entry_pause")
             or learning.get("entry_pause")
             or mode_learning.get("entry_pause")
         ):
-            return {
-                "entry_paused": True,
+            sizing = {
+                **sizing,
+                "entry_paused": False,
+                "strategy_learning_pause_is_hard_gate": False,
+                "recovery_probe_allowed": True,
+                "health_guard_active": True,
                 "reason": (
                     context.get("strategy_learning_entry_pause_reason")
                     or strategy_mode.get("strategy_learning_entry_pause_reason")
                     or learning.get("entry_pause_reason")
                     or mode_learning.get("entry_pause_reason")
-                    or "strategy learning entry pause is active"
+                    or "策略学习护栏提示：已转为小仓恢复探针，不作为新开仓硬拦截。"
+                ),
+                "position_size_multiplier": min(
+                    cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
+                    0.35,
+                ),
+                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "max_probe_size_pct": min(
+                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
+                    0.012,
+                ),
+            }
+        if (
+            context.get("strategy_learning_recovery_probe_allowed")
+            or strategy_mode.get("strategy_learning_recovery_probe_allowed")
+            or learning.get("recovery_probe_allowed")
+            or mode_learning.get("recovery_probe_allowed")
+        ):
+            sizing = {
+                **sizing,
+                "health_guard_active": True,
+                "recovery_probe_allowed": True,
+                "reason": (
+                    context.get("strategy_learning_recovery_probe_reason")
+                    or strategy_mode.get("strategy_learning_recovery_probe_reason")
+                    or learning.get("recovery_probe_reason")
+                    or mode_learning.get("recovery_probe_reason")
+                    or sizing.get("reason")
+                    or "strategy learning recovery probe is active"
+                ),
+                "position_size_multiplier": min(
+                    cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.35
+                ),
+                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "max_probe_size_pct": min(
+                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
+                    0.012,
                 ),
             }
         runtime = cls._safe_dict(learning.get("runtime"))
@@ -131,16 +210,30 @@ class EntryProfitRiskSizingPolicy:
         current_size: float,
         action_side: str,
         sizing: dict[str, Any],
+        quality_override: bool = False,
     ) -> dict[str, Any]:
         if current_size <= 0 or not sizing:
             return {"applied": False}
         if sizing.get("entry_paused"):
-            return {
-                "applied": False,
-                "entry_paused": True,
-                "reason": str(sizing.get("reason") or "strategy learning entry pause is active")[
-                    :240
-                ],
+            sizing = {
+                **sizing,
+                "entry_paused": False,
+                "strategy_learning_pause_is_hard_gate": False,
+                "recovery_probe_allowed": True,
+                "health_guard_active": True,
+                "position_size_multiplier": min(
+                    cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
+                    0.35,
+                ),
+                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "max_probe_size_pct": min(
+                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
+                    0.012,
+                ),
+                "reason": str(
+                    sizing.get("reason")
+                    or "策略学习护栏提示：已转为小仓恢复探针，不作为新开仓硬拦截。"
+                )[:240],
             }
         global_multiplier = min(
             max(cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.10), 1.25
@@ -151,12 +244,18 @@ class EntryProfitRiskSizingPolicy:
             max(cls._safe_float(side_row.get("size_multiplier"), 1.0), 0.10), 1.25
         )
         probe_fraction = min(max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.0), 0.10)
-        max_probe_size = min(
-            max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0), 0.03
+        max_probe_size = min(max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0), 0.03)
+        effective_global_multiplier = global_multiplier
+        effective_side_multiplier = side_multiplier
+        if quality_override:
+            effective_global_multiplier = max(effective_global_multiplier, 1.0)
+            effective_side_multiplier = max(effective_side_multiplier, 1.0)
+        adjusted = min(
+            max(current_size * effective_global_multiplier * effective_side_multiplier, 0.0),
+            1.0,
         )
-        adjusted = min(max(current_size * global_multiplier * side_multiplier, 0.0), 1.0)
         cap = max_probe_size if max_probe_size > 0 and probe_fraction > 0 else 0.0
-        if cap > 0:
+        if cap > 0 and not quality_override:
             adjusted = min(adjusted, cap)
         applied = abs(adjusted - current_size) > 1e-9
         return {
@@ -167,11 +266,57 @@ class EntryProfitRiskSizingPolicy:
             "position_size_pct": round(adjusted, 6),
             "position_size_multiplier": round(global_multiplier, 6),
             "side_size_multiplier": round(side_multiplier, 6),
+            "effective_position_size_multiplier": round(effective_global_multiplier, 6),
+            "effective_side_size_multiplier": round(effective_side_multiplier, 6),
             "probe_fraction": round(probe_fraction, 6),
             "max_probe_size_pct": round(max_probe_size, 6),
-            "probe_cap_applied": bool(cap > 0 and adjusted <= cap + 1e-12),
+            "probe_cap_applied": bool(cap > 0 and adjusted <= cap + 1e-12 and not quality_override),
+            "quality_override": bool(quality_override),
+            "entry_paused": bool(sizing.get("entry_paused", False)),
+            "strategy_learning_pause_is_hard_gate": bool(
+                sizing.get("strategy_learning_pause_is_hard_gate", False)
+            ),
+            "release_pressure_active": bool(sizing.get("release_pressure_active")),
+            "health_guard_active": bool(sizing.get("health_guard_active")),
+            "recovery_probe_allowed": bool(sizing.get("recovery_probe_allowed")),
+            "execution_guard_active": bool(sizing.get("execution_guard_active")),
             "reason": str(sizing.get("reason") or side_row.get("reason") or "")[:240],
         }
+
+    @classmethod
+    def _adaptive_quality_loss_cap_pct(
+        cls,
+        *,
+        expected_net_return_pct: float,
+        profit_quality_ratio: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        quality_tier: str,
+    ) -> float:
+        """Return the equity-risk cap for high-quality entries.
+
+        The cap is intentionally adaptive: better net edge, stronger profit
+        quality, lower loss probability, and lower tail risk increase the
+        single-trade budget; weak or uncertain signals stay near the base cap.
+        """
+
+        expected_component = min(max(expected_net_return_pct, 0.0) / 100.0 * 0.55, 0.012)
+        quality_component = min(max(profit_quality_ratio - 1.0, 0.0) * 0.004, 0.006)
+        probability_component = min(max(0.45 - loss_probability, 0.0) * 0.020, 0.006)
+        tail_risk_discount = min(max(tail_risk_score - 0.55, 0.0) * 0.012, 0.006)
+        raw_cap = (
+            ENTRY_QUALITY_RISK_BASE_CAP_PCT
+            + expected_component
+            + quality_component
+            + probability_component
+            - tail_risk_discount
+        )
+        hard_cap = (
+            ENTRY_QUALITY_RISK_ELITE_CAP_PCT
+            if quality_tier in {"elite", "winner_add", "high_profit"}
+            else ENTRY_QUALITY_RISK_MAX_CAP_PCT
+        )
+        return min(max(raw_cap, ENTRY_QUALITY_RISK_BASE_CAP_PCT), hard_cap)
 
     def _missing_dependencies(self) -> list[str]:
         required = {
@@ -366,10 +511,23 @@ class EntryProfitRiskSizingPolicy:
                 decision.position_size_pct = current_size
                 caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
         strategy_sizing = self._strategy_learning_sizing(raw)
+        timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
+        strategy_quality_override = bool(
+            high_quality_entry
+            and not low_payoff_quality
+            and (local_aligned or ml_aligned or timeseries_aligned)
+            and (
+                expected_net >= 1.20
+                or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
+            )
+            and loss_probability <= 0.40
+            and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
         strategy_sizing_applied = self._apply_strategy_learning_sizing(
             current_size=current_size,
             action_side="long" if str(decision.action.value) == "long" else "short",
             sizing=strategy_sizing,
+            quality_override=strategy_quality_override,
         )
         if strategy_sizing_applied.get("applied"):
             current_size = self._safe_float(
@@ -437,7 +595,6 @@ class EntryProfitRiskSizingPolicy:
         notional_floor_reason = ""
         quality_tier = "probe" if (quant_probe_triggered or evidence_probe_triggered) else "base"
         meaningful_size_reason = ""
-        timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
         existing_winner = self.entry_existing_winner_context.context(
             decision,
             open_positions or [],
@@ -634,6 +791,45 @@ class EntryProfitRiskSizingPolicy:
                     "symbol_profit_tier": symbol_profit_tier,
                     "reason": "按预期净收益动态压缩单笔止损预算，避免小盈大亏结构。",
                 }
+            elif (
+                high_quality_entry
+                and not low_payoff_quality
+                and target_min_notional > 0
+                and quality_tier in {"elite", "winner_add", "high_profit", "strong_probe"}
+            ):
+                required_floor_loss = target_min_notional * stress_stop_loss_pct
+                adaptive_cap_pct = self._adaptive_quality_loss_cap_pct(
+                    expected_net_return_pct=expected_net,
+                    profit_quality_ratio=profit_quality_ratio,
+                    loss_probability=loss_probability,
+                    tail_risk_score=tail_risk,
+                    quality_tier=quality_tier,
+                )
+                adaptive_cap_usdt = balance * adaptive_cap_pct
+                target_quality_budget = min(
+                    max(required_floor_loss, structure_max_loss),
+                    adaptive_cap_usdt,
+                )
+                if target_quality_budget > max_loss:
+                    previous_max_loss = max_loss
+                    max_loss = target_quality_budget
+                    pnl_structure_guard = {
+                        "applied": True,
+                        "previous_max_stop_loss_usdt": round(previous_max_loss, 6),
+                        "max_stop_loss_usdt": round(max_loss, 6),
+                        "expected_profit_usdt": round(expected_profit_usdt, 6),
+                        "expected_net_return_pct": round(expected_net, 6),
+                        "max_loss_multiple": round(max_loss_multiple, 6),
+                        "quality_tier": quality_tier,
+                        "symbol_profit_tier": symbol_profit_tier,
+                        "adaptive_cap_pct_of_equity": round(adaptive_cap_pct, 6),
+                        "adaptive_cap_usdt": round(adaptive_cap_usdt, 6),
+                        "required_floor_loss_usdt": round(required_floor_loss, 6),
+                        "reason": (
+                            "高质量正期望信号按收益质量动态放宽单笔止损预算，"
+                            "避免策略学习或固定权益上限把有效机会压成无意义小仓。"
+                        ),
+                    }
 
         notional_floor_blocked = ""
         if target_min_notional > 0:

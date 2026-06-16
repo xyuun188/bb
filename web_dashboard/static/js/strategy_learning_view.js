@@ -1,4 +1,4 @@
-﻿function strategyLearningText(key) {
+function strategyLearningText(key) {
     const labels = {
         baseline_current: '系统基线',
         balanced_probe: '平衡探针',
@@ -32,7 +32,8 @@
         degraded: '退化',
         healthy: '健康',
         neutral: '中性',
-        blocked: '阻断',
+        blocked: '硬风控阻断',
+        degraded_missing_probe: '模型缺失降级探针',
         failed: '失败',
         executed: '已执行',
         recorded: '已记录',
@@ -86,7 +87,7 @@ function strategyLearningEventReasonCategoryLabel(category) {
 
 function strategyLearningIsReadable(text) {
     const value = String(text || '');
-    const badTokens = ['锟', '閿', '姒', '娴', '濡', '缁', '鐠', '閸'];
+    const badTokens = ['\u951f', '\u95ff', '\u59d2', '\u5a34', '\u6fe1', '\u7f01', '\u9420', '\u95b8'];
     return Boolean(value.trim()) && !badTokens.some(token => value.includes(token));
 }
 
@@ -189,6 +190,10 @@ function strategyLearningProfileMetric(label, value, tone = '') {
     return `<span class="strategy-learning-profile-stat ${strategyLearningEsc(tone)}"><b>${strategyLearningEsc(label)}</b>${value}</span>`;
 }
 
+function strategyLearningCount(value, unit = '条') {
+    return `${Number(value || 0)} ${unit}`;
+}
+
 function strategyLearningSourceLabel(source) {
     const value = String(source || '').trim();
     if (value === 'current_system' || value === 'baseline') return '当前系统';
@@ -256,6 +261,11 @@ function renderStrategyLearningSummary(data) {
     const activeName = profile.label || strategyLearningText(profile.id) || profile.id || '系统基线';
     const modeLabel = manualLocked ? '人工指定中' : '自动调度中';
     const modeTone = manualLocked ? 'warn' : 'good';
+    const sampleTarget = Number(totals.trade_count_target || 0);
+    const sampleTargetIsEntryGate = Boolean(totals.trade_count_target_is_entry_gate);
+    const sampleTargetHint = totals.low_trade_count_penalty
+        ? `低于动态学习目标 ${sampleTarget} 条，只降低策略置信并扩大受控探针`
+        : `动态学习目标 ${sampleTarget} 条，${sampleTargetIsEntryGate ? '会影响开仓门槛' : '不是开仓门槛'}`;
     const guardTone = guard.should_rollback ? 'bad' : 'good';
     const guardLabel = guard.should_rollback ? '护栏预警' : '护栏正常';
     const source = profile.source || (profile.id === 'baseline_current' ? 'baseline' : 'feedback_generator');
@@ -292,12 +302,13 @@ function renderStrategyLearningSummary(data) {
             </div>
             <div class="strategy-learning-metric-grid">
                 ${strategyLearningMetric('净收益', `${strategyLearningMoney(pnl)} U`, '训练窗口', pnl >= 0 ? 'good' : 'bad')}
-                ${strategyLearningMetric('胜率', strategyLearningPct(totals.win_rate || 0, 1), `${Number(totals.win_count || 0)} / ${Number(totals.training_trade_count || 0)}`, 'neutral')}
-                ${strategyLearningMetric('交易数', `${Number(totals.training_trade_count || 0)} / ${Number(totals.trade_count_target || 0)}`, totals.low_trade_count_penalty ? '低交易量惩罚' : '样本达标', totals.low_trade_count_penalty ? 'warn' : 'good')}
-                ${strategyLearningMetric('策略复盘', `${Number(totals.reflection_count || 0)} / ${Number(totals.reflection_total_count || 0)}`, '训练 / 总数', 'neutral')}
+                ${strategyLearningMetric('胜率', strategyLearningPct(totals.win_rate || 0, 1), `${strategyLearningCount(totals.win_count, '笔')}盈利 · ${strategyLearningCount(totals.training_trade_count, '笔')}训练`, 'neutral')}
+                ${strategyLearningMetric('交易样本', strategyLearningCount(totals.training_trade_count), sampleTargetHint, totals.low_trade_count_penalty ? 'warn' : 'good')}
+                ${strategyLearningMetric('复盘覆盖', strategyLearningCount(totals.reflection_count), `总复盘 ${Number(totals.reflection_total_count || 0)} 条，手动干预样本不训练`, 'neutral')}
                 ${strategyLearningMetric('问题数', Number(problemCount || 0), '当前归因', problemCount ? 'warn' : 'good')}
                 ${strategyLearningMetric('LLM 候选', Number(llm.candidate_count || 0), llm.last_error ? '生成有错误' : '结构化候选', llm.last_error ? 'warn' : 'neutral')}
             </div>
+            <div class="strategy-learning-inline-help">交易样本目标由窗口、信号、影子机会和复盘数量动态计算，只用于学习评分置信；真正是否开仓还会经过行情质量、盈利期望、账户风险、持仓质量和硬风控共同判断。</div>
         </div>`;
 }
 
@@ -342,18 +353,28 @@ function renderStrategyLearningRelease(data) {
     const el = document.getElementById('strategy-learning-release');
     if (!el) return;
     const pressure = data.feedback?.open_position_pressure || {};
+    const runtime = data.schedule?.runtime || {};
     const candidates = pressure.release_candidates || [];
+    const openCount = Number(pressure.open_count || 0);
+    const baseCapacity = Number(pressure.max_open_positions || 0);
+    const learnedTarget = Number(runtime.target_position_groups || runtime.target_open_position_groups || 0);
+    const rotationSlots = Number(runtime.rotation_slots || 0);
+    const capacityText = [
+        baseCapacity ? `基础容量参考 ${baseCapacity} 组` : '',
+        learnedTarget ? `学习目标 ${learnedTarget} 组` : '',
+        rotationSlots ? `轮换槽 ${rotationSlots} 个` : '',
+    ].filter(Boolean).join(' · ') || '等待容量评估';
     const header = `
         <div class="strategy-learning-compact-head">
-            <strong>${Number(pressure.open_count || 0)} / ${Number(pressure.max_open_positions || 0)}</strong>
-            <span>亏损仓 ${Number(pressure.losing_open_count || 0)} · ${strategyLearningMoney(pressure.losing_unrealized_pnl || 0)} U</span>
-            <em>${pressure.full_position_pressure ? '满仓压力' : '正常'}</em>
+            <strong>${openCount} 组持仓</strong>
+            <span>${strategyLearningEsc(capacityText)} · 亏损仓 ${Number(pressure.losing_open_count || 0)} · ${strategyLearningMoney(pressure.losing_unrealized_pnl || 0)} U</span>
+            <em>${pressure.full_position_pressure ? '释放队列优先' : '容量正常'}</em>
         </div>`;
     if (!candidates.length) {
-        el.innerHTML = header + '<div class="strategy-learning-empty">暂无释放候选。</div>';
+        el.innerHTML = header + '<div class="strategy-learning-empty">暂无释放候选。基础容量不是固定开仓数量，系统会再结合账户风险、行情质量、释放队列和硬风控计算实际开仓节奏。</div>'; 
         return;
     }
-    el.innerHTML = header + `<div class="strategy-learning-mini-list">${candidates.slice(0, 6).map(row => `
+    el.innerHTML = header + '<div class="strategy-learning-inline-help">基础容量来自配置，学习目标和轮换槽由策略调度动态计算；低质量旧仓优先进入释放纪律，新机会只走受控探针。</div>' + `<div class="strategy-learning-mini-list">${candidates.slice(0, 6).map(row => `
         <div>
             <strong>${strategyLearningEsc(row.symbol || '-')}</strong>
             <span>${strategyLearningEsc(row.side || '-')} · ${strategyLearningEsc(row.model_name || '')}</span>
@@ -399,7 +420,7 @@ function renderStrategyLearningReflections(data) {
     el.innerHTML = `
         <div class="strategy-learning-compact-head">
             <strong class="${pnl >= 0 ? 'good' : 'bad'}">${strategyLearningMoney(pnl)} U</strong>
-            <span>复盘 ${training} / ${total} · 手动排除 ${Number(reflection.excluded_manual_count || 0)}</span>
+            <span>训练复盘 ${training} 条 · 总复盘 ${total} 条 · 手动排除 ${Number(reflection.excluded_manual_count || 0)} 条</span>
             <em>费后</em>
         </div>
         <div class="strategy-learning-split-metrics">
@@ -487,7 +508,7 @@ function renderStrategyLearningProfiles(data) {
                             ${strategyLearningProfileMetric('回测评分', score.toFixed(2), score >= 0 ? 'good' : 'bad')}
                             ${strategyLearningProfileMetric('费后收益', `${strategyLearningMoney(fee)} U`, fee >= 0 ? 'good' : 'bad')}
                             ${strategyLearningProfileMetric('最大回撤', `${strategyLearningMoney(bt.max_drawdown || 0)} U`)}
-                            ${strategyLearningProfileMetric('交易数量', `${Number(bt.trade_count || 0)} / ${Number(bt.trade_count_target || 0)}`, Number(bt.low_trade_count_penalty || 0) ? 'warn' : '')}
+                            ${strategyLearningProfileMetric('交易数量', `${Number(bt.trade_count || 0)} 笔 · 学习目标 ${Number(bt.trade_count_target || 0)} 笔`, Number(bt.low_trade_count_penalty || 0) ? 'warn' : '')}
                             ${strategyLearningProfileMetric('影子评分', shadowScore.toFixed(2), shadowOk ? 'good' : 'bad')}
                             ${strategyLearningProfileMetric('探针仓位', probePct ? strategyLearningPct(probePct, 1) : '-')}
                         </div>

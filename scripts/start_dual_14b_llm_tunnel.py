@@ -6,7 +6,7 @@ The trading backend should use local OpenAI-compatible endpoints:
 
 This keeps remote vLLM ports private while allowing the local paper-trading
 process to call them as if they were local services. Server credentials are read
-through core.remote_ssh and are never printed.
+through the online platform server and are never printed.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from core.remote_ai_service_spec import (  # noqa: E402
 )
 from core.remote_ssh import connect_remote_ssh  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 BUFFER_SIZE = 16384
 SELECT_TIMEOUT_SECONDS = 1.0
@@ -141,7 +142,8 @@ def _start_servers(specs: list[TunnelSpec], ssh_transport: Any) -> list[_Forward
 
 def run_tunnels(specs: list[TunnelSpec]) -> None:
     """Connect SSH once and keep all local forwarders alive."""
-    ssh = connect_remote_ssh(ROOT, timeout=20)
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     servers: list[_ForwardServer] = []
     try:
         transport = ssh.get_transport()

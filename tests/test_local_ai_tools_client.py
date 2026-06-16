@@ -75,7 +75,72 @@ async def test_local_ai_tools_circuit_breaker_recovers_after_cooldown(
     assert result["status"] == "completed"
     assert result["failure_count"] == 0
     assert result["profit_prediction"]["available"] is True
+    assert result["profit_prediction"]["status"] == "returned"
+    assert result["profit_prediction"]["path"] == "/profit/predict"
+    assert result["profit_prediction"]["duration_sec"] > 0
     assert result["time_series_prediction"]["side"] == "long"
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_second_cap(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 8.0)
+    client = LocalAIToolsClient()
+    timeouts: list[float | None] = []
+
+    async def succeed(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        timeouts.append(request_timeout)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", succeed)
+
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert result["status"] == "completed"
+    assert timeouts == [8.0, 8.0, 8.0]
+    assert result["profit_prediction"]["duration_sec"] > 0
+    assert result["time_series_prediction"]["duration_sec"] > 0
+    assert result["sentiment_analysis"]["duration_sec"] > 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_readtimeout_does_not_open_circuit(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 8.0)
+    monkeypatch.setattr(settings, "local_ai_tools_circuit_breaker_failures", 2)
+    client = LocalAIToolsClient()
+    calls: list[str] = []
+
+    async def timeout(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        calls.append(path)
+        raise RuntimeError("local AI tools request could not reach the service: ReadTimeout")
+
+    monkeypatch.setattr(client, "_post", timeout)
+
+    first = await client.enrich_with_context({"symbol": "BTC/USDT"})
+    second = await client.enrich_with_context({"symbol": "ETH/USDT"})
+    third = await client.enrich_with_context({"symbol": "SOL/USDT"})
+
+    assert first["status"] == "unavailable"
+    assert second["status"] == "unavailable"
+    assert third["status"] == "unavailable"
+    assert third["profit_prediction"]["status"] == "error"
+    assert third["profit_prediction"]["path"] == "/profit/predict"
+    assert third["profit_prediction"]["duration_sec"] > 0
+    assert "circuit_open_until" not in third
+    assert len(calls) == 9
 
 
 def test_local_ai_tools_client_refreshes_runtime_settings(
@@ -117,6 +182,42 @@ def test_local_ai_tools_client_clamps_runtime_settings(
     assert client._timeout == 0.2
     assert client._failure_threshold == 1
     assert client._cooldown_seconds == 0.2
+
+
+def test_local_ai_tools_normalizes_wrapped_prediction_payloads(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "ok": True,
+            "data": {
+                "prediction": {
+                    "predicted_side": "short",
+                    "expected_short_return_pct": 0.42,
+                    "expected_long_return_pct": -0.18,
+                }
+            },
+        },
+    )
+    timeseries = client._normalize_signal(
+        "time_series_prediction",
+        {"status": "ok", "result": {"forecast_direction": "up", "expected_move_pct": 0.16}},
+    )
+    sentiment = client._normalize_signal(
+        "sentiment_analysis",
+        {"available": True, "payload": {"sentiment": "bearish", "sentiment_score": -0.31}},
+    )
+
+    assert profit["available"] is True
+    assert profit["best_side"] == "short"
+    assert profit["expected_return_pct"] == 0.42
+    assert timeseries["side"] == "long"
+    assert timeseries["expected_return_pct"] == 0.16
+    assert sentiment["side"] == "short"
+    assert sentiment["available"] is True
 
 
 def test_local_ai_tools_exit_advice_uses_clean_chinese_labels(
@@ -211,7 +312,7 @@ async def test_local_ai_tools_status_failure_is_redacted(
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     client = LocalAIToolsClient()
 
-    async def fail(path: str) -> dict[str, Any]:
+    async def fail(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         raise RuntimeError(f"Authorization: Bearer {leaked_value} failed")
 
     monkeypatch.setattr(client, "_get", fail)
@@ -222,6 +323,134 @@ async def test_local_ai_tools_status_failure_is_redacted(
     assert leaked_value not in str(result)
     assert result["error"] == "Authorization: *** failed"
     assert client._last_failure == "Authorization: *** failed"
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_missing(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    get_calls: list[str] = []
+    post_calls: list[str] = []
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        get_calls.append(path)
+        assert request_timeout == 0.5
+        return {"available": False, "message": "No trained local quant bundle found"}
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        post_calls.append(path)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert get_calls == ["/models/status"]
+    assert set(post_calls) == {
+        "/profit/predict",
+        "/timeseries/deep/predict",
+        "/sentiment/deep/analyze",
+        "/exit/advise",
+    }
+    assert result["available"] is True
+    assert result["model_bundle_available"] is False
+    assert result["service_available"] is True
+    assert result["status"] == "heuristic_fallback_available"
+    assert result["child_endpoints"]["profit_prediction"]["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fails(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+
+    async def fail_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        assert request_timeout == 0.5
+        raise RuntimeError("models status endpoint unavailable")
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if path == "/profit/predict":
+            return {"available": True, "best_side": "long"}
+        raise RuntimeError(f"{path} unavailable")
+
+    monkeypatch.setattr(client, "_get", fail_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert result["available"] is True
+    assert result["service_available"] is True
+    assert result["model_bundle_available"] is False
+    assert result["status"] == "heuristic_fallback_available"
+    assert result["status_error"] == "models status endpoint unavailable"
+    assert result["child_endpoints"]["profit_prediction"]["available"] is True
+    assert result["failure_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_uses_short_cache(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    get_calls: list[str] = []
+    post_calls: list[str] = []
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        get_calls.append(path)
+        assert request_timeout == 0.5
+        return {"available": False, "message": "No trained local quant bundle found"}
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        post_calls.append(path)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    first = await client.status()
+    first["child_endpoints"]["profit_prediction"]["available"] = False
+    second = await client.status()
+
+    assert len(get_calls) == 1
+    assert set(post_calls) == {
+        "/profit/predict",
+        "/timeseries/deep/predict",
+        "/sentiment/deep/analyze",
+        "/exit/advise",
+    }
+    assert second["status_cache"]["hit"] is True
+    assert second["child_endpoints"]["profit_prediction"]["available"] is True
+
+
+def test_local_ai_tools_auth_headers_close_connections(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_api_key", "  local-secret-token  ")
+    headers = LocalAIToolsClient()._auth_headers()
+
+    assert headers == {
+        "Authorization": "Bearer local-secret-token",
+        "Connection": "close",
+    }
 
 
 @pytest.mark.asyncio

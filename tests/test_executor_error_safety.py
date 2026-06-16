@@ -462,3 +462,56 @@ async def test_okx_leverage_open_order_limit_with_unknown_actual_rejects_entry()
     assert hidden_value not in rendered
     assert "Authorization: ***" in rendered
     assert "password=***" in rendered
+
+class _FloorAmountPrecisionCcxt:
+    def amount_to_precision(self, _symbol: str, amount: float) -> str:
+        return str(float(int(amount)))
+
+
+
+def test_okx_amount_min_uses_raw_okx_min_size() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "DOGE/USDT:USDT",
+        "limits": {"amount": {"min": 0.0}},
+        "info": {"minSz": "5", "lotSz": "1"},
+    }
+
+    assert executor._amount_min(market) == 5.0
+
+
+def test_okx_entry_amount_lifts_to_okx_raw_min_size() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "DOGE/USDT:USDT",
+        "contractSize": 1.0,
+        "limits": {"amount": {"min": 0.0}},
+        "info": {"minSz": "5", "lotSz": "1"},
+    }
+
+    contracts, base_quantity = executor._entry_order_amount(
+        _FloorAmountPrecisionCcxt(),
+        market,
+        position_value=400.0,
+        price=100.0,
+        balance=500.0,
+        leverage=1.0,
+    )
+
+    assert contracts == 5.0
+    assert base_quantity == 5.0
+
+
+def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "ALT/USDT:USDT",
+        "limits": {"amount": {"min": 0.0}},
+        "info": {"minSz": "1.1", "lotSz": "0.1"},
+    }
+
+    contracts = executor._normalize_order_contracts(
+        _FloorAmountPrecisionCcxt(), market, contracts=1.05, min_contracts=1.1
+    )
+
+    assert contracts == 1.1

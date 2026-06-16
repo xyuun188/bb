@@ -78,6 +78,45 @@ def test_extract_signal_sides_reads_chinese_side_labels():
     assert signals["timeseries"]["side"] == "long"
 
 
+def test_extract_signal_sides_reads_wrapped_server_quant_tools_payloads():
+    signals = extract_signal_sides(
+        {
+            "server_quant_tools": {
+                "profit_prediction": {
+                    "ok": True,
+                    "data": {
+                        "prediction": {
+                            "predicted_side": "long",
+                            "expected_long_return_pct": 0.48,
+                        }
+                    },
+                },
+                "time_series_prediction": {
+                    "status": "ok",
+                    "result": {
+                        "forecast_direction": "down",
+                        "expected_move_pct": -0.22,
+                    },
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "payload": {"label": "bullish", "score": 0.36},
+                },
+            }
+        }
+    )
+
+    assert signals["server_profit"]["available"] is True
+    assert signals["server_profit"]["side"] == "long"
+    assert signals["server_profit"]["expected_return_pct"] == 0.48
+    assert signals["timeseries"]["available"] is True
+    assert signals["timeseries"]["side"] == "short"
+    assert signals["timeseries"]["expected_return_pct"] == -0.22
+    assert signals["sentiment"]["available"] is True
+    assert signals["sentiment"]["side"] == "long"
+    assert signals["sentiment"]["score"] == 0.36
+
+
 def test_extract_signal_sides_falls_back_to_opportunity_score_fields():
     signals = extract_signal_sides(
         {

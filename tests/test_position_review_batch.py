@@ -87,3 +87,33 @@ def test_position_review_batch_keeps_profit_exits_ahead_of_normal_rotation() -> 
     assert [item[0][1] for item in result.selected_items] == ["BTC/USDT", "ETH/USDT"]
     assert result.profit_exit_count == 1
     assert result.next_cursor == 2
+
+
+def test_position_review_batch_never_skips_forced_release_candidates() -> None:
+    items = [_item(symbol) for symbol in ["A/USDT", "B/USDT", "C/USDT", "D/USDT"]]
+    fast_scan = {item[0]: {"exit_score": 0.0, "priority_score": 0.0} for item in items}
+    fast_scan[("ensemble_trader", "D/USDT")] = {
+        "force_exit_candidate": True,
+        "exit_score": 92.0,
+        "priority_score": 92.0,
+    }
+    policy = PositionReviewBatchPolicy(
+        urgent_exit_checker=lambda scan: bool(scan and scan.get("force_exit_candidate")),
+    )
+
+    result = policy.select(items, fast_scan, max_groups_override=1, cursor=0)
+
+    assert ("ensemble_trader", "D/USDT") in result.selected_keys
+    assert ("ensemble_trader", "D/USDT") not in {item[0] for item in result.skipped_items}
+    assert result.urgent_exit_count == 1
+
+
+def test_position_review_batch_priority_slots_default_to_runtime_budget() -> None:
+    items = [_item(f"SYM{index}/USDT") for index in range(6)]
+    fast_scan = {item[0]: {"exit_score": 0.0, "priority_score": 80.0} for item in items}
+
+    result = _policy().select(items, fast_scan, max_groups_override=6, cursor=0)
+
+    assert len(result.selected_items) == 6
+    assert result.priority_selected_count == 6
+    assert result.skipped_items == []

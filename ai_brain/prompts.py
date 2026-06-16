@@ -396,39 +396,6 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         ],
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    if False:
-        _ = f"""STRICT_COMPACT_BATCH_JSON_V3
-你要在一次调用中生成 5 个加密货币量化交易专家的独立意见，只输出一个完整 JSON 对象。
-不要 markdown，不要代码块，不要 <think>，不要 JSON 之外的解释，不要新增字段。
-
-核心目标：在扣除手续费和滑点后最大化真实净收益。不要强迫交易；证据不足时可以 hold。
-关键要求：
-- 这是同一次批量调用，但 5 个专家必须按各自职责独立判断，不要互相复制结论、confidence 或 reasoning。
-- 专家可以一致，也可以分歧；如果同一份证据对不同职责含义不同，必须体现差异。
-- 不要把 schema 里的字段名或示例范围当作默认答案。没有证据才 hold，不能默认全员 hold 0.50。
-- 如果出现方向、盈利质量、短周期路径、持仓退出、硬风险之间的冲突，用 cross_check_for 指向最该复核的另一个专家。
-
-固定专家职责：
-- trend_expert：只判断短线方向结构，long、short、震荡或不确定。
-- momentum_expert：只判断预期净收益、亏损概率、盈亏比、手续费覆盖和小赚大亏风险。
-- sentiment_expert：只判断未来 1/5/10/30 分钟路径、事件/情绪冲击、动量延续或假突破。
-- position_expert：只判断已有仓位的继续持有、加仓、减仓或平仓；无匹配仓位时必须 hold。
-- risk_expert：只判断异常插针、流动性、极端波动、保证金/交易所限制和硬风险；没有硬风险时给仓位/杠杆折扣建议，不要用普通谨慎当硬拦截。
-
-必须输出 exactly this JSON shape，5 个专家都必须出现：
-{{"experts":{{"trend_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"momentum_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"sentiment_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"position_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"risk_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}}}}}}
-
-字段规则：
-- action 只能是 long、short、close_long、close_short、hold。
-- confidence、position_size_pct、suggested_leverage、stop_loss_pct、take_profit_pct 必须是数字，不要字符串。
-- reasoning 用简体中文 12 到 32 字，写核心证据、主要风险和动作，不要长段落。
-- cross_check_for 只能是 null，或指向另一个专家；target 不能指向自己。
-- analysis_type=position 时，close/reduce 必须有硬止损、止盈、关键位失效、动量确认反转、严重风险恶化或有效锁盈证据。
-- 所有专家都要检查 abnormal_wick_count72h、abnormal_wick_max、abnormal_wick_recent_h；近期大插针时 risk_expert 可作为硬风险。
-
-资料：
-{text[:2800]}
-"""
     return f"""STRICT_FINAL_DECISION_JSON_V2
 Read the compact payload and output only the schema JSON. Do not add fields.
 Reasoning must be Simplified Chinese, 12-48 chars. No markdown, no <think>.
@@ -510,117 +477,17 @@ def build_batch_experts_user_prompt(
         ),
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    return f"""STRICT_COMPACT_BATCH_JSON_V4
-Return ONLY valid minified JSON. No markdown, no prose, no <think>, no extra keys.
-Root schema exactly:
-{{"experts":{{{requested_schema}}}}}
-Required experts for THIS call: {requested_list}.
-Every required expert above must appear exactly once under experts.
-{omitted_rule.rstrip()}
-Each expert object must have exactly:
-{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文8到24字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}}
-Do not copy one expert's conclusion into all experts. Each expert must judge only its role.
-Entry rule: do not force trades; usable positive EV may be small/probe; poor evidence is hold.
-Memory rule: if decision_habit says probe_when_ev_ok, be selectively earlier with only the probe budget; if strict_confirm, tighten proof and reduce size.
-Risk rule: hard risk can veto; soft caution changes size/leverage.
-Position rule: if no matching open position, position_expert must hold.
-Payload JSON:
-{text[:2200]}
+    max_payload_chars = 1000
+    return f"""BATCH_EXPERT_JSON_V7
+Return one minified JSON object only. No markdown, no prose, no <think>.
+Schema: {{"experts":{{{requested_schema}}}}}
+Required experts: {requested_list}. {omitted_rule.rstrip()}
+Each expert value must contain exactly:
+{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文40-80字，包含方向/收益/风险中的两个具体证据","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}}
+Rules: weak evidence=hold; hard risk can veto; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; use small probe only when EV is positive and hard risk is absent.
+Payload JSON, truncated to {max_payload_chars} chars:
+{text[:max_payload_chars]}
 JSON:"""
-    return f"""STRICT_COMPACT_BATCH_JSON_V3
-你要在一次调用中生成 5 个加密货币量化交易专家的独立意见，只输出一个完整 JSON 对象。
-不要 markdown，不要代码块，不要 <think>，不要 JSON 之外的解释，不要新增字段。
-
-核心目标：在扣除手续费和滑点后最大化真实净收益。不要强迫交易；证据不足时可以 hold。
-关键要求：
-- 这是同一次批量调用，但 5 个专家必须按各自职责独立判断，不要互相复制结论、confidence 或 reasoning。
-- 专家可以一致，也可以分歧；如果同一份证据对不同职责含义不同，必须体现差异。
-- 不要把 schema 里的字段名或示例范围当作默认答案。没有证据才 hold，不能默认全员 hold 0.50。
-- 如果方向、盈利质量、短周期路径、持仓退出、硬风险之间有冲突，用 cross_check_for 指向最该复核的另一个专家。
-
-固定专家职责：
-- trend_expert：只判断短线方向结构，long、short、震荡或不确定。
-- momentum_expert：只判断预期净收益、亏损概率、盈亏比、手续费覆盖和小赚大亏风险。
-- sentiment_expert：只判断未来 1/5/10/30 分钟路径、事件/情绪冲击、动量延续或假突破。
-- position_expert：只判断已有仓位的继续持有、加仓、减仓或平仓；无匹配仓位时必须 hold。
-- risk_expert：只判断异常插针、流动性、极端波动、保证金/交易所限制和硬风险；没有硬风险时给仓位/杠杆折扣建议，不要用普通谨慎当硬拦截。
-
-必须输出 exactly this JSON shape，5 个专家都必须出现：
-{{"experts":{{"trend_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"momentum_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"sentiment_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"position_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}},"risk_expert":{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12到32字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"简体中文12到30字"}}}}}}}}
-
-字段规则：
-- action 只能是 long、short、close_long、close_short、hold。
-- confidence、position_size_pct、suggested_leverage、stop_loss_pct、take_profit_pct 必须是数字，不要字符串。
-- reasoning 用简体中文 12 到 32 字，写核心证据、主要风险和动作，不要长段落。
-- cross_check_for 只能是 null，或指向另一个专家；target 不能指向自己。
-- analysis_type=position 时，close/reduce 必须有硬止损、止盈、关键位失效、动量确认反转、严重风险恶化或有效锁盈证据。
-- 所有专家都要检查 abnormal_wick_count72h、abnormal_wick_max、abnormal_wick_recent_h；近期大插针时 risk_expert 可作为硬风险。
-
-资料：
-{text[:2800]}
-"""
-    return f"""STRICT_COMPACT_BATCH_JSON_V2
-你要一次性扮演 5 个加密货币交易专家，只输出一个完整 JSON 对象。不要 markdown，不要代码块，
-不要 <think>，不要 JSON 之外的解释，不要新增字段。目标是在扣除手续费和滑点后最大化真实净收益。
-
-固定专家：
-- trend_expert：短线方向。
-- momentum_expert：预期净收益、亏损概率、盈亏比、手续费覆盖和小赚大亏风险。
-- sentiment_expert：1/5/10/30 分钟路径、事件/情绪冲击。
-- position_expert：已有仓位的继续持有、加仓、减仓或平仓。
-- risk_expert：异常插针、流动性、极端波动、保证金和硬风险。
-
-必须输出 exactly this shape，5 个专家都必须出现：
-{{"experts":{{"trend_expert":{{"action":"hold","confidence":0.50,"reasoning":"短理由12到32字","position_size_pct":0,"suggested_leverage":1,"stop_loss_pct":0.05,"take_profit_pct":0.10,"cross_check_for":null}},"momentum_expert":{{"action":"hold","confidence":0.50,"reasoning":"短理由12到32字","position_size_pct":0,"suggested_leverage":1,"stop_loss_pct":0.05,"take_profit_pct":0.10,"cross_check_for":null}},"sentiment_expert":{{"action":"hold","confidence":0.50,"reasoning":"短理由12到32字","position_size_pct":0,"suggested_leverage":1,"stop_loss_pct":0.05,"take_profit_pct":0.10,"cross_check_for":null}},"position_expert":{{"action":"hold","confidence":0.50,"reasoning":"短理由12到32字","position_size_pct":0,"suggested_leverage":1,"stop_loss_pct":0.05,"take_profit_pct":0.10,"cross_check_for":null}},"risk_expert":{{"action":"hold","confidence":0.50,"reasoning":"短理由12到32字","position_size_pct":0,"suggested_leverage":1,"stop_loss_pct":0.05,"take_profit_pct":0.10,"cross_check_for":null}}}}}}
-
-字段规则：
-- action 只能是 long、short、close_long、close_short、hold。
-- confidence 是 0 到 1 的数字；仓位和杠杆字段必须是数字，不要字符串。
-- reasoning 用简体中文 12-32 字，只写核心证据+风险+动作，不要长段落。
-- cross_check_for 只能是 null，或 {{"target":"trend|momentum|sentiment|position|risk","question":"12到30字问题"}}。
-- 若 analysis_type=position，close/reduce 必须有硬止损、止盈、关键位失效、动量确认反转、严重风险恶化或有效锁盈证据；普通噪音、小浮亏/小浮盈、低量能或模糊降风险措辞必须 hold。
-- 所有专家都要检查 abnormal_wick_count72h、abnormal_wick_max、abnormal_wick_recent_h；若近期大插针，risk_expert 可作为硬风险。
-
-资料：{text[:2400]}
-"""
-    return f"""你要一次性扮演 5 个加密货币量化交易专家，并输出一个 JSON 对象。
-目标：最大化扣除手续费和滑点后的真实净收益；每个专家独立判断，不能互相复制结论。
-必须只输出 JSON，不要 markdown，不要代码块，不要 <think>，不要 JSON 之外的解释。
-
-专家字段固定为：
-- trend_expert：行情方向专家，只判断短线方向：做多、做空、震荡或不确定；不负责仓位。
-- momentum_expert：盈利质量专家，判断预期净收益、亏损概率、盈亏比、手续费覆盖和小赚大亏风险。
-- sentiment_expert：短线时序专家，判断未来 1/5/10/30 分钟路径、动量延续/反转、假突破和事件/情绪冲击。
-- position_expert：持仓退出专家，只看已有仓位：浮盈落袋、亏损修复、加仓、减仓或全平。
-- risk_expert：异常风控专家，只负责异常插针、流动性、极端波动、保证金/交易所限制和硬风险拦截。
-
-决策顺序必须是：先看盈利质量和亏损修复，再看方向，再看执行时机，最后才给动作。不要让普通方向投票压过“预期净收益为负、亏损概率高、浮盈应落袋、亏损无法修复”等盈利质量证据。
-
-所有专家都必须检查资料中的 abnormal_wick_count72h / abnormal_wick_max / abnormal_wick_recent_h。
-如果近期出现大插针，要在 reasoning 的“风险”里明确写出止损滑点/尾部亏损风险；risk_expert 可把重复大插针作为硬风险。
-
-每个专家必须输出：
-{{
-  "action":"long|short|close_long|close_short|hold",
-  "confidence":0-1,
-  "reasoning":"依据:...; 风险:...; 盈利质量:...; 动作:...",
-  "position_size_pct":0-1,
-  "suggested_leverage":1-20,
-  "stop_loss_pct":0.01-0.10,
-  "take_profit_pct":0.02-0.25,
-  "cross_check_for":null|{{"target":"trend|momentum|sentiment|position|risk","question":"最多50字"}}
-}}
-
-reasoning 要用简体中文，45-80 字；必须说明依据、主要风险、盈利质量和动作。
-不要只写“趋势向下”“动量不足”“风险偏高”这种短句。
-如果证据不足，说明缺少什么证据，以及为什么观望比交易更有利。
-
-最终只输出 JSON，不要 markdown：
-{{"experts":{{"trend_expert":{{...}},"momentum_expert":{{...}},"sentiment_expert":{{...}},"position_expert":{{...}},"risk_expert":{{...}}}}}}
-
-资料：
-{text[:2800]}
-"""
 
 
 def build_user_prompt(

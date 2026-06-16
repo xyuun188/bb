@@ -104,7 +104,7 @@ def test_entry_evidence_blocks_ml_and_timeseries_opposite():
     assert evidence["hard_block"] is True
     assert any("ML 和时序" in reason for reason in evidence["hard_block_reasons"])
     assert reason is not None
-    assert "动态证据评分硬拦截" in reason
+    assert "动态证据强冲突硬拦截" in reason
 
 
 def test_entry_evidence_allows_weak_conflict_probe_when_support_is_aligned():
@@ -152,6 +152,40 @@ def test_entry_evidence_allows_weak_conflict_probe_when_support_is_aligned():
     assert "server_profit" in evidence["aligned_support_sources"]
 
 
+def test_missing_ml_and_timeseries_degrades_to_tiny_probe():
+    service = _service()
+    decision = _decision(
+        Action.LONG,
+        {
+            "local_ai_tools": {
+                "profit_prediction": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.22,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.18,
+                },
+            },
+        },
+        confidence=0.72,
+    )
+
+    service._candidate_opportunity_score(decision, {"min_opportunity_score": 0.95})
+    reason = _gate_reason(decision)
+
+    evidence = _raw_response(decision)["opportunity_score"]["evidence_score"]
+    assert reason is None
+    assert evidence["hard_block"] is False
+    assert evidence["tier"] == "degraded_missing_probe"
+    assert evidence["size_multiplier"] == 0.05
+    assert evidence["missing_key_sources"] == ["ml", "timeseries"]
+    assert evidence["missing_key_degraded_relief"]["applied"] is True
+    assert "动态证据评分硬拦截" not in str(reason or "")
+
+
 def test_entry_evidence_blocks_weak_probe_without_three_aligned_sources():
     decision = _decision(
         Action.LONG,
@@ -176,10 +210,11 @@ def test_entry_evidence_blocks_weak_probe_without_three_aligned_sources():
 
     assert 35 <= evidence["effective_score"] < 45
     assert evidence["tier"] == "blocked"
-    assert evidence["hard_block"] is True
+    assert evidence["hard_block"] is False
     assert evidence["size_multiplier"] == 0.0
     assert len(evidence["aligned_support_sources"]) == 2
-    assert any("three aligned" in item for item in evidence["hard_block_reasons"])
+    assert any("three aligned" in item for item in evidence["advisory_wait_reasons"])
+    assert any("观望" in item or "探针" in item for item in evidence["advisory_wait_reasons"])
 
 
 def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():
@@ -224,7 +259,9 @@ def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():
     assert server_component["status"] == "ignored_negative_expected"
     assert server_component["points"] == 0.0
     assert evidence["tier"] == "blocked"
-    assert evidence["hard_block"] is True
+    assert evidence["hard_block"] is False
+    assert evidence["advisory_wait_reasons"]
+    assert any("观望" in item or "探针" in item for item in evidence["advisory_wait_reasons"])
 
 
 def test_server_profit_uses_adjusted_side_return_before_raw_return():
@@ -657,3 +694,72 @@ async def test_probe_budget_caps_loss_to_balanced_probe_limit() -> None:
     assert guard["previous_max_stop_loss_usdt"] > 5.0
     # Later structural guards may tighten further, but never above the probe budget.
     assert sizing["max_stop_loss_usdt"] <= 5.0
+
+
+@pytest.mark.asyncio
+async def test_high_quality_entry_escapes_learning_probe_micro_size() -> None:
+    service = _service()
+
+    async def fake_balance(*args, **kwargs):
+        return 1000.0
+
+    service.account_accounting_service = SimpleNamespace(allocated_order_balance=fake_balance)
+
+    class FakeExistingWinnerContext:
+        def context(self, *args, **kwargs):
+            return {"has_winner": False}
+
+    service.entry_existing_winner_context = FakeExistingWinnerContext()
+    service.entry_low_payoff_quality = EntryLowPayoffQualityPolicy()
+    service.entry_stress_stop = EntryStressStopPolicy()
+    service.entry_stop_loss_budget = EntryStopLossBudgetPolicy()
+
+    decision = _decision(
+        Action.LONG,
+        {
+            "opportunity_score": {
+                "score": 3.4,
+                "min_score_required": 0.95,
+                "expected_net_return_pct": 1.8,
+                "expected_loss_pct": 0.35,
+                "tail_risk_score": 0.25,
+                "raw_expected_return_pct": 1.9,
+                "profit_quality_ratio": 1.6,
+                "server_profit_loss_probability": 0.30,
+                "risk_mode": "normal",
+                "ml_aligned": True,
+                "local_profit_aligned": True,
+                "timeseries_aligned": True,
+                "evidence_score": {
+                    "tier": "normal",
+                    "effective_score": 88.0,
+                    "size_multiplier": 1.0,
+                    "max_size_pct": None,
+                },
+            },
+            "strategy_learning_context": {
+                "strategy_learning_release_pressure_active": True,
+                "strategy_learning_sizing": {
+                    "profile_id": "loss_release",
+                    "release_pressure_active": True,
+                    "position_size_multiplier": 0.25,
+                    "probe_fraction": 0.03,
+                    "max_probe_size_pct": 0.012,
+                },
+            },
+        },
+        confidence=0.82,
+    )
+    decision.position_size_pct = 0.08
+    decision.suggested_leverage = 6.0
+    decision.stop_loss_pct = 0.012
+    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 0.6}
+
+    await service._apply_entry_profit_risk_sizing(decision, "paper", [])
+
+    sizing = _raw_response(decision)["profit_risk_sizing"]
+    assert sizing["high_quality_entry"] is True
+    assert sizing["low_payoff_quality"] is False
+    assert sizing["strategy_learning_sizing"]["quality_override"] is True
+    assert sizing["notional_floor_applied"] is True
+    assert decision.position_size_pct >= 0.06

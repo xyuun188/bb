@@ -3,6 +3,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ai_brain.cross_validator import CrossValidator, _is_local_qwen3_trade_model
+from config.settings import settings
 from core.model_runtime import completion_token_limit
 
 
@@ -65,3 +66,38 @@ async def test_qwen3_consultation_uses_short_non_thinking_runtime_policy(monkeyp
     assert captured["kwargs"]["max_completion_tokens"] == 700
     assert captured["kwargs"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert str(captured["messages"][1].content).endswith("/no_think")
+
+
+async def test_consultation_request_timeout_is_capped(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["kwargs"] = kwargs
+
+        async def ainvoke(self, messages: list[Any]) -> AIMessage:
+            return AIMessage(content='{"recommended_action":"hold"}')
+
+    monkeypatch.setattr("ai_brain.cross_validator.ChatOpenAI", FakeChatOpenAI)
+
+    await CrossValidator()._invoke_consultation_model(
+        [SystemMessage(content="system"), HumanMessage(content="payload")],
+        {
+            "api_base": "http://127.0.0.1:8000/v1",
+            "api_key": "test-key",
+            "model": "qwen3-32b-trade",
+        },
+        request_timeout=60.0,
+    )
+
+    assert captured["kwargs"]["timeout"] == 12.0
+
+
+def test_consultation_budget_is_bounded(monkeypatch) -> None:
+    from ai_brain.cross_validator import _consultation_budget_seconds
+
+    monkeypatch.setattr(settings, "ai_decision_maker_timeout_seconds", 120.0)
+    assert _consultation_budget_seconds() == 12.0
+
+    monkeypatch.setattr(settings, "ai_decision_maker_timeout_seconds", 2.0)
+    assert _consultation_budget_seconds() == 6.0

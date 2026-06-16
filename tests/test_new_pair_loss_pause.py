@@ -29,7 +29,7 @@ async def _balance_snapshot(_mode: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_new_pair_loss_pause_blocks_after_daily_equity_loss() -> None:
+async def test_new_pair_loss_pause_advises_after_daily_equity_loss() -> None:
     now = datetime.now(UTC)
     rows = [
         _position(is_open=False, realized_pnl=-30.0, closed_at=now - timedelta(minutes=5)),
@@ -66,6 +66,7 @@ async def test_new_pair_loss_pause_blocks_after_daily_equity_loss() -> None:
     reason = await policy.cooldown_loss_pause_reason("paper", 100.0, 0.5)
 
     assert reason is not None
+    assert "slowed by realized daily loss guard" in reason
     assert "Today equity PnL -55.00 USDT" in reason
     assert "Trigger is 50% of max daily loss 100.00 USDT = 50.00 USDT" in reason
     assert calls == [("paper", None, 5000)]
@@ -89,7 +90,7 @@ async def test_new_pair_loss_pause_allows_when_daily_loss_below_trigger() -> Non
 
 
 @pytest.mark.asyncio
-async def test_new_pair_loss_pause_blocks_fresh_loss_streak() -> None:
+async def test_new_pair_loss_pause_advises_fresh_loss_streak() -> None:
     now = datetime.now(UTC)
 
     async def records(mode: str, is_open: bool | None, limit: int) -> list[Any]:
@@ -110,6 +111,7 @@ async def test_new_pair_loss_pause_blocks_fresh_loss_streak() -> None:
     reason = await policy.recent_loss_streak_pause_reason("live", 100.0, 0.5)
 
     assert reason is not None
+    assert "slowed by consecutive realized losses" in reason
     assert "Recent losing streak: 2 trades, total loss 55.00 USDT" in reason
 
 

@@ -9,6 +9,7 @@ Then open: http://localhost:8002
 
 import asyncio
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,11 +24,13 @@ from ai_brain.model_factory import create_models_from_config
 from ai_brain.model_registry import ModelRegistry
 from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.logging_config import setup_logging
+from core.redis_runtime import create_redis_client
 from core.safe_output import safe_error_text
 from db.session import close_db, init_db
 from services.competition_service import CompetitionService
 from services.data_service import DataService
 from services.notification_service import NotificationService
+from services.secure_runtime_config import load_secure_settings_into_runtime
 from services.trading_service import TradingService
 from web_dashboard.api.dashboard import (
     _build_tickers_for_open_positions,
@@ -40,6 +43,18 @@ logger = structlog.get_logger(__name__)
 
 LOCK_FILE = Path(__file__).resolve().parent.parent / "data" / "paper_trading.lock"
 _lock_handle: TextIO | None = None
+
+
+async def _send_dashboard_message(redis: Any | None, inline_dashboard: bool, message: dict[str, Any]) -> None:
+    if inline_dashboard:
+        await ws_manager.broadcast(message)
+        return
+    if redis is None:
+        return
+    try:
+        await redis.publish("dashboard:update", json.dumps(message, default=str))
+    except Exception as exc:
+        logger.debug("dashboard Redis publish failed", error=safe_error_text(exc))
 
 
 def _lock_file(handle: TextIO) -> None:
@@ -84,12 +99,17 @@ async def main():
     print(f"AI Expert Models: {', '.join(model_names)} ({len(model_names)} models)")
     print(f"Execution Model: {ENSEMBLE_TRADER_NAME}")
     print(f"Default Virtual Balance: ${settings.initial_virtual_balance:,.0f}")
-    print(f"Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
+    inline_dashboard = bool(settings.dashboard_inline_enabled)
+    if inline_dashboard:
+        print(f"Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
+    else:
+        print("Dashboard: split process (Redis dashboard:update)")
     print("=" * 60)
 
     # Init database
     print("\n[1/5] Initializing database...")
     await init_db()
+    await load_secure_settings_into_runtime()
 
     # Init services
     print("[2/5] Starting data service (OKX WebSocket)...")
@@ -112,17 +132,7 @@ async def main():
     competition_service.set_active_models([ENSEMBLE_TRADER_NAME])
     notification_service = NotificationService()
 
-    # Redis (fakeredis)
-    redis: Any = None
-    try:
-        import fakeredis.aioredis
-
-        redis = fakeredis.aioredis.FakeRedis()
-    except Exception as exc:
-        logger.warning(
-            "fakeredis initialization failed; continuing without redis",
-            error=safe_error_text(exc),
-        )
+    redis = await create_redis_client()
 
     # Trading service
     print("[4/5] Starting trading service...")
@@ -193,13 +203,17 @@ async def main():
                 tickers = await _build_tickers_for_open_positions(open_symbols, tickers)
 
                 stats = trading_service.get_stats()
-                await ws_manager.broadcast(
+                await _send_dashboard_message(
+                    redis,
+                    inline_dashboard,
                     {
                         "type": "ticker_update",
                         "symbols": tickers,
                     }
                 )
-                await ws_manager.broadcast(
+                await _send_dashboard_message(
+                    redis,
+                    inline_dashboard,
                     {
                         "type": "trading_round",
                         "decisions": stats.get("recent_decisions", []),
@@ -213,25 +227,28 @@ async def main():
 
     ws_push_task = asyncio.create_task(periodic_ws_push())
 
-    # Start dashboard
-    print(f"\n[5/5] Starting web dashboard on port {settings.dashboard_port}...")
-    config = uvicorn.Config(
-        app,
-        host=settings.dashboard_host,
-        port=settings.dashboard_port,
-        log_level="info",
-    )
-    server = uvicorn.Server(config)
-
-    # Run server (this blocks until shutdown)
+    print("\n[5/5] Starting runtime...")
     try:
-        await server.serve()
+        if inline_dashboard:
+            print(f"  Web dashboard on port {settings.dashboard_port}...")
+            config = uvicorn.Config(
+                app,
+                host=settings.dashboard_host,
+                port=settings.dashboard_port,
+                log_level="info",
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+        else:
+            print("  Trading engine only; dashboard runs in scripts/run_dashboard.py")
+            await trading_task
     except KeyboardInterrupt:
         print("\nShutting down...")
 
     # Cleanup
     trading_service._running = False
-    trading_task.cancel()
+    if not trading_task.done():
+        trading_task.cancel()
     eval_task.cancel()
     ws_push_task.cancel()
     try:

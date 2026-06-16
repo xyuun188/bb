@@ -13,6 +13,12 @@ from statistics import pstdev
 from typing import TYPE_CHECKING, Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+    first_tool_payload,
+    payload_side,
+    signal_available,
+)
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -207,21 +213,28 @@ def _score_local_profit_model(
     side_reasons: dict[str, list[str]],
 ) -> None:
     tools = context.get("local_ai_tools")
-    profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
-    if not isinstance(profit, dict) or profit.get("available") is False:
+    profit = (
+        first_tool_payload(
+            {"local_ai_tools": tools},
+            "profit_prediction",
+            "profit_model",
+            "server_profit",
+            "server_profit_model",
+            "profit",
+        )
+        if isinstance(tools, dict)
+        else {}
+    )
+    if not signal_available(profit):
         return
-    side = _normal_side(profit.get("best_side") or profit.get("side") or profit.get("direction"))
+    side = _normal_side(payload_side(profit) or profit.get("direction"))
     if side is None:
-        long_expected = _side_expected(profit, "long")
-        short_expected = _side_expected(profit, "short")
+        long_expected = signal_expected_return_pct(profit, "long")
+        short_expected = signal_expected_return_pct(profit, "short")
         side = "long" if long_expected >= short_expected else "short"
     opposite = "short" if side == "long" else "long"
-    expected = max(
-        _side_expected(profit, side),
-        _float(profit.get("expected_return_pct")),
-        _float(profit.get("best_expected_return_pct")),
-    )
-    opposite_expected = _side_expected(profit, opposite)
+    expected = signal_expected_return_pct(profit, side)
+    opposite_expected = signal_expected_return_pct(profit, opposite)
     loss_probability = _float(profit.get(f"{side}_loss_probability"), 0.50)
     if expected >= 0.03 and expected >= opposite_expected and loss_probability <= 0.62:
         points = 2.0 if expected >= 0.12 else 1.25

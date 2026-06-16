@@ -1,5 +1,3 @@
-"""Entry capacity policy for staged and open positions."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -9,7 +7,7 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 
 NormalizeSymbol = Callable[[Any], str | None]
-MaxOpenPositionsProvider = Callable[[], int]
+MaxOpenPositionsProvider = Callable[[], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,17 +52,75 @@ class EntryCapacityPolicy:
         if not is_same_symbol_add and staged_symbol_side.get(staged_key):
             model_open_count = max(model_open_count - 1, 0)
             is_same_symbol_add = True
-        max_open_positions = int(self.max_open_positions_per_model_provider() or 0)
+        capacity = self._capacity_context()
+        max_open_positions = int(
+            capacity.get("entry_limit")
+            or capacity.get("effective_limit")
+            or 0
+        )
         if (
             not is_same_symbol_add
             and max_open_positions > 0
             and model_open_count >= max_open_positions
         ):
             return (
-                "当前持仓组数已达上限，暂停新开不同币种/方向仓位。"
+                "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
                 f"当前 {model_open_count} 组，限制 {max_open_positions} 组。"
+                f"{self._capacity_suffix(capacity)}"
             )
         return None
+
+    def _capacity_context(self) -> dict[str, Any]:
+        raw = self.max_open_positions_per_model_provider()
+        if isinstance(raw, dict):
+            return dict(raw)
+        as_dict = getattr(raw, "as_dict", None)
+        if callable(as_dict):
+            value = as_dict()
+            if isinstance(value, dict):
+                return value
+        effective = int(raw or 0)
+        return {
+            "entry_limit": effective,
+            "effective_limit": effective,
+            "base_limit": effective,
+            "reason": "",
+        }
+
+    @staticmethod
+    def _capacity_suffix(capacity: dict[str, Any]) -> str:
+        base_limit = capacity.get("base_limit")
+        effective_limit = capacity.get("effective_limit")
+        entry_limit = capacity.get("entry_limit")
+        reason = str(capacity.get("reason") or "").strip()
+        parts: list[str] = []
+        if base_limit and effective_limit and int(base_limit) != int(effective_limit):
+            parts.append(f"基础上限 {base_limit}，运行上限 {effective_limit}")
+        if entry_limit and int(entry_limit) != int(effective_limit or 0):
+            parts.append(f"开仓上限 {entry_limit}")
+        readable_reason = EntryCapacityPolicy._capacity_reason_text(capacity, reason)
+        if readable_reason:
+            parts.append(readable_reason[:160])
+        return " " + "；".join(parts) if parts else ""
+
+    @staticmethod
+    def _capacity_reason_text(capacity: dict[str, Any], reason: str) -> str:
+        factors = capacity.get("factors") if isinstance(capacity.get("factors"), dict) else {}
+        codes = factors.get("reason_codes") if isinstance(factors, dict) else None
+        if isinstance(codes, list) and codes:
+            labels = {
+                "strategy_rotation_slots": "策略学习已为轮换释放预留开仓槽",
+                "release_rotation_slots": "低质量持仓释放中，系统预留了小仓轮换槽",
+                "rotation_entry_expansion": "开仓上限已按轮换释放策略上调",
+                "low_quality_pressure": "低质量持仓压力较高，优先复盘释放旧仓",
+                "low_quality_warn": "低质量持仓偏高，降低扩仓节奏",
+                "drawdown": "当日回撤达到收缩区间",
+                "drawdown_watch": "当日回撤进入观察区间",
+            }
+            return "；".join(labels.get(str(code), str(code)) for code in codes[:4])
+        if "=" in reason:
+            return "容量由策略学习、持仓质量和账户风险动态计算。"
+        return reason
 
     def _model_open_group_count(self, model_name: str, open_positions: list[dict]) -> int:
         groups: set[tuple[str | None, str]] = set()

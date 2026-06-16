@@ -208,6 +208,36 @@ def test_dashboard_cors_origins_parse_from_env_strings() -> None:
     assert json_cfg.dashboard_allowed_origins() == ["https://dash.example.invalid"]
 
 
+def test_settings_parse_legacy_complex_env_values(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "SYMBOLS=[BTC/USDT, ETH/USDT]",
+                "EXECUTION_ACCOUNT_MAX_LOSS_PCT={paper: 0.5, live: 0.25}",
+                "EXECUTION_ACCOUNT_COOLDOWN_LOSS_PCT={'paper': 0.6, 'live': 0.7}",
+                "AI_MODELS=[{name: trend_expert, api_base: http://127.0.0.1:8000/v1, api_key: key, model: qwen3}]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = Settings(_env_file=env_path)  # type: ignore[call-arg]
+
+    assert cfg.symbols == ["BTC/USDT", "ETH/USDT"]
+    assert cfg.execution_account_max_loss_pct == {"paper": 0.5, "live": 0.25}
+    assert cfg.execution_account_cooldown_loss_pct == {"paper": 0.6, "live": 0.7}
+    assert cfg.ai_models == [
+        {
+            "name": "trend_expert",
+            "api_base": "http://127.0.0.1:8000/v1",
+            "api_key": "key",
+            "model": "qwen3",
+        }
+    ]
+
+
 def test_update_env_file_ignores_masked_secret_and_rejects_invalid_values(tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
     env_path.write_text(
@@ -289,6 +319,7 @@ def test_update_env_file_quotes_complex_values_for_dotenv_round_trip(
         {
             "AI_MODEL": 'qwen3 32b "trade"#safe',
             "DASHBOARD_CORS_ORIGINS": '["https://dash.example.invalid/path#frag"]',
+            "EXECUTION_ACCOUNT_MAX_LOSS_PCT": {"paper": 0.5, "live": 0.25},
             "DASHBOARD_HOST": "127.0.0.1",
         }
     )
@@ -296,8 +327,10 @@ def test_update_env_file_quotes_complex_values_for_dotenv_round_trip(
     text = env_path.read_text(encoding="utf-8")
     assert 'AI_MODEL="qwen3 32b \\"trade\\"#safe"' in text
     assert "DASHBOARD_CORS_ORIGINS=" in text
+    assert 'EXECUTION_ACCOUNT_MAX_LOSS_PCT="{\\"paper\\": 0.5, \\"live\\": 0.25}"' in text
     assert "DASHBOARD_HOST=127.0.0.1" in text
 
     loaded = TmpSettings(_env_file=env_path)  # type: ignore[call-arg]
     assert loaded.ai_model == 'qwen3 32b "trade"#safe'
     assert loaded.dashboard_allowed_origins() == ["https://dash.example.invalid/path#frag"]
+    assert loaded.execution_account_max_loss_pct == {"paper": 0.5, "live": 0.25}

@@ -26,6 +26,7 @@ from core.remote_ai_service_spec import (  # noqa: E402
 )
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 DUAL_14B_SPECS = (QWEN3_14B_TRADE_SERVICE, DEEPSEEK_R1_14B_RISK_SERVICE)
 
@@ -82,7 +83,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.plan_only:
         return
 
-    ssh = connect_remote_ssh(ROOT, timeout=20)
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         safe_print(run_remote_text(ssh, qwen3_main_cleanup_command()))
         for spec in DUAL_14B_SPECS:

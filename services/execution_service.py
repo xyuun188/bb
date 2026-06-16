@@ -568,13 +568,24 @@ class ExecutionService:
                 data,
             )
 
+        async def mark_skipped(reason: str, data: dict[str, Any] | None = None) -> None:
+            await mark_stage(
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.SKIPPED,
+                reason,
+                data,
+            )
+
         async def block_before_submit(policy_result: PolicyGateResult) -> None:
             reason = str(policy_result.reason or "策略或风控检查未通过，未提交 OKX 订单。")
             blocker = str(policy_result.blocker or "policy_gate")
             data = {"blocker": blocker}
             if isinstance(policy_result.data, dict):
                 data.update(policy_result.data)
-            await mark_blocked(reason, data)
+            if data.get("stage_status") == DecisionStageStatus.SKIPPED:
+                await mark_skipped(reason, data)
+            else:
+                await mark_blocked(reason, data)
             if decision_db_id is not None:
                 await mark_decision_reason(decision_db_id, reason)
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)

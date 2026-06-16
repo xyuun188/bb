@@ -13,6 +13,7 @@ Flow:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 
@@ -45,11 +46,22 @@ class RiskAssessment:
 class RiskEngine:
     """Orchestrates all risk checks and produces a final RiskAssessment."""
 
-    def __init__(self) -> None:
-        self.position_checker = PositionLimitChecker()
-        self.stop_loss_manager = StopLossManager()
-        self.black_swan_detector = BlackSwanDetector()
-        self.circuit_breaker = CircuitBreaker()
+    def __init__(
+        self,
+        max_open_positions_provider=None,
+        *,
+        position_checker: PositionLimitChecker | None = None,
+        stop_loss_manager: StopLossManager | None = None,
+        black_swan_detector: BlackSwanDetector | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
+        self.position_checker = position_checker or PositionLimitChecker()
+        self.stop_loss_manager = stop_loss_manager or StopLossManager()
+        self.black_swan_detector = black_swan_detector or BlackSwanDetector()
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self.max_open_positions_provider = max_open_positions_provider or (
+            lambda: settings.max_open_positions_per_model
+        )
 
     def assess(
         self,
@@ -203,17 +215,25 @@ class RiskEngine:
             ]
             is_same_symbol_add = bool(same_symbol_positions)
 
+            capacity = self._max_open_positions_context()
+            max_open_positions = int(
+                capacity.get("entry_limit")
+                or capacity.get("effective_limit")
+                or 0
+            )
+            model_open_group_count = self._model_open_group_count(model_open_positions)
             if (
                 not is_same_symbol_add
-                and settings.max_open_positions_per_model > 0
-                and len(model_open_positions) >= settings.max_open_positions_per_model
+                and max_open_positions > 0
+                and model_open_group_count >= max_open_positions
             ):
                 return RiskAssessment(
                     approved=False,
                     decision=decision,
                     rejection_reason=(
-                        f"当前持仓数已达上限，暂停新开仓。"
-                        f"当前 {len(model_open_positions)} 笔，限制 {settings.max_open_positions_per_model} 笔。"
+                        "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
+                        f"当前 {model_open_group_count} 组，限制 {max_open_positions} 组。"
+                        f"{self._capacity_suffix(capacity)}"
                     ),
                 )
 
@@ -319,7 +339,71 @@ class RiskEngine:
             warnings=warnings,
         )
 
-    def _get_adx(self, decision: DecisionOutput, adx_14: float | None) -> float:
+    def _max_open_positions_context(self) -> dict[str, Any]:
+        raw = self.max_open_positions_provider()
+        if isinstance(raw, dict):
+            return dict(raw)
+        as_dict = getattr(raw, "as_dict", None)
+        if callable(as_dict):
+            value = as_dict()
+            if isinstance(value, dict):
+                return value
+        effective = int(raw or 0)
+        return {
+            "entry_limit": effective,
+            "effective_limit": effective,
+            "base_limit": effective,
+            "reason": "",
+        }
+
+    @staticmethod
+    def _model_open_group_count(positions: list[dict]) -> int:
+        groups: set[tuple[str, str]] = set()
+        for position in positions or []:
+            if position.get("is_open", True) is False:
+                continue
+            symbol = str(position.get("symbol") or "").strip().upper()
+            side = str(position.get("side") or "unknown").strip().lower() or "unknown"
+            groups.add((symbol, side))
+        return len(groups)
+
+    @staticmethod
+    def _capacity_suffix(capacity: dict[str, Any]) -> str:
+        base_limit = capacity.get("base_limit")
+        effective_limit = capacity.get("effective_limit")
+        entry_limit = capacity.get("entry_limit")
+        reason = str(capacity.get("reason") or "").strip()
+        parts: list[str] = []
+        if base_limit and effective_limit and int(base_limit) != int(effective_limit):
+            parts.append(f"基础上限 {base_limit}，运行上限 {effective_limit}")
+        if entry_limit and int(entry_limit) != int(effective_limit or 0):
+            parts.append(f"开仓上限 {entry_limit}")
+        readable_reason = RiskEngine._capacity_reason_text(capacity, reason)
+        if readable_reason:
+            parts.append(readable_reason[:160])
+        return " " + "；".join(parts) if parts else ""
+
+    @staticmethod
+    def _capacity_reason_text(capacity: dict[str, Any], reason: str) -> str:
+        factors = capacity.get("factors") if isinstance(capacity.get("factors"), dict) else {}
+        codes = factors.get("reason_codes") if isinstance(factors, dict) else None
+        if isinstance(codes, list) and codes:
+            labels = {
+                "strategy_rotation_slots": "策略学习已为轮换释放预留开仓槽",
+                "release_rotation_slots": "低质量持仓释放中，系统预留了小仓轮换槽",
+                "rotation_entry_expansion": "开仓上限已按轮换释放策略上调",
+                "low_quality_pressure": "低质量持仓压力较高，优先复盘释放旧仓",
+                "low_quality_warn": "低质量持仓偏高，降低扩仓节奏",
+                "drawdown": "当日回撤达到收缩区间",
+                "drawdown_watch": "当日回撤进入观察区间",
+            }
+            return "；".join(labels.get(str(code), str(code)) for code in codes[:4])
+        if "=" in reason:
+            return "容量由策略学习、持仓质量和账户风险动态计算。"
+        return reason
+
+    @staticmethod
+    def _get_adx(decision: DecisionOutput, adx_14: float | None) -> float:
         if adx_14 is not None:
             return float(adx_14)
         snapshot = decision.feature_snapshot or {}

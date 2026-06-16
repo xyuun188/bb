@@ -68,6 +68,19 @@ ACTION_DIRECTION = {
 _CONSULTATION_SEMAPHORE = asyncio.Semaphore(1)
 BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
+_CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
+_CONSULTATION_TIMEOUT_CAP_SECONDS = 12.0
+_CONSULTATION_ATTEMPT_CAP_SECONDS = 8.0
+_CONSULTATION_REASONING_ATTEMPT_CAP_SECONDS = 10.0
+
+
+def _consultation_budget_seconds() -> float:
+    configured = float(settings.ai_decision_maker_timeout_seconds or 20.0)
+    return min(
+        max(configured * 0.6, _CONSULTATION_TIMEOUT_FLOOR_SECONDS),
+        _CONSULTATION_TIMEOUT_CAP_SECONDS,
+    )
+
 
 def _is_reasoning_model(model: str | None) -> bool:
     return is_openai_reasoning_model(model)
@@ -182,13 +195,15 @@ class CrossValidator:
 
         consultation_started_at = datetime.now(UTC)
         consultation_perf_started = time.perf_counter()
-        consultation_timeout = max(
-            float(settings.ai_decision_maker_timeout_seconds or 20.0) + 45.0, 60.0
-        )
+        consultation_timeout = _consultation_budget_seconds()
         major_conflicts = [v for v in validations if v.get("major_conflict")]
         try:
             consultation = await asyncio.wait_for(
-                self.consult_if_needed(opinions, validations),
+                self.consult_if_needed(
+                    opinions,
+                    validations,
+                    timeout_seconds=consultation_timeout,
+                ),
                 timeout=consultation_timeout,
             )
         except TimeoutError:
@@ -499,7 +514,7 @@ class CrossValidator:
             api_base=trend_cfg.get("api_base") or settings.ai_api_base,
             api_key=trend_cfg.get("api_key") or settings.ai_api_key,
             model=trend_cfg.get("model") or settings.ai_model,
-            retries=2,
+            retries=1,
             source="primary",
         )
 
@@ -590,19 +605,23 @@ class CrossValidator:
         self,
         messages: list[Any],
         candidate: dict[str, Any],
+        request_timeout: float | None = None,
     ) -> tuple[Any, str]:
         model = candidate.get("model")
         reasoning_model = _is_reasoning_model(model)
+        default_timeout = 20.0 if reasoning_model else 12.0
+        llm_timeout = min(max(float(request_timeout or default_timeout), 1.0), default_timeout)
         llm_kwargs: dict[str, Any] = {
             "base_url": candidate.get("api_base"),
             "api_key": candidate.get("api_key"),
             "model": model,
-            "timeout": 60 if reasoning_model else 45,
+            "timeout": llm_timeout,
             "max_retries": 0,
             "max_completion_tokens": completion_token_limit(
                 "consultation",
                 1400 if reasoning_model else 700,
                 floor=160,
+                model=model,
             ),
         }
         if reasoning_model:
@@ -636,10 +655,16 @@ class CrossValidator:
         self,
         opinions: dict[str, DecisionOutput],
         validations: list[dict[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any] | None:
         major = [v for v in validations if v.get("major_conflict")]
         if not major:
             return None
+
+        deadline = time.perf_counter() + max(
+            float(timeout_seconds or _consultation_budget_seconds()), 1.0
+        )
 
         trend_cfg = self._fixed_model_cfg("trend_expert")
         candidates = self._consultation_candidates(trend_cfg)
@@ -683,11 +708,24 @@ class CrossValidator:
         last_model = primary_model
         for candidate in candidates:
             last_model = str(candidate.get("model") or last_model or "")
-            for attempt_no in range(1, int(candidate.get("retries") or 1) + 1):
+            max_attempts = min(max(int(candidate.get("retries") or 1), 1), 1)
+            for attempt_no in range(1, max_attempts + 1):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.5:
+                    break
                 try:
-                    call_timeout = 75.0 if _is_reasoning_model(candidate.get("model")) else 55.0
+                    model_attempt_cap = (
+                        _CONSULTATION_REASONING_ATTEMPT_CAP_SECONDS
+                        if _is_reasoning_model(candidate.get("model"))
+                        else _CONSULTATION_ATTEMPT_CAP_SECONDS
+                    )
+                    call_timeout = min(model_attempt_cap, remaining)
                     response, content = await asyncio.wait_for(
-                        self._invoke_consultation_model(messages, candidate),
+                        self._invoke_consultation_model(
+                            messages,
+                            candidate,
+                            request_timeout=call_timeout,
+                        ),
                         timeout=call_timeout,
                     )
                     if not content:
@@ -768,6 +806,8 @@ class CrossValidator:
                             error_text,
                         )
                     )
+            if deadline - time.perf_counter() <= 0.5:
+                break
 
         return self._fallback_consultation(
             major,

@@ -25,8 +25,104 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+_WRAPPED_TOOL_KEYS = ("data", "result", "prediction", "payload", "output")
+_WRAPPER_METADATA_KEYS = (
+    "available",
+    "enabled",
+    "ok",
+    "trained",
+    "status",
+    "model",
+    "backend",
+    "endpoint",
+    "path",
+    "duration_sec",
+    "latency_ms",
+)
+
+
+def unwrap_tool_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    payload = dict(value)
+    for key in _WRAPPED_TOOL_KEYS:
+        child = payload.get(key)
+        if not isinstance(child, dict):
+            continue
+        inner = unwrap_tool_payload(child)
+        if not inner:
+            continue
+        for meta_key in _WRAPPER_METADATA_KEYS:
+            if meta_key in payload and meta_key not in inner:
+                inner[meta_key] = payload[meta_key]
+        return inner
+    return payload
+
+
+def enrich_signal_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a tool payload into the common side/expected-return contract."""
+
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    normalized = unwrap_tool_payload(payload) or dict(payload)
+    if "available" not in normalized and "ok" in normalized:
+        normalized["available"] = bool(normalized.get("ok"))
+    if name == "profit_prediction":
+        side = payload_side(normalized)
+        if side not in {"long", "short"}:
+            long_expected = safe_float(
+                normalized.get(
+                    "adjusted_long_return_pct",
+                    normalized.get(
+                        "long_expected_return_pct",
+                        normalized.get("expected_long_return_pct"),
+                    ),
+                ),
+                0.0,
+            )
+            short_expected = safe_float(
+                normalized.get(
+                    "adjusted_short_return_pct",
+                    normalized.get(
+                        "short_expected_return_pct",
+                        normalized.get("expected_short_return_pct"),
+                    ),
+                ),
+                0.0,
+            )
+            if long_expected or short_expected:
+                side = "long" if long_expected >= short_expected else "short"
+        if side in {"long", "short"}:
+            normalized["best_side"] = side
+            normalized["side"] = side
+        if "expected_return_pct" not in normalized:
+            normalized["expected_return_pct"] = expected_return_pct(normalized, side)
+        if "profit_edge_pct" not in normalized:
+            long_value = expected_return_pct(normalized, "long")
+            short_value = expected_return_pct(normalized, "short")
+            normalized["profit_edge_pct"] = round(abs(long_value - short_value), 6)
+    elif name == "time_series_prediction":
+        side = payload_side(normalized)
+        if side in {"long", "short"}:
+            normalized["best_side"] = side
+            normalized["side"] = side
+        if "expected_return_pct" not in normalized and "expected_move_pct" in normalized:
+            normalized["expected_return_pct"] = normalized.get("expected_move_pct")
+    elif name == "sentiment_analysis":
+        side = payload_side(normalized)
+        if side in {"long", "short"}:
+            normalized["best_side"] = side
+            normalized["side"] = side
+        if (
+            "expected_return_pct" not in normalized
+            and "expected_return_from_sentiment_pct" in normalized
+        ):
+            normalized["expected_return_pct"] = normalized.get("expected_return_from_sentiment_pct")
+    return normalized
+
+
 def first_tool_payload(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
-    containers = (
+    source_containers = (
         raw.get("local_ai_tools"),
         raw.get("server_quant_tools"),
         raw.get("quant_tools"),
@@ -34,18 +130,30 @@ def first_tool_payload(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
         raw.get("server_tools"),
         raw,
     )
-    for container in containers:
+    containers: list[dict[str, Any]] = []
+    for container in source_containers:
         if not isinstance(container, dict):
             continue
+        containers.append(container)
+        unwrapped = unwrap_tool_payload(container)
+        if unwrapped and unwrapped != container:
+            containers.append(unwrapped)
+    for container in containers:
         for key in keys:
             value = container.get(key)
-            if isinstance(value, dict):
-                return value
+            payload = unwrap_tool_payload(value)
+            if payload:
+                return enrich_signal_payload(key, payload)
     return {}
 
 
 def signal_available(payload: dict[str, Any]) -> bool:
     if not isinstance(payload, dict) or not payload:
+        return False
+    if payload.get("error") or payload.get("exception"):
+        return False
+    status = str(payload.get("status") or "").lower()
+    if status in {"unavailable", "error", "disabled", "circuit_open", "failed"}:
         return False
     for key in ("available", "enabled", "ok"):
         if key in payload and payload.get(key) is False:
@@ -59,6 +167,9 @@ def payload_side(payload: dict[str, Any] | None, side_key: str = "best_side") ->
     value = str(
         payload.get(side_key)
         or payload.get("side")
+        or payload.get("predicted_side")
+        or payload.get("prediction_side")
+        or payload.get("recommendation_side")
         or payload.get("best_action")
         or payload.get("action")
         or payload.get("side_label")
@@ -172,8 +283,10 @@ def expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
     keys.extend(
         [
             "expected_return_pct",
+            "expected_net_return_pct",
             "best_expected_return_pct",
             "expected_move_pct",
+            "expected_return_from_sentiment_pct",
             "forecast_return_pct",
             "return_pct",
             "expected_profit_pct",

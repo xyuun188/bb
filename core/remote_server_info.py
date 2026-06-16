@@ -51,6 +51,13 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 MAX_PASSWORD_LENGTH = 4096
 
 HOST_KEYS = {"host", "ip", "hostname", "server"}
+MODEL_ACCESS_HOST_KEYS = {
+    "access_host",
+    "access_ip",
+    "public_access_ip",
+    "model_access_host",
+}
+SSH_HOST_KEYS = {"ssh_host", "ssh_ip", "ssh_public_ip"}
 PORT_KEYS = {"port", "ssh_port"}
 USERNAME_KEYS = {"user", "username", "login", "account"}
 PASSWORD_KEYS = {"pass", "password"}
@@ -65,6 +72,21 @@ CHINESE_HOST_LABELS = {
 CHINESE_PORT_LABELS = {"\u7aef\u53e3"}
 CHINESE_USERNAME_LABELS = {"\u7528\u6237\u540d", "\u8d26\u53f7", "\u7528\u6237"}
 CHINESE_PASSWORD_LABELS = {"\u5bc6\u7801", "\u53e3\u4ee4"}
+
+CHINESE_MODEL_ACCESS_HOST_LABELS = {
+    "访问公网ip",
+    "访问公网 ip",
+    "外网访问ip",
+    "外网访问 ip",
+    "模型访问公网ip",
+}
+CHINESE_SSH_HOST_LABELS = {
+    "ssh公网ip",
+    "ssh 公网ip",
+    "ssh公网 ip",
+    "ssh 公网 ip",
+    "ssh ip",
+}
 
 KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[^:=\uff1a]+?)\s*(?:[:=]|\uff1a)\s*(?P<value>.*?)\s*$")
 IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
@@ -136,12 +158,16 @@ class RemoteServerInfo:
     username: str
     password: str
     source_path: Path
+    access_host: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", _normalize_host(self.host))
         object.__setattr__(self, "port", _normalize_port(self.port))
         object.__setattr__(self, "username", _normalize_username(self.username))
         object.__setattr__(self, "password", _normalize_password(self.password))
+        access_host = str(self.access_host or "").strip()
+        if access_host:
+            object.__setattr__(self, "access_host", _normalize_host(access_host))
         if not isinstance(self.source_path, Path):
             object.__setattr__(self, "source_path", Path(str(self.source_path)))
 
@@ -149,6 +175,7 @@ class RemoteServerInfo:
         """Return a safe public dict shape for diagnostics and API payloads."""
         return {
             "host": self.host,
+            "access_host": self.access_host or self.host,
             "port": self.port,
             "username": self.username,
             "password": mask_secret(self.password),
@@ -219,6 +246,10 @@ def find_model_server_info_file(project_root: Path) -> Path:
 
 def _field_kind(key: str) -> str | None:
     normalized = re.sub(r"\s+", " ", key.strip().lower())
+    if normalized in MODEL_ACCESS_HOST_KEYS or normalized in CHINESE_MODEL_ACCESS_HOST_LABELS:
+        return "access_host"
+    if normalized in SSH_HOST_KEYS or normalized in CHINESE_SSH_HOST_LABELS:
+        return "host"
     if normalized in HOST_KEYS or normalized in CHINESE_HOST_LABELS:
         return "host"
     if normalized in PORT_KEYS or normalized in CHINESE_PORT_LABELS:
@@ -291,6 +322,8 @@ def parse_remote_server_info(text: str, *, source_path: Path | None = None) -> R
         kind = _field_kind(key)
         if kind and kind not in values:
             values[kind] = value
+    if "host" not in values and values.get("access_host"):
+        values["host"] = values["access_host"]
 
     if "host" not in values:
         match = IPV4_RE.search(text)
@@ -310,6 +343,7 @@ def parse_remote_server_info(text: str, *, source_path: Path | None = None) -> R
         username=values["username"],
         password=values["password"],
         source_path=source_path or Path("<memory>"),
+        access_host=values.get("access_host", ""),
     )
 
 

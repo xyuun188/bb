@@ -11,7 +11,7 @@ import os
 import re
 import time
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Any
 
 import structlog
@@ -337,6 +337,8 @@ class OKXExecutor(AbstractExecutor):
                 )
 
             if order_quantity <= 0 and decision.is_entry:
+                min_notional = self._minimum_order_notional(market, price)
+                affordable_notional = balance * max(float(decision.suggested_leverage or 1.0), 1.0)
                 return ExecutionResult(
                     order_id="rejected",
                     symbol=decision.symbol,
@@ -345,7 +347,17 @@ class OKXExecutor(AbstractExecutor):
                     quantity=0,
                     price=price,
                     status=OrderStatus.REJECTED,
-                    raw_response={"error": "Order size is below OKX minimum contract size"},
+                    raw_response={
+                        "error": (
+                            "该交易对的 OKX 最小下单张数超过当前可用余额或风险预算，"
+                            "系统已在提交前拦截，未向 OKX 发送无效订单。"
+                        ),
+                        "okx_symbol": okx_symbol,
+                        "contract_size": contract_size,
+                        "okx_min_order_notional_usdt": round(min_notional, 8),
+                        "affordable_notional_usdt": round(affordable_notional, 8),
+                        "planned_order_notional_usdt": round(position_value, 8),
+                    },
                 )
 
             if decision.is_entry:
@@ -421,18 +433,12 @@ class OKXExecutor(AbstractExecutor):
                         1.0,
                     )
                     order_quantity = pre_exit_contracts * requested_exit_fraction
-                    try:
-                        order_quantity = float(ccxt.amount_to_precision(okx_symbol, order_quantity))
-                    except Exception as exc:
-                        logger.debug(
-                            "OKX amount precision failed for exit order",
-                            symbol=okx_symbol,
-                            quantity=order_quantity,
-                            error=safe_error_text(exc),
-                        )
                     amount_min = self._amount_min(market)
-                    if amount_min > 0 and 0 < order_quantity < amount_min:
-                        order_quantity = min(pre_exit_contracts, amount_min)
+                    order_quantity = self._normalize_order_contracts(
+                        ccxt, market, order_quantity, amount_min
+                    )
+                    if amount_min > 0 and order_quantity > pre_exit_contracts:
+                        order_quantity = pre_exit_contracts
                     if order_quantity <= 0:
                         return ExecutionResult(
                             order_id="rejected",
@@ -574,19 +580,11 @@ class OKXExecutor(AbstractExecutor):
                             order_quantity = min(pre_exit_contracts, leftover_contracts)
                         else:
                             order_quantity = pre_exit_contracts * requested_exit_fraction
-                        try:
-                            order_quantity = float(
-                                ccxt.amount_to_precision(okx_symbol, order_quantity)
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                "OKX amount precision failed for replacement exit",
-                                symbol=okx_symbol,
-                                quantity=order_quantity,
-                                error=safe_error_text(exc),
-                            )
-                        if amount_min > 0 and 0 < order_quantity < amount_min:
-                            order_quantity = min(pre_exit_contracts, amount_min)
+                        order_quantity = self._normalize_order_contracts(
+                            ccxt, market, order_quantity, amount_min
+                        )
+                        if amount_min > 0 and order_quantity > pre_exit_contracts:
+                            order_quantity = pre_exit_contracts
                         if order_quantity <= 0:
                             return ExecutionResult(
                                 order_id=order_id,
@@ -704,7 +702,10 @@ class OKXExecutor(AbstractExecutor):
                             price=price,
                             status=OrderStatus.REJECTED,
                             raw_response={
-                                "error": "Order size is below OKX minimum contract size after leverage fallback",
+                                "error": (
+                                    "杠杆按 OKX 上限回退后，该交易对最小下单张数仍超过当前可用余额或风险预算，"
+                                    "系统已在提交前拦截，未向 OKX 发送无效订单。"
+                                ),
                                 "leverage_check": leverage_check,
                                 "okx_symbol": okx_symbol,
                                 "contract_size": contract_size,
@@ -1390,11 +1391,14 @@ class OKXExecutor(AbstractExecutor):
         min_contracts = amount_min if amount_min > 0 else 0.0
         contracts = max(planned_contracts, min_contracts)
 
-        # Avoid silently turning a tiny probing signal into a much larger trade.
+        # OKX enforces minSz/lotSz in contracts.  Entry sizing owns risk, but
+        # exchange validity owns order shape: if the intended order is below the
+        # hard minimum and the account can afford that minimum, lift to the
+        # minimum before submission instead of letting OKX reject the order.
         min_notional = min_contracts * contract_size * price
         if min_contracts > 0 and planned_contracts < min_contracts:
             affordable_notional = balance * max(float(leverage or 1.0), 1.0)
-            if min_notional > affordable_notional or min_notional > position_value * 1.5:
+            if min_notional > affordable_notional:
                 return 0.0, 0.0
 
         try:
@@ -1406,10 +1410,16 @@ class OKXExecutor(AbstractExecutor):
                 contracts=contracts,
                 error=safe_error_text(exc),
             )
-        if min_contracts > 0 and contracts < min_contracts:
-            contracts = min_contracts
+        contracts = self._normalize_order_contracts(ccxt, market, contracts, min_contracts)
 
         return contracts, contracts * contract_size
+
+    def _minimum_order_notional(self, market: dict[str, Any], price: float) -> float:
+        min_contracts = self._amount_min(market)
+        contract_size = self._contract_size(market)
+        if min_contracts <= 0 or contract_size <= 0 or price <= 0:
+            return 0.0
+        return min_contracts * contract_size * price
 
     def _capped_quantity_from_position_limit_error(
         self,
@@ -1449,11 +1459,67 @@ class OKXExecutor(AbstractExecutor):
         return capped if capped > 0 else None
 
     def _amount_min(self, market: dict[str, Any]) -> float:
-        try:
-            value = ((market.get("limits") or {}).get("amount") or {}).get("min")
-            return float(value or 0.0)
-        except (TypeError, ValueError):
+        values = [
+            self._safe_float(((market.get("limits") or {}).get("amount") or {}).get("min"), 0.0),
+            self._market_info_float(market, "minSz", "min_size", "minSize"),
+            self._amount_step(market),
+        ]
+        return max((value for value in values if value > 0), default=0.0)
+
+    def _amount_step(self, market: dict[str, Any]) -> float:
+        info_step = self._market_info_float(market, "lotSz", "stepSize", "amount_step")
+        if info_step > 0:
+            return info_step
+        precision_amount = self._safe_float((market.get("precision") or {}).get("amount"), 0.0)
+        if 0 < precision_amount <= 1:
+            return precision_amount
+        return 0.0
+
+    def _market_info_float(self, market: dict[str, Any], *keys: str) -> float:
+        info = market.get("info") or {}
+        for key in keys:
+            value = self._safe_float(info.get(key), 0.0)
+            if value > 0:
+                return value
+        return 0.0
+
+    def _normalize_order_contracts(
+        self,
+        ccxt,
+        market: dict[str, Any],
+        contracts: float,
+        min_contracts: float | None = None,
+    ) -> float:
+        minimum = min_contracts if min_contracts is not None else self._amount_min(market)
+        if contracts <= 0 and minimum <= 0:
             return 0.0
+        target = max(float(contracts), float(minimum or 0.0))
+        try:
+            normalized = float(ccxt.amount_to_precision(market["symbol"], target))
+        except Exception as exc:
+            logger.debug(
+                "OKX amount precision failed for normalized order size",
+                symbol=market.get("symbol"),
+                contracts=target,
+                error=safe_error_text(exc),
+            )
+            normalized = target
+
+        if normalized <= 0 or (minimum > 0 and normalized < minimum):
+            normalized = self._ceil_to_amount_step(max(target, minimum), market)
+        return normalized if normalized > 0 else 0.0
+
+    def _ceil_to_amount_step(self, amount: float, market: dict[str, Any]) -> float:
+        step = self._amount_step(market)
+        if amount <= 0 or step <= 0:
+            return amount
+        try:
+            amount_decimal = Decimal(str(amount))
+            step_decimal = Decimal(str(step))
+            units = (amount_decimal / step_decimal).to_integral_value(rounding=ROUND_CEILING)
+            return float(units * step_decimal)
+        except (InvalidOperation, ValueError, ZeroDivisionError):
+            return amount
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         ccxt = await self._get_ccxt()

@@ -559,16 +559,42 @@ def build_entry_evidence_score(
                 ),
             }
     hard_block_reasons: list[str] = []
+    advisory_wait_reasons: list[str] = []
     if {"ml", "timeseries"}.issubset(set(strong_opposites)):
         hard_block_reasons.append("ML 和时序同时强反向")
     elif {"ml", "timeseries"}.issubset(set(major_opposites)):
         hard_block_reasons.append("ML 和时序同时明确反向")
     if "ml" in strong_opposites and "shadow_memory" in major_opposites:
         hard_block_reasons.append("ML 反向且影子/交易记忆偏负")
-    if len(missing_key_sources) >= 2 and effective_score < ENTRY_EVIDENCE_SCORE_NORMAL:
-        hard_block_reasons.append("ML 和时序关键证据同时缺失，无法按正常信号执行")
+    missing_key_degraded_relief: dict[str, Any] = {"applied": False}
+    missing_key_degraded = bool(
+        len(missing_key_sources) >= 2 and not major_opposites and not strong_opposites
+    )
+    if missing_key_degraded:
+        ai_confidence = safe_float(ai_item.get("confidence"), 0.0)
+        ai_points = safe_float(ai_item.get("points"), 0.0)
+        allow_degraded_probe = bool(
+            ai_points >= ENTRY_EVIDENCE_SCORE_WEAK_PROBE / 3.0 or aligned_support_sources
+        )
+        if allow_degraded_probe:
+            original_effective_score = effective_score
+            if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
+                effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+            missing_key_degraded_relief = {
+                "applied": True,
+                "missing_key_sources": list(missing_key_sources),
+                "from_effective_score": round(original_effective_score, 6),
+                "to_effective_score": round(effective_score, 6),
+                "ai_confidence": round(ai_confidence, 6),
+                "aligned_support_sources": list(aligned_support_sources),
+                "reason": (
+                    "ML/time-series services are unavailable, so missing model data is treated "
+                    "as degraded evidence and limited to a controlled tiny probe instead of "
+                    "a hard execution veto."
+                ),
+            }
     if effective_score < ENTRY_EVIDENCE_SCORE_HARD_BLOCK:
-        hard_block_reasons.append("动态证据评分低于硬拦下限")
+        advisory_wait_reasons.append("动态证据评分低于可交易底线，当前仅保留观望或极小探针")
 
     if effective_score >= ENTRY_EVIDENCE_SCORE_NORMAL:
         tier = "normal"
@@ -583,7 +609,11 @@ def build_entry_evidence_score(
         tier = "exploration"
         size_multiplier = 0.10
     elif effective_score >= ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
-        tier = "weak_conflict_probe"
+        tier = (
+            "degraded_missing_probe"
+            if missing_key_degraded_relief.get("applied") and not major_opposites and not weak_opposites
+            else "weak_conflict_probe"
+        )
         size_multiplier = 0.05
     else:
         tier = "blocked"
@@ -593,7 +623,8 @@ def build_entry_evidence_score(
         tier == "weak_conflict_probe"
         and len(aligned_support_sources) < ENTRY_EVIDENCE_WEAK_PROBE_MIN_ALIGNED_SOURCES
     ):
-        hard_block_reasons.append(
+        advisory_wait_reasons.append("当前仅保留观望或极小探针，等待更多同向证据")
+        advisory_wait_reasons.append(
             "weak conflict probe requires at least three aligned evidence sources"
         )
         tier = "blocked"
@@ -604,7 +635,7 @@ def build_entry_evidence_score(
     max_size_pct = None
     if tier == "exploration":
         max_size_pct = ENTRY_EVIDENCE_EXPLORATION_SIZE_CAP
-    elif tier == "weak_conflict_probe":
+    elif tier in {"weak_conflict_probe", "degraded_missing_probe"}:
         max_size_pct = ENTRY_EVIDENCE_WEAK_CONFLICT_SIZE_CAP
     elif missing_key_sources:
         max_size_pct = ENTRY_EVIDENCE_MISSING_KEY_SIZE_CAP
@@ -629,16 +660,18 @@ def build_entry_evidence_score(
         "max_size_pct": round(max_size_pct, 6) if max_size_pct is not None else None,
         "hard_block": bool(hard_block_reasons),
         "hard_block_reasons": hard_block_reasons,
+        "advisory_wait_reasons": advisory_wait_reasons,
         "major_opposites": major_opposites,
         "weak_opposites": weak_opposites,
         "strong_opposites": strong_opposites,
         "missing_key_sources": missing_key_sources,
         "aligned_support_sources": aligned_support_sources,
+        "missing_key_degraded_relief": missing_key_degraded_relief,
         "short_probe_relief": short_probe_relief,
         "components": components,
         "policy": (
-            "硬风控只拦严重冲突、关键证据缺失和低于硬底线的信号；"
-            "弱反向按小仓探针处理，其余按 AI/ML/时序/情绪/影子记忆/"
-            "server_profit/币种方向历史的动态证据分映射仓位。"
+            "硬风控只拦严重方向冲突和交易安全风险；"
+            "模型服务缺失或证据不足先按观望/极小探针处理，不等同于方向错误；"
+            "其余按 AI/ML/时序/情绪/影子记忆/server_profit/币种方向历史的动态证据分映射仓位。"
         ),
     }

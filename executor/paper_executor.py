@@ -164,6 +164,18 @@ class PaperExecutor(AbstractExecutor):
 
         leverage = max(float(decision.suggested_leverage or 1.0), 1.0)
 
+        if decision.position_size_pct <= 0:
+            return ExecutionResult(
+                order_id=str(uuid.uuid4())[:12],
+                symbol=decision.symbol,
+                side=decision.action.value,
+                order_type="market",
+                quantity=0,
+                price=fill_price,
+                status=OrderStatus.REJECTED,
+                raw_response={"error": "Position size is zero after evidence sizing"},
+            )
+
         # Calculate quantity
         position_value = balance * decision.position_size_pct * leverage
         quantity = position_value / fill_price

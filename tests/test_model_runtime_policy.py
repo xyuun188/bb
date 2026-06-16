@@ -7,6 +7,7 @@ from core.model_runtime import (
     cap_completion_tokens,
     completion_token_limit,
     ensure_no_think_text,
+    supports_batch_expert_json,
     uses_thinking_tags,
     with_no_think_content,
 )
@@ -16,6 +17,12 @@ def test_uses_thinking_tags_for_qwen3_and_deepseek_r1() -> None:
     assert uses_thinking_tags("qwen3-32b-trade")
     assert uses_thinking_tags("DeepSeek-R1-Distill-Qwen-32B")
     assert not uses_thinking_tags("Qwen2.5-32B-Instruct")
+
+
+def test_batch_expert_json_support_excludes_deepseek_r1() -> None:
+    assert supports_batch_expert_json("qwen3-14b-trade")
+    assert not supports_batch_expert_json("deepseek-r1-14b-risk")
+    assert not supports_batch_expert_json("DeepSeek-R1-Distill-Qwen-14B-AWQ")
 
 
 def test_ensure_no_think_text_is_idempotent() -> None:
@@ -79,6 +86,8 @@ def test_completion_token_limit_enforces_stage_caps() -> None:
     assert completion_token_limit("expert", 999, floor=180) == 360
     assert completion_token_limit("decision_maker", 999, floor=180) == 320
     assert completion_token_limit("batch_expert", 999, floor=180) == 700
+    assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3-14b-trade") == 700
+    assert completion_token_limit("batch_expert", 999, floor=180, model="deepseek-r1-14b-risk") == 999
     assert (
         completion_token_limit(
             "high_risk_review",

@@ -22,8 +22,29 @@ from config.settings import (
 )
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from data_feed.okx_rest_client import OKXRestClient
+from executor.okx_executor import OKXExecutor
+from services.account_accounting_service import (
+    allocatable_balance_from_snapshot,
+    balance_from_snapshot,
+    tradeable_balance_from_snapshot,
+)
+from services.entry_signal_extraction import (
+    enrich_signal_payload,
+    first_tool_payload,
+    unwrap_tool_payload,
+)
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+)
+from services.entry_signal_extraction import (
+    payload_side as signal_payload_side,
+)
+from services.entry_signal_extraction import (
+    signal_available as signal_payload_available,
+)
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
-from services.server_monitor_status import get_server_monitor_status_sync
+from services.server_monitor_status import get_server_monitor_status_async
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -36,13 +57,17 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 _trading_service = None
 _data_service = None
 _competition_service = None
+_local_ai_tools_status_client = None
+_ml_signal_status_service = None
 _EXCHANGE_MARK_CACHE_TTL_SECONDS = 5.0
 _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 5.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
+_DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 10.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, float]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
+_dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 
@@ -427,6 +452,61 @@ def _model_side_from_payload(payload: dict | None, side_key: str = "best_side") 
     return ""
 
 
+def _normalized_tool_payload(
+    raw: dict[str, Any],
+    canonical_name: str,
+    *aliases: str,
+) -> dict[str, Any]:
+    payload = first_tool_payload(raw, canonical_name, *aliases)
+    if payload:
+        return payload
+    source = _safe_dict(raw.get("local_ai_tools"))
+    for key in (canonical_name, *aliases):
+        value = source.get(key)
+        if isinstance(value, dict):
+            normalized = enrich_signal_payload(canonical_name, unwrap_tool_payload(value))
+            return normalized or dict(value)
+    return {}
+
+
+def _normalized_local_ai_tools_payload(raw: dict[str, Any]) -> dict[str, Any] | None:
+    source = _safe_dict(raw.get("local_ai_tools"))
+    if not source:
+        return None
+    normalized = dict(source)
+    normalized["profit_prediction"] = _normalized_tool_payload(
+        raw,
+        "profit_prediction",
+        "profit_model",
+        "server_profit",
+        "server_profit_model",
+        "profit",
+    )
+    normalized["time_series_prediction"] = _normalized_tool_payload(
+        raw,
+        "time_series_prediction",
+        "timeseries_prediction",
+        "sequence_prediction",
+        "timeseries",
+        "time_series",
+    )
+    normalized["sentiment_analysis"] = _normalized_tool_payload(
+        raw,
+        "sentiment_analysis",
+        "sentiment_prediction",
+        "sentiment_model",
+        "sentiment",
+    )
+    normalized["exit_advice"] = _normalized_tool_payload(
+        raw,
+        "exit_advice",
+        "exit_model",
+        "position_exit",
+        "exit",
+    )
+    return normalized
+
+
 def _extract_primary_ml(raw: dict[str, Any]) -> dict[str, Any]:
     ml = _safe_dict(raw.get("ml_signal"))
     predictions = _safe_list(ml.get("predictions"))
@@ -451,59 +531,63 @@ def _extract_primary_ml(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
-    tools = _safe_dict(raw.get("local_ai_tools"))
+    tools = _normalized_local_ai_tools_payload(raw) or {}
     profit = _safe_dict(tools.get("profit_prediction"))
-    ts = _safe_dict(
-        tools.get("time_series_prediction")
-        or tools.get("timeseries_prediction")
-        or tools.get("sequence_prediction")
-    )
-    sentiment = _safe_dict(tools.get("sentiment_analysis") or tools.get("sentiment_prediction"))
-    profit_side = _model_side_from_payload(profit)
-    ts_side = _model_side_from_payload(ts)
-    sentiment_side = _model_side_from_payload(sentiment)
+    ts = _safe_dict(tools.get("time_series_prediction"))
+    sentiment = _safe_dict(tools.get("sentiment_analysis"))
+    profit_side = signal_payload_side(profit)
+    ts_side = signal_payload_side(ts)
+    sentiment_side = signal_payload_side(sentiment)
     return {
         "profit": {
-            "available": bool(profit.get("available") or profit.get("trained")),
+            "available": signal_payload_available(profit),
             "side": profit_side,
             "side_label": _side_label(profit_side),
-            "expected_return_pct": _safe_float(
-                profit.get("expected_return_pct"),
-                profit.get(f"{profit_side}_expected_return_pct", 0.0),
-            )
-            or 0.0,
+            "expected_return_pct": signal_expected_return_pct(profit, profit_side),
             "profit_quality_score": _safe_float(profit.get("profit_quality_score"), 0.0) or 0.0,
             "loss_probability": _safe_float(profit.get(f"{profit_side}_loss_probability"), 0.0)
             or 0.0,
             "model": profit.get("model") or "",
         },
         "timeseries": {
-            "available": bool(ts.get("available") or ts.get("trained")),
+            "available": signal_payload_available(ts),
             "side": ts_side,
             "side_label": _side_label(ts_side),
-            "expected_return_pct": _safe_float(
-                ts.get("expected_return_pct"),
-                ts.get("expected_move_pct", ts.get(f"{ts_side}_expected_return_pct", 0.0)),
-            )
-            or 0.0,
+            "expected_return_pct": signal_expected_return_pct(ts, ts_side),
             "horizon_minutes": ts.get("horizon_minutes") or ts.get("primary_horizon_minutes"),
             "model": ts.get("model") or "",
         },
         "sentiment": {
-            "available": bool(sentiment.get("available") or sentiment.get("trained") or sentiment),
+            "available": signal_payload_available(sentiment),
             "side": sentiment_side,
             "side_label": _side_label(sentiment_side),
             "score": _safe_float(sentiment.get("score"), sentiment.get("sentiment_score", 0.0))
             or 0.0,
-            "expected_return_pct": _safe_float(
-                sentiment.get("expected_return_pct"),
-                sentiment.get("expected_return_from_sentiment_pct", 0.0),
-            )
-            or 0.0,
+            "expected_return_pct": signal_expected_return_pct(sentiment, sentiment_side),
             "summary": sentiment.get("summary") or sentiment.get("reason") or "",
             "model": sentiment.get("model") or "",
         },
     }
+
+
+def _execution_tradeable_balance(
+    *,
+    okx_available: float | None,
+    okx_allocatable: float | None,
+    okx_equity: float | None,
+    okx_total: float | None,
+    fallback_available: float | None,
+) -> float | None:
+    snapshot = {
+        "free": okx_available,
+        "allocatable": okx_allocatable,
+        "equity": okx_equity,
+        "total": okx_total,
+    }
+    tradeable = tradeable_balance_from_snapshot(snapshot)
+    if tradeable > 0:
+        return tradeable
+    return _safe_float(fallback_available, None)
 
 
 def _build_decision_attribution(
@@ -957,18 +1041,30 @@ def _build_execution_account_status(
             else None
         )
     )
+    okx_snapshot_for_balance = (
+        {
+            "free": okx_available,
+            "used": okx_used,
+            "total": okx_total,
+            "cash": okx_cash,
+            "equity": okx_equity,
+            "allocatable": okx_allocatable,
+        }
+        if okx_account and not okx_error
+        else None
+    )
+    parsed_account_equity = balance_from_snapshot(okx_snapshot_for_balance)
+    parsed_allocatable = allocatable_balance_from_snapshot(okx_snapshot_for_balance)
+    parsed_tradeable = tradeable_balance_from_snapshot(okx_snapshot_for_balance)
+    live_balance_unavailable = mode == "live" and (not okx_account or bool(okx_error))
     account_equity = (
-        _safe_float(
-            okx_equity or okx_total or okx_allocatable or okx_available,
-            legacy_allocated,
-        )
-        or 0.0
+        0.0 if live_balance_unavailable else (parsed_account_equity or legacy_allocated)
     )
     max_loss_usdt = (
         account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
     )
     risk_floor = _execution_risk_floor(account_equity, max_loss_pct, max_loss_usdt)
-    allocated = account_equity
+    allocated = legacy_allocated
     pause_reason = None
     if _trading_service:
         pause_reason = getattr(_trading_service, "_new_pair_pause_reasons", {}).get(
@@ -1001,7 +1097,8 @@ def _build_execution_account_status(
     payload = {
         **cfg,
         "model_name": ENSEMBLE_TRADER_NAME,
-        "allocated_balance": account_equity,
+        "allocated_balance": legacy_allocated,
+        "account_balance_source_value": account_equity,
         "account_equity": account_equity,
         "max_loss_usdt": max_loss_usdt,
         "risk_floor": risk_floor,
@@ -1013,7 +1110,7 @@ def _build_execution_account_status(
         "okx_total_balance": okx_total,
         "okx_cash_balance": okx_cash,
         "okx_equity_balance": okx_equity,
-        "max_allocatable_balance": okx_allocatable if okx_allocatable is not None else 0.0,
+        "max_allocatable_balance": parsed_allocatable,
         "allocation_exceeds_balance": False,
         "positions": [],
         "open_positions": int(pnl_summary.get("open_positions") or 0),
@@ -1046,7 +1143,15 @@ def _build_execution_account_status(
         "cumulative_realized_pnl": _safe_float(pnl_summary.get("cumulative_realized_pnl"), 0.0),
         "cumulative_unrealized_pnl": _safe_float(pnl_summary.get("cumulative_unrealized_pnl"), 0.0),
         "cumulative_total_pnl": _safe_float(pnl_summary.get("cumulative_total_pnl"), 0.0),
-        "remaining_allocation": okx_available,
+        "remaining_allocation": _execution_tradeable_balance(
+            okx_available=okx_available,
+            okx_allocatable=okx_allocatable,
+            okx_equity=okx_equity,
+            okx_total=okx_total,
+            fallback_available=None,
+        )
+        or parsed_tradeable
+        or 0.0,
     }
 
     if mode == "paper":
@@ -1054,30 +1159,42 @@ def _build_execution_account_status(
         local_available = _safe_float(summary.get("available_balance"), allocated)
         local_used_margin = _safe_float(pnl_summary.get("used_margin"), 0.0) or 0.0
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0) or 0.0
-        if okx_error:
-            available = None
-            used_margin = None
-            wallet = None
-            equity = None
-        else:
-            available = okx_available if okx_available is not None else local_available
-            used_margin = okx_used if okx_used is not None else local_used_margin
-            wallet = (
+        available = _execution_tradeable_balance(
+            okx_available=okx_available,
+            okx_allocatable=okx_allocatable,
+            okx_equity=okx_equity,
+            okx_total=okx_total,
+            fallback_available=local_available,
+        )
+        if available is None:
+            available = local_available
+        used_margin = okx_used if okx_used is not None else local_used_margin
+        wallet = (
+            okx_cash
+            if okx_cash is not None
+            else (
                 okx_total
                 if okx_total is not None
                 else _safe_float(summary.get("wallet_balance"), (available or 0.0) + used_margin)
             )
-            equity = (
+        )
+        equity = (
+            okx_equity
+            if okx_equity is not None
+            else (
                 okx_total
                 if okx_total is not None
                 else _safe_float(summary.get("equity"), (wallet or 0.0) + unrealized)
             )
+        )
         total_pnl = _safe_float(pnl_summary.get("total_pnl"), 0.0)
         cumulative_total_pnl = _safe_float(pnl_summary.get("cumulative_total_pnl"), total_pnl)
         payload.update(
             {
                 "available_balance": available,
                 "current_balance": available,
+                "tradeable_balance": available,
+                "remaining_allocation": available,
                 "wallet_balance": wallet,
                 "equity": equity,
                 "used_margin": used_margin,
@@ -1094,7 +1211,7 @@ def _build_execution_account_status(
                 ),
                 "initial_balance": account_equity,
                 "paper_execution_available_balance": _safe_float(
-                    okx_available,
+                    available,
                     local_available,
                 ),
                 "paper_execution_used_margin": (
@@ -1102,13 +1219,23 @@ def _build_execution_account_status(
                 ),
                 "positions": summary.get("positions", []),
                 "open_positions": int(pnl_summary.get("open_positions") or 0),
+                "balance_snapshot_stale": bool(okx_account and okx_account.get("stale") is True),
+                "balance_snapshot_age_seconds": (
+                    _safe_float(okx_account.get("stale_age_seconds"), None) if okx_account else None
+                ),
                 "balance_source": "OKX 模拟盘账户" if okx_account else "模拟盘执行账户",
             }
         )
         return payload
 
-    if okx_account:
-        available = okx_available
+    if okx_account and not okx_error:
+        available = _execution_tradeable_balance(
+            okx_available=okx_available,
+            okx_allocatable=okx_allocatable,
+            okx_equity=okx_equity,
+            okx_total=okx_total,
+            fallback_available=None,
+        ) or (okx_available if okx_available is not None else okx_allocatable)
         used_margin = (
             okx_used if okx_used is not None else _safe_float(pnl_summary.get("used_margin"), 0.0)
         )
@@ -1120,8 +1247,10 @@ def _build_execution_account_status(
             {
                 "available_balance": available,
                 "current_balance": available,
-                "wallet_balance": total,
-                "equity": total,
+                "tradeable_balance": available,
+                "remaining_allocation": available,
+                "wallet_balance": okx_cash if okx_cash is not None else total,
+                "equity": okx_equity if okx_equity is not None else total,
                 "used_margin": used_margin,
                 "position_margin_used": used_margin,
                 "unrealized_pnl": unrealized,
@@ -1134,13 +1263,23 @@ def _build_execution_account_status(
                 ),
                 "initial_balance": account_equity,
                 "balance_source": "OKX 实盘账户",
+                "balance_snapshot_stale": bool(okx_account.get("stale")),
+                "balance_snapshot_age_seconds": _safe_float(
+                    okx_account.get("stale_age_seconds"), None
+                ),
             }
         )
     else:
         payload.update(
             {
+                "allocated_balance": None,
+                "account_equity": None,
+                "max_loss_usdt": None,
+                "risk_floor": None,
                 "available_balance": None,
                 "current_balance": None,
+                "tradeable_balance": None,
+                "remaining_allocation": None,
                 "wallet_balance": None,
                 "equity": None,
                 "used_margin": None,
@@ -1148,9 +1287,11 @@ def _build_execution_account_status(
                 "unrealized_pnl": None,
                 "total_pnl": None,
                 "total_pnl_pct": None,
-                "initial_balance": account_equity,
+                "initial_balance": None,
                 "balance_source": "OKX 实盘账户",
-                "balance_error": "实盘账户未连接或余额查询失败",
+                "balance_error": okx_error or "实盘账户未连接或余额查询失败",
+                "balance_snapshot_stale": False,
+                "balance_snapshot_age_seconds": None,
             }
         )
     return payload
@@ -1353,10 +1494,33 @@ def _trading_service_is_running() -> bool:
     return bool(is_running()) if callable(is_running) else False
 
 
+def _dashboard_ml_signal_service() -> Any | None:
+    if _trading_service and getattr(_trading_service, "ml_signal_service", None):
+        return _trading_service.ml_signal_service
+    global _ml_signal_status_service
+    if _ml_signal_status_service is None:
+        from services.ml_signal_service import MLSignalService
+
+        _ml_signal_status_service = MLSignalService()
+    return _ml_signal_status_service
+
+
+def _dashboard_local_ai_tools_client() -> Any | None:
+    if _trading_service and getattr(_trading_service, "local_ai_tools", None):
+        return _trading_service.local_ai_tools
+    global _local_ai_tools_status_client
+    if _local_ai_tools_status_client is None:
+        from services.local_ai_tools_client import LocalAIToolsClient
+
+        _local_ai_tools_status_client = LocalAIToolsClient()
+    return _local_ai_tools_status_client
+
+
 async def _completed_ml_shadow_sample_count() -> int:
-    if not _trading_service or not getattr(_trading_service, "ml_signal_service", None):
+    ml_signal_service = _dashboard_ml_signal_service()
+    if not ml_signal_service:
         return 0
-    counter = getattr(_trading_service.ml_signal_service, "completed_shadow_sample_count", None)
+    counter = getattr(ml_signal_service, "completed_shadow_sample_count", None)
     if not callable(counter):
         return 0
     return int(await counter())
@@ -1535,7 +1699,7 @@ async def _get_exchange_position_mark_map(
         return {}
 
     try:
-        positions = await executor.get_positions()
+        positions = await asyncio.wait_for(executor.get_positions(), timeout=1.2)
     except Exception as exc:
         _log_dashboard_fallback(
             "exchange mark map fallback",
@@ -1597,22 +1761,69 @@ async def _get_exchange_position_mark_map(
 
 async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, Any] | None:
     """Fetch the OKX balance snapshot used by dashboard summary with fallback logging."""
-    if not _trading_service:
-        return None
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    now = datetime.now(UTC)
+    cached = _dashboard_okx_balance_cache.get(selected_mode)
+    if cached:
+        cached_at, cached_value = cached
+        if (now - cached_at).total_seconds() <= _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached_value)
+
+    async def fetch_with_executor(executor: Any) -> dict[str, Any] | None:
+        snapshot = await asyncio.wait_for(executor.get_balance_snapshot("USDT"), timeout=8.0)
+        if not snapshot:
+            raise RuntimeError("empty OKX balance snapshot")
+        if snapshot.get("error"):
+            raise RuntimeError(safe_error_text(snapshot.get("error")))
+        return dict(snapshot)
 
     executor = _dashboard_okx_executor_for_mode(selected_mode)
-    if not executor:
-        return None
+    if executor:
+        try:
+            snapshot = await fetch_with_executor(executor)
+            _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
+            return snapshot
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "dashboard summary okx balance fallback",
+                exc,
+                mode=selected_mode,
+                source="trading_service_executor",
+            )
 
+    fallback_executor = OKXExecutor(mode=selected_mode)
     try:
-        return await executor.get_balance_snapshot("USDT")
+        await asyncio.wait_for(fallback_executor.initialize(), timeout=12.0)
+        snapshot = await fetch_with_executor(fallback_executor)
+        _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
+        return snapshot
     except Exception as exc:
         _log_dashboard_fallback(
             "dashboard summary okx balance fallback",
             exc,
             mode=selected_mode,
+            source="isolated_executor",
         )
+        cached = _dashboard_okx_balance_cache.get(selected_mode)
+        if cached and cached[1]:
+            stale_snapshot = copy.deepcopy(cached[1])
+            if isinstance(stale_snapshot, dict):
+                stale_snapshot["stale"] = True
+                stale_snapshot["stale_age_seconds"] = round(
+                    (datetime.now(UTC) - cached[0]).total_seconds(),
+                    3,
+                )
+            return stale_snapshot
         return None
+    finally:
+        try:
+            await fallback_executor.shutdown()
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "dashboard summary okx fallback shutdown failed",
+                exc,
+                mode=selected_mode,
+            )
 
 
 async def _get_display_open_position_symbols(mode: str | None = None) -> set[str]:
@@ -1730,6 +1941,207 @@ async def _build_tickers_for_open_positions(
     return tickers
 
 
+async def _build_dashboard_tickers(
+    open_symbols: set[str],
+    market_tickers: dict,
+    mode: str | None = None,
+) -> dict:
+    open_position_tickers = await _build_tickers_for_open_positions(
+        open_symbols,
+        market_tickers,
+        mode,
+    )
+    if open_position_tickers:
+        return open_position_tickers
+    return {}
+
+
+async def _build_open_position_market_snapshot(mode: str | None = None) -> dict[str, Any]:
+    """Build the single dashboard contract for current open-position market data.
+
+    The dashboard must not infer current position tickers from account cards.
+    Account cards summarize balances and counts; this payload is the canonical
+    source for the real-time held-symbol list and prices.
+    """
+    selected_mode = mode or mode_manager.mode.value
+    market_state: dict[str, Any] = {}
+    if _data_service:
+        market_state = _data_service.get_market_state() or {}
+    market_tickers = market_state.get("tickers", {}) if isinstance(market_state, dict) else {}
+    open_symbols = await _get_display_open_position_symbols(selected_mode)
+    tickers = await _build_dashboard_tickers(open_symbols, market_tickers, selected_mode)
+    open_positions = await _get_display_open_positions_snapshot(selected_mode)
+    if open_positions:
+        position_tickers = _build_tickers_from_position_snapshot(
+            open_positions,
+            tickers,
+        )
+        if position_tickers:
+            tickers = {**tickers, **position_tickers}
+    return {
+        **(market_state if isinstance(market_state, dict) else {}),
+        "tickers": tickers,
+        "position_symbols": sorted(open_symbols),
+        "open_positions": open_positions,
+        "open_position_count": len(open_positions),
+        "ws_stats": (market_state.get("ws_stats", {}) if isinstance(market_state, dict) else {}),
+    }
+
+
+async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[dict[str, Any]]:
+    """Return display-ready open positions without pagination for dashboard widgets."""
+    from db.repositories.trade_repo import TradeRepository
+    from db.session import get_session_ctx
+
+    selected_mode = mode or mode_manager.mode.value
+    exchange_mark_map = await _get_exchange_position_mark_map(selected_mode)
+    exchange_symbols = (
+        {symbol for symbol, _side in exchange_mark_map.keys()} if exchange_mark_map else None
+    )
+    market_tickers: dict[str, dict[str, Any]] = {}
+    if _data_service:
+        market_tickers = (_data_service.get_market_state() or {}).get("tickers", {}) or {}
+
+    positions: list[dict[str, Any]] = []
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            rows = await repo.get_position_records(
+                execution_mode=selected_mode,
+                limit=5000,
+                offset=0,
+                is_open=True,
+            )
+            for p in rows:
+                symbol = _normalize_dashboard_symbol(p.symbol)
+                side = str(p.side or "").lower()
+                exchange_key = (symbol, side)
+                exchange_synced = True
+                if exchange_symbols is not None:
+                    exchange_synced = exchange_key in exchange_mark_map
+                if not exchange_synced:
+                    continue
+
+                current_price = p.current_price
+                unrealized_pnl = p.unrealized_pnl
+                entry_price = p.entry_price
+                quantity = p.quantity
+                pnl_source = "local_db"
+                change_24h = 0.0
+                snapshot = exchange_mark_map.get(exchange_key)
+                market_ticker = market_tickers.get(symbol, {})
+                change_24h = float(
+                    market_ticker.get("change_24h") or market_ticker.get("change24h") or 0.0
+                )
+                if snapshot:
+                    latest_price = float(snapshot.get("mark_price") or 0.0)
+                    if latest_price > 0:
+                        current_price = latest_price
+                        if side == "short":
+                            unrealized_pnl = (entry_price - latest_price) * quantity
+                        else:
+                            unrealized_pnl = (latest_price - entry_price) * quantity
+                        pnl_source = "okx_mark_local_recomputed"
+                elif market_ticker:
+                    latest_price = float(
+                        market_ticker.get("price") or market_ticker.get("last_price") or 0.0
+                    )
+                    if latest_price > 0:
+                        current_price = latest_price
+                        if side == "short":
+                            unrealized_pnl = (entry_price - latest_price) * quantity
+                        else:
+                            unrealized_pnl = (latest_price - entry_price) * quantity
+                        pnl_source = "market_ticker_recomputed"
+
+                positions.append(
+                    {
+                        "id": p.id,
+                        "model_name": p.model_name,
+                        "mode": p.execution_mode,
+                        "symbol": symbol or p.symbol,
+                        "side": side,
+                        "quantity": quantity,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "change_24h": change_24h,
+                        "unrealized_pnl": unrealized_pnl,
+                        "pnl_source": pnl_source,
+                        "local_quantity": p.quantity,
+                        "local_entry_price": p.entry_price,
+                        "local_unrealized_pnl": p.unrealized_pnl,
+                        "realized_pnl": p.realized_pnl,
+                        "leverage": p.leverage,
+                        "stop_loss": p.stop_loss_price,
+                        "take_profit": p.take_profit_price,
+                        "is_open": True,
+                        "db_is_open": p.is_open,
+                        "exchange_synced": exchange_synced,
+                        "close_status": "open",
+                        "close_status_label": "持有中",
+                        "close_status_source": "position",
+                        "position_status": "持有中",
+                        "opened_at": p.created_at.isoformat() if p.created_at else None,
+                        "closed_at": p.closed_at.isoformat() if p.closed_at else None,
+                    }
+                )
+    except Exception as exc:
+        _log_dashboard_fallback(
+            "open position snapshot fallback",
+            exc,
+            mode=selected_mode,
+        )
+
+    return _group_open_dashboard_positions(
+        positions,
+        exchange_mark_map,
+        mode=selected_mode,
+    )
+
+
+def _build_tickers_from_position_snapshot(
+    open_positions: list[dict[str, Any]],
+    existing_tickers: dict[str, Any] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Build ticker cards directly from open-position snapshots."""
+    existing_tickers = existing_tickers or {}
+    tickers: dict[str, dict[str, float]] = {}
+    for position in open_positions:
+        if not isinstance(position, dict):
+            continue
+        if position.get("is_open") is False:
+            continue
+        symbol = _normalize_dashboard_symbol(str(position.get("symbol") or ""))
+        if not symbol:
+            continue
+        price = (
+            _safe_float(position.get("current_price"), 0.0)
+            or _safe_float(position.get("exchange_mark_price"), 0.0)
+            or _safe_float(position.get("entry_price"), 0.0)
+            or 0.0
+        )
+        if price <= 0:
+            continue
+        previous = existing_tickers.get(symbol, {}) if isinstance(existing_tickers, dict) else {}
+        raw_change = position.get("change_24h")
+        if raw_change is None and isinstance(previous, dict):
+            raw_change = previous.get("change_24h", previous.get("change24h"))
+        tickers[symbol] = {
+            "price": price,
+            "change_24h": _safe_float(raw_change, 0.0) or 0.0,
+            "volume_24h": _safe_float(
+                previous.get("volume_24h") if isinstance(previous, dict) else None,
+                0.0,
+            )
+            or 0.0,
+            "bid": _safe_float(previous.get("bid") if isinstance(previous, dict) else None, 0.0)
+            or 0.0,
+            "ask": _safe_float(previous.get("ask") if isinstance(previous, dict) else None, 0.0)
+            or 0.0,
+        }
+    return tickers
+
+
 def _merge_market_and_public_ticker(market_ticker: dict, public_ticker: dict) -> dict:
     merged = {**public_ticker, **market_ticker}
     market_change = market_ticker.get("change_24h")
@@ -1745,7 +2157,7 @@ def _merge_market_and_public_ticker(market_ticker: dict, public_ticker: dict) ->
 
 async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
     requested = sorted(s for s in symbols if s)
-    if not requested or not _data_service or not getattr(_data_service, "rest_client", None):
+    if not requested:
         return {}
 
     cache_key = ",".join(requested)
@@ -1756,8 +2168,14 @@ async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
         if (now - cached_at).total_seconds() <= _PUBLIC_TICKER_CACHE_TTL_SECONDS:
             return cached_value
 
+    rest_client = getattr(_data_service, "rest_client", None) if _data_service else None
+    owns_client = False
+    if rest_client is None:
+        rest_client = OKXRestClient()
+        owns_client = True
+
     try:
-        raw_tickers = await _data_service.rest_client.fetch_tickers(requested)
+        raw_tickers = await asyncio.wait_for(rest_client.fetch_tickers(requested), timeout=8.0)
     except Exception as exc:
         _log_dashboard_fallback(
             "public ticker fallback",
@@ -1765,15 +2183,64 @@ async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
             symbol_count=len(requested),
             has_cached=bool(cached),
         )
-        return cached[1] if cached else {}
+        raw_tickers = await _fetch_public_tickers_individually(rest_client, requested)
+        if not raw_tickers:
+            return cached[1] if cached else {}
+    finally:
+        if owns_client:
+            try:
+                await rest_client.close()
+            except Exception as exc:
+                _log_dashboard_fallback("public ticker client close fallback", exc)
 
+    parsed = _parse_public_tickers(raw_tickers, set(requested))
+
+    _public_ticker_cache[cache_key] = (now, parsed)
+    return parsed
+
+
+async def _fetch_public_tickers_individually(
+    rest_client: Any, requested: list[str]
+) -> dict[str, dict[str, Any]]:
+    fetch_ticker = getattr(rest_client, "fetch_ticker", None)
+    has_single_ticker = callable(fetch_ticker)
+    if len(requested) == 1 and not has_single_ticker:
+        return {}
+
+    recovered: dict[str, dict[str, Any]] = {}
+    for symbol in requested:
+        try:
+            if has_single_ticker:
+                ticker = await asyncio.wait_for(fetch_ticker(symbol), timeout=3.0)
+                raw_tickers = {symbol: ticker} if isinstance(ticker, dict) else {}
+            else:
+                raw_tickers = await asyncio.wait_for(
+                    rest_client.fetch_tickers([symbol]), timeout=3.0
+                )
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "public ticker symbol fallback",
+                exc,
+                symbol=symbol,
+            )
+            continue
+
+        if isinstance(raw_tickers, dict):
+            recovered.update(raw_tickers)
+
+    return recovered
+
+
+def _parse_public_tickers(
+    raw_tickers: dict[str, Any] | None, requested_symbols: set[str]
+) -> dict[str, dict]:
     parsed: dict[str, dict] = {}
     for raw_key, ticker in (raw_tickers or {}).items():
         if not isinstance(ticker, dict):
             continue
         info = ticker.get("info") or {}
         symbol = _normalize_dashboard_symbol(ticker.get("symbol") or info.get("instId") or raw_key)
-        if symbol not in symbols:
+        if symbol not in requested_symbols:
             continue
         price = _safe_float(
             ticker.get("last") or ticker.get("close") or info.get("last") or info.get("lastPx"),
@@ -1789,8 +2256,6 @@ async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
             "bid": _safe_float(ticker.get("bid") or info.get("bidPx"), 0.0),
             "ask": _safe_float(ticker.get("ask") or info.get("askPx"), 0.0),
         }
-
-    _public_ticker_cache[cache_key] = (now, parsed)
     return parsed
 
 
@@ -1830,9 +2295,10 @@ async def get_status(mode: str | None = None):
 
 @router.get("/ml-signal/status")
 async def get_ml_signal_status():
-    if not _trading_service or not getattr(_trading_service, "ml_signal_service", None):
+    ml_signal_service = _dashboard_ml_signal_service()
+    if not ml_signal_service:
         return {"available": False, "status": "service_not_ready"}
-    status = _trading_service.ml_signal_service.status()
+    status = ml_signal_service.status()
     if not isinstance(status, dict):
         return status
 
@@ -1869,9 +2335,10 @@ async def get_ml_signal_status():
 
 @router.get("/local-ai-tools/status")
 async def get_local_ai_tools_status():
-    if not _trading_service or not getattr(_trading_service, "local_ai_tools", None):
+    local_ai_tools = _dashboard_local_ai_tools_client()
+    if not local_ai_tools:
         return {"available": False, "status": "service_not_ready"}
-    status = await _trading_service.local_ai_tools.status()
+    status = await local_ai_tools.status()
     if isinstance(status, dict):
         try:
             completed_total = await _completed_local_ai_shadow_backtest_total()
@@ -1885,23 +2352,13 @@ async def get_local_ai_tools_status():
 
 @router.get("/server-monitor/status")
 async def get_server_monitor_status():
-    return await asyncio.to_thread(get_server_monitor_status_sync)
+    return await get_server_monitor_status_async()
 
 
 @router.get("/dashboard/summary")
 async def get_dashboard_summary():
     """Aggregate dashboard data."""
-    market_state = {}
-    if _data_service:
-        market_state = _data_service.get_market_state()
-
-    # The main dashboard ticker panel should reflect current holdings only.
-    open_symbols = await _get_display_open_position_symbols()
-    all_tickers = market_state.get("tickers", {})
-    market_state["tickers"] = await _build_tickers_for_open_positions(
-        open_symbols, all_tickers, mode_manager.mode.value
-    )
-    market_state["position_symbols"] = sorted(open_symbols)
+    market_state = await _build_open_position_market_snapshot(mode_manager.mode.value)
 
     account_summaries = []
     if _trading_service and _trading_service.paper_executor:
@@ -1990,9 +2447,7 @@ async def get_dashboard_summary():
 @router.get("/dashboard/market")
 async def get_market_data():
     """Current market prices and stats."""
-    if _data_service:
-        return _data_service.get_market_state()
-    return {"tickers": {}, "ws_stats": {}}
+    return await _build_open_position_market_snapshot(mode_manager.mode.value)
 
 
 @router.get("/dashboard/positions")
@@ -2474,6 +2929,17 @@ async def get_decisions(
     for d in rows:
         decision_type, decision_type_label = _decision_type(d.action)
         raw = d.raw_llm_response if isinstance(d.raw_llm_response, dict) else {}
+        order = order_map.get(d.id)
+        order_quantity = _safe_float(getattr(order, "quantity", None), 0.0) if order else None
+        order_price = _safe_float(getattr(order, "price", None), 0.0) if order else None
+        order_notional = (
+            order_quantity * order_price
+            if order_quantity is not None
+            and order_price is not None
+            and order_quantity > 0
+            and order_price > 0
+            else None
+        )
         decisions.append(
             sanitize_payload(
                 {
@@ -2486,10 +2952,18 @@ async def get_decisions(
                     "confidence": d.confidence,
                     "reasoning": sanitize_text(d.reasoning),
                     "position_size_pct": d.position_size_pct,
+                    "position_size_pct_basis": "execution_account_available_margin",
+                    "position_size_pct_label": "保证金占当前执行账户可用余额比例",
+                    "suggested_leverage": d.suggested_leverage,
                     "was_executed": d.was_executed,
-                    "execution_reason": _display_execution_reason(d, order_map.get(d.id)),
+                    "execution_reason": _display_execution_reason(d, order),
                     "executed_at": d.executed_at.isoformat() if d.executed_at else None,
                     "execution_price": d.execution_price,
+                    "order_quantity": order_quantity,
+                    "order_price": order_price,
+                    "order_notional_usdt": order_notional,
+                    "order_status": getattr(order, "status", None) if order else None,
+                    "exchange_order_id": getattr(order, "exchange_order_id", None) if order else None,
                     "created_at": d.created_at.isoformat() if d.created_at else None,
                     "outcome": d.outcome,
                     "is_paper": d.is_paper,
@@ -2517,6 +2991,17 @@ def _opening_funnel_reason_bucket(reason: str | None) -> str:
     text = str(reason or "").lower()
     if not text:
         return "unknown"
+    if any(
+        token in text
+        for token in (
+            "动态证据不足",
+            "保持观望",
+            "极小探针",
+            "entry_evidence_wait",
+            "skip_kind",
+        )
+    ):
+        return "waiting_queue"
     if any(
         token in text
         for token in (
@@ -2737,9 +3222,9 @@ async def get_opening_funnel(
             top_bucket = max(reason_buckets.items(), key=lambda item: item[1])[0]
             bottleneck = top_bucket
             label_map = {
-                "evidence_gate": "动态证据评分/机会评分拦截",
-                "risk_or_precheck": "风控或入场预检拦截",
-                "waiting_queue": "候选排队后未进入执行",
+                "evidence_gate": "动态证据强冲突硬拦",
+                "risk_or_precheck": "风控或入场预检未通过",
+                "waiting_queue": "动态证据不足，观望等待",
                 "execution_or_exchange": "执行层或交易所接口问题",
                 "ai_budget": "AI 成本预算仍在拦截",
                 "other": "未执行原因分散",
@@ -3065,6 +3550,7 @@ async def get_analysis_records(
             if len(records) >= effective_page_size:
                 continue
 
+        local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
         detail_payload = (
             {
                 "experts": experts,
@@ -3080,11 +3566,7 @@ async def get_analysis_records(
                 "ml_signal": (
                     raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else None
                 ),
-                "local_ai_tools": (
-                    raw.get("local_ai_tools")
-                    if isinstance(raw.get("local_ai_tools"), dict)
-                    else None
-                ),
+                "local_ai_tools": local_ai_tools_payload,
                 "agent_skills": (
                     raw.get("agent_skills") if isinstance(raw.get("agent_skills"), dict) else None
                 ),
@@ -4006,6 +4488,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "loss_count": 0,
             "symbols": [],
             "symbol_pnl": {},
+            "position_details": [],
             "cumulative_realized_pnl": 0.0,
             "cumulative_total_pnl": 0.0,
         }
@@ -4068,6 +4551,9 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             symbol = str(pos.symbol or "")
             if symbol and symbol not in row["symbols"]:
                 row["symbols"].append(symbol)
+            row["position_details"].append(
+                _daily_pnl_position_detail(pos, pnl=pnl, closed_at=closed_at)
+            )
             if symbol:
                 symbol_row = row["symbol_pnl"].setdefault(
                     symbol,
@@ -4122,6 +4608,11 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             row["cumulative_total_pnl"] = round(cumulative, 8)
         row["cumulative_realized_pnl"] = round(cumulative, 8)
         row["symbols"] = sorted(row["symbols"])
+        row["position_details"] = sorted(
+            row["position_details"],
+            key=lambda item: item.get("closed_at") or "",
+            reverse=True,
+        )
         row["symbol_pnl"] = [
             {
                 **symbol_row,
@@ -4142,6 +4633,33 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         "start_date": start_day.isoformat(),
         "end_date": today_local.isoformat(),
         "records": [records[key] for key in sorted(records.keys(), reverse=True)],
+    }
+
+
+def _daily_pnl_position_detail(
+    position: Any,
+    *,
+    pnl: float,
+    closed_at: datetime | None,
+) -> dict[str, Any]:
+    quantity = _safe_float(getattr(position, "quantity", None), 0.0) or 0.0
+    entry_price = _safe_float(getattr(position, "entry_price", None), 0.0) or 0.0
+    exit_price = _safe_float(getattr(position, "current_price", None), 0.0) or 0.0
+    return {
+        "id": getattr(position, "id", None),
+        "symbol": str(getattr(position, "symbol", "") or ""),
+        "side": str(getattr(position, "side", "") or ""),
+        "side_label": _side_label(getattr(position, "side", "")),
+        "quantity": round(quantity, 8),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "realized_pnl": round(float(pnl or 0.0), 8),
+        "closed_at": closed_at.isoformat() if closed_at else None,
+        "opened_at": (
+            _as_utc_datetime(getattr(position, "created_at", None)).isoformat()
+            if _as_utc_datetime(getattr(position, "created_at", None))
+            else None
+        ),
     }
 
 

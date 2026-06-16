@@ -11,6 +11,11 @@ import structlog
 
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
+from services.position_open_time import (
+    parse_position_time,
+    position_open_time,
+    serialize_position_time,
+)
 
 NormalizeSymbol = Callable[[str | None], str | None]
 FloatParser = Callable[[Any, float], float]
@@ -25,6 +30,34 @@ def _default_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _position_contract_size(position: dict[str, Any], float_parser: FloatParser) -> float:
+    info = position.get("info") if isinstance(position.get("info"), dict) else {}
+    contract_size = float_parser(
+        position.get("contract_size") or position.get("contractSize") or info.get("ctVal"),
+        1.0,
+    )
+    return contract_size if contract_size > 0 else 1.0
+
+
+def _derived_unrealized_pnl(
+    position: dict[str, Any],
+    *,
+    side: str,
+    quantity: float,
+    entry: float,
+    current: float,
+    float_parser: FloatParser,
+) -> float:
+    if quantity <= 0 or entry <= 0 or current <= 0:
+        return 0.0
+    contract_size = _position_contract_size(position, float_parser)
+    if side == "short":
+        return (entry - current) * quantity * contract_size
+    if side == "long":
+        return (current - entry) * quantity * contract_size
+    return 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +85,7 @@ class PositionGroupAggregator:
         entry_value = 0.0
         current_value = 0.0
         unrealized = 0.0
+        pnl_source = "reported"
         stop_value = 0.0
         stop_weight = 0.0
         take_profit_value = 0.0
@@ -69,7 +103,20 @@ class PositionGroupAggregator:
             total_qty += qty
             entry_value += entry * qty
             current_value += (current if current > 0 else entry) * qty
-            unrealized += self.float_parser(position.get("unrealized_pnl"), 0.0)
+            reported_unrealized = self.float_parser(position.get("unrealized_pnl"), 0.0)
+            derived_unrealized = _derived_unrealized_pnl(
+                position,
+                side=side,
+                quantity=qty,
+                entry=entry,
+                current=current if current > 0 else entry,
+                float_parser=self.float_parser,
+            )
+            if abs(reported_unrealized) < 1e-9 and abs(derived_unrealized) > 1e-9:
+                unrealized += derived_unrealized
+                pnl_source = "derived_from_prices"
+            else:
+                unrealized += reported_unrealized
 
             stop = self.float_parser(
                 position.get("stop_loss") or position.get("stop_loss_price"),
@@ -94,7 +141,7 @@ class PositionGroupAggregator:
 
             created_at = self._earliest_created_at(
                 created_at,
-                position.get("created_at"),
+                position_open_time(position) or position.get("created_at"),
                 symbol=symbol,
             )
 
@@ -113,23 +160,20 @@ class PositionGroupAggregator:
             "current_price": current_price,
             "notional": notional,
             "unrealized_pnl": unrealized,
+            "unrealized_pnl_source": pnl_source,
             "stop_loss": stop_value / stop_weight if stop_weight > 0 else 0.0,
             "take_profit": (
                 take_profit_value / take_profit_weight if take_profit_weight > 0 else 0.0
             ),
             "leverage": leverage_value / leverage_weight if leverage_weight > 0 else 1.0,
             "is_open": True,
-            "created_at": created_at,
+            "created_at": serialize_position_time(created_at),
             "rows": len(rows),
         }
 
     @staticmethod
     def _parse_time(value: Any) -> datetime | None:
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return value
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parse_position_time(value)
 
     def _earliest_created_at(self, current: Any, candidate: Any, *, symbol: str) -> Any:
         if current is None:

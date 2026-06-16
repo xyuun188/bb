@@ -63,6 +63,7 @@ def apply_evidence_sizing_policy(
 
     leverage_cap = {
         "weak_conflict_probe": 2.0,
+        "degraded_missing_probe": 2.0,
         "exploration": 3.0,
         "small": 4.0,
         "medium": 6.0,
@@ -85,6 +86,7 @@ def evidence_is_low_payoff_quality(evidence_score: dict[str, Any], effective_sco
         return False
     return effective_score < ENTRY_EVIDENCE_SCORE_SMALL or str(evidence_score.get("tier")) in {
         "weak_conflict_probe",
+        "degraded_missing_probe",
         "blocked",
     }
 

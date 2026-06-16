@@ -173,3 +173,34 @@ def test_entry_opportunity_scoring_tightens_degraded_side_quality() -> None:
     assert opportunity["min_score_required"] >= 0.85
     assert side_quality["adjusted_position_size"] < side_quality["original_position_size"]
     assert decision.position_size_pct < 0.04
+
+
+def test_entry_opportunity_scoring_reads_wrapped_server_quant_payloads() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": {
+            "ok": True,
+            "data": {
+                "prediction": {
+                    "best_side": "long",
+                    "adjusted_long_return_pct": 0.82,
+                    "adjusted_short_return_pct": -0.12,
+                    "long_loss_probability": 0.29,
+                    "profit_quality_score": 0.88,
+                }
+            },
+        },
+        "time_series_prediction": {
+            "result": {"best_side": "long", "expected_return_pct": 0.37}
+        },
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["server_profit_best_side"] == "long"
+    assert opportunity["server_profit_expected_return_pct"] == 0.82
+    assert opportunity["timeseries_expected_return_pct"] == 0.37
+    assert opportunity["timeseries_aligned"] is True
+    assert "鏈" not in opportunity["dynamic_score_reason"]

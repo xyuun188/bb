@@ -15,6 +15,12 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from services.entry_evidence import build_entry_evidence_score
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+    first_tool_payload,
+    payload_side,
+    signal_available,
+)
 from services.entry_stop_loss_budget import ENTRY_MAX_STOP_LOSS_NORMAL_USDT
 from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
 from services.trading_params import ESTIMATED_TAKER_FEE_PCT
@@ -59,6 +65,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _tool_signal(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return first_tool_payload(raw, *keys)
 
 
 @dataclass(slots=True)
@@ -308,17 +320,21 @@ class EntryOpportunityScoringPolicy:
             MIN_ENTRY_OPPORTUNITY_SCORE,
         )
         min_score_required = base_min_score_required
-        dynamic_score_reason = f"分歧大、波动异常或没有盈利模型同向确认，保持 {base_min_score_required:.2f}+ 基础门槛。"
-        local_tools = self._safe_dict(raw.get("local_ai_tools"))
-        local_profit = self._safe_dict(local_tools.get("profit_prediction"))
-        local_best_side = str(local_profit.get("best_side") or "").lower()
-        local_expected = self._safe_float(
-            local_profit.get(
-                f"adjusted_{side}_return_pct", local_profit.get(f"{side}_expected_return_pct")
-            ),
-            0.0,
+        dynamic_score_reason = (
+            f"分歧大、波动异常或没有盈利模型同向确认，保持 {base_min_score_required:.2f}+ 基础门槛。"
         )
-        local_available = bool(local_profit.get("available") or local_profit.get("trained"))
+        local_tools = self._safe_dict(raw.get("local_ai_tools"))
+        local_profit = _tool_signal(
+            raw,
+            "profit_prediction",
+            "profit_model",
+            "server_profit",
+            "server_profit_model",
+            "profit",
+        )
+        local_best_side = payload_side(local_profit)
+        local_expected = signal_expected_return_pct(local_profit, side)
+        local_available = signal_available(local_profit)
         ml_aligned = (
             side_influence_enabled
             and expected_pct > 0
@@ -333,21 +349,17 @@ class EntryOpportunityScoringPolicy:
             local_profit.get(f"{side}_loss_probability"), 0.50
         )
         local_quality = self._safe_float(local_profit.get("profit_quality_score"), 0.0)
-        ts_prediction = self._safe_dict(
-            local_tools.get("time_series_prediction")
-            or local_tools.get("timeseries_prediction")
-            or local_tools.get("sequence_prediction")
+        ts_prediction = _tool_signal(
+            raw,
+            "time_series_prediction",
+            "timeseries_prediction",
+            "sequence_prediction",
+            "timeseries",
+            "time_series",
         )
-        ts_best_side = str(
-            ts_prediction.get("best_side") or ts_prediction.get("side") or ""
-        ).lower()
-        ts_expected = self._safe_float(
-            ts_prediction.get(
-                "expected_return_pct", ts_prediction.get(f"{side}_expected_return_pct")
-            ),
-            0.0,
-        )
-        ts_aligned = bool(ts_prediction) and ts_best_side == side and ts_expected > 0
+        ts_best_side = payload_side(ts_prediction)
+        ts_expected = signal_expected_return_pct(ts_prediction, side)
+        ts_aligned = signal_available(ts_prediction) and ts_best_side == side and ts_expected > 0
         if exposure.get("dominant_side") in {"long", "short"}:
             dominant = str(exposure.get("dominant_side") or "")
             opposite_dominant = "short" if dominant == "long" else "long"
@@ -654,7 +666,7 @@ class EntryOpportunityScoringPolicy:
                 same_side_loss_concentration = True
                 quant_conflict_penalty += min(abs(side_unrealized) / 30.0, 0.65)
                 dynamic_score_reason = (
-                    f"当前组合已经高度集中在{side}，且该方向浮亏 {side_unrealized:.2f}U；"
+                    f"当前组合已经高度集中在 {side}，且该方向浮亏 {side_unrealized:.2f}U；"
                     "本轮只作为风险扣分，不再直接禁止同方向开仓。"
                 )
 
@@ -830,7 +842,7 @@ class EntryOpportunityScoringPolicy:
             if not strong_current_profit_support:
                 min_score_required = max(min_score_required, ENTRY_WEAK_HISTORY_MIN_SCORE)
                 dynamic_score_reason = (
-                    "该币种/方向近期真实盈亏偏弱；只有净盈亏比足够高且模型证据改善时才允许继续试。"
+                    "该币种方向近期真实盈亏偏弱；只有净盈亏比足够高且模型证据改善时才允许继续试。"
                 )
 
         raw["opportunity_score"] = {

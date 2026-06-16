@@ -20,12 +20,14 @@ from ai_brain.model_factory import create_models_from_config
 from ai_brain.model_registry import ModelRegistry
 from config.settings import settings
 from core.logging_config import setup_logging
+from core.redis_runtime import create_redis_client
 from core.safe_output import safe_error_text
 from core.secret_utils import secret_state
 from core.trading_mode import mode_manager
 from db.session import close_db, init_db
 from services.competition_service import CompetitionService
 from services.data_service import DataService
+from services.secure_runtime_config import load_secure_settings_into_runtime
 from services.trading_service import TradingService
 from web_dashboard.api.dashboard import set_services
 from web_dashboard.app import app
@@ -51,6 +53,7 @@ async def main():
 
     # Init
     await init_db()
+    await load_secure_settings_into_runtime()
     print("Database initialized.")
 
     data_service = DataService()
@@ -84,17 +87,7 @@ async def main():
         mode_manager._live_model_name = "llm_agent"
         await mode_manager.switch_to_live("llm_agent")
 
-    # Redis
-    redis: Any = None
-    try:
-        import fakeredis.aioredis
-
-        redis = fakeredis.aioredis.FakeRedis()
-    except Exception as exc:
-        logger.warning(
-            "fakeredis unavailable; continuing without redis",
-            error=safe_error_text(exc),
-        )
+    redis = await create_redis_client()
 
     trading_service = TradingService(
         model_registry=model_registry,
@@ -119,19 +112,30 @@ async def main():
 
     eval_task = asyncio.create_task(periodic_evaluation())
 
-    print(f"\nDashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
-    config = uvicorn.Config(
-        app, host=settings.dashboard_host, port=settings.dashboard_port, log_level="info"
-    )
-    server = uvicorn.Server(config)
+    inline_dashboard = bool(settings.dashboard_inline_enabled)
+    if inline_dashboard:
+        print(f"\nDashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
+    else:
+        print("\nDashboard: split process (Redis dashboard:update)")
 
     try:
-        await server.serve()
+        if inline_dashboard:
+            config = uvicorn.Config(
+                app,
+                host=settings.dashboard_host,
+                port=settings.dashboard_port,
+                log_level="info",
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+        else:
+            await trading_task
     except KeyboardInterrupt:
         print("\nShutting down...")
 
     trading_service._running = False
-    trading_task.cancel()
+    if not trading_task.done():
+        trading_task.cancel()
     eval_task.cancel()
     try:
         await trading_task

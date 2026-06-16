@@ -89,15 +89,28 @@ class EntryOpportunityGatePolicy:
             or strategy_mode.get("strategy_learning_entry_pause_reason")
             or learning.get("entry_pause_reason")
             or mode_learning.get("entry_pause_reason")
-            or "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针，优先释放已有低质量仓位。"
+            or "策略学习护栏提示：已转为小仓恢复探针，不作为新开仓硬拦截。"
         )
+        opportunity = _safe_dict(raw.get("opportunity_score"))
+        warnings = list(_safe_list(opportunity.get("execution_advisory_warnings")))
+        warnings.append(
+            {
+                "reason": str(reason)[:300],
+                "policy": "strategy_learning_recovery_advisory",
+                "blocks_entry": False,
+            }
+        )
+        opportunity["execution_advisory_warnings"] = warnings
+        opportunity["strategy_learning_pause_is_hard_gate"] = False
+        raw["opportunity_score"] = opportunity
+        raw["strategy_learning_entry_pause_is_hard_gate"] = False
         return str(reason)[:300]
 
     def _evaluate(self, decision: DecisionOutput) -> str | None:
         raw = _safe_dict(decision.raw_response)
         entry_pause_reason = self._strategy_learning_entry_pause_reason(raw)
         if entry_pause_reason:
-            return entry_pause_reason
+            decision.raw_response = raw
         opportunity = _safe_dict(raw.get("opportunity_score"))
         confidence = max(
             float(decision.confidence or 0.0),
@@ -505,14 +518,14 @@ class EntryOpportunityGatePolicy:
             "tier": evidence_score.get("tier"),
             "reasons": reasons if isinstance(reasons, list) else [],
             "policy": (
-                "Dynamic evidence scoring only hard-blocks strong conflicts, missing key evidence, "
-                "or scores below the hard floor; weak conflict signals are handled by sizing tiers."
+                "Dynamic evidence scoring only hard-blocks severe directional conflicts; "
+                "missing model data and weak evidence are handled by skipped observation or tiny probe sizing."
             ),
         }
         decision.raw_response = raw
         return (
-            f"动态证据评分硬拦截：{reason_text or '证据评分低于硬拦下限'}。"
-            f"当前有效分 {effective_score:.1f}，低于硬拦/强冲突要求；本次不开仓。"
+            f"动态证据强冲突硬拦截：{reason_text or 'ML/时序/记忆出现严重反向'}。"
+            f"当前有效分 {effective_score:.1f}；本次不提交开仓，等待下一轮重新评估。"
         )
 
     def _entry_side(self, decision: DecisionOutput, opportunity: dict[str, Any]) -> str:

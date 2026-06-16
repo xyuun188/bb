@@ -1,5 +1,6 @@
 from models.account import ExecutionEquitySnapshot, VirtualAccount
 from models.base import Base, TimestampMixin
+from models.dashboard_auth import DashboardUser
 from models.decision import AIDecision
 from models.learning import (
     ExpertMemory,
@@ -11,6 +12,7 @@ from models.learning import (
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.risk import ModelPerformanceSnapshot, RiskEvent
+from models.secure_config import SecureSetting, SecureSettingAudit
 from models.trade import Order, Position
 
 __all__ = [
@@ -24,9 +26,12 @@ __all__ = [
     "Position",
     "VirtualAccount",
     "ExecutionEquitySnapshot",
+    "DashboardUser",
     "AIDecision",
     "ExpertMemory",
     "ShadowBacktest",
+    "SecureSetting",
+    "SecureSettingAudit",
     "StrategyLearningEvent",
     "StrategyProfileSnapshot",
     "TradeReflection",

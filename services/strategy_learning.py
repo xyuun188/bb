@@ -33,10 +33,12 @@ from models.learning import (
     TradeReflection,
 )
 from models.trade import Order, Position
-from services.execution_result_classifier import ExecutionResultClassifier
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
-from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
+from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
+from services.position_open_time import parse_position_time, position_open_time
+from services.position_quality import PositionQualityScorer
+from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -48,6 +50,9 @@ UNTRUSTED_EXPERT_STATUSES = {
     "failed",
     "invalid",
     "timeout",
+    "timeout_fallback",
+    "independent_provider_fallback",
+    "independent_provider_failed",
 }
 REQUIRED_ENTRY_EXPERTS = {
     "trend_expert",
@@ -58,7 +63,7 @@ REQUIRED_ENTRY_EXPERTS = {
 }
 CORE_ENTRY_EXPERTS = {"trend_expert", "momentum_expert", "risk_expert"}
 NON_CORE_ENTRY_EXPERTS = REQUIRED_ENTRY_EXPERTS - CORE_ENTRY_EXPERTS
-DEFAULT_MIN_TRADE_TARGET = 8
+DEFAULT_MIN_TRADE_TARGET_FALLBACK = 8
 DEFAULT_LOOKBACK_HOURS = 168
 STATE_FILE_NAME = "strategy_learning_state.json"
 PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS = 600
@@ -108,6 +113,51 @@ ALLOWED_EXPERT_INTEGRITY_MODES = {
 }
 ALLOWED_AGGRESSIVENESS = {"low", "normal", "high"}
 ALLOWED_WINNER_HOLD = {"normal", "high"}
+
+
+def default_min_trade_target() -> int:
+    """Return the advisory training-sample target used by strategy learning."""
+
+    return max(
+        1,
+        min(
+            _safe_int(
+                getattr(
+                    settings,
+                    "strategy_learning_min_trade_count_target",
+                    DEFAULT_MIN_TRADE_TARGET_FALLBACK,
+                ),
+                DEFAULT_MIN_TRADE_TARGET_FALLBACK,
+            ),
+            80,
+        ),
+    )
+
+
+def learning_trade_count_target(
+    *,
+    window_hours: int,
+    market_scans: int = 0,
+    entry_signals: int = 0,
+    reflection_count: int = 0,
+    shadow_opportunities: int = 0,
+) -> int:
+    """Return a dynamic, advisory sample target for strategy-confidence scoring."""
+
+    baseline = default_min_trade_target()
+    window_factor = max(0, min(int(window_hours or DEFAULT_LOOKBACK_HOURS), 24 * 90)) / 168.0
+    activity_target = math.ceil(
+        max(int(entry_signals or 0) * 0.60, int(shadow_opportunities or 0) * 0.35)
+    )
+    review_target = math.ceil(max(int(reflection_count or 0), 0) * 0.50)
+    scan_target = math.ceil(max(int(market_scans or 0), 0) * 0.08)
+    dynamic_target = max(
+        math.ceil(baseline * min(max(window_factor, 0.50), 2.0)),
+        activity_target,
+        review_target,
+        scan_target,
+    )
+    return max(3, min(dynamic_target, 40))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -162,20 +212,12 @@ def _aware(value: Any) -> datetime | None:
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return _aware(value)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return _aware(parsed)
+    return parse_position_time(value)
 
 
 def _hours_between(start: Any, end: Any) -> float:
-    started = _aware(start)
-    ended = _aware(end)
+    started = parse_position_time(start)
+    ended = parse_position_time(end)
     if not started or not ended:
         return 0.0
     return max((ended - started).total_seconds() / 3600.0, 0.0)
@@ -195,11 +237,15 @@ def _position_side(value: Any) -> str:
 
 
 def _created_at(row: Any) -> datetime | None:
-    return _aware(getattr(row, "created_at", None))
+    if isinstance(row, dict):
+        return position_open_time(row)
+    return parse_position_time(getattr(row, "created_at", None))
 
 
 def _closed_at(row: Any) -> datetime | None:
-    return _aware(getattr(row, "closed_at", None))
+    if isinstance(row, dict):
+        return parse_position_time(row.get("closed_at"))
+    return parse_position_time(getattr(row, "closed_at", None))
 
 
 def _position_pnl(row: Any) -> float:
@@ -207,9 +253,36 @@ def _position_pnl(row: Any) -> float:
 
 
 def _open_position_pnl(row: Any) -> float:
-    if isinstance(row, dict):
-        return _safe_float(row.get("unrealized_pnl"), 0.0)
-    return _safe_float(getattr(row, "unrealized_pnl", None), 0.0)
+    reported = _safe_float(_row_get(row, "unrealized_pnl"), 0.0)
+    derived = _derived_open_position_pnl(row)
+    if abs(reported) < 1e-9 and abs(derived) > 1e-9:
+        return derived
+    return reported
+
+
+def _derived_open_position_pnl(row: Any) -> float:
+    quantity = abs(
+        _safe_float(
+            _row_get(row, "quantity") or _row_get(row, "contracts") or _row_get(row, "sz"),
+            0.0,
+        )
+    )
+    entry = _safe_float(_row_get(row, "entry_price"), 0.0)
+    current = _safe_float(_row_get(row, "current_price"), entry)
+    if quantity <= 0 or entry <= 0 or current <= 0:
+        return 0.0
+    contract_size = _safe_float(
+        _row_get(row, "contract_size") or _row_get(row, "contractSize"),
+        1.0,
+    )
+    if contract_size <= 0:
+        contract_size = 1.0
+    side = _row_side(row)
+    if side == "short":
+        return (entry - current) * quantity * contract_size
+    if side == "long":
+        return (current - entry) * quantity * contract_size
+    return 0.0
 
 
 def _row_side(row: Any) -> str:
@@ -243,6 +316,28 @@ def _row_model(row: Any) -> str:
     if isinstance(row, dict):
         return str(row.get("model_name") or ENSEMBLE_TRADER_NAME)
     return str(getattr(row, "model_name", ENSEMBLE_TRADER_NAME) or ENSEMBLE_TRADER_NAME)
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _position_open_time_value(row: Any) -> Any:
+    opened = position_open_time(row)
+    if opened is not None:
+        return opened.isoformat()
+    return _row_get(row, "created_at") or _row_get(row, "opened_at") or _row_get(row, "timestamp")
+
+
+def _row_strategy_profile_id(row: Any) -> str:
+    direct = _row_get(row, "strategy_profile_id") or _row_get(row, "profile_id")
+    if direct:
+        return str(direct)
+    raw = _row_get(row, "raw_response")
+    context = _safe_dict(_safe_dict(raw).get("strategy_learning_context"))
+    return str(context.get("strategy_profile_id") or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +568,9 @@ class StrategyLearningStateStore:
 class StrategyFeedbackCompiler:
     """Compile existing records into a single strategy feedback report."""
 
+    def __init__(self, quality_scorer: PositionQualityScorer | None = None) -> None:
+        self.quality_scorer = quality_scorer or PositionQualityScorer()
+
     def compile(
         self,
         *,
@@ -536,12 +634,22 @@ class StrategyFeedbackCompiler:
         avg_loss_hold_hours = (
             sum(loss_hold_hours) / len(loss_hold_hours) if loss_hold_hours else 0.0
         )
+        trade_count_target = learning_trade_count_target(
+            window_hours=window_hours,
+            market_scans=_safe_int(decision_quality.get("market_scans"), 0),
+            entry_signals=_safe_int(decision_quality.get("entry_signals"), 0),
+            reflection_count=_safe_int(reflection_feedback.get("training_count"), 0),
+            shadow_opportunities=_safe_int(
+                shadow_feedback.get("missed_opportunity_count"), 0
+            ),
+        )
         problems, root_causes = self._problems(
             side_performance=side_performance,
             open_pressure=open_pressure,
             decision_quality=decision_quality,
             shadow_feedback=shadow_feedback,
             trade_count=trade_count,
+            trade_count_target=trade_count_target,
             net_pnl=net_pnl,
             small_win_count=small_win_count,
             large_loss_count=large_loss_count,
@@ -560,8 +668,11 @@ class StrategyFeedbackCompiler:
             "large_loss_count": large_loss_count,
             "avg_hold_hours": round(avg_hold_hours, 4),
             "avg_loss_hold_hours": round(avg_loss_hold_hours, 4),
-            "trade_count_target": DEFAULT_MIN_TRADE_TARGET,
-            "low_trade_count_penalty": trade_count < DEFAULT_MIN_TRADE_TARGET,
+            "trade_count_target": trade_count_target,
+            "trade_count_target_policy": "dynamic_advisory_learning_confidence",
+            "trade_count_target_is_entry_gate": False,
+            "trade_count_target_baseline": default_min_trade_target(),
+            "low_trade_count_penalty": trade_count < trade_count_target,
             "reflection_count": reflection_feedback.get("training_count", 0),
             "reflection_total_count": reflection_feedback.get("total_count", 0),
         }
@@ -684,10 +795,29 @@ class StrategyFeedbackCompiler:
                     "model_name": _row_model(row),
                     "parts": 0,
                     "unrealized_pnl": 0.0,
+                    "quantity": 0.0,
+                    "entry_value": 0.0,
+                    "current_value": 0.0,
+                    "created_at": _position_open_time_value(row),
+                    "strategy_profile_id": _row_strategy_profile_id(row),
                 },
             )
             group["parts"] += 1
             group["unrealized_pnl"] += pnl
+            qty = abs(_safe_float(_row_get(row, "quantity"), 0.0))
+            entry = _safe_float(_row_get(row, "entry_price"), 0.0)
+            current = _safe_float(_row_get(row, "current_price"), entry)
+            if qty > 0 and entry > 0:
+                group["quantity"] += qty
+                group["entry_value"] += entry * qty
+                group["current_value"] += (current if current > 0 else entry) * qty
+            if not group.get("strategy_profile_id"):
+                group["strategy_profile_id"] = _row_strategy_profile_id(row)
+            if _created_at(row) and (
+                not group.get("created_at")
+                or _created_at(row) < _parse_iso_datetime(group.get("created_at"))
+            ):
+                group["created_at"] = _position_open_time_value(row)
             part_candidates.append(
                 {
                     "symbol": symbol,
@@ -711,6 +841,27 @@ class StrategyFeedbackCompiler:
         near_full_threshold = max(1, math.ceil(max_open * 0.85))
         full_pressure = group_count >= max_open or group_count >= near_full_threshold
         fragment_pressure = duplicate_part_count >= 3 or part_usage_ratio >= 1.15
+        for row in group_rows:
+            qty = _safe_float(row.pop("quantity", 0.0), 0.0)
+            entry_value = _safe_float(row.pop("entry_value", 0.0), 0.0)
+            current_value = _safe_float(row.pop("current_value", 0.0), 0.0)
+            if qty > 0:
+                row["entry_price"] = entry_value / qty
+                row["current_price"] = (
+                    current_value / qty if current_value > 0 else row["entry_price"]
+                )
+                row["quantity"] = qty
+                row["notional"] = abs(row["entry_price"] * qty)
+            quality = self.quality_scorer.score(
+                row,
+                same_symbol_side_parts=_safe_int(row.get("parts"), 1),
+            )
+            row["position_quality"] = quality.as_dict()
+            row["quality_score"] = round(quality.score, 4)
+            row["quality_bucket"] = quality.bucket
+            row["quality_reasons"] = list(quality.reasons)
+            row["release_priority"] = round(quality.release_priority, 4)
+            row["should_release"] = quality.should_release
         release_groups = sorted(
             (
                 {
@@ -719,8 +870,19 @@ class StrategyFeedbackCompiler:
                 }
                 for row in group_rows
             ),
-            key=lambda item: item["unrealized_pnl"],
+            key=lambda item: (
+                _safe_float(item.get("quality_score"), 100.0),
+                _safe_float(item.get("unrealized_pnl"), 0.0),
+                -_safe_float(_safe_dict(item.get("position_quality")).get("hold_hours"), 0.0),
+            ),
         )
+        low_quality_groups = [row for row in group_rows if bool(row.get("should_release"))]
+        stale_groups = [
+            row
+            for row in group_rows
+            if _safe_dict(row.get("position_quality")).get("bucket")
+            in {"watch", "release_candidate", "release_now"}
+        ]
         return {
             "open_count": group_count,
             "open_part_count": part_count,
@@ -731,6 +893,11 @@ class StrategyFeedbackCompiler:
             "part_usage_ratio": round(part_usage_ratio, 6),
             "full_position_pressure": bool(full_pressure),
             "fragmentation_pressure": bool(fragment_pressure),
+            "low_quality_open_count": len(low_quality_groups),
+            "low_quality_open_ratio": round(len(low_quality_groups) / max(group_count, 1), 6),
+            "stale_open_count": len(stale_groups),
+            "release_queue": release_groups[:8],
+            "release_queue_count": len(release_groups),
             "losing_open_count": len(losing_groups),
             "losing_open_part_count": sum(_safe_int(row.get("parts"), 0) for row in losing_groups),
             "winner_open_count": len(winner_groups),
@@ -1050,6 +1217,8 @@ class StrategyFeedbackCompiler:
         max_position_blocks = 0
         fallback_blocks = 0
         execution_errors = 0
+        execution_successes = 0
+        execution_event_rows: list[dict[str, Any]] = []
         covered = 0
         missing_profile = 0
         attributable_total = 0
@@ -1103,6 +1272,41 @@ class StrategyFeedbackCompiler:
                 fallback_blocks += 1
             if status in {"error", "failed", "rejected"} or event_type == "execution_error":
                 execution_errors += 1
+            is_execution_event = event_type in {
+                "execution_attempt",
+                "execution_result",
+                "execution_error",
+            }
+            if event_type == "execution_result" and status in {
+                "executed",
+                "filled",
+                "success",
+            }:
+                execution_successes += 1
+            if is_execution_event:
+                execution_event_rows.append(
+                    {
+                        "created_at": parse_position_time(getattr(row, "created_at", None)),
+                        "event_type": event_type,
+                        "status": status,
+                        "reason_category": reason_info.get("category", "other"),
+                        "blocks_execution_guard": self._event_blocks_execution_guard(
+                            event_type=event_type,
+                            status=status,
+                            reason=reason,
+                            attribution=attribution,
+                            reason_info=reason_info,
+                        ),
+                        "is_error": bool(
+                            status in {"error", "failed", "rejected"}
+                            or event_type == "execution_error"
+                        ),
+                        "is_success": bool(
+                            event_type == "execution_result"
+                            and status in {"executed", "filled", "success"}
+                        ),
+                    }
+                )
             if status in {"blocked", "skipped", "rejected", "failed"}:
                 key = str(reason_info.get("label") or event_type)[:160]
                 if key:
@@ -1111,9 +1315,9 @@ class StrategyFeedbackCompiler:
                         {
                             "reason": key,
                             "category": reason_info.get("category", "other"),
-                            "raw_reason": str(
-                                attribution.get("blocker") or reason or event_type
-                            )[:240],
+                            "raw_reason": str(attribution.get("blocker") or reason or event_type)[
+                                :240
+                            ],
                             "count": 0,
                         },
                     )
@@ -1148,6 +1352,23 @@ class StrategyFeedbackCompiler:
             key=lambda item: _safe_int(item.get("count"), 0),
             reverse=True,
         )[:8]
+        latest_execution_success_at = self._latest_execution_event_at(
+            execution_event_rows,
+            key="is_success",
+        )
+        latest_execution_error_at = self._latest_execution_event_at(
+            execution_event_rows,
+            key="is_error",
+        )
+        unresolved_execution_errors = self._unresolved_execution_errors(
+            execution_event_rows,
+            latest_success_at=latest_execution_success_at,
+        )
+        unresolved_execution_guard_errors = self._unresolved_execution_errors(
+            execution_event_rows,
+            latest_success_at=latest_execution_success_at,
+            guard_only=True,
+        )
         return {
             "total_events": total,
             "type_counts": dict(
@@ -1169,9 +1390,102 @@ class StrategyFeedbackCompiler:
             "max_position_blocks": max_position_blocks,
             "fallback_blocks": fallback_blocks,
             "execution_errors": execution_errors,
+            "execution_successes": execution_successes,
+            "unresolved_execution_errors": unresolved_execution_errors,
+            "unresolved_execution_guard_errors": unresolved_execution_guard_errors,
+            "latest_execution_success_at": (
+                latest_execution_success_at.isoformat() if latest_execution_success_at else None
+            ),
+            "latest_execution_error_at": (
+                latest_execution_error_at.isoformat() if latest_execution_error_at else None
+            ),
+            "execution_recovered_after_error": bool(
+                latest_execution_success_at
+                and latest_execution_error_at
+                and latest_execution_success_at >= latest_execution_error_at
+            ),
             "top_block_reasons": top_blocks,
             "recent_events": recent,
         }
+
+    @staticmethod
+    def _latest_execution_event_at(
+        rows: list[dict[str, Any]],
+        *,
+        key: str,
+    ) -> datetime | None:
+        timestamps = [
+            parse_position_time(row.get("created_at"))
+            for row in rows
+            if row.get(key) and parse_position_time(row.get("created_at"))
+        ]
+        return max(timestamps) if timestamps else None
+
+    @staticmethod
+    def _unresolved_execution_errors(
+        rows: list[dict[str, Any]],
+        *,
+        latest_success_at: datetime | None,
+        guard_only: bool = False,
+    ) -> int:
+        unresolved = 0
+        for row in rows:
+            if not row.get("is_error"):
+                continue
+            if guard_only and not row.get("blocks_execution_guard"):
+                continue
+            created_at = parse_position_time(row.get("created_at"))
+            if latest_success_at and created_at and created_at <= latest_success_at:
+                continue
+            unresolved += 1
+        return unresolved
+
+    @staticmethod
+    def _event_blocks_execution_guard(
+        *,
+        event_type: str,
+        status: str,
+        reason: str,
+        attribution: dict[str, Any],
+        reason_info: dict[str, str],
+    ) -> bool:
+        normalized_type = str(event_type or "").lower()
+        normalized_status = str(status or "").lower()
+        if normalized_type not in {"execution_attempt", "execution_result", "execution_error"}:
+            return False
+        if normalized_status not in {"error", "failed", "rejected"} and normalized_type != "execution_error":
+            return False
+        text = " ".join(
+            str(value or "")
+            for value in (
+                reason,
+                attribution.get("blocker"),
+                attribution.get("error"),
+                reason_info.get("label"),
+            )
+        ).lower()
+        non_systemic_tokens = (
+            "minimum contract size",
+            "below okx minimum",
+            "order size is below",
+            "minsz",
+            "51008",
+            "insufficient usdt margin",
+            "more than 5 open orders",
+            "59670",
+            "platform's limit",
+            "open interest",
+            "don't have any positions in this direction",
+            "no matching position to close",
+            "okx 最小",
+            "保证金不足",
+            "可用 usdt 保证金不足",
+            "当前没有对应方向",
+            "平台总持仓量",
+        )
+        if any(token in text for token in non_systemic_tokens):
+            return False
+        return True
 
     @staticmethod
     def _is_attributable_strategy_event(
@@ -1245,6 +1559,7 @@ class StrategyFeedbackCompiler:
         decision_quality: dict[str, Any],
         shadow_feedback: dict[str, Any],
         trade_count: int,
+        trade_count_target: int,
         net_pnl: float,
         small_win_count: int,
         large_loss_count: int,
@@ -1280,12 +1595,16 @@ class StrategyFeedbackCompiler:
             )
             root_causes.append(label)
 
-        if trade_count < DEFAULT_MIN_TRADE_TARGET:
+        if trade_count < trade_count_target:
             add(
                 "low_trade_count",
                 "medium",
                 "样本和开仓数量不足，不能让系统学成不开仓最安全",
-                {"trade_count": trade_count, "target": DEFAULT_MIN_TRADE_TARGET},
+                {
+                    "trade_count": trade_count,
+                    "target": trade_count_target,
+                    "policy": "动态学习置信目标；不是开仓硬阈值",
+                },
             )
         if trade_count >= 3 and net_pnl < 0:
             add(
@@ -1307,6 +1626,13 @@ class StrategyFeedbackCompiler:
                 "full_position_loss_pressure",
                 "high",
                 "满仓压力来自亏损持仓占位，应优先复盘并释放低质量亏损仓",
+                open_pressure,
+            )
+        if open_pressure.get("low_quality_open_count"):
+            add(
+                "low_quality_position_pressure",
+                "high",
+                "低质量持仓正在占用仓位，应先释放低质量仓，再恢复新开仓探针。",
                 open_pressure,
             )
         if (
@@ -1413,7 +1739,7 @@ class StrategyCandidateGenerator:
     """Generate controlled profile candidates from feedback."""
 
     def generate(self, feedback: StrategyFeedback) -> list[StrategyProfile]:
-        profiles = [self.baseline()]
+        profiles = [self.baseline(feedback)]
         profiles.extend(self.rule_based_candidates(feedback))
         return self._dedupe(profiles)
 
@@ -1422,12 +1748,13 @@ class StrategyCandidateGenerator:
         problem_keys = {item["key"] for item in feedback.problems}
         open_pressure = feedback.open_position_pressure
         totals = feedback.totals
+        trade_target = _safe_int(totals.get("trade_count_target"), default_min_trade_target())
 
         if (
             "expert_fallback_overblocking" in problem_keys
             or "missed_opportunities" in problem_keys
             or "trade_reflection_mistakes" in problem_keys
-            or totals.get("training_trade_count", 0) < DEFAULT_MIN_TRADE_TARGET
+            or totals.get("training_trade_count", 0) < trade_target
         ):
             profiles.append(
                 StrategyProfile(
@@ -1445,7 +1772,7 @@ class StrategyCandidateGenerator:
                         "global_min_score_delta": -0.08,
                         "position_size_multiplier": 0.62,
                         "probe_fraction": 0.08,
-                        "min_trade_count_target": DEFAULT_MIN_TRADE_TARGET,
+                        "min_trade_count_target": trade_target,
                         "expert_integrity_mode": "balanced_probe_allow_one_non_core_missing",
                         "max_probe_size_pct": 0.018,
                         "fallback_tolerance": {
@@ -1458,6 +1785,7 @@ class StrategyCandidateGenerator:
             )
         if (
             open_pressure.get("full_position_pressure")
+            or open_pressure.get("low_quality_open_count")
             or "loss_hold_too_long" in problem_keys
             or "reflection_loss_hold_too_long" in problem_keys
             or "reflection_negative_pnl" in problem_keys
@@ -1567,10 +1895,7 @@ class StrategyCandidateGenerator:
             )
             label = str(sanitize_text(item.get("label")) or f"LLM候选{index}")[:80]
             description = str(
-                sanitize_text(
-                    item.get("description")
-                    or "大模型根据结构化反馈生成的受控参数候选。"
-                )
+                sanitize_text(item.get("description") or "大模型根据结构化反馈生成的受控参数候选。")
             )[:500]
             profiles.append(
                 StrategyProfile(
@@ -1583,12 +1908,12 @@ class StrategyCandidateGenerator:
                     params={
                         **params,
                         "min_trade_count_target": max(
-                            DEFAULT_MIN_TRADE_TARGET,
+                            default_min_trade_target(),
                             _safe_int(
                                 params.get("min_trade_count_target"),
                                 _safe_int(
                                     feedback.totals.get("trade_count_target"),
-                                    DEFAULT_MIN_TRADE_TARGET,
+                                    default_min_trade_target(),
                                 ),
                             ),
                         ),
@@ -1615,7 +1940,7 @@ class StrategyCandidateGenerator:
                 low, high = BOUNDED_FLOAT_PARAM_RANGES[key]
                 clean[key] = round(min(max(_safe_float(value, 0.0), low), high), 6)
             elif key == "min_trade_count_target":
-                clean[key] = max(DEFAULT_MIN_TRADE_TARGET, min(_safe_int(value), 80))
+                clean[key] = max(default_min_trade_target(), min(_safe_int(value), 80))
             elif key == "expert_integrity_mode":
                 mode = str(value or "")
                 if mode in ALLOWED_EXPERT_INTEGRITY_MODES:
@@ -1713,7 +2038,10 @@ class StrategyCandidateGenerator:
         return result
 
     @staticmethod
-    def baseline() -> StrategyProfile:
+    def baseline(feedback: StrategyFeedback | None = None) -> StrategyProfile:
+        target = default_min_trade_target()
+        if feedback is not None:
+            target = _safe_int(feedback.totals.get("trade_count_target"), target)
         return StrategyProfile(
             profile_id="baseline_current",
             version=1,
@@ -1728,7 +2056,7 @@ class StrategyCandidateGenerator:
                 "global_min_score_delta": 0.0,
                 "position_size_multiplier": 1.0,
                 "expert_integrity_mode": "strict_all_required",
-                "min_trade_count_target": DEFAULT_MIN_TRADE_TARGET,
+                "min_trade_count_target": target,
             },
         )
 
@@ -1748,7 +2076,7 @@ class StrategyBacktester:
         trade_count = _safe_int(totals.get("training_trade_count"), 0)
         target = _safe_int(
             profile.params.get("min_trade_count_target"),
-            DEFAULT_MIN_TRADE_TARGET,
+            _safe_int(totals.get("trade_count_target"), default_min_trade_target()),
         )
         trade_gap = max(target - trade_count, 0)
         low_trade_penalty = trade_gap * 1.25
@@ -1805,6 +2133,14 @@ class StrategyBacktester:
                 matched_fixes.append("low_trade_count")
                 low_trade_penalty = max(low_trade_penalty - trade_gap * 0.95, 0.0)
         elif profile.profile_id == "loss_release":
+            if "low_quality_position_pressure" in problem_keys:
+                low_quality_count = _safe_int(
+                    feedback.open_position_pressure.get("low_quality_open_count"),
+                    0,
+                )
+                estimated_delta += max(low_quality_count, 1) * 0.9
+                loss_release_speed = 1.0
+                matched_fixes.append("low_quality_position_pressure")
             if "full_position_loss_pressure" in problem_keys:
                 estimated_delta += (
                     abs(
@@ -1880,6 +2216,8 @@ class StrategyBacktester:
             "trade_count": trade_count,
             "trade_count_target": target,
             "low_trade_count_penalty": round(low_trade_penalty, 6),
+            "trade_count_target_policy": "dynamic_advisory_learning_confidence",
+            "trade_count_target_is_entry_gate": False,
             "matched_fixes": matched_fixes,
             "fee_estimate": round(fee_estimate, 6),
             "fee_adjusted_pnl": round(fee_adjusted_pnl, 6),
@@ -1911,7 +2249,7 @@ class StrategyBacktester:
         params = profile.params
         deltas: list[tuple[str, float]] = []
         trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
-        target = _safe_int(params.get("min_trade_count_target"), DEFAULT_MIN_TRADE_TARGET)
+        target = _safe_int(params.get("min_trade_count_target"), default_min_trade_target())
         trade_gap = max(target - trade_count, 0)
         opens_more = (
             _safe_float(params.get("global_min_score_delta"), 0.0) < 0
@@ -2058,17 +2396,27 @@ class StrategyScheduler:
             disabled=disabled,
             problem_keys=problem_keys,
         )
+        loss_release_profile = by_id.get("loss_release")
 
         if manual_lock_active:
 
             selected = by_id[manual_profile_id]
             reason = f"人工指定策略画像 {manual_profile_id}。"
+        elif pressure_guard_active and loss_release_profile is not None:
+            selected = loss_release_profile
+            reason = (
+                "Strategy guard is active: release low-quality positions while allowing "
+                "bounded high-quality probes."
+            )
         elif pressure_guard_active:
             selected = by_id.get("baseline_current", StrategyCandidateGenerator.baseline())
             reason = (
-                "Strategy guard is active: keep baseline and pause new probes until "
-                "open-position pressure is reduced."
+                "Strategy guard is active: keep baseline sizing, release low-quality positions, "
+                "and allow only bounded high-quality probes."
             )
+        elif ("low_quality_position_pressure" in problem_keys) and "loss_release" in by_id:
+            selected = by_id["loss_release"]
+            reason = "检测到低质量持仓占用仓位，优先调度亏损释放画像。"
         elif (
             "full_position_loss_pressure" in problem_keys or "max_position_blocks" in problem_keys
         ) and "loss_release" in by_id:
@@ -2098,7 +2446,11 @@ class StrategyScheduler:
                     or "event_fallback_blocks" in problem_keys
                     or "missed_opportunities" in problem_keys
                     or "trade_reflection_mistakes" in problem_keys
-                    or feedback.totals.get("training_trade_count", 0) < DEFAULT_MIN_TRADE_TARGET
+                    or feedback.totals.get("training_trade_count", 0)
+                    < _safe_int(
+                        feedback.totals.get("trade_count_target"),
+                        default_min_trade_target(),
+                    )
                 ) and "balanced_probe" in by_id:
                     selected = by_id["balanced_probe"]
                     reason = "开仓样本不足或专家 fallback 拦截偏多，调度平衡探针画像。"
@@ -2189,6 +2541,7 @@ class StrategyScheduler:
         pressure_active = bool(
             open_pressure.get("full_position_pressure")
             or open_pressure.get("fragmentation_pressure")
+            or open_pressure.get("low_quality_open_count")
             or problem_keys & {"full_position_loss_pressure", "max_position_blocks"}
         )
         net_pnl = _safe_float(feedback.totals.get("net_pnl"), 0.0)
@@ -2228,6 +2581,7 @@ class StrategyScheduler:
         pressure_active = bool(
             open_pressure.get("full_position_pressure")
             or open_pressure.get("fragmentation_pressure")
+            or open_pressure.get("low_quality_open_count")
             or problem_keys & {"full_position_loss_pressure", "max_position_blocks"}
         )
         if (
@@ -2278,6 +2632,7 @@ class StrategyScheduler:
                 & {
                     "full_position_loss_pressure",
                     "max_position_blocks",
+                    "low_quality_position_pressure",
                     "loss_hold_too_long",
                     "reflection_loss_hold_too_long",
                     "reflection_negative_pnl",
@@ -2372,8 +2727,10 @@ class StrategyScheduler:
         if pressure_guard_active and selected_profile_id == "baseline_current":
             return (
                 "策略护栏已触发自动回滚，且满仓/碎片化压力仍在；暂用系统基线，"
-                "暂停新开仓探针，优先释放已有低质量仓位。"
+                "优先释放已有低质量仓位，只允许高质量小仓探针。"
             )
+        if pressure_guard_active and selected_profile_id == "loss_release":
+            return "策略护栏检测到满仓/碎片化压力，自动调度亏损释放画像，并保留高质量小仓探针。"
         if reconsidered_profiles and selected_profile_id in reconsidered_profiles:
             return (
                 f"模型服务已恢复且候选重新通过回测/影子验证，自动解锁并调度 {selected_profile_id}。"
@@ -2411,6 +2768,7 @@ class StrategyScheduler:
 
     def _runtime(self, profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
         params = profile.params
+        roster = self._runtime_roster(profile, feedback)
         return {
             "profile_id": profile.profile_id,
             "profile_version": profile.version,
@@ -2426,11 +2784,98 @@ class StrategyScheduler:
             "loss_exit_aggressiveness": params.get("loss_exit_aggressiveness", "normal"),
             "winner_hold_extension": params.get("winner_hold_extension", "normal"),
             "full_position_release": bool(params.get("full_position_release")),
+            "release_losing_positions_first": bool(params.get("release_losing_positions_first")),
             "position_review_priority_boost": _safe_float(
                 params.get("position_review_priority_boost"), 1.0
             ),
+            "target_position_groups": roster["target_position_groups"],
+            "target_open_position_groups": roster["target_position_groups"],
+            "max_open_positions": roster["max_open_positions"],
+            "rotation_slots": roster["rotation_slots"],
+            "release_target_groups": roster["release_target_groups"],
+            "position_review_max_groups": roster["position_review_max_groups"],
+            "position_high_risk_max_groups": roster["position_high_risk_max_groups"],
+            "position_urgent_exit_max_groups": roster["position_urgent_exit_max_groups"],
+            "roster_fill_market_symbol_min": roster["roster_fill_market_symbol_min"],
+            "capacity_policy_reason": roster["reason"],
+            "analysis_budget": {
+                "position_max_groups": roster["position_review_max_groups"],
+                "position_high_risk_max_groups": roster["position_high_risk_max_groups"],
+                "position_urgent_exit_max_groups": roster["position_urgent_exit_max_groups"],
+                "roster_fill_market_symbol_min": roster["roster_fill_market_symbol_min"],
+            },
             "training_trade_count": feedback.totals.get("training_trade_count", 0),
             "low_trade_count_penalty": bool(feedback.totals.get("low_trade_count_penalty")),
+        }
+
+    @staticmethod
+    def _runtime_roster(profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
+        open_pressure = _safe_dict(feedback.open_position_pressure)
+        max_open = max(
+            1,
+            _safe_int(
+                open_pressure.get("max_open_positions"),
+                int(settings.max_open_positions_per_model or 1),
+            ),
+        )
+        open_groups = max(0, _safe_int(open_pressure.get("open_group_count"), 0))
+        low_quality = max(0, _safe_int(open_pressure.get("low_quality_open_count"), 0))
+        losing = max(0, _safe_int(open_pressure.get("losing_open_count"), 0))
+        release_queue = max(0, _safe_int(open_pressure.get("release_queue_count"), 0))
+        release_pressure = bool(
+            profile.profile_id == "loss_release"
+            or profile.params.get("full_position_release")
+            or profile.params.get("release_losing_positions_first")
+            or low_quality > 0
+            or open_pressure.get("full_position_pressure")
+            or open_pressure.get("fragmentation_pressure")
+        )
+        release_target = (
+            max(low_quality, min(losing, max(release_queue, 1))) if release_pressure else 0
+        )
+        rotation_slots = 0
+        if release_pressure and open_groups > 0:
+            pressure_count = max(release_target, low_quality, release_queue, 1)
+            pressure_slots = max(1, math.ceil(pressure_count * 0.20))
+            envelope_slots = max(1, math.ceil(max(max_open, open_groups, 1) * 0.15))
+            rotation_slots = min(pressure_slots, envelope_slots)
+            max_open = max(max_open, open_groups + rotation_slots)
+            target_groups = min(max_open, open_groups + rotation_slots)
+            review_groups = min(max_open, max(open_groups, release_target + rotation_slots))
+            reason = "release_low_quality_positions_with_rotation_slots"
+        else:
+            healthy_target = max(
+                open_groups,
+                min(max_open, max(1, math.ceil(max_open * 0.60))),
+            )
+            target_groups = min(max_open, healthy_target)
+            review_groups = min(max_open, max(1, math.ceil(max(target_groups, 1) * 0.60)))
+            reason = "expand_by_learned_positive_expectancy_capacity"
+        high_risk_groups = min(max_open, max(review_groups, open_groups, target_groups))
+        urgent_groups = min(
+            max_open,
+            max(high_risk_groups, open_groups + 1 if release_pressure else high_risk_groups),
+        )
+        roster_fill_market_symbol_min = max(
+            1,
+            min(
+                int(settings.auto_scan_symbol_limit or 1),
+                max(
+                    1,
+                    math.ceil(max(target_groups - open_groups, 1) * 0.30 * max_open),
+                ),
+            ),
+        )
+        return {
+            "target_position_groups": target_groups,
+            "max_open_positions": max_open,
+            "rotation_slots": rotation_slots,
+            "release_target_groups": release_target,
+            "position_review_max_groups": max(1, review_groups),
+            "position_high_risk_max_groups": max(1, high_risk_groups),
+            "position_urgent_exit_max_groups": max(1, urgent_groups),
+            "roster_fill_market_symbol_min": roster_fill_market_symbol_min,
+            "reason": reason,
         }
 
     @staticmethod
@@ -2465,6 +2910,10 @@ class StrategyScheduler:
         integrity_blocks = _safe_int(feedback.decision_quality.get("expert_integrity_blocks"), 0)
         max_position_blocks = _safe_int(feedback.event_feedback.get("max_position_blocks"), 0)
         losing_open_count = _safe_int(feedback.open_position_pressure.get("losing_open_count"), 0)
+        low_quality_open_count = _safe_int(
+            feedback.open_position_pressure.get("low_quality_open_count"),
+            0,
+        )
         small_wins = _safe_int(feedback.totals.get("small_win_count"), 0) + _safe_int(
             feedback.reflection_feedback.get("small_win_count"), 0
         )
@@ -2472,6 +2921,10 @@ class StrategyScheduler:
             feedback.reflection_feedback.get("large_loss_count"), 0
         )
         trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
+        trade_target = _safe_int(
+            feedback.totals.get("trade_count_target"),
+            default_min_trade_target(),
+        )
         baseline_score = 0.0
 
         for profile in profiles:
@@ -2511,11 +2964,15 @@ class StrategyScheduler:
 
             score = 0.0
             if would_increase_entries:
-                score += missed * 0.36 + max(DEFAULT_MIN_TRADE_TARGET - trade_count, 0) * 0.18
+                score += missed * 0.36 + max(trade_target - trade_count, 0) * 0.18
             if would_reduce_blocks:
                 score += (fallback_blocks + integrity_blocks) * 0.14
             if would_release_losers:
-                score += losing_open_count * 0.32 + max_position_blocks * 0.25
+                score += (
+                    losing_open_count * 0.32
+                    + low_quality_open_count * 0.42
+                    + max_position_blocks * 0.25
+                )
             if would_hold_winners:
                 score += small_wins * 0.16 + good * 0.05
             if side_recovery:
@@ -2528,11 +2985,13 @@ class StrategyScheduler:
                 score = 0.0
                 baseline_score = score
 
-            target = _safe_int(params.get("min_trade_count_target"), DEFAULT_MIN_TRADE_TARGET)
+            target = _safe_int(params.get("min_trade_count_target"), default_min_trade_target())
             trade_count_guard = {
                 "target": target,
                 "current": trade_count,
                 "penalized_if_low": True,
+                "is_entry_gate": False,
+                "policy": "dynamic_advisory_learning_confidence",
                 "low_trade_count": trade_count < target,
             }
             eligible = profile.profile_id == "baseline_current" or (
@@ -2577,7 +3036,7 @@ class StrategyScheduler:
             "probe_fraction": probe_fraction,
             "small_position_first": True,
             "promotion_requirements": {
-                "min_training_trades": DEFAULT_MIN_TRADE_TARGET,
+                "min_training_trades": default_min_trade_target(),
                 "net_pnl_must_improve": True,
                 "max_consecutive_losses": 3,
                 "fallback_rate_must_not_increase": True,
@@ -2693,27 +3152,145 @@ class StrategyLearningEngine:
             "side_overrides": _safe_dict(runtime.get("side_overrides")),
             "reason": schedule.get("reason", ""),
         }
+        result["target_position_groups"] = _safe_int(runtime.get("target_position_groups"), 0)
+        result["target_open_position_groups"] = _safe_int(
+            runtime.get("target_open_position_groups"), result["target_position_groups"]
+        )
+        result["position_review_max_groups"] = _safe_int(
+            runtime.get("position_review_max_groups"), 0
+        )
+        result["portfolio_roster"] = {
+            **_safe_dict(result.get("portfolio_roster")),
+            "target_position_groups": result["target_position_groups"],
+            "rotation_slots": _safe_int(runtime.get("rotation_slots"), 0),
+            "release_target_groups": _safe_int(runtime.get("release_target_groups"), 0),
+            "max_open_positions": _safe_int(runtime.get("max_open_positions"), 0),
+            "policy_source": "strategy_learning_runtime",
+            "policy_reason": runtime.get("capacity_policy_reason"),
+        }
+        result["loss_exit_aggressiveness"] = str(
+            runtime.get("loss_exit_aggressiveness") or "normal"
+        )
+        result["full_position_release"] = bool(runtime.get("full_position_release"))
+        result["release_losing_positions_first"] = bool(
+            runtime.get("release_losing_positions_first")
+        )
+        result["position_review_priority_boost"] = _safe_float(
+            runtime.get("position_review_priority_boost"), 1.0
+        )
+        result["winner_hold_extension"] = str(runtime.get("winner_hold_extension") or "normal")
         guard = _safe_dict(payload.get("runtime_guard"))
         feedback_payload = _safe_dict(payload.get("feedback"))
         feedback_summary = self._compact_feedback(_safe_dict(payload.get("feedback")))
         open_pressure = _safe_dict(feedback_payload.get("open_position_pressure"))
-        entry_pause = bool(
-            guard.get("should_rollback")
+        release_queue = _safe_list(open_pressure.get("release_queue")) or _safe_list(
+            open_pressure.get("release_candidates")
+        )
+        active_profile_id = str(active_profile.get("id") or runtime.get("profile_id") or "")
+        rebalance_queue = [
+            _safe_dict(item)
+            for item in release_queue
+            if _safe_dict(item).get("should_release")
             or (
-                active_profile.get("id") == "baseline_current"
-                and _safe_list(schedule.get("disabled_profiles"))
-                and (
-                    open_pressure.get("full_position_pressure")
-                    or open_pressure.get("fragmentation_pressure")
-                )
-                and _safe_float(feedback_summary.get("net_pnl"), 0.0) < 0.0
+                active_profile_id
+                and _safe_dict(item).get("strategy_profile_id")
+                and _safe_dict(item).get("strategy_profile_id") != active_profile_id
+            )
+        ][:8]
+        release_pressure_active = bool(
+            (
+                open_pressure.get("full_position_pressure")
+                or open_pressure.get("fragmentation_pressure")
+                or rebalance_queue
+            )
+            and (
+                _safe_float(feedback_summary.get("net_pnl"), 0.0) < 0.0
+                or _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0
             )
         )
+        guard_reasons = {str(token) for token in _safe_list(guard.get("reasons"))}
+        model_health_recovered = bool(guard.get("model_health_recovered"))
+        fallback_health_guard_active = bool(
+            "fallback_dependency_guard" in guard_reasons and not model_health_recovered
+        )
+        execution_guard_active = bool(
+            guard.get("should_rollback")
+            and "execution_error_guard" in guard_reasons
+            and not model_health_recovered
+        )
+        recovery_probe_allowed = bool(
+            fallback_health_guard_active or execution_guard_active
+        )
+        entry_pause = False
+        if release_pressure_active:
+            sizing = result["strategy_learning_sizing"]
+            sizing["release_pressure_active"] = True
+            sizing["reason"] = (
+                "满仓/低质量仓位压力存在：优先释放低质量仓位，同时只允许高质量小仓探针。"
+            )
+            sizing["probe_fraction"] = max(
+                _safe_float(sizing.get("probe_fraction"), 0.0),
+                0.03,
+            )
+            sizing["max_probe_size_pct"] = min(
+                max(_safe_float(sizing.get("max_probe_size_pct"), 0.012), 0.008),
+                0.018,
+            )
+            sizing["reason"] = (
+                "满仓或低质量仓位压力存在：优先释放低质量仓位，"
+                "同时只允许高质量小仓探针。"
+            )
+        if recovery_probe_allowed:
+            sizing = result["strategy_learning_sizing"]
+            sizing["health_guard_active"] = True
+            sizing["recovery_probe_allowed"] = True
+            sizing["reason"] = (
+                "模型健康护栏激活：fallback 依赖偏高，系统不再硬停所有新开仓，"
+                "只允许通过后续风控的极小仓恢复探针来采集真实健康样本。"
+            )
+            sizing["position_size_multiplier"] = min(
+                _safe_float(sizing.get("position_size_multiplier"), 1.0),
+                0.35,
+            )
+            sizing["probe_fraction"] = max(
+                _safe_float(sizing.get("probe_fraction"), 0.0),
+                0.02,
+            )
+            sizing["max_probe_size_pct"] = min(
+                max(_safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
+                0.012,
+            )
+            sizing["execution_guard_active"] = execution_guard_active
+            sizing["reason"] = (
+                "策略健康护栏已触发：系统不再硬停全部新开仓，"
+                "仅允许通过后续风控确认的小仓恢复探针采集真实样本。"
+            )
         result["strategy_learning_entry_pause"] = entry_pause
-        result["strategy_learning_entry_pause_reason"] = (
-            "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针，优先释放已有低质量仓位。"
-            if entry_pause
+        result["strategy_learning_entry_pause_reason"] = ""
+        result["strategy_learning_execution_guard_active"] = execution_guard_active
+        result["strategy_learning_execution_guard_reason"] = (
+            "策略护栏检测到执行链路异常：已回滚异常画像并转入小仓恢复探针；"
+            "不再阻断全部新开仓，真实下单仍会经过执行前风控和 OKX 规则校验。"
+            if execution_guard_active
             else ""
+        )
+        result["strategy_learning_health_guard_active"] = fallback_health_guard_active
+        result["strategy_learning_recovery_probe_allowed"] = recovery_probe_allowed
+        result["strategy_learning_recovery_probe_reason"] = (
+            "策略健康护栏已转为小仓恢复探针；执行前风控和 OKX 规则仍会逐单校验。"
+            if recovery_probe_allowed
+            else ""
+        )
+        result["strategy_learning_release_pressure_active"] = release_pressure_active
+        result["strategy_learning_release_pressure_reason"] = (
+            "满仓/碎片化或低质量仓位压力存在：系统应先释放低质量仓位，并把新策略限制为小仓验证。"
+            if release_pressure_active
+            else ""
+        )
+        result["position_rebalance_queue"] = rebalance_queue
+        result["low_quality_open_count"] = _safe_int(open_pressure.get("low_quality_open_count"), 0)
+        result["low_quality_open_ratio"] = _safe_float(
+            open_pressure.get("low_quality_open_ratio"), 0.0
         )
         result["strategy_learning"] = {
             "active_profile": active_profile,
@@ -2721,9 +3298,26 @@ class StrategyLearningEngine:
             "reason": schedule.get("reason", ""),
             "rollback": schedule.get("rollback", {}),
             "feedback_summary": feedback_summary,
+            "open_position_pressure": open_pressure,
             "runtime_guard": guard,
             "entry_pause": entry_pause,
             "entry_pause_reason": result["strategy_learning_entry_pause_reason"],
+            "execution_guard_active": execution_guard_active,
+            "execution_guard_reason": result["strategy_learning_execution_guard_reason"],
+            "health_guard_active": fallback_health_guard_active,
+            "recovery_probe_allowed": recovery_probe_allowed,
+            "recovery_probe_reason": result["strategy_learning_recovery_probe_reason"],
+            "release_pressure_active": release_pressure_active,
+            "release_pressure_reason": result["strategy_learning_release_pressure_reason"],
+            "loss_exit_aggressiveness": result["loss_exit_aggressiveness"],
+            "full_position_release": result["full_position_release"],
+            "release_losing_positions_first": result["release_losing_positions_first"],
+            "position_review_priority_boost": result["position_review_priority_boost"],
+            "winner_hold_extension": result["winner_hold_extension"],
+            "release_queue": release_queue[:8],
+            "rebalance_queue": rebalance_queue,
+            "low_quality_open_count": result["low_quality_open_count"],
+            "low_quality_open_ratio": result["low_quality_open_ratio"],
             "candidate_count": len(_safe_list(schedule.get("candidates"))),
             "scheduler_mode": schedule.get("scheduler_mode", "auto"),
             "manual_profile_id": schedule.get("manual_profile_id", ""),
@@ -3235,6 +3829,10 @@ class StrategyLearningService:
                 "part_usage_ratio",
                 "full_position_pressure",
                 "fragmentation_pressure",
+                "low_quality_open_count",
+                "low_quality_open_ratio",
+                "stale_open_count",
+                "release_queue_count",
                 "losing_open_count",
                 "losing_open_part_count",
                 "winner_open_count",
@@ -3252,6 +3850,10 @@ class StrategyLearningService:
                 "symbol": row.get("symbol"),
                 "side": row.get("side"),
                 "unrealized_pnl": row.get("unrealized_pnl"),
+                "quality_score": row.get("quality_score"),
+                "quality_bucket": row.get("quality_bucket"),
+                "release_priority": row.get("release_priority"),
+                "strategy_profile_id": row.get("strategy_profile_id"),
             }
             for row in (
                 _safe_dict(item) for item in _safe_list(source.get("release_candidates"))[:4]
@@ -3313,6 +3915,11 @@ class StrategyLearningService:
                 "max_position_blocks",
                 "fallback_blocks",
                 "execution_errors",
+                "execution_successes",
+                "unresolved_execution_errors",
+                "latest_execution_success_at",
+                "latest_execution_error_at",
+                "execution_recovered_after_error",
             ),
         )
         result["type_counts"] = self._compact_count_map(source.get("type_counts"), limit=6)
@@ -4234,8 +4841,24 @@ class StrategyLearningService:
             decision_quality.get("recent_zero_second_entry_decisions"),
             _safe_int(decision_quality.get("zero_second_entry_decisions"), 0),
         )
+        unresolved_execution_errors = _safe_int(
+            event_feedback.get("unresolved_execution_errors"),
+            _safe_int(event_feedback.get("execution_errors"), 0),
+        )
+        unresolved_execution_guard_errors = _safe_int(
+            event_feedback.get("unresolved_execution_guard_errors"),
+            unresolved_execution_errors,
+        )
+        execution_recovered_after_error = bool(
+            event_feedback.get("execution_recovered_after_error")
+            or (
+                event_feedback.get("latest_execution_success_at")
+                and not unresolved_execution_errors
+            )
+        )
         model_health_recovered = bool(
             decision_quality.get("model_health_recovered")
+            or execution_recovered_after_error
             or (
                 _safe_int(decision_quality.get("recent_entry_signals"), 0) > 0
                 and recent_fallback_rate < 0.20
@@ -4266,18 +4889,16 @@ class StrategyLearningService:
             if _safe_float(totals.get("net_pnl"), 0.0) <= -8.0:
                 reasons.append("recent_net_pnl_guard")
                 if not validated_probe or _safe_int(totals.get("training_trade_count"), 0) >= max(
-                    3, DEFAULT_MIN_TRADE_TARGET // 2
+                    3, default_min_trade_target() // 2
                 ):
                     should_rollback = True
             if _safe_int(totals.get("training_trade_count"), 0) < max(
-                2, DEFAULT_MIN_TRADE_TARGET // 3
+                2, default_min_trade_target() // 3
             ):
                 reasons.append("insufficient_trade_samples")
             if _safe_float(decision_quality.get("fallback_entry_rate"), 0.0) >= 0.55:
                 reasons.append("fallback_dependency_guard")
-                if not validated_probe and not model_health_recovered:
-                    should_rollback = True
-            if _safe_int(event_feedback.get("execution_errors"), 0) >= 3:
+            if unresolved_execution_guard_errors >= 3:
                 reasons.append("execution_error_guard")
                 if not model_health_recovered:
                     should_rollback = True
@@ -4301,6 +4922,17 @@ class StrategyLearningService:
             "auto_disable_reconsider_seconds": AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS,
             "disabled_until": disabled_until,
             "model_health_recovered": model_health_recovered,
+            "fallback_health_guard_active": bool(
+                "fallback_dependency_guard" in reasons and not model_health_recovered
+            ),
+            "recovery_probe_allowed": bool(
+                "fallback_dependency_guard" in reasons
+                and not model_health_recovered
+                and "execution_error_guard" not in reasons
+            ),
+            "unresolved_execution_errors": unresolved_execution_errors,
+            "unresolved_execution_guard_errors": unresolved_execution_guard_errors,
+            "execution_recovered_after_error": execution_recovered_after_error,
             "recent_fallback_entry_rate": recent_fallback_rate,
             "recent_expert_integrity_blocks": recent_integrity_blocks,
             "rules": [

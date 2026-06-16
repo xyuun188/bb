@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -36,16 +37,26 @@ def _manual_exit_decision(symbol: str = "HOME/USDT") -> DecisionOutput:
 
 
 class FakeCcxt:
-    def __init__(self, *, open_orders=None, created_order=None, confirmed_order=None):
+    def __init__(
+        self,
+        *,
+        open_orders=None,
+        created_order=None,
+        confirmed_order=None,
+        amount_min=1.0,
+        contract_size=1.0,
+    ):
         self.urls = {"api": {"rest": "https://www.okx.com"}}
         self.hostname = "www.okx.com"
         self.open_orders = list(open_orders or [])
+        self.amount_min = amount_min
+        self.contract_size = contract_size
         self.positions = [
             {
                 "symbol": "HOME/USDT:USDT",
                 "side": "long",
                 "contracts": 100.0,
-                "contractSize": 1.0,
+                "contractSize": contract_size,
                 "info": {"posSide": "long", "pos": "100"},
             }
         ]
@@ -68,8 +79,9 @@ class FakeCcxt:
     def market(self, symbol):
         return {
             "symbol": symbol,
-            "contractSize": 1.0,
-            "limits": {"amount": {"min": 1.0}},
+            "contractSize": self.contract_size,
+            "limits": {"amount": {"min": self.amount_min}},
+            "info": {"minSz": str(self.amount_min), "lotSz": str(self.amount_min)},
         }
 
     def amount_to_precision(self, _symbol, amount):
@@ -210,6 +222,45 @@ async def test_existing_active_entry_order_blocks_duplicate_submit():
 
 
 @pytest.mark.asyncio
+async def test_entry_size_lifts_to_okx_min_contracts_when_affordable():
+    fake_ccxt = FakeCcxt(amount_min=10.0, contract_size=1.0)
+    executor = _executor(fake_ccxt)
+    decision = _entry_decision()
+    decision.position_size_pct = 0.001
+    decision.suggested_leverage = 1.0
+
+    await executor.place_order(
+        decision,
+        account_id="ensemble_trader",
+        override_balance=1_000.0,
+    )
+
+    assert fake_ccxt.create_calls
+    assert fake_ccxt.create_calls[0][3] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_entry_size_rejects_before_okx_when_min_contracts_unaffordable():
+    fake_ccxt = FakeCcxt(amount_min=10.0, contract_size=1.0)
+    executor = _executor(fake_ccxt)
+    decision = _entry_decision()
+    decision.position_size_pct = 0.001
+    decision.suggested_leverage = 1.0
+
+    result = await executor.place_order(
+        decision,
+        account_id="ensemble_trader",
+        override_balance=1.0,
+    )
+
+    assert fake_ccxt.create_calls == []
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response is not None
+    assert "\u63d0\u4ea4\u524d\u62e6\u622a" in result.raw_response["error"]
+    assert result.raw_response["okx_min_order_notional_usdt"] > 0
+
+
+@pytest.mark.asyncio
 async def test_manual_close_exit_fraction_is_not_forced_to_five_percent():
     fake_ccxt = FakeCcxt(
         confirmed_order={
@@ -257,3 +308,10 @@ async def test_manual_close_exit_fraction_is_not_forced_to_five_percent():
     assert result.status == OrderStatus.FILLED
     assert result.raw_response is not None
     assert result.raw_response["requested_exit_fraction"] == pytest.approx(0.01)
+
+
+def test_okx_executor_no_english_min_contract_rejection_message() -> None:
+    source = Path("executor/okx_executor.py").read_text(encoding="utf-8")
+
+    assert "Order size is below OKX minimum contract size" not in source
+    assert "\u63d0\u4ea4\u524d\u62e6\u622a" in source

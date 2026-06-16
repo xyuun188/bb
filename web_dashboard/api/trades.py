@@ -18,10 +18,39 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
+from services.position_open_time import parse_position_time
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
 
 router = APIRouter()
+
+
+def _normalize_display_symbol(symbol: str | None) -> str:
+    text = str(symbol or "").replace("-", "/").replace("_", "/").upper()
+    if ":" in text:
+        text = text.split(":", 1)[0]
+    if text.endswith("/USDT/SWAP"):
+        text = text[: -len("/SWAP")]
+    return text
+
+
+def _symbol_query_variants(symbols: set[str]) -> set[str]:
+    variants: set[str] = set()
+    for symbol in symbols:
+        normalized = _normalize_display_symbol(symbol)
+        if not normalized:
+            continue
+        variants.update(
+            {
+                symbol,
+                normalized,
+                normalized.replace("/", "-"),
+                f"{normalized}:USDT",
+                f"{normalized}-SWAP",
+                f"{normalized.replace('/', '-')}-SWAP",
+            }
+        )
+    return variants
 
 
 def _looks_mojibake(text: str) -> bool:
@@ -162,6 +191,24 @@ def _pct_text(value, digits: int = 2) -> str | None:
     return f"{number * 100:+.{digits}f}%"
 
 
+def _repair_position_reason_hold_hours(reason: str | None, hold_minutes: float | None) -> str:
+    """Replace stale stored zero hold-hour text with matched position duration."""
+
+    text = str(reason or "").strip()
+    if not text or hold_minutes is None or hold_minutes <= 0:
+        return text
+    hold_hours = hold_minutes / 60.0
+    formatted = f"{hold_hours:.4f}".rstrip("0").rstrip(".")
+    replacements = (
+        (r"(持仓小时=)0(?:\.0+)?(?=。|，|；|,|;|\s|$)", rf"\g<1>{formatted}"),
+        (r"(hold_hours=)0(?:\.0+)?(?=\.|,|;|\s|$)", rf"\g<1>{formatted}"),
+    )
+    repaired = text
+    for pattern, replacement in replacements:
+        repaired = re.sub(pattern, replacement, repaired)
+    return repaired
+
+
 def _fast_risk_reason_from_raw(symbol: str | None, raw: dict[str, Any]) -> str | None:
     """Build a readable reason for old fast-risk close records whose reasoning was mojibake."""
     if not isinstance(raw, dict):
@@ -270,6 +317,7 @@ async def get_trades(
                 for row in result.all()
             }
         order_symbols = {o.symbol for o in orders if o.symbol}
+        position_symbol_variants = _symbol_query_variants(order_symbols)
         position_stmt = select(
             Position.id,
             Position.model_name,
@@ -288,8 +336,8 @@ async def get_trades(
         )
         if mode:
             position_stmt = position_stmt.where(Position.execution_mode == mode)
-        if order_symbols:
-            position_stmt = position_stmt.where(Position.symbol.in_(order_symbols))
+        if position_symbol_variants:
+            position_stmt = position_stmt.where(Position.symbol.in_(position_symbol_variants))
         else:
             position_stmt = position_stmt.where(Position.id == -1)
         position_rows = await session.execute(position_stmt.limit(1000))
@@ -297,12 +345,31 @@ async def get_trades(
         closed_positions = [p for p in all_positions if not p.is_open]
 
     def normalize_symbol(symbol: str | None) -> str:
-        return str(symbol or "").replace("-", "/").replace("_", "/").upper()
+        text = str(symbol or "").replace("-", "/").replace("_", "/").upper()
+        if ":" in text:
+            text = text.split(":", 1)[0]
+        if text.endswith("/USDT/SWAP"):
+            text = text[: -len("/SWAP")]
+        return text
+
+    def display_symbol(symbol: str | None) -> str:
+        normalized = normalize_symbol(symbol)
+        return normalized or str(symbol or "")
 
     def aware_dt(value: datetime | None) -> datetime | None:
+        parsed = parse_position_time(value)
+        if parsed is not None:
+            return parsed
         if value and value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
+
+    def hold_minutes_for_position(position) -> float | None:
+        opened = aware_dt(position.created_at)
+        closed = aware_dt(position.closed_at)
+        if not opened or not closed:
+            return None
+        return max((closed - opened).total_seconds() / 60.0, 0.0)
 
     def matching_closed_position(order):
         if order.status != "filled" or not order.filled_at:
@@ -312,7 +379,7 @@ async def get_trades(
             if (
                 p.model_name == order.model_name
                 and p.execution_mode == order.execution_mode
-                and p.symbol == order.symbol
+                and normalize_symbol(p.symbol) == normalize_symbol(order.symbol)
                 and p.closed_at
             ):
                 close_side = "buy" if p.side == "short" else "sell"
@@ -336,7 +403,7 @@ async def get_trades(
             if (
                 p.model_name != order.model_name
                 or p.execution_mode != order.execution_mode
-                or p.symbol != order.symbol
+                or normalize_symbol(p.symbol) != normalize_symbol(order.symbol)
                 or not p.created_at
             ):
                 continue
@@ -540,64 +607,77 @@ async def get_trades(
         if fast_reason:
             return fast_reason
 
+        hold_minutes = hold_minutes_for_position(p) if p is not None else None
         reasoning = meta.get("reasoning")
         if reasoning and not _text_is_unusable(str(reasoning)):
-            return reasoning
+            return _repair_position_reason_hold_hours(reasoning, hold_minutes)
         if meta.get("execution_reason"):
-            return _translate_execution_text(meta["execution_reason"])
+            return _repair_position_reason_hold_hours(
+                _translate_execution_text(meta["execution_reason"]),
+                hold_minutes,
+            )
         if not p:
             return "系统同步的交易记录。"
         return "系统执行该交易。"
+
+    def matched_position_for_order(order):
+        return matching_closed_position(order) or matching_entry_position(order)
+
+    def serialize_trade(order) -> dict[str, Any]:
+        source = display_execution_source(order)
+        close_status = close_status_for_order(order)
+        matched_position = matched_position_for_order(order)
+        hold_minutes = (
+            hold_minutes_for_position(matched_position) if matched_position is not None else None
+        )
+        execution_leverage = execution_leverage_for_order(order)
+        meta = meta_for_order(order)
+        actual_leverage = _safe_float(
+            execution_leverage.get("actual_leverage") or meta.get("suggested_leverage"),
+            1.0,
+        )
+        ai_suggested_leverage = _safe_float(
+            execution_leverage.get("ai_suggested_leverage") or meta.get("suggested_leverage"),
+            1.0,
+        )
+        reason = sanitize_text(display_reason(order))
+        return {
+            "id": order.id,
+            "decision_id": order.decision_id,
+            "model_name": order.model_name,
+            "mode": order.execution_mode,
+            "symbol": order.symbol,
+            "display_symbol": display_symbol(order.symbol),
+            "side": order.side,
+            "action": display_action(order),
+            "order_side": order.side,
+            "order_type": order.order_type,
+            "quantity": order.quantity,
+            "price": order.price,
+            "status": order.status,
+            "fee": order.fee,
+            "leverage": actual_leverage,
+            "ai_suggested_leverage": ai_suggested_leverage,
+            "okx_max_leverage": execution_leverage.get("okx_max_leverage"),
+            "actual_leverage": actual_leverage,
+            "close_status": close_status[0],
+            "close_status_label": close_status[1],
+            "hold_minutes": round(hold_minutes, 4) if hold_minutes is not None else None,
+            "hold_hours": round(hold_minutes / 60.0, 4) if hold_minutes is not None else None,
+            "execution_source": source[0],
+            "execution_source_label": source[1],
+            "reason": reason,
+            "detail": reason,
+            "success": order.status == "filled",
+            "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+            "created_at": order.created_at.isoformat() if order.created_at else None,
+        }
 
     return {
         "count": len(orders),
         "total": total,
         "filled_total": filled_total,
-        "trades": [
-            (
-                lambda reason, source, close_status: {
-                    "id": o.id,
-                    "decision_id": o.decision_id,
-                    "model_name": o.model_name,
-                    "mode": o.execution_mode,
-                    "symbol": o.symbol,
-                    "side": o.side,
-                    "action": display_action(o),
-                    "order_side": o.side,
-                    "order_type": o.order_type,
-                    "quantity": o.quantity,
-                    "price": o.price,
-                    "status": o.status,
-                    "fee": o.fee,
-                    "leverage": _safe_float(
-                        execution_leverage_for_order(o).get("actual_leverage")
-                        or meta_for_order(o).get("suggested_leverage"),
-                        1.0,
-                    ),
-                    "ai_suggested_leverage": _safe_float(
-                        execution_leverage_for_order(o).get("ai_suggested_leverage")
-                        or meta_for_order(o).get("suggested_leverage"),
-                        1.0,
-                    ),
-                    "okx_max_leverage": execution_leverage_for_order(o).get("okx_max_leverage"),
-                    "actual_leverage": _safe_float(
-                        execution_leverage_for_order(o).get("actual_leverage")
-                        or meta_for_order(o).get("suggested_leverage"),
-                        1.0,
-                    ),
-                    "close_status": close_status[0],
-                    "close_status_label": close_status[1],
-                    "execution_source": source[0],
-                    "execution_source_label": source[1],
-                    "reason": sanitize_text(reason),
-                    "detail": sanitize_text(reason),
-                    "success": o.status == "filled",
-                    "filled_at": o.filled_at.isoformat() if o.filled_at else None,
-                    "created_at": o.created_at.isoformat() if o.created_at else None,
-                }
-            )(display_reason(o), display_execution_source(o), close_status_for_order(o))
-            for o in orders[:limit]
-        ],
+        "trades": [serialize_trade(o) for o in orders[:limit]],
         "page": page,
         "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size) if total else 1,

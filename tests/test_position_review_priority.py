@@ -1,7 +1,9 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 from services.exit_predictive_reversal import ExitPredictiveReversalPolicy
+from services.position_quality import PositionQualityScorer
 from services.position_review_priority import (
     PORTFOLIO_PROFIT_PROTECTION_EXIT_SCORE,
     PositionReviewPriorityPolicy,
@@ -170,3 +172,109 @@ def test_is_urgent_exit_scan_uses_score_or_marker() -> None:
         policy.is_urgent_exit_scan({"exit_score": 70.0, "reason": "predictive_reversal:88"}) is True
     )
     assert policy.is_urgent_exit_scan({"exit_score": 70.0, "reason": "loss_watch"}) is False
+
+
+def test_fast_position_exit_score_prioritizes_low_quality_flat_position() -> None:
+    policy = PositionReviewPriorityPolicy(
+        normalize_symbol=lambda value: str(value or "").split(":")[0],
+        position_peak_key=lambda model, symbol, side: (model, symbol, side),
+        position_peaks_provider=lambda: {},
+        predictive_reversal=ExitPredictiveReversalPolicy(),
+        quality_scorer=PositionQualityScorer(),
+    )
+
+    score, reasons = policy.fast_position_exit_score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price": 100.0,
+            "current_price": 100.01,
+            "quantity": 10.0,
+            "unrealized_pnl": 0.02,
+            "created_at": (datetime.now(UTC) - timedelta(hours=14)).isoformat(),
+        },
+        None,
+    )
+
+    assert score >= 76.0
+    assert any(reason.startswith("quality_release") for reason in reasons)
+
+
+def test_strategy_loss_release_context_boosts_low_quality_exit_scan() -> None:
+    policy = PositionReviewPriorityPolicy(
+        normalize_symbol=lambda value: str(value or "").split(":")[0],
+        position_peak_key=lambda model, symbol, side: (model, symbol, side),
+        position_peaks_provider=lambda: {},
+        predictive_reversal=ExitPredictiveReversalPolicy(),
+        quality_scorer=PositionQualityScorer(),
+    )
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "ARB/USDT",
+        "side": "long",
+        "entry_price": 100.0,
+        "current_price": 100.01,
+        "quantity": 10.0,
+        "unrealized_pnl": 0.01,
+        "created_at": (datetime.now(UTC) - timedelta(hours=14)).isoformat(),
+    }
+
+    scans = policy.scan_groups(
+        [(("ensemble_trader", "ARB/USDT"), [position])],
+        feature_vectors={},
+        portfolio_profit_context={},
+        strategy_context={
+            "full_position_release": True,
+            "loss_exit_aggressiveness": "high",
+            "position_review_priority_boost": 1.35,
+        },
+        aggregate_position_group=lambda rows, model, symbol, side: dict(rows[0]),
+    )
+    scan = scans[("ensemble_trader", "ARB/USDT")]
+
+    assert scan["exit_score"] >= 92.0
+    assert scan["priority_score"] >= 92.0
+    assert "strategy_loss_release_boost" in scan["reason"]
+    assert scan["force_exit_candidate"] is True
+    assert scan["release_action"] == "close_long"
+    assert scan["position_quality"]["should_release"] is True
+
+
+def test_capacity_pressure_forces_low_quality_release_scan() -> None:
+    policy = PositionReviewPriorityPolicy(
+        normalize_symbol=lambda value: str(value or "").split(":")[0],
+        position_peak_key=lambda model, symbol, side: (model, symbol, side),
+        position_peaks_provider=lambda: {},
+        predictive_reversal=ExitPredictiveReversalPolicy(),
+        quality_scorer=PositionQualityScorer(),
+    )
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "SOL/USDT",
+        "side": "short",
+        "entry_price": 100.0,
+        "current_price": 110.0,
+        "quantity": 2.0,
+        "unrealized_pnl": 0.0,
+        "created_at": (datetime.now(UTC) - timedelta(hours=16)).isoformat(),
+    }
+
+    scans = policy.scan_groups(
+        [(("ensemble_trader", "SOL/USDT"), [position])],
+        feature_vectors={},
+        portfolio_profit_context={},
+        strategy_context={
+            "dynamic_position_capacity": {
+                "open_group_count": 7,
+                "effective_limit": 3,
+                "low_quality_count": 4,
+            }
+        },
+        aggregate_position_group=lambda rows, model, symbol, side: dict(rows[0]),
+    )
+    scan = scans[("ensemble_trader", "SOL/USDT")]
+
+    assert scan["force_exit_candidate"] is True
+    assert scan["release_action"] == "close_short"
+    assert policy.is_urgent_exit_scan(scan) is True

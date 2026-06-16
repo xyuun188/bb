@@ -24,6 +24,13 @@ from config.settings import (
     settings,
 )
 from core.safe_output import safe_error_text
+from services.entry_signal_extraction import (
+    enrich_signal_payload,
+    expected_return_pct as signal_expected_return_pct,
+    payload_side as signal_payload_side,
+    signal_available,
+    unwrap_tool_payload,
+)
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -504,7 +511,11 @@ class EnsembleCoordinator:
         )
 
         try:
-            dm_timeout = max(float(settings.ai_decision_maker_timeout_seconds or 20.0), 5.0)
+            try:
+                configured_dm_timeout = float(settings.ai_decision_maker_timeout_seconds or 14.0)
+            except (TypeError, ValueError):
+                configured_dm_timeout = 14.0
+            dm_timeout = min(max(configured_dm_timeout, 5.0), 18.0)
             proposal = await asyncio.wait_for(
                 decision_maker.decide(features, decider_context),
                 timeout=dm_timeout,
@@ -1291,21 +1302,12 @@ class EnsembleCoordinator:
         side = "long" if action == Action.LONG else "short"
         opposite = "short" if side == "long" else "long"
 
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
-        if isinstance(profit, dict) and profit.get("available", True) is not False:
-            expected = float(
-                profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct"))
-                or 0.0
-            )
-            opposite_expected = float(
-                profit.get(
-                    f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
-                )
-                or 0.0
-            )
-            loss_probability = float(profit.get(f"{side}_loss_probability") or 0.0)
-            best_side = str(profit.get("best_side") or "").lower()
+        profit = self._local_profit_signal(context)
+        if profit and signal_available(profit):
+            expected = self._local_expected_return(profit, side)
+            opposite_expected = self._local_expected_return(profit, opposite)
+            loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
+            best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
             if (
                 expected > 0
                 and expected >= opposite_expected
@@ -2689,6 +2691,55 @@ class EnsembleCoordinator:
             ),
         }
 
+    def _local_tool_signal(
+        self,
+        context: dict[str, Any] | None,
+        name: str,
+        *aliases: str,
+    ) -> dict[str, Any]:
+        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
+        if not isinstance(tools, dict):
+            return {}
+        for key in (name, *aliases):
+            payload = unwrap_tool_payload(tools.get(key))
+            if payload:
+                return enrich_signal_payload(name, payload)
+        return {}
+
+    def _local_profit_signal(self, context: dict[str, Any] | None) -> dict[str, Any]:
+        return self._local_tool_signal(
+            context,
+            "profit_prediction",
+            "profit_model",
+            "server_profit",
+            "server_profit_model",
+            "profit",
+        )
+
+    def _local_timeseries_signal(self, context: dict[str, Any] | None) -> dict[str, Any]:
+        return self._local_tool_signal(
+            context,
+            "time_series_prediction",
+            "timeseries_prediction",
+            "sequence_prediction",
+            "timeseries",
+            "time_series",
+        )
+
+    def _local_sentiment_signal(self, context: dict[str, Any] | None) -> dict[str, Any]:
+        return self._local_tool_signal(
+            context,
+            "sentiment_analysis",
+            "sentiment_prediction",
+            "sentiment_model",
+            "sentiment",
+        )
+
+    def _local_expected_return(self, payload: dict[str, Any], side: str) -> float:
+        if not isinstance(payload, dict):
+            return 0.0
+        return self._safe_float(signal_expected_return_pct(payload, side), 0.0)
+
     def _quant_only_probe_evidence(
         self,
         ml_profit_hint: dict[str, Any],
@@ -2696,14 +2747,9 @@ class EnsembleCoordinator:
         raw_opinions: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Allow a tiny candidate when quant tools agree but LLM experts stay neutral."""
-        tools = self._safe_dict(context.get("local_ai_tools") if isinstance(context, dict) else {})
-        profit = self._safe_dict(tools.get("profit_prediction"))
-        time_series = self._safe_dict(
-            tools.get("time_series_prediction")
-            or tools.get("timeseries_prediction")
-            or tools.get("sequence_prediction")
-        )
-        sentiment = self._safe_dict(tools.get("sentiment_analysis"))
+        profit = self._local_profit_signal(context)
+        time_series = self._local_timeseries_signal(context)
+        sentiment = self._local_sentiment_signal(context)
         directional_expert_votes = [
             o
             for o in raw_opinions
@@ -2719,11 +2765,11 @@ class EnsembleCoordinator:
         ml_strong = bool(ml_hint.get("strong"))
 
         best_profit_side = str(profit.get("best_side") or "").lower()
-        ts_side = str(time_series.get("best_side") or time_series.get("side") or "").lower()
+        ts_side = signal_payload_side(time_series)
         if not ts_side:
             ts_direction = str(time_series.get("direction") or "").lower()
             ts_side = "long" if ts_direction == "up" else "short" if ts_direction == "down" else ""
-        sentiment_side = str(sentiment.get("best_side") or sentiment.get("side") or "").lower()
+        sentiment_side = signal_payload_side(sentiment)
         sentiment_risk = str(sentiment.get("risk_level") or "").lower()
         direction_competition = self._safe_dict(
             context.get("direction_competition") if isinstance(context, dict) else {}
@@ -2734,18 +2780,8 @@ class EnsembleCoordinator:
         candidates: list[dict[str, Any]] = []
         for side in ("long", "short"):
             opposite = "short" if side == "long" else "long"
-            local_expected = self._safe_float(
-                profit.get(
-                    f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")
-                ),
-                0.0,
-            )
-            opposite_expected = self._safe_float(
-                profit.get(
-                    f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
-                ),
-                0.0,
-            )
+            local_expected = self._local_expected_return(profit, side)
+            opposite_expected = self._local_expected_return(profit, opposite)
             loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.50)
             supports: list[str] = []
             support_detail: dict[str, Any] = {}
@@ -3162,22 +3198,14 @@ class EnsembleCoordinator:
         tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
         if not isinstance(tools, dict) or not tools.get("enabled"):
             return {"enabled": False, "allow": True, "status": "unavailable"}
-        profit = tools.get("profit_prediction")
-        if not isinstance(profit, dict) or profit.get("available", True) is False:
+        profit = self._local_profit_signal(context)
+        if not profit or not signal_available(profit):
             return {"enabled": False, "allow": True, "status": "no_profit_prediction"}
         side = "long" if direction == "long" else "short"
-        expected = self._safe_float(
-            profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")),
-            0.0,
-        )
+        expected = self._local_expected_return(profit, side)
         opposite = "short" if side == "long" else "long"
-        opposite_expected = self._safe_float(
-            profit.get(
-                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
-            ),
-            0.0,
-        )
-        best_side = str(profit.get("best_side") or "")
+        opposite_expected = self._local_expected_return(profit, opposite)
+        best_side = signal_payload_side(profit) or str(profit.get("best_side") or "")
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
         profile = self._safe_dict(profit.get("symbol_side_profile"))
         side_profile = self._safe_dict(profile.get(side))
@@ -3267,15 +3295,11 @@ class EnsembleCoordinator:
         side = str(side or "").lower()
         if side not in {"long", "short"}:
             return False
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
-        if not isinstance(profit, dict) or profit.get("available", True) is False:
+        profit = self._local_profit_signal(context)
+        if not profit or not signal_available(profit):
             return False
-        expected = self._safe_float(
-            profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")),
-            0.0,
-        )
-        best_side = str(profit.get("best_side") or "").lower()
+        expected = self._local_expected_return(profit, side)
+        best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.50)
         return (
             expected > 0
@@ -3287,21 +3311,11 @@ class EnsembleCoordinator:
         side = str(side or "").lower()
         if side not in {"long", "short"}:
             return False
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        prediction = None
-        if isinstance(tools, dict):
-            prediction = (
-                tools.get("time_series_prediction")
-                or tools.get("timeseries_prediction")
-                or tools.get("sequence_prediction")
-            )
-        if not isinstance(prediction, dict) or prediction.get("available", True) is False:
+        prediction = self._local_timeseries_signal(context)
+        if not prediction or not signal_available(prediction):
             return False
-        best_side = str(prediction.get("best_side") or prediction.get("side") or "").lower()
-        expected = self._safe_float(
-            prediction.get("expected_return_pct", prediction.get(f"{side}_expected_return_pct")),
-            0.0,
-        )
+        best_side = signal_payload_side(prediction)
+        expected = self._local_expected_return(prediction, side)
         return best_side == side and expected > 0
 
     def _profit_quality_entry_expand_evidence(
@@ -3611,9 +3625,8 @@ class EnsembleCoordinator:
             )
             return result
 
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
-        if not isinstance(profit, dict) or profit.get("available", True) is False:
+        profit = self._local_profit_signal(context)
+        if not profit or not signal_available(profit):
             result.update(
                 {
                     "status": "blocked_no_local_profit_prediction",
@@ -3622,17 +3635,9 @@ class EnsembleCoordinator:
             )
             return result
         opposite = "short" if side == "long" else "long"
-        local_expected = self._safe_float(
-            profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")),
-            0.0,
-        )
-        opposite_expected = self._safe_float(
-            profit.get(
-                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
-            ),
-            0.0,
-        )
-        best_side = str(profit.get("best_side") or "").lower()
+        local_expected = self._local_expected_return(profit, side)
+        opposite_expected = self._local_expected_return(profit, opposite)
+        best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
         loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
         profit_quality_score = self._safe_float(profit.get("profit_quality_score"), 0.0)
         result.update(
@@ -3829,30 +3834,19 @@ class EnsembleCoordinator:
         local_gate = ml_gate.get("local_ai_tools_gate") if isinstance(ml_gate, dict) else {}
         if not isinstance(local_gate, dict):
             local_gate = {}
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        profit = tools.get("profit_prediction") if isinstance(tools, dict) else {}
-        if not isinstance(profit, dict) or profit.get("available", True) is False:
+        profit = self._local_profit_signal(context)
+        if not profit or not signal_available(profit):
             result.update(
                 {"status": "blocked_no_local_profit_prediction", "reason": "服务器盈利预测不可用。"}
             )
             return result
 
-        expected = self._safe_float(
-            profit.get(
-                f"adjusted_{reverse_side}_return_pct",
-                profit.get(f"{reverse_side}_expected_return_pct"),
-            ),
-            0.0,
-        )
+        expected = self._local_expected_return(profit, reverse_side)
         blocked_side = "long" if blocked_action == Action.LONG else "short"
-        blocked_expected = self._safe_float(
-            profit.get(
-                f"adjusted_{blocked_side}_return_pct",
-                profit.get(f"{blocked_side}_expected_return_pct"),
-            ),
-            0.0,
-        )
-        best_side = str(profit.get("best_side") or local_gate.get("best_side") or "").lower()
+        blocked_expected = self._local_expected_return(profit, blocked_side)
+        best_side = signal_payload_side(profit) or str(
+            profit.get("best_side") or local_gate.get("best_side") or ""
+        ).lower()
         loss_probability = self._safe_float(profit.get(f"{reverse_side}_loss_probability"), 0.0)
         profit_quality_score = self._safe_float(profit.get("profit_quality_score"), 0.0)
         result.update(
@@ -4482,49 +4476,20 @@ class EnsembleCoordinator:
 
         opposite = "short" if current_side == "long" else "long"
         continuation_score = score if current_side == "long" else -score
-        tools = context.get("local_ai_tools") if isinstance(context, dict) else {}
-        if not isinstance(tools, dict):
-            tools = {}
-        profit = tools.get("profit_prediction")
-        if not isinstance(profit, dict):
-            profit = {}
-        local_expected = self._safe_float(
-            profit.get(
-                f"adjusted_{current_side}_return_pct",
-                profit.get(f"{current_side}_expected_return_pct"),
-            ),
-            0.0,
-        )
-        opposite_local_expected = self._safe_float(
-            profit.get(
-                f"adjusted_{opposite}_return_pct", profit.get(f"{opposite}_expected_return_pct")
-            ),
-            0.0,
-        )
+        profit = self._local_profit_signal(context)
+        local_expected = self._local_expected_return(profit, current_side)
+        opposite_local_expected = self._local_expected_return(profit, opposite)
         local_loss_probability = self._safe_float(
             profit.get(f"{current_side}_loss_probability"), 0.50
         )
-        local_best_side = str(profit.get("best_side") or "").lower()
+        local_best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
         local_available = (
-            isinstance(profit, dict) and bool(profit) and profit.get("available", True) is not False
+            isinstance(profit, dict) and bool(profit) and signal_available(profit)
         )
 
-        ts_prediction = (
-            tools.get("time_series_prediction")
-            or tools.get("timeseries_prediction")
-            or tools.get("sequence_prediction")
-        )
-        if not isinstance(ts_prediction, dict):
-            ts_prediction = {}
-        ts_best_side = str(
-            ts_prediction.get("best_side") or ts_prediction.get("side") or ""
-        ).lower()
-        ts_expected = self._safe_float(
-            ts_prediction.get(
-                "expected_return_pct", ts_prediction.get(f"{current_side}_expected_return_pct")
-            ),
-            0.0,
-        )
+        ts_prediction = self._local_timeseries_signal(context)
+        ts_best_side = signal_payload_side(ts_prediction)
+        ts_expected = self._local_expected_return(ts_prediction, current_side)
         ts_direction = str(ts_prediction.get("direction") or "").lower()
         ts_aligned = (
             ts_best_side == current_side
@@ -5812,15 +5777,39 @@ class EnsembleCoordinator:
             key=lambda row: float(row.get("duration_sec") or 0.0),
             default=None,
         )
+        shared_batch_durations: dict[tuple[Any, ...], float] = {}
+        non_shared_model_duration = 0.0
+        raw_model_duration = 0.0
+        for row in model_rows:
+            duration = float(row.get("duration_sec") or 0.0)
+            raw_model_duration += duration
+            if row.get("shared_batch_call") or row.get("batch_expert"):
+                key = (
+                    row.get("stage"),
+                    row.get("started_at"),
+                    row.get("provider_model"),
+                    row.get("duration_kind"),
+                    row.get("duration_sec"),
+                )
+                shared_batch_durations[key] = max(
+                    shared_batch_durations.get(key, 0.0), duration
+                )
+            else:
+                non_shared_model_duration += duration
+        shared_batch_total = sum(shared_batch_durations.values())
+        effective_model_duration = non_shared_model_duration + shared_batch_total
         return {
             "stage_duration_sec": round(
                 sum(float(row.get("duration_sec") or 0.0) for row in stage_rows),
                 3,
             ),
             "model_duration_sec": round(
-                sum(float(row.get("duration_sec") or 0.0) for row in model_rows),
+                effective_model_duration,
                 3,
             ),
+            "raw_model_duration_sec": round(raw_model_duration, 3),
+            "shared_batch_total_duration_sec": round(shared_batch_total, 3),
+            "shared_batch_call_count": len(shared_batch_durations),
             "shared_batch_duration_sec": round(
                 max(
                     (

@@ -16,6 +16,20 @@ COMPLETION_TOKEN_CAPS = {
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,
 }
+# Reasoning/thinking models (e.g. deepseek-r1 distill, qwen3 thinking) emit a
+# chunk of chain-of-thought before the final JSON even when thinking is nominally
+# disabled. The standard caps truncate that output right at the JSON boundary,
+# which forces an expensive repair retry and roughly doubles latency. DeepSeek-R1
+# keeps extra headroom on non-batch paths; strict batch JSON is disabled for it.
+THINKING_COMPLETION_TOKEN_CAPS = {
+    "expert": 640,
+    "decision_maker": 560,
+    "batch_expert": 1100,
+    "consultation": 1100,
+    "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
+    "proxy": 1100,
+}
+MIN_BATCH_TIMEOUT_CIRCUIT_BREAKER_SECONDS = 300.0
 
 
 def is_openai_reasoning_model(model: str | None) -> bool:
@@ -33,6 +47,17 @@ def uses_thinking_tags(model: str | None) -> bool:
     """Return True for models that may emit explicit thinking tags."""
     name = str(model or "").lower()
     return "qwen3" in name or "deepseek-r1" in name
+
+
+def batch_expert_json_unreliable_model(model: str | None) -> bool:
+    """Return True when a model is unsafe for strict multi-expert JSON batching."""
+    name = str(model or "").lower()
+    return "deepseek-r1" in name
+
+
+def supports_batch_expert_json(model: str | None) -> bool:
+    """Return True when a provider model can be used for batched expert JSON."""
+    return not batch_expert_json_unreliable_model(model)
 
 
 def non_thinking_extra_body(existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -129,7 +154,18 @@ def completion_token_limit(
     requested: int | None = None,
     *,
     floor: int = 64,
+    model: str | None = None,
 ) -> int:
-    """Return the centrally enforced output-token limit for a model call stage."""
-    cap = COMPLETION_TOKEN_CAPS.get(str(stage or "").strip(), COMPLETION_TOKEN_CAPS["proxy"])
+    """Return the centrally enforced output-token limit for a model call stage.
+
+    When ``model`` is a thinking/reasoning model, a larger cap is applied so the
+    chain-of-thought plus the final JSON can complete in one call instead of
+    being truncated and repaired.
+    """
+    stage_key = str(stage or "").strip()
+    caps = COMPLETION_TOKEN_CAPS
+    model_name = str(model or "").lower()
+    if model is not None and "deepseek-r1" in model_name:
+        caps = {**COMPLETION_TOKEN_CAPS, **THINKING_COMPLETION_TOKEN_CAPS}
+    cap = caps.get(stage_key, caps["proxy"])
     return cap_completion_tokens(requested, floor=floor, cap=cap)

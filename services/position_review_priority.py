@@ -12,6 +12,7 @@ from services.exit_predictive_reversal import (
     PREDICTIVE_REVERSAL_REVIEW_SCORE,
     ExitPredictiveReversalPolicy,
 )
+from services.position_quality import PositionQualityScorer
 from services.trading_params import ESTIMATED_TAKER_FEE_PCT
 
 PROFIT_PROTECTION_MIN_NET_PNL_RATIO = 0.004
@@ -34,6 +35,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 @dataclass(slots=True)
 class PositionReviewPriorityPolicy:
     """Score position groups before spending slow AI review time."""
@@ -42,6 +47,7 @@ class PositionReviewPriorityPolicy:
     position_peak_key: PositionPeakKeyProvider
     position_peaks_provider: PositionPeaksProvider
     predictive_reversal: ExitPredictiveReversalPolicy
+    quality_scorer: PositionQualityScorer | None = None
     urgent_exit_markers: tuple[str, ...] = ()
 
     def portfolio_profit_protection_score(
@@ -84,6 +90,18 @@ class PositionReviewPriorityPolicy:
         pnl_ratio = unrealized / notional
         estimated_round_trip_fee = max(notional * ESTIMATED_TAKER_FEE_PCT * 2.0, 1e-9)
         score = 0.0
+        if self.quality_scorer is not None:
+            quality = self.quality_scorer.score(pos, feature_vector=feature_vector)
+            if quality.bucket == "release_now":
+                score = max(score, 86.0)
+                reasons.append("quality_release_now")
+            elif quality.should_release:
+                score = max(score, 76.0)
+                reasons.append("quality_release_candidate")
+            elif quality.bucket == "watch":
+                score = max(score, 64.0)
+                reasons.append("quality_watch")
+
         if pnl_ratio <= -0.02 or unrealized <= -8.0:
             score = max(score, 95.0)
             reasons.append("loss_expanding")
@@ -250,10 +268,52 @@ class PositionReviewPriorityPolicy:
         grouped_items: list[tuple[tuple[str, str], list[dict[str, Any]]]],
         feature_vectors: dict[str, Any],
         portfolio_profit_context: dict[str, Any] | None,
+        strategy_context: dict[str, Any] | None = None,
         *,
         aggregate_position_group: AggregatePositionGroup,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         scans: dict[tuple[str, str], dict[str, Any]] = {}
+        strategy_context = strategy_context or {}
+        learning = (
+            strategy_context.get("strategy_learning")
+            if isinstance(strategy_context.get("strategy_learning"), dict)
+            else {}
+        )
+        loss_aggressive = (
+            str(
+                strategy_context.get("loss_exit_aggressiveness")
+                or learning.get("loss_exit_aggressiveness")
+                or "normal"
+            )
+            == "high"
+        )
+        full_release = bool(
+            strategy_context.get("full_position_release")
+            or learning.get("full_position_release")
+            or strategy_context.get("strategy_learning_release_pressure_active")
+            or learning.get("release_pressure_active")
+        )
+        release_losing_first = bool(
+            strategy_context.get("release_losing_positions_first")
+            or learning.get("release_losing_positions_first")
+        )
+        capacity = _safe_dict(strategy_context.get("dynamic_position_capacity"))
+        capacity_release_pressure = bool(
+            _safe_float(capacity.get("open_group_count"), 0.0)
+            > _safe_float(capacity.get("effective_limit"), 0.0)
+            and _safe_float(capacity.get("low_quality_count"), 0.0) > 0
+        )
+        priority_boost = min(
+            max(
+                _safe_float(
+                    strategy_context.get("position_review_priority_boost")
+                    or learning.get("position_review_priority_boost"),
+                    1.0,
+                ),
+                0.70,
+            ),
+            1.80,
+        )
         for key, positions in grouped_items:
             symbol = key[1]
             normalized = self.normalize_symbol(symbol)
@@ -261,6 +321,10 @@ class PositionReviewPriorityPolicy:
             exit_score = 0.0
             add_score = 0.0
             reasons: list[str] = []
+            release_action = ""
+            release_reason = ""
+            release_quality: dict[str, Any] | None = None
+            force_exit_candidate = False
 
             by_side: dict[str, list[dict[str, Any]]] = {}
             for pos in positions or []:
@@ -275,6 +339,49 @@ class PositionReviewPriorityPolicy:
                 if not aggregate:
                     continue
                 pos_exit_score, pos_reasons = self.fast_position_exit_score(aggregate, fv)
+                pos_quality = (
+                    self.quality_scorer.score(aggregate, feature_vector=fv)
+                    if self.quality_scorer
+                    else None
+                )
+                if full_release or loss_aggressive or priority_boost > 1.0:
+                    if pos_quality and (
+                        pos_quality.should_release
+                        or _safe_float(aggregate.get("unrealized_pnl"), 0.0) < 0
+                    ):
+                        boosted = min(pos_exit_score * priority_boost, 98.0)
+                        if loss_aggressive:
+                            boosted = max(boosted, 88.0)
+                        if full_release and pos_quality.should_release:
+                            boosted = max(boosted, 92.0)
+                        if boosted > pos_exit_score:
+                            pos_exit_score = boosted
+                            pos_reasons = [*pos_reasons, "strategy_loss_release_boost"]
+                loss_release_trigger = bool(
+                    release_losing_first
+                    and pos_quality
+                    and pos_quality.bucket in {"watch", "release_candidate", "release_now"}
+                    and _safe_float(aggregate.get("unrealized_pnl"), 0.0) < 0
+                )
+                quality_release_trigger = bool(
+                    pos_quality
+                    and (
+                        pos_quality.bucket == "release_now"
+                        or (full_release and pos_quality.should_release)
+                        or (capacity_release_pressure and pos_quality.should_release)
+                        or loss_release_trigger
+                    )
+                )
+                if quality_release_trigger and pos_quality:
+                    force_exit_candidate = True
+                    release_action = "close_long" if side == "long" else "close_short"
+                    release_quality = pos_quality.as_dict()
+                    release_reason = "; ".join(pos_quality.reasons) or pos_quality.bucket
+                    pos_exit_score = max(
+                        pos_exit_score,
+                        94.0 if pos_quality.bucket == "release_now" else 92.0,
+                    )
+                    pos_reasons = [*pos_reasons, "forced_low_quality_release"]
                 if pos_exit_score > exit_score:
                     exit_score = pos_exit_score
                 reasons.extend(pos_reasons)
@@ -298,12 +405,19 @@ class PositionReviewPriorityPolicy:
                 "exit_score": exit_score,
                 "add_score": add_score,
                 "reason": "; ".join(dict.fromkeys(reasons))[:260],
+                "force_exit_candidate": force_exit_candidate,
+                "release_action": release_action,
+                "release_fraction": 1.0 if force_exit_candidate else 0.0,
+                "release_reason": release_reason[:260],
+                "position_quality": release_quality or {},
             }
         return scans
 
     def is_urgent_exit_scan(self, scan: dict[str, Any] | None) -> bool:
         if not isinstance(scan, dict):
             return False
+        if bool(scan.get("force_exit_candidate")):
+            return True
         exit_score = _safe_float(scan.get("exit_score"), 0.0)
         reason = str(scan.get("reason") or "")
         if exit_score >= 90.0:

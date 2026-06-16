@@ -25,6 +25,46 @@ class FailingRestClient:
         raise RuntimeError(f"ticker unavailable: {len(symbols)}")
 
 
+class SuccessfulRestClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def fetch_tickers(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        return {
+            symbol: {
+                "symbol": f"{symbol}:USDT",
+                "last": 100.0,
+                "percentage": 1.5,
+                "baseVolume": 1234.0,
+                "bid": 99.9,
+                "ask": 100.1,
+                "info": {"instId": symbol.replace("/", "-") + "-SWAP", "sodUtc8": "98.5"},
+            }
+            for symbol in symbols
+        }
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class PartiallyFailingRestClient:
+    async def fetch_tickers(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        raise RuntimeError(f"bad batch symbol: {','.join(symbols)}")
+
+    async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+        if symbol == "UNI/USDT":
+            raise RuntimeError("okx does not have market symbol UNI/USDT:USDT")
+        return {
+            "symbol": f"{symbol}:USDT",
+            "last": 25000.0,
+            "percentage": 2.0,
+            "baseVolume": 4321.0,
+            "bid": 24999.0,
+            "ask": 25001.0,
+            "info": {"instId": symbol.replace("/", "-") + "-SWAP", "sodUtc8": "24500"},
+        }
+
+
 class FakeTradingService:
     def __init__(self) -> None:
         self.okx_paper = FailingExecutor()
@@ -45,6 +85,37 @@ class FakeBalanceTradingService:
 
 class FakeDataService:
     rest_client = FailingRestClient()
+
+
+class FakePartialDataService:
+    rest_client = PartiallyFailingRestClient()
+
+
+class SuccessfulStandaloneBalanceExecutor:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.closed = False
+
+    async def initialize(self) -> None:
+        return None
+
+    async def get_balance_snapshot(self, currency: str) -> dict[str, Any]:
+        return {
+            "free": 5.0,
+            "used": 1.0,
+            "total": 6.0,
+            "cash": 6.0,
+            "equity": 7.0,
+            "allocatable": 7.0,
+        }
+
+    async def shutdown(self) -> None:
+        self.closed = True
+
+
+class FailingStandaloneBalanceExecutor(SuccessfulStandaloneBalanceExecutor):
+    async def get_balance_snapshot(self, currency: str) -> dict[str, Any]:
+        raise RuntimeError("standalone balance unavailable")
 
 
 @pytest.fixture
@@ -115,6 +186,37 @@ async def test_exchange_mark_map_fallback_logs_and_uses_stale_cache(
     ]
 
 
+async def test_exchange_mark_map_uses_short_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    dashboard_fallback_events: list[dict[str, Any]],
+) -> None:
+    stale_at = datetime.now(UTC) - timedelta(minutes=1)
+    cached_mark = {("BTC/USDT", "long"): {"mark_price": 100.0}}
+    waits: list[float] = []
+
+    async def timeout_wait_for(awaitable: Any, **kwargs: Any) -> Any:
+        waits.append(float(kwargs["timeout"]))
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise TimeoutError
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeTradingService())
+    monkeypatch.setattr(dashboard.asyncio, "wait_for", timeout_wait_for)
+    monkeypatch.setattr(
+        dashboard,
+        "_exchange_mark_cache",
+        {"paper": (stale_at, cached_mark)},
+    )
+
+    result = await dashboard._get_exchange_position_mark_map("paper")
+
+    assert result == cached_mark
+    assert waits == [1.2]
+    assert dashboard_fallback_events[0]["event"] == "exchange mark map fallback"
+    assert dashboard_fallback_events[0]["has_cached"] is True
+
+
 async def test_public_ticker_fallback_logs_and_uses_stale_cache(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
@@ -141,11 +243,82 @@ async def test_public_ticker_fallback_logs_and_uses_stale_cache(
     ]
 
 
+async def test_public_ticker_bad_symbol_does_not_drop_valid_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+    dashboard_fallback_events: list[dict[str, Any]],
+) -> None:
+    monkeypatch.setattr(dashboard, "_data_service", FakePartialDataService())
+    monkeypatch.setattr(dashboard, "_public_ticker_cache", {})
+
+    result = await dashboard._get_public_ticker_map({"BTC/USDT", "UNI/USDT"})
+
+    assert set(result) == {"BTC/USDT"}
+    assert result["BTC/USDT"]["price"] == 25000.0
+    assert result["BTC/USDT"]["volume_24h"] == 4321.0
+    assert dashboard_fallback_events == [
+        {
+            "event": "public ticker fallback",
+            "error": "bad batch symbol: BTC/USDT,UNI/USDT",
+            "symbol_count": 2,
+            "has_cached": False,
+        },
+        {
+            "event": "public ticker symbol fallback",
+            "error": "okx does not have market symbol UNI/USDT:USDT",
+            "symbol": "UNI/USDT",
+        },
+    ]
+
+
+async def test_public_ticker_map_works_without_data_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dashboard, "_data_service", None)
+    monkeypatch.setattr(dashboard, "_public_ticker_cache", {})
+    monkeypatch.setattr(dashboard, "OKXRestClient", SuccessfulRestClient)
+
+    result = await dashboard._get_public_ticker_map({"BTC/USDT"})
+
+    assert result["BTC/USDT"]["price"] == 100.0
+    assert result["BTC/USDT"]["change_24h"] == pytest.approx(1.52284263959)
+    assert result["BTC/USDT"]["volume_24h"] == 1234.0
+
+
 async def test_dashboard_okx_balance_snapshot_fallback_logs(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
 ) -> None:
     monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "OKXExecutor", SuccessfulStandaloneBalanceExecutor)
+
+    result = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert result == {
+        "free": 5.0,
+        "used": 1.0,
+        "total": 6.0,
+        "cash": 6.0,
+        "equity": 7.0,
+        "allocatable": 7.0,
+    }
+    assert dashboard_fallback_events == [
+        {
+            "event": "dashboard summary okx balance fallback",
+            "error": FAKE_BEARER_ERROR,
+            "mode": "paper",
+            "source": "trading_service_executor",
+        }
+    ]
+
+
+async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    dashboard_fallback_events: list[dict[str, Any]],
+) -> None:
+    monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "OKXExecutor", FailingStandaloneBalanceExecutor)
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
@@ -155,5 +328,12 @@ async def test_dashboard_okx_balance_snapshot_fallback_logs(
             "event": "dashboard summary okx balance fallback",
             "error": FAKE_BEARER_ERROR,
             "mode": "paper",
-        }
+            "source": "trading_service_executor",
+        },
+        {
+            "event": "dashboard summary okx balance fallback",
+            "error": "standalone balance unavailable",
+            "mode": "paper",
+            "source": "isolated_executor",
+        },
     ]

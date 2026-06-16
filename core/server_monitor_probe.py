@@ -31,7 +31,11 @@ def render_python_here_doc(script: str) -> str:
     return f"python3 - <<'PY'\n{clean_script}\nPY"
 
 
-def render_server_monitor_probe(primary_model_id: str, primary_model_label: str) -> str:
+def render_server_monitor_probe(
+    primary_model_id: str,
+    primary_model_label: str,
+    local_ai_tools_api_key: str = "",
+) -> str:
     """Render the Python probe executed on the remote model server."""
     return textwrap.dedent(
         f"""
@@ -46,6 +50,8 @@ def render_server_monitor_probe(primary_model_id: str, primary_model_label: str)
 
         PRIMARY_MODEL_ID = {json.dumps(primary_model_id, ensure_ascii=False)}
         PRIMARY_MODEL_LABEL = {json.dumps(primary_model_label, ensure_ascii=False)}
+        LOCAL_AI_TOOLS_API_KEY = {json.dumps(local_ai_tools_api_key, ensure_ascii=False)}
+        DEEPSEEK_R1_MODEL_ID = "deepseek-r1-14b-risk"
         ERROR_TEXT_LIMIT = 240
         HTTP_BODY_READ_LIMIT = 512 * 1024
         MAX_MODEL_ROWS = 24
@@ -292,10 +298,13 @@ def render_server_monitor_probe(primary_model_id: str, primary_model_label: str)
             }}
 
 
-        def http_json(url, timeout=3):
+        def http_json(url, timeout=3, extra_headers=None):
             started = time.monotonic()
             try:
-                req = urllib.request.Request(url, headers={{"Accept": "application/json"}})
+                headers = {{"Accept": "application/json"}}
+                if isinstance(extra_headers, dict):
+                    headers.update(extra_headers)
+                req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     text, truncated = read_response_text(resp)
                     return {{
@@ -340,7 +349,11 @@ def render_server_monitor_probe(primary_model_id: str, primary_model_label: str)
 
 
         def primary_model_available(model_ids):
-            wanted = (PRIMARY_MODEL_ID or "").lower()
+            return target_model_available(model_ids, PRIMARY_MODEL_ID)
+
+
+        def target_model_available(model_ids, target_model_id):
+            wanted = (target_model_id or "").lower()
             rows = [str(m or "") for m in (model_ids or []) if str(m or "")]
             return bool(rows) and (
                 not wanted
@@ -351,40 +364,94 @@ def render_server_monitor_probe(primary_model_id: str, primary_model_label: str)
             )
 
 
-        def model_runtime():
-            vllm = http_json("http://127.0.0.1:8000/v1/models", timeout=4)
-            local_status = http_json("http://127.0.0.1:8001/models/status", timeout=4)
-            local_health = http_json("http://127.0.0.1:8001/health", timeout=3)
-            vllm_models = []
-            if isinstance(vllm.get("data"), dict):
-                vllm_models = [
+        def openai_model_ids(response):
+            if not isinstance(response.get("data"), dict):
+                return []
+            return safe_string_list(
+                [
                     item.get("id") or item.get("root") or ""
-                    for item in vllm["data"].get("data", [])
+                    for item in response["data"].get("data", [])
                     if isinstance(item, dict)
                 ]
-            vllm_models = safe_string_list(vllm_models)
-            vllm_model_ok = primary_model_available(vllm_models)
+            )
+
+
+        def read_env_value_file(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        clean = line.strip()
+                        if not clean or clean.startswith("#") or "=" not in clean:
+                            continue
+                        key, value = clean.split("=", 1)
+                        if key.strip() != "LOCAL_AI_TOOLS_API_KEY":
+                            continue
+                        return value.strip().strip('"').strip("'")
+            except OSError:
+                return ""
+            return ""
+
+
+        def local_ai_tools_api_key():
+            return (
+                os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
+                or read_env_value_file("/data/trade_ai/local_ai_tools.env")
+                or (LOCAL_AI_TOOLS_API_KEY or "").strip()
+            )
+
+
+        def vllm_endpoint_runtime(port, label, target_model_id=None):
+            endpoint = f"127.0.0.1:{{port}}/v1"
+            response = http_json(f"http://127.0.0.1:{{port}}/v1/models", timeout=4)
+            model_ids = openai_model_ids(response)
+            target_model = target_model_id or PRIMARY_MODEL_ID
+            target_ok = target_model_available(model_ids, target_model)
+            endpoint_ok = bool(response.get("ok"))
+            return {{
+                "available": bool(endpoint_ok and target_ok),
+                "endpoint_available": endpoint_ok,
+                "model_available": bool(target_ok),
+                "discovered_model_available": bool(model_ids),
+                "primary_model_available": bool(primary_model_available(model_ids)),
+                "target_model_available": bool(target_ok),
+                "label": label,
+                "provider_model": target_model,
+                "endpoint": endpoint,
+                "models": model_ids,
+                "health": endpoint_health(response),
+                "status": (
+                    "active"
+                    if endpoint_ok and target_ok
+                    else "model_not_available"
+                    if endpoint_ok
+                    else "endpoint_unavailable"
+                ),
+                "error": response.get("error", ""),
+            }}
+
+
+        def model_runtime():
+            vllm_endpoints = [
+                vllm_endpoint_runtime(8000, PRIMARY_MODEL_LABEL or PRIMARY_MODEL_ID or "vLLM"),
+                vllm_endpoint_runtime(8002, "DeepSeek R1 14B", DEEPSEEK_R1_MODEL_ID),
+            ]
+            vllm = next(
+                (
+                    item
+                    for item in vllm_endpoints
+                    if item.get("primary_model_available") or item.get("available")
+                ),
+                vllm_endpoints[0],
+            )
+            _local_ai_key = local_ai_tools_api_key()
+            _auth_h = {{"Authorization": f"Bearer {{_local_ai_key}}"}} if _local_ai_key else {{}}
+            local_status = http_json("http://127.0.0.1:8001/models/status", timeout=4, extra_headers=_auth_h)
+            local_health = http_json("http://127.0.0.1:8001/health", timeout=3, extra_headers=_auth_h)
             tools = local_status.get("data") if isinstance(local_status.get("data"), dict) else {{}}
             local_available = bool(local_status.get("ok") or local_health.get("ok"))
             return {{
-                "vllm": {{
-                    "available": bool(vllm.get("ok") and vllm_model_ok),
-                    "endpoint_available": bool(vllm.get("ok")),
-                    "model_available": bool(vllm_model_ok),
-                    "label": PRIMARY_MODEL_LABEL or PRIMARY_MODEL_ID or "Local LLM",
-                    "provider_model": PRIMARY_MODEL_ID,
-                    "endpoint": "127.0.0.1:8000/v1",
-                    "models": vllm_models,
-                    "health": endpoint_health(vllm),
-                    "status": (
-                        "active"
-                        if vllm.get("ok") and vllm_model_ok
-                        else "model_not_available"
-                        if vllm.get("ok")
-                        else "endpoint_unavailable"
-                    ),
-                    "error": vllm.get("error", ""),
-                }},
+                "vllm": vllm,
+                "vllm_endpoints": vllm_endpoints,
                 "local_ai_tools": {{
                     "available": local_available,
                     "endpoint": "127.0.0.1:8001",

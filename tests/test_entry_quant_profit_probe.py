@@ -106,3 +106,40 @@ def test_quant_profit_probe_rejects_after_post_score_fails() -> None:
     block = original.raw_response["quant_profit_probe_blocked"]
     assert block["blocked"] is True
     assert block["expected_net_return_pct"] == -0.1
+    assert "服务端盈利模型" in block["reason"]
+    assert "鏈" not in block["reason"]
+
+
+def test_quant_profit_probe_reads_wrapped_profit_payload() -> None:
+    candidate = _policy(
+        {
+            "score": 1.2,
+            "expected_net_return_pct": 0.5,
+            "profit_quality_ratio": 0.7,
+            "tail_risk_score": 0.4,
+        }
+    ).create(
+        _hold_decision(),
+        _fv(),
+        {},
+        None,
+        {
+            "profit_prediction": {
+                "ok": True,
+                "data": {
+                    "prediction": {
+                        "best_side": "long",
+                        "adjusted_long_return_pct": 0.80,
+                        "adjusted_short_return_pct": 0.10,
+                        "long_loss_probability": 0.35,
+                    }
+                },
+            }
+        },
+        None,
+    )
+
+    assert candidate is not None
+    assert candidate.action == Action.LONG
+    assert "服务端盈利模型" in candidate.reasoning
+    assert "鏈" not in candidate.reasoning

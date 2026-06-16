@@ -6,6 +6,7 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision
+from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
 
 class DecisionRepository(BaseRepository):
@@ -14,7 +15,7 @@ class DecisionRepository(BaseRepository):
     model = AIDecision
 
     async def log_decision(self, data: dict) -> AIDecision:
-        decision = AIDecision(**data)
+        decision = AIDecision(**_sanitize_decision_payload(data))
         self.session.add(decision)
         await self.session.flush()
         return decision
@@ -69,7 +70,7 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            decision.execution_reason = reason
+            decision.execution_reason = sanitize_text(reason)
             await self.session.flush()
         return decision
 
@@ -78,7 +79,7 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            decision.raw_llm_response = raw_response
+            decision.raw_llm_response = sanitize_payload(raw_response)
             await self.session.flush()
         return decision
 
@@ -100,8 +101,9 @@ class DecisionRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
+        clean_reason = sanitize_text(reason)
         for decision in rows:
-            decision.execution_reason = reason
+            decision.execution_reason = clean_reason
         if rows:
             await self.session.flush()
         return len(rows)
@@ -165,3 +167,14 @@ class DecisionRepository(BaseRepository):
         result = await self.session.execute(delete(AIDecision))
         await self.session.flush()
         return result.rowcount
+
+
+def _sanitize_decision_payload(data: dict) -> dict:
+    clean = dict(data or {})
+    for key in ("reasoning", "execution_reason"):
+        if key in clean:
+            clean[key] = sanitize_text(clean.get(key))
+    for key in ("feature_snapshot", "raw_llm_response"):
+        if key in clean:
+            clean[key] = sanitize_payload(clean.get(key))
+    return clean

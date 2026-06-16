@@ -61,6 +61,10 @@ def _decision(action: Action) -> DecisionOutput:
     )
 
 
+async def _async_value(value: Any) -> Any:
+    return value
+
+
 def test_ai_entry_candidate_evidence_exposes_profile_recency_to_model() -> None:
     service = TradingService.__new__(TradingService)
     profile = {
@@ -388,6 +392,42 @@ def test_new_pair_loss_pause_is_not_a_trading_service_private_rule():
     assert not hasattr(TradingService, "_cooldown_loss_pause_reason")
     assert not hasattr(TradingService, "_recent_loss_streak_pause_reason")
     assert not hasattr(service, "_cooldown_loss_pause_reason")
+
+
+@pytest.mark.asyncio
+async def test_new_pair_loss_cooldown_is_advisory_not_global_scan_pause():
+    service = TradingService.__new__(TradingService)
+    service._model_execution_modes = {}
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(
+            is_open=False,
+            get_state=lambda: {},
+        ),
+        position_checker=SimpleNamespace(
+            entry_capacity_reason=lambda **_kwargs: None,
+        ),
+    )
+    service.execution_allocation_state = lambda _mode: _async_value({"total_pnl": -20.0})
+    service._get_okx_balance_snapshot_for_mode = lambda _mode: _async_value(
+        {
+            "free": 1000.0,
+            "allocatable": 1000.0,
+            "equity": 1000.0,
+        }
+    )
+
+    class FakeLossPause:
+        async def cooldown_loss_pause_reason(self, *_args):
+            return "日内亏损冷却，仅降速"
+
+        async def recent_loss_streak_pause_reason(self, *_args):
+            return "连续亏损冷却，仅降速"
+
+    service.new_pair_loss_pause = FakeLossPause()
+
+    reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
+
+    assert reason is None
 
 
 def test_shadow_backtest_service_is_not_a_trading_service_private_rule():
@@ -893,23 +933,43 @@ async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_priva
     assert sizing["planned_stop_loss_usdt"] > 0
 
 
-def test_entry_opportunity_gate_blocks_strategy_learning_entry_pause():
+def test_entry_opportunity_gate_treats_strategy_learning_pause_as_advisory():
     decision = _decision(Action.LONG)
     decision.raw_response = {
         "strategy_learning_context": {
             "strategy_learning_entry_pause": True,
             "strategy_learning_entry_pause_reason": "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针。",
-        }
+        },
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.8,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.15,
+            "raw_expected_return_pct": 0.8,
+            "profit_quality_ratio": 1.0,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
     }
 
     reason = EntryOpportunityGatePolicy().gate_reason(decision)
 
-    assert reason is not None
-    assert "暂停新开仓探针" in reason
+    assert reason is None
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["strategy_learning_pause_is_hard_gate"] is False
+    assert opportunity["execution_advisory_warnings"][0]["blocks_entry"] is False
 
 
 @pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_skips_strategy_learning_when_entry_paused():
+async def test_entry_profit_risk_sizing_converts_strategy_learning_pause_to_probe():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0
 
@@ -959,9 +1019,71 @@ async def test_entry_profit_risk_sizing_skips_strategy_learning_when_entry_pause
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["applied"] is False
-    assert sizing["entry_paused"] is True
+    assert sizing["applied"] is True
+    assert sizing["entry_paused"] is False
+    assert sizing["strategy_learning_pause_is_hard_gate"] is False
+    assert sizing["recovery_probe_allowed"] is True
     assert sizing["reason"] == "策略护栏暂停新探针"
+    assert decision.position_size_pct <= 0.012
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_allows_recovery_probe_when_not_paused():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_entry_pause": False,
+            "strategy_learning_health_guard_active": True,
+            "strategy_learning_recovery_probe_allowed": True,
+            "strategy_learning_recovery_probe_reason": "fallback 依赖偏高，改为极小仓恢复探针",
+            "strategy_learning_sizing": {
+                "profile_id": "balanced_probe",
+                "position_size_multiplier": 0.8,
+                "probe_fraction": 0.05,
+                "max_probe_size_pct": 0.02,
+            },
+        },
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.8,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.15,
+            "raw_expected_return_pct": 0.8,
+            "profit_quality_ratio": 1.0,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
+    assert sizing["applied"] is True
+    assert not sizing.get("entry_paused", False)
+    assert sizing["health_guard_active"] is True
+    assert sizing["recovery_probe_allowed"] is True
+    assert sizing["probe_cap_applied"] is True
+    assert decision.position_size_pct <= 0.012
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1139,64 @@ async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
     assert sizing["profile_id"] == "balanced_probe"
     assert sizing["probe_cap_applied"] is True
     assert decision.position_size_pct <= 0.018
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_cap():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.06
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_release_pressure_active": True,
+            "strategy_learning_release_pressure_reason": "低质量仓位压力，先释放并只做小仓探针",
+            "strategy_learning_sizing": {
+                "profile_id": "loss_release",
+                "position_size_multiplier": 0.9,
+                "probe_fraction": 0.03,
+                "max_probe_size_pct": 0.014,
+                "side_overrides": {"long": {"size_multiplier": 0.8}},
+            },
+        },
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.8,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.15,
+            "raw_expected_return_pct": 0.8,
+            "profit_quality_ratio": 1.0,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
+    assert sizing["applied"] is True
+    assert sizing["profile_id"] == "loss_release"
+    assert sizing["probe_cap_applied"] is True
+    assert sizing["release_pressure_active"] is True
+    assert decision.position_size_pct <= 0.014
 
 
 @pytest.mark.asyncio

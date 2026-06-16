@@ -65,3 +65,53 @@ async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
     assert decision.raw_response
     assert decision.raw_response["provider_model"] == "qwen3-max"
     assert decision.raw_response["fallback_from"] == "plain-primary"
+
+
+@pytest.mark.asyncio
+async def test_fast_independent_expert_uses_short_json_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_calls: list[dict[str, Any]] = []
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def ainvoke(self, messages: list[Any]) -> SimpleNamespace:
+            captured_calls.append({"kwargs": self.kwargs, "messages": messages})
+            return SimpleNamespace(
+                content=(
+                    '{"action":"hold","confidence":0.55,"reasoning":"???????",'
+                    '"position_size_pct":0,"suggested_leverage":1,'
+                    '"stop_loss_pct":0.05,"take_profit_pct":0.1,"cross_check_for":null}'
+                )
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="risk_expert",
+        api_config={
+            "api_base": "http://llm.test/v1",
+            "api_key": "test-key",
+            "model": "deepseek-r1-14b-risk",
+            "role": "risk_anomaly",
+        },
+    )
+    await agent.initialize()
+
+    decision = await agent.decide(
+        FeatureVector(symbol="SOL/USDT", current_price=150.0),
+        {"expert_mode": True, "_force_fast_independent_expert": True},
+    )
+
+    assert decision.action.value == "hold"
+    assert captured_calls
+    kwargs = captured_calls[-1]["kwargs"]
+    assert kwargs["timeout"] <= 12.0
+    assert kwargs["max_tokens"] <= 220
+    assert kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
+    assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    prompt_text = str(captured_calls[-1]["messages"][1].content)
+    assert "FAST_EXPERT_JSON_V1" not in prompt_text
+    assert "Return JSON only" in prompt_text
+    assert len(prompt_text) < 1400

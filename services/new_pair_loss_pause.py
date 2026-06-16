@@ -109,12 +109,12 @@ class NewPairLossPausePolicy:
             return None
 
         return (
-            "New-pair analysis paused by realized daily loss guard. "
+            "New-pair analysis slowed by realized daily loss guard. "
             f"Today equity PnL {day_risk_pnl:.2f} USDT, "
             f"realized {today_realized:.2f} USDT, open floating {open_unrealized:.2f} USDT. "
             f"Trigger is {cooldown_loss_pct * 100:.0f}% of max daily loss "
             f"{max_loss_usdt:.2f} USDT = {trigger_loss:.2f} USDT. "
-            "Existing positions will continue to be reviewed."
+            "Market scanning remains active with tighter sizing; existing positions continue review."
         )
 
     async def recent_loss_streak_pause_reason(
@@ -123,7 +123,7 @@ class NewPairLossPausePolicy:
         max_loss_usdt: float,
         cooldown_loss_pct: float,
     ) -> str | None:
-        """Pause briefly after a fresh losing streak exceeds the cooldown line."""
+        """Advise tighter sizing after a fresh losing streak exceeds the cooldown line."""
         if max_loss_usdt <= 0 or cooldown_loss_pct <= 0:
             return None
 
@@ -169,12 +169,12 @@ class NewPairLossPausePolicy:
 
         remaining = max(self.loss_streak_pause_minutes - minutes_since_latest, 0.0)
         return (
-            "New-pair analysis paused by consecutive realized losses. "
-            f"Pause remains about {remaining:.0f} minutes. "
+            "New-pair analysis slowed by consecutive realized losses. "
+            f"Recovery caution remains about {remaining:.0f} minutes. "
             f"Recent losing streak: {streak} trades, total loss {streak_loss:.2f} USDT. "
             f"Trigger is {cooldown_loss_pct * 100:.0f}% of max daily loss "
             f"{max_loss_usdt:.2f} USDT = {trigger_loss:.2f} USDT. "
-            "Existing positions will continue to be monitored."
+            "Market scanning remains active with tighter sizing; existing positions continue review."
         )
 
     async def _position_records(

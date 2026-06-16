@@ -49,6 +49,7 @@ from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
 from services.decision_freshness import DecisionFreshnessPolicy
 from services.decision_persistence_service import DecisionPersistenceService
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
+from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
 from services.entry_candidate_queue import EntryCandidateQueuePolicy
@@ -150,9 +151,12 @@ from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
 from services.position_group_aggregator import PositionGroupAggregator
 from services.position_margin import PositionMarginCalculator
+from services.position_open_time import position_open_time
 from services.position_profit_peak_context import PositionProfitPeakContextPolicy
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
+from services.position_quality import PositionQualityScorer
+from services.position_release_decision import PositionReleaseDecisionPolicy
 from services.position_review_batch import PositionReviewBatchPolicy
 from services.position_review_decision_normalizer import PositionReviewDecisionNormalizer
 from services.position_review_decision_processor import PositionReviewDecisionProcessor
@@ -299,7 +303,13 @@ class TradingService:
         self.models = model_registry
         self.ensemble = EnsembleCoordinator(model_registry)
         self.data_service = data_service
-        self.risk_engine = RiskEngine()
+        self.position_quality_scorer = PositionQualityScorer()
+        self.dynamic_capacity = DynamicPositionCapacityPolicy(
+            lambda: settings.max_open_positions_per_model,
+            quality_scorer=self.position_quality_scorer,
+        )
+        self._current_capacity_context = self.dynamic_capacity.evaluate(open_positions=[]).as_dict()
+        self.risk_engine = RiskEngine(max_open_positions_provider=self._dynamic_capacity_context)
         self.market_decision_risk_assessment = MarketDecisionRiskAssessmentPolicy(
             risk_engine=self.risk_engine,
             account_balance_provider=self.get_account_balance,
@@ -584,6 +594,7 @@ class TradingService:
             position_peak_key=self.position_profit_peaks.key,
             position_peaks_provider=lambda: self.position_profit_peaks.peaks,
             predictive_reversal=self.exit_predictive_reversal,
+            quality_scorer=self.position_quality_scorer,
             urgent_exit_markers=POSITION_REVIEW_URGENT_EXIT_MARKERS,
         )
         self.position_review_batch = PositionReviewBatchPolicy(
@@ -634,7 +645,7 @@ class TradingService:
         )
         self.entry_capacity = EntryCapacityPolicy(
             self._normalize_position_symbol,
-            lambda: settings.max_open_positions_per_model,
+            self._dynamic_capacity_context,
         )
         self.entry_position_exposure = EntryPositionExposurePolicy()
         self.entry_market_regime = EntryMarketRegimePolicy(
@@ -821,7 +832,7 @@ class TradingService:
         self.okx_executor: OKXExecutor | None = None  # kept for backward compat
         self._okx_paper: OKXExecutor | None = None
         self._okx_live: OKXExecutor | None = None
-        self._model_execution_modes: dict[str, str] = {}  # model_name 鈫?"paper"/"live"
+        self._model_execution_modes: dict[str, str] = {}  # model_name -> "paper"/"live"
 
         self._running = False
         self._decision_count = 0
@@ -1845,6 +1856,59 @@ class TradingService:
             return policy
         return EntryStrategyModeContextPolicy()
 
+    def _dynamic_capacity_context(self) -> dict[str, Any]:
+        context = getattr(self, "_current_capacity_context", None)
+        if isinstance(context, dict):
+            return dict(context)
+        fallback = int(settings.max_open_positions_per_model or 0)
+        return {
+            "entry_limit": fallback,
+            "effective_limit": fallback,
+            "base_limit": fallback,
+        }
+
+    def _dynamic_capacity_policy(self) -> DynamicPositionCapacityPolicy:
+        policy = getattr(self, "dynamic_capacity", None)
+        if policy is not None:
+            return policy
+        scorer = getattr(self, "position_quality_scorer", None)
+        if scorer is None:
+            scorer = PositionQualityScorer()
+            self.position_quality_scorer = scorer
+        policy = DynamicPositionCapacityPolicy(
+            lambda: settings.max_open_positions_per_model,
+            quality_scorer=scorer,
+        )
+        self.dynamic_capacity = policy
+        return policy
+
+    def _refresh_dynamic_capacity(
+        self,
+        *,
+        open_positions: list[dict[str, Any]],
+        strategy_context: dict[str, Any],
+        market_regime: dict[str, Any],
+        account_equity: float,
+    ) -> dict[str, Any]:
+        decision = (
+            self._dynamic_capacity_policy()
+            .evaluate(
+                open_positions=open_positions or [],
+                strategy_context=strategy_context,
+                market_regime=market_regime,
+                account_equity=account_equity,
+                active_strategy_profile_id=strategy_context.get("strategy_profile_id") or None,
+            )
+            .as_dict()
+        )
+        self._current_capacity_context = decision
+        strategy_context["dynamic_position_capacity"] = decision
+        strategy_context["account_equity"] = account_equity
+        strategy_context["max_open_positions_base"] = decision.get("base_limit")
+        strategy_context["max_open_positions_effective"] = decision.get("effective_limit")
+        strategy_context["max_open_positions_entry"] = decision.get("entry_limit")
+        return strategy_context
+
     async def _strategy_mode_context(
         self,
         mode: str,
@@ -1883,15 +1947,27 @@ class TradingService:
             account_equity=account_equity,
             account_config=settings.get_execution_account_config(selected_mode),
         )
+        context["account_equity"] = account_equity
         strategy_learning = getattr(self, "strategy_learning_service", None)
         if strategy_learning is None:
-            return context
+            return self._refresh_dynamic_capacity(
+                open_positions=open_positions or [],
+                strategy_context=context,
+                market_regime=market_regime,
+                account_equity=account_equity,
+            )
         try:
-            return await strategy_learning.apply_to_strategy_context(
+            learned_context = await strategy_learning.apply_to_strategy_context(
                 mode=selected_mode,
                 strategy_context=context,
                 open_positions=open_positions or [],
                 max_open_positions=int(settings.max_open_positions_per_model or 20),
+            )
+            return self._refresh_dynamic_capacity(
+                open_positions=open_positions or [],
+                strategy_context=learned_context,
+                market_regime=market_regime,
+                account_equity=account_equity,
             )
         except Exception as exc:
             logger.warning(
@@ -1899,7 +1975,12 @@ class TradingService:
                 error=safe_error_text(exc),
             )
             context["strategy_learning_error"] = safe_error_text(exc, limit=160)
-            return context
+            return self._refresh_dynamic_capacity(
+                open_positions=open_positions or [],
+                strategy_context=context,
+                market_regime=market_regime,
+                account_equity=account_equity,
+            )
 
     def _attach_strategy_learning_context(
         self,
@@ -1920,6 +2001,28 @@ class TradingService:
             "strategy_learning_entry_pause_reason": strategy_mode_context.get(
                 "strategy_learning_entry_pause_reason", ""
             ),
+            "strategy_learning_execution_guard_active": strategy_mode_context.get(
+                "strategy_learning_execution_guard_active", False
+            ),
+            "strategy_learning_execution_guard_reason": strategy_mode_context.get(
+                "strategy_learning_execution_guard_reason", ""
+            ),
+            "strategy_learning_release_pressure_active": strategy_mode_context.get(
+                "strategy_learning_release_pressure_active", False
+            ),
+            "strategy_learning_release_pressure_reason": strategy_mode_context.get(
+                "strategy_learning_release_pressure_reason", ""
+            ),
+            "strategy_learning_health_guard_active": strategy_mode_context.get(
+                "strategy_learning_health_guard_active", False
+            ),
+            "strategy_learning_recovery_probe_allowed": strategy_mode_context.get(
+                "strategy_learning_recovery_probe_allowed", False
+            ),
+            "strategy_learning_recovery_probe_reason": strategy_mode_context.get(
+                "strategy_learning_recovery_probe_reason", ""
+            ),
+            "strategy_learning_sizing": strategy_mode_context.get("strategy_learning_sizing", {}),
             "strategy_learning": strategy_mode_context.get("strategy_learning"),
         }
         decision.raw_response = raw
@@ -2427,14 +2530,19 @@ class TradingService:
         if not self._running:
             return {"status": "stopped"}
 
-        if mode_manager.is_paused:
-            return {"status": "paused"}
-
         analysis_scope = (
             analysis_scope if analysis_scope in {"full", "market", "position"} else "full"
         )
         run_market_analysis = analysis_scope in {"full", "market"}
         run_position_analysis = analysis_scope in {"full", "position"}
+        account_pause_reason = ""
+        if mode_manager.is_paused:
+            account_pause_reason = (
+                "当前执行账户已暂停投资：停止新开仓和新交易对分析，"
+                "已有仓位继续复盘直到触发正常平仓。"
+            )
+            run_market_analysis = False
+            run_position_analysis = analysis_scope in {"full", "position"}
         new_pair_market_pause_applied = False
         round_start = datetime.now(UTC)
         results: dict[str, Any] = {
@@ -2475,6 +2583,8 @@ class TradingService:
                 ENSEMBLE_TRADER_NAME,
                 open_positions=open_positions,
             )
+            if account_pause_reason:
+                new_pair_pause_reason = account_pause_reason
             await self._record_new_pair_pause_state(ENSEMBLE_TRADER_NAME, new_pair_pause_reason)
             if new_pair_pause_reason and run_market_analysis:
                 new_pair_market_pause_applied = True
@@ -2494,6 +2604,14 @@ class TradingService:
                 # The account guard is only meant to stop opening new symbols.
                 # Existing positions still need SL/TP enforcement and AI review.
                 run_market_analysis = False
+            elif account_pause_reason:
+                results["warnings"].append(
+                    {
+                        "model": ENSEMBLE_TRADER_NAME,
+                        "symbol": "ALL",
+                        "warning": account_pause_reason,
+                    }
+                )
 
             # 1. Determine which symbols to process based on scan mode
             self._set_loop_stage("select_symbols")
@@ -2668,6 +2786,14 @@ class TradingService:
                 if mode_manager.is_auto_scan
                 else len(market_feature_vectors)
             )
+            market_regime_context = self._market_regime_context(
+                market_feature_vectors or feature_vectors
+            )
+            strategy_mode_context = await self._strategy_mode_context(
+                self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
+                market_regime_context,
+                open_positions,
+            )
             analysis_budget_context = self._position_review_budget_context(
                 open_positions,
                 feature_vectors,
@@ -2675,6 +2801,7 @@ class TradingService:
                 run_position_analysis=run_position_analysis,
                 run_market_analysis=run_market_analysis,
                 new_pair_pause_reason=new_pair_pause_reason,
+                strategy_context=strategy_mode_context,
             )
             market_symbol_budget = int(analysis_budget_context.get("market_symbol_limit") or 0)
             if run_market_analysis and market_feature_vectors:
@@ -2702,20 +2829,13 @@ class TradingService:
                 market_symbol_limit=analysis_budget_context.get("market_symbol_limit"),
                 forced_exit_groups=analysis_budget_context.get("forced_exit_groups"),
                 priority_groups=analysis_budget_context.get("priority_groups"),
+                target_position_groups=analysis_budget_context.get("target_position_groups"),
+                budget_source=analysis_budget_context.get("budget_source"),
                 reason=analysis_budget_context.get("reason"),
             )
             if mode_manager.is_auto_scan and market_feature_vectors:
                 # Already ranked by the dynamic analysis budget above.
                 pass
-
-            market_regime_context = self._market_regime_context(
-                market_feature_vectors or feature_vectors
-            )
-            strategy_mode_context = await self._strategy_mode_context(
-                self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
-                market_regime_context,
-                open_positions,
-            )
             strategy_mode_context["analysis_budget"] = analysis_budget_context
             logger.info(
                 "market regime prediction",
@@ -2755,6 +2875,12 @@ class TradingService:
                         ),
                         claimed_analysis_symbols=claimed_analysis_symbols,
                     )
+                )
+                strategy_mode_context = self._refresh_dynamic_capacity(
+                    open_positions=open_positions,
+                    strategy_context=strategy_mode_context,
+                    market_regime=market_regime_context,
+                    account_equity=float(strategy_mode_context.get("account_equity") or 0.0),
                 )
 
             # 3. Collect all entry decisions from all symbols/models
@@ -4476,7 +4602,9 @@ class TradingService:
             adx_14 = self._safe_float(getattr(fv, "adx_14", 0) if fv is not None else 0, 0.0)
             high_24h = self._safe_float(getattr(fv, "high_24h", 0) if fv is not None else 0, 0.0)
             low_24h = self._safe_float(getattr(fv, "low_24h", 0) if fv is not None else 0, 0.0)
-            hold_minutes = self.position_time.position_age_minutes(pos.get("created_at"))
+            hold_minutes = self.position_time.position_age_minutes(
+                position_open_time(pos) or pos.get("created_at")
+            )
             feature_price_suspicious_reason = (
                 self.exit_fast_risk.suspicious_feature_price_reason(
                     side=side,
@@ -4873,10 +5001,17 @@ class TradingService:
 
         grouped_items = list(grouped.items())
         portfolio_profit_context = self._portfolio_profit_protection_context(open_positions)
+        market_regime_context = self._market_regime_context(feature_vectors)
+        strategy_mode_context = await self._strategy_mode_context(
+            self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
+            market_regime_context,
+            open_positions,
+        )
         fast_scan = self._scan_position_review_groups(
             grouped_items,
             feature_vectors,
             portfolio_profit_context,
+            strategy_mode_context,
         )
         batch_selection = self._position_review_batch_policy().select(
             grouped_items,
@@ -4925,13 +5060,6 @@ class TradingService:
                     )[:8]
                 ],
             )
-        market_regime_context = self._market_regime_context(feature_vectors)
-        strategy_mode_context = await self._strategy_mode_context(
-            self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
-            market_regime_context,
-            open_positions,
-        )
-
         for (model_name, symbol), positions in grouped_items:
             normalized_symbol = self._normalize_position_symbol(symbol)
             portfolio_symbol_context = self._portfolio_profit_protection_symbol_context(
@@ -4956,7 +5084,54 @@ class TradingService:
                         model=model_name,
                         error=safe_error_text(exc),
                     )
+                    fv = None
+
+            scan = fast_scan.get((model_name, symbol), {})
+            release_policy = self._position_release_decision_policy()
+            if release_policy.should_release(scan):
+                release_decision = release_policy.build(
+                    model_name=model_name,
+                    symbol=symbol,
+                    positions=positions,
+                    scan=scan,
+                    feature_vector=fv,
+                )
+                if isinstance(release_decision, DecisionOutput):
+                    model_mode = self._get_model_execution_mode(model_name)
+                    decision_db_id = await self._log_decision(
+                        release_decision,
+                        is_paper=(model_mode == "paper"),
+                    )
+                    self._decision_count += 1
+                    if decision_db_id is not None and round_decision_ids is not None:
+                        round_decision_ids.add(decision_db_id)
+                    handled_keys.add((model_name, self._normalize_position_symbol(symbol)))
+                    risk_alert = self.position_review_risk_alert_policy.build_alert(
+                        release_decision,
+                        positions,
+                    )
+                    if risk_alert:
+                        self.position_review_risk_alert_policy.attach(
+                            release_decision,
+                            risk_alert,
+                        )
+                    process_result = await self.position_review_decision_processor.process(
+                        decision=release_decision,
+                        model_name=model_name,
+                        symbol=symbol,
+                        model_mode=model_mode,
+                        decision_db_id=decision_db_id,
+                        open_positions=open_positions,
+                        feature_vector=fv,
+                        position_entry_pause_reason=position_entry_pause_reason,
+                        risk_alert=risk_alert,
+                        results=results,
+                    )
+                    if process_result.candidate is not None:
+                        candidates.append(process_result.candidate)
                     continue
+            if fv is None:
+                continue
 
             try:
                 decision_result = await self.position_review_decision_service.decide(
@@ -5059,6 +5234,7 @@ class TradingService:
         grouped_items: list[tuple[tuple[str, str], list[dict]]],
         feature_vectors: dict[str, Any],
         portfolio_profit_context: dict[str, Any] | None = None,
+        strategy_context: dict[str, Any] | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         """Fast pass over every open position before spending AI time.
 
@@ -5070,6 +5246,7 @@ class TradingService:
             grouped_items,
             feature_vectors,
             portfolio_profit_context,
+            strategy_context,
             aggregate_position_group=self._position_group_aggregator_policy().aggregate,
         )
 
@@ -5083,6 +5260,14 @@ class TradingService:
         return PositionReviewBatchPolicy(
             urgent_exit_checker=self._is_urgent_position_exit_scan,
         )
+
+    def _position_release_decision_policy(self) -> PositionReleaseDecisionPolicy:
+        policy = getattr(self, "position_release_decision", None)
+        if policy is not None:
+            return policy
+        policy = PositionReleaseDecisionPolicy()
+        self.position_release_decision = policy
+        return policy
 
     def _analysis_budget_policy(self) -> AnalysisBudgetPolicy:
         policy = getattr(self, "analysis_budget", None)
@@ -5106,6 +5291,7 @@ class TradingService:
         run_position_analysis: bool,
         run_market_analysis: bool,
         new_pair_pause_reason: str | None = None,
+        strategy_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate slow AI work between position protection and new entries."""
         return self._analysis_budget_policy().context(
@@ -5115,6 +5301,7 @@ class TradingService:
             run_position_analysis=run_position_analysis,
             run_market_analysis=run_market_analysis,
             new_pair_pause_reason=new_pair_pause_reason,
+            strategy_context=strategy_context,
         )
 
     def _portfolio_profit_protection_policy(self) -> PortfolioProfitProtectionPolicy:
@@ -5306,14 +5493,20 @@ class TradingService:
             cooldown_loss_pct,
         )
         if cooldown_loss_reason:
-            return cooldown_loss_reason
+            logger.info(
+                "loss cooldown is advisory; market scan remains active with tighter sizing",
+                reason=cooldown_loss_reason,
+            )
         loss_streak_reason = await self.new_pair_loss_pause.recent_loss_streak_pause_reason(
             model_mode,
             max_loss_usdt,
             cooldown_loss_pct,
         )
         if loss_streak_reason:
-            return loss_streak_reason
+            logger.info(
+                "recent loss streak is advisory; market scan remains active with tighter sizing",
+                reason=loss_streak_reason,
+            )
         return None
 
     async def _record_new_pair_pause_state(self, model_name: str, reason: str | None) -> None:
@@ -5341,7 +5534,7 @@ class TradingService:
             )
 
     def _refresh_model_modes(self) -> None:
-        """Rebuild model_name 鈫?execution_mode mapping from current settings."""
+        """Rebuild model_name -> execution_mode mapping from current settings."""
         self._model_execution_modes = {ENSEMBLE_TRADER_NAME: mode_manager.mode.value}
         for cfg in settings.ai_models:
             self._model_execution_modes[cfg.get("name", "")] = cfg.get("execution_mode", "paper")

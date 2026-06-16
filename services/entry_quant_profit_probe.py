@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+    first_tool_payload,
+    payload_side,
+    signal_available,
+)
 from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryQuantProfitProbeParams
 
@@ -24,6 +30,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _profit_signal(local_ai_tools_context: dict[str, Any] | None) -> dict[str, Any]:
+    tools = local_ai_tools_context if isinstance(local_ai_tools_context, dict) else {}
+    if not tools:
+        return {}
+    return first_tool_payload(
+        {"local_ai_tools": tools},
+        "profit_prediction",
+        "profit_model",
+        "server_profit",
+        "server_profit_model",
+        "profit",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,25 +66,16 @@ class EntryQuantProfitProbePolicy:
         if not original.is_hold:
             return None
         tools = local_ai_tools_context if isinstance(local_ai_tools_context, dict) else {}
-        profit = _safe_dict(tools.get("profit_prediction"))
-        if not profit or profit.get("available", True) is False:
+        profit = _profit_signal(local_ai_tools_context)
+        if not signal_available(profit):
             return None
-        side = str(profit.get("best_side") or "").lower()
+        side = payload_side(profit)
         if side not in {"long", "short"}:
             return None
 
-        side_expected = _safe_float(
-            profit.get(f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")),
-            0.0,
-        )
+        side_expected = signal_expected_return_pct(profit, side)
         opposite = "short" if side == "long" else "long"
-        opposite_expected = _safe_float(
-            profit.get(
-                f"adjusted_{opposite}_return_pct",
-                profit.get(f"{opposite}_expected_return_pct"),
-            ),
-            0.0,
-        )
+        opposite_expected = signal_expected_return_pct(profit, opposite)
         edge = side_expected - opposite_expected
         loss_probability = _safe_float(profit.get(f"{side}_loss_probability"), 0.50)
         strategy_context = _safe_dict(strategy)

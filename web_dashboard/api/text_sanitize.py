@@ -158,8 +158,8 @@ def _business_rewrite(text: str) -> str | None:
         return "交易接口未返回执行结果，系统没有拿到 OKX 订单号，也没有生成本地订单；本次裁决已按未执行处理。"
     if "OKX 涓嬪崟" in text and "瓒呮椂" in text:
         return "OKX 下单或确认超时，系统没有拿到最终订单结果；本次裁决已按未执行处理。"
-    if "浠婃棩鐩堝埄" in text and "淇濇姢" in text:
-        return "今日盈利回落触发目标保护线，暂停新开仓，优先守住已实现利润；已有持仓仍会继续复盘、止盈止损和平仓处理。"
+    if "浠婃棩鐩堜" in text and "淇濇姢" in text:
+        return "今日盈利回落触发目标保护线，系统将降低新开仓节奏，优先守住已实现利润；已有持仓仍会继续复盘、止盈止损和平仓处理。"
     if "鍖椾含鏃堕棿浠婃棩" in text:
         return "北京时间今日同向参与表现已用于调整专家权重。"
     if "鏆傛棤瓒冲" in text:
@@ -232,6 +232,8 @@ def sanitize_text(value: Any) -> Any:
         text = text.replace(src, dst)
     text = text.replace("銆?", "。").replace("锛?", "，").replace("锛屾", "，").replace("锛", "，")
     text = text.replace("�?", "。").replace("€?", "。")
+    if text.endswith("。?"):
+        text = text[:-1]
     if looks_mojibake(text) and _mojibake_score(text) >= 6:
         return "该笔历史记录的原始说明已损坏，无法准确还原；请以当前执行状态、成交价格和 OKX 订单状态为准。"
     return text

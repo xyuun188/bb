@@ -36,9 +36,16 @@ from core.model_runtime import (
     is_openai_reasoning_model,
     is_qwen3_model,
     non_thinking_extra_body,
+    supports_batch_expert_json,
     uses_thinking_tags,
 )
 from core.safe_output import safe_error_text
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+    first_tool_payload,
+    payload_side,
+    signal_available,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -290,10 +297,18 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
     status = str(tools.get("status") or "unknown")
     parts = [f"Local AI quant tools: status={status}."]
 
-    profit = tools.get("profit_prediction")
-    if isinstance(profit, dict) and profit.get("available", True) is not False:
-        best_side = profit.get("best_side") or profit.get("side") or profit.get("direction")
-        expected = profit.get("expected_return_pct", profit.get("best_expected_return_pct"))
+    tool_context = {"local_ai_tools": tools}
+    profit = first_tool_payload(
+        tool_context,
+        "profit_prediction",
+        "profit_model",
+        "server_profit",
+        "server_profit_model",
+        "profit",
+    )
+    if signal_available(profit):
+        best_side = payload_side(profit) or profit.get("direction")
+        expected = signal_expected_return_pct(profit, str(best_side or ""))
         edge = profit.get("profit_edge_pct", profit.get("edge_pct"))
         quality = profit.get("profit_quality_score", profit.get("score"))
         parts.append(
@@ -304,10 +319,19 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
             f"quality={_fmt_num(quality, 4)}."
         )
 
-    ts = tools.get("time_series_prediction")
-    if isinstance(ts, dict) and ts.get("available", True) is not False:
-        trend = ts.get("trend") or ts.get("direction") or ts.get("forecast_direction")
+    ts = first_tool_payload(
+        tool_context,
+        "time_series_prediction",
+        "timeseries_prediction",
+        "sequence_prediction",
+        "timeseries",
+        "time_series",
+    )
+    if signal_available(ts):
+        trend = payload_side(ts) or ts.get("trend") or ts.get("direction") or ts.get("forecast_direction")
         move = ts.get("expected_move_pct", ts.get("forecast_return_pct"))
+        if move is None:
+            move = signal_expected_return_pct(ts, str(trend or ""))
         confidence = ts.get("confidence", ts.get("score"))
         parts.append(
             "Time-series model: "
@@ -316,9 +340,15 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
             f"confidence={_fmt_num(confidence, 3)}."
         )
 
-    sentiment = tools.get("sentiment_analysis")
-    if isinstance(sentiment, dict) and sentiment.get("available", True) is not False:
-        label = sentiment.get("label") or sentiment.get("sentiment") or sentiment.get("direction")
+    sentiment = first_tool_payload(
+        tool_context,
+        "sentiment_analysis",
+        "sentiment_prediction",
+        "sentiment_model",
+        "sentiment",
+    )
+    if signal_available(sentiment):
+        label = sentiment.get("label") or sentiment.get("sentiment") or payload_side(sentiment)
         score = sentiment.get("score", sentiment.get("sentiment_score"))
         risk = sentiment.get("risk_level", sentiment.get("risk"))
         parts.append(
@@ -876,10 +906,45 @@ def _calibrate_sentiment_decision(
     return decision
 
 
-BATCH_EXPERT_SYSTEM_PROMPT = """You are a five-expert crypto trading committee in one local model call.
-Return ONLY one complete compact JSON object with key "experts".
-No markdown, no code fences, no <think>, no prose outside JSON.
-Each reasoning field must be concise but useful: 12-32 Chinese characters covering evidence, main risk, profit quality, and action rationale."""
+_FAST_EXPERT_SYSTEM_PROMPT = """FAST_EXPERT_JSON_V1. Return only one compact JSON object. No markdown, no prose, no <think>.
+Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}
+Weak or conflicting evidence => hold with confidence <=0.55."""
+
+
+def _fast_feature_text(feature_text: str, *, limit: int = 900) -> str:
+    """Return the highest-signal prefix of an expert feature context."""
+    compact = " ".join(str(feature_text or "").replace("\n", "; ").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _build_fast_expert_user_prompt(
+    role: str,
+    feature_context: str,
+    positions_text: str = "",
+    confidence_threshold: float = 0.65,
+) -> str:
+    """Build the bounded prompt used for provider independent retries."""
+    role_hint = {
+        "trend_direction": "只判断短线方向和趋势质量。",
+        "profit_quality": "只判断预期净收益、亏损概率和盈亏质量。",
+        "short_timeseries": "只判断未来短线方向、动量和回撤风险。",
+        "position_exit": "只判断现有仓位继续持有、减仓或平仓。",
+        "risk_anomaly": "只判断异常波动、流动性和硬风险。",
+    }.get(role or "", "只给本专家职责内结论。")
+    position_section = (
+        f" positions={_fast_feature_text(positions_text, limit=260)}" if positions_text else ""
+    )
+    return (
+        f"role={role}; threshold={confidence_threshold}; {role_hint} "
+        f"data={feature_context}{position_section}. "
+        "Return JSON only. reasoning <=36 Chinese chars. cross_check_for null unless one concrete uncertainty."
+    )
+
+
+BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested JSON object. No markdown, no prose, no <think>.
+Use short Chinese reasoning. Prefer hold when evidence is weak."""
 
 
 class LLMAgent(AbstractAIModel):
@@ -923,7 +988,12 @@ class LLMAgent(AbstractAIModel):
         )
 
     def _create_llm(
-        self, model: str, max_completion_tokens_override: int | None = None
+        self,
+        model: str,
+        max_completion_tokens_override: int | None = None,
+        *,
+        json_response: bool = False,
+        fast_expert: bool = False,
     ) -> ChatOpenAI:
         reasoning_model = _is_reasoning_model(model)
         configured_timeout = (
@@ -931,10 +1001,18 @@ class LLMAgent(AbstractAIModel):
             if self._role == "final_decision"
             else settings.ai_expert_timeout_seconds
         )
-        request_timeout = max(
-            float(configured_timeout or 0.0),
-            45.0 if reasoning_model or _uses_thinking_tags(model) else 30.0,
-        )
+        try:
+            configured_timeout_value = float(configured_timeout or 0.0)
+        except (TypeError, ValueError):
+            configured_timeout_value = 0.0
+        if fast_expert:
+            request_timeout = min(max(configured_timeout_value or 10.0, 6.0), 12.0)
+        elif max_completion_tokens_override is not None:
+            request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 26.0)
+        elif self._role == "final_decision":
+            request_timeout = min(max(configured_timeout_value or 20.0, 8.0), 26.0)
+        else:
+            request_timeout = min(max(configured_timeout_value or 28.0, 8.0), 30.0)
         configured_max_tokens = (
             settings.ai_decision_maker_max_completion_tokens
             if self._role == "final_decision"
@@ -945,10 +1023,14 @@ class LLMAgent(AbstractAIModel):
             if max_completion_tokens_override is not None
             else ("decision_maker" if self._role == "final_decision" else "expert")
         )
+        requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
+        if fast_expert:
+            requested_tokens = min(int(requested_tokens or 0), 220)
         max_completion_tokens = completion_token_limit(
             token_stage,
-            int(max_completion_tokens_override or configured_max_tokens or 0),
-            floor=180,
+            int(requested_tokens or 0),
+            floor=96 if fast_expert else 180,
+            model=model,
         )
         kwargs: dict[str, Any] = {
             "base_url": self._base_url,
@@ -966,6 +1048,14 @@ class LLMAgent(AbstractAIModel):
             kwargs["max_tokens"] = max_completion_tokens
         if _uses_thinking_tags(model):
             kwargs["extra_body"] = non_thinking_extra_body()
+        if fast_expert:
+            model_kwargs = dict(kwargs.get("model_kwargs") or {})
+            model_kwargs["response_format"] = {"type": "json_object"}
+            kwargs["model_kwargs"] = model_kwargs
+        elif json_response and not _uses_thinking_tags(model):
+            model_kwargs = dict(kwargs.get("model_kwargs") or {})
+            model_kwargs["response_format"] = {"type": "json_object"}
+            kwargs["model_kwargs"] = model_kwargs
         return ChatOpenAI(**kwargs)
 
     async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
@@ -982,12 +1072,20 @@ class LLMAgent(AbstractAIModel):
         if self._llm is None:
             await self.initialize()
 
+        fast_expert_mode = bool(
+            expert_mode
+            and not decision_maker_mode
+            and context.get("_force_fast_independent_expert")
+        )
+
         # Build the user prompt from features. Expert mode receives a compact
         # role-filtered context to keep multi-expert token cost under control.
         if decision_maker_mode:
             feature_text = _build_compact_feature_context(features, "final_decision")
         elif expert_mode:
             feature_text = _build_compact_feature_context(features, self._role)
+            if fast_expert_mode:
+                feature_text = _fast_feature_text(feature_text)
         else:
             feature_text = features.to_llm_context()
 
@@ -1024,17 +1122,18 @@ class LLMAgent(AbstractAIModel):
         local_tools_text = ""
         if (
             expert_mode
+            and not fast_expert_mode
             and context.get("local_ai_tools")
             and context.get("local_ai_tools_prompt_enabled", True)
         ):
             local_tools_text = _format_local_ai_tools(context.get("local_ai_tools") or {})
         entry_candidate_text = ""
-        if expert_mode and context.get("entry_candidate_evidence"):
+        if expert_mode and not fast_expert_mode and context.get("entry_candidate_evidence"):
             entry_candidate_text = _format_entry_candidate_evidence(
                 context.get("entry_candidate_evidence") or {}
             )
         portfolio_profit_text = ""
-        if expert_mode and context.get("portfolio_profit_protection"):
+        if expert_mode and not fast_expert_mode and context.get("portfolio_profit_protection"):
             portfolio_profit_text = _format_portfolio_profit_protection(
                 context.get("portfolio_profit_protection") or {}
             )
@@ -1051,24 +1150,33 @@ class LLMAgent(AbstractAIModel):
             )
             user_prompt = build_close_prompt(feature_text, pos_desc)
         elif expert_mode:
-            user_prompt = build_expert_user_prompt(
-                self._role,
-                feature_text,
-                "\n".join(
-                    part
-                    for part in (
-                        positions_text,
-                        memories_text,
-                        regime_text,
-                        strategy_text,
-                        entry_candidate_text,
-                        local_tools_text,
-                        portfolio_profit_text,
-                    )
-                    if part
-                ),
-                settings.confidence_threshold,
+            extra_context = "\n".join(
+                part
+                for part in (
+                    positions_text,
+                    memories_text,
+                    regime_text,
+                    strategy_text,
+                    entry_candidate_text,
+                    local_tools_text,
+                    portfolio_profit_text,
+                )
+                if part
             )
+            if fast_expert_mode:
+                user_prompt = _build_fast_expert_user_prompt(
+                    self._role,
+                    feature_text,
+                    positions_text,
+                    settings.confidence_threshold,
+                )
+            else:
+                user_prompt = build_expert_user_prompt(
+                    self._role,
+                    feature_text,
+                    extra_context,
+                    settings.confidence_threshold,
+                )
         else:
             user_prompt = build_user_prompt(
                 feature_text, positions_text, settings.confidence_threshold
@@ -1078,9 +1186,13 @@ class LLMAgent(AbstractAIModel):
             DECISION_MAKER_SYSTEM_PROMPT
             if decision_maker_mode
             else (
-                get_compact_role_system_prompt(self._role)
-                if expert_mode
-                else get_role_system_prompt(self._role, settings.confidence_threshold)
+                _FAST_EXPERT_SYSTEM_PROMPT
+                if fast_expert_mode
+                else (
+                    get_compact_role_system_prompt(self._role)
+                    if expert_mode
+                    else get_role_system_prompt(self._role, settings.confidence_threshold)
+                )
             )
         )
 
@@ -1093,7 +1205,11 @@ class LLMAgent(AbstractAIModel):
         last_error = ""
         primary_model = self._model_name
         for model_name in models_to_try:
-            llm = self._llm if model_name == primary_model else self._create_llm(model_name)
+            llm = (
+                self._create_llm(model_name, fast_expert=True)
+                if fast_expert_mode
+                else (self._llm if model_name == primary_model else self._create_llm(model_name))
+            )
             if llm is None:
                 raise RuntimeError(f"LLM client for {model_name} is not initialized")
             for attempt in range(self._max_retries + 1):
@@ -1167,52 +1283,6 @@ class LLMAgent(AbstractAIModel):
         context: dict[str, Any],
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
-        def _fallback_decision(name: str, error: str) -> DecisionOutput:
-            fallback = self._local_expert_fallback(
-                features, {**context, "expert_mode": True}, error
-            )
-            fallback.model_name = name
-            fallback.raw_response = {
-                **(fallback.raw_response or {}),
-                "provider_model": self._model_name,
-                "batch_expert_fallback": True,
-            }
-            return fallback
-
-        def _decision_from_batch_payload(name: str, payload: dict[str, Any]) -> DecisionOutput:
-            payload = dict(payload)
-            payload["provider_model"] = self._model_name
-            payload["batch_expert"] = True
-            payload["batch_source_model"] = self.name
-            payload["cross_check_for"] = _normalize_cross_check(
-                payload.get("cross_check_for"),
-                role_by_name.get(name, ""),
-            )
-            decision = DecisionOutput(
-                model_name=name,
-                symbol=features.symbol,
-                action=Action.from_string(str(payload.get("action", "hold"))),
-                confidence=min(max(float(payload.get("confidence", 0.5) or 0.5), 0.0), 1.0),
-                reasoning=str(payload.get("reasoning") or "暂无分析内容。")[:150],
-                position_size_pct=min(
-                    max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
-                ),
-                suggested_leverage=min(
-                    max(float(payload.get("suggested_leverage", 1.0) or 1.0), 1.0),
-                    settings.max_leverage,
-                ),
-                stop_loss_pct=min(
-                    max(float(payload.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15
-                ),
-                take_profit_pct=min(
-                    max(float(payload.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
-                ),
-                cross_check_for=payload.get("cross_check_for"),
-                raw_response=payload,
-                feature_snapshot=features.to_dict(),
-            )
-            return _calibrate_sentiment_decision(features, decision)
-
         async def _invoke_batch(prompt: str, *, repair: bool = False) -> dict[str, Any]:
             messages = _messages_for_model(
                 BATCH_EXPERT_SYSTEM_PROMPT,
@@ -1225,6 +1295,7 @@ class LLMAgent(AbstractAIModel):
                 batch_llm = self._create_llm(
                     self._model_name,
                     max_completion_tokens_override=settings.ai_batch_expert_max_completion_tokens,
+                    json_response=True,
                 )
                 response = await batch_llm.ainvoke(messages)
             parsed = _extract_json(_message_content_text(response))
@@ -1238,6 +1309,10 @@ class LLMAgent(AbstractAIModel):
             await self.initialize()
         if self._llm is None:
             raise ModelInferenceError(f"LLM agent {self.name} is not initialized")
+        if not supports_batch_expert_json(self._model_name):
+            raise LLMResponseParseError(
+                f"batch expert JSON is disabled for provider model {self._model_name}"
+            )
 
         role_by_name = {
             "trend_expert": "trend_direction",
@@ -1291,13 +1366,21 @@ class LLMAgent(AbstractAIModel):
                             repaired["batch_repair_reason"] = repair_error
                         experts_payload[name] = repaired
 
+        missing_after_repair = [
+            name for name in expert_names if not isinstance(experts_payload.get(name), dict)
+        ]
+        if missing_after_repair:
+            missing_text = ", ".join(missing_after_repair)
+            raise LLMResponseParseError(
+                "batch experts response incomplete after repair; "
+                f"missing experts: {missing_text}"
+            )
+
         decisions: dict[str, DecisionOutput] = {}
         for name in expert_names:
             payload = experts_payload.get(name)
-            if not isinstance(payload, dict):
-                decisions[name] = _fallback_decision(name, f"batch missing {name}")
-                continue
-
+            if not isinstance(payload, dict):  # pragma: no cover - guarded above.
+                raise LLMResponseParseError(f"batch experts response missing {name}")
             payload = dict(payload)
             payload["provider_model"] = self._model_name
             payload["batch_expert"] = True

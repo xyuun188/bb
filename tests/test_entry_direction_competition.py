@@ -226,3 +226,34 @@ def test_trading_service_direction_competition_delegates_to_policy() -> None:
     assert context["enabled"] is True
     assert context["preferred_side"] == "long"
     assert context["market_regime_mode"] == "mixed"
+
+
+def test_direction_competition_reads_wrapped_server_quant_payloads() -> None:
+    context = _context(
+        tools={
+            "profit_prediction": {
+                "ok": True,
+                "data": {
+                    "prediction": {
+                        "best_side": "long",
+                        "adjusted_long_return_pct": 0.72,
+                        "adjusted_short_return_pct": -0.14,
+                        "long_loss_probability": 0.31,
+                        "short_loss_probability": 0.68,
+                        "profit_quality_score": 0.48,
+                    }
+                },
+            },
+            "time_series_prediction": {
+                "result": {"best_side": "long", "expected_return_pct": 0.41},
+            },
+            "sentiment_analysis": {
+                "payload": {"label": "bullish", "score": 0.55, "expected_return_pct": 0.22},
+            },
+        }
+    )
+
+    assert context["preferred_side"] == "long"
+    assert any("Server profit long" in note for note in context["long"]["evidence"])
+    assert any("Timeseries favors long" in note for note in context["long"]["evidence"])
+    assert any("Sentiment favors long" in note for note in context["long"]["evidence"])

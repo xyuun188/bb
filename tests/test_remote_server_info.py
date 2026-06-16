@@ -25,10 +25,28 @@ def test_parse_remote_server_info_chinese_labels() -> None:
     )
 
     assert info.host == "203.0.113.17"
+    assert info.access_host == ""
     assert info.port == 31822
     assert info.username == "linux"
     assert info.password == "super-secret"
     assert info.redacted()["password"] == "***"
+
+
+def test_parse_model_server_info_keeps_access_ip_separate_from_ssh_ip() -> None:
+    info = parse_remote_server_info(
+        "访问公网IP：103.85.84.147\n"
+        "SSH公网IP：203.0.113.18\n"
+        "端口：22184\n"
+        "账号：linux\n"
+        "密码：super-secret",
+        source_path=Path("大模型服务器信息.txt"),
+    )
+
+    assert info.host == "203.0.113.18"
+    assert info.access_host == "103.85.84.147"
+    assert info.as_dict()["host"] == "203.0.113.18"
+    assert info.as_dict()["access_host"] == "103.85.84.147"
+    assert info.connection_kwargs()["host"] == "203.0.113.18"
 
 
 def test_parse_remote_server_info_english_labels() -> None:
@@ -38,6 +56,7 @@ def test_parse_remote_server_info_english_labels() -> None:
 
     assert info.as_dict() == {
         "host": "10.0.0.8",
+        "access_host": "10.0.0.8",
         "port": 22,
         "username": "deploy",
         "password": "***",

@@ -38,6 +38,7 @@ def _policy(
         grouped_items: list[tuple[tuple[str, str], list[dict[str, Any]]]],
         _feature_vectors: dict[str, Any],
         portfolio_profit_context: dict[str, Any] | None,
+        _strategy_context: dict[str, Any] | None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         assert portfolio_profit_context == {"position_count": sum(len(g[1]) for g in grouped_items)}
         scans_seen.append(grouped_items)
@@ -139,7 +140,7 @@ def test_analysis_budget_raises_position_review_budget_when_positions_are_crowde
     )
 
     assert result["risk_level"] == "low"
-    assert result["position_max_groups"] == 10
+    assert result["position_max_groups"] == 13
     assert result["total_position_groups"] == 13
 
 
@@ -180,10 +181,44 @@ def test_analysis_budget_new_pair_pause_zeroes_market_scan_budget() -> None:
     assert result["roster_underfilled"] is True
 
 
+def test_analysis_budget_uses_strategy_learning_runtime_targets() -> None:
+    policy, scans_seen = _policy()
+    strategy_context = {
+        "strategy_profile_id": "loss_release",
+        "strategy_learning": {
+            "runtime": {
+                "target_position_groups": 5,
+                "max_open_positions": 12,
+                "analysis_budget": {
+                    "position_max_groups": 9,
+                    "position_high_risk_max_groups": 11,
+                    "position_urgent_exit_max_groups": 12,
+                    "roster_fill_market_symbol_min": 18,
+                },
+            }
+        },
+    }
+    result = policy.context(
+        [_position("BTC/USDT"), _position("ETH/USDT")],
+        {},
+        base_market_limit=2,
+        run_position_analysis=True,
+        run_market_analysis=True,
+        strategy_context=strategy_context,
+    )
+
+    assert result["budget_source"] == "strategy_learning"
+    assert result["target_position_groups"] == 5
+    assert result["position_max_groups"] == 9
+    assert result["market_symbol_limit"] == 18
+    assert scans_seen
+
+
 def test_trading_service_analysis_budget_context_delegates_to_policy() -> None:
     service = object.__new__(TradingService)
     calls: list[dict[str, Any]] = []
     feature_vector = object()
+    strategy_context = {"strategy_profile_id": "loss_release"}
 
     class FakeBudget:
         def context(self, open_positions, feature_vectors, **kwargs):
@@ -205,6 +240,7 @@ def test_trading_service_analysis_budget_context_delegates_to_policy() -> None:
         run_position_analysis=True,
         run_market_analysis=False,
         new_pair_pause_reason="pause",
+        strategy_context=strategy_context,
     )
 
     assert result == {"risk_level": "delegated", "market_symbol_limit": 3}
@@ -216,5 +252,6 @@ def test_trading_service_analysis_budget_context_delegates_to_policy() -> None:
             "run_position_analysis": True,
             "run_market_analysis": False,
             "new_pair_pause_reason": "pause",
+            "strategy_context": strategy_context,
         }
     ]

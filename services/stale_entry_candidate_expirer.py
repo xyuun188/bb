@@ -23,19 +23,36 @@ from web_dashboard.api.text_sanitize import sanitize_text
 logger = structlog.get_logger(__name__)
 
 ENTRY_PENDING_EXECUTION_MAX_SECONDS = 45.0
-WAITING_ENTRY_PATTERNS = (
-    "已进入本轮开仓候选排序%",
-    "本轮还在分析或排队中%",
-)
-PENDING_EXECUTION_PATTERNS = (
-    "正在提交 OKX%",
-    "本轮执行仍在处理中%",
-    "Execution still pending this round%",
+PENDING_EXECUTION_PREFIXES = (
+    "正在提交 OKX",
+    "本轮执行仍在处理中",
+    "Execution still pending this round",
 )
 
 FloatParser = Callable[[Any, float], float]
 OrderCountProvider = Callable[[int], Awaitable[int]]
 FlushCallback = Callable[[], Awaitable[None]]
+
+
+def _legacy_sql_like_patterns(pattern: str) -> tuple[str, ...]:
+    """Match clean Chinese rows and old rows damaged by a wrong decode step."""
+
+    damaged = pattern.encode("utf-8").decode("gbk", errors="replace")
+    damaged_question = damaged.replace("\ufffd", "?")
+    if damaged_question == damaged:
+        return (pattern, damaged)
+    return (pattern, damaged, damaged_question)
+
+
+WAITING_ENTRY_PATTERNS = (
+    *_legacy_sql_like_patterns("已进入本轮开仓候选排序%"),
+    *_legacy_sql_like_patterns("本轮还在分析或排队中%"),
+)
+PENDING_EXECUTION_PATTERNS = (
+    *_legacy_sql_like_patterns("正在提交 OKX%"),
+    *_legacy_sql_like_patterns("本轮执行仍在处理中%"),
+    "Execution still pending this round%",
+)
 
 
 def action_label(action: str | None) -> str:
@@ -44,20 +61,19 @@ def action_label(action: str | None) -> str:
         return "做多"
     if value in {"short", "open_short"}:
         return "做空"
-    if value in {"close_long"}:
+    if value == "close_long":
         return "平多"
-    if value in {"close_short"}:
+    if value == "close_short":
         return "平空"
     return value or "交易"
 
 
 def is_pending_execution_reason(reason: str | None) -> bool:
     text = str(reason or "")
-    return (
-        not text
-        or text.startswith("正在提交 OKX")
-        or text.startswith("本轮执行仍在处理中")
-        or text.startswith("Execution still pending this round")
+    cleaned = str(sanitize_text(text) or text)
+    return not cleaned or any(
+        cleaned.startswith(prefix) or text.startswith(prefix)
+        for prefix in PENDING_EXECUTION_PREFIXES
     )
 
 
@@ -78,6 +94,7 @@ class StaleEntryCandidateExpirer:
 
     async def expire(self) -> int:
         """Load and expire stale waiting/pending entry decisions from the DB."""
+
         now = datetime.utcnow()
         waiting_cutoff = now - timedelta(seconds=ENTRY_DECISION_MAX_AGE_SECONDS)
         pending_cutoff = now - timedelta(seconds=ENTRY_PENDING_EXECUTION_MAX_SECONDS)
@@ -128,6 +145,7 @@ class StaleEntryCandidateExpirer:
         flush_callback: FlushCallback | None = None,
     ) -> int:
         """Apply stale-entry expiration rules to already-loaded decision rows."""
+
         expired = 0
         for row in waiting_rows:
             reason = self._waiting_expiration_reason(row)
@@ -138,7 +156,7 @@ class StaleEntryCandidateExpirer:
             order_count = await order_count_provider(int(row.id))
             if order_count > 0:
                 reason = (
-                    "本地订单记录已生成，但成交或拒单状态还没有最终确认。"
+                    "本地订单记录已生成，但成交或撤单状态还没有最终确认。"
                     "请以执行记录中的最新订单状态为准。"
                 )
             else:
@@ -195,15 +213,16 @@ class StaleEntryCandidateExpirer:
         )
 
     def _apply_reason(self, row: Any, reason: str) -> None:
+        clean_reason = str(sanitize_text(reason) or reason)
         raw = _safe_raw_response(row.raw_llm_response)
         opportunity = raw.get("opportunity_score")
         if not isinstance(opportunity, dict):
             opportunity = {}
         opportunity["selected_for_execution"] = False
-        opportunity["selection_reason"] = reason
+        opportunity["selection_reason"] = clean_reason
         raw["opportunity_score"] = opportunity
         row.raw_llm_response = raw
-        row.execution_reason = sanitize_text(reason)
+        row.execution_reason = clean_reason
 
 
 def _safe_raw_response(value: Any) -> dict[str, Any]:

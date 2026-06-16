@@ -10,7 +10,7 @@ import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config.settings import ENSEMBLE_TRADER_NAME
+from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from web_dashboard.api import dashboard as _dash
@@ -42,7 +42,7 @@ class ManualCloseAllPositionsRequest(BaseModel):
 
 
 class ScanModeRequest(BaseModel):
-    mode: str  # "auto" or "manual"
+    mode: str  # only "auto" is supported
 
 
 def _normalize_okx_bar(timeframe: str) -> str:
@@ -64,6 +64,29 @@ def _normalize_okx_bar(timeframe: str) -> str:
 
 def _okx_bar_to_ccxt_timeframe(bar: str) -> str:
     return {"1H": "1h", "4H": "4h", "1D": "1d"}.get(bar, bar)
+
+
+def _missing_okx_credential_fields(mode: str) -> list[str]:
+    creds = settings.get_okx_credentials(mode)
+    required = {
+        "api_key": "API Key",
+        "api_secret": "API Secret",
+        "passphrase": "Passphrase",
+    }
+    return [label for key, label in required.items() if not str(creds.get(key) or "").strip()]
+
+
+def _assert_execution_account_configured(mode: str) -> None:
+    missing = _missing_okx_credential_fields(mode)
+    if not missing:
+        return
+    detail = {
+        "message": f"{('实盘' if mode == 'live' else '模拟盘')}账户未配置完整，不能切换执行账户。",
+        "mode": mode,
+        "settings_tab": "okx",
+        "missing_fields": missing,
+    }
+    raise HTTPException(status_code=409, detail=detail)
 
 
 def _symbol_to_okx_inst_id(symbol: str, inst_type: str = "SWAP") -> str:
@@ -116,6 +139,8 @@ async def switch_mode(req: ModeSwitchRequest):
     if mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
 
+    _assert_execution_account_configured(mode)
+
     if mode == "paper":
         await mode_manager.switch_to_paper()
         return {
@@ -145,17 +170,12 @@ async def pause_trading():
 
 @router.post("/control/scan-mode")
 async def switch_scan_mode(req: ScanModeRequest):
-    """Switch between auto (scan all pairs) and manual (selected symbols) scan modes."""
+    """Keep scan mode on automatic portfolio discovery."""
     mode = req.mode.lower()
-    if mode not in ("auto", "manual"):
-        raise HTTPException(status_code=400, detail="Scan mode must be 'auto' or 'manual'")
-
-    if mode == "auto":
-        await mode_manager.switch_to_auto()
-        return {"status": "ok", "message": "Switched to auto scan mode", "scan_mode": "auto"}
-    else:
-        await mode_manager.switch_to_manual()
-        return {"status": "ok", "message": "Switched to manual scan mode", "scan_mode": "manual"}
+    if mode != "auto":
+        raise HTTPException(status_code=400, detail="主面板只支持自动模式，手动扫描已移除。")
+    await mode_manager.switch_to_auto()
+    return {"status": "ok", "message": "已切换为自动模式", "scan_mode": "auto"}
 
 
 @router.post("/control/resume")

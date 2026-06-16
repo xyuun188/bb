@@ -9,25 +9,11 @@ This repository has a project-specific Hindsight memory bank:
 - Hindsight MCP endpoint: `http://45.207.197.48:18888/mcp/`
 - Hindsight control panel: `http://45.207.197.48:19999/zh-CN`
 
-At the beginning of a Codex session for this repository, recall project memory:
+Use the persistent CODEX++ MCP server `hindsight_bb` for this repository. The old `.codex-memory` scripts are not present in this checkout and must not be called.
 
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\recall_project_memory.ps1" -Query "What should I remember about this project?"
-```
+At the beginning of a session, do not run broad live recall by default. Use `hindsight_bb.recall` only when current context is needed, with `budget="low"` and a small `max_tokens` limit first. Escalate to broader recall only when the user explicitly asks for deeper historical context.
 
-Prefer reading `PROJECT_MEMORY.md` first when it exists. If it is missing or stale, refresh it:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\refresh_project_memory.ps1"
-```
-
-When the user asks to remember something about this project, add it here:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\add_project_memory.ps1" -Content "memory text"
-```
-
-After adding durable project memory, refresh `PROJECT_MEMORY.md` with `.codex-memory\refresh_project_memory.ps1`.
+Durable project changes are retained automatically by the user-level CODEX++ watcher and local Git hooks under `C:\Users\Administrator\.codex\hindsight-memory`. Do not duplicate this by saving every turn manually.
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
@@ -38,10 +24,10 @@ After adding durable project memory, refresh `PROJECT_MEMORY.md` with `.codex-me
 
 **Important**: Even in command chains with `&&`, use `rtk`:
 ```bash
-# 鉂?Wrong
+# BAD:
 git add . && git commit -m "msg" && git push
 
-# 鉁?Correct
+# GOOD:
 rtk git add . && rtk git commit -m "msg" && rtk git push
 ```
 
@@ -167,41 +153,20 @@ rtk init --global       # Add RTK to ~/.Codex/AGENTS.md
 
 Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
-When the user asks to remember something about this project, add it here:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File ".\.codex-memory\add_project_memory.ps1" -Content "memory text"
-```
 ## Codex Automatic Hindsight Workflow
 
-For this repository, use the project-specific Hindsight bank `bb` automatically.
-Hindsight reads and writes must use `http://45.207.197.48:18888` by default; the MCP endpoint is `http://45.207.197.48:18888/mcp/`, and the control panel is `http://45.207.197.48:19999/zh-CN`.
+For this repository, use the project-specific Hindsight MCP server `hindsight_bb` and bank `bb` automatically.
+Hindsight reads and writes must use `http://45.207.197.48:18888/mcp/bb/` by default.
 
-At the beginning of every Codex session for this repository, recall memory before substantive work. The default command is the fast path: it reads `PROJECT_MEMORY.md` and skips server-side live recall to avoid shell timeouts.
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_start.ps1" -ProjectRoot "F:\bb"
-```
-
-Use `-LiveRecall` only when a fresh Hindsight server recall is explicitly needed. Use `-RefreshSnapshot` only when rebuilding `PROJECT_MEMORY.md` is explicitly needed.
-
-During work, save durable project facts to Hindsight when they would prevent repeated work later: architecture decisions, important paths, service ports, tested fixes, setup steps, user preferences for this project, and non-obvious debugging results. Do not save secrets, one-off chatter, temporary failed guesses, or bulky command output.
-
-Before finishing a meaningful task in this repository, summarize and distill the useful long-term facts before saving them to the `bb` bank. Do not store the whole chat verbatim. The default save path is fast: it saves the provided distilled notes asynchronously and does not refresh the large snapshot.
+Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts; that directory is not part of the current setup. Project changes are retained by user-level CODEX++ automation:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_summarize_and_save.ps1" -ProjectRoot "F:\bb" -Content "session notes to distill"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1" -ProjectRoot "F:\BB" -Event "manual"
 ```
 
-Use `-UseReflect` only when Hindsight should do an extra cloud-model distillation pass before saving. Use `-RefreshSnapshot` only when the saved memory must immediately appear in `PROJECT_MEMORY.md`.
+Only call live recall when it is needed for the current task. Prefer `hindsight_bb.recall` with `budget="low"` and `max_tokens` around `1200` first; avoid `budget="high"` at session start because it commonly takes 30+ seconds on this remote Hindsight server.
 
-Shortcut:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\code\Hindsight\codex_memory_end.ps1" -ProjectRoot "F:\bb" -Content "session notes to distill"
-```
-
-Keep all memories for this repository in `bb`; do not store this project's facts in the global `codex` bank.
+Keep all memories for this repository in `bb`; do not store this project's facts in the global `codex`, `manju`, or `MetaCode` banks.
 <!-- BEGIN CODEX SEMBLE RTK -->
 ## Project Tooling
 

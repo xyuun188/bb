@@ -7,46 +7,13 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
+from web_dashboard.api.text_sanitize import looks_mojibake
 
-MEMORY_MOJIBAKE_MARKERS = (
-    "閿",
-    "缁",
-    "閹",
-    "閸",
-    "楠",
-    "娴",
-    "鈧",
-    "鎾",
-    "閫",
-    "嫨",
-    "瑙",
-    "傛",
-    "澧",
-    "鍫",
-    "鐟",
-    "闁",
-    "锟",
-    "褰",
-    "鏃",
-    "涓",
-    "鏆",
-    "姣",
-    "锛",
-    "絾",
-    "鍒",
-    "挓",
-    "鍚",
-    "庢",
-    "敹",
-    "鐩",
-    "婁",
-)
-MEMORY_DAMAGED_MARKERS = (
-    "原始说明已损坏",
+DAMAGED_MEMORY_MARKERS = (
+    "\u539f\u59cb\u8bf4\u660e\u5df2\u635f\u574f",
+    "\u65e0\u6cd5\u51c6\u786e\u8fd8\u539f",
     "raw note is damaged",
-    "无法准确还原",
 )
-
 
 class MemoryRepository(BaseRepository):
     """Repository for expert long-term memories and trade reflections."""
@@ -362,10 +329,9 @@ def _memory_text_usable(value: Any) -> bool:
     if not text:
         return True
     lowered = text.lower()
-    if any(marker.lower() in lowered for marker in MEMORY_DAMAGED_MARKERS):
+    if any(marker.lower() in lowered for marker in DAMAGED_MEMORY_MARKERS):
         return False
-    marker_hits = sum(1 for marker in MEMORY_MOJIBAKE_MARKERS if marker in text)
-    return marker_hits < 2 and not _has_suspicious_unicode(text)
+    return not looks_mojibake(text) and not _has_suspicious_unicode(text)
 
 
 def _has_suspicious_unicode(text: str) -> bool:

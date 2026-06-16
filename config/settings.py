@@ -5,15 +5,16 @@ All modules import settings from here. Single source of truth.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
@@ -80,6 +81,135 @@ def _format_env_value(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _split_top_level_commas(value: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escape = False
+    for idx, char in enumerate(value):
+        if quote:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "[{(":
+            depth += 1
+        elif char in "]})":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            parts.append(value[start:idx].strip())
+            start = idx + 1
+    tail = value[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _split_legacy_key_value(value: str) -> tuple[str, str] | None:
+    quote = ""
+    escape = False
+    depth = 0
+    for idx, char in enumerate(value):
+        if quote:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "[{(":
+            depth += 1
+        elif char in "]})":
+            depth = max(depth - 1, 0)
+        elif char == ":" and depth == 0:
+            return value[:idx].strip(), value[idx + 1 :].strip()
+    return None
+
+
+def _parse_scalar_env_value(value: str) -> Any:
+    text = value.strip()
+    if not text:
+        return ""
+    if (text.startswith("{") and text.endswith("}")) or (
+        text.startswith("[") and text.endswith("]")
+    ):
+        parsed = _parse_complex_env_value(text)
+        if parsed is not text:
+            return parsed
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            return parser(text)
+        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+            pass
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"none", "null"}:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return text.strip("'\"")
+    if number.is_integer() and not re.search(r"[.eE]", text):
+        return int(number)
+    return number
+
+
+def _parse_legacy_mapping(text: str) -> dict[str, Any] | None:
+    inner = text.strip()[1:-1].strip()
+    if not inner:
+        return {}
+    result: dict[str, Any] = {}
+    for item in _split_top_level_commas(inner):
+        pair = _split_legacy_key_value(item)
+        if pair is None:
+            return None
+        key, raw_value = pair
+        key = str(_parse_scalar_env_value(key)).strip()
+        if not key:
+            return None
+        result[key] = _parse_scalar_env_value(raw_value)
+    return result
+
+
+def _parse_legacy_sequence(text: str) -> list[Any] | None:
+    inner = text.strip()[1:-1].strip()
+    if not inner:
+        return []
+    return [_parse_scalar_env_value(item) for item in _split_top_level_commas(inner)]
+
+
+def _parse_complex_env_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            return parser(text)
+        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+            pass
+    if text.startswith("{") and text.endswith("}"):
+        parsed_map = _parse_legacy_mapping(text)
+        if parsed_map is not None:
+            return parsed_map
+    if text.startswith("[") and text.endswith("]"):
+        parsed_list = _parse_legacy_sequence(text)
+        if parsed_list is not None:
+            return parsed_list
+    return text
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -107,7 +237,7 @@ class Settings(BaseSettings):
     # --- AI API (OpenAI-compatible) ---
     # Per-model AI configurations (list of dicts from AI_MODELS env var)
     # Each element: {"name": "gpt-5.4", "api_base": "...", "api_key": "...", "model": "...", "balance": 1000}
-    ai_models: list[dict] = Field(default_factory=list)
+    ai_models: Annotated[list[dict], NoDecode] = Field(default_factory=list)
     # Backward compatibility: fallback for single-model setups
     ai_api_base: str = ""
     ai_api_key: str = ""
@@ -115,7 +245,7 @@ class Settings(BaseSettings):
     local_ai_tools_enabled: bool = False
     local_ai_tools_api_base: str = ""
     local_ai_tools_api_key: str = ""
-    local_ai_tools_timeout_seconds: float = 2.5
+    local_ai_tools_timeout_seconds: float = 8.0
     local_ai_tools_circuit_breaker_failures: int = 3
     local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
     high_risk_review_enabled: bool = True
@@ -137,14 +267,20 @@ class Settings(BaseSettings):
     # --- Trading Parameters ---
     trading_mode: TradingMode = TradingMode.PAPER
     scan_mode: str = "auto"  # "auto" = scan all OKX pairs, "manual" = only settings.symbols
-    symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+    symbols: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    )
     initial_virtual_balance: float = 100_000.0
-    model_initial_balances: dict[str, float] = Field(default_factory=dict)
+    model_initial_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
     execution_account_name: str = "多专家执行账户"
-    execution_account_balances: dict[str, float] = Field(default_factory=dict)
-    execution_account_max_loss_pct: dict[str, float] = Field(default_factory=dict)
-    execution_account_max_loss_usdt: dict[str, float] = Field(default_factory=dict)
-    execution_account_cooldown_loss_pct: dict[str, float] = Field(
+    execution_account_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
+    execution_account_max_loss_pct: Annotated[dict[str, float], NoDecode] = Field(
+        default_factory=dict
+    )
+    execution_account_max_loss_usdt: Annotated[dict[str, float], NoDecode] = Field(
+        default_factory=dict
+    )
+    execution_account_cooldown_loss_pct: Annotated[dict[str, float], NoDecode] = Field(
         default_factory=lambda: {"paper": 0.5, "live": 0.5}
     )
     decision_interval_seconds: int = 60
@@ -170,10 +306,11 @@ class Settings(BaseSettings):
     ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
     ai_batch_expert_max_completion_tokens: int = 900
-    ai_batch_expert_timeout_seconds: float = 90.0
+    ai_batch_expert_timeout_seconds: float = 35.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
     strategy_learning_llm_candidates_enabled: bool = True
+    strategy_learning_min_trade_count_target: int = 8
     strategy_learning_llm_candidate_interval_seconds: int = 21600
     strategy_learning_llm_candidate_timeout_seconds: float = 20.0
     strategy_learning_llm_candidate_max_tokens: int = 360
@@ -198,8 +335,16 @@ class Settings(BaseSettings):
     # --- Web Dashboard ---
     dashboard_port: int = 8002
     dashboard_host: str = "127.0.0.1"
-    dashboard_cors_origins: list[str] = Field(default_factory=list)
+    dashboard_cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     dashboard_admin_api_key: str = ""
+    dashboard_inline_enabled: bool = True
+    dashboard_auth_enabled: bool = False
+    dashboard_auth_username: str = ""
+    dashboard_auth_password_hash: str = ""
+    dashboard_auth_email: str = ""
+    dashboard_session_secret: str = ""
+    dashboard_session_ttl_seconds: int = 43200
+    dashboard_auth_cookie_secure: bool = False
 
     # --- Notifications ---
     telegram_bot_token: str = ""
@@ -260,11 +405,13 @@ class Settings(BaseSettings):
     @classmethod
     def parse_symbols(cls, v: Any) -> list[str]:
         if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return [s.strip() for s in v.split(",")]
-        return v
+            parsed = _parse_complex_env_value(v)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if isinstance(v, list):
+            return [str(item).strip() for item in v if str(item).strip()]
+        return []
 
     @field_validator("dashboard_cors_origins", mode="before")
     @classmethod
@@ -272,12 +419,10 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             if not v.strip():
                 return []
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    return [str(item).strip() for item in parsed if str(item).strip()]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in v.split(",") if item.strip()]
+            parsed = _parse_complex_env_value(v)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            return [item.strip() for item in v.split(",") if item.strip()]
         if isinstance(v, list):
             return [str(item).strip() for item in v if str(item).strip()]
         return []
@@ -298,11 +443,13 @@ class Settings(BaseSettings):
     @classmethod
     def parse_model_balances(cls, v: Any) -> dict[str, float]:
         if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return {}
-        return v or {}
+            parsed = _parse_complex_env_value(v)
+            if isinstance(parsed, dict):
+                return {str(k): float(val) for k, val in parsed.items() if val is not None}
+            return {}
+        if isinstance(v, dict):
+            return {str(k): float(val) for k, val in v.items() if val is not None}
+        return {}
 
     @field_validator(
         "execution_account_balances",
@@ -314,9 +461,8 @@ class Settings(BaseSettings):
     @classmethod
     def parse_execution_account_maps(cls, v: Any) -> dict[str, float]:
         if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (json.JSONDecodeError, TypeError):
+            parsed = _parse_complex_env_value(v)
+            if not isinstance(parsed, dict):
                 return {}
             return {str(k): float(val) for k, val in parsed.items() if val is not None}
         if isinstance(v, dict):
@@ -329,11 +475,17 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             if not v.strip():
                 return []
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-        return v or []
+            parsed = _parse_complex_env_value(v)
+            if isinstance(parsed, dict):
+                return [parsed]
+            if isinstance(parsed, list):
+                return [dict(item) for item in parsed if isinstance(item, dict)]
+            return []
+        if isinstance(v, dict):
+            return [v]
+        if isinstance(v, list):
+            return [dict(item) for item in v if isinstance(item, dict)]
+        return []
 
     def get_fixed_ai_models(self, include_empty: bool = True) -> list[dict[str, Any]]:
         """Return AI model configs merged into the fixed expert slots."""
@@ -458,7 +610,12 @@ class Settings(BaseSettings):
         updates_str: dict[str, str] = {}
         for raw_key, raw_value in updates.items():
             key = str(raw_key or "").strip()
-            value = "" if raw_value is None else str(raw_value)
+            if raw_value is None:
+                value = ""
+            elif isinstance(raw_value, (dict, list, tuple)):
+                value = json.dumps(raw_value, ensure_ascii=False)
+            else:
+                value = str(raw_value)
             if not ENV_KEY_RE.fullmatch(key):
                 raise ValueError(f"Invalid .env key: {key!r}")
             if "\n" in value or "\r" in value:

@@ -38,7 +38,10 @@ def test_server_monitor_probe_uses_argv_subprocess_commands() -> None:
     assert "subprocess.run(\n            args," in script
     assert '["systemctl", "is-active", name]' in script
     assert '["ps", "-p", pid, "-o", "etime="]' in script
-    assert "http://127.0.0.1:8000/v1/models" in script
+    assert "vllm_endpoint_runtime(8000" in script
+    assert "vllm_endpoint_runtime(8002" in script
+    assert "vllm_endpoint_runtime(8003" not in script
+    assert "127.0.0.1:8003" not in script
     assert "http://127.0.0.1:8001/models/status" in script
 
 
@@ -113,7 +116,11 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
     namespace = _load_probe_namespace(script)
 
-    def fake_http_json(url: str, timeout: int = 3) -> dict[str, object]:
+    def fake_http_json(
+        url: str,
+        timeout: int = 3,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
         if url.endswith("/v1/models"):
             return {
                 "ok": True,
@@ -142,6 +149,7 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     namespace["http_json"] = fake_http_json
     runtime = cast(Callable[[], dict[str, object]], namespace["model_runtime"])()
     vllm = cast(dict[str, object], runtime["vllm"])
+    vllm_endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
     tools = cast(dict[str, object], runtime["local_ai_tools"])
 
     assert vllm["endpoint_available"] is True
@@ -152,6 +160,11 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     assert vllm["provider_model"] == "qwen3-32b-trade"
     assert cast(dict[str, object], vllm["health"])["status_code"] == 200
     assert cast(dict[str, object], vllm["health"])["latency_ms"] == 12.4
+    assert [item["endpoint"] for item in vllm_endpoints] == [
+        "127.0.0.1:8000/v1",
+        "127.0.0.1:8002/v1",
+    ]
+    assert vllm_endpoints[1]["provider_model"] == "deepseek-r1-14b-risk"
     assert tools["available"] is True
     assert cast(dict[str, object], tools["status_health"])["status_code"] == 503
     assert cast(dict[str, object], tools["health"])["ok"] is True
@@ -164,3 +177,11 @@ def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> 
     assert "vllm.label || vllm.provider_model || 'vLLM'" in source
     assert "runtimeEndpointSummary" in source
     assert "配置模型" in source
+    assert "独立失败回退" not in source
+    assert "独立调用失败，本地兜底" in source
+    assert "independent_provider_failed: '独立调用失败'" in source
+    assert "21840" in source
+    assert "21841" in source
+    assert "21842" in source
+    assert "configuredBase.includes('127.0.0.1')" in source
+    assert "configuredBase.includes('localhost')" in source

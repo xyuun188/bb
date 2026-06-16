@@ -10,7 +10,6 @@ from services.analysis_budget import (
     POSITION_REVIEW_FAST_ADD_SCORE,
     POSITION_REVIEW_FAST_EXIT_SCORE,
     POSITION_REVIEW_MAX_GROUPS_PER_ROUND,
-    POSITION_REVIEW_PRIORITY_MAX_GROUPS_PER_ROUND,
     POSITION_REVIEW_URGENT_EXIT_MAX_GROUPS_PER_ROUND,
 )
 
@@ -52,7 +51,7 @@ class PositionReviewBatchPolicy:
 
     urgent_exit_checker: UrgentExitChecker
     max_groups_per_round: int = POSITION_REVIEW_MAX_GROUPS_PER_ROUND
-    priority_max_groups_per_round: int = POSITION_REVIEW_PRIORITY_MAX_GROUPS_PER_ROUND
+    priority_max_groups_per_round: int | None = None
     urgent_exit_max_groups_per_round: int = POSITION_REVIEW_URGENT_EXIT_MAX_GROUPS_PER_ROUND
     fast_exit_score: float = POSITION_REVIEW_FAST_EXIT_SCORE
     fast_add_score: float = POSITION_REVIEW_FAST_ADD_SCORE
@@ -155,7 +154,11 @@ class PositionReviewBatchPolicy:
 
         priority_slots = min(
             len(priority_items),
-            max(0, min(max_groups, int(self.priority_max_groups_per_round))),
+            (
+                max_groups
+                if self.priority_max_groups_per_round is None
+                else max(0, min(max_groups, int(self.priority_max_groups_per_round)))
+            ),
         )
         selected_items = self._unique_items(
             urgent_exit_items + profit_exit_items + loss_watch_items

@@ -24,7 +24,7 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
-from web_dashboard.api.text_sanitize import sanitize_text
+from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -207,13 +207,11 @@ class DecisionPersistenceService:
         text = str(reason or "").strip()
         if not text:
             return False
+        if looks_mojibake(text):
+            return True
         unusable_markers = (
             "原始说明已损坏",
             "无法准确还原",
-            "鍘熷璇存槑宸叉崯鍧?",
-            "鏃犳硶鍑嗙‘杩樺師",
-            "閸樺棗褰剁拋鏉跨秿",
-            "閹圭喎娼?",
         )
         return any(marker in text for marker in unusable_markers)
 

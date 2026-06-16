@@ -25,7 +25,20 @@ CandidateExecutor = Callable[..., Awaitable[Any]]
 Clock = Callable[[], datetime]
 
 PENDING_EXIT_REASON_PREFIX = "本轮还在分析或排队中"
-LEGACY_PENDING_EXIT_REASON_PREFIX = "鏈疆杩樺湪鍒嗘瀽鎴栨帓闃熶腑"
+
+
+def _legacy_prefix_variants(prefix: str) -> tuple[str, ...]:
+    damaged = prefix.encode("utf-8").decode("gbk", errors="replace")
+    variants = (
+        prefix,
+        damaged,
+        damaged.replace("\ufffd", "?"),
+        damaged.replace("\ufffd", "\ue103"),
+    )
+    return tuple(dict.fromkeys(variants))
+
+
+PENDING_EXIT_REASON_PREFIXES = _legacy_prefix_variants(PENDING_EXIT_REASON_PREFIX)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +66,10 @@ async def load_pending_exit_decision_rows(cutoff: datetime) -> list[dict[str, An
                 or_(
                     AIDecision.execution_reason.is_(None),
                     AIDecision.execution_reason == "",
-                    AIDecision.execution_reason.like(f"{PENDING_EXIT_REASON_PREFIX}%"),
-                    AIDecision.execution_reason.like(f"{LEGACY_PENDING_EXIT_REASON_PREFIX}%"),
+                    *[
+                        AIDecision.execution_reason.like(f"{prefix}%")
+                        for prefix in PENDING_EXIT_REASON_PREFIXES
+                    ],
                 ),
             )
             .order_by(AIDecision.created_at.asc())

@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+    first_tool_payload,
+    payload_side,
+    signal_available,
+)
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -39,6 +46,16 @@ def _empty_side() -> dict[str, Any]:
         "loss_probability": None,
         "evidence": [],
     }
+
+
+def _tool_signal(
+    local_ai_tools_context: dict[str, Any] | None,
+    *keys: str,
+) -> dict[str, Any]:
+    tools = _safe_dict(local_ai_tools_context)
+    if not tools:
+        return {}
+    return first_tool_payload({"local_ai_tools": tools}, *keys)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,19 +189,20 @@ class EntryDirectionCompetitionPolicy:
         local_ai_tools_context: dict[str, Any] | None,
         strategy: dict[str, Any],
     ) -> None:
-        tools = _safe_dict(local_ai_tools_context)
-        profit = _safe_dict(tools.get("profit_prediction"))
-        if not profit or profit.get("available", True) is False:
+        profit = _tool_signal(
+            local_ai_tools_context,
+            "profit_prediction",
+            "profit_model",
+            "server_profit",
+            "server_profit_model",
+            "profit",
+        )
+        if not signal_available(profit):
             return
 
         weight = self._source_weight(strategy, "server_profit_model")
         for side in ("long", "short"):
-            expected = _safe_float(
-                profit.get(
-                    f"adjusted_{side}_return_pct", profit.get(f"{side}_expected_return_pct")
-                ),
-                0.0,
-            )
+            expected = signal_expected_return_pct(profit, side)
             loss_probability = _safe_float(profit.get(f"{side}_loss_probability"), 0.5)
             quality = _safe_float(profit.get("profit_quality_score"), 0.0)
             score = (
@@ -208,23 +226,20 @@ class EntryDirectionCompetitionPolicy:
         local_ai_tools_context: dict[str, Any] | None,
         strategy: dict[str, Any],
     ) -> None:
-        tools = _safe_dict(local_ai_tools_context)
-        prediction = (
-            tools.get("time_series_prediction")
-            or tools.get("timeseries_prediction")
-            or tools.get("sequence_prediction")
+        prediction = _tool_signal(
+            local_ai_tools_context,
+            "time_series_prediction",
+            "timeseries_prediction",
+            "sequence_prediction",
+            "timeseries",
+            "time_series",
         )
-        if not isinstance(prediction, dict) or not prediction:
+        if not signal_available(prediction):
             return
 
         weight = self._source_weight(strategy, "timeseries_model")
-        predicted_side = str(prediction.get("best_side") or prediction.get("side") or "").lower()
-        expected = _safe_float(
-            prediction.get(
-                "expected_return_pct", prediction.get(f"{predicted_side}_expected_return_pct")
-            ),
-            0.0,
-        )
+        predicted_side = payload_side(prediction)
+        expected = signal_expected_return_pct(prediction, predicted_side)
         if predicted_side not in {"long", "short"}:
             return
 
@@ -248,16 +263,27 @@ class EntryDirectionCompetitionPolicy:
         sides: dict[str, dict[str, Any]],
         local_ai_tools_context: dict[str, Any] | None,
     ) -> None:
-        tools = _safe_dict(local_ai_tools_context)
-        sentiment = _safe_dict(tools.get("sentiment_analysis"))
-        if not sentiment:
+        sentiment = _tool_signal(
+            local_ai_tools_context,
+            "sentiment_analysis",
+            "sentiment_prediction",
+            "sentiment_model",
+            "sentiment",
+        )
+        if not signal_available(sentiment):
             return
 
-        side = str(sentiment.get("best_side") or sentiment.get("side") or "").lower()
-        expected = _safe_float(sentiment.get("expected_return_pct"), 0.0)
+        side = payload_side(sentiment)
+        expected = signal_expected_return_pct(sentiment, side)
         score = _safe_float(sentiment.get("score", sentiment.get("sentiment_score")), 0.0)
         if side in {"long", "short"}:
-            self._add(sides, side, expected * 0.25 + score * 0.08, f"Sentiment favors {side}.")
+            self._add(
+                sides,
+                side,
+                expected * 0.25 + score * 0.08,
+                f"Sentiment favors {side}.",
+                expected=expected,
+            )
 
     def _add_technical_evidence(
         self,

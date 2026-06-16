@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -102,7 +103,7 @@ async def test_destructive_dashboard_action_rejects_remote_without_admin_key(
             x_dashboard_confirm="delete-records",
         )
 
-    assert exc_info.value.status_code == 403
+    assert exc_info.value.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -120,7 +121,7 @@ async def test_destructive_dashboard_action_allows_matching_admin_key(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_write_middleware_allows_readonly_remote_requests(
+async def test_dashboard_middleware_rejects_remote_read_without_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
@@ -130,7 +131,8 @@ async def test_dashboard_write_middleware_allows_readonly_remote_requests(
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/api/control/state")
 
-    assert response.status_code == 200
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Dashboard login required."
 
 
 @pytest.mark.asyncio
@@ -144,12 +146,12 @@ async def test_dashboard_write_middleware_rejects_remote_write_without_admin_key
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post("/api/control/pause")
 
-    assert response.status_code == 403
-    assert "DASHBOARD_ADMIN_API_KEY" in response.json()["detail"]
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Dashboard login required."
 
 
 @pytest.mark.asyncio
-async def test_dashboard_write_middleware_allows_remote_write_with_admin_key(
+async def test_dashboard_write_middleware_rejects_removed_manual_scan_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configured = "unit-" + "dashboard-write-token"
@@ -164,8 +166,8 @@ async def test_dashboard_write_middleware_allows_remote_write_with_admin_key(
             json={"mode": "manual"},
         )
 
-    assert response.status_code == 200
-    assert response.json()["scan_mode"] == "manual"
+    assert response.status_code == 400
+    assert "自动模式" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -212,6 +214,39 @@ async def test_dashboard_settings_exposes_high_risk_review_token_bounds(
     data = response.json()
     assert data["high_risk_review_token_floor"] == HIGH_RISK_REVIEW_TOKEN_FLOOR
     assert data["high_risk_review_token_cap"] == HIGH_RISK_REVIEW_TOKEN_CAP
+
+
+@pytest.mark.asyncio
+async def test_execution_account_update_ignores_legacy_allocated_balance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_updates: list[dict[str, Any]] = []
+    original_balances = dict(settings.execution_account_balances)
+
+    async def fake_status(mode: str) -> dict[str, Any]:
+        return settings.get_execution_account_config(mode)
+
+    def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
+        captured_updates.append(updates)
+
+    monkeypatch.setattr(settings, "execution_account_balances", original_balances)
+    monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
+    monkeypatch.setattr(settings_api_module, "_execution_account_status", fake_status)
+
+    response = await settings_api_module.update_execution_account_settings(
+        settings_api_module.ExecutionAccountRequest(
+            mode="paper",
+            allocated_balance=321.5,
+            max_loss_pct=0.25,
+        )
+    )
+
+    assert response["status"] == "ok"
+    assert settings.execution_account_balances == original_balances
+    assert captured_updates
+    assert "EXECUTION_ACCOUNT_BALANCES" not in captured_updates[-1]
+    persisted = json.loads(captured_updates[-1]["EXECUTION_ACCOUNT_MAX_LOSS_PCT"])
+    assert persisted["paper"] == 0.25
 
 
 @pytest.mark.asyncio
@@ -479,3 +514,82 @@ async def test_dashboard_okx_balance_error_is_redacted(
     assert leaked_value not in body["live_error"]
     assert "Authorization: ***" in body["paper_error"]
     assert "Authorization: ***" in body["live_error"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_login_session_allows_remote_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api.security import hash_dashboard_password
+
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "dashboard_auth_enabled", True)
+    monkeypatch.setattr(settings, "dashboard_auth_username", "admin")
+    monkeypatch.setattr(
+        settings, "dashboard_auth_password_hash", hash_dashboard_password("unit-pass")
+    )
+    monkeypatch.setattr(settings, "dashboard_session_secret", "unit-session-secret")
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 12345))
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver", follow_redirects=False
+    ) as client:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "unit-pass"},
+        )
+        response = await client.get("/api/control/state")
+
+    assert login.status_code == 200
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_dashboard_public_bind_requires_login_even_from_local_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/control/state")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_dashboard_mode_switch_requires_configured_okx_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "unit-" + "dashboard-write-token"
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", configured)
+    for field in (
+        "okx_paper_api_key",
+        "okx_paper_api_secret",
+        "okx_paper_passphrase",
+        "okx_live_api_key",
+        "okx_live_api_secret",
+        "okx_live_passphrase",
+        "okx_api_key",
+        "okx_api_secret",
+        "okx_passphrase",
+    ):
+        monkeypatch.setattr(settings, field, "")
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/control/mode",
+            headers={"Authorization": f"Bearer {configured}"},
+            json={"mode": "live"},
+        )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["mode"] == "live"
+    assert detail["settings_tab"] == "okx"
+    assert "API Key" in detail["missing_fields"]

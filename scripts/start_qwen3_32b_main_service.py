@@ -12,11 +12,13 @@ if str(ROOT) not in sys.path:
 from core.remote_ai_service_spec import QWEN3_32B_MAIN_SERVICE  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 
 def main() -> None:
     spec = QWEN3_32B_MAIN_SERVICE
-    ssh = connect_remote_ssh(ROOT, timeout=20)
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         run_remote_text(ssh, spec.model_presence_command())
         run_remote_text(ssh, spec.runtime_dirs_command())

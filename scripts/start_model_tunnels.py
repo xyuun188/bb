@@ -179,7 +179,7 @@ def main() -> int:
     parser.add_argument(
         "--forward",
         action="append",
-        default=["8000:127.0.0.1:8000", "8003:127.0.0.1:8003"],
+        default=["8000:127.0.0.1:8000", "8002:127.0.0.1:8002"],
         help="Forward spec local_port:remote_host:remote_port",
     )
     args = parser.parse_args()

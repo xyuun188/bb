@@ -53,6 +53,7 @@ SKIP_FILE_NAMES = {
     ".env.local",
     ".env.production",
     "PROJECT_MEMORY.md",
+    "AGENTS.md",
 }
 
 SKIP_FILE_SUBSTRINGS = (

@@ -4,6 +4,7 @@ Exchange & AI settings API — get/set OKX credentials (paper/live split), AI co
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -23,6 +24,21 @@ from core.model_runtime import (
 from core.safe_output import redact_output, safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
+from services.secure_runtime_config import (
+    scrub_ai_model_env,
+    secure_ai_model_key,
+    set_runtime_secret,
+    strip_secret_env_updates,
+)
+from services.model_server_config import (
+    ModelServerConfigError,
+    ModelServerConfigNotConfigured,
+    build_model_server_info_from_update,
+    get_model_server_settings_public,
+    load_model_server_info_from_secure_settings,
+    save_model_server_settings,
+)
+from services.server_monitor_status import ServerMonitorStatusService, clear_server_monitor_cache
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
@@ -65,10 +81,17 @@ class AIModelTestRequest(BaseModel):
 class ExecutionAccountRequest(BaseModel):
     mode: str = "paper"
     account_name: str | None = None
-    allocated_balance: float | None = None
+    allocated_balance: float | None = None  # legacy clients may send it; ignored intentionally
     max_loss_pct: float | None = None
     max_loss_usdt: float | None = None
     cooldown_loss_pct: float | None = None
+
+
+class ModelServerSettingsRequest(BaseModel):
+    host: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
 
 
 # ── Helpers ──
@@ -103,6 +126,10 @@ def _normalize_api_base_or_400(
 
 def _connection_error_text(value: Any) -> str:
     return safe_error_text(value, limit=_MODEL_CONNECTION_ERROR_LIMIT)
+
+
+def _model_server_error(exc: Exception) -> str:
+    return safe_error_text(exc, limit=500)
 
 
 async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
@@ -277,7 +304,8 @@ async def _execution_account_status(mode: str) -> dict:
     status = dict(cfg)
     status.update(
         {
-            "allocated_balance": account_equity,
+            "allocated_balance": legacy_allocated,
+            "account_balance_source_value": account_equity,
             "account_equity": account_equity,
             "max_loss_usdt": max_loss_usdt,
             "available_balance": okx_available,
@@ -400,6 +428,86 @@ async def _sync_models_to_running_services() -> None:
 # ── OKX Settings (split paper / live) ──
 
 
+# ── Model Server Settings ──
+
+
+@router.get("/settings/model-server")
+async def get_model_server_settings():
+    """Return encrypted model-server settings without exposing the password."""
+    try:
+        payload = await get_model_server_settings_public()
+    except ModelServerConfigError as exc:
+        raise HTTPException(status_code=503, detail=_model_server_error(exc)) from exc
+    return payload.as_dict()
+
+
+@router.post("/settings/model-server")
+async def update_model_server_settings(req: ModelServerSettingsRequest):
+    """Save model-server SSH settings for hardware/model monitoring."""
+    if not str(req.host or "").strip():
+        raise HTTPException(status_code=400, detail="模型服务器地址不能为空")
+    if req.port is None:
+        raise HTTPException(status_code=400, detail="模型服务器 SSH 端口不能为空")
+    if not str(req.username or "").strip():
+        raise HTTPException(status_code=400, detail="模型服务器用户名不能为空")
+
+    try:
+        payload = await save_model_server_settings(
+            host=req.host or "",
+            port=req.port,
+            username=req.username or "",
+            password=req.password,
+        )
+    except ModelServerConfigNotConfigured as exc:
+        raise HTTPException(status_code=400, detail=_model_server_error(exc)) from exc
+    except ModelServerConfigError as exc:
+        raise HTTPException(status_code=400, detail=_model_server_error(exc)) from exc
+
+    clear_server_monitor_cache()
+    return {
+        "status": "ok",
+        "message": "模型服务器配置已加密保存。",
+        "settings": payload.as_dict(),
+    }
+
+
+@router.post("/settings/model-server/test")
+async def test_model_server_settings(req: ModelServerSettingsRequest | None = None):
+    """Test the saved or submitted model-server settings."""
+    try:
+        if req and any(
+            value is not None for value in (req.host, req.port, req.username, req.password)
+        ):
+            if (
+                not str(req.host or "").strip()
+                or req.port is None
+                or not str(req.username or "").strip()
+            ):
+                raise ModelServerConfigNotConfigured("请先填写地址、端口和用户名。")
+            info = await build_model_server_info_from_update(
+                host=req.host or "",
+                port=req.port,
+                username=req.username or "",
+                password=req.password,
+            )
+        else:
+            info = await load_model_server_info_from_secure_settings()
+    except ModelServerConfigNotConfigured as exc:
+        raise HTTPException(status_code=400, detail=_model_server_error(exc)) from exc
+    except ModelServerConfigError as exc:
+        raise HTTPException(status_code=400, detail=_model_server_error(exc)) from exc
+
+    service = ServerMonitorStatusService(info_loader=lambda _root: info)
+    result = await asyncio.to_thread(service.collect_sync)
+    return {
+        "success": bool(result.get("available")),
+        "status": result.get("status"),
+        "message": result.get("message") or ("连接成功" if result.get("available") else "连接失败"),
+        "host": info.host,
+        "result": result,
+    }
+
+
 @router.get("/settings/okx")
 async def get_okx_settings():
     """Return both paper and live OKX config with secrets masked."""
@@ -427,6 +535,7 @@ async def update_okx_settings(req: OKXSettingsRequest):
     updates = {}
     if req.api_key is not None and req.api_key.strip() and not _is_masked_secret(req.api_key):
         updates[f"{prefix}_API_KEY"] = req.api_key.strip()
+        await set_runtime_secret(f"okx.{req.mode}.api_key", req.api_key.strip())
         setattr(settings, f"okx_{req.mode}_api_key", req.api_key.strip())
     if (
         req.api_secret is not None
@@ -434,13 +543,18 @@ async def update_okx_settings(req: OKXSettingsRequest):
         and not _is_masked_secret(req.api_secret)
     ):
         updates[f"{prefix}_API_SECRET"] = req.api_secret.strip()
+        await set_runtime_secret(f"okx.{req.mode}.api_secret", req.api_secret.strip())
         setattr(settings, f"okx_{req.mode}_api_secret", req.api_secret.strip())
     if req.passphrase is not None and not _is_masked_secret(req.passphrase):
         updates[f"{prefix}_PASSPHRASE"] = req.passphrase.strip()
+        if req.passphrase.strip():
+            await set_runtime_secret(f"okx.{req.mode}.passphrase", req.passphrase.strip())
         setattr(settings, f"okx_{req.mode}_passphrase", req.passphrase.strip())
 
     if updates:
-        settings.update_env_file(updates)
+        env_updates = strip_secret_env_updates(updates)
+        if env_updates:
+            settings.update_env_file(env_updates)
         _OKX_BALANCE_CACHE.pop(req.mode, None)
 
     # Reinitialize connections so displayed OKX balances immediately use the
@@ -612,7 +726,7 @@ async def update_execution_account_settings(req: ExecutionAccountRequest):
 
     return {
         "status": "ok",
-        "message": "执行账户设置已保存。",
+        "message": "执行账户风控设置已保存；下单资金自动使用 OKX 当前可用余额。",
         "paper": await _execution_account_status("paper"),
         "live": await _execution_account_status("live"),
     }
@@ -676,11 +790,14 @@ async def update_ai_model_fixed(name: str, req: AIModelRequest):
             updates["model"] = req.model
         if req.api_key is not None and req.api_key.strip() and not _is_masked_secret(req.api_key):
             updates["api_key"] = req.api_key
+            await set_runtime_secret(secure_ai_model_key(name), req.api_key.strip())
         updated = settings.set_fixed_ai_model(name, updates)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=safe_error_text(e)) from e
 
-    settings.update_env_file({"AI_MODELS": json.dumps(settings.ai_models, ensure_ascii=False)})
+    settings.update_env_file(
+        {"AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)}
+    )
     await _sync_models_to_running_services()
     return {"status": "ok", "message": f"Model '{name}' updated.", "model": _masked(updated)}
 
@@ -742,11 +859,16 @@ async def add_ai_model(req: AIModelRequest):
     if req.balance is not None:
         new_model["balance"] = req.balance
         settings.model_initial_balances[req.name.strip()] = req.balance
+    if new_model["api_key"]:
+        await set_runtime_secret(secure_ai_model_key(new_model["name"]), new_model["api_key"])
 
     settings.ai_models.append(new_model)
-    env_updates = {"AI_MODELS": json.dumps(settings.ai_models)}
+    env_updates = {
+        "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
+    }
     if req.balance is not None:
         env_updates["MODEL_INITIAL_BALANCES"] = json.dumps(settings.model_initial_balances)
+    env_updates = strip_secret_env_updates(env_updates)
     settings.update_env_file(env_updates)
 
     await _sync_models_to_running_services()
@@ -773,6 +895,9 @@ async def update_ai_model(name: str, req: AIModelRequest):
                 and not _is_masked_secret(req.api_key)
             ):
                 updated["api_key"] = req.api_key.strip()
+                await set_runtime_secret(
+                    secure_ai_model_key(updated.get("name", name)), req.api_key.strip()
+                )
             if req.model is not None and req.model.strip():
                 updated["model"] = req.model.strip()
             if req.execution_mode:
@@ -803,9 +928,12 @@ async def update_ai_model(name: str, req: AIModelRequest):
                 target_name = updated.get("name", name)
                 settings.model_initial_balances[target_name] = req.balance
             settings.ai_models[i] = updated
-            env_updates = {"AI_MODELS": json.dumps(settings.ai_models)}
+            env_updates = {
+                "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
+            }
             if req.balance is not None:
                 env_updates["MODEL_INITIAL_BALANCES"] = json.dumps(settings.model_initial_balances)
+            env_updates = strip_secret_env_updates(env_updates)
             settings.update_env_file(env_updates)
             await _sync_models_to_running_services()
             return {
@@ -824,7 +952,13 @@ async def delete_ai_model(name: str):
     for i, m in enumerate(settings.ai_models):
         if m.get("name") == name:
             settings.ai_models.pop(i)
-            settings.update_env_file({"AI_MODELS": json.dumps(settings.ai_models)})
+            settings.update_env_file(
+                {
+                    "AI_MODELS": json.dumps(
+                        scrub_ai_model_env(settings.ai_models), ensure_ascii=False
+                    )
+                }
+            )
             await _sync_models_to_running_services()
             return {"status": "ok", "message": f"Model '{name}' deleted."}
 
@@ -1051,6 +1185,7 @@ async def update_thresholds(req: ThresholdsRequest):
         if api_key and not _is_masked_secret(api_key):
             settings.high_risk_review_api_key = api_key
             updates["HIGH_RISK_REVIEW_API_KEY"] = settings.high_risk_review_api_key
+            await set_runtime_secret("high_risk_review.api_key", api_key)
 
     if req.high_risk_review_model is not None:
         settings.high_risk_review_model = req.high_risk_review_model.strip()
@@ -1108,7 +1243,9 @@ async def update_thresholds(req: ThresholdsRequest):
         updates["MAX_TOTAL_MARGIN_PCT"] = str(settings.max_total_margin_pct)
 
     if updates:
-        settings.update_env_file(updates)
+        env_updates = strip_secret_env_updates(updates)
+        if env_updates:
+            settings.update_env_file(env_updates)
 
     total_margin_limit_pct = (
         float(settings.max_total_margin_pct)
