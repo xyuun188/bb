@@ -1572,12 +1572,16 @@ def _dashboard_symbol_query_variants(symbols: set[str]) -> set[str]:
                 dashed = value.replace("/", "-")
                 variants.add(dashed)
                 variants.add(f"{dashed}-SWAP")
+                variants.add(f"{value}:USDT")
+                variants.add(f"{value.upper()}:USDT")
             elif "-" in value:
                 parts = [part for part in value.replace("-SWAP", "").split("-") if part]
                 if len(parts) >= 2:
                     slash = f"{parts[0]}/{parts[1]}"
                     variants.add(slash)
                     variants.add(slash.upper())
+                    variants.add(f"{slash}:USDT")
+                    variants.add(f"{slash.upper()}:USDT")
                     variants.add(f"{parts[0]}-{parts[1]}")
                     variants.add(f"{parts[0]}-{parts[1]}-SWAP")
     return {item for item in variants if item}
@@ -2514,10 +2518,11 @@ async def get_positions(
                 {_normalize_dashboard_symbol(p.symbol) for p in closed_rows if p.symbol}
             )
             if close_symbols:
+                close_symbol_variants = _dashboard_symbol_query_variants(set(close_symbols))
                 min_closed = min((p.closed_at for p in closed_rows if p.closed_at), default=None)
                 max_closed = max((p.closed_at for p in closed_rows if p.closed_at), default=None)
                 order_stmt = select(Order).where(
-                    Order.symbol.in_(close_symbols),
+                    Order.symbol.in_(close_symbol_variants),
                     Order.status == "filled",
                 )
                 if mode:
@@ -2816,13 +2821,6 @@ async def get_positions(
             if group.get("close_status") == "full":
                 group["close_status_label"] = "全部平仓"
             group["position_status"] = group["close_status_label"]
-            if (
-                int(group.get("split_count") or 1) > 1
-                and group.get("close_status_source") != "order"
-            ):
-                group["close_status"] = "partial"
-                group["close_status_label"] = "部分平仓"
-                group["position_status"] = "部分平仓"
 
         for item in grouped_positions:
             item.pop("_entry_notional_for_avg", None)
@@ -2963,7 +2961,9 @@ async def get_decisions(
                     "order_price": order_price,
                     "order_notional_usdt": order_notional,
                     "order_status": getattr(order, "status", None) if order else None,
-                    "exchange_order_id": getattr(order, "exchange_order_id", None) if order else None,
+                    "exchange_order_id": (
+                        getattr(order, "exchange_order_id", None) if order else None
+                    ),
                     "created_at": d.created_at.isoformat() if d.created_at else None,
                     "outcome": d.outcome,
                     "is_paper": d.is_paper,

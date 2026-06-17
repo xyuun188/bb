@@ -139,6 +139,20 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     assert "data.model_access_host" not in script
 
 
+def test_position_history_symbol_variants_include_okx_swap_suffix() -> None:
+    variants = dashboard._dashboard_symbol_query_variants({"OP/USDT"})
+
+    assert "OP/USDT:USDT" in variants
+    assert "OP-USDT-SWAP" in variants
+
+
+def test_position_history_does_not_treat_split_batches_as_partial() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/api/dashboard.py").read_text(encoding="utf-8")
+
+    assert "Order.symbol.in_(close_symbol_variants)" in script
+    assert 'int(group.get("split_count") or 1) > 1' not in script
+
+
 def test_analysis_timing_deduplicates_final_expert_rows() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
