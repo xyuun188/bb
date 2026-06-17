@@ -123,7 +123,11 @@ def expert_analysis_entry_block_reason(
         seen.add(name)
         status = str(item.get("status") or "").lower()
         provider = str(item.get("provider_model") or "").lower()
-        fallback_flag = bool(item.get("batch_expert_fallback") or item.get("fallback"))
+        fallback_flag = bool(
+            item.get("batch_expert_fallback")
+            or item.get("fallback")
+            or item.get("local_fallback")
+        )
         if status == "completed" and provider != "local_fast_prefilter" and not fallback_flag:
             trusted_by_name.add(name)
         elif status in UNTRUSTED_EXPERT_TIMING_STATUSES or "fallback" in status:

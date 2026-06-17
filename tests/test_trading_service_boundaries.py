@@ -1207,6 +1207,96 @@ async def test_entry_policy_fails_fast_without_profit_risk_sizing_dependency():
         await policy.apply_profit_risk_sizing(_decision(Action.LONG), "paper", [])
 
 
+@pytest.mark.asyncio
+async def test_entry_policy_scores_missing_opportunity_before_sizing_and_gate() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "strategy_mode": {"min_opportunity_score": 0.7},
+        "strategy_learning_context": {"strategy_profile_id": "unit-profile"},
+    }
+
+    def fake_score(scored_decision, strategy):
+        calls.append("score")
+        assert strategy["min_opportunity_score"] == 0.7
+        assert strategy["strategy_profile_id"] == "unit-profile"
+        raw = scored_decision.raw_response
+        raw["opportunity_score"] = {
+            "score": 1.35,
+            "min_score_required": 0.7,
+            "expected_net_return_pct": 0.8,
+            "profit_quality_ratio": 1.8,
+            "tail_risk_score": 0.2,
+            "success_probability": 0.62,
+        }
+        scored_decision.raw_response = raw
+        return 1.35
+
+    async def fake_sizing(sized_decision, model_mode, open_positions):
+        calls.append("sizing")
+        assert model_mode == "paper"
+        assert len(open_positions) == 1
+        assert sized_decision.raw_response["opportunity_score"]["score"] == 1.35
+
+    class FakeGate:
+        def gate_reason(self, gated_decision):
+            calls.append("gate")
+            assert gated_decision.raw_response["opportunity_score"]["score"] == 1.35
+            return None
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(
+        decision,
+        "ensemble_trader",
+        "paper",
+        [{"symbol": "ETH/USDT"}],
+    )
+
+    assert result.passed is True
+    assert calls == ["score", "sizing", "gate"]
+    assert decision.raw_response["opportunity_score"]["score"] == 1.35
+
+
+def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.SHORT)
+    decision.raw_response = {"strategy_mode": {"min_opportunity_score": 0.8}}
+
+    def fake_score(scored_decision, strategy):
+        calls.append("score")
+        assert strategy == {"min_opportunity_score": 0.8}
+        raw = scored_decision.raw_response
+        raw["opportunity_score"] = {
+            "score": 1.1,
+            "min_score_required": 0.8,
+            "expected_net_return_pct": 0.3,
+            "profit_quality_ratio": 1.1,
+            "tail_risk_score": 0.3,
+            "success_probability": 0.55,
+        }
+        scored_decision.raw_response = raw
+        return 1.1
+
+    class FakeGate:
+        def gate_reason(self, gated_decision):
+            calls.append("gate")
+            assert gated_decision.raw_response["opportunity_score"]["score"] == 1.1
+            return None
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    assert policy.gate_reason(decision) is None
+    assert calls == ["score", "gate"]
+
+
 def test_entry_policy_uses_injected_abnormal_wick_guard_boundary():
     calls: list[str] = []
 
@@ -1282,6 +1372,40 @@ async def test_trading_service_dashboard_async_boundaries_call_internal_owners()
     assert await service.get_okx_balance_snapshot_for_mode("live") == {"equity": 123.0}
     assert await service.completed_shadow_backtest_total() == 456
     assert calls == [("balance", "live"), ("shadow", "completed")]
+
+
+@pytest.mark.asyncio
+async def test_trading_service_stage_boundary_passes_duration() -> None:
+    service = TradingService.__new__(TradingService)
+    decision = _decision(Action.LONG)
+    captured: dict[str, Any] = {}
+
+    async def record_stage(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"ok": True}
+
+    service._record_and_persist_decision_stage = record_stage  # type: ignore[method-assign]
+
+    await service.record_and_persist_decision_stage(
+        9,
+        decision,
+        "exchange_submit",
+        "passed",
+        "OKX 已返回",
+        {"order_id": "1"},
+        duration_sec=1.25,
+    )
+
+    assert captured["kwargs"]["duration_sec"] == 1.25
+    assert captured["args"][:6] == (
+        9,
+        decision,
+        "exchange_submit",
+        "passed",
+        "OKX 已返回",
+        {"order_id": "1"},
+    )
 
 
 @pytest.mark.asyncio
@@ -2180,6 +2304,7 @@ async def test_execution_service_serializes_candidate_execution():
         "strategy_arbitration",
         "risk_check",
         "risk_check",
+        "exchange_submit",
         "exchange_submit",
         "exchange_confirm",
         "local_sync",

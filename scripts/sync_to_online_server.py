@@ -215,12 +215,21 @@ def read_secret_file(path):
 
 values = parse_env(runtime_path)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
+app_env_values = parse_env(app_env_path)
 if local_ai_tools_api_key:
     values['LOCAL_AI_TOOLS_API_KEY'] = local_ai_tools_api_key
 if not values.get('BB_SECURE_SETTINGS_KEY'):
-    values['BB_SECURE_SETTINGS_KEY'] = parse_env(app_env_path).get('BB_SECURE_SETTINGS_KEY', '')
+    values['BB_SECURE_SETTINGS_KEY'] = app_env_values.get('BB_SECURE_SETTINGS_KEY', '')
 if not values.get('BB_SECURE_SETTINGS_KEY'):
     values['BB_SECURE_SETTINGS_KEY'] = secrets.token_hex(32)
+database_url = str(values.get('DATABASE_URL') or app_env_values.get('DATABASE_URL') or '').strip()
+if (
+    not database_url
+    or database_url == 'postgresql+asyncpg:///bb_trading'
+    or database_url.startswith('postgresql+asyncpg:///')
+):
+    database_url = 'postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql'
+values['DATABASE_URL'] = database_url
 values['DASHBOARD_AUTH_ENABLED'] = 'true'
 values['DASHBOARD_INLINE_ENABLED'] = 'false'
 values['USE_FAKEREDIS'] = 'false'
@@ -488,7 +497,7 @@ def main() -> None:
                 f"systemctl is-active {_remote_quote(args.service)} && "
                 f"systemctl is-active {_remote_quote(args.dashboard_service)} && "
                 "for i in $(seq 1 30); do "
-                "code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
+                "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
                 'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
                 "sleep 2; "
                 "done; echo dashboard-timeout; exit 7"
@@ -499,7 +508,7 @@ def main() -> None:
             f"systemctl restart {_remote_quote(args.service)} && "
             f"systemctl is-active {_remote_quote(args.service)} && "
             "for i in $(seq 1 30); do "
-            "code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
+            "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
             'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
             "sleep 2; "
             "done; echo dashboard-timeout; exit 7"

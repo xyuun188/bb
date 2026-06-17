@@ -17,6 +17,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
+from services.decision_execution_trace import build_execution_trace
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.position_open_time import parse_position_time
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
@@ -690,30 +691,66 @@ async def get_trade_detail(trade_id: int):
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         order = await repo.get(trade_id)
-        action = None
+        decision = None
         if order and order.decision_id:
             result = await session.execute(
-                select(AIDecision.action).where(AIDecision.id == order.decision_id)
+                select(AIDecision).where(AIDecision.id == order.decision_id)
             )
-            action = result.scalar_one_or_none()
+            decision = result.scalar_one_or_none()
 
     if not order:
         return {"error": "Trade not found"}
 
+    raw_response = _safe_dict(getattr(decision, "raw_llm_response", None))
+    execution_reason = sanitize_text(getattr(decision, "execution_reason", None))
+    fallback_reason = (
+        _translate_execution_text(execution_reason)
+        if execution_reason
+        else _translate_execution_text(order.exchange_order_id)
+        if order.exchange_order_id and order.exchange_order_id not in {"", "rejected"}
+        else ("订单执行成功。" if order.status == "filled" else "订单未成交或执行失败。")
+    )
+    trace = build_execution_trace(
+        raw_response,
+        order_status=order.status,
+        order_created_at=order.created_at,
+        order_filled_at=order.filled_at,
+        fallback_reason=fallback_reason,
+    )
+
     return sanitize_payload(
         {
             "id": order.id,
+            "decision_id": order.decision_id,
             "model_name": order.model_name,
             "mode": order.execution_mode,
             "symbol": order.symbol,
             "side": order.side,
-            "action": action,
+            "action": getattr(decision, "action", None),
             "order_type": order.order_type,
             "quantity": order.quantity,
             "price": order.price,
             "status": order.status,
             "fee": order.fee,
             "exchange_order_id": sanitize_text(order.exchange_order_id),
+            "reason": fallback_reason,
+            "detail": fallback_reason,
+            "success": order.status == "filled",
+            "decision": {
+                "action": getattr(decision, "action", None),
+                "confidence": getattr(decision, "confidence", None),
+                "position_size_pct": getattr(decision, "position_size_pct", None),
+                "suggested_leverage": getattr(decision, "suggested_leverage", None),
+                "reasoning": sanitize_text(getattr(decision, "reasoning", None)),
+                "execution_reason": execution_reason,
+            }
+            if decision is not None
+            else None,
+            "execution_steps": trace["execution_steps"],
+            "stage_events": trace["stage_events"],
+            "final_result": trace["final_result"],
+            "failed_step": trace["failed_step"],
+            "repair_suggestions": trace["repair_suggestions"],
             "filled_at": order.filled_at.isoformat() if order.filled_at else None,
             "created_at": order.created_at.isoformat() if order.created_at else None,
         }

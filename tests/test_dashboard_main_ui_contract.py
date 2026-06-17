@@ -54,6 +54,35 @@ def test_dashboard_refreshes_auth_status_in_topbar() -> None:
     assert "dashboard-current-user" in script
 
 
+def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "mode-static-tag" not in html
+    assert "mode-static-title" not in html
+    assert "自动模式</span>" not in html
+    assert html.count("自动扫描 · 系统调度") == 1
+    assert html.index('id="live-model-name"') < html.index("自动扫描 · 系统调度")
+    assert ".mode-btn[data-scan]" not in script
+
+
+def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert "system-self-check-panel" in html
+    assert "fetchSystemSelfCheck()" in html
+    assert "repairSystemSelfCheck()" in html
+    assert "fetchJSON(`/api/trades/${encodeURIComponent(Number(tradeId))}`)" in script
+    assert "function renderExecutionTimeline" in script
+    assert "failed_step" in script
+    assert "execution_steps" in script
+    assert "旧记录未采集耗时" in script
+    assert ".execution-timeline" in style
+    assert ".self-check-card" in style
+
+
 def test_analysis_timing_deduplicates_final_expert_rows() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 

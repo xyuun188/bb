@@ -7,6 +7,7 @@ state-machine event and dashboard row.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +68,37 @@ class EntryPolicy:
             return self.entry_opportunity_score.score_candidate(decision, strategy)
         raise RuntimeError("EntryPolicy requires entry_opportunity_score dependency")
 
+    def ensure_opportunity_score(
+        self,
+        decision: DecisionOutput,
+        strategy: dict[str, Any] | None = None,
+    ) -> None:
+        """Ensure every entry reaches execution with a computed opportunity score."""
+
+        if not decision.is_entry:
+            return
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity = raw.get("opportunity_score")
+        if isinstance(opportunity, dict):
+            try:
+                if math.isfinite(float(opportunity.get("score"))):
+                    return
+            except (TypeError, ValueError):
+                pass
+        self.score_candidate(decision, strategy)
+
+    @staticmethod
+    def strategy_context_from_decision(decision: DecisionOutput) -> dict[str, Any]:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        context: dict[str, Any] = {}
+        strategy_mode = raw.get("strategy_mode")
+        if isinstance(strategy_mode, dict):
+            context.update(strategy_mode)
+        learning_context = raw.get("strategy_learning_context")
+        if isinstance(learning_context, dict):
+            context.update(learning_context)
+        return context
+
     def immediate_execution_reason(self, decision: DecisionOutput) -> str | None:
         if self.entry_priority is None:
             return None
@@ -88,9 +120,11 @@ class EntryPolicy:
         )
 
     def gate_reason(self, decision: DecisionOutput) -> str | None:
-        if self.entry_opportunity_gate is not None:
-            return self.entry_opportunity_gate.gate_reason(decision)
-        raise RuntimeError("EntryPolicy requires entry_opportunity_gate dependency")
+        if self.entry_opportunity_gate is None:
+            raise RuntimeError("EntryPolicy requires entry_opportunity_gate dependency")
+        if self.entry_opportunity_score is not None:
+            self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
+        return self.entry_opportunity_gate.gate_reason(decision)
 
     def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
         if self.decision_freshness is not None:
@@ -178,6 +212,8 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
+        self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
+
         await self.apply_profit_risk_sizing(
             decision,
             model_mode,
@@ -185,11 +221,19 @@ class EntryPolicy:
         )
         evidence_score = {}
         opportunity = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity_data = opportunity.get("opportunity_score") if isinstance(opportunity, dict) else {}
-        if isinstance(opportunity_data, dict) and isinstance(opportunity_data.get("evidence_score"), dict):
+        opportunity_data = (
+            opportunity.get("opportunity_score") if isinstance(opportunity, dict) else {}
+        )
+        if isinstance(opportunity_data, dict) and isinstance(
+            opportunity_data.get("evidence_score"), dict
+        ):
             evidence_score = opportunity_data["evidence_score"]
         evidence_tier = str(evidence_score.get("tier") or "")
-        if decision.position_size_pct <= 0 and evidence_tier in {"blocked", "weak_conflict_probe", "degraded_missing_probe"}:
+        if decision.position_size_pct <= 0 and evidence_tier in {
+            "blocked",
+            "weak_conflict_probe",
+            "degraded_missing_probe",
+        }:
             return PolicyGateResult.block(
                 "entry_evidence_wait",
                 (

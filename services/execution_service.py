@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
+from time import perf_counter
 from typing import Any
 
 import structlog
@@ -544,6 +545,8 @@ class ExecutionService:
 
         execution_result = None
         model_mode = get_model_execution_mode(model_name)
+        stage_started_at: dict[str, float] = {}
+        submitted_to_exchange = False
 
         async def mark_stage(
             stage: str,
@@ -551,14 +554,38 @@ class ExecutionService:
             reason: str,
             data: dict[str, Any] | None = None,
         ) -> None:
-            await record_decision_stage(
-                decision_db_id,
-                decision,
-                stage,
-                status,
-                reason,
-                data,
-            )
+            now = perf_counter()
+            started_at = stage_started_at.get(stage, now)
+            if status == DecisionStageStatus.PENDING:
+                stage_started_at[stage] = now
+                duration_sec = 0.0
+            else:
+                duration_sec = now - started_at
+                stage_started_at[stage] = now
+
+            payload = dict(data or {})
+            payload.setdefault("model_mode", model_mode)
+            payload.setdefault("symbol", symbol)
+            payload.setdefault("model_name", model_name)
+            try:
+                await record_decision_stage(
+                    decision_db_id,
+                    decision,
+                    stage,
+                    status,
+                    reason,
+                    payload,
+                    duration_sec=duration_sec,
+                )
+            except TypeError:
+                await record_decision_stage(
+                    decision_db_id,
+                    decision,
+                    stage,
+                    status,
+                    reason,
+                    payload,
+                )
 
         async def mark_blocked(reason: str, data: dict[str, Any] | None = None) -> None:
             await mark_stage(
@@ -721,6 +748,7 @@ class ExecutionService:
                 )
             else:
                 execution_timeout = 90.0 if decision.is_exit else 60.0
+                submitted_to_exchange = True
                 execution_result = await asyncio.wait_for(
                     executor.place_order(
                         decision,
@@ -728,6 +756,19 @@ class ExecutionService:
                         override_balance=override_balance,
                     ),
                     timeout=execution_timeout,
+                )
+            if submitted_to_exchange and (decision.is_entry or decision.is_exit):
+                await mark_stage(
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.PASSED,
+                    "OKX 提交阶段已返回订单响应，进入成交确认阶段。",
+                    {
+                        "has_execution_result": execution_result is not None,
+                        "status": getattr(getattr(execution_result, "status", None), "value", None),
+                        "exchange_order_id": getattr(
+                            execution_result, "exchange_order_id", None
+                        ),
+                    },
                 )
             if decision.is_entry and execution_result is not None:
                 attach_execution_leverage_summary(
@@ -750,6 +791,13 @@ class ExecutionService:
                     "本轮按未执行处理，下一轮会继续复盘该仓位。"
                 ),
             )
+            if submitted_to_exchange:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    "OKX 下单请求超时，未拿到交易所明确接收结果。",
+                    {"error_type": "timeout"},
+                )
             await mark_stage(
                 DecisionStage.EXCHANGE_CONFIRM,
                 DecisionStageStatus.FAILED,

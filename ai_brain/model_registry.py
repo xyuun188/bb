@@ -140,6 +140,16 @@ def _positive_duration_seconds(started_at: float) -> float:
     return max(round(time.perf_counter() - started_at, 3), 0.001)
 
 
+def _independent_expert_timeout_seconds(active_count: int) -> float:
+    """Return the real independent expert timeout without the old 18-second cap."""
+
+    base_timeout = max(float(settings.ai_expert_timeout_seconds or 30.0), 8.0)
+    expert_count = max(int(active_count or 1), 1)
+    concurrency = max(int(settings.ai_llm_concurrency or expert_count), 1)
+    queue_batches = max((expert_count + concurrency - 1) // concurrency, 1)
+    return base_timeout * queue_batches
+
+
 class ModelRegistry:
     """Central registry for all AI models.
 
@@ -627,10 +637,13 @@ class ModelRegistry:
                 if isinstance(result.raw_response, dict):
                     provider_model = result.raw_response.get("provider_model")
                     fallback_from = result.raw_response.get("fallback_from")
+                    local_fallback = bool(result.raw_response.get("local_fallback"))
                     if provider_model:
                         timing["provider_model"] = provider_model
                     if fallback_from:
                         timing["fallback_from"] = fallback_from
+                    if local_fallback:
+                        timing["local_fallback"] = True
             return model, result, timing
 
         tasks = [_timed_decide(model) for model in active_models]
@@ -701,10 +714,7 @@ class ModelRegistry:
             retry_started_at = datetime.now(UTC)
             perf_started = time.perf_counter()
             try:
-                timeout_seconds = min(
-                    max(float(settings.ai_expert_timeout_seconds or 30.0), 8.0),
-                    18.0,
-                )
+                timeout_seconds = _independent_expert_timeout_seconds(len(active_models))
                 result = await asyncio.wait_for(
                     model.decide(features, retry_context),
                     timeout=timeout_seconds,
@@ -727,6 +737,7 @@ class ModelRegistry:
                     _provider_model_name(model) or _provider_model_name(batch_model),
                 )
                 result.raw_response = raw
+                local_fallback = bool(raw.get("local_fallback"))
                 return (
                     model,
                     result,
@@ -736,10 +747,12 @@ class ModelRegistry:
                         "status": "completed",
                         "started_at": retry_started_at.isoformat(),
                         "duration_sec": retry_duration,
+                        "timeout_seconds": timeout_seconds,
                         "batch_expert": False,
                         "shared_batch_call": False,
                         "batch_failure_status": status,
                         "provider_independent_expert_mode": True,
+                        "local_fallback": local_fallback,
                         "action": result.action.value,
                         "confidence": result.confidence,
                         "provider_model": raw.get("provider_model"),
@@ -766,6 +779,7 @@ class ModelRegistry:
                         "status": "independent_provider_failed",
                         "started_at": retry_started_at.isoformat(),
                         "duration_sec": retry_duration,
+                        "timeout_seconds": timeout_seconds,
                         "batch_expert": False,
                         "shared_batch_call": False,
                         "batch_failure_status": status,
@@ -870,10 +884,7 @@ class ModelRegistry:
             started_at = datetime.now(UTC)
             perf_started = time.perf_counter()
             try:
-                timeout_seconds = min(
-                    max(float(settings.ai_expert_timeout_seconds or 30.0), 8.0),
-                    18.0,
-                )
+                timeout_seconds = _independent_expert_timeout_seconds(len(retry_models))
                 result = await asyncio.wait_for(
                     model.decide(features, retry_context),
                     timeout=timeout_seconds,
@@ -889,6 +900,7 @@ class ModelRegistry:
                             "status": "invalid",
                             "started_at": started_at.isoformat(),
                             "duration_sec": duration,
+                            "timeout_seconds": timeout_seconds,
                             "reason": "independent expert retry returned invalid result",
                         },
                     )
@@ -912,6 +924,7 @@ class ModelRegistry:
                     "status": "completed",
                     "started_at": started_at.isoformat(),
                     "duration_sec": duration,
+                    "timeout_seconds": timeout_seconds,
                     "action": result.action.value,
                     "confidence": result.confidence,
                     "replaces_batch_decision": True,
@@ -939,6 +952,7 @@ class ModelRegistry:
                         "status": "failed",
                         "started_at": started_at.isoformat(),
                         "duration_sec": duration,
+                        "timeout_seconds": timeout_seconds,
                         "reason": error_text,
                         "replaces_batch_decision": False,
                     },

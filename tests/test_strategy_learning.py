@@ -59,6 +59,22 @@ def _position(
     )
 
 
+def test_strategy_learning_expert_integrity_reads_duration_sec() -> None:
+    compiler = StrategyLearningEngine().compiler
+    timings = [
+        {**item, "duration_sec": item.pop("seconds")}
+        for item in (dict(row) for row in COMPLETED_EXPERT_TIMINGS)
+    ]
+
+    fallback, zero_second, missing = compiler._expert_integrity_flags(
+        {"model_timings": timings}
+    )
+
+    assert fallback is False
+    assert zero_second is False
+    assert missing == []
+
+
 def _open_position(symbol: str, side: str, pnl: float) -> dict[str, Any]:
 
     return {

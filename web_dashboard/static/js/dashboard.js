@@ -58,6 +58,7 @@ const state = {
     mlSignalStatus: null,
     localAIToolsStatus: null,
     serverMonitorStatus: null,
+    systemSelfCheck: null,
     mlSignalRecords: [],
     mlSignalPage: 1,
     tradesTotalPages: 1,
@@ -584,9 +585,6 @@ function updateModeDisplay(mode, paused, scanMode) {
         btn.classList.toggle('active', btn.dataset.mode === mode);
     });
 
-    document.querySelectorAll('.mode-btn[data-scan]').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.scan === 'auto');
-    });
     const scanLabel = document.getElementById('scan-mode-label');
     if (scanLabel) scanLabel.textContent = '自动扫描全市场 · 智能调度';
 }
@@ -1437,7 +1435,10 @@ function loadPageData(page) {
     if (page === 'expert-memory') fetchExpertMemories();
     if (page === 'shadow-backtest') fetchShadowBacktests();
     if (page === 'ml-signal') fetchMLSignalDashboard();
-    if (page === 'server-monitor') fetchServerMonitor();
+    if (page === 'server-monitor') {
+        fetchSystemSelfCheck();
+        fetchServerMonitor();
+    }
     if (page === 'settings') {
         fetchDashboardAccountSettings();
         fetchModelServerSettings();
@@ -3804,6 +3805,99 @@ async function fetchServerMonitor() {
     renderServerMonitor();
 }
 
+async function fetchSystemSelfCheck() {
+    const updated = document.getElementById('system-self-check-updated');
+    const panel = document.getElementById('system-self-check-panel');
+    if (updated) updated.textContent = '自检中...';
+    if (panel) panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">正在检查模型、账户、执行链路和最近失败步骤...</div>';
+    const data = await fetchJSON('/api/system/self-check');
+    state.systemSelfCheck = data || null;
+    renderSystemSelfCheck();
+}
+
+async function repairSystemSelfCheck() {
+    const updated = document.getElementById('system-self-check-updated');
+    if (updated) updated.textContent = '安全修复中...';
+    try {
+        const data = await postJSON('/api/system/self-check/repair', {});
+        const actions = (data.actions || []).map(item => `${item.action}: ${item.status}`).join('；');
+        alert(`安全修复已执行：${actions || '无可执行动作'}。将重新自检。`);
+        await fetchSystemSelfCheck();
+        await fetchServerMonitor();
+    } catch (error) {
+        alert(`安全修复失败：${error.message || error}`);
+        renderSystemSelfCheck();
+    }
+}
+
+function selfCheckStatusLabel(status) {
+    const labels = { ok: '正常', warning: '需关注', critical: '异常', info: '提示' };
+    return labels[status] || status || '-';
+}
+
+function selfCheckDetailText(details) {
+    if (!details || typeof details !== 'object' || !Object.keys(details).length) return '';
+    const lines = [];
+    Object.entries(details).forEach(([key, value]) => {
+        if (value === null || value === undefined || value === '') return;
+        if (typeof value === 'object') {
+            lines.push(`${key}: ${JSON.stringify(value)}`);
+        } else {
+            lines.push(`${key}: ${value}`);
+        }
+    });
+    return lines.join('\n');
+}
+
+function renderSystemSelfCheck() {
+    const updated = document.getElementById('system-self-check-updated');
+    const panel = document.getElementById('system-self-check-panel');
+    const data = state.systemSelfCheck || {};
+    if (updated) {
+        updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '等待自检';
+    }
+    if (!panel) return;
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!items.length) {
+        panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">还没有自检结果。</div>';
+        return;
+    }
+    const summary = data.summary || {};
+    const summaryHtml = `
+        <div class="self-check-summary">
+            <div class="self-check-card ${data.status || 'info'}">
+                <div class="self-check-title"><span>总体状态</span><strong>${escHtml(selfCheckStatusLabel(data.status))}</strong></div>
+                <div class="self-check-message">异常 ${Number(summary.critical || 0)} · 需关注 ${Number(summary.warning || 0)} · 正常 ${Number(summary.ok || 0)}</div>
+            </div>
+            ${items.slice(0, 3).map(item => `
+                <div class="self-check-card ${escHtml(item.status || 'info')}">
+                    <div class="self-check-title">
+                        <span>${escHtml(item.title || item.key || '-')}</span>
+                        <strong>${escHtml(selfCheckStatusLabel(item.status))}</strong>
+                    </div>
+                    <div class="self-check-message">${escHtml(item.message || '-')}</div>
+                </div>
+            `).join('')}
+        </div>`;
+    const detailHtml = `
+        <div class="server-monitor-services" style="padding:0 12px 12px;">
+            ${items.map(item => {
+                const detailText = selfCheckDetailText(item.details);
+                return `
+                    <div class="self-check-card ${escHtml(item.status || 'info')}">
+                        <div class="self-check-title">
+                            <span>${escHtml(item.title || item.key || '-')}</span>
+                            <strong>${escHtml(selfCheckStatusLabel(item.status))}</strong>
+                        </div>
+                        <div class="self-check-message">${escHtml(item.message || '-')}</div>
+                        ${detailText ? `<div class="self-check-details">${escHtml(detailText)}</div>` : ''}
+                        ${item.repairable ? '<div class="self-check-message">可执行安全修复：清缓存 / 重置熔断，不会改资金和订单。</div>' : ''}
+                    </div>`;
+            }).join('')}
+        </div>`;
+    panel.innerHTML = summaryHtml + detailHtml;
+}
+
 function monitorNumber(value, digits = 1) {
     const n = Number(value || 0);
     if (!Number.isFinite(n)) return '0';
@@ -5505,9 +5599,53 @@ function translatePauseReason(value) {
     return text;
 }
 
-function showExecutionDetail(tradeId) {
-    const trade = state.allTrades.find(t => Number(t.id) === Number(tradeId));
-    if (!trade) return;
+function executionStepTone(status) {
+    const value = String(status || '').toLowerCase();
+    if (['blocked', 'failed'].includes(value)) return 'bad';
+    if (['skipped', 'pending'].includes(value)) return 'warn';
+    return 'ok';
+}
+
+function executionStepDuration(step) {
+    if (!step || step.duration_sec === null || step.duration_sec === undefined) {
+        return '旧记录未采集耗时';
+    }
+    return analysisDurationLabel(step.duration_sec);
+}
+
+function executionStepDataText(data) {
+    if (!data || typeof data !== 'object' || !Object.keys(data).length) return '';
+    return Object.entries(data)
+        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+        .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+        .join('\n');
+}
+
+function renderExecutionTimeline(steps, failedStep) {
+    const rows = Array.isArray(steps) ? steps : [];
+    if (!rows.length) {
+        return '<div class="reason-block">该记录没有执行步骤链；如果是旧记录，只能显示订单快照。</div>';
+    }
+    const failedKey = failedStep ? `${failedStep.stage || ''}:${failedStep.status || ''}` : '';
+    return `<div class="execution-timeline">${rows.map((step, index) => {
+        const status = step.status || '';
+        const key = `${step.stage || ''}:${status}`;
+        const tone = key === failedKey ? 'bad' : executionStepTone(status);
+        const dataText = executionStepDataText(step.data);
+        return `
+            <div class="execution-step ${tone}">
+                <div class="execution-step-head">
+                    <span>${Number(step.step_no || index + 1)}. ${escHtml(step.stage_label || stateStageLabel(step.stage))}</span>
+                    <span class="execution-step-meta">${escHtml(step.status_label || stateStatusLabel(status))} · ${escHtml(executionStepDuration(step))}</span>
+                </div>
+                <div class="execution-step-reason">${escapeMultiline(step.reason || '该步骤没有返回额外说明。')}</div>
+                <div class="execution-step-meta">时间：${toBeijingTime(step.at)}</div>
+                ${dataText ? `<div class="execution-step-data">${escHtml(dataText)}</div>` : ''}
+            </div>`;
+    }).join('')}</div>`;
+}
+
+function renderExecutionDetailModal(trade, detailData = null) {
     setDecisionModalWide(false);
     const success = trade.success === true || trade.status === 'filled';
     const fallbackSource = trade.execution_source === 'okx' ? 'OKX执行' : '系统执行';
@@ -5519,7 +5657,7 @@ function showExecutionDetail(tradeId) {
         ? `${actionLabel(trade.action || trade.side)} / ${closeStatus}`
         : actionLabel(trade.action || trade.side);
     const detail = cleanExecutionDetailText(
-        trade.detail || trade.reason,
+        detailData?.detail || detailData?.reason || trade.detail || trade.reason,
         success ? '订单执行成功。' : '订单执行失败，暂无详细原因。'
     );
     const aiLev = Number(trade.ai_suggested_leverage ?? trade.leverage ?? 1).toFixed(1);
@@ -5529,9 +5667,46 @@ function showExecutionDetail(tradeId) {
         ? `持仓时长：${holdHours >= 1 ? `${holdHours.toFixed(2)} 小时` : `${Number(trade.hold_minutes || 0).toFixed(0)} 分钟`}<br>`
         : '';
 
+    const finalResult = detailData?.final_result || null;
+    const failedStep = detailData?.failed_step || null;
+    const repairSuggestions = Array.isArray(detailData?.repair_suggestions)
+        ? detailData.repair_suggestions
+        : [];
+    const timelineHtml = detailData
+        ? renderExecutionTimeline(detailData.execution_steps, failedStep)
+        : '<div class="reason-block">正在读取每一步执行耗时和失败节点...</div>';
+    const finalHtml = finalResult ? `
+        <div class="reason-block">
+            <div class="reason-label">最终结果</div>
+            <div class="execution-result-grid">
+                <div><strong>${escHtml(finalResult.success ? '执行成功' : '执行未完成/失败')}</strong><br><span class="reason-meta">${escHtml(finalResult.stage_label || '-')}</span></div>
+                <div><strong>${escHtml(finalResult.status_label || '-')}</strong><br><span class="reason-meta">最终状态</span></div>
+                <div><strong>${escHtml(analysisDurationLabel(finalResult.total_duration_sec))}</strong><br><span class="reason-meta">总耗时</span></div>
+            </div>
+            ${finalResult.reason ? `<div style="margin-top:8px;">${escapeMultiline(finalResult.reason)}</div>` : ''}
+        </div>` : '';
+    const failedHtml = failedStep ? `
+        <div class="reason-block">
+            <div class="reason-label">问题定位</div>
+            <div>卡在：${escHtml(failedStep.stage_label || stateStageLabel(failedStep.stage))} / ${escHtml(failedStep.status_label || stateStatusLabel(failedStep.status))} / 耗时 ${escHtml(executionStepDuration(failedStep))}</div>
+            <div style="margin-top:6px;">${escapeMultiline(failedStep.reason || '该步骤未返回详细原因。')}</div>
+        </div>` : '';
+    const suggestionsHtml = repairSuggestions.length ? `
+        <div class="reason-block">
+            <div class="reason-label">处理建议</div>
+            <div>${repairSuggestions.map(item => `• ${escHtml(item)}`).join('<br>')}</div>
+        </div>` : '';
+
     document.getElementById('decision-reason-title').textContent =
         `${trade.display_symbol || trade.symbol || '-'} / ${actionTitle} / ${success ? '执行成功' : '执行失败'}`;
     document.getElementById('decision-reason-body').innerHTML = `
+        ${finalHtml}
+        ${failedHtml}
+        ${suggestionsHtml}
+        <div class="reason-block">
+            <div class="reason-label">执行步骤</div>
+            ${timelineHtml}
+        </div>
         <div class="reason-block">
             <div class="reason-label">${success ? '执行详情' : '失败原因'}</div>
             <div>${escapeMultiline(detail)}</div>
@@ -5555,7 +5730,22 @@ function showExecutionDetail(tradeId) {
                 状态：${statusLabel(trade.status)}
             </div>
         </div>`;
+}
+
+async function showExecutionDetail(tradeId) {
+    const trade = state.allTrades.find(t => Number(t.id) === Number(tradeId));
+    if (!trade) return;
+    renderExecutionDetailModal(trade, null);
     document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
+    const detail = await fetchJSON(`/api/trades/${encodeURIComponent(Number(tradeId))}`);
+    if (!detail || detail.error) {
+        const body = document.getElementById('decision-reason-body');
+        if (body) {
+            body.innerHTML = `<div class="reason-block"><div class="reason-label">详情加载失败</div><div>${escHtml(detail?.error || '未能读取执行步骤详情。')}</div></div>` + body.innerHTML;
+        }
+        return;
+    }
+    renderExecutionDetailModal({ ...trade, ...detail }, detail);
 }
 
 // Close modal on overlay click

@@ -1083,17 +1083,32 @@ class TradingService:
         status: str,
         reason: str | None,
         data: dict[str, Any] | None = None,
+        *,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
         """Record decision-stage telemetry through an explicit boundary."""
 
-        return await self._record_and_persist_decision_stage(
-            decision_id,
-            decision,
-            stage,
-            status,
-            reason,
-            data,
-        )
+        try:
+            return await self._record_and_persist_decision_stage(
+                decision_id,
+                decision,
+                stage,
+                status,
+                reason,
+                data,
+                duration_sec=duration_sec,
+            )
+        except TypeError as exc:
+            if "duration_sec" not in str(exc):
+                raise
+            return await self._record_and_persist_decision_stage(
+                decision_id,
+                decision,
+                stage,
+                status,
+                reason,
+                data,
+            )
 
     async def mark_decision_reason(self, decision_id: int, reason: str | None) -> None:
         """Persist execution reason through an explicit execution-service boundary."""
@@ -1990,6 +2005,7 @@ class TradingService:
         if not isinstance(strategy_mode_context, dict):
             return
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["strategy_mode"] = self._json_safe_payload(strategy_mode_context)
         raw["strategy_learning_context"] = {
             "strategy_profile_id": strategy_mode_context.get("strategy_profile_id"),
             "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
@@ -2298,8 +2314,22 @@ class TradingService:
         and stored as advisory evidence. At execution time they may reduce size
         or add warnings, but they should not frequently veto AI entries.
         """
+        entry_policy = getattr(self, "entry_policy", None)
+        if entry_policy is not None:
+            return entry_policy.gate_reason(decision)
         gate = getattr(self, "entry_opportunity_gate", None)
         if gate is not None:
+            scorer = getattr(self, "entry_opportunity_score", None)
+            if scorer is not None and decision.is_entry:
+                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                strategy = {}
+                strategy_mode = raw.get("strategy_mode")
+                if isinstance(strategy_mode, dict):
+                    strategy.update(strategy_mode)
+                learning_context = raw.get("strategy_learning_context")
+                if isinstance(learning_context, dict):
+                    strategy.update(learning_context)
+                scorer.score_candidate(decision, strategy)
             return gate.gate_reason(decision)
         return EntryOpportunityGatePolicy(
             symbol_loss_cooldown_policy=EntryLossCooldownPolicy(self._normalize_position_symbol),
@@ -3047,6 +3077,8 @@ class TradingService:
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
                     )
+                if decision.is_entry:
+                    self._candidate_opportunity_score(decision, strategy_mode_context)
                 self._attach_strategy_learning_context(decision, strategy_mode_context)
                 self._attach_decision_timing(decision, analysis_started, "market")
                 self.agent_skills.attach(
@@ -3144,6 +3176,7 @@ class TradingService:
                         probe_source_label = "服务器盈利模型"
                     if probe_decision is not None:
                         executed = probe_decision
+                        self._candidate_opportunity_score(executed, strategy_mode_context)
                         self._attach_strategy_learning_context(executed, strategy_mode_context)
                         if decision_db_id is not None:
                             await self._mark_decision_reason(
@@ -6035,6 +6068,8 @@ class TradingService:
         status: str,
         reason: str | None,
         data: dict[str, Any] | None = None,
+        *,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
         return self.decision_persistence.record_stage(
             decision,
@@ -6042,6 +6077,7 @@ class TradingService:
             status,
             reason,
             data,
+            duration_sec=duration_sec,
         )
 
     async def _record_and_persist_decision_stage(
@@ -6052,6 +6088,7 @@ class TradingService:
         status: str,
         reason: str | None,
         data: dict[str, Any] | None = None,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
         return await self.decision_persistence.record_and_persist_stage(
             decision_id=decision_id,
@@ -6060,6 +6097,7 @@ class TradingService:
             status=status,
             reason=reason,
             data=data,
+            duration_sec=duration_sec,
         )
 
     async def _record_decision_reason_strategy_event(

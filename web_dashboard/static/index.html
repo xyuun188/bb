@@ -105,17 +105,13 @@
                         <button class="mode-btn active" data-mode="paper">模拟盘</button>
                         <button class="mode-btn" data-mode="live">实盘</button>
                     </div>
-                    <div class="mode-static-tag">
-                        <span class="mode-static-title">自动模式</span>
-                        <span class="mode-static-desc">全市场扫描 · 智能调度</span>
-                    </div>
                     <button class="btn" onclick="togglePause()" id="pause-btn">暂停交易</button>
                     <span style="font-size:11px;color:var(--text-muted);">
                         执行账户 <strong id="live-model-name" style="color:var(--text);">加载中</strong>
                     </span>
+                    <span class="auto-scan-pill">自动扫描 · 系统调度</span>
                 </div>
                 <div class="topbar-right">
-                    <span class="auto-scan-pill">自动扫描 · 系统调度</span>
                     <div class="dashboard-user-chip" id="dashboard-user-chip" title="当前登录账号">
                         <span class="dashboard-user-dot"></span>
                         <span id="dashboard-current-user">未登录</span>
@@ -974,6 +970,20 @@
 
         <!-- ═══════ PAGE: SERVER MONITOR ═══════ -->
         <div class="page-section" id="page-server-monitor">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">系统自检 / 自动修复</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="system-self-check-updated">等待自检</span>
+                        <button class="btn btn-sm" onclick="fetchSystemSelfCheck()">立即自检</button>
+                        <button class="btn btn-sm" onclick="repairSystemSelfCheck()">安全修复</button>
+                    </div>
+                </div>
+                <div id="system-self-check-panel">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">点击“立即自检”检查模型、账户、执行链路和最近失败步骤。</div>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">服务器硬件状态</span>

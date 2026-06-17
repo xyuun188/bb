@@ -76,6 +76,7 @@ def append_decision_stage(
     data: dict[str, Any] | None = None,
     *,
     at: datetime | None = None,
+    duration_sec: float | None = None,
 ) -> dict[str, Any]:
     """Append a state-machine event to a raw LLM response payload."""
 
@@ -95,6 +96,8 @@ def append_decision_stage(
         "reason": str(reason or "").strip(),
         "at": (at or datetime.now(UTC)).isoformat(),
     }
+    if duration_sec is not None:
+        event["duration_sec"] = round(max(float(duration_sec), 0.0), 3)
     if data:
         event["data"] = data
     stages.append(event)
@@ -150,6 +153,7 @@ def summarize_decision_stages(stages: list[dict[str, Any]] | None) -> dict[str, 
                 "status_label": event.get("status_label") or STATUS_LABELS.get(status, status),
                 "reason": event.get("reason") or "",
                 "at": event.get("at"),
+                "duration_sec": event.get("duration_sec"),
             }
         )
         if status in {DecisionStageStatus.PASSED, DecisionStageStatus.COMPLETED}:

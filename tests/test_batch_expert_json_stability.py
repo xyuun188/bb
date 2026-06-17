@@ -669,6 +669,43 @@ async def test_batch_timeout_activates_minimum_circuit_breaker_when_config_is_ze
 
 
 @pytest.mark.asyncio
+async def test_independent_provider_retry_uses_configured_expert_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_expert_timeout_seconds", 30.0)
+    _ProviderBatchExpert.batch_calls = []
+    _ProviderBatchExpert.individual_calls = []
+    registry = ModelRegistry()
+    for name in ("sentiment_expert", "position_expert", "risk_expert"):
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=LOCAL_DEEPSEEK_TEST_BASE,
+                model_name="deepseek-r1-14b-risk",
+                allow_individual=True,
+            )
+        )
+
+    context: dict[str, Any] = {}
+    await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
+
+    assert _ProviderBatchExpert.batch_calls == []
+    assert _ProviderBatchExpert.individual_calls == [
+        ("deepseek-r1-14b-risk", "sentiment_expert"),
+        ("deepseek-r1-14b-risk", "position_expert"),
+        ("deepseek-r1-14b-risk", "risk_expert"),
+    ]
+    timeout_by_name = {row["name"]: row["timeout_seconds"] for row in context["_model_timings"]}
+    assert timeout_by_name == {
+        "sentiment_expert": 60.0,
+        "position_expert": 60.0,
+        "risk_expert": 60.0,
+    }
+    assert all(timeout >= settings.ai_expert_timeout_seconds for timeout in timeout_by_name.values())
+
+
+@pytest.mark.asyncio
 async def test_batch_experts_are_grouped_by_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

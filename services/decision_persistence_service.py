@@ -145,6 +145,8 @@ class DecisionPersistenceService:
         status: str,
         reason: str | None,
         data: dict[str, Any] | None = None,
+        *,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
         """Append one state-machine event to a decision raw payload."""
 
@@ -155,6 +157,7 @@ class DecisionPersistenceService:
             status,
             sanitize_text(reason) if reason else "",
             data=self.json_safe_payload(data or {}) if data else None,
+            duration_sec=duration_sec,
         )
         decision.raw_response = raw
         return raw
@@ -168,8 +171,9 @@ class DecisionPersistenceService:
         status: str,
         reason: str | None,
         data: dict[str, Any] | None = None,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
-        raw = self.record_stage(decision, stage, status, reason, data)
+        raw = self.record_stage(decision, stage, status, reason, data, duration_sec=duration_sec)
         if decision_id is not None:
             await self.update_raw_response(decision_id, raw)
         return raw

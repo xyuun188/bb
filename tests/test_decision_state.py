@@ -40,6 +40,23 @@ def test_decision_state_records_ordered_summary():
     ]
 
 
+def test_decision_state_preserves_stage_duration() -> None:
+    raw = append_decision_stage(
+        {},
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.PASSED,
+        "OKX 已返回订单响应。",
+        duration_sec=2.3456,
+    )
+
+    machine = decision_state_from_raw(raw)
+    event = machine["stages"][0]
+    summary = machine["summary"]["by_stage"][0]
+
+    assert event["duration_sec"] == 2.346
+    assert summary["duration_sec"] == 2.346
+
+
 def _decision(action: Action) -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",

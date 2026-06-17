@@ -142,12 +142,14 @@ async def test_record_and_persist_stage_updates_raw_response() -> None:
         status=DecisionStageStatus.BLOCKED,
         reason="风险拒绝",
         data={"bad": float("inf")},
+        duration_sec=0.75,
     )
 
     assert repo.raw_updates == [(9, raw)]
     event = raw["decision_state_machine"]["stages"][-1]
     assert event["stage"] == DecisionStage.RISK_CHECK
     assert event["data"] == {"bad": None}
+    assert event["duration_sec"] == 0.75
 
 
 @pytest.mark.asyncio

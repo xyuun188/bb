@@ -1015,7 +1015,11 @@ class StrategyFeedbackCompiler:
             seen.add(name)
             status = str(item.get("status") or "").lower()
             provider = str(item.get("provider_model") or "").lower()
-            fallback_flag = bool(item.get("batch_expert_fallback") or item.get("fallback"))
+            fallback_flag = bool(
+                item.get("batch_expert_fallback")
+                or item.get("fallback")
+                or item.get("local_fallback")
+            )
             seconds = self._timing_seconds(item)
             if status in UNTRUSTED_EXPERT_STATUSES or "fallback" in status or fallback_flag:
                 fallback = True
@@ -1030,7 +1034,13 @@ class StrategyFeedbackCompiler:
 
     @staticmethod
     def _timing_seconds(item: dict[str, Any]) -> float:
-        for key in ("seconds", "duration_seconds", "elapsed_seconds", "latency_seconds"):
+        for key in (
+            "seconds",
+            "duration_sec",
+            "duration_seconds",
+            "elapsed_seconds",
+            "latency_seconds",
+        ):
             if key in item:
                 return _safe_float(item.get(key), 0.0)
         return _safe_float(item.get("duration_ms"), 0.0) / 1000.0

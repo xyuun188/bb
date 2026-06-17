@@ -236,6 +236,61 @@ def test_expert_analysis_entry_block_reason_blocks_missing_timings() -> None:
     assert "expert_integrity" in reason
 
 
+def test_expert_analysis_entry_block_reason_allows_independent_provider_completed() -> None:
+    raw = {
+        "model_timings": [
+            {
+                "name": "trend_expert",
+                "status": "completed",
+                "provider_model": "qwen3-14b-trade",
+                "provider_independent_expert_mode": True,
+                "duration_sec": 2.1,
+            },
+            {
+                "name": "momentum_expert",
+                "status": "completed",
+                "provider_model": "qwen3-14b-trade",
+                "provider_independent_expert_mode": True,
+                "duration_sec": 2.0,
+            },
+            {
+                "name": "sentiment_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b-risk",
+                "provider_independent_expert_mode": True,
+                "duration_sec": 8.4,
+            },
+            {
+                "name": "position_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b-risk",
+                "provider_independent_expert_mode": True,
+                "duration_sec": 8.8,
+            },
+            {
+                "name": "risk_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b-risk",
+                "provider_independent_expert_mode": True,
+                "duration_sec": 9.1,
+            },
+        ]
+    }
+
+    assert expert_analysis_entry_block_reason(_decision(raw)) is None
+
+
+def test_expert_analysis_entry_block_reason_blocks_local_fallback_even_when_completed() -> None:
+    timings = _completed_timings()
+    timings[-1]["local_fallback"] = True
+
+    reason = expert_analysis_entry_block_reason(_decision({"model_timings": timings}))
+
+    assert reason is not None
+    assert "expert_integrity" in reason
+    assert "risk_expert" in reason
+
+
 def test_expert_analysis_entry_block_reason_allows_balanced_probe_missing_non_core() -> None:
     raw = {
         "model_timings": [
