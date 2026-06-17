@@ -62,9 +62,12 @@ def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
     assets = [
         PROJECT_ROOT / "web_dashboard/static/index.html",
         PROJECT_ROOT / "web_dashboard/static/js/dashboard.js",
+        PROJECT_ROOT / "web_dashboard/static/js/strategy_learning_view.js",
         PROJECT_ROOT / "web_dashboard/static/css/dashboard.css",
+        PROJECT_ROOT / "web_dashboard/static/css/strategy_learning.css",
     ]
     mojibake_markers = (
+        "????",
         "鐧诲綍",
         "瀹炵洏",
         "鍒囨崲",
@@ -125,12 +128,25 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
+    assert "function decisionMetricItem" in script
+    assert "decision-score-grid" in script
+    assert "decision-score-reason" in script
+    opportunity_start = script.index("function opportunityScoreBlock")
+    opportunity_end = script.index("function showDecisionReason", opportunity_start)
+    opportunity_block = script[opportunity_start:opportunity_end]
+    assert "<br>" not in opportunity_block
     assert "function dynamicEvidenceBlock" in script
     assert "动态证据评分" in script
-    assert "分析信心：${evidencePercentLabel(confidence)}" in script
+    assert "decisionMetricItem('分析信心', evidencePercentLabel(confidence)" in script
     assert "不等于动态证据分" in script
     assert "弱证据不是单看分析信心" in script
     assert "AI、ML、时序、情绪、服务器盈利、影子记忆和币种历史" in script
+    assert ".decision-score-grid" in style
+    assert ".decision-score-metric" in style
+    assert "max-width: min(1120px, 96vw);" in style
+    assert "overflow-x: hidden;" in style
+    assert "overflow-wrap: anywhere;" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));" in style
     assert "decision-evidence-summary" in script
     assert ".decision-evidence-summary" in style
     assert ".decision-evidence-components" in style
@@ -151,6 +167,7 @@ def test_agent_skill_detail_uses_readable_card_layout() -> None:
     assert ".analysis-agent-skills-grid" in style
     assert ".analysis-skill-item" in style
     assert ".analysis-skill-data-row" in style
+    assert "overflow-wrap: anywhere" in style
 
 
 def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> None:

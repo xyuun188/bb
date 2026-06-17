@@ -1891,30 +1891,51 @@ function dynamicEvidenceBlock(score, decision = null) {
     `;
 }
 
+function decisionMetricItem(label, value, hint = '', tone = '') {
+    return `
+        <div class="decision-score-metric ${escHtml(tone)}">
+            <span>${escHtml(label)}</span>
+            <strong>${value}</strong>
+            ${hint ? `<em>${escHtml(hint)}</em>` : ''}
+        </div>
+    `;
+}
+
 function opportunityScoreBlock(score, decision = null) {
     if (!score || typeof score !== 'object') return '';
     const selected = score.selected_for_execution === true
         ? '已进入执行队列'
         : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
+    const selectedTone = score.selected_for_execution === true
+        ? 'good'
+        : (score.selected_for_execution === false ? 'warn' : 'neutral');
     const reason = score.selection_reason || score.rule || '系统按预期净收益、方向优势、AI 信心、ML 盈亏质量、手续费、滑点、止损风险和当前敞口综合排序。';
     const primaryReturn = opportunityScorePrimaryReturn(score);
     const returnDetail = opportunityScoreReturnDetail(score);
     const confidence = Number(decision?.confidence ?? score.confidence);
+    const feeAndSlippage = Number(score.fee_pct || 0) + Number(score.slippage_pct || 0);
+    const winRate = Number(score.win_rate || 0) * 100;
     return `
-        <div class="reason-block">
+        <div class="reason-block decision-score-block">
             <div class="reason-label">盈利机会评分</div>
-            <div>
-                机会分：${opportunityScoreValue(score.score, 6)}<br>
-                方向：${escHtml(actionLabel(score.side || '-'))}<br>
-                分析信心：${evidencePercentLabel(confidence)}（AI/专家最终置信度，不等于动态证据分）<br>
-                ${primaryReturn.label}：${opportunityScoreValue(primaryReturn.value, 4)}%<br>
-                ${returnDetail ? `收益来源：${escHtml(returnDetail)}<br>` : ''}
-                相对反向优势：${opportunityScoreValue(score.profit_edge_pct, 4)}%<br>
-                ML 胜率：${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%<br>
-                仓位 x 杠杆：${opportunityScoreValue(score.size_x_leverage, 4)}<br>
-                手续费+滑点：${opportunityScoreValue(Number(score.fee_pct || 0) + Number(score.slippage_pct || 0), 4)}%<br>
-                状态：${escHtml(selected)}<br>
-                原因：${escapeMultiline(reason)}
+            <div class="decision-score-head">
+                <div>
+                    <strong>${opportunityScoreValue(score.score, 6)}</strong>
+                    <span>${escHtml(actionLabel(score.side || '-'))} · ${primaryReturn.label} ${opportunityScoreValue(primaryReturn.value, 4)}%</span>
+                </div>
+                <span class="decision-score-state ${selectedTone}">${escHtml(selected)}</span>
+            </div>
+            <div class="decision-score-grid">
+                ${decisionMetricItem('分析信心', evidencePercentLabel(confidence), 'AI/专家最终置信度，不等于动态证据分')}
+                ${decisionMetricItem(primaryReturn.label, `${opportunityScoreValue(primaryReturn.value, 4)}%`, returnDetail || '综合收益估计', Number(primaryReturn.value) >= 0 ? 'good' : 'bad')}
+                ${decisionMetricItem('相对反向优势', `${opportunityScoreValue(score.profit_edge_pct, 4)}%`)}
+                ${decisionMetricItem('ML 胜率', `${opportunityScoreValue(winRate, 1)}%`)}
+                ${decisionMetricItem('仓位 x 杠杆', opportunityScoreValue(score.size_x_leverage, 4))}
+                ${decisionMetricItem('手续费+滑点', `${opportunityScoreValue(feeAndSlippage, 4)}%`)}
+            </div>
+            <div class="decision-score-reason">
+                <span>排序原因</span>
+                <div>${escapeMultiline(reason)}</div>
             </div>
         </div>
         ${dynamicEvidenceBlock(score, decision)}
@@ -7438,19 +7459,56 @@ function renderStrategyLearning(data) {
     summary.innerHTML = `<div class="opening-funnel-empty">\u7b56\u7565\u63a7\u5236\u53f0\u6570\u636e\u5df2\u52a0\u8f7d\uff1a${escHtml(profile.label || profile.id || '\u5f53\u524d\u57fa\u7ebf')}</div>`;
 }
 
+function strategyLearningSetActionState(profileId, status, message = '') {
+    if (!window.strategyLearningActionState) window.strategyLearningActionState = {};
+    const key = String(profileId || 'auto');
+    window.strategyLearningActionState[key] = {
+        status,
+        message,
+        updatedAt: Date.now(),
+    };
+    if (state.strategyLearning && typeof renderStrategyLearning === 'function') {
+        renderStrategyLearning(state.strategyLearning);
+    }
+}
+
+async function strategyLearningWriteRequest(profileId, statusText, requestFactory) {
+    strategyLearningSetActionState(profileId, 'loading', statusText);
+    try {
+        const res = await requestFactory();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(apiErrorText(data, res.statusText || '请求失败'));
+        strategyLearningSetActionState(profileId, 'success', '已生效，正在刷新调度状态');
+        await fetchStrategyLearning();
+        return data;
+    } catch (error) {
+        strategyLearningSetActionState(profileId, 'error', error.message || String(error));
+        throw error;
+    }
+}
+
 async function setStrategyLearningProfileDisabled(profileId, disabled) {
-    await fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' }));
-    await fetchStrategyLearning();
+    await strategyLearningWriteRequest(
+        profileId,
+        disabled ? '正在禁用策略...' : '正在取消禁用...',
+        () => fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' })),
+    );
 }
 
 async function activateStrategyLearningProfile(profileId) {
-    await fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' }));
-    await fetchStrategyLearning();
+    await strategyLearningWriteRequest(
+        profileId,
+        '正在人工指定策略...',
+        () => fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' })),
+    );
 }
 
 async function clearStrategyLearningManualOverride() {
-    await fetchWithAuth('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
-    await fetchStrategyLearning();
+    await strategyLearningWriteRequest(
+        'auto',
+        '正在恢复系统自动调度...',
+        () => fetchWithAuth('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' })),
+    );
 }
 
 async function rollbackStrategyLearning() {

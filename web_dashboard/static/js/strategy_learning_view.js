@@ -103,10 +103,53 @@ function strategyLearningIsManualLocked(data) {
     return schedule.scheduler_mode === 'manual' || Boolean(strategyLearningManualProfile(data));
 }
 
+function strategyLearningActionState(profileId) {
+    const store = window.strategyLearningActionState || {};
+    const key = String(profileId || 'auto');
+    const item = store[key];
+    if (!item) return null;
+    const ageMs = Date.now() - Number(item.updatedAt || 0);
+    const keepMs = item.status === 'error' ? 30000 : 12000;
+    if (item.status !== 'loading' && ageMs > keepMs) {
+        delete store[key];
+        return null;
+    }
+    return item;
+}
+
+function strategyLearningActionFeedback(profileId) {
+    const item = strategyLearningActionState(profileId);
+    if (!item) return '';
+    const status = String(item.status || 'info');
+    const label = status === 'loading' ? '处理中' : status === 'success' ? '已生效' : '操作失败';
+    return `<div class="strategy-learning-action-feedback ${strategyLearningEsc(status)}" role="status" aria-live="polite"><strong>${label}</strong><span>${strategyLearningEsc(item.message || '')}</span></div>`;
+}
+
+function strategyLearningActionButtonAttrs(profileId) {
+    const item = strategyLearningActionState(profileId);
+    return item?.status === 'loading' ? 'disabled data-action-loading="true"' : '';
+}
+
+function strategyLearningActionButtonLabel(profileId, label) {
+    const item = strategyLearningActionState(profileId);
+    return item?.status === 'loading' ? '处理中...' : label;
+}
+
 function updateStrategyLearningAutoButton(data) {
     const button = document.getElementById('strategy-learning-auto-button');
     if (!button) return;
     const manualId = strategyLearningManualProfile(data);
+    const actionState = strategyLearningActionState('auto');
+    button.classList.toggle('is-loading', actionState?.status === 'loading');
+    button.classList.toggle('is-success', actionState?.status === 'success');
+    button.classList.toggle('is-error', actionState?.status === 'error');
+    if (actionState?.status === 'loading') {
+        button.disabled = true;
+        button.textContent = '恢复中...';
+        button.title = actionState.message || '正在恢复系统自动调度。';
+        button.classList.add('btn-accent');
+        return;
+    }
     if (manualId) {
         button.disabled = false;
         button.textContent = '取消人工指定';
@@ -114,7 +157,7 @@ function updateStrategyLearningAutoButton(data) {
         button.classList.add('btn-accent');
     } else {
         button.disabled = true;
-        button.textContent = '当前自动调度';
+        button.textContent = actionState?.status === 'success' ? '已恢复自动调度' : '当前自动调度';
         button.title = '当前没有人工指定策略，系统会根据复盘、回测、影子验证和护栏自动选择策略画像。';
         button.classList.remove('btn-accent');
     }
@@ -473,9 +516,10 @@ function renderStrategyLearningProfiles(data) {
                     ? (isActive ? '自动兜底中' : '稳定兜底')
                     : (profile.cached_only ? (llm.cache_status === 'current' ? 'LLM缓存候选' : 'LLM过期缓存') : (isActive ? (manualLocked ? '人工指定中' : '自动调度选中') : (isDisabled ? '已禁用' : (pass && shadowOk ? '候选可用' : '未通过验证'))));
                 const statusTone = isActive ? 'good' : isDisabled ? 'bad' : profile.cached_only || pass && shadowOk ? 'neutral' : 'warn';
-                let actionButton = '<button class="btn btn-sm" disabled title="系统基线只是兜底画像；没有人工指定时，调度器会在它和更合适的画像之间自动选择。">系统兜底</button>';
-                let disableButton = '<button class="btn btn-sm" disabled title="系统基线是自动调度兜底画像，不能在控制台禁用。">兜底保留</button>';
+                let actionButton = '<button class="btn btn-sm" disabled title="系统基线只是兜底画像；没有人工指定时，调度器会在它和更合适的画像之间自动选择。">系统兜底</button>'; 
+                let disableButton = '<button class="btn btn-sm" disabled title="系统基线是自动调度兜底画像，不能在控制台禁用。">兜底保留</button>'; 
                 if (profile.id !== 'baseline_current') {
+                    const actionState = strategyLearningActionState(profile.id);
                     const disableAction = profile.cached_only || isDisabled || (isActive && manualLocked) || !pass || !shadowOk;
                     const actionTitle = isActive && manualLocked
                         ? '这个策略已经被人工指定；要交回系统调度请点页面顶部“取消人工指定”。'
@@ -487,10 +531,11 @@ function renderStrategyLearningProfiles(data) {
                                 ? '这个策略还没有同时通过回测和影子验证，不能人工指定。'
                                 : '人工指定后，自动调度不会覆盖它；需要交回系统调度时点页面顶部“取消人工指定”。';
                     const actionLabel = isActive && manualLocked ? '已人工指定' : '人工指定此策略';
-                    actionButton = `<button class="btn btn-sm" ${disableAction ? 'disabled' : ''} title="${strategyLearningEsc(actionTitle)}" onclick='activateStrategyLearningProfile(${profileIdArg})'>${actionLabel}</button>`;
+                    const loadingAttrs = strategyLearningActionButtonAttrs(profile.id);
+                    actionButton = `<button class="btn btn-sm strategy-learning-action-btn" data-profile-id="${strategyLearningEsc(profile.id || '')}" ${disableAction && actionState?.status !== 'loading' ? 'disabled' : loadingAttrs} title="${strategyLearningEsc(actionTitle)}" onclick='activateStrategyLearningProfile(${profileIdArg})'>${strategyLearningActionButtonLabel(profile.id, actionLabel)}</button>`;
                     disableButton = profile.cached_only
                         ? '<button class="btn btn-sm" disabled title="缓存展示候选需要刷新进入当前调度列表后才能禁用。">仅展示</button>'
-                        : `<button class="btn btn-sm" title="${isDisabled ? '允许系统重新评估这个策略。' : '临时禁用这个策略，自动调度不会选它。'}" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${isDisabled ? '取消禁用' : '禁用策略'}</button>`;
+                        : `<button class="btn btn-sm strategy-learning-action-btn" data-profile-id="${strategyLearningEsc(profile.id || '')}" ${loadingAttrs} title="${isDisabled ? '允许系统重新评估这个策略。' : '临时禁用这个策略，自动调度不会选它。'}" onclick='setStrategyLearningProfileDisabled(${profileIdArg}, ${isDisabled ? 'false' : 'true'})'>${strategyLearningActionButtonLabel(profile.id, isDisabled ? '取消禁用' : '禁用策略')}</button>`;
                 }
                 return `
                     <article class="strategy-learning-profile-card ${strategyLearningEsc(cardClass)}">
@@ -514,6 +559,7 @@ function renderStrategyLearningProfiles(data) {
                         </div>
                         <div class="strategy-learning-chip-row strategy-learning-profile-chips">${strategyLearningShadowChips(sh)}</div>
                         <div class="strategy-learning-chip-row muted strategy-learning-profile-chips">${strategyLearningFixChips(bt.matched_fixes)}</div>
+                        ${strategyLearningActionFeedback(profile.id)}
                         <div class="strategy-learning-profile-footer">
                             <span>${pass ? '回测通过' : '回测未通过'} · ${shadowOk ? '影子通过' : '影子未通过'} · ${sh.trade_count_guard?.low_trade_count ? '低交易量惩罚中' : '交易量约束正常'}</span>
                             <div class="strategy-learning-profile-actions">

@@ -2,6 +2,8 @@
 #page-strategy-learning .card-header {
     align-items: flex-start;
     gap: 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
 }
 
 #page-strategy-learning .opening-funnel-controls {
@@ -40,14 +42,14 @@
 
 .strategy-learning-body {
     display: grid;
-    gap: 10px;
-    padding: 12px;
+    gap: 14px;
+    padding: 14px;
 }
 
 .strategy-learning-command {
     display: grid;
-    grid-template-columns: minmax(320px, 0.82fr) minmax(620px, 1.8fr);
-    gap: 10px;
+    grid-template-columns: minmax(340px, 0.9fr) minmax(580px, 1.5fr);
+    gap: 12px;
     align-items: stretch;
 }
 
@@ -63,8 +65,10 @@
 .strategy-learning-command-main {
     display: grid;
     align-content: start;
-    gap: 9px;
-    padding: 12px;
+    gap: 10px;
+    padding: 14px;
+    border-color: rgba(6,182,212,0.20);
+    background: linear-gradient(135deg, rgba(6,182,212,0.08), rgba(15,23,42,0.46));
 }
 
 .strategy-learning-command-eyebrow {
@@ -265,7 +269,7 @@
 .strategy-learning-grid-wide {
     display: grid;
     grid-template-columns: repeat(12, minmax(0, 1fr));
-    gap: 10px;
+    gap: 12px;
     align-items: start;
 }
 
@@ -294,9 +298,10 @@
 }
 
 .strategy-learning-panel {
-    padding: 10px;
+    padding: 12px;
     overflow: hidden;
     align-self: start;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.12);
 }
 
 .strategy-learning-panel.opening-funnel-panel-full {
@@ -663,9 +668,10 @@
 
 .strategy-learning-profile-actions {
     display: grid;
-    grid-template-columns: minmax(132px, 1.3fr) minmax(88px, 0.9fr);
-    gap: 6px;
-    min-width: 230px;
+    grid-template-columns: minmax(136px, 1.25fr) minmax(92px, 0.85fr);
+    gap: 7px;
+    min-width: 244px;
+    max-width: 100%;
 }
 
 .strategy-learning-profile-actions .btn {
@@ -673,6 +679,51 @@
     padding-left: 6px;
     padding-right: 6px;
     white-space: nowrap;
+    transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.strategy-learning-profile-actions .btn:not(:disabled):hover {
+    transform: translateY(-1px);
+}
+.strategy-learning-profile-actions .btn[data-action-loading="true"],
+#strategy-learning-auto-button.is-loading {
+    cursor: progress;
+    opacity: 0.86;
+}
+.strategy-learning-action-feedback {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-panel);
+}
+.strategy-learning-action-feedback strong {
+    color: var(--text);
+    font-size: 11px;
+    white-space: nowrap;
+}
+.strategy-learning-action-feedback span {
+    min-width: 0;
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+.strategy-learning-action-feedback.loading {
+    border-color: rgba(6,182,212,0.35);
+    background: rgba(6,182,212,0.08);
+}
+.strategy-learning-action-feedback.success {
+    border-color: rgba(34,197,94,0.35);
+    background: var(--green-dim);
+}
+.strategy-learning-action-feedback.error {
+    border-color: rgba(239,68,68,0.42);
+    background: var(--red-dim);
 }
 
 .strategy-learning-profile-board {
@@ -689,6 +740,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-card);
+    overflow: hidden;
 }
 
 .strategy-learning-profile-card.active {
@@ -785,6 +837,7 @@
 
 .strategy-learning-profile-footer {
     align-items: center;
+    flex-wrap: wrap;
 }
 
 .strategy-learning-profile-footer > span {
