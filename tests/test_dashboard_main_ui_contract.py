@@ -132,6 +132,11 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     assert ".server-monitor-tabs" in style
     assert ".server-monitor-self-check-actions" in style
     assert ".server-monitor-panel.active" in style
+    assert "const MODEL_PUBLIC_HOST = '103.85.84.147';" in script
+    assert "'qwen3-14b-trade': `http://${MODEL_PUBLIC_HOST}:21840/v1`" in script
+    assert "'deepseek-r1-14b-risk': `http://${MODEL_PUBLIC_HOST}:21842/v1`" in script
+    assert "local_ai_tools: `http://${MODEL_PUBLIC_HOST}:21841`" in script
+    assert "data.model_access_host" not in script
 
 
 def test_analysis_timing_deduplicates_final_expert_rows() -> None:

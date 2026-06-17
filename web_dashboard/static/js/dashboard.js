@@ -4243,21 +4243,17 @@ function renderServerModelRuntime(data, container) {
     const toolsStatusLine = runtimeEndpointSummary(tools.status_health);
     const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
-    const modelAccessHost = data.model_access_host || data.public_model_host || '103.85.84.147';
+    const MODEL_PUBLIC_HOST = '103.85.84.147';
+    const MODEL_PUBLIC_ENDPOINTS = {
+        'qwen3-14b-trade': `http://${MODEL_PUBLIC_HOST}:21840/v1`,
+        'deepseek-r1-14b-risk': `http://${MODEL_PUBLIC_HOST}:21842/v1`,
+        local_ai_tools: `http://${MODEL_PUBLIC_HOST}:21841`,
+    };
     const platformModelPublicUrl = (modelId, fallbackPort = '21840') => {
-        const row = platformModels.find(item => item && item.model === modelId);
-        const configuredBase = String((row && row.api_base) || '').trim();
-        if (configuredBase && !configuredBase.includes('127.0.0.1') && !configuredBase.includes('localhost')) {
-            return configuredBase;
-        }
-        return `http://${modelAccessHost}:${fallbackPort}/v1`; 
+        return MODEL_PUBLIC_ENDPOINTS[modelId] || `http://${MODEL_PUBLIC_HOST}:${fallbackPort}/v1`; 
     };
     const localToolsPublicUrl = () => {
-        const configuredBase = String(platformTools.api_base || '').trim();
-        if (configuredBase && !configuredBase.includes('127.0.0.1') && !configuredBase.includes('localhost')) {
-            return configuredBase;
-        }
-        return `http://${modelAccessHost}:21841`; 
+        return MODEL_PUBLIC_ENDPOINTS.local_ai_tools; 
     }; 
     const vllmEndpointRows = vllmEndpoints.length
         ? `<div class="server-monitor-process-list">${vllmEndpoints.map(item => {
