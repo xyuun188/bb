@@ -367,6 +367,70 @@ td .ml-bar-row .ml-bar-label {
 .ml-bar-muted { background: var(--text-muted); }
 
 /* Server monitor page */
+.server-monitor-shell {
+    overflow: hidden;
+    background:
+        radial-gradient(circle at 8% 0%, rgba(6,182,212,0.12), transparent 30%),
+        radial-gradient(circle at 95% 12%, rgba(34,197,94,0.08), transparent 26%),
+        var(--bg-card);
+}
+.server-monitor-tabs {
+    display: inline-flex;
+    gap: 6px;
+    margin: 12px 12px 0;
+    padding: 5px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(0,0,0,0.16);
+}
+.server-monitor-tab {
+    min-height: 34px;
+    padding: 0 16px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+}
+.server-monitor-tab:hover {
+    color: var(--text);
+    background: var(--bg-hover);
+}
+.server-monitor-tab.active {
+    color: #03111a;
+    border-color: rgba(108,255,184,0.35);
+    background: linear-gradient(135deg, var(--cyan), var(--green));
+    box-shadow: 0 0 24px rgba(6,182,212,0.18);
+}
+.server-monitor-panel {
+    display: none;
+}
+.server-monitor-panel.active {
+    display: block;
+}
+.server-monitor-section-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 12px 12px 0;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: rgba(0,0,0,0.12);
+}
+.server-monitor-section-head strong {
+    display: block;
+    color: var(--text);
+    font-size: 15px;
+}
+.server-monitor-section-head span {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
 .server-monitor-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -439,6 +503,7 @@ td .ml-bar-row .ml-bar-label {
 .self-check-card.ok { border-color: rgba(34,197,94,0.35); background: var(--green-dim); }
 .self-check-card.warning { border-color: rgba(245,158,11,0.35); background: var(--accent-dim); }
 .self-check-card.critical { border-color: rgba(239,68,68,0.35); background: var(--red-dim); }
+.self-check-card.info { border-color: rgba(6,182,212,0.35); background: rgba(6,182,212,0.10); }
 .self-check-title {
     display: flex;
     align-items: center;
@@ -2701,6 +2766,12 @@ select.form-input { cursor: pointer; }
     font-size: 12px; 
     margin-top: 8px; 
 } 
+.execution-reason-primary {
+    padding: 12px;
+    border: 1px solid rgba(6,182,212,0.32);
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, rgba(6,182,212,0.10), rgba(34,197,94,0.06));
+}
 .execution-timeline {
     display: flex;
     flex-direction: column;
@@ -2742,6 +2813,9 @@ select.form-input { cursor: pointer; }
     line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
+    padding: 7px 8px;
+    border-radius: var(--radius-sm);
+    background: rgba(0,0,0,0.14);
 }
 .execution-result-grid {
     display: grid;

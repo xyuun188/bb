@@ -7,7 +7,6 @@ import pytest
 
 from web_dashboard.api import dashboard
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -18,7 +17,10 @@ def test_main_dashboard_removes_manual_symbol_selector() -> None:
 
     assert "\u6301\u4ed3\u5b9e\u65f6\u884c\u60c5" in html
     assert "\u4fdd\u8bc1\u91d1\u5360\u6bd4" in html
-    assert "\u4e0b\u5355\u4fdd\u8bc1\u91d1\u5360\u5f53\u524d\u6267\u884c\u8d26\u6237\u53ef\u7528\u4f59\u989d" in html
+    assert (
+        "\u4e0b\u5355\u4fdd\u8bc1\u91d1\u5360\u5f53\u524d\u6267\u884c\u8d26\u6237\u53ef\u7528\u4f59\u989d"
+        in html
+    )
     assert "+ \u5e01\u79cd" not in html
     assert "price-chart-symbol" not in html
     assert "price-chart-timeframe" not in html
@@ -60,9 +62,11 @@ def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> No
 
     assert "mode-static-tag" not in html
     assert "mode-static-title" not in html
-    assert "自动模式</span>" not in html
-    assert html.count("自动扫描 · 系统调度") == 1
-    assert html.index('id="live-model-name"') < html.index("自动扫描 · 系统调度")
+    assert "\u81ea\u52a8\u6a21\u5f0f</span>" not in html
+    assert html.count("\u81ea\u52a8\u626b\u63cf \u00b7 \u7cfb\u7edf\u8c03\u5ea6") == 1
+    assert html.index('id="live-model-name"') < html.index(
+        "\u81ea\u52a8\u626b\u63cf \u00b7 \u7cfb\u7edf\u8c03\u5ea6"
+    )
     assert ".mode-btn[data-scan]" not in script
 
 
@@ -76,11 +80,52 @@ def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> No
     assert "repairSystemSelfCheck()" in html
     assert "fetchJSON(`/api/trades/${encodeURIComponent(Number(tradeId))}`)" in script
     assert "function renderExecutionTimeline" in script
+    assert "execution-reason-primary" in script
+    assert "\u6267\u884c\u539f\u56e0" in script
+    assert "\u6267\u884c\u6b65\u9aa4\u8bf4\u660e" in script
     assert "failed_step" in script
     assert "execution_steps" in script
-    assert "旧记录未采集耗时" in script
+    assert "\u65e7\u8bb0\u5f55\u672a\u91c7\u96c6\u8017\u65f6" in script
+    assert "\\u63d0\\u793a ${Number(summary.info || 0)}" in script
     assert ".execution-timeline" in style
     assert ".self-check-card" in style
+    assert ".self-check-card.info" in style
+    assert ".execution-reason-primary" in style
+
+
+def test_dashboard_account_buttons_use_delegated_actions() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert 'data-dashboard-user-action="create"' in html
+    assert "function initDashboardUserActions" in script
+    assert "dashboardUserWriteRequest" in script
+    assert 'data-dashboard-user-action="edit"' in script
+    assert "data-dashboard-user-action=\"${active ? 'deactivate' : 'activate'}\"" in script
+    assert 'data-dashboard-user-action="delete"' in script
+    assert 'onclick="openDashboardUserModal' not in script
+    assert 'onclick="setDashboardUserActive' not in script
+    assert 'onclick="deleteDashboardUser' not in script
+
+
+def test_server_monitor_splits_model_and_platform_panels() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert 'data-server-monitor-tab="model"' in html
+    assert 'data-server-monitor-tab="platform"' in html
+    assert "\u5927\u6a21\u578b\u670d\u52a1\u5668" in html
+    assert "\u5e73\u53f0\u670d\u52a1\u5668" in html
+    assert "platform-server-overview" in html
+    assert "function renderPlatformServerMonitor" in script
+    assert "platform_server" in script
+    assert "const visibleServices = Array.from(" in script
+    assert "services.reduce((map, service) =>" in script
+    assert "'redis-server.service': 'Redis'" in script
+    assert "'redis.service': 'Redis'" in script
+    assert ".server-monitor-tabs" in style
+    assert ".server-monitor-panel.active" in style
 
 
 def test_analysis_timing_deduplicates_final_expert_rows() -> None:

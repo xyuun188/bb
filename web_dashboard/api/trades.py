@@ -706,9 +706,11 @@ async def get_trade_detail(trade_id: int):
     fallback_reason = (
         _translate_execution_text(execution_reason)
         if execution_reason
-        else _translate_execution_text(order.exchange_order_id)
-        if order.exchange_order_id and order.exchange_order_id not in {"", "rejected"}
-        else ("订单执行成功。" if order.status == "filled" else "订单未成交或执行失败。")
+        else (
+            _translate_execution_text(order.exchange_order_id)
+            if order.exchange_order_id and order.exchange_order_id not in {"", "rejected"}
+            else ("订单执行成功。" if order.status == "filled" else "订单未成交或执行失败。")
+        )
     )
     trace = build_execution_trace(
         raw_response,
@@ -735,17 +737,20 @@ async def get_trade_detail(trade_id: int):
             "exchange_order_id": sanitize_text(order.exchange_order_id),
             "reason": fallback_reason,
             "detail": fallback_reason,
+            "display_reason": fallback_reason,
             "success": order.status == "filled",
-            "decision": {
-                "action": getattr(decision, "action", None),
-                "confidence": getattr(decision, "confidence", None),
-                "position_size_pct": getattr(decision, "position_size_pct", None),
-                "suggested_leverage": getattr(decision, "suggested_leverage", None),
-                "reasoning": sanitize_text(getattr(decision, "reasoning", None)),
-                "execution_reason": execution_reason,
-            }
-            if decision is not None
-            else None,
+            "decision": (
+                {
+                    "action": getattr(decision, "action", None),
+                    "confidence": getattr(decision, "confidence", None),
+                    "position_size_pct": getattr(decision, "position_size_pct", None),
+                    "suggested_leverage": getattr(decision, "suggested_leverage", None),
+                    "reasoning": sanitize_text(getattr(decision, "reasoning", None)),
+                    "execution_reason": execution_reason,
+                }
+                if decision is not None
+                else None
+            ),
             "execution_steps": trace["execution_steps"],
             "stage_events": trace["stage_events"],
             "final_result": trace["final_result"],

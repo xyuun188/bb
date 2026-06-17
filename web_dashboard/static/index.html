@@ -984,36 +984,54 @@
                 </div>
             </div>
 
-            <div class="card">
+            <div class="card server-monitor-shell">
                 <div class="card-header">
-                    <span class="card-title">服务器硬件状态</span>
+                    <div>
+                        <span class="card-title">服务器监控</span>
+                        <span class="card-subtitle">大模型服务器 / 平台服务器分区展示</span>
+                    </div>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="server-monitor-updated">等待加载</span>
                         <button class="btn btn-sm" onclick="fetchServerMonitor()">刷新</button>
                     </div>
                 </div>
-                <div class="server-monitor-grid" id="server-monitor-overview">
-                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">正在读取服务器硬件状态...</div>
+                <div class="server-monitor-tabs" role="tablist" aria-label="服务器监控类型">
+                    <button class="server-monitor-tab active" type="button" data-server-monitor-tab="model">大模型服务器</button>
+                    <button class="server-monitor-tab" type="button" data-server-monitor-tab="platform">平台服务器</button>
                 </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">模型运行情况</span>
-                    <span class="card-subtitle">vLLM / 本地训练模型 / 显存进程</span>
+                <div class="server-monitor-panel active" id="server-monitor-panel-model">
+                    <div class="server-monitor-section-head">
+                        <div>
+                            <strong>大模型服务器</strong>
+                            <span>GPU、vLLM、本地量化工具与远程 systemd 服务</span>
+                        </div>
+                    </div>
+                    <div class="server-monitor-grid" id="server-monitor-overview">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">正在读取大模型服务器硬件状态...</div>
+                    </div>
+                    <div id="server-monitor-model-runtime">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待模型运行数据...</div>
+                    </div>
+                    <div id="server-monitor-services">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待模型服务状态...</div>
+                    </div>
                 </div>
-                <div id="server-monitor-model-runtime">
-                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待模型运行数据...</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">模型服务</span>
-                    <span class="card-subtitle">DeepSeek 与本地量化工具</span>
-                </div>
-                <div id="server-monitor-services">
-                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待服务状态...</div>
+                <div class="server-monitor-panel" id="server-monitor-panel-platform">
+                    <div class="server-monitor-section-head">
+                        <div>
+                            <strong>平台服务器</strong>
+                            <span>Dashboard、交易主循环、隧道服务、PostgreSQL/Redis 与平台调用端点</span>
+                        </div>
+                    </div>
+                    <div class="server-monitor-grid" id="platform-server-overview">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">正在读取平台服务器状态...</div>
+                    </div>
+                    <div id="platform-server-services">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待平台服务状态...</div>
+                    </div>
+                    <div id="platform-server-runtime">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待平台调用端点...</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1358,7 +1376,7 @@
                             <div class="settings-panel-title">会员列表</div>
                             <div class="dashboard-users-subtitle">管理可登录平台的账号，当前账号不能删除</div>
                         </div>
-                        <button class="btn btn-accent btn-sm" onclick="openDashboardUserModal('create')">新增会员</button>
+                        <button class="btn btn-accent btn-sm" type="button" data-dashboard-user-action="create">新增会员</button>
                     </div>
                     <div class="table-wrap dashboard-users-table-wrap">
                         <table class="model-table">
@@ -1379,7 +1397,7 @@
             <div class="modal">
                 <div class="modal-header">
                     <span id="dashboard-user-modal-title">新增会员</span>
-                    <button class="modal-close" onclick="closeDashboardUserModal()">&times;</button>
+                    <button class="modal-close" type="button" data-dashboard-user-action="close-modal">&times;</button>
                 </div>
                 <div class="modal-body">
                     <input type="hidden" id="dashboard-user-modal-mode" value="create">
@@ -1408,8 +1426,8 @@
                     <div id="dashboard-user-modal-status" class="settings-inline-status"></div>
                 </div>
                 <div class="modal-footer">
-                    <button class="btn btn-sm" onclick="closeDashboardUserModal()">取消</button>
-                    <button class="btn btn-accent btn-sm" onclick="saveDashboardUserModal()" id="dashboard-user-save-btn">保存</button>
+                    <button class="btn btn-sm" type="button" data-dashboard-user-action="close-modal">取消</button>
+                    <button class="btn btn-accent btn-sm" type="button" data-dashboard-user-action="save-modal" id="dashboard-user-save-btn">保存</button>
                 </div>
             </div>
         </div>
@@ -1419,7 +1437,7 @@
             <div class="modal">
                 <div class="modal-header">
                     <span id="model-modal-title">添加 AI 模型</span>
-                    <button class="modal-close" onclick="closeModelModal()">&times;</button>
+                    <button class="modal-close" type="button" data-modal-action="close-model">&times;</button>
                 </div>
                 <div class="modal-body">
                     <input type="hidden" id="model-edit-orig-name">
@@ -1441,8 +1459,8 @@
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button class="btn btn-sm" onclick="closeModelModal()">取消</button>
-                    <button class="btn btn-accent btn-sm" onclick="saveModelConfig()" id="model-save-btn">保存</button>
+                    <button class="btn btn-sm" type="button" data-modal-action="close-model">取消</button>
+                    <button class="btn btn-accent btn-sm" type="button" data-modal-action="save-model" id="model-save-btn">保存</button>
                 </div>
             </div>
         </div>

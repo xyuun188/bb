@@ -68,7 +68,7 @@ async def test_self_check_repair_only_resets_low_risk_caches(
     payload = await system_health.system_self_check_repair()
 
     assert payload["status"] == "ok"
-    assert "资金" in payload["safety_note"]
+    assert "\u8d44\u91d1" in payload["safety_note"]
     assert actions == ["clear_monitor_cache"]
     assert local_client._status_cache is None
     assert local_client._failure_count == 0
@@ -97,9 +97,9 @@ async def test_self_check_api_returns_recent_execution_problem(
         return [
             system_health._check_item(
                 "recent_failed_orders",
-                "最近失败/未成交订单",
+                "recent failed orders",
                 "warning",
-                "最近 6 小时有 1 条失败或未成交订单。",
+                "1 recent failed order",
             )
         ]
 
@@ -107,13 +107,13 @@ async def test_self_check_api_returns_recent_execution_problem(
     monkeypatch.setattr(system_health, "_recent_execution_items", recent_items)
 
     async def running_item() -> dict[str, Any]:
-        return system_health._check_item("trading_service", "交易主循环", "ok", "运行中")
+        return system_health._check_item("trading_service", "trading service", "ok", "running")
 
     monkeypatch.setattr(system_health, "_trading_service_running_item", running_item)
     monkeypatch.setattr(
         system_health,
         "_okx_config_item",
-        lambda mode: system_health._check_item(f"okx_{mode}", f"{mode} OKX", "ok", "已配置"),
+        lambda mode: system_health._check_item(f"okx_{mode}", f"{mode} OKX", "ok", "configured"),
     )
     monkeypatch.setattr(system_health, "_configured_endpoint_items", lambda: [])
 
@@ -121,6 +121,7 @@ async def test_self_check_api_returns_recent_execution_problem(
 
     assert payload["status"] == "warning"
     assert payload["summary"]["warning"] >= 1
+    assert payload["summary"]["info"] == 0
     assert any(item["key"] == "recent_failed_orders" for item in payload["items"])
 
 
@@ -190,7 +191,7 @@ async def test_trading_service_split_process_uses_recent_activity_heartbeat(
     item = await system_health._trading_service_running_item()
 
     assert item["status"] == "ok"
-    assert "独立进程" in item["message"]
+    assert "\u72ec\u7acb\u8fdb\u7a0b" in item["message"]
     assert item["details"]["decision_count"] == 5
 
 
@@ -302,3 +303,76 @@ async def test_recent_execution_step_trace_is_info_when_new_records_have_steps(
 
     assert by_key["decision_trace_coverage"]["status"] == "info"
     assert by_key["decision_trace_coverage"]["details"]["traced_decisions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_blocked_decisions_are_info_not_system_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(
+                    [
+                        SimpleNamespace(
+                            id=201,
+                            status="filled",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                17,
+                                4,
+                                30,
+                                tzinfo=system_health.UTC,
+                            ),
+                        )
+                    ]
+                )
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=301,
+                        action="long",
+                        created_at=system_health.datetime(
+                            2026,
+                            6,
+                            17,
+                            4,
+                            20,
+                            tzinfo=system_health.UTC,
+                        ),
+                        raw_llm_response={
+                            "decision_state_machine": {
+                                "stages": [{"status": "blocked"}],
+                            }
+                        },
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_execution"]["status"] == "ok"
+    assert by_key["recent_blocked_decisions"]["status"] == "info"
+    assert by_key["recent_blocked_decisions"]["details"]["sample_decision_ids"] == [301]

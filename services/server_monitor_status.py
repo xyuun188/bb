@@ -5,6 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +40,14 @@ from services.model_server_config import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_MONITOR_CACHE_TTL_SECONDS = 10.0
 SERVER_MONITOR_STALE_CACHE_TTL_SECONDS = 60.0
+PLATFORM_SERVICE_NAMES = (
+    "bb-dashboard.service",
+    "bb-paper-trading.service",
+    "bb-model-tunnels.service",
+    "postgresql.service",
+    "redis-server.service",
+    "redis.service",
+)
 
 InfoLoader = Callable[[Path], Any]
 SshConnector = Callable[..., Any]
@@ -337,6 +351,155 @@ def get_server_monitor_status_sync() -> dict[str, Any]:
     return _default_service.get_status_sync()
 
 
+def _safe_run_platform_command(args: list[str], *, timeout: float = 2.0) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except Exception as exc:
+        return 124, "", safe_error_text(exc, limit=180)
+
+
+def _platform_cpu_snapshot() -> dict[str, Any]:
+    load_1m = load_5m = load_15m = 0.0
+    if hasattr(os, "getloadavg"):
+        try:
+            load_1m, load_5m, load_15m = os.getloadavg()
+        except OSError:
+            pass
+    usage_pct = 0.0
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as handle:
+                first = [int(item) for item in handle.readline().split()[1:]]
+            time.sleep(0.15)
+            with open("/proc/stat", "r", encoding="utf-8") as handle:
+                second = [int(item) for item in handle.readline().split()[1:]]
+            idle_delta = (second[3] + second[4]) - (first[3] + first[4])
+            total_delta = sum(second) - sum(first)
+            usage_pct = round((1 - idle_delta / max(total_delta, 1)) * 100, 1)
+        except Exception:
+            usage_pct = 0.0
+    return {
+        "usage_pct": usage_pct,
+        "load_1m": round(float(load_1m), 2),
+        "load_5m": round(float(load_5m), 2),
+        "load_15m": round(float(load_15m), 2),
+        "cores": os.cpu_count() or 0,
+    }
+
+
+def _platform_memory_snapshot() -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        try:
+            values: dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    key, value = line.split(":", 1)
+                    values[key] = int(value.strip().split()[0])
+            total_mb = values.get("MemTotal", 0) / 1024
+            available_mb = values.get("MemAvailable", 0) / 1024
+            used_mb = max(total_mb - available_mb, 0)
+            return {
+                "total_mb": round(total_mb, 1),
+                "used_mb": round(used_mb, 1),
+                "available_mb": round(available_mb, 1),
+                "used_pct": round((used_mb / total_mb * 100) if total_mb else 0.0, 1),
+            }
+        except Exception:
+            pass
+    return {"total_mb": 0.0, "used_mb": 0.0, "available_mb": 0.0, "used_pct": 0.0}
+
+
+def _platform_disk_snapshot(path: Path) -> dict[str, Any]:
+    target = path if path.exists() else Path.cwd()
+    usage = shutil.disk_usage(target)
+    total_gb = usage.total / 1024 / 1024 / 1024
+    used_gb = usage.used / 1024 / 1024 / 1024
+    free_gb = usage.free / 1024 / 1024 / 1024
+    return {
+        "path": str(target),
+        "total_gb": round(total_gb, 1),
+        "used_gb": round(used_gb, 1),
+        "free_gb": round(free_gb, 1),
+        "used_pct": round((used_gb / total_gb * 100) if total_gb else 0.0, 1),
+    }
+
+
+def _platform_uptime_seconds() -> float | None:
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/uptime", "r", encoding="utf-8") as handle:
+                return round(float(handle.readline().split()[0]), 1)
+        except Exception:
+            return None
+    return None
+
+
+def _platform_service_status(name: str) -> dict[str, Any]:
+    if not sys.platform.startswith("linux"):
+        return {
+            "name": name,
+            "active": False,
+            "status": "local_dev_unavailable",
+            "pid": "",
+            "elapsed": "",
+        }
+    code, out, err = _safe_run_platform_command(["systemctl", "is-active", name])
+    _pid_code, pid_out, _pid_err = _safe_run_platform_command(
+        ["systemctl", "show", name, "-p", "MainPID", "--value"]
+    )
+    pid = pid_out.strip()
+    elapsed = ""
+    if pid and pid != "0":
+        _elapsed_code, elapsed_out, _elapsed_err = _safe_run_platform_command(
+            ["ps", "-p", pid, "-o", "etime="]
+        )
+        elapsed = elapsed_out.strip()
+    return {
+        "name": name,
+        "active": out.strip() == "active",
+        "status": out.strip() or err.strip() or ("unknown" if code else "active"),
+        "pid": pid if pid and pid != "0" else "",
+        "elapsed": elapsed,
+    }
+
+
+def collect_platform_server_status() -> dict[str, Any]:
+    """Collect platform-host status without exposing secrets or account values."""
+    checked_at = datetime.now(UTC).isoformat()
+    try:
+        root_disk = _platform_disk_snapshot(PROJECT_ROOT)
+        services = [_platform_service_status(name) for name in PLATFORM_SERVICE_NAMES]
+        return {
+            "available": True,
+            "status": "ok",
+            "checked_at": checked_at,
+            "hostname": socket.gethostname(),
+            "platform": sys.platform,
+            "python": sys.version.split()[0],
+            "project_root": str(PROJECT_ROOT),
+            "uptime_seconds": _platform_uptime_seconds(),
+            "cpu": _platform_cpu_snapshot(),
+            "memory": _platform_memory_snapshot(),
+            "disks": [root_disk],
+            "services": services,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "platform_probe_failed",
+            "checked_at": checked_at,
+            "message": safe_error_text(exc, limit=240),
+        }
+
+
 async def _probe_platform_json(
     client: httpx.AsyncClient,
     url: str,
@@ -601,6 +764,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
 async def get_server_monitor_status_async() -> dict[str, Any]:
     """Return cached server monitor status using async DB loading on the main loop."""
     checked_at = datetime.now(UTC).isoformat()
+    platform_server = await asyncio.to_thread(collect_platform_server_status)
     try:
         info = await load_model_server_info_from_secure_settings()
     except ModelServerConfigNotConfigured as exc:
@@ -609,6 +773,7 @@ async def get_server_monitor_status_async() -> dict[str, Any]:
             "status": "model_server_not_configured",
             "message": safe_error_text(exc),
             "checked_at": checked_at,
+            "platform_server": platform_server,
         }
     except ModelServerConfigError as exc:
         return {
@@ -616,10 +781,12 @@ async def get_server_monitor_status_async() -> dict[str, Any]:
             "status": "model_server_config_error",
             "message": safe_error_text(exc),
             "checked_at": checked_at,
+            "platform_server": platform_server,
         }
     payload = await asyncio.to_thread(_default_service.get_status_sync, info)
     platform_runtime = await collect_platform_runtime_status()
     payload["platform_runtime"] = platform_runtime
+    payload["platform_server"] = platform_server
     platform_access_host = _model_access_host_from_platform_runtime(platform_runtime)
     if platform_access_host:
         payload["model_access_host"] = platform_access_host

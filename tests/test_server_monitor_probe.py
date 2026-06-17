@@ -11,6 +11,7 @@ from core.server_monitor_probe import (
     render_python_here_doc,
     render_server_monitor_probe,
 )
+from services import server_monitor_status
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -185,3 +186,24 @@ def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> 
     assert "21842" in source
     assert "configuredBase.includes('127.0.0.1')" in source
     assert "configuredBase.includes('localhost')" in source
+
+
+def test_platform_server_status_contract_is_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_service_status(name: str) -> dict[str, object]:
+        return {"name": name, "active": name == "bb-dashboard.service", "status": "active"}
+
+    monkeypatch.setattr(server_monitor_status, "_platform_service_status", fake_service_status)
+    payload = server_monitor_status.collect_platform_server_status()
+
+    assert payload["available"] is True
+    assert payload["status"] == "ok"
+    assert "cpu" in payload
+    assert "memory" in payload
+    assert "disks" in payload
+    service_names = [item["name"] for item in payload["services"]]
+    assert "bb-dashboard.service" in service_names
+    assert "bb-paper-trading.service" in service_names
+    serialized = str(payload).lower()
+    assert "api_key" not in serialized
+    assert "password" not in serialized
+    assert "secret" not in serialized

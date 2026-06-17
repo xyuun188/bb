@@ -446,8 +446,8 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
             _check_item(
                 "recent_blocked_decisions",
                 "最近拦截/失败决策",
-                "warning",
-                f"最近 6 小时有 {len(hard_gate_decisions)} 条决策卡在拦截或失败状态。",
+                "info",
+                f"\u6700\u8fd1 6 \u5c0f\u65f6\u6709 {len(hard_gate_decisions)} \u6761\u51b3\u7b56\u5361\u5728\u62e6\u622a\u6216\u5931\u8d25\u72b6\u6001\uff0c\u53ef\u6253\u5f00\u6267\u884c\u8be6\u60c5\u7ee7\u7eed\u6392\u67e5\u539f\u56e0\u3002",
                 details={"sample_decision_ids": [row.id for row in hard_gate_decisions[:5]]},
             )
         )
@@ -537,6 +537,7 @@ async def system_self_check() -> dict[str, Any]:
                 "critical": sum(1 for item in items if item.get("status") == "critical"),
                 "warning": sum(1 for item in items if item.get("status") == "warning"),
                 "ok": sum(1 for item in items if item.get("status") == "ok"),
+                "info": sum(1 for item in items if item.get("status") == "info"),
             },
             "items": items,
         }

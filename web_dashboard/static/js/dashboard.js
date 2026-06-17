@@ -58,6 +58,7 @@ const state = {
     mlSignalStatus: null,
     localAIToolsStatus: null,
     serverMonitorStatus: null,
+    serverMonitorTab: 'model',
     systemSelfCheck: null,
     mlSignalRecords: [],
     mlSignalPage: 1,
@@ -132,6 +133,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initSettingsTabs();
     initScanModeButtons();
     initPositionActions();
+    initDashboardUserActions();
+    initModalActionButtons();
+    initServerMonitorTabs();
     fetchDashboardSummary();
     fetchPnlHistory();
     fetchRecentDecisions();
@@ -363,6 +367,37 @@ async function putJSON(url, body = {}) {
         throw new Error(apiErrorText(data, res.statusText || '请求失败'));
     }
     return data;
+}
+
+async function dashboardUserWriteRequest(url, options = {}) {
+    const res = await fetch(url, dashboardWriteOptions(options));
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+        redirectToLogin('登录已过期，请重新登录后再操作会员。');
+        throw new Error('登录已过期，请重新登录。');
+    }
+    if (res.status === 403) {
+        throw new Error('当前登录账号没有执行该操作的权限。');
+    }
+    if (!res.ok) {
+        throw new Error(apiErrorText(data, res.statusText || '会员操作失败'));
+    }
+    return data;
+}
+
+function setButtonBusy(button, busy, label = '') {
+    if (!button) return;
+    if (busy) {
+        button.dataset.originalText = button.textContent || '';
+        button.disabled = true;
+        if (label) button.textContent = label;
+        return;
+    }
+    button.disabled = false;
+    if (button.dataset.originalText) {
+        button.textContent = button.dataset.originalText;
+        delete button.dataset.originalText;
+    }
 }
 
 async function logoutDashboard() {
@@ -1395,6 +1430,69 @@ function initSettingsTabs() {
 
     buttons.forEach(btn => {
         btn.addEventListener('click', () => activateSettingsTab(btn.dataset.settingsTab || 'okx'));
+    });
+}
+
+function initDashboardUserActions() {
+    document.addEventListener('click', async event => {
+        const button = event.target?.closest?.('[data-dashboard-user-action]');
+        if (!button) return;
+        event.preventDefault();
+        const action = button.dataset.dashboardUserAction || '';
+        const username = button.dataset.username || '';
+        if (action === 'create') {
+            openDashboardUserModal('create');
+            return;
+        }
+        if (action === 'edit') {
+            openDashboardUserModal('edit', username);
+            return;
+        }
+        if (action === 'activate') {
+            await setDashboardUserActive(username, true, button);
+            return;
+        }
+        if (action === 'deactivate') {
+            await setDashboardUserActive(username, false, button);
+            return;
+        }
+        if (action === 'delete') {
+            await deleteDashboardUser(username, button);
+            return;
+        }
+        if (action === 'close-modal') {
+            closeDashboardUserModal();
+            return;
+        }
+        if (action === 'save-modal') {
+            await saveDashboardUserModal();
+        }
+    });
+}
+
+function initModalActionButtons() {
+    document.addEventListener('click', async event => {
+        const button = event.target?.closest?.('[data-modal-action]');
+        if (!button) return;
+        event.preventDefault();
+        const action = button.dataset.modalAction || '';
+        if (action === 'close-model') {
+            closeModelModal();
+            return;
+        }
+        if (action === 'save-model') {
+            await saveModelConfig();
+        }
+    });
+}
+
+function initServerMonitorTabs() {
+    document.addEventListener('click', event => {
+        const button = event.target?.closest?.('[data-server-monitor-tab]');
+        if (!button) return;
+        event.preventDefault();
+        state.serverMonitorTab = button.dataset.serverMonitorTab || 'model';
+        renderServerMonitor();
     });
 }
 
@@ -3867,7 +3965,7 @@ function renderSystemSelfCheck() {
         <div class="self-check-summary">
             <div class="self-check-card ${data.status || 'info'}">
                 <div class="self-check-title"><span>总体状态</span><strong>${escHtml(selfCheckStatusLabel(data.status))}</strong></div>
-                <div class="self-check-message">异常 ${Number(summary.critical || 0)} · 需关注 ${Number(summary.warning || 0)} · 正常 ${Number(summary.ok || 0)}</div>
+                <div class="self-check-message">\u5f02\u5e38 ${Number(summary.critical || 0)} \u00b7 \u9700\u5173\u6ce8 ${Number(summary.warning || 0)} \u00b7 \u63d0\u793a ${Number(summary.info || 0)} \u00b7 \u6b63\u5e38 ${Number(summary.ok || 0)}</div>
             </div>
             ${items.slice(0, 3).map(item => `
                 <div class="self-check-card ${escHtml(item.status || 'info')}">
@@ -3933,11 +4031,24 @@ function renderServerMonitor() {
     const overview = document.getElementById('server-monitor-overview');
     const runtimeEl = document.getElementById('server-monitor-model-runtime');
     const servicesEl = document.getElementById('server-monitor-services');
+    const platformOverview = document.getElementById('platform-server-overview');
+    const platformServices = document.getElementById('platform-server-services');
+    const platformRuntime = document.getElementById('platform-server-runtime');
     const data = state.serverMonitorStatus || {};
     if (updated) {
         updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : new Date().toLocaleTimeString('zh-CN', { hour12: false });
     }
-    if (!overview || !runtimeEl || !servicesEl) return;
+    document.querySelectorAll('[data-server-monitor-tab]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.serverMonitorTab === state.serverMonitorTab);
+    });
+    document.querySelectorAll('.server-monitor-panel').forEach(panel => {
+        panel.classList.toggle(
+            'active',
+            panel.id === `server-monitor-panel-${state.serverMonitorTab}`
+        );
+    });
+    if (!overview || !runtimeEl || !servicesEl || !platformOverview || !platformServices || !platformRuntime) return;
+    renderPlatformServerMonitor(data, platformOverview, platformServices, platformRuntime);
     if (!data.available) {
         const msg = data.message || data.status || '服务器监控暂不可用';
         overview.innerHTML = monitorMetric('连接状态', '不可用', msg, 100);
@@ -3977,6 +4088,115 @@ function renderServerMonitor() {
             <span class="status-badge ${s.active ? 'status-live' : 'status-paused'}">${s.active ? 'ACTIVE' : 'DOWN'}</span>
         </div>
     `).join('')}</div>`;
+}
+
+function renderPlatformServerMonitor(data, overview, servicesEl, runtimeEl) {
+    const platform = data.platform_server || {};
+    if (!platform.available) {
+        overview.innerHTML = monitorMetric(
+            '平台服务器',
+            '不可用',
+            platform.message || platform.status || '平台服务器状态暂未返回',
+            100
+        );
+        servicesEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">平台服务状态暂不可用。</div>';
+        runtimeEl.innerHTML = renderPlatformRuntimeCard(data.platform_runtime || {});
+        return;
+    }
+    const cpu = platform.cpu || {};
+    const memory = platform.memory || {};
+    const disks = Array.isArray(platform.disks) ? platform.disks : [];
+    const mainDisk = disks[0] || {};
+    const uptime = Number(platform.uptime_seconds);
+    const uptimeText = Number.isFinite(uptime) && uptime > 0
+        ? `${monitorNumber(uptime / 3600, 1)} 小时`
+        : '-';
+    overview.innerHTML = [
+        monitorMetric('CPU 使用率', `${monitorNumber(cpu.usage_pct)}%`, `${Number(cpu.cores || 0)} 核 · 负载 ${monitorNumber(cpu.load_1m)}/${monitorNumber(cpu.load_5m)}/${monitorNumber(cpu.load_15m)}`, cpu.usage_pct),
+        monitorMetric('内存使用', `${monitorNumber(memory.used_pct)}%`, `${monitorNumber(memory.used_mb / 1024)} / ${monitorNumber(memory.total_mb / 1024)} GB`, memory.used_pct),
+        monitorMetric('磁盘使用', `${monitorNumber(mainDisk.used_pct)}%`, `${mainDisk.path || '-'} · ${monitorNumber(mainDisk.used_gb)} / ${monitorNumber(mainDisk.total_gb)} GB`, mainDisk.used_pct),
+        monitorMetric('平台主机', platform.hostname || '-', `${platform.platform || '-'} · Python ${platform.python || '-'} · 运行 ${uptimeText}`, null),
+    ].join('');
+    const services = Array.isArray(platform.services) ? platform.services : [];
+    const visibleServices = Array.from(
+        services.reduce((map, service) => {
+            const key = serviceLabel(service.name);
+            const current = map.get(key);
+            if (!current) {
+                map.set(key, service);
+                return map;
+            }
+            const currentScore = (current.active ? 2 : 0) + (current.pid ? 1 : 0);
+            const nextScore = (service.active ? 2 : 0) + (service.pid ? 1 : 0);
+            if (nextScore >= currentScore) map.set(key, service);
+            return map;
+        }, new Map()).values()
+    );
+    servicesEl.innerHTML = visibleServices.length
+        ? `<div class="server-monitor-services platform-services">${visibleServices.map(service => `
+            <div class="server-monitor-service">
+                <div>
+                    <strong>${escHtml(serviceLabel(service.name))}</strong>
+                    <span>${escHtml(service.name || '-')} · ${escHtml(service.active ? '运行中' : service.status || '未运行')}${service.pid ? ` · PID ${escHtml(service.pid)}` : ''}${service.elapsed ? ` · 已运行 ${escHtml(service.elapsed)}` : ''}</span>
+                </div>
+                <span class="status-badge ${service.active ? 'status-live' : 'status-paused'}">${service.active ? 'ACTIVE' : 'DOWN'}</span>
+            </div>
+        `).join('')}</div>`
+        : '<div style="color:var(--text-muted);font-size:12px;padding:16px;">没有返回平台服务状态。</div>';
+    runtimeEl.innerHTML = renderPlatformRuntimeCard(data.platform_runtime || {});
+}
+
+function serviceLabel(name) {
+    const labels = {
+        'bb-dashboard.service': 'Dashboard 看板',
+        'bb-paper-trading.service': '交易主循环',
+        'bb-model-tunnels.service': '模型隧道',
+        'postgresql.service': 'PostgreSQL',
+        'redis-server.service': 'Redis',
+        'redis.service': 'Redis',
+    };
+    return labels[name] || name || '-';
+}
+
+function renderPlatformRuntimeCard(platformRuntime) {
+    const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
+    const platformTools = platformRuntime.local_ai_tools || {};
+    const childEndpoints = platformTools.child_endpoints || {};
+    const childRows = Object.entries(childEndpoints);
+    const childAvailable = childRows.filter(([, item]) => item && (item.available || item.ok)).length;
+    const modelRows = platformModels.length
+        ? platformModels.map(item => `
+            <div class="server-monitor-process">
+                <span>${escHtml(item.label || item.name || item.model || '-')} · 平台调用 ${escHtml(item.api_base || '-')}<br><em>目标：${escHtml(item.model || '-')} · 返回：${escHtml((item.models || []).join('、') || '未返回模型名')} · ${escHtml(runtimeEndpointSummary(item) || '-')}</em></span>
+                <strong>${item.available ? '正常' : (item.endpoint_ok ? '模型不匹配' : '不可达')}</strong>
+            </div>
+        `).join('')
+        : '<div style="color:var(--text-muted);font-size:11px;">未配置平台侧模型端点。</div>';
+    const childHtml = childRows.length
+        ? childRows.map(([name, item]) => `
+            <div class="server-monitor-process">
+                <span>${escHtml(name)} · ${escHtml(item.path || '-')}<br><em>${escHtml(runtimeEndpointSummary(item) || item.error || '-')}</em></span>
+                <strong>${item.available ? '正常' : (item.ok ? '接口异常' : '不可达')}</strong>
+            </div>
+        `).join('')
+        : '<div style="color:var(--text-muted);font-size:11px;">本地量化工具子接口未返回。</div>';
+    return `
+        <div class="server-monitor-runtime">
+            <div class="server-monitor-runtime-card">
+                <strong>平台实际调用模型端点</strong>
+                <div class="server-monitor-process-list">${modelRows}</div>
+            </div>
+            <div class="server-monitor-runtime-card">
+                <strong>平台本地量化工具 ${runtimeStatusBadge(platformTools.available)}</strong>
+                <div>平台调用地址：${escHtml(platformTools.api_base || '-')}</div>
+                <div>健康接口：${escHtml(runtimeEndpointSummary(platformTools.health) || '-')}</div>
+                <div>状态接口：${escHtml(runtimeEndpointSummary(platformTools.status) || '-')}</div>
+                <div>子接口：${childRows.length ? `${childAvailable}/${childRows.length} 正常` : '-'}</div>
+                <div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '未就绪/启发式可用')}</div>
+                ${platformTools.status && platformTools.status.error ? `<div style="color:var(--red);">状态接口：${escHtml(platformTools.status.error)}</div>` : ''}
+                <div class="server-monitor-process-list">${childHtml}</div>
+            </div>
+        </div>`;
 }
 
 function runtimeStatusBadge(ok) {
@@ -4567,10 +4787,10 @@ function renderDashboardUsers(users, currentUsername) {
             : '<span class="settings-status-badge inactive">停用</span>';
         const action = `
             <div class="dashboard-user-actions">
-                <button class="btn btn-sm" onclick="openDashboardUserModal('edit', ${jsStringAttr(username)})">修改</button>
+                <button class="btn btn-sm" type="button" data-dashboard-user-action="edit" data-username="${escHtml(username)}">修改</button>
                 ${isCurrent ? '<span style="color:var(--text-muted);font-size:11px;">当前账号</span>' : `
-                    <button class="btn btn-sm" onclick="setDashboardUserActive(${jsStringAttr(username)}, ${active ? 'false' : 'true'})">${active ? '停用' : '启用'}</button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteDashboardUser(${jsStringAttr(username)})">删除</button>
+                    <button class="btn btn-sm" type="button" data-dashboard-user-action="${active ? 'deactivate' : 'activate'}" data-username="${escHtml(username)}">${active ? '停用' : '启用'}</button>
+                    <button class="btn btn-sm btn-danger" type="button" data-dashboard-user-action="delete" data-username="${escHtml(username)}">删除</button>
                 `}
             </div>
         `;
@@ -4669,7 +4889,7 @@ async function saveDashboardUserModal() {
     }
 }
 
-async function setDashboardUserActive(username, active) {
+async function setDashboardUserActive(username, active, sourceButton = null) {
     if (!username) return;
     if (username === dashboardAuthState.currentUsername && !active) {
         setSettingsStatus('dashboard-users-status', '当前账号不能停用', false);
@@ -4677,39 +4897,49 @@ async function setDashboardUserActive(username, active) {
     }
     const actionText = active ? '启用' : '停用';
     if (!confirm(`${actionText}会员 ${username}？`)) return;
+    setButtonBusy(sourceButton, true, `${actionText}中`);
     setSettingsStatus('dashboard-users-status', `${actionText}中...`, null);
-    const res = active
-        ? await fetch(`/api/auth/users/${encodeURIComponent(username)}`, dashboardWriteOptions({
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ is_active: true }),
-        }))
-        : await fetch(`/api/auth/users/${encodeURIComponent(username)}/deactivate`, dashboardWriteOptions({ method: 'POST' }));
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-        setSettingsStatus('dashboard-users-status', `${actionText}失败：${apiErrorText(data)}`, false);
-        return;
+    try {
+        if (active) {
+            await dashboardUserWriteRequest(`/api/auth/users/${encodeURIComponent(username)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_active: true }),
+            });
+        } else {
+            await dashboardUserWriteRequest(`/api/auth/users/${encodeURIComponent(username)}/deactivate`, {
+                method: 'POST',
+            });
+        }
+        setSettingsStatus('dashboard-users-status', `会员已${actionText}`, true);
+        await fetchDashboardAccountSettings();
+    } catch (error) {
+        setSettingsStatus('dashboard-users-status', `${actionText}失败：${error.message || error}`, false);
+    } finally {
+        setButtonBusy(sourceButton, false);
     }
-    setSettingsStatus('dashboard-users-status', `会员已${actionText}`, true);
-    await fetchDashboardAccountSettings();
 }
 
-async function deleteDashboardUser(username) {
+async function deleteDashboardUser(username, sourceButton = null) {
     if (!username) return;
     if (username === dashboardAuthState.currentUsername) {
         setSettingsStatus('dashboard-users-status', '当前账号不能删除', false);
         return;
     }
     if (!confirm(`删除会员 ${username}？删除后该账号无法登录。`)) return;
+    setButtonBusy(sourceButton, true, '删除中');
     setSettingsStatus('dashboard-users-status', '删除中...', null);
-    const res = await fetch(`/api/auth/users/${encodeURIComponent(username)}`, dashboardWriteOptions({ method: 'DELETE' }));
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-        setSettingsStatus('dashboard-users-status', `删除失败：${apiErrorText(data)}`, false);
-        return;
+    try {
+        await dashboardUserWriteRequest(`/api/auth/users/${encodeURIComponent(username)}`, {
+            method: 'DELETE',
+        });
+        setSettingsStatus('dashboard-users-status', '会员已删除', true);
+        await fetchDashboardAccountSettings();
+    } catch (error) {
+        setSettingsStatus('dashboard-users-status', `删除失败：${error.message || error}`, false);
+    } finally {
+        setButtonBusy(sourceButton, false);
     }
-    setSettingsStatus('dashboard-users-status', '会员已删除', true);
-    await fetchDashboardAccountSettings();
 }
 
 window.createDashboardUser = createDashboardUser;
@@ -5615,10 +5845,46 @@ function executionStepDuration(step) {
 
 function executionStepDataText(data) {
     if (!data || typeof data !== 'object' || !Object.keys(data).length) return '';
+    const labels = {
+        source: '来源',
+        order_status: '订单状态',
+        blocker: '拦截类型',
+        okx_code: 'OKX 返回码',
+        min_size: '最小数量',
+        min_notional: '最小名义价值',
+        requested_qty: '请求数量',
+        adjusted_qty: '调整后数量',
+        available_balance: '可用余额',
+        required_margin: '所需保证金',
+        symbol: '交易对',
+        side: '方向',
+    };
     return Object.entries(data)
         .filter(([, value]) => value !== null && value !== undefined && value !== '')
-        .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+        .map(([key, value]) => `${labels[key] || key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
         .join('\n');
+}
+
+function executionStepPlainReason(step) {
+    const stage = String(step?.stage || '');
+    const status = String(step?.status || '');
+    const reason = String(step?.reason || '').trim();
+    if (reason) return reason;
+    if (status === 'passed' || status === 'completed') {
+        const labels = {
+            ai_analysis: 'AI 已完成本轮交易判断。',
+            strategy_arbitration: '策略调度已完成候选排序与执行裁决。',
+            risk_check: '风控检查通过，允许继续提交订单。',
+            exchange_submit: '订单已提交到交易所。',
+            exchange_confirm: '交易所成交确认已返回。',
+            local_sync: '本地订单、持仓和收益记录已同步。',
+        };
+        return labels[stage] || '该步骤已完成。';
+    }
+    if (status === 'blocked') return '该步骤拦截了订单，系统没有继续向后执行。';
+    if (status === 'failed') return '该步骤执行失败，请优先查看本步骤的原因和数据。';
+    if (status === 'skipped') return '前置步骤未通过，该步骤被跳过。';
+    return '该步骤没有返回额外说明。';
 }
 
 function renderExecutionTimeline(steps, failedStep) {
@@ -5638,8 +5904,8 @@ function renderExecutionTimeline(steps, failedStep) {
                     <span>${Number(step.step_no || index + 1)}. ${escHtml(step.stage_label || stateStageLabel(step.stage))}</span>
                     <span class="execution-step-meta">${escHtml(step.status_label || stateStatusLabel(status))} · ${escHtml(executionStepDuration(step))}</span>
                 </div>
-                <div class="execution-step-reason">${escapeMultiline(step.reason || '该步骤没有返回额外说明。')}</div>
-                <div class="execution-step-meta">时间：${toBeijingTime(step.at)}</div>
+                <div class="execution-step-reason">${escapeMultiline(executionStepPlainReason(step))}</div>
+                <div class="execution-step-meta">发生时间：${toBeijingTime(step.at)} · 阶段：${escHtml(step.stage || '-')}</div>
                 ${dataText ? `<div class="execution-step-data">${escHtml(dataText)}</div>` : ''}
             </div>`;
     }).join('')}</div>`;
@@ -5657,8 +5923,17 @@ function renderExecutionDetailModal(trade, detailData = null) {
         ? `${actionLabel(trade.action || trade.side)} / ${closeStatus}`
         : actionLabel(trade.action || trade.side);
     const detail = cleanExecutionDetailText(
-        detailData?.detail || detailData?.reason || trade.detail || trade.reason,
+        detailData?.display_reason || detailData?.detail || detailData?.reason || trade.display_reason || trade.detail || trade.reason,
         success ? '订单执行成功。' : '订单执行失败，暂无详细原因。'
+    );
+    const decision = detailData?.decision || trade.decision || {};
+    const aiReason = cleanExecutionDetailText(
+        decision.reasoning || trade.reasoning || '',
+        ''
+    );
+    const executionReason = cleanExecutionDetailText(
+        detailData?.display_reason || decision.execution_reason || detailData?.reason || trade.execution_reason || trade.reason || detail,
+        detail
     );
     const aiLev = Number(trade.ai_suggested_leverage ?? trade.leverage ?? 1).toFixed(1);
     const actualLev = Number(trade.actual_leverage ?? trade.leverage ?? 1).toFixed(1);
@@ -5685,6 +5960,12 @@ function renderExecutionDetailModal(trade, detailData = null) {
             </div>
             ${finalResult.reason ? `<div style="margin-top:8px;">${escapeMultiline(finalResult.reason)}</div>` : ''}
         </div>` : '';
+    const reasonHtml = `
+        <div class="reason-block execution-reason-primary">
+            <div class="reason-label">${success ? '执行原因' : '失败原因'}</div>
+            <div>${escapeMultiline(executionReason || detail)}</div>
+            ${aiReason ? `<div class="reason-meta">AI 裁决依据：${escapeMultiline(aiReason)}</div>` : ''}
+        </div>`;
     const failedHtml = failedStep ? `
         <div class="reason-block">
             <div class="reason-label">问题定位</div>
@@ -5701,14 +5982,16 @@ function renderExecutionDetailModal(trade, detailData = null) {
         `${trade.display_symbol || trade.symbol || '-'} / ${actionTitle} / ${success ? '执行成功' : '执行失败'}`;
     document.getElementById('decision-reason-body').innerHTML = `
         ${finalHtml}
+        ${reasonHtml}
         ${failedHtml}
         ${suggestionsHtml}
         <div class="reason-block">
-            <div class="reason-label">执行步骤</div>
+            <div class="reason-label">执行步骤说明</div>
+            <div class="reason-meta" style="margin:0 0 8px;">按实际执行顺序展示：每一步包含状态、耗时、发生时间和可读原因；如果某一步失败，系统会在“问题定位”中指出卡在哪一步。</div>
             ${timelineHtml}
         </div>
         <div class="reason-block">
-            <div class="reason-label">${success ? '执行详情' : '失败原因'}</div>
+            <div class="reason-label">${success ? '执行补充' : '失败补充'}</div>
             <div>${escapeMultiline(detail)}</div>
         </div>
         <div class="reason-block">
