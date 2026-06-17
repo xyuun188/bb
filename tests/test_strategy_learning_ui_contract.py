@@ -73,7 +73,12 @@ def test_strategy_learning_console_uses_clear_stage_layout() -> None:
     assert ".strategy-learning-stage-kicker" in style
     assert ".strategy-learning-grid-diagnostics .strategy-learning-panel-problems" in style
     assert ".strategy-learning-panel-candidates" in style
+    assert "grid-template-columns: minmax(420px, 0.88fr) minmax(520px, 1.12fr);" in style
+    assert "align-items: start;" in style
+    assert "columns: 2 420px;" in style
+    assert "break-inside: avoid;" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));" in style
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in style
     assert "strategy-learning-grid > .strategy-learning-panel:nth-child" not in style
     assert "????" not in html
     assert "????" not in style
