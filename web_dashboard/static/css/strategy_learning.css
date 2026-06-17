@@ -797,18 +797,20 @@
 
 .strategy-learning-profile-stat {
     display: grid;
-    gap: 2px;
+    gap: 4px;
     min-width: 0;
     color: var(--text-dim);
     font-size: 12px;
-    line-height: 1.25;
-    white-space: nowrap;
+    line-height: 1.35;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .strategy-learning-profile-stat b {
     color: var(--text-muted);
     font-size: 10px;
     font-weight: 700;
+    line-height: 1.2;
 }
 
 .strategy-learning-profile-actions {
@@ -968,16 +970,27 @@
 
 .strategy-learning-profile-card-stats {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 9px;
 }
 
 .strategy-learning-profile-card-stats .strategy-learning-profile-stat {
-    min-height: 54px;
-    padding: 8px 9px;
+    min-height: 56px;
+    padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-panel);
+    overflow: hidden;
+}
+
+.strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4) {
+    grid-column: 1 / -1;
+    min-height: 48px;
+}
+
+.strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4) b {
+    display: inline;
+    margin-right: 6px;
 }
 
 .strategy-learning-profile-stat.warn {
@@ -1311,5 +1324,9 @@
 
     .strategy-learning-profile-card-stats {
         grid-template-columns: 1fr;
+    }
+
+    .strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4) {
+        grid-column: auto;
     }
 }

@@ -79,6 +79,10 @@ def test_strategy_learning_console_uses_clear_stage_layout() -> None:
     assert "break-inside: avoid;" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));" in style
     assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in style
+    assert ".strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4)" in style
+    assert "grid-column: 1 / -1;" in style
+    assert "white-space: normal;" in style
+    assert "overflow-wrap: anywhere;" in style
     assert "strategy-learning-grid > .strategy-learning-panel:nth-child" not in style
     assert "????" not in html
     assert "????" not in style
