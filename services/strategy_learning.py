@@ -639,9 +639,7 @@ class StrategyFeedbackCompiler:
             market_scans=_safe_int(decision_quality.get("market_scans"), 0),
             entry_signals=_safe_int(decision_quality.get("entry_signals"), 0),
             reflection_count=_safe_int(reflection_feedback.get("training_count"), 0),
-            shadow_opportunities=_safe_int(
-                shadow_feedback.get("missed_opportunity_count"), 0
-            ),
+            shadow_opportunities=_safe_int(shadow_feedback.get("missed_opportunity_count"), 0),
         )
         problems, root_causes = self._problems(
             side_performance=side_performance,
@@ -1463,7 +1461,10 @@ class StrategyFeedbackCompiler:
         normalized_status = str(status or "").lower()
         if normalized_type not in {"execution_attempt", "execution_result", "execution_error"}:
             return False
-        if normalized_status not in {"error", "failed", "rejected"} and normalized_type != "execution_error":
+        if (
+            normalized_status not in {"error", "failed", "rejected"}
+            and normalized_type != "execution_error"
+        ):
             return False
         text = " ".join(
             str(value or "")
@@ -3228,9 +3229,7 @@ class StrategyLearningEngine:
             and "execution_error_guard" in guard_reasons
             and not model_health_recovered
         )
-        recovery_probe_allowed = bool(
-            fallback_health_guard_active or execution_guard_active
-        )
+        recovery_probe_allowed = bool(fallback_health_guard_active or execution_guard_active)
         entry_pause = False
         if release_pressure_active:
             sizing = result["strategy_learning_sizing"]
@@ -3247,8 +3246,7 @@ class StrategyLearningEngine:
                 0.018,
             )
             sizing["reason"] = (
-                "满仓或低质量仓位压力存在：优先释放低质量仓位，"
-                "同时只允许高质量小仓探针。"
+                "满仓或低质量仓位压力存在：优先释放低质量仓位，" "同时只允许高质量小仓探针。"
             )
         if recovery_probe_allowed:
             sizing = result["strategy_learning_sizing"]
@@ -3256,30 +3254,30 @@ class StrategyLearningEngine:
             sizing["recovery_probe_allowed"] = True
             sizing["reason"] = (
                 "模型健康护栏激活：fallback 依赖偏高，系统不再硬停所有新开仓，"
-                "只允许通过后续风控的极小仓恢复探针来采集真实健康样本。"
+                "改为质量驱动恢复探针来采集真实健康样本。"
             )
             sizing["position_size_multiplier"] = min(
                 _safe_float(sizing.get("position_size_multiplier"), 1.0),
-                0.35,
+                0.55,
             )
             sizing["probe_fraction"] = max(
                 _safe_float(sizing.get("probe_fraction"), 0.0),
-                0.02,
+                0.03,
             )
             sizing["max_probe_size_pct"] = min(
-                max(_safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
-                0.012,
+                max(_safe_float(sizing.get("max_probe_size_pct"), 0.018), 0.012),
+                0.024,
             )
             sizing["execution_guard_active"] = execution_guard_active
             sizing["reason"] = (
                 "策略健康护栏已触发：系统不再硬停全部新开仓，"
-                "仅允许通过后续风控确认的小仓恢复探针采集真实样本。"
+                "改为质量驱动恢复探针；强信号可按收益质量动态放大，弱信号仍保持小仓。"
             )
         result["strategy_learning_entry_pause"] = entry_pause
         result["strategy_learning_entry_pause_reason"] = ""
         result["strategy_learning_execution_guard_active"] = execution_guard_active
         result["strategy_learning_execution_guard_reason"] = (
-            "策略护栏检测到执行链路异常：已回滚异常画像并转入小仓恢复探针；"
+            "策略护栏检测到执行链路异常：已回滚异常画像并转入质量驱动恢复探针；"
             "不再阻断全部新开仓，真实下单仍会经过执行前风控和 OKX 规则校验。"
             if execution_guard_active
             else ""
@@ -3287,7 +3285,7 @@ class StrategyLearningEngine:
         result["strategy_learning_health_guard_active"] = fallback_health_guard_active
         result["strategy_learning_recovery_probe_allowed"] = recovery_probe_allowed
         result["strategy_learning_recovery_probe_reason"] = (
-            "策略健康护栏已转为小仓恢复探针；执行前风控和 OKX 规则仍会逐单校验。"
+            "策略健康护栏已转为质量驱动恢复探针；强信号可动态放大，执行前风控和 OKX 规则仍会逐单校验。"
             if recovery_probe_allowed
             else ""
         )

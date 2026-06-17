@@ -991,14 +991,15 @@ async def test_entry_profit_risk_sizing_converts_strategy_learning_pause_to_prob
         "opportunity_score": {
             "score": 3.0,
             "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
+            "expected_net_return_pct": 4.0,
             "expected_loss_pct": 1.0,
             "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
+            "raw_expected_return_pct": 4.0,
             "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.40,
+            "server_profit_loss_probability": 0.35,
             "ml_aligned": True,
             "local_profit_aligned": True,
+            "timeseries_aligned": True,
             "evidence_score": {
                 "tier": "normal",
                 "effective_score": 82.0,
@@ -1024,7 +1025,9 @@ async def test_entry_profit_risk_sizing_converts_strategy_learning_pause_to_prob
     assert sizing["strategy_learning_pause_is_hard_gate"] is False
     assert sizing["recovery_probe_allowed"] is True
     assert sizing["reason"] == "策略护栏暂停新探针"
-    assert decision.position_size_pct <= 0.012
+    assert sizing["adaptive_recovery_lift_applied"] is True
+    assert sizing["adaptive_recovery_cap_pct"] > 0.012
+    assert decision.position_size_pct >= 0.018
 
 
 @pytest.mark.asyncio
@@ -1050,14 +1053,15 @@ async def test_entry_profit_risk_sizing_allows_recovery_probe_when_not_paused():
         "opportunity_score": {
             "score": 3.0,
             "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
+            "expected_net_return_pct": 4.0,
             "expected_loss_pct": 1.0,
             "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
+            "raw_expected_return_pct": 4.0,
             "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.40,
+            "server_profit_loss_probability": 0.35,
             "ml_aligned": True,
             "local_profit_aligned": True,
+            "timeseries_aligned": True,
             "evidence_score": {
                 "tier": "normal",
                 "effective_score": 82.0,
@@ -1083,7 +1087,9 @@ async def test_entry_profit_risk_sizing_allows_recovery_probe_when_not_paused():
     assert sizing["health_guard_active"] is True
     assert sizing["recovery_probe_allowed"] is True
     assert sizing["probe_cap_applied"] is True
-    assert decision.position_size_pct <= 0.012
+    assert sizing["adaptive_recovery_lift_applied"] is True
+    assert sizing["adaptive_recovery_cap_pct"] > 0.012
+    assert decision.position_size_pct >= 0.018
 
 
 @pytest.mark.asyncio

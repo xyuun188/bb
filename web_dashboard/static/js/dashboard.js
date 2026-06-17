@@ -58,7 +58,7 @@ const state = {
     mlSignalStatus: null,
     localAIToolsStatus: null,
     serverMonitorStatus: null,
-    serverMonitorTab: 'model',
+    serverMonitorTab: 'self-check',
     systemSelfCheck: null,
     mlSignalRecords: [],
     mlSignalPage: 1,
@@ -116,6 +116,7 @@ const okxTickerCache = {};
 let positionsRequestToken = 0;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
+let serverMonitorRefreshInFlight = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
 
 function isPageActive(page) {
@@ -159,7 +160,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 15000);
     setInterval(() => {
         if (isPageActive('server-monitor')) {
-            fetchServerMonitor();
+            refreshServerMonitorPage();
         }
     }, 15000);
     fetchDashboardAccountSettings();
@@ -1491,7 +1492,7 @@ function initServerMonitorTabs() {
         const button = event.target?.closest?.('[data-server-monitor-tab]');
         if (!button) return;
         event.preventDefault();
-        state.serverMonitorTab = button.dataset.serverMonitorTab || 'model';
+        state.serverMonitorTab = button.dataset.serverMonitorTab || 'self-check';
         renderServerMonitor();
     });
 }
@@ -1534,8 +1535,7 @@ function loadPageData(page) {
     if (page === 'shadow-backtest') fetchShadowBacktests();
     if (page === 'ml-signal') fetchMLSignalDashboard();
     if (page === 'server-monitor') {
-        fetchSystemSelfCheck();
-        fetchServerMonitor();
+        refreshServerMonitorPage();
     }
     if (page === 'settings') {
         fetchDashboardAccountSettings();
@@ -3913,6 +3913,17 @@ async function fetchSystemSelfCheck() {
     renderSystemSelfCheck();
 }
 
+async function refreshServerMonitorPage() {
+    if (serverMonitorRefreshInFlight) return serverMonitorRefreshInFlight;
+    serverMonitorRefreshInFlight = (async () => {
+        await fetchServerMonitor();
+        await fetchSystemSelfCheck();
+    })().finally(() => {
+        serverMonitorRefreshInFlight = null;
+    });
+    return serverMonitorRefreshInFlight;
+}
+
 async function repairSystemSelfCheck() {
     const updated = document.getElementById('system-self-check-updated');
     if (updated) updated.textContent = '安全修复中...';
@@ -3920,8 +3931,7 @@ async function repairSystemSelfCheck() {
         const data = await postJSON('/api/system/self-check/repair', {});
         const actions = (data.actions || []).map(item => `${item.action}: ${item.status}`).join('；');
         alert(`安全修复已执行：${actions || '无可执行动作'}。将重新自检。`);
-        await fetchSystemSelfCheck();
-        await fetchServerMonitor();
+        await refreshServerMonitorPage();
     } catch (error) {
         alert(`安全修复失败：${error.message || error}`);
         renderSystemSelfCheck();

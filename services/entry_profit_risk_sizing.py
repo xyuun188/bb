@@ -59,6 +59,8 @@ ENTRY_STRONG_PROBE_MAX_LOSS_USDT = 9.0
 ENTRY_QUALITY_RISK_BASE_CAP_PCT = 0.008
 ENTRY_QUALITY_RISK_MAX_CAP_PCT = 0.024
 ENTRY_QUALITY_RISK_ELITE_CAP_PCT = 0.030
+ENTRY_RECOVERY_PROBE_BASE_CAP_PCT = 0.012
+ENTRY_RECOVERY_PROBE_MAX_CAP_PCT = 0.060
 
 
 def _settings_max_leverage() -> float:
@@ -211,6 +213,7 @@ class EntryProfitRiskSizingPolicy:
         action_side: str,
         sizing: dict[str, Any],
         quality_override: bool = False,
+        recovery_quality_cap_pct: float = 0.0,
     ) -> dict[str, Any]:
         if current_size <= 0 or not sizing:
             return {"applied": False}
@@ -245,6 +248,21 @@ class EntryProfitRiskSizingPolicy:
         )
         probe_fraction = min(max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.0), 0.10)
         max_probe_size = min(max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0), 0.03)
+        recovery_probe_active = bool(
+            sizing.get("recovery_probe_allowed")
+            or sizing.get("health_guard_active")
+            or sizing.get("execution_guard_active")
+            or sizing.get("entry_paused")
+        )
+        adaptive_recovery_lift = bool(
+            recovery_probe_active
+            and recovery_quality_cap_pct > max(max_probe_size, ENTRY_RECOVERY_PROBE_BASE_CAP_PCT)
+        )
+        if adaptive_recovery_lift:
+            max_probe_size = min(
+                max(recovery_quality_cap_pct, max_probe_size),
+                ENTRY_RECOVERY_PROBE_MAX_CAP_PCT,
+            )
         effective_global_multiplier = global_multiplier
         effective_side_multiplier = side_multiplier
         if quality_override:
@@ -272,6 +290,8 @@ class EntryProfitRiskSizingPolicy:
             "max_probe_size_pct": round(max_probe_size, 6),
             "probe_cap_applied": bool(cap > 0 and adjusted <= cap + 1e-12 and not quality_override),
             "quality_override": bool(quality_override),
+            "adaptive_recovery_lift_applied": adaptive_recovery_lift,
+            "adaptive_recovery_cap_pct": round(recovery_quality_cap_pct, 6),
             "entry_paused": bool(sizing.get("entry_paused", False)),
             "strategy_learning_pause_is_hard_gate": bool(
                 sizing.get("strategy_learning_pause_is_hard_gate", False)
@@ -317,6 +337,55 @@ class EntryProfitRiskSizingPolicy:
             else ENTRY_QUALITY_RISK_MAX_CAP_PCT
         )
         return min(max(raw_cap, ENTRY_QUALITY_RISK_BASE_CAP_PCT), hard_cap)
+
+    @classmethod
+    def _adaptive_recovery_probe_cap_pct(
+        cls,
+        *,
+        expected_net_return_pct: float,
+        profit_quality_ratio: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        score: float,
+        min_score_required: float,
+        aligned_source_count: int,
+    ) -> float:
+        """Return a quality-driven cap for recovery probes.
+
+        Recovery mode exists to keep the system trading while model health or
+        execution feedback is being rebuilt. It should not permanently flatten
+        every good signal into dust-size orders; strong positive expectancy and
+        multiple independent confirmations earn a larger but still bounded cap.
+        """
+
+        if (
+            expected_net_return_pct <= 0.0
+            or profit_quality_ratio < 0.75
+            or loss_probability > 0.58
+            or tail_risk_score >= 0.90
+            or aligned_source_count <= 0
+        ):
+            return 0.0
+        score_ratio = score / max(min_score_required, 1e-12)
+        expected_component = min(max(expected_net_return_pct, 0.0) * 0.010, 0.018)
+        quality_component = min(max(profit_quality_ratio - 0.75, 0.0) * 0.016, 0.018)
+        score_component = min(max(score_ratio - 1.0, 0.0) * 0.005, 0.012)
+        alignment_component = min(aligned_source_count * 0.004, 0.012)
+        loss_discount = max(loss_probability - 0.35, 0.0) * 0.018
+        tail_discount = max(tail_risk_score - 0.55, 0.0) * 0.014
+        cap = (
+            ENTRY_RECOVERY_PROBE_BASE_CAP_PCT
+            + expected_component
+            + quality_component
+            + score_component
+            + alignment_component
+            - loss_discount
+            - tail_discount
+        )
+        return min(
+            max(cap, ENTRY_RECOVERY_PROBE_BASE_CAP_PCT),
+            ENTRY_RECOVERY_PROBE_MAX_CAP_PCT,
+        )
 
     def _missing_dependencies(self) -> list[str]:
         required = {
@@ -512,22 +581,41 @@ class EntryProfitRiskSizingPolicy:
                 caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
         strategy_sizing = self._strategy_learning_sizing(raw)
         timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
+        aligned_source_count = sum(
+            1
+            for aligned in (
+                local_aligned,
+                ml_aligned,
+                timeseries_aligned,
+                bool(opportunity.get("expert_aligned")),
+            )
+            if aligned
+        )
         strategy_quality_override = bool(
             high_quality_entry
             and not low_payoff_quality
             and (local_aligned or ml_aligned or timeseries_aligned)
             and (
-                expected_net >= 1.20
-                or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
+                expected_net >= 1.20 or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
             )
             and loss_probability <= 0.40
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
+        recovery_quality_cap_pct = self._adaptive_recovery_probe_cap_pct(
+            expected_net_return_pct=expected_net,
+            profit_quality_ratio=profit_quality_ratio,
+            loss_probability=loss_probability,
+            tail_risk_score=tail_risk,
+            score=score,
+            min_score_required=min_score_required,
+            aligned_source_count=aligned_source_count,
         )
         strategy_sizing_applied = self._apply_strategy_learning_sizing(
             current_size=current_size,
             action_side="long" if str(decision.action.value) == "long" else "short",
             sizing=strategy_sizing,
             quality_override=strategy_quality_override,
+            recovery_quality_cap_pct=recovery_quality_cap_pct,
         )
         if strategy_sizing_applied.get("applied"):
             current_size = self._safe_float(

@@ -264,13 +264,24 @@ def _configured_endpoint_items() -> list[dict[str, Any]]:
 
 def _server_monitor_items(status: dict[str, Any]) -> list[dict[str, Any]]:
     if not status.get("available"):
+        monitor_status = str(status.get("status") or "")
+        if monitor_status == "server_monitor_refreshing":
+            return [
+                _check_item(
+                    "server_monitor",
+                    "模型服务器监控",
+                    "info",
+                    "模型服务器监控正在刷新，本次不计入异常或需关注。",
+                    details={"status": monitor_status},
+                )
+            ]
         return [
             _check_item(
                 "server_monitor",
                 "模型服务器监控",
                 "warning",
                 str(status.get("message") or "模型服务器监控暂不可用。"),
-                details={"status": status.get("status")},
+                details={"status": monitor_status},
                 repairable=True,
                 repair_action="clear_monitor_cache",
             )
@@ -411,15 +422,41 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
         )
     ]
     if failed_orders:
+        unresolved_statuses = {"open", "pending", "partial", "partially_filled"}
+        has_unresolved_order = any(
+            str(row.status or "").lower() in unresolved_statuses for row in failed_orders
+        )
+        latest_failed_at = max(
+            (row.created_at for row in failed_orders if isinstance(row.created_at, datetime)),
+            default=None,
+        )
+        latest_executed_at = max(
+            (row.created_at for row in executed_orders if isinstance(row.created_at, datetime)),
+            default=None,
+        )
+        recovered_after_failure = bool(
+            latest_executed_at and latest_failed_at and latest_executed_at >= latest_failed_at
+        )
+        failed_status = "warning" if has_unresolved_order or not recovered_after_failure else "info"
+        failed_message = (
+            f"最近 6 小时有 {len(failed_orders)} 条失败或未成交订单，需要打开执行详情查看失败步骤。"
+            if failed_status == "warning"
+            else f"最近 6 小时有 {len(failed_orders)} 条历史失败订单，但之后已有更新成交，执行链路已恢复；保留详情供复盘，不计入总体异常。"
+        )
         items.append(
             _check_item(
                 "recent_failed_orders",
                 "最近失败/未成交订单",
-                "warning",
-                f"最近 6 小时有 {len(failed_orders)} 条失败或未成交订单，需要打开执行详情查看失败步骤。",
+                failed_status,
+                failed_message,
                 details={
                     "sample_order_ids": [row.id for row in failed_orders[:5]],
                     "sample_statuses": [row.status for row in failed_orders[:5]],
+                    "has_unresolved_order": has_unresolved_order,
+                    "latest_failed_at": latest_failed_at.isoformat() if latest_failed_at else None,
+                    "latest_executed_at": (
+                        latest_executed_at.isoformat() if latest_executed_at else None
+                    ),
                 },
             )
         )

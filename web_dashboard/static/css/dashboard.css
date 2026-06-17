@@ -431,6 +431,13 @@ td .ml-bar-row .ml-bar-label {
     color: var(--text-muted);
     font-size: 12px;
 }
+.server-monitor-self-check-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 10px;
+}
 .server-monitor-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));

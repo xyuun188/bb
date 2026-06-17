@@ -970,36 +970,39 @@
 
         <!-- ═══════ PAGE: SERVER MONITOR ═══════ -->
         <div class="page-section" id="page-server-monitor">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">系统自检 / 自动修复</span>
-                    <div style="display:flex;align-items:center;gap:10px;">
-                        <span class="card-subtitle" id="system-self-check-updated">等待自检</span>
-                        <button class="btn btn-sm" onclick="fetchSystemSelfCheck()">立即自检</button>
-                        <button class="btn btn-sm" onclick="repairSystemSelfCheck()">安全修复</button>
-                    </div>
-                </div>
-                <div id="system-self-check-panel">
-                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">点击“立即自检”检查模型、账户、执行链路和最近失败步骤。</div>
-                </div>
-            </div>
-
             <div class="card server-monitor-shell">
                 <div class="card-header">
                     <div>
                         <span class="card-title">服务器监控</span>
-                        <span class="card-subtitle">大模型服务器 / 平台服务器分区展示</span>
+                        <span class="card-subtitle">系统自检 / 大模型服务器 / 平台服务器 分区展示</span>
                     </div>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="server-monitor-updated">等待加载</span>
-                        <button class="btn btn-sm" onclick="fetchServerMonitor()">刷新</button>
+                        <button class="btn btn-sm" onclick="refreshServerMonitorPage()">刷新</button>
                     </div>
                 </div>
                 <div class="server-monitor-tabs" role="tablist" aria-label="服务器监控类型">
-                    <button class="server-monitor-tab active" type="button" data-server-monitor-tab="model">大模型服务器</button>
+                    <button class="server-monitor-tab active" type="button" data-server-monitor-tab="self-check">系统自检 / 自动修复</button>
+                    <button class="server-monitor-tab" type="button" data-server-monitor-tab="model">大模型服务器</button>
                     <button class="server-monitor-tab" type="button" data-server-monitor-tab="platform">平台服务器</button>
                 </div>
-                <div class="server-monitor-panel active" id="server-monitor-panel-model">
+                <div class="server-monitor-panel active" id="server-monitor-panel-self-check">
+                    <div class="server-monitor-section-head">
+                        <div>
+                            <strong>系统自检 / 自动修复</strong>
+                            <span>检查模型、账户、执行链路和最近失败步骤；修复只清缓存/熔断，不改资金与订单</span>
+                        </div>
+                        <div class="server-monitor-self-check-actions">
+                            <span class="card-subtitle" id="system-self-check-updated">等待自检</span>
+                            <button class="btn btn-sm" onclick="refreshServerMonitorPage()">立即检查</button>
+                            <button class="btn btn-sm" onclick="repairSystemSelfCheck()">安全修复</button>
+                        </div>
+                    </div>
+                    <div id="system-self-check-panel">
+                        <div style="color:var(--text-muted);font-size:12px;padding:16px;">点击“立即检查”检查模型、账户、执行链路和最近失败步骤。</div>
+                    </div>
+                </div>
+                <div class="server-monitor-panel" id="server-monitor-panel-model">
                     <div class="server-monitor-section-head">
                         <div>
                             <strong>大模型服务器</strong>

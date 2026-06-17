@@ -87,6 +87,25 @@ def test_fast_adverse_full_closes_when_loss_and_stop_progress_are_large() -> Non
     assert plan["risk_progress"] >= 0.5
 
 
+def test_fast_adverse_fresh_position_waits_when_stop_not_breached() -> None:
+    plan = _policy().fast_adverse_exit_plan(
+        side="long",
+        entry_price=100.0,
+        current_price=94.5,
+        stop_loss=93.0,
+        returns_1=-0.03,
+        returns_5=-0.045,
+        hold_minutes=6.0,
+        volume_ratio=1.4,
+        current_unrealized_pnl=-2.0,
+    )
+
+    assert plan["should_exit"] is False
+    assert plan["fraction"] == 0.0
+    assert plan["fresh_review_window"] is True
+    assert "普通短线噪音" in plan["note"]
+
+
 def test_fast_adverse_observes_small_losses() -> None:
     plan = _policy().fast_adverse_exit_plan(
         side="long",
@@ -192,4 +211,4 @@ def test_fast_adverse_does_not_partially_reduce_ordinary_losing_positions() -> N
 
     assert plan["should_exit"] is False
     assert plan["fraction"] == 0.0
-    assert "不再做部分减仓" in plan["note"]
+    assert "不因普通短线噪音全平" in plan["note"] or "不再做部分减仓" in plan["note"]

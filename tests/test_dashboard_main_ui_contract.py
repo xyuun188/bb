@@ -76,7 +76,7 @@ def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> No
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert "system-self-check-panel" in html
-    assert "fetchSystemSelfCheck()" in html
+    assert "refreshServerMonitorPage()" in html
     assert "repairSystemSelfCheck()" in html
     assert "fetchJSON(`/api/trades/${encodeURIComponent(Number(tradeId))}`)" in script
     assert "function renderExecutionTimeline" in script
@@ -114,17 +114,23 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert 'data-server-monitor-tab="model"' in html
+    assert 'data-server-monitor-tab="self-check"' in html
     assert 'data-server-monitor-tab="platform"' in html
+    assert 'id="server-monitor-panel-self-check"' in html
     assert "\u5927\u6a21\u578b\u670d\u52a1\u5668" in html
     assert "\u5e73\u53f0\u670d\u52a1\u5668" in html
     assert "platform-server-overview" in html
     assert "function renderPlatformServerMonitor" in script
+    assert "serverMonitorTab: 'self-check'" in script
+    assert "function refreshServerMonitorPage" in script
+    assert "serverMonitorRefreshInFlight" in script
     assert "platform_server" in script
     assert "const visibleServices = Array.from(" in script
     assert "services.reduce((map, service) =>" in script
     assert "'redis-server.service': 'Redis'" in script
     assert "'redis.service': 'Redis'" in script
     assert ".server-monitor-tabs" in style
+    assert ".server-monitor-self-check-actions" in style
     assert ".server-monitor-panel.active" in style
 
 

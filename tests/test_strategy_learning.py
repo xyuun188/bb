@@ -66,9 +66,7 @@ def test_strategy_learning_expert_integrity_reads_duration_sec() -> None:
         for item in (dict(row) for row in COMPLETED_EXPERT_TIMINGS)
     ]
 
-    fallback, zero_second, missing = compiler._expert_integrity_flags(
-        {"model_timings": timings}
-    )
+    fallback, zero_second, missing = compiler._expert_integrity_flags({"model_timings": timings})
 
     assert fallback is False
     assert zero_second is False
@@ -928,7 +926,8 @@ def test_strategy_learning_fallback_guard_allows_recovery_probe(tmp_path) -> Non
     assert context["strategy_learning_health_guard_active"] is True
     assert context["strategy_learning_recovery_probe_allowed"] is True
     assert context["strategy_learning_sizing"]["recovery_probe_allowed"] is True
-    assert context["strategy_learning_sizing"]["max_probe_size_pct"] <= 0.012
+    assert 0.012 <= context["strategy_learning_sizing"]["max_probe_size_pct"] <= 0.024
+    assert "质量驱动恢复探针" in context["strategy_learning_sizing"]["reason"]
 
 
 def test_strategy_learning_execution_success_clears_stale_missing_results(tmp_path) -> None:
@@ -2059,10 +2058,7 @@ def test_strategy_learning_trade_target_is_dynamic_advisory_not_entry_gate() -> 
         positions=[_position(side="long", pnl=1.2, position_id=index) for index in range(6)],
         open_positions=[],
         orders=[],
-        decisions=[
-            _healthy_decision("long", executed=index % 3 == 0)
-            for index in range(120)
-        ],
+        decisions=[_healthy_decision("long", executed=index % 3 == 0) for index in range(120)],
         shadows=[],
         memories=[],
         max_open_positions=20,

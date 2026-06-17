@@ -376,3 +376,88 @@ async def test_recent_blocked_decisions_are_info_not_system_warning(
     assert by_key["recent_execution"]["status"] == "ok"
     assert by_key["recent_blocked_decisions"]["status"] == "info"
     assert by_key["recent_blocked_decisions"]["details"]["sample_decision_ids"] == [301]
+
+
+@pytest.mark.asyncio
+async def test_recent_failed_orders_become_info_after_new_successful_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(
+                    [
+                        SimpleNamespace(
+                            id=2346,
+                            status="rejected",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                17,
+                                5,
+                                31,
+                                tzinfo=system_health.UTC,
+                            ),
+                        ),
+                        SimpleNamespace(
+                            id=2401,
+                            status="filled",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                17,
+                                6,
+                                40,
+                                tzinfo=system_health.UTC,
+                            ),
+                        ),
+                    ]
+                )
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=301,
+                        action="short",
+                        created_at=system_health.datetime(
+                            2026,
+                            6,
+                            17,
+                            6,
+                            40,
+                            tzinfo=system_health.UTC,
+                        ),
+                        raw_llm_response={
+                            "opportunity_score": {"score": 2.0},
+                            "decision_state_machine": {"stages": [{"status": "passed"}]},
+                        },
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_failed_orders"]["status"] == "info"
+    assert by_key["recent_failed_orders"]["details"]["has_unresolved_order"] is False
+    assert by_key["recent_failed_orders"]["details"]["sample_order_ids"] == [2346]
+    assert by_key["recent_execution"]["status"] == "ok"

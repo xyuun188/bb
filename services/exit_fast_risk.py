@@ -30,6 +30,7 @@ PROFIT_DRAWDOWN_ACCELERATED_HOLD_MINUTES = 8.0
 FAST_RISK_1M_MOVE_PCT = 0.025
 FAST_RISK_5M_MOVE_PCT = 0.04
 FAST_RISK_MIN_HOLD_MINUTES = 4.0
+FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES = 12.0
 FAST_RISK_MIN_LOSS_PCT = 0.008
 FAST_RISK_REDUCE_LOSS_PCT = 0.012
 FAST_RISK_FULL_LOSS_PCT = 0.018
@@ -392,6 +393,33 @@ class ExitFastRiskPolicy:
             and adverse_pct >= FAST_RISK_FULL_LOSS_PCT
             and risk_progress >= FAST_RISK_FORCE_FULL_PROGRESS
         )
+        fresh_review_window = bool(
+            hold_minutes is not None and hold_minutes < FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES
+        )
+        stop_breached = bool(risk_progress >= 1.0)
+        fresh_full_exit_confirmed = bool(
+            stop_breached
+            or force_full_by_loss
+            or (
+                hard_adverse_observed
+                and strong_adverse_momentum
+                and volume_confirmed
+                and adverse_pct >= FAST_RISK_FULL_LOSS_PCT
+            )
+        )
+        if fresh_review_window and not fresh_full_exit_confirmed:
+            return {
+                "should_exit": False,
+                "fraction": 0.0,
+                "adverse_pct": adverse_pct,
+                "risk_progress": risk_progress,
+                "loss_usdt": loss_usdt,
+                "fresh_review_window": True,
+                "note": (
+                    f"开仓不足 {FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES:.0f} 分钟，"
+                    "且未破止损、未达到强制亏损扩大条件；不因普通短线噪音全平。"
+                ),
+            }
 
         if (
             full_stop_progress
