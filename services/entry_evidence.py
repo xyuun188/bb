@@ -566,6 +566,7 @@ def build_entry_evidence_score(
         hard_block_reasons.append("ML 和时序同时明确反向")
     if "ml" in strong_opposites and "shadow_memory" in major_opposites:
         hard_block_reasons.append("ML 反向且影子/交易记忆偏负")
+    positive_net_probe_relief: dict[str, Any] = {"applied": False}
     missing_key_degraded_relief: dict[str, Any] = {"applied": False}
     missing_key_degraded = bool(
         len(missing_key_sources) >= 2 and not major_opposites and not strong_opposites
@@ -593,6 +594,44 @@ def build_entry_evidence_score(
                     "a hard execution veto."
                 ),
             }
+    expected_net_return = safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+    opportunity_score = safe_float(opportunity.get("score"), 0.0)
+    min_score_required = safe_float(opportunity.get("min_score_required"), 0.95)
+    profit_quality_ratio = safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+    loss_probability = safe_float(opportunity.get("server_profit_loss_probability"), 1.0)
+    tail_risk_score = safe_float(opportunity.get("tail_risk_score"), 1.0)
+    confidence = max(
+        safe_float(decision.confidence, 0.0),
+        safe_float(opportunity.get("confidence"), 0.0),
+    )
+    positive_net_probe_allowed = bool(
+        not hard_block_reasons
+        and expected_net_return >= 0.35
+        and opportunity_score >= max(min_score_required - 0.55, 0.35)
+        and confidence >= 0.62
+        and profit_quality_ratio >= 0.20
+        and loss_probability <= 0.62
+        and tail_risk_score <= 0.95
+        and not {"ml", "timeseries"}.issubset(set(strong_opposites))
+        and not ("ml" in strong_opposites and "timeseries" in major_opposites)
+    )
+    if positive_net_probe_allowed and effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
+        original_effective_score = effective_score
+        effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+        positive_net_probe_relief = {
+            "applied": True,
+            "from_effective_score": round(original_effective_score, 6),
+            "to_effective_score": round(effective_score, 6),
+            "expected_net_return_pct": round(expected_net_return, 6),
+            "opportunity_score": round(opportunity_score, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+            "reason": (
+                "机会评分为正且净收益、亏损概率、尾部风险满足受控探针条件；"
+                "动态证据不足从硬归零降级为极小仓验证，反向证据仍保留在仓位和风控里。"
+            ),
+        }
     if effective_score < ENTRY_EVIDENCE_SCORE_HARD_BLOCK:
         advisory_wait_reasons.append("动态证据评分低于可交易底线，当前仅保留观望或极小探针")
 
@@ -611,7 +650,9 @@ def build_entry_evidence_score(
     elif effective_score >= ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
         tier = (
             "degraded_missing_probe"
-            if missing_key_degraded_relief.get("applied") and not major_opposites and not weak_opposites
+            if missing_key_degraded_relief.get("applied")
+            and not major_opposites
+            and not weak_opposites
             else "weak_conflict_probe"
         )
         size_multiplier = 0.05
@@ -621,6 +662,7 @@ def build_entry_evidence_score(
 
     if (
         tier == "weak_conflict_probe"
+        and not positive_net_probe_relief.get("applied")
         and len(aligned_support_sources) < ENTRY_EVIDENCE_WEAK_PROBE_MIN_ALIGNED_SOURCES
     ):
         advisory_wait_reasons.append("当前仅保留观望或极小探针，等待更多同向证据")
@@ -667,6 +709,7 @@ def build_entry_evidence_score(
         "missing_key_sources": missing_key_sources,
         "aligned_support_sources": aligned_support_sources,
         "missing_key_degraded_relief": missing_key_degraded_relief,
+        "positive_net_probe_relief": positive_net_probe_relief,
         "short_probe_relief": short_probe_relief,
         "components": components,
         "policy": (

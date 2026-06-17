@@ -275,9 +275,25 @@ class EntryProfitRiskSizingPolicy:
         cap = max_probe_size if max_probe_size > 0 and probe_fraction > 0 else 0.0
         if cap > 0 and not quality_override:
             adjusted = min(adjusted, cap)
-        applied = abs(adjusted - current_size) > 1e-9
+        size_changed = abs(adjusted - current_size) > 1e-9
+        policy_active = bool(
+            sizing.get("profile_id")
+            or sizing.get("release_pressure_active")
+            or sizing.get("recovery_probe_allowed")
+            or sizing.get("health_guard_active")
+            or sizing.get("execution_guard_active")
+            or sizing.get("entry_paused")
+            or probe_fraction > 0
+            or max_probe_size > 0
+            or abs(global_multiplier - 1.0) > 1e-9
+            or abs(side_multiplier - 1.0) > 1e-9
+            or quality_override
+            or adaptive_recovery_lift
+        )
+        applied = bool(size_changed or policy_active)
         return {
             "applied": applied,
+            "size_changed": size_changed,
             "profile_id": sizing.get("profile_id"),
             "action_side": action_side,
             "original_position_size_pct": round(current_size, 6),
@@ -591,15 +607,28 @@ class EntryProfitRiskSizingPolicy:
             )
             if aligned
         )
-        strategy_quality_override = bool(
-            high_quality_entry
-            and not low_payoff_quality
-            and (local_aligned or ml_aligned or timeseries_aligned)
-            and (
-                expected_net >= 1.20 or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
-            )
-            and loss_probability <= 0.40
+        strong_positive_strategy_signal = bool(
+            not low_payoff_quality
+            and aligned_source_count >= 2
+            and score >= max(min_score_required, 1.0)
+            and expected_net >= 1.20
+            and profit_quality_ratio >= 0.85
+            and loss_probability <= 0.42
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
+        strategy_quality_override = bool(
+            strong_positive_strategy_signal
+            or (
+                high_quality_entry
+                and not low_payoff_quality
+                and (local_aligned or ml_aligned or timeseries_aligned)
+                and (
+                    expected_net >= 1.20
+                    or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
+                )
+                and loss_probability <= 0.40
+                and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+            )
         )
         recovery_quality_cap_pct = self._adaptive_recovery_probe_cap_pct(
             expected_net_return_pct=expected_net,

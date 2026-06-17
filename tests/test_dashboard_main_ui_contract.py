@@ -56,6 +56,17 @@ def test_dashboard_refreshes_auth_status_in_topbar() -> None:
     assert "dashboard-current-user" in script
 
 
+def test_opportunity_score_ui_prefers_expected_net_return() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "function opportunityScorePrimaryReturn" in script
+    assert "const net = Number(score.expected_net_return_pct);" in script
+    assert "if (Number.isFinite(net)) return { label: '预期净收益', value: net };" in script
+    assert "预期收益：${opportunityScoreValue(score.expected_return_pct, 4)}%" not in script
+    assert "`预期收益 ${opportunityScoreValue(score.expected_return_pct, 4)}%`" not in script
+    assert "收益来源" in script
+
+
 def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")

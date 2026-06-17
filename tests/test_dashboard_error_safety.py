@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pytest
 
 from core.safe_output import safe_error_text
 from core.server_monitor_probe import SERVER_MONITOR_REMOTE_COMMAND_TIMEOUT_SECONDS
+from core.trading_mode import TradingMode
 from services import server_monitor_status
 from web_dashboard.api import dashboard, symbols
 
@@ -110,6 +112,33 @@ def test_dashboard_fallback_logger_redacts_exception_text(
             "mode": "paper",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_account_balance_is_mode_aware(monkeypatch) -> None:
+    class FakePaperExecutor:
+        async def get_all_summaries(self) -> list[dict[str, Any]]:
+            return [{"model_name": "ensemble_trader", "available_balance": 123.0}]
+
+    class FakeOkxExecutor:
+        async def get_balance(self) -> float:
+            return 456.0
+
+    class FakeTradingService:
+        paper_executor = FakePaperExecutor()
+        okx_executor = None
+
+        def okx_executor_for_dashboard(self, mode: str) -> FakeOkxExecutor | None:
+            return FakeOkxExecutor() if mode == "live" else None
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeTradingService())
+    monkeypatch.setattr(dashboard.mode_manager, "_mode", TradingMode.LIVE)
+
+    payload = await dashboard.get_account_balance()
+
+    assert payload["mode"] == "live"
+    assert payload["virtual_accounts"] == []
+    assert payload["live_balance"] == 456.0
 
 
 def test_server_monitor_uses_probe_timeout_budget() -> None:

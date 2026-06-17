@@ -2365,7 +2365,7 @@ async def get_dashboard_summary():
     market_state = await _build_open_position_market_snapshot(mode_manager.mode.value)
 
     account_summaries = []
-    if _trading_service and _trading_service.paper_executor:
+    if mode_manager.mode.value == "paper" and _trading_service and _trading_service.paper_executor:
         all_summaries = await _trading_service.paper_executor.get_all_summaries()
         account_summaries = [
             item for item in all_summaries if item.get("model_name") == ENSEMBLE_TRADER_NAME
@@ -4398,18 +4398,21 @@ async def clear_decisions():
 @router.get("/dashboard/account")
 async def get_account_balance():
     """Account balances (virtual for paper, real for live)."""
+    selected_mode = mode_manager.mode.value
     summaries = []
-    if _trading_service and _trading_service.paper_executor:
+    if selected_mode == "paper" and _trading_service and _trading_service.paper_executor:
         summaries = await _trading_service.paper_executor.get_all_summaries()
 
     live_balance = 0.0
-    if _trading_service and _trading_service.okx_executor:
+    live_executor = _dashboard_okx_executor_for_mode(selected_mode)
+    if selected_mode == "live" and live_executor:
         try:
-            live_balance = await _trading_service.okx_executor.get_balance()
+            live_balance = await live_executor.get_balance()
         except Exception as exc:
             _log_dashboard_fallback("live balance fallback", exc)
 
     return {
+        "mode": selected_mode,
         "virtual_accounts": summaries,
         "live_balance": live_balance,
     }

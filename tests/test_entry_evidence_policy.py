@@ -217,6 +217,43 @@ def test_entry_evidence_blocks_weak_probe_without_three_aligned_sources():
     assert any("观望" in item or "探针" in item for item in evidence["advisory_wait_reasons"])
 
 
+def test_positive_net_return_relieves_blocked_evidence_to_controlled_probe():
+    decision = _decision(
+        Action.SHORT,
+        {
+            "ml_signal": {"predictions": [{"best_side": "long", "best_expected_return_pct": 0.8}]},
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "expected_return_pct": 0.1,
+                }
+            },
+        },
+        confidence=0.78,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 2.40,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 1.60,
+            "profit_quality_ratio": 0.70,
+            "server_profit_loss_probability": 0.42,
+            "tail_risk_score": 0.35,
+            "confidence": 0.78,
+        },
+    )
+
+    assert evidence["tier"] == "weak_conflict_probe"
+    assert evidence["hard_block"] is False
+    assert evidence["size_multiplier"] > 0.0
+    assert evidence["positive_net_probe_relief"]["applied"] is True
+    assert evidence["positive_net_probe_relief"]["expected_net_return_pct"] == pytest.approx(1.60)
+    assert not any("three aligned" in item for item in evidence["advisory_wait_reasons"])
+
+
 def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():
     decision = _decision(
         Action.LONG,

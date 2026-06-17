@@ -379,8 +379,9 @@ class Settings(BaseSettings):
     def get_okx_credentials(self, mode: str | None = None) -> dict[str, str]:
         """Return OKX credentials for the given mode ("paper" or "live").
 
-        Falls back to old unified fields if new split fields are empty.
-        Paper always uses sandbox/demo; live always uses real exchange.
+        Paper may use legacy unified fields for backward compatibility.
+        Live must use live-specific fields so demo/global credentials cannot
+        accidentally unlock real-exchange mode.
         """
         m = mode or self.trading_mode.value
         if m == "paper":
@@ -388,9 +389,9 @@ class Settings(BaseSettings):
             secret = self.okx_paper_api_secret or self.okx_api_secret
             passphrase = self.okx_paper_passphrase or self.okx_passphrase
         else:  # live
-            key = self.okx_live_api_key or self.okx_api_key
-            secret = self.okx_live_api_secret or self.okx_api_secret
-            passphrase = self.okx_live_passphrase or self.okx_passphrase
+            key = self.okx_live_api_key
+            secret = self.okx_live_api_secret
+            passphrase = self.okx_live_passphrase
         result = {"api_key": key, "api_secret": secret}
         if passphrase:
             result["passphrase"] = passphrase

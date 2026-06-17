@@ -518,9 +518,9 @@ async def get_okx_settings():
             "has_passphrase": bool(settings.okx_paper_passphrase or settings.okx_passphrase),
         },
         "live": {
-            "api_key": mask_secret(settings.okx_live_api_key or settings.okx_api_key),
-            "has_secret": bool(settings.okx_live_api_secret or settings.okx_api_secret),
-            "has_passphrase": bool(settings.okx_live_passphrase or settings.okx_passphrase),
+            "api_key": mask_secret(settings.okx_live_api_key),
+            "has_secret": bool(settings.okx_live_api_secret),
+            "has_passphrase": bool(settings.okx_live_passphrase),
         },
     }
 

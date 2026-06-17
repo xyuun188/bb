@@ -1749,19 +1749,41 @@ function opportunityScoreValue(value, digits = 4) {
     return Number.isFinite(num) ? num.toFixed(digits) : '-';
 }
 
+function opportunityScorePrimaryReturn(score) {
+    if (!score || typeof score !== 'object') return { label: '预期净收益', value: null };
+    const net = Number(score.expected_net_return_pct);
+    if (Number.isFinite(net)) return { label: '预期净收益', value: net };
+    return { label: '预期收益', value: Number(score.expected_return_pct) };
+}
+
+function opportunityScoreReturnDetail(score) {
+    if (!score || typeof score !== 'object') return '';
+    const raw = Number(score.raw_expected_return_pct ?? score.expected_return_pct);
+    const server = Number(score.server_profit_expected_return_pct);
+    const timeseries = Number(score.timeseries_expected_return_pct);
+    const parts = [];
+    if (Number.isFinite(raw)) parts.push(`ML毛收益 ${opportunityScoreValue(raw, 4)}%`);
+    if (Number.isFinite(server)) parts.push(`服务器盈利 ${opportunityScoreValue(server, 4)}%`);
+    if (Number.isFinite(timeseries)) parts.push(`时序 ${opportunityScoreValue(timeseries, 4)}%`);
+    return parts.join(' / ');
+}
+
 function opportunityScoreBlock(score) {
     if (!score || typeof score !== 'object') return '';
     const selected = score.selected_for_execution === true
         ? '已进入执行队列'
         : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
     const reason = score.selection_reason || score.rule || '系统按预期净收益、方向优势、AI 信心、ML 盈亏质量、手续费、滑点、止损风险和当前敞口综合排序。';
+    const primaryReturn = opportunityScorePrimaryReturn(score);
+    const returnDetail = opportunityScoreReturnDetail(score);
     return `
         <div class="reason-block">
             <div class="reason-label">盈利机会评分</div>
             <div>
                 机会分：${opportunityScoreValue(score.score, 6)}<br>
                 方向：${escHtml(actionLabel(score.side || '-'))}<br>
-                预期收益：${opportunityScoreValue(score.expected_return_pct, 4)}%<br>
+                ${primaryReturn.label}：${opportunityScoreValue(primaryReturn.value, 4)}%<br>
+                ${returnDetail ? `收益来源：${escHtml(returnDetail)}<br>` : ''}
                 相对反向优势：${opportunityScoreValue(score.profit_edge_pct, 4)}%<br>
                 ML 胜率：${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%<br>
                 仓位 x 杠杆：${opportunityScoreValue(score.size_x_leverage, 4)}<br>
@@ -2130,11 +2152,14 @@ function analysisOpportunityScoreHtml(score) {
         ? '已进入执行队列'
         : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
     const rank = score.rank && score.candidate_count ? `${score.rank}/${score.candidate_count}` : '-';
+    const primaryReturn = opportunityScorePrimaryReturn(score);
+    const returnDetail = opportunityScoreReturnDetail(score);
     const text = [
         `机会分 ${opportunityScoreValue(score.score, 6)}`,
         `排名 ${rank}`,
         `方向 ${actionLabel(score.side || '-')}`,
-        `预期收益 ${opportunityScoreValue(score.expected_return_pct, 4)}%`,
+        `${primaryReturn.label} ${opportunityScoreValue(primaryReturn.value, 4)}%`,
+        ...(returnDetail ? [`收益来源 ${returnDetail}`] : []),
         `相对反向优势 ${opportunityScoreValue(score.profit_edge_pct, 4)}%`,
         `ML胜率 ${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%`,
         `状态 ${selected}`,
