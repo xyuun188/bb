@@ -60,6 +60,14 @@ class EntryLossCooldownParams:
     override_min_server_expected: float = 0.80
     override_max_loss_probability: float = 0.48
     override_max_tail_risk: float = 0.85
+    fresh_loss_reentry_cooldown_hours: float = 2.0
+    fresh_loss_reentry_min_confidence: float = 0.76
+    fresh_loss_reentry_score_multiple: float = 1.75
+    fresh_loss_reentry_min_expected_net: float = 1.20
+    fresh_loss_reentry_min_profit_quality: float = 1.10
+    fresh_loss_reentry_min_reward_risk: float = 1.45
+    fresh_loss_reentry_max_loss_probability: float = 0.42
+    fresh_loss_reentry_min_aligned_sources: int = 2
 
 
 @dataclass(frozen=True, slots=True)

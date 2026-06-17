@@ -46,15 +46,22 @@ class EntryLossCooldownPolicy:
         raw = _safe_dict(decision.raw_response)
         opportunity = _safe_dict(raw.get("opportunity_score"))
         side_profile = _safe_dict(opportunity.get("symbol_side_profile"))
+        symbol_profile = _safe_dict(opportunity.get("symbol_profile"))
         side_reason = self._profile_reason(decision, raw, opportunity, side_profile)
         if side_reason:
             return side_reason
+        if symbol_profile and not side_profile:
+            symbol_reason = self._profile_reason(decision, raw, opportunity, symbol_profile)
+            if symbol_reason:
+                return symbol_reason
         return None
 
     def override(
         self,
         decision: DecisionOutput,
         profile: dict[str, Any],
+        *,
+        fresh_loss: bool = False,
     ) -> dict[str, Any]:
         """Evaluate whether high-quality evidence may unlock a recent-loss cooldown."""
 
@@ -78,6 +85,12 @@ class EntryLossCooldownPolicy:
             self.params.override_min_score,
             max(min_score, MIN_ENTRY_OPPORTUNITY_SCORE) * self.params.override_score_multiple,
         )
+        if fresh_loss:
+            score_required = max(
+                score_required,
+                max(min_score, MIN_ENTRY_OPPORTUNITY_SCORE)
+                * self.params.fresh_loss_reentry_score_multiple,
+            )
         aligned_sources = [
             name
             for name in ("ml_aligned", "local_profit_aligned", "timeseries_aligned")
@@ -90,14 +103,45 @@ class EntryLossCooldownPolicy:
             len(aligned_sources) >= 2
             and server_loss_probability <= self.params.override_max_loss_probability
         )
+        if fresh_loss:
+            source_support = (
+                source_support
+                and len(aligned_sources) >= self.params.fresh_loss_reentry_min_aligned_sources
+            )
         checks = {
-            "confidence": confidence >= self.params.override_min_confidence,
+            "confidence": confidence
+            >= (
+                self.params.fresh_loss_reentry_min_confidence
+                if fresh_loss
+                else self.params.override_min_confidence
+            ),
             "score": math.isfinite(score) and score >= score_required,
-            "expected_net": expected_net >= self.params.override_min_expected_net,
-            "profit_quality": profit_quality >= self.params.override_min_profit_quality,
-            "reward_risk": reward_risk >= self.params.override_min_reward_risk,
+            "expected_net": expected_net
+            >= (
+                self.params.fresh_loss_reentry_min_expected_net
+                if fresh_loss
+                else self.params.override_min_expected_net
+            ),
+            "profit_quality": profit_quality
+            >= (
+                self.params.fresh_loss_reentry_min_profit_quality
+                if fresh_loss
+                else self.params.override_min_profit_quality
+            ),
+            "reward_risk": reward_risk
+            >= (
+                self.params.fresh_loss_reentry_min_reward_risk
+                if fresh_loss
+                else self.params.override_min_reward_risk
+            ),
             "tail_risk": tail_risk <= self.params.override_max_tail_risk,
             "source_support": source_support,
+            "loss_probability": server_loss_probability
+            <= (
+                self.params.fresh_loss_reentry_max_loss_probability
+                if fresh_loss
+                else self.params.override_max_loss_probability
+            ),
         }
         failed = [name for name, passed in checks.items() if not passed]
         metrics = {
@@ -116,19 +160,25 @@ class EntryLossCooldownPolicy:
             "profile_today_pnl": round(_safe_float(profile.get("today_pnl"), 0.0), 6),
             "profile_loss": round(_safe_float(profile.get("loss"), 0.0), 6),
             "profile_losses": int(profile.get("losses") or 0),
+            "fresh_loss": bool(fresh_loss),
         }
         allowed = not failed
+        summary = (
+            "真实亏损冷却已由高质量信号解锁：AI 置信度、机会评分、预期净收益、"
+            "盈利质量和模型同向支持均达到放行条件。"
+            if allowed
+            else (
+                "真实亏损冷却未解锁：当前信号还不足以覆盖近期真实亏损。"
+                if fresh_loss
+                else "真实亏损冷却未解锁：当前信号还不足以覆盖最近真实亏损。"
+            )
+        )
         return {
             "allowed": allowed,
             "failed": failed,
             "checks": checks,
             "metrics": metrics,
-            "summary": (
-                "真实亏损冷却已由高质量信号解锁：AI 置信度、机会评分、预期净收益、"
-                "盈利质量和模型同向支持均达到放行条件。"
-                if allowed
-                else "真实亏损冷却未解锁：当前信号还不足以覆盖近期真实亏损。"
-            ),
+            "summary": summary,
         }
 
     def _profile_reason(
@@ -138,10 +188,14 @@ class EntryLossCooldownPolicy:
         opportunity: dict[str, Any],
         profile: dict[str, Any],
     ) -> str | None:
-        if not isinstance(profile, dict) or not profile.get("cooldown"):
+        if not isinstance(profile, dict):
+            return None
+        cooldown_active = bool(profile.get("cooldown"))
+        fresh_loss_active = self._fresh_loss_reentry_active(profile)
+        if not cooldown_active and not fresh_loss_active:
             return None
 
-        override = self.override(decision, profile)
+        override = self.override(decision, profile, fresh_loss=fresh_loss_active)
         raw["loss_cooldown_override"] = override
         opportunity["loss_cooldown_override"] = {
             "allowed": bool(override.get("allowed")),
@@ -171,6 +225,24 @@ class EntryLossCooldownPolicy:
         symbol_key = self._normalized_symbol(decision.symbol)
         failed_text = self._failed_text(_safe_list(override.get("failed")))
 
+        if fresh_loss_active:
+            return (
+                f"该币种{side_label}方向刚刚出现真实亏损，本次进入短周期复入冷却：最近 {count} 笔平仓累计 "
+                f"{pnl:.2f}U，今日 {today_pnl:.2f}U，总亏损 {loss:.2f}U，"
+                f"今日亏损 {today_loss:.2f}U，最大单笔亏损 {largest_loss:.2f}U，"
+                f"胜/负 {wins}/{losses}，盈利因子 {profit_factor:.2f}。"
+                f"本次尝试用高质量信号解锁冷却，但 {failed_text} 未达标；"
+                f"当前机会评分 {self._metric(metrics, 'score'):.2f}/要求 "
+                f"{self._metric(metrics, 'score_required'):.2f}，置信度 "
+                f"{self._metric(metrics, 'confidence'):.0%}，预期净收益 "
+                f"{self._metric(metrics, 'expected_net_return_pct'):.2f}% ，盈利质量 "
+                f"{self._metric(metrics, 'profit_quality_ratio'):.2f}，服务器预期 "
+                f"{self._metric(metrics, 'server_profit_expected_return_pct'):.2f}% ，亏损概率 "
+                f"{self._metric(metrics, 'server_profit_loss_probability', 1.0):.0%}。"
+                f"为避免在 {symbol_key} 上刚亏完又同向复入，本次禁止{side_label}新开仓；"
+                f"预计还需冷却约 {cooldown_remaining_hours:.1f} 小时，之后再按最新行情重新评估。"
+            )
+
         return (
             f"该币种{side_label}方向已进入真实亏损冷却：最近 {count} 笔平仓累计 "
             f"{pnl:.2f}U，今日 {today_pnl:.2f}U，总亏损 {loss:.2f}U，"
@@ -180,13 +252,27 @@ class EntryLossCooldownPolicy:
             f"当前机会评分 {self._metric(metrics, 'score'):.2f}/要求 "
             f"{self._metric(metrics, 'score_required'):.2f}，置信度 "
             f"{self._metric(metrics, 'confidence'):.0%}，预期净收益 "
-            f"{self._metric(metrics, 'expected_net_return_pct'):.2f}%，盈利质量 "
+            f"{self._metric(metrics, 'expected_net_return_pct'):.2f}% ，盈利质量 "
             f"{self._metric(metrics, 'profit_quality_ratio'):.2f}，服务器预期 "
-            f"{self._metric(metrics, 'server_profit_expected_return_pct'):.2f}%，亏损概率 "
+            f"{self._metric(metrics, 'server_profit_expected_return_pct'):.2f}% ，亏损概率 "
             f"{self._metric(metrics, 'server_profit_loss_probability', 1.0):.0%}。"
             f"为避免在 {symbol_key} 上连续同向复亏，本次禁止{side_label}新开仓；"
             f"预计还需冷却约 {cooldown_remaining_hours:.1f} 小时，之后再按最新行情重新评估。"
         )
+
+    def _fresh_loss_reentry_active(self, profile: dict[str, Any]) -> bool:
+        try:
+            last_loss_age_hours = float(profile.get("last_loss_age_hours") or 9999.0)
+        except (TypeError, ValueError):
+            last_loss_age_hours = 9999.0
+        losses = int(profile.get("losses") or 0)
+        today_pnl = _safe_float(profile.get("today_pnl"), 0.0)
+        pnl = _safe_float(profile.get("pnl"), 0.0)
+        if losses <= 0:
+            return False
+        if last_loss_age_hours > self.params.fresh_loss_reentry_cooldown_hours:
+            return False
+        return today_pnl < 0 or pnl < 0
 
     def _normalized_symbol(self, symbol: str) -> str:
         if self.normalize_symbol is None:
@@ -223,7 +309,7 @@ class EntryLossCooldownPolicy:
             "reward_risk": "盈亏比",
             "tail_risk": "尾部风险",
             "source_support": "服务器/本地模型同向支持",
+            "loss_probability": "亏损概率",
         }
-        return "、".join(failed_labels.get(str(item), str(item)) for item in failed) or (
-            "高质量解锁条件"
-        )
+        labels = [failed_labels.get(str(item), str(item)) for item in failed]
+        return "、".join(labels) if labels else "高质量解锁条件"

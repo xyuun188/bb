@@ -1325,6 +1325,53 @@ async def test_entry_policy_scores_missing_opportunity_before_sizing_and_gate() 
     assert decision.raw_response["opportunity_score"]["score"] == 1.35
 
 
+@pytest.mark.asyncio
+async def test_entry_policy_keeps_weak_evidence_shadow_only_even_with_size() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.018
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.75,
+            "min_score_required": 0.7,
+            "expected_net_return_pct": 0.18,
+            "profit_quality_ratio": 0.2,
+            "tail_risk_score": 0.7,
+            "success_probability": 0.47,
+            "evidence_score": {
+                "tier": "weak_conflict_probe",
+                "effective_score": 38.0,
+                "size_multiplier": 0.05,
+            },
+        }
+    }
+
+    async def fake_sizing(sized_decision, model_mode, open_positions):
+        calls.append("sizing")
+        assert model_mode == "paper"
+        assert open_positions == []
+        assert sized_decision.position_size_pct > 0
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            calls.append("gate")
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
+    assert result.passed is False
+    assert result.blocker == "entry_evidence_shadow_only"
+    assert result.data["shadow_only"] is True
+    assert result.data["skip_kind"] == "entry_evidence_shadow_only"
+    assert result.data["position_size_pct_before_block"] == 0.018
+    assert calls == ["sizing"]
+
+
 def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:
     calls: list[str] = []
     decision = _decision(Action.SHORT)

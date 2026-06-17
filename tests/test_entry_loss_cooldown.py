@@ -81,6 +81,88 @@ def test_entry_loss_cooldown_allows_high_quality_override() -> None:
     assert override["failed"] == []
 
 
+def test_entry_loss_cooldown_blocks_fresh_recent_loss_without_strong_override() -> None:
+    profile = {
+        "cooldown": False,
+        "pnl": -9.0,
+        "today_pnl": -4.0,
+        "loss": 9.0,
+        "today_loss": 4.0,
+        "largest_loss": -3.5,
+        "count": 2,
+        "losses": 1,
+        "wins": 1,
+        "profit_factor": 0.72,
+        "cooldown_remaining_hours": 1.6,
+        "cooldown_reason": "fresh recent loss",
+        "last_loss_age_hours": 1.2,
+    }
+    decision = _decision(
+        {
+            "score": 1.8,
+            "min_score_required": 0.95,
+            "confidence": 0.74,
+            "expected_net_return_pct": 0.5,
+            "profit_quality_ratio": 0.55,
+            "reward_risk_ratio": 0.9,
+            "server_profit_expected_return_pct": 0.2,
+            "server_profit_loss_probability": 0.55,
+            "tail_risk_score": 0.45,
+            "symbol_side_profile": profile,
+        }
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is not None
+    override = decision.raw_response["loss_cooldown_override"]
+    assert override["allowed"] is False
+    assert override["metrics"]["fresh_loss"] is True
+    assert override["failed"]
+
+
+def test_entry_loss_cooldown_allows_high_quality_fresh_loss_override() -> None:
+    profile = {
+        "cooldown": False,
+        "pnl": -7.5,
+        "today_pnl": -3.0,
+        "loss": 7.5,
+        "today_loss": 3.0,
+        "largest_loss": -2.4,
+        "count": 3,
+        "losses": 1,
+        "wins": 2,
+        "profit_factor": 0.8,
+        "cooldown_remaining_hours": 1.2,
+        "cooldown_reason": "fresh recent loss",
+        "last_loss_age_hours": 0.8,
+    }
+    decision = _decision(
+        {
+            "score": 4.8,
+            "min_score_required": 0.95,
+            "confidence": 0.84,
+            "expected_net_return_pct": 1.45,
+            "profit_quality_ratio": 1.2,
+            "reward_risk_ratio": 1.7,
+            "server_profit_expected_return_pct": 1.0,
+            "server_profit_loss_probability": 0.28,
+            "tail_risk_score": 0.35,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": True,
+            "symbol_side_profile": profile,
+        }
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is None
+    override = decision.raw_response["loss_cooldown_override"]
+    assert override["allowed"] is True
+    assert override["metrics"]["fresh_loss"] is True
+
+
 def test_entry_opportunity_gate_uses_injected_loss_cooldown_policy() -> None:
     decision = _decision(
         {

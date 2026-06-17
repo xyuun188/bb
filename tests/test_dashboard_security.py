@@ -593,3 +593,23 @@ async def test_dashboard_mode_switch_requires_configured_okx_account(
     assert detail["mode"] == "live"
     assert detail["settings_tab"] == "okx"
     assert "API Key" in detail["missing_fields"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_manual_open_trade_endpoint_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "unit-" + "dashboard-write-token"
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", configured)
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/trade/manual",
+            headers={"Authorization": f"Bearer {configured}"},
+            json={"symbol": "BTC/USDT"},
+        )
+
+    assert response.status_code == 410
+    assert "自动模式" in response.json()["detail"]

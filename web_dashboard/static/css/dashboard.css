@@ -3028,22 +3028,37 @@ select.form-input { cursor: pointer; }
 }
 .analysis-resolution-item {
     display: grid;
-    grid-template-columns: 170px minmax(0, 1fr);
+    grid-template-columns: minmax(160px, 0.32fr) minmax(0, 1fr);
     gap: 10px;
     padding: 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: rgba(255,255,255,0.025);
 }
+.analysis-skill-item {
+    align-items: start;
+}
 .analysis-resolution-item strong {
     color: var(--text);
     font-size: 11px;
     line-height: 1.45;
 }
-.analysis-resolution-item span {
+.analysis-resolution-item span, .analysis-skill-reason {
     color: var(--text-dim);
     font-size: 12px;
     line-height: 1.55;
+}
+.analysis-skill-head, .analysis-skill-body {
+    min-width: 0;
+}
+.analysis-skill-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+}
+.analysis-skill-reason {
+    overflow-wrap: anywhere;
 }
 .analysis-skill-data {
     display: flex;
@@ -3064,6 +3079,11 @@ select.form-input { cursor: pointer; }
     font-size: 10px;
     line-height: 1.45;
     overflow-wrap: anywhere;
+}
+@media (max-width: 900px) {
+    .analysis-resolution-item {
+        grid-template-columns: 1fr;
+    }
 }
 .analysis-skill-data-chip b {
     color: var(--text-muted);

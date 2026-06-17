@@ -174,3 +174,47 @@ async def test_dashboard_admin_can_create_reset_and_disable_user(
     assert disabled.status_code == 200
     assert deleted.status_code == 200
     assert disabled_login.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_dashboard_account_rejects_disabled_current_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    admin_key = "unit-dashboard-write-key"
+    client = await _create_auth_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", admin_key)
+    try:
+        await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "InitialPass123"},
+        )
+        created = await client.post(
+            "/api/auth/users",
+            json={
+                "username": "ops",
+                "email": "ops@example.test",
+                "password": "OpsPass12345",
+            },
+        )
+        await client.post("/api/auth/logout")
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "ops", "password": "OpsPass12345"},
+        )
+        disabled = await client.post(
+            "/api/auth/users/ops/deactivate",
+            headers={"X-Dashboard-Admin-Key": admin_key},
+        )
+        response = await client.get("/api/auth/account")
+        status_response = await client.get("/api/auth/status")
+    finally:
+        await client.aclose()
+        await close_db()
+
+    assert created.status_code == 200
+    assert login.status_code == 200
+    assert disabled.status_code == 200
+    assert response.status_code == 401
+    assert status_response.status_code == 401
+    assert "重新登录" in response.json()["detail"]

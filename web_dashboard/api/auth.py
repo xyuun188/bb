@@ -74,6 +74,14 @@ async def login_page(request: Request):
 @router.get("/auth/status")
 async def auth_status(request: Request) -> dict[str, object]:
     session = ensure_dashboard_login(request)
+    if session is not None and settings.dashboard_auth_enabled:
+        async with get_session_ctx() as db_session:
+            current = await get_dashboard_user(db_session, session.username)
+        if current is None or not current.is_active:
+            raise HTTPException(
+                status_code=401,
+                detail="当前登录账号不存在或已停用，请重新登录。",
+            )
     return {
         "authenticated": True,
         "username": session.username if session else "",
@@ -143,8 +151,11 @@ async def dashboard_account(
     async with get_session_ctx() as session:
         users = await list_dashboard_users(session)
         current = await get_dashboard_user(session, context.username)
-    if current is None and users:
-        current = users[0]
+    if (current is None or not current.is_active) and settings.dashboard_auth_enabled:
+        raise HTTPException(
+            status_code=401,
+            detail="当前登录账号不存在或已停用，请重新登录。",
+        )
     return {
         "auth_enabled": bool(settings.dashboard_auth_enabled),
         "current_user": current.as_dict() if current else {},
@@ -246,7 +257,9 @@ async def update_dashboard_account_user(
     x_dashboard_admin_key: str | None = Header(default=None),
 ) -> dict[str, object]:
     context = _auth_context(request, authorization, x_dashboard_admin_key)
-    if payload.is_active is False and normalize_username(username) == normalize_username(context.username):
+    if payload.is_active is False and normalize_username(username) == normalize_username(
+        context.username
+    ):
         raise HTTPException(status_code=400, detail="当前登录账号不能停用")
     try:
         async with get_session_ctx() as session:

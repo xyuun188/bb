@@ -214,29 +214,8 @@ async def get_control_state():
 
 @router.post("/trade/manual")
 async def manual_trade(req: ManualTradeRequest):
-    """Trigger a manual AI analysis and trade for a specific symbol."""
-    if not _dash._trading_service:
-        raise HTTPException(status_code=503, detail="Trading service not initialized")
-
-    result = await _dash._trading_service.manual_trade(
-        symbol=req.symbol,
-        model_name=req.model_name,
-    )
-
-    # Broadcast result via WebSocket
-    try:
-        from web_dashboard.app import ws_manager
-
-        await ws_manager.broadcast(
-            {
-                "type": "manual_trade_result",
-                **result,
-            }
-        )
-    except Exception as exc:
-        logger.debug("manual trade websocket broadcast failed", error=safe_error_text(exc))
-
-    return result
+    """Manual open-trade entry is disabled; auto mode only."""
+    raise HTTPException(status_code=410, detail="主面板已移除手动开仓入口，仅保留自动模式。")
 
 
 @router.post("/positions/{position_id}/close")

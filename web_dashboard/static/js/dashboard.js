@@ -44,6 +44,10 @@ const state = {
     priceChartSymbol: '',
     priceChartTimeframe: '1h',
     executionAccount: null,
+    okxConfig: {
+        paperConfigured: true,
+        liveConfigured: null,
+    },
     expertMemories: [],
     tradeReflections: [],
     expertMemoryPage: 1,
@@ -336,17 +340,22 @@ function redirectToLogin(message = '') {
     }
 }
 
+async function fetchWithAuth(url, options = {}, expiredMessage = '登录已过期，请重新登录。') {
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+        redirectToLogin(expiredMessage);
+        throw new Error(expiredMessage);
+    }
+    return res;
+}
+
 async function postJSON(url, body = {}) {
-    const res = await fetch(url, dashboardWriteOptions({
+    const res = await fetchWithAuth(url, dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }));
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401) {
-        redirectToLogin('登录已过期，请重新登录。');
-        throw new Error('登录已过期，请重新登录。');
-    }
     if (!res.ok) {
         throw new Error(apiErrorText(data, res.statusText || '请求失败'));
     }
@@ -354,16 +363,12 @@ async function postJSON(url, body = {}) {
 }
 
 async function putJSON(url, body = {}) {
-    const res = await fetch(url, dashboardWriteOptions({
+    const res = await fetchWithAuth(url, dashboardWriteOptions({
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }));
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401) {
-        redirectToLogin('登录已过期，请重新登录。');
-        throw new Error('登录已过期，请重新登录。');
-    }
     if (!res.ok) {
         throw new Error(apiErrorText(data, res.statusText || '请求失败'));
     }
@@ -371,12 +376,12 @@ async function putJSON(url, body = {}) {
 }
 
 async function dashboardUserWriteRequest(url, options = {}) {
-    const res = await fetch(url, dashboardWriteOptions(options));
+    const res = await fetchWithAuth(
+        url,
+        dashboardWriteOptions(options),
+        '登录已过期，请重新登录后再操作会员。',
+    );
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401) {
-        redirectToLogin('登录已过期，请重新登录后再操作会员。');
-        throw new Error('登录已过期，请重新登录。');
-    }
     if (res.status === 403) {
         throw new Error('当前登录账号没有执行该操作的权限。');
     }
@@ -620,6 +625,7 @@ function updateModeDisplay(mode, paused, scanMode) {
     document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.mode === mode);
     });
+    updateModeButtonAvailability();
 
     const scanLabel = document.getElementById('scan-mode-label');
     if (scanLabel) scanLabel.textContent = '自动扫描全市场 · 智能调度';
@@ -1575,7 +1581,21 @@ function initModeButtons() {
     document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const mode = btn.dataset.mode;
-            const res = await fetch('/api/control/mode', dashboardWriteOptions({
+            if (mode === 'live' && state.okxConfig?.liveConfigured === false) {
+                const message = '实盘 OKX API 未配置完整，不能切换执行账户。请先配置 API Key、API Secret 和 Passphrase。';
+                alert(message);
+                openPage('settings');
+                activateSettingsTab('okx');
+                const status = document.getElementById('execution-account-save-status');
+                if (status) {
+                    status.textContent = message;
+                    status.style.color = 'var(--red)';
+                }
+                fetchOKXSettings();
+                fetchExecutionAccountSettings();
+                return;
+            }
+            const res = await fetchWithAuth('/api/control/mode', dashboardWriteOptions({
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode }),
@@ -1626,7 +1646,7 @@ function initModeButtons() {
 
 async function togglePause() {
     const endpoint = state.paused ? '/api/control/resume' : '/api/control/pause';
-    await fetch(endpoint, dashboardWriteOptions({
+    await fetchWithAuth(endpoint, dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
     }));
@@ -1636,7 +1656,7 @@ async function togglePause() {
 }
 
 async function selectLiveModel(modelName) {
-    await fetch('/api/control/select-model', dashboardWriteOptions({
+    await fetchWithAuth('/api/control/select-model', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_name: modelName }),
@@ -1718,7 +1738,7 @@ async function populateDecisionModelFilter() {
 async function clearAllDecisions() {
     if (!confirm('确定要删除所有 AI 决策记录吗？此操作不可撤销。')) return;
 
-    const res = await fetch('/api/decisions', dashboardWriteOptions({
+    const res = await fetchWithAuth('/api/decisions', dashboardWriteOptions({
         method: 'DELETE',
         headers: { 'X-Dashboard-Confirm': 'delete-records' },
     }));
@@ -2527,15 +2547,19 @@ function renderAnalysisAgentSkills(agentSkills) {
         const rows = skills.map(skill => {
             const tone = statusTone(skill);
             return `
-                <div class="analysis-resolution-item">
-                    <strong>${escHtml(skill.label || skill.name || '-')}</strong>
-                    <span>
-                        ${analysisPill(statusLabel(skill.status), tone)}
-                        ${skill.decision ? analysisPill(analysisDecisionLabel(skill.decision), tone) : ''}
-                        ${skill.confidence !== undefined ? analysisPill(`信心 ${(Number(skill.confidence || 0) * 100).toFixed(0)}%`, 'muted') : ''}
-                        ${analysisText(analysisReasonLabel(skill.reason || '-'))}
+                <div class="analysis-resolution-item analysis-skill-item">
+                    <div class="analysis-skill-head">
+                        <strong>${escHtml(skill.label || skill.name || '-')}</strong>
+                        <div class="analysis-skill-badges">
+                            ${analysisPill(statusLabel(skill.status), tone)}
+                            ${skill.decision ? analysisPill(analysisDecisionLabel(skill.decision), tone) : ''}
+                            ${skill.confidence !== undefined ? analysisPill(`信心 ${(Number(skill.confidence || 0) * 100).toFixed(0)}%`, 'muted') : ''}
+                        </div>
+                    </div>
+                    <div class="analysis-skill-body">
+                        <div class="analysis-skill-reason">${analysisText(analysisReasonLabel(skill.reason || '-'))}</div>
                         ${renderSkillDataSummary(skill.data)}
-                    </span>
+                    </div>
                 </div>
             `;
         }).join('');
@@ -4984,6 +5008,14 @@ window.deleteDashboardUser = deleteDashboardUser;
 async function fetchOKXSettings() {
     const data = await fetchJSON('/api/settings/okx');
     if (!data) return;
+    const hasCredentials = (item) => Boolean(
+        item && item.api_key && item.has_secret && item.has_passphrase
+    );
+    state.okxConfig = {
+        paperConfigured: hasCredentials(data.paper),
+        liveConfigured: hasCredentials(data.live),
+    };
+    updateModeButtonAvailability();
 
     // Paper account
     if (data.paper) {
@@ -5007,6 +5039,19 @@ async function fetchOKXSettings() {
             liveSecret.placeholder = '已有密钥（已隐藏）';
         }
     }
+}
+
+function updateModeButtonAvailability() {
+    document.querySelectorAll('.mode-btn[data-mode="live"]').forEach(button => {
+        const configured = state.okxConfig?.liveConfigured === true;
+        const knownMissing = state.okxConfig?.liveConfigured === false;
+        button.classList.toggle('needs-config', knownMissing);
+        button.title = configured
+            ? '切换到 OKX 实盘账户'
+            : knownMissing
+                ? '实盘 OKX API 未配置完整，点击后会跳转到系统设置。'
+                : '正在读取 OKX 实盘配置，后端会在切换前再次校验。';
+    });
 }
 
 function setText(id, text) {
@@ -5118,15 +5163,11 @@ async function saveExecutionAccountSettings() {
             if (body[key] === null || body[key] === undefined || body[key] === '') delete body[key];
         });
 
-        const res = await fetch('/api/settings/execution-account', dashboardWriteOptions({
+        const res = await fetchWithAuth('/api/settings/execution-account', dashboardWriteOptions({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         }));
-        if (res.status === 401) {
-            redirectToLogin('登录已过期，请重新登录。');
-            return;
-        }
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             if (status) {
@@ -5156,7 +5197,7 @@ async function saveOKXSettings(mode) {
     if (apiSecret && !apiSecret.startsWith('****')) body.api_secret = apiSecret;
     if (passphrase) body.passphrase = passphrase;
 
-    const res = await fetch('/api/settings/okx', dashboardWriteOptions({
+    const res = await fetchWithAuth('/api/settings/okx', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -5182,7 +5223,7 @@ async function testOKXConnection(mode) {
     status.textContent = '';
     status.className = '';
 
-    const res = await fetch('/api/settings/okx/balance', { cache: 'no-store' });
+    const res = await fetchWithAuth('/api/settings/okx/balance', { cache: 'no-store' });
     const data = await res.json().catch(() => ({}));
     if (data && !data.error) data.error = apiErrorText(data);
     const modeError = data[`${mode}_error`];
@@ -5213,7 +5254,7 @@ async function testModelByName(name) {
         btn.textContent = '...';
     }
 
-    const res = await fetch('/api/settings/ai-models/test', dashboardWriteOptions({
+    const res = await fetchWithAuth('/api/settings/ai-models/test', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
@@ -5337,7 +5378,7 @@ async function saveModelConfig() {
 
     if (!origName || !body.name) { alert('请选择要编辑的专家模型'); return; }
 
-    const res = await fetch(`/api/settings/ai-models/${encodeURIComponent(origName)}`, dashboardWriteOptions({
+    const res = await fetchWithAuth(`/api/settings/ai-models/${encodeURIComponent(origName)}`, dashboardWriteOptions({
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -6321,7 +6362,7 @@ async function saveTradingParams() {
         body.total_margin_limit_pct = pct / 100;
     }
 
-    const res = await fetch('/api/settings/thresholds', dashboardWriteOptions({
+    const res = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -7286,17 +7327,17 @@ function renderStrategyLearning(data) {
 }
 
 async function setStrategyLearningProfileDisabled(profileId, disabled) {
-    await fetch(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' }));
+    await fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' }));
     await fetchStrategyLearning();
 }
 
 async function activateStrategyLearningProfile(profileId) {
-    await fetch(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' }));
+    await fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' }));
     await fetchStrategyLearning();
 }
 
 async function clearStrategyLearningManualOverride() {
-    await fetch('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
+    await fetchWithAuth('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' }));
     await fetchStrategyLearning();
 }
 

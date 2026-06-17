@@ -54,6 +54,60 @@ def test_dashboard_refreshes_auth_status_in_topbar() -> None:
     assert "setInterval(fetchDashboardAuthStatus, 60000);" in script
     assert "fetchJSON('/api/auth/status')" in script
     assert "dashboard-current-user" in script
+    assert "logoutDashboard" in script
+    assert "redirectToLogin('已退出登录。')" in script
+
+
+def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
+    assets = [
+        PROJECT_ROOT / "web_dashboard/static/index.html",
+        PROJECT_ROOT / "web_dashboard/static/js/dashboard.js",
+        PROJECT_ROOT / "web_dashboard/static/css/dashboard.css",
+    ]
+    mojibake_markers = (
+        "鐧诲綍",
+        "瀹炵洏",
+        "鍒囨崲",
+        "宸叉湁",
+        "璐︽埛",
+        "澶辫触",
+        "棰勬湡",
+        "鏀剁泭",
+        "�",
+    )
+
+    for asset in assets:
+        text = asset.read_text(encoding="utf-8")
+        assert not any(marker in text for marker in mojibake_markers), asset
+
+
+def test_live_mode_switch_requires_known_missing_okx_config() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "liveConfigured: null" in script
+    assert "if (mode === 'live' && state.okxConfig?.liveConfigured === false)" in script
+    assert "const knownMissing = state.okxConfig?.liveConfigured === false" in script
+    assert "button.classList.toggle('needs-config', knownMissing)" in script
+    assert "后端会在切换前再次校验" in script
+    assert "请先配置 API Key、API Secret 和 Passphrase" in script
+
+
+def test_dashboard_internal_api_requests_handle_auth_expiry() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    allowed_raw_fetches = {
+        "const res = await fetch(url, { cache: 'no-store' });",
+        "const res = await fetch(url, options);",
+        "await fetch('/api/auth/logout', dashboardWriteOptions({",
+        "const res = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);",  # noqa: E501
+    }
+
+    for line in script.splitlines():
+        stripped = line.strip()
+        if "fetch(" in stripped:
+            assert stripped in allowed_raw_fetches or "fetchWithAuth(" in stripped
+    assert "fetchWithAuth('/api/settings/okx/balance'" in script
+    assert "fetchWithAuth('/api/control/mode'" in script
+    assert "fetchWithAuth('/api/settings/okx'" in script
 
 
 def test_opportunity_score_ui_prefers_expected_net_return() -> None:

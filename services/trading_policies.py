@@ -229,11 +229,25 @@ class EntryPolicy:
         ):
             evidence_score = opportunity_data["evidence_score"]
         evidence_tier = str(evidence_score.get("tier") or "")
-        if decision.position_size_pct <= 0 and evidence_tier in {
-            "blocked",
-            "weak_conflict_probe",
-            "degraded_missing_probe",
-        }:
+        weak_shadow_tiers = {"weak_conflict_probe", "degraded_missing_probe"}
+        if evidence_tier in weak_shadow_tiers:
+            return PolicyGateResult.block(
+                "entry_evidence_shadow_only",
+                (
+                    "动态证据仍处于弱证据学习档，本轮只记录影子样本和复盘数据，"
+                    "不提交 OKX 真实/模拟订单；需要更多同向模型证据或更高预期收益后再开仓。"
+                ),
+                {
+                    "pipeline_context": context.public_data(),
+                    "stage_status": "skipped",
+                    "skip_kind": "entry_evidence_shadow_only",
+                    "shadow_only": True,
+                    "evidence_tier": evidence_tier,
+                    "evidence_score": evidence_score,
+                    "position_size_pct_before_block": float(decision.position_size_pct or 0.0),
+                },
+            )
+        if decision.position_size_pct <= 0 or evidence_tier == "blocked":
             return PolicyGateResult.block(
                 "entry_evidence_wait",
                 (
