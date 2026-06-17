@@ -19,6 +19,31 @@ PRICE_GUARD_ENTRY_BLOCK_MINUTES = 8.0
 
 logger = structlog.get_logger(__name__)
 
+UNTRADABLE_EXCHANGE_ERROR_MARKERS = (
+    "51155",
+    "can't trade this pair",
+    "cannot trade this pair",
+    "can not trade this pair",
+    "local compliance restrictions",
+    "not currently tradable",
+    "not available for trading",
+    "not available to trade",
+    "trading unavailable",
+    "trading is unavailable",
+    "instrument suspended",
+    "symbol suspended",
+    "market suspended",
+    "temporarily suspended",
+    "currently not tradable",
+    "currently unavailable for trading",
+    "当前不可交易",
+    "暂时不可交易",
+    "交易对当前不可交易",
+    "该交易对当前不可交易",
+    "当前不支持交易",
+    "暂停交易",
+)
+
 
 @dataclass(slots=True)
 class EntrySymbolBlocklistPolicy:
@@ -30,11 +55,7 @@ class EntrySymbolBlocklistPolicy:
 
     def is_untradable_exchange_error(self, text: Any) -> bool:
         value = str(text or "").lower()
-        return (
-            "51155" in value
-            or "can't trade this pair" in value
-            or "local compliance restrictions" in value
-        )
+        return any(marker in value for marker in UNTRADABLE_EXCHANGE_ERROR_MARKERS)
 
     def is_transient_entry_exchange_error(self, text: Any) -> bool:
         value = str(text or "").lower()

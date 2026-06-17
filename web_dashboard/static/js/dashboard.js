@@ -1788,7 +1788,110 @@ function opportunityScoreReturnDetail(score) {
     return parts.join(' / ');
 }
 
-function opportunityScoreBlock(score) {
+function evidenceTierLabel(tier) {
+    return {
+        normal: '正常仓位',
+        medium: '中等仓位',
+        small: '小仓',
+        exploration: '探索小仓',
+        weak_conflict_probe: '弱冲突学习档',
+        degraded_missing_probe: '模型缺失降级学习档',
+        blocked: '不可交易档',
+    }[String(tier || '').toLowerCase()] || tier || '-';
+}
+
+function evidenceSourceLabel(source) {
+    return {
+        ai: 'AI/专家',
+        ml: '本地 ML',
+        timeseries: '时序',
+        sentiment: '情绪',
+        server_profit: '服务器盈利',
+        shadow_memory: '影子/记忆',
+        symbol_side_history: '币种方向历史',
+    }[String(source || '').toLowerCase()] || source || '-';
+}
+
+function evidenceStatusLabel(status) {
+    return {
+        aligned: '同向支持',
+        opposite: '反向冲突',
+        weak_opposite: '弱反向',
+        missing: '缺失',
+        neutral: '中性',
+        ignored: '学习观察',
+        limited_no_expert_support: '专家未同向',
+        limited_single_expert_support: '仅 1 个专家同向',
+        probe_derived_limited: '探针来源限分',
+        probe_derived_no_expert_support: '探针无专家支持',
+    }[String(status || '').toLowerCase()] || status || '-';
+}
+
+function evidenceListLabel(items) {
+    return Array.isArray(items) && items.length
+        ? items.map(evidenceSourceLabel).join('、')
+        : '无';
+}
+
+function evidencePercentLabel(value, digits = 1) {
+    const num = Number(value);
+    return Number.isFinite(num) ? `${(num * 100).toFixed(digits)}%` : '-';
+}
+
+function dynamicEvidenceBlock(score, decision = null) {
+    const evidence = score && typeof score === 'object' ? score.evidence_score : null;
+    if (!evidence || typeof evidence !== 'object') return '';
+    const rawScore = Number(evidence.score);
+    const effective = Number(evidence.effective_score);
+    const multiplier = Number(evidence.size_multiplier);
+    const maxSize = Number(evidence.max_size_pct);
+    const confidence = Number(decision?.confidence ?? score?.confidence);
+    const components = Array.isArray(evidence.components) ? evidence.components : [];
+    const componentRows = components.slice(0, 8).map(item => {
+        const points = Number(item.points);
+        const expected = Number(item.expected_return_pct ?? item.pnl);
+        const sub = Number.isFinite(expected) ? ` · ${signedPctValueLabel(expected)}` : '';
+        return `
+            <div class="decision-evidence-component">
+                <strong>${escHtml(item.label || evidenceSourceLabel(item.source))}</strong>
+                <span>${escHtml(evidenceStatusLabel(item.status))}${sub}</span>
+                <em>${Number.isFinite(points) ? points.toFixed(1) : '-'} 分</em>
+            </div>
+        `;
+    }).join('');
+    const waitReasons = Array.isArray(evidence.advisory_wait_reasons)
+        ? evidence.advisory_wait_reasons.filter(Boolean)
+        : [];
+    const tier = String(evidence.tier || '').toLowerCase();
+    const explanation = tier === 'weak_conflict_probe'
+        ? '弱证据不是单看分析信心；它表示有效证据分只够学习/观察，而且存在反向或同向来源不足。'
+        : tier === 'degraded_missing_probe'
+            ? '弱证据不是单看分析信心；它表示关键模型缺失或质量不足，只能作为学习样本。'
+            : '动态证据分综合 AI、ML、时序、情绪、服务器盈利、影子记忆和币种历史。';
+    return `
+        <div class="reason-block decision-evidence-block">
+            <div class="reason-label">动态证据评分</div>
+            <div class="decision-evidence-summary">
+                <div><span>分析信心</span><strong>${evidencePercentLabel(confidence)}</strong><small>AI/专家最终置信度</small></div>
+                <div><span>证据分</span><strong>${Number.isFinite(rawScore) ? rawScore.toFixed(1) : '-'}</strong><small>原始多来源分</small></div>
+                <div><span>有效分</span><strong>${Number.isFinite(effective) ? effective.toFixed(1) : '-'}</strong><small>做空偏移/风控修正后</small></div>
+                <div><span>档位</span><strong>${escHtml(evidenceTierLabel(evidence.tier))}</strong><small>仓位系数 ${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '-'}</small></div>
+            </div>
+            <div class="decision-evidence-explain">${escHtml(explanation)}</div>
+            <div class="decision-evidence-lists">
+                <span>同向支持：${escHtml(evidenceListLabel(evidence.aligned_support_sources))}</span>
+                <span>明确反向：${escHtml(evidenceListLabel(evidence.major_opposites))}</span>
+                <span>弱反向：${escHtml(evidenceListLabel(evidence.weak_opposites))}</span>
+                <span>缺失关键源：${escHtml(evidenceListLabel(evidence.missing_key_sources))}</span>
+                ${Number.isFinite(maxSize) ? `<span>最大仓位参考：${(maxSize * 100).toFixed(2)}%</span>` : ''}
+            </div>
+            ${waitReasons.length ? `<div class="decision-evidence-wait">${waitReasons.map(item => `<span>${escHtml(analysisLocalizeText(item))}</span>`).join('')}</div>` : ''}
+            ${componentRows ? `<div class="decision-evidence-components">${componentRows}</div>` : ''}
+        </div>
+    `;
+}
+
+function opportunityScoreBlock(score, decision = null) {
     if (!score || typeof score !== 'object') return '';
     const selected = score.selected_for_execution === true
         ? '已进入执行队列'
@@ -1796,12 +1899,14 @@ function opportunityScoreBlock(score) {
     const reason = score.selection_reason || score.rule || '系统按预期净收益、方向优势、AI 信心、ML 盈亏质量、手续费、滑点、止损风险和当前敞口综合排序。';
     const primaryReturn = opportunityScorePrimaryReturn(score);
     const returnDetail = opportunityScoreReturnDetail(score);
+    const confidence = Number(decision?.confidence ?? score.confidence);
     return `
         <div class="reason-block">
             <div class="reason-label">盈利机会评分</div>
             <div>
                 机会分：${opportunityScoreValue(score.score, 6)}<br>
                 方向：${escHtml(actionLabel(score.side || '-'))}<br>
+                分析信心：${evidencePercentLabel(confidence)}（AI/专家最终置信度，不等于动态证据分）<br>
                 ${primaryReturn.label}：${opportunityScoreValue(primaryReturn.value, 4)}%<br>
                 ${returnDetail ? `收益来源：${escHtml(returnDetail)}<br>` : ''}
                 相对反向优势：${opportunityScoreValue(score.profit_edge_pct, 4)}%<br>
@@ -1812,6 +1917,7 @@ function opportunityScoreBlock(score) {
                 原因：${escapeMultiline(reason)}
             </div>
         </div>
+        ${dynamicEvidenceBlock(score, decision)}
     `;
 }
 
@@ -1830,7 +1936,8 @@ function showDecisionReason(decisionId) {
     const aiReasoning = decision.reasoning
         ? `<div class="reason-block"><div class="reason-label">AI 分析</div><div>${escapeMultiline(decision.reasoning)}</div></div>`
         : '';
-    const opportunityHtml = opportunityScoreBlock(decision.opportunity_score);
+    const opportunityHtml = opportunityScoreBlock(decision.opportunity_score, decision);
+    setDecisionModalWide(Boolean(decision.opportunity_score?.evidence_score));
 
     document.getElementById('decision-reason-title').textContent = title;
     document.getElementById('decision-reason-body').innerHTML = `
@@ -2502,12 +2609,17 @@ function renderSkillDataSummary(data) {
             const label = SKILL_DATA_LABELS[key] || key;
             const text = skillDataValueLabel(key, value);
             if (!text) return ''; 
-            return `<span class="analysis-skill-data-chip"><b>${escHtml(label)}</b>${analysisText(text)}</span>`;
+            return `
+                <div class="analysis-skill-data-row">
+                    <span class="analysis-skill-data-key">${escHtml(label)}</span>
+                    <span class="analysis-skill-data-value">${analysisText(text)}</span>
+                </div>
+            `;
         })
         .filter(Boolean)
         .slice(0, 8);
     if (!rows.length) return ''; 
-    return `<div class="analysis-skill-data" aria-label="SkillData">${rows.join('')}</div>`;
+    return `<div class="analysis-skill-data-grid" aria-label="SkillData">${rows.join('')}</div>`;
 }
 
 function renderAnalysisAgentSkills(agentSkills) {
@@ -2547,9 +2659,9 @@ function renderAnalysisAgentSkills(agentSkills) {
         const rows = skills.map(skill => {
             const tone = statusTone(skill);
             return `
-                <div class="analysis-resolution-item analysis-skill-item">
+                <div class="analysis-skill-item">
                     <div class="analysis-skill-head">
-                        <strong>${escHtml(skill.label || skill.name || '-')}</strong>
+                        <strong class="analysis-skill-title">${escHtml(skill.label || skill.name || '-')}</strong>
                         <div class="analysis-skill-badges">
                             ${analysisPill(statusLabel(skill.status), tone)}
                             ${skill.decision ? analysisPill(analysisDecisionLabel(skill.decision), tone) : ''}
@@ -2557,7 +2669,7 @@ function renderAnalysisAgentSkills(agentSkills) {
                         </div>
                     </div>
                     <div class="analysis-skill-body">
-                        <div class="analysis-skill-reason">${analysisText(analysisReasonLabel(skill.reason || '-'))}</div>
+                        <div class="analysis-skill-reason"><span>结论</span>${analysisText(analysisReasonLabel(skill.reason || '-'))}</div>
                         ${renderSkillDataSummary(skill.data)}
                     </div>
                 </div>
@@ -2579,7 +2691,7 @@ function renderAnalysisAgentSkills(agentSkills) {
             </div>
         `;
     }).join('');
-    return `<div class="analysis-grid">${skillRows}</div>`;
+    return `<div class="analysis-grid analysis-agent-skills-grid">${skillRows}</div>`;
 }
 
 function unwrapAnalysisToolPayload(value) {

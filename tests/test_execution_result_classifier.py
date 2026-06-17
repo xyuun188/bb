@@ -1,4 +1,5 @@
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.entry_symbol_blocklist import EntrySymbolBlocklistPolicy
 from services.execution_result_classifier import ExecutionResultClassifier
 
 
@@ -109,6 +110,23 @@ def test_execution_reason_uses_untradable_checker() -> None:
     assert "交易对当前不可交易" in reason
 
 
+def test_execution_reason_uses_default_untradable_policy_terms() -> None:
+    blocklist = EntrySymbolBlocklistPolicy(lambda symbol: symbol)
+    policy = ExecutionResultClassifier(
+        untradable_exchange_error_checker=blocklist.is_untradable_exchange_error
+    )
+    result = _result(
+        OrderStatus.REJECTED,
+        raw_response={"error": "OKX 提示该交易对当前不可交易"},
+        exchange_order_id=None,
+    )
+
+    reason = policy.reason_from_result(result)
+
+    assert "交易对当前不可交易" in reason
+    assert "系统已暂时跳过该交易对" in reason
+
+
 def test_execution_result_detects_no_exchange_position() -> None:
     policy = ExecutionResultClassifier()
     result = _result(
@@ -132,10 +150,7 @@ def test_execution_confirmation_requires_real_exchange_order_id() -> None:
         is False
     )
     assert (
-        policy.is_exchange_confirmed_execution(
-            _result(OrderStatus.FILLED, quantity=0.0)
-        )
-        is False
+        policy.is_exchange_confirmed_execution(_result(OrderStatus.FILLED, quantity=0.0)) is False
     )
     assert (
         policy.is_exchange_confirmed_execution(

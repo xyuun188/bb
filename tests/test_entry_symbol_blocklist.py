@@ -19,6 +19,10 @@ def test_entry_symbol_blocklist_classifies_exchange_errors() -> None:
 
     assert policy.is_untradable_exchange_error("OKX 51155 can't trade this pair")
     assert policy.is_untradable_exchange_error("local compliance restrictions")
+    assert policy.is_untradable_exchange_error("OKX 提示该交易对当前不可交易")
+    assert policy.is_untradable_exchange_error("交易对当前不可交易，请稍后重试")
+    assert policy.is_untradable_exchange_error("instrument suspended")
+    assert policy.is_untradable_exchange_error("not available for trading")
     assert policy.is_transient_entry_exchange_error("51290 engine currently upgrading")
     assert policy.is_transient_entry_exchange_error(
         "open interest has reached the platform's limit"
