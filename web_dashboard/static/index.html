@@ -651,7 +651,10 @@
         <div class="page-section" id="page-strategy-learning">
             <div class="card strategy-learning-card">
                 <div class="card-header">
-                    <span class="card-title">策略生成 / 调度控制台</span>
+                    <div class="strategy-learning-title-block">
+                        <span class="card-title">策略生成 / 调度控制台</span>
+                        <span class="card-subtitle">把问题归因、策略候选、影子验证和执行事件分层展示</span>
+                    </div>
                     <div class="opening-funnel-controls">
                         <span class="card-subtitle" id="strategy-learning-updated">等待刷新</span>
                         <select class="form-input" id="strategy-learning-hours" onchange="fetchStrategyLearning()">
@@ -668,36 +671,44 @@
                     <div class="strategy-learning-summary" id="strategy-learning-summary">
                         <div class="opening-funnel-empty">加载中...</div>
                     </div>
-                    <div class="strategy-learning-grid">
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                    <section class="strategy-learning-stage strategy-learning-stage-diagnostics" aria-label="策略诊断看板">
+                        <div class="strategy-learning-stage-head">
+                            <div>
+                                <span class="strategy-learning-stage-kicker">01 · Diagnostics</span>
+                                <strong>诊断看板</strong>
+                            </div>
+                            <p>先看系统为什么调度、哪里拖累收益，再决定是否需要切换策略。</p>
+                        </div>
+                        <div class="strategy-learning-grid strategy-learning-grid-diagnostics">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-problems">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">问题归因</span>
                                 <span class="analysis-section-subtitle">不开仓、亏损、满仓、fallback</span>
                             </div>
                             <div id="strategy-learning-problems" class="opening-funnel-list"></div>
                         </div>
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-sides">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">多空表现</span>
                                 <span class="analysis-section-subtitle">真实平仓反馈</span>
                             </div>
                             <div id="strategy-learning-sides" class="opening-funnel-list"></div>
                         </div>
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-release">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">动态容量 / 释放候选</span>
                                 <span class="analysis-section-subtitle">容量参考随行情、风险和持仓质量变化</span>
                             </div>
                             <div id="strategy-learning-release" class="opening-funnel-list"></div>
                         </div>
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-experts">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">专家稳定性</span>
                                 <span class="analysis-section-subtitle">fallback 与完整性保护</span>
                             </div>
                             <div id="strategy-learning-experts" class="opening-funnel-list"></div>
                         </div>
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-reflections">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">策略复盘反馈</span>
                                 <span class="analysis-section-subtitle">训练复盘、错误模式、改进建议</span>
@@ -705,22 +716,40 @@
                             <div id="strategy-learning-reflections" class="opening-funnel-list"></div>
                         </div>
                     </div>
-                    <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel">
+                    </section>
+                    <section class="strategy-learning-stage strategy-learning-stage-profiles" aria-label="候选策略实验室">
+                        <div class="strategy-learning-stage-head">
+                            <div>
+                                <span class="strategy-learning-stage-kicker">02 · Strategy Lab</span>
+                                <strong>候选策略实验室</strong>
+                            </div>
+                            <p>每个策略画像必须同时看回测、影子验证、探针仓位和人工控制状态。</p>
+                        </div>
+                        <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel strategy-learning-panel-candidates">
                         <div class="analysis-section-head">
                             <span class="analysis-section-title">候选策略 / 回测 / 影子验证 / 探针</span>
                             <span class="analysis-section-subtitle">只允许受控参数，不生成交易代码</span>
                         </div>
                         <div id="strategy-learning-profiles" class="strategy-learning-profile-list"></div>
                     </div>
-                    <div class="strategy-learning-grid strategy-learning-grid-wide">
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                    </section>
+                    <section class="strategy-learning-stage strategy-learning-stage-audit" aria-label="执行审计轨迹">
+                        <div class="strategy-learning-stage-head">
+                            <div>
+                                <span class="strategy-learning-stage-kicker">03 · Audit Trail</span>
+                                <strong>执行审计轨迹</strong>
+                            </div>
+                            <p>把事件覆盖、自动回滚和最近策略事件放在一起，方便追踪问题从哪里开始。</p>
+                        </div>
+                        <div class="strategy-learning-grid strategy-learning-grid-wide strategy-learning-grid-audit">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-events">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">事件归因覆盖</span>
                                 <span class="analysis-section-subtitle">决策、拦截、执行、手动平仓</span>
                             </div>
                             <div id="strategy-learning-events" class="opening-funnel-list"></div>
                         </div>
-                        <div class="opening-funnel-panel strategy-learning-panel">
+                        <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-guard">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">自动回滚护栏</span>
                                 <span class="analysis-section-subtitle">亏损、fallback、执行异常</span>
@@ -728,13 +757,14 @@
                             <div id="strategy-learning-guard" class="opening-funnel-list"></div>
                         </div>
                     </div>
-                    <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel">
+                    <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel strategy-learning-panel-recent-events">
                         <div class="analysis-section-head">
                             <span class="analysis-section-title">最近策略事件</span>
                             <span class="analysis-section-subtitle">用于回答为什么不开仓、为什么回滚、手动平仓是否排除训练</span>
                         </div>
                         <div id="strategy-learning-recent-events" class="strategy-learning-event-list"></div>
                     </div>
+                    </section>
                 </div>
             </div>
         </div>

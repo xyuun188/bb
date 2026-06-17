@@ -52,3 +52,28 @@ def test_strategy_learning_profile_actions_show_immediate_feedback() -> None:
     assert ".strategy-learning-action-feedback.error" in style
     assert "#strategy-learning-auto-button.is-loading" in style
     assert "????" not in script
+
+
+def test_strategy_learning_console_uses_clear_stage_layout() -> None:
+    html = Path("web_dashboard/static/index.html").read_text(encoding="utf-8")
+    style = Path("web_dashboard/static/css/strategy_learning.css").read_text(encoding="utf-8")
+
+    assert "strategy-learning-title-block" in html
+    assert "strategy-learning-stage-diagnostics" in html
+    assert "strategy-learning-stage-profiles" in html
+    assert "strategy-learning-stage-audit" in html
+    assert "诊断看板" in html
+    assert "候选策略实验室" in html
+    assert "执行审计轨迹" in html
+    assert "strategy-learning-panel-problems" in html
+    assert "strategy-learning-panel-candidates" in html
+    assert "strategy-learning-panel-recent-events" in html
+    assert ".strategy-learning-stage" in style
+    assert ".strategy-learning-stage-head" in style
+    assert ".strategy-learning-stage-kicker" in style
+    assert ".strategy-learning-grid-diagnostics .strategy-learning-panel-problems" in style
+    assert ".strategy-learning-panel-candidates" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));" in style
+    assert "strategy-learning-grid > .strategy-learning-panel:nth-child" not in style
+    assert "????" not in html
+    assert "????" not in style
