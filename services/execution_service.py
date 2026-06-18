@@ -548,6 +548,19 @@ class ExecutionService:
         stage_started_at: dict[str, float] = {}
         submitted_to_exchange = False
 
+        def attach_execution_parameters(source: str) -> None:
+            raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw_response = dict(raw_response)
+            raw_response["execution_parameters"] = {
+                "source": source,
+                "action": decision.action.value,
+                "position_size_pct": float(decision.position_size_pct or 0.0),
+                "suggested_leverage": float(decision.suggested_leverage or 1.0),
+                "stop_loss_pct": float(decision.stop_loss_pct or 0.0),
+                "take_profit_pct": float(decision.take_profit_pct or 0.0),
+            }
+            decision.raw_response = raw_response
+
         async def mark_stage(
             stage: str,
             status: str,
@@ -645,6 +658,7 @@ class ExecutionService:
                 }
             )
             decision.raw_response = raw_response
+            attach_execution_parameters("policy_blocked")
             if decision_db_id is not None:
                 await mark_decision_reason(decision_db_id, reason)
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -721,6 +735,7 @@ class ExecutionService:
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
             if decision_db_id is not None:
+                attach_execution_parameters("entry_policy_passed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
 
         if decision.is_entry or decision.is_exit:
@@ -755,6 +770,7 @@ class ExecutionService:
                     note="提交 OKX 前的 Agent/Skills 执行守门。",
                 )
             if decision_db_id is not None:
+                attach_execution_parameters("execution_precheck")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
             execution_guard_reason = (
                 execution_skills_block_reason(execution_agent_skills, for_entry=True)
@@ -806,6 +822,7 @@ class ExecutionService:
                     execution_result,
                     ai_requested_leverage,
                 )
+                attach_execution_parameters("exchange_result")
         except TimeoutError:
             logger.error(
                 "decision execution timed out",
@@ -1088,6 +1105,7 @@ class ExecutionService:
                 record_trade_notional(execution_result.price * execution_result.quantity)
             if decision_db_id is not None and exchange_confirmed:
                 await mark_decision_executed(decision_db_id, execution_result.price)
+                attach_execution_parameters("exchange_confirmed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
                 if decision.is_entry:
                     clear_market_no_opportunity_symbol(symbol)
@@ -1096,6 +1114,7 @@ class ExecutionService:
                     decision_db_id,
                     execution_reason_from_result(execution_result),
                 )
+                attach_execution_parameters("exchange_not_confirmed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
             if model_mode != "paper" and decision.is_exit and execution_result.pnl != 0.0:
                 await persist_account_update(model_name, decision.model_name, execution_result)
@@ -1133,6 +1152,7 @@ class ExecutionService:
             )
             if decision_db_id is not None:
                 await mark_decision_reason(decision_db_id, missing_result_reason)
+                attach_execution_parameters("missing_execution_result")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
             if position_review_alert_context(decision):
                 await log_position_review_risk_result(

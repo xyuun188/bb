@@ -188,6 +188,35 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _material_low_quality_pressure(open_pressure: dict[str, Any]) -> bool:
+    open_groups = max(0, _safe_int(open_pressure.get("open_group_count"), 0))
+    max_open = max(1, _safe_int(open_pressure.get("max_open_positions"), open_groups or 1))
+    low_quality = max(0, _safe_int(open_pressure.get("low_quality_open_count"), 0))
+    if low_quality <= 0:
+        return False
+    ratio = _safe_float(open_pressure.get("low_quality_open_ratio"), 0.0)
+    dynamic_threshold = max(2, math.ceil(max(open_groups, 1) * 0.40), math.ceil(max_open * 0.15))
+    return bool(low_quality >= dynamic_threshold or (low_quality >= 2 and ratio >= 0.45))
+
+
+def _material_release_pressure(
+    open_pressure: dict[str, Any],
+    problem_keys: set[str] | None = None,
+    *,
+    active_profile_id: str = "",
+) -> bool:
+    if open_pressure.get("full_position_pressure") or open_pressure.get("fragmentation_pressure"):
+        return True
+    if (problem_keys or set()) & {"full_position_loss_pressure", "max_position_blocks"}:
+        return True
+    if (
+        active_profile_id == "loss_release"
+        and _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0
+    ):
+        return True
+    return _material_low_quality_pressure(open_pressure)
+
+
 def _json_safe(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False, default=str))
@@ -1813,7 +1842,7 @@ class StrategyCandidateGenerator:
             )
         if (
             open_pressure.get("full_position_pressure")
-            or open_pressure.get("low_quality_open_count")
+            or _material_low_quality_pressure(open_pressure)
             or "loss_hold_too_long" in problem_keys
             or "reflection_loss_hold_too_long" in problem_keys
             or "reflection_negative_pnl" in problem_keys
@@ -2419,6 +2448,11 @@ class StrategyScheduler:
         reason = "默认使用系统基线兜底。"
         problem_keys = {item["key"] for item in feedback.problems}
         blocked_candidate_count = sum(1 for profile in profiles if profile.profile_id in disabled)
+        open_pressure = _safe_dict(feedback.open_position_pressure)
+        material_release_pressure = _material_release_pressure(
+            open_pressure,
+            problem_keys,
+        )
         pressure_guard_active = self._should_hold_baseline_due_to_pressure(
             feedback=feedback,
             disabled=disabled,
@@ -2442,7 +2476,11 @@ class StrategyScheduler:
                 "Strategy guard is active: keep baseline sizing, release low-quality positions, "
                 "and allow only bounded high-quality probes."
             )
-        elif ("low_quality_position_pressure" in problem_keys) and "loss_release" in by_id:
+        elif (
+            "low_quality_position_pressure" in problem_keys
+            and material_release_pressure
+            and "loss_release" in by_id
+        ):
             selected = by_id["loss_release"]
             reason = "检测到低质量持仓占用仓位，优先调度亏损释放画像。"
         elif (
@@ -2566,12 +2604,7 @@ class StrategyScheduler:
         if not auto_disabled:
             return False
         open_pressure = _safe_dict(feedback.open_position_pressure)
-        pressure_active = bool(
-            open_pressure.get("full_position_pressure")
-            or open_pressure.get("fragmentation_pressure")
-            or open_pressure.get("low_quality_open_count")
-            or problem_keys & {"full_position_loss_pressure", "max_position_blocks"}
-        )
+        pressure_active = _material_release_pressure(open_pressure, problem_keys)
         net_pnl = _safe_float(feedback.totals.get("net_pnl"), 0.0)
         return bool(pressure_active and net_pnl < 0.0)
 
@@ -2606,12 +2639,7 @@ class StrategyScheduler:
             str(item.get("key")) for item in feedback.problems if isinstance(item, dict)
         }
         open_pressure = _safe_dict(feedback.open_position_pressure)
-        pressure_active = bool(
-            open_pressure.get("full_position_pressure")
-            or open_pressure.get("fragmentation_pressure")
-            or open_pressure.get("low_quality_open_count")
-            or problem_keys & {"full_position_loss_pressure", "max_position_blocks"}
-        )
+        pressure_active = _material_release_pressure(open_pressure, problem_keys)
         if (
             "recent_net_pnl_guard" in reason
             and _safe_float(feedback.totals.get("net_pnl"), 0.0) < 0.0
@@ -2850,13 +2878,16 @@ class StrategyScheduler:
         low_quality = max(0, _safe_int(open_pressure.get("low_quality_open_count"), 0))
         losing = max(0, _safe_int(open_pressure.get("losing_open_count"), 0))
         release_queue = max(0, _safe_int(open_pressure.get("release_queue_count"), 0))
-        release_pressure = bool(
-            profile.profile_id == "loss_release"
-            or profile.params.get("full_position_release")
+        problem_keys = {
+            str(item.get("key")) for item in feedback.problems if isinstance(item, dict)
+        }
+        release_pressure = _material_release_pressure(
+            open_pressure,
+            problem_keys,
+            active_profile_id=profile.profile_id,
+        ) or bool(
+            profile.params.get("full_position_release")
             or profile.params.get("release_losing_positions_first")
-            or low_quality > 0
-            or open_pressure.get("full_position_pressure")
-            or open_pressure.get("fragmentation_pressure")
         )
         release_target = (
             max(low_quality, min(losing, max(release_queue, 1))) if release_pressure else 0
@@ -3225,12 +3256,13 @@ class StrategyLearningEngine:
                 and _safe_dict(item).get("strategy_profile_id") != active_profile_id
             )
         ][:8]
+        material_release_pressure = _material_release_pressure(
+            open_pressure,
+            {str(item) for item in _safe_list(feedback_summary.get("problem_keys"))},
+            active_profile_id=active_profile_id,
+        )
         release_pressure_active = bool(
-            (
-                open_pressure.get("full_position_pressure")
-                or open_pressure.get("fragmentation_pressure")
-                or rebalance_queue
-            )
+            material_release_pressure
             and (
                 _safe_float(feedback_summary.get("net_pnl"), 0.0) < 0.0
                 or _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0

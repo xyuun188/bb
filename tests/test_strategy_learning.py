@@ -351,7 +351,11 @@ def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_p
         mode="paper",
         window_hours=168,
         positions=[],
-        open_positions=[old_flat_position],
+        open_positions=[
+            old_flat_position,
+            _old_flat_open_position("LOW2/USDT"),
+            _old_flat_open_position("LOW3/USDT"),
+        ],
         orders=[],
         decisions=[],
         shadows=[],
@@ -360,7 +364,7 @@ def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_p
     )
     context = engine.apply_to_context({}, payload)
 
-    assert payload["feedback"]["open_position_pressure"]["low_quality_open_count"] == 1
+    assert payload["feedback"]["open_position_pressure"]["low_quality_open_count"] == 3
     assert payload["schedule"]["active_profile"]["id"] == "loss_release"
     assert context["full_position_release"] is True
     assert context["release_losing_positions_first"] is True
@@ -372,6 +376,33 @@ def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_p
         context["target_position_groups"] == context["portfolio_roster"]["target_position_groups"]
     )
     assert context["position_review_max_groups"] >= 1
+
+
+def test_strategy_learning_single_low_quality_open_position_does_not_global_release(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[_old_flat_open_position("LOW/USDT")],
+        orders=[],
+        decisions=[_healthy_decision("long", executed=True)],
+        shadows=[],
+        memories=[],
+        max_open_positions=20,
+    )
+    context = engine.apply_to_context({}, payload)
+
+    pressure = payload["feedback"]["open_position_pressure"]
+    assert pressure["low_quality_open_count"] == 1
+    assert payload["schedule"]["active_profile"]["id"] != "loss_release"
+    assert context["strategy_learning_release_pressure_active"] is False
+    assert context["strategy_learning_sizing"].get("release_pressure_active") is not True
 
 
 def test_llm_candidate_status_exposes_sanitized_cached_candidates(tmp_path) -> None:

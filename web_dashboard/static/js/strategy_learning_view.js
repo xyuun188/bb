@@ -514,7 +514,7 @@ function renderStrategyLearningProfiles(data) {
                 const cardClass = [isActive ? 'active' : '', isDisabled ? 'disabled' : '', profile.cached_only ? 'cached' : '', pass && shadowOk ? '' : 'failed'].filter(Boolean).join(' ');
                 const activeLabel = profile.id === 'baseline_current'
                     ? (isActive ? '自动兜底中' : '稳定兜底')
-                    : (profile.cached_only ? (llm.cache_status === 'current' ? 'LLM缓存候选' : 'LLM过期缓存') : (isActive ? (manualLocked ? '人工指定中' : '自动调度选中') : (isDisabled ? '已禁用' : (pass && shadowOk ? '候选可用' : '未通过验证'))));
+                    : (profile.cached_only ? (llm.cache_status === 'current' ? 'LLM缓存候选' : 'LLM过期缓存') : (isActive ? (manualLocked ? '人工指定中' : '自动调度选中') : (isDisabled ? '已禁用 · 未生效' : (pass && shadowOk ? '候选可用' : '未通过验证'))));
                 const statusTone = isActive ? 'good' : isDisabled ? 'bad' : profile.cached_only || pass && shadowOk ? 'neutral' : 'warn';
                 let actionButton = '<button class="btn btn-sm" disabled title="系统基线只是兜底画像；没有人工指定时，调度器会在它和更合适的画像之间自动选择。">系统兜底</button>'; 
                 let disableButton = '<button class="btn btn-sm" disabled title="系统基线是自动调度兜底画像，不能在控制台禁用。">兜底保留</button>'; 
@@ -547,7 +547,7 @@ function renderStrategyLearningProfiles(data) {
                             <span class="strategy-learning-table-pill ${statusTone}">${strategyLearningEsc(activeLabel)}</span>
                         </div>
                         <p>${strategyLearningEsc(strategyLearningShort(profile.description || '', 128))}</p>
-                        ${isDisabled && disabledText ? `<div class="strategy-learning-profile-note">禁用原因：${strategyLearningEsc(disabledText)}</div>` : ''}
+                        ${isDisabled ? `<div class="strategy-learning-profile-note">禁用候选，当前没有参与自动调度${disabledText ? `；原因：${strategyLearningEsc(disabledText)}` : '。'}</div>` : ''}
                         ${profile.cached_only ? `<div class="strategy-learning-profile-note">${llm.cache_status === 'current' ? '已生成但未进入当前调度列表。' : '候选签名与当前反馈不一致，等待下一次生成刷新后再参与调度。'}</div>` : ''}
                         <div class="strategy-learning-profile-card-stats">
                             ${strategyLearningProfileMetric('回测评分', score.toFixed(2), score >= 0 ? 'good' : 'bad')}

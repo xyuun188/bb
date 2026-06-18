@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import func, or_, select
 
@@ -79,7 +80,9 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            decision.raw_llm_response = sanitize_payload(raw_response)
+            clean_response = sanitize_payload(raw_response)
+            decision.raw_llm_response = clean_response
+            _sync_execution_parameters(decision, clean_response)
             await self.session.flush()
         return decision
 
@@ -178,3 +181,33 @@ def _sanitize_decision_payload(data: dict) -> dict:
         if key in clean:
             clean[key] = sanitize_payload(clean.get(key))
     return clean
+
+
+def _sync_execution_parameters(decision: AIDecision, raw_response: Any) -> None:
+    if not isinstance(raw_response, dict):
+        return
+    parameters = raw_response.get("execution_parameters")
+    if not isinstance(parameters, dict):
+        parameters = raw_response.get("profit_risk_sizing")
+    if not isinstance(parameters, dict):
+        return
+    for field_name in (
+        "position_size_pct",
+        "suggested_leverage",
+        "stop_loss_pct",
+        "take_profit_pct",
+    ):
+        if field_name not in parameters:
+            continue
+        value = _optional_float(parameters.get(field_name))
+        if value is not None:
+            setattr(decision, field_name, value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

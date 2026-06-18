@@ -2193,6 +2193,7 @@ async def test_execution_service_serializes_candidate_execution():
     lock = asyncio.Lock()
     calls: list[tuple[Any, ...]] = []
     stages: list[tuple[Any, ...]] = []
+    raw_updates: list[dict[str, Any] | None] = []
 
     class FakeExecutor:
         async def place_order(self, decision, account_id=None, override_balance=None):
@@ -2234,6 +2235,7 @@ async def test_execution_service_serializes_candidate_execution():
 
     async def mark_decision_raw_response(decision_db_id, raw_response):
         calls.append(("raw", decision_db_id))
+        raw_updates.append(raw_response)
 
     async def log_position_review_risk_result(*args, **kwargs):
         calls.append(("position_review_risk", args, kwargs))
@@ -2345,6 +2347,8 @@ async def test_execution_service_serializes_candidate_execution():
 
     async def evaluate_entry_policy(decision, model_name, model_mode, open_positions):
         calls.append(("entry_policy", model_name, model_mode, len(open_positions or [])))
+        decision.position_size_pct = 0.004
+        decision.suggested_leverage = 2.0
         return PolicyGateResult.allow({"intent": "entry"})
 
     async def evaluate_exit_policy(
@@ -2466,6 +2470,9 @@ async def test_execution_service_serializes_candidate_execution():
     assert ("executed", 123, 100.0) in calls
     assert ("clear_symbol", "BTC/USDT") in calls
     assert ("record_trade", 200.0) in calls
+    assert raw_updates[-1] is not None
+    assert raw_updates[-1]["execution_parameters"]["position_size_pct"] == 0.004
+    assert raw_updates[-1]["execution_parameters"]["suggested_leverage"] == 2.0
     assert results["executions"][0]["order_id"] == "order-1"
     assert results["decisions"][0]["executed"] is True
     assert [stage for stage, _status, _reason in stages] == [

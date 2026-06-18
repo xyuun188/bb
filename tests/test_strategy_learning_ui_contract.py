@@ -43,6 +43,8 @@ def test_strategy_learning_profile_actions_show_immediate_feedback() -> None:
     assert "恢复中..." in script
     assert "已恢复自动调度" in script
     assert "人工指定此策略" in script
+    assert "已禁用 · 未生效" in script
+    assert "禁用候选，当前没有参与自动调度" in script
     assert "setStrategyLearningProfileDisabled" in script
     assert "strategy-learning-action-btn" in script
     assert "await fetchStrategyLearning()" in dashboard_script
