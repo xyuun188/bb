@@ -236,3 +236,12 @@ def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned
     assert opportunity["ai_expected_return_contribution_pct"] == 0.15
     assert opportunity["timeseries_expected_return_pct"] == 0.05
     assert opportunity["expected_net_return_pct"] < 0.05
+    breakdown = opportunity["expected_net_breakdown"]
+    assert breakdown["formula"] == "ai + local_ml + server_profit + timeseries - fee - slippage"
+    assert breakdown["net_pct"] == opportunity["expected_net_return_pct"]
+    components = {row["key"]: row for row in breakdown["components"]}
+    assert components["ai"]["contribution_pct"] == 0.15
+    assert components["local_ml"]["available"] is False
+    assert components["server_profit"]["raw_return_pct"] == -0.28
+    assert components["fee"]["contribution_pct"] < 0
+    assert breakdown["observed_not_in_formula"][0]["key"] == "sentiment"

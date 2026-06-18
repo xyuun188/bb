@@ -404,7 +404,51 @@ async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
     assert tools["model_bundle_available"] is False
     assert tools["child_endpoints"]["profit_prediction"]["available"] is True
     assert tools["child_endpoints"]["exit_advice"]["available"] is False
+    assert tools["expected_platform_api_base"] == "http://127.0.0.1:18001"
+    assert tools["tunnel_contract"]["status"] == "external_or_dev_endpoint"
     assert ("POST", "http://local-ai.test/profit/predict", "Bearer hidden-tools-key") in requests
+
+
+async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_port(
+    monkeypatch,
+) -> None:
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [],
+        local_ai_tools_api_base="http://127.0.0.1:8001",
+        local_ai_tools_api_key="hidden-tools-key",
+        ai_api_key="",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            request = httpx.Request(method, url)
+            return httpx.Response(200, json={"available": True}, request=request)
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+
+    tools = result["local_ai_tools"]
+    assert tools["available"] is False
+    assert tools["tunnel_contract"]["status"] == "wrong_loopback_port"
+    assert tools["tunnel_contract"]["expected"] == "http://127.0.0.1:18001"
+    assert "18001" in tools["config_issue"]
 
 
 async def test_symbols_available_error_response_is_redacted(

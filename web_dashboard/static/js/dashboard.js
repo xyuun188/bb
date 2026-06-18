@@ -1784,6 +1784,29 @@ function opportunityScoreReturnDetail(score) {
 
 function opportunityScoreFormulaItems(score) {
     if (!score || typeof score !== 'object') return [];
+    const breakdown = score.expected_net_breakdown || {};
+    const components = Array.isArray(breakdown.components) ? breakdown.components : [];
+    if (components.length) {
+        return components.map(component => {
+            const contribution = Number(component.contribution_pct);
+            const rawReturn = Number(component.raw_return_pct);
+            const weight = Number(component.weight);
+            const available = component.available !== false;
+            const pieces = [];
+            if (Number.isFinite(contribution)) pieces.push(signedPctValueLabel(contribution));
+            if (Number.isFinite(rawReturn) && Number.isFinite(weight)) {
+                pieces.push(`原始 ${signedPctValueLabel(rawReturn)} × 权重 ${opportunityScoreValue(weight, 2)}`);
+            }
+            if (!available) pieces.push('当前未参与');
+            return {
+                label: component.label || component.key || '收益来源',
+                value: Number.isFinite(contribution) ? contribution : 0,
+                text: pieces.join(' · ') || '-',
+                tone: !available ? 'muted' : (contribution > 0 ? 'good' : (contribution < 0 ? 'bad' : 'muted')),
+                note: component.note || '',
+            };
+        });
+    }
     const weights = score.expected_net_weights || {};
     const weightOf = (key) => Number(weights[key] ?? 0);
     const signed = (value) => `${Number(value) >= 0 ? '+' : ''}${opportunityScoreValue(value, 4)}%`;
@@ -1822,20 +1845,28 @@ function opportunityScoreFormulaItems(score) {
 function opportunityScoreFormulaHtml(score) {
     const items = opportunityScoreFormulaItems(score);
     if (!items.length) return '';
+    const breakdown = score.expected_net_breakdown || {};
     const net = Number(score.expected_net_return_pct);
     const modelNet = Number(score.model_expected_net_return_pct);
     const rows = items.map(item => `
         <div class="decision-score-formula-item ${escHtml(item.tone || '')}">
             <span>${escHtml(item.label)}</span>
             <strong>${escHtml(item.text)}</strong>
+            ${item.note ? `<em>${escHtml(item.note)}</em>` : ''}
         </div>
     `).join('');
+    const observedRows = Array.isArray(breakdown.observed_not_in_formula)
+        ? breakdown.observed_not_in_formula.map(item => `
+            <span>${escHtml(item.label || item.key || '观察项')}：${escHtml(item.available === false ? '未返回' : (item.aligned ? '同向观察' : '仅作证据观察'))}</span>
+        `).join('')
+        : '';
     const modelNetText = Number.isFinite(modelNet) ? `模型净值 ${signedPctValueLabel(modelNet)}` : '';
     const netText = Number.isFinite(net) ? `最终净收益 ${signedPctValueLabel(net)}` : '';
     return `
         <div class="decision-score-formula">
-            <div class="decision-score-formula-head"><span>净收益来源</span><em>${escHtml([modelNetText, netText].filter(Boolean).join(' · '))}</em></div>
+            <div class="decision-score-formula-head"><span>净收益拆解</span><em>${escHtml([modelNetText, netText].filter(Boolean).join(' · '))}</em></div>
             <div class="decision-score-formula-grid">${rows}</div>
+            ${observedRows ? `<div class="decision-score-observed"><strong>只参与证据评分</strong>${observedRows}</div>` : ''}
         </div>
     `;
 }
@@ -2360,20 +2391,28 @@ function analysisOpportunityScoreHtml(score, record = null) {
     const executionState = opportunityScoreExecutionState(score, record);
     const rank = score.rank && score.candidate_count ? `${score.rank}/${score.candidate_count}` : '-';
     const primaryReturn = opportunityScorePrimaryReturn(score);
-    const returnDetail = opportunityScoreReturnDetail(score);
-    const text = [
-        `机会分 ${opportunityScoreValue(score.score, 6)}`,
-        `排名 ${rank}`,
-        `方向 ${actionLabel(score.side || '-')}`,
-        `${primaryReturn.label} ${opportunityScoreValue(primaryReturn.value, 4)}%`,
-        ...(returnDetail ? [`收益来源 ${returnDetail}`] : []),
-        `相对反向优势 ${opportunityScoreValue(score.profit_edge_pct, 4)}%`,
-        `ML胜率 ${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%`,
-        `状态 ${executionState.label}`,
-    ].join('；');
+    const metrics = [
+        ['机会分', opportunityScoreValue(score.score, 6)],
+        ['排名', rank],
+        ['方向', actionLabel(score.side || '-')],
+        [primaryReturn.label, `${opportunityScoreValue(primaryReturn.value, 4)}%`],
+        ['反向优势', `${opportunityScoreValue(score.profit_edge_pct, 4)}%`],
+        ['ML胜率', `${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%`],
+        ['执行状态', executionState.label],
+    ].map(([label, value]) => `
+        <div class="analysis-opportunity-metric">
+            <span>${escHtml(label)}</span>
+            <strong>${escHtml(value)}</strong>
+        </div>
+    `).join('');
     const reason = score.selection_reason || '用于把多个开仓候选按预期净收益排序，不替代 AI 对方向、仓位、杠杆和平仓的裁决。';
+    const formulaHtml = opportunityScoreFormulaHtml(score);
     return `
-        <div class="analysis-note"><span>盈利机会评分</span>${analysisText(text)}</div>
+        <div class="analysis-opportunity-card">
+            <div class="analysis-opportunity-head"><span>盈利机会评分</span><em>${escHtml(executionState.label)}</em></div>
+            <div class="analysis-opportunity-grid">${metrics}</div>
+            ${formulaHtml}
+        </div>
         <div class="analysis-note analysis-note-muted"><span>排序原因</span>${analysisText(reason)}</div>
     `;
 }
@@ -3926,7 +3965,7 @@ function localModelStatus(status, key) {
         deep_timeseries: 'time_series_prediction',
         sentiment: 'sentiment_analysis',
         deep_sentiment: 'sentiment_analysis',
-        exit: 'exit_advice',
+        exit: ['exit_advice', 'exit', 'position_exit'],
     };
     const modelAliases = {
         profit: ['profit', 'profit_model', 'entry_profit', 'profit_prediction'],
@@ -3936,7 +3975,10 @@ function localModelStatus(status, key) {
         deep_sentiment: ['deep_sentiment', 'sentiment', 'sentiment_model', 'sentiment_analysis'],
         exit: ['exit', 'exit_advice', 'position_exit'],
     };
-    const endpoint = childEndpoints[endpointByModel[key]];
+    const endpointAliases = Array.isArray(endpointByModel[key])
+        ? endpointByModel[key]
+        : [endpointByModel[key]];
+    const endpoint = endpointAliases.map(name => childEndpoints[name]).find(Boolean);
     const modelReady = (modelAliases[key] || [key]).some(alias => Boolean(models[alias]));
     return Boolean(status?.service_available !== false && (modelReady || endpoint?.available));
 }
@@ -4469,6 +4511,7 @@ function runtimeEndpointSummary(health) {
     const parts = [];
     parts.push(status ? `HTTP ${status}` : (health.ok ? 'HTTP 正常' : 'HTTP 未连接'));
     if (Number.isFinite(latency)) parts.push(`${monitorNumber(latency, 0)} ms`);
+    if (health.error) parts.push(String(health.error));
     if (health.truncated) parts.push('响应已截断');
     return parts.join(' · ');
 }
@@ -4485,7 +4528,11 @@ function renderServerModelRuntime(data, container) {
     const platformToolChildren = platformTools.child_endpoints || {};
     const platformToolChildEntries = Object.entries(platformToolChildren);
     const platformToolChildAvailable = platformToolChildEntries.filter(([, item]) => item && item.available).length;
-    const toolsAvailable = Boolean(tools.available || platformTools.available || platformToolChildAvailable > 0);
+    const platformToolContract = platformTools.tunnel_contract || {};
+    const platformToolContractOk = platformToolContract.ok !== false;
+    const toolsAvailable = Boolean(
+        tools.available || (platformToolContractOk && (platformTools.available || platformToolChildAvailable > 0))
+    );
     const toolsModels = tools.models || platformTools.models || {};
     const vllmLabel = vllm.label || vllm.provider_model || 'vLLM';
     const vllmHealthLine = runtimeEndpointSummary(vllm.health);
@@ -4573,6 +4620,9 @@ function renderServerModelRuntime(data, container) {
                 <div>内网地址：${escHtml(tools.endpoint || '-')}</div>
                 <div>外网地址：${escHtml(localToolsPublicUrl())}</div>
                 <div>平台调用：${escHtml(platformTools.api_base || '-')}</div>
+                ${platformTools.expected_platform_api_base ? `<div>平台应调用：${escHtml(platformTools.expected_platform_api_base)}</div>` : ''}
+                ${platformToolContract.message ? `<div style="color:var(--accent-light);">契约提示：${escHtml(platformToolContract.message)}</div>` : ''}
+                ${platformTools.config_issue ? `<div style="color:var(--red);">配置问题：${escHtml(platformTools.config_issue)}</div>` : ''}
                 <div>状态接口：${escHtml(toolsStatusLine || '-')}</div>
                 <div>健康接口：${escHtml(toolsHealthLine || '-')}</div>
                 <div>平台子接口：${platformToolChildEntries.length ? `${platformToolChildAvailable}/${platformToolChildEntries.length} 正常` : '-'}</div>
@@ -4592,6 +4642,8 @@ function renderServerModelRuntime(data, container) {
                 ${platformRows}
                 <div>量化工具：${escHtml(platformTools.configured ? (platformTools.available ? '可访问' : '不可访问') : '未配置')}</div>
                 <div>量化工具地址：${escHtml(platformTools.api_base || '-')}</div>
+                ${platformTools.expected_platform_api_base ? `<div>期望地址：${escHtml(platformTools.expected_platform_api_base)}</div>` : ''}
+                ${platformTools.config_issue ? `<div style="color:var(--red);">配置问题：${escHtml(platformTools.config_issue)}</div>` : ''}
                 <div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '未就绪/启发式可用')}</div>
                 ${platformTools.status && platformTools.status.error ? `<div style="color:var(--red);">状态接口：${escHtml(platformTools.status.error)}</div>` : ''}
                 ${platformToolChildEntries.length ? `<div class="server-monitor-process-list">${platformToolChildEntries.map(([name, item]) => `

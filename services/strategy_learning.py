@@ -35,8 +35,8 @@ from models.learning import (
 from models.trade import Order, Position
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.execution_result_classifier import ExecutionResultClassifier
-from services.okx_error_classifier import is_okx_temporary_service_error
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -206,8 +206,6 @@ def _material_release_pressure(
     active_profile_id: str = "",
 ) -> bool:
     if open_pressure.get("full_position_pressure") or open_pressure.get("fragmentation_pressure"):
-        return True
-    if (problem_keys or set()) & {"full_position_loss_pressure", "max_position_blocks"}:
         return True
     if (
         active_profile_id == "loss_release"
@@ -2484,14 +2482,20 @@ class StrategyScheduler:
             selected = by_id["loss_release"]
             reason = "检测到低质量持仓占用仓位，优先调度亏损释放画像。"
         elif (
-            "full_position_loss_pressure" in problem_keys or "max_position_blocks" in problem_keys
-        ) and "loss_release" in by_id:
+            ("full_position_loss_pressure" in problem_keys or "max_position_blocks" in problem_keys)
+            and material_release_pressure
+            and "loss_release" in by_id
+        ):
             selected = by_id["loss_release"]
             reason = "检测到满仓和亏损仓占位，优先调度亏损释放画像。"
         elif (
-            "reflection_loss_hold_too_long" in problem_keys
-            or "reflection_negative_pnl" in problem_keys
-        ) and "loss_release" in by_id:
+            (
+                "reflection_loss_hold_too_long" in problem_keys
+                or "reflection_negative_pnl" in problem_keys
+            )
+            and material_release_pressure
+            and "loss_release" in by_id
+        ):
             selected = by_id["loss_release"]
             reason = "策略复盘显示费后亏损或亏损仓拖延过久，调度亏损释放画像。"
         else:
@@ -2606,7 +2610,13 @@ class StrategyScheduler:
         open_pressure = _safe_dict(feedback.open_position_pressure)
         pressure_active = _material_release_pressure(open_pressure, problem_keys)
         net_pnl = _safe_float(feedback.totals.get("net_pnl"), 0.0)
-        return bool(pressure_active and net_pnl < 0.0)
+        has_current_pressure = bool(
+            open_pressure.get("full_position_pressure")
+            or open_pressure.get("fragmentation_pressure")
+            or _material_low_quality_pressure(open_pressure)
+            or _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0
+        )
+        return bool(pressure_active and has_current_pressure and net_pnl < 0.0)
 
     @staticmethod
     def _auto_disabled_profile_can_be_reconsidered(
@@ -3261,8 +3271,15 @@ class StrategyLearningEngine:
             {str(item) for item in _safe_list(feedback_summary.get("problem_keys"))},
             active_profile_id=active_profile_id,
         )
+        has_current_release_pressure = bool(
+            open_pressure.get("full_position_pressure")
+            or open_pressure.get("fragmentation_pressure")
+            or _material_low_quality_pressure(open_pressure)
+            or _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0
+        )
         release_pressure_active = bool(
             material_release_pressure
+            and has_current_release_pressure
             and (
                 _safe_float(feedback_summary.get("net_pnl"), 0.0) < 0.0
                 or _safe_int(open_pressure.get("low_quality_open_count"), 0) > 0
@@ -3344,6 +3361,25 @@ class StrategyLearningEngine:
             if release_pressure_active
             else ""
         )
+        result["strategy_learning_release_pressure_detail"] = {
+            "active": release_pressure_active,
+            "material_pressure": material_release_pressure,
+            "current_pressure": has_current_release_pressure,
+            "policy": "current_position_pressure_only",
+            "reason": result["strategy_learning_release_pressure_reason"],
+            "open_position_pressure": {
+                "open_count": _safe_int(open_pressure.get("open_count"), 0),
+                "open_group_count": _safe_int(open_pressure.get("open_group_count"), 0),
+                "max_open_positions": _safe_int(open_pressure.get("max_open_positions"), 0),
+                "full_position_pressure": bool(open_pressure.get("full_position_pressure")),
+                "fragmentation_pressure": bool(open_pressure.get("fragmentation_pressure")),
+                "low_quality_open_count": _safe_int(open_pressure.get("low_quality_open_count"), 0),
+                "low_quality_open_ratio": _safe_float(
+                    open_pressure.get("low_quality_open_ratio"), 0.0
+                ),
+                "release_queue_count": _safe_int(open_pressure.get("release_queue_count"), 0),
+            },
+        }
         result["position_rebalance_queue"] = rebalance_queue
         result["low_quality_open_count"] = _safe_int(open_pressure.get("low_quality_open_count"), 0)
         result["low_quality_open_ratio"] = _safe_float(
@@ -3366,6 +3402,7 @@ class StrategyLearningEngine:
             "recovery_probe_reason": result["strategy_learning_recovery_probe_reason"],
             "release_pressure_active": release_pressure_active,
             "release_pressure_reason": result["strategy_learning_release_pressure_reason"],
+            "release_pressure_detail": result["strategy_learning_release_pressure_detail"],
             "loss_exit_aggressiveness": result["loss_exit_aggressiveness"],
             "full_position_release": result["full_position_release"],
             "release_losing_positions_first": result["release_losing_positions_first"],

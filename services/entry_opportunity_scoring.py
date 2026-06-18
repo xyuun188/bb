@@ -17,10 +17,12 @@ from services.entry_evidence import build_entry_evidence_score
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_signal_extraction import (
     directional_expected_return_pct,
-    expected_return_pct as signal_expected_return_pct,
     first_tool_payload,
     payload_side,
     signal_available,
+)
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
 )
 from services.entry_stop_loss_budget import ENTRY_MAX_STOP_LOSS_NORMAL_USDT
 from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
@@ -322,7 +324,6 @@ class EntryOpportunityScoringPolicy:
         )
         min_score_required = base_min_score_required
         dynamic_score_reason = f"分歧大、波动异常或没有盈利模型同向确认，保持 {base_min_score_required:.2f}+ 基础门槛。"
-        local_tools = self._safe_dict(raw.get("local_ai_tools"))
         local_profit = _tool_signal(
             raw,
             "profit_prediction",
@@ -359,6 +360,22 @@ class EntryOpportunityScoringPolicy:
         ts_best_side = payload_side(ts_prediction)
         ts_expected = directional_expected_return_pct(ts_prediction, side)
         ts_aligned = signal_available(ts_prediction) and ts_best_side == side and ts_expected > 0
+        sentiment_prediction = _tool_signal(
+            raw,
+            "sentiment_analysis",
+            "sentiment_prediction",
+            "sentiment_model",
+            "sentiment",
+        )
+        sentiment_best_side = payload_side(sentiment_prediction)
+        sentiment_expected = signal_expected_return_pct(
+            sentiment_prediction, sentiment_best_side or side
+        )
+        sentiment_aligned = (
+            signal_available(sentiment_prediction)
+            and sentiment_best_side == side
+            and sentiment_expected > 0
+        )
         if exposure.get("dominant_side") in {"long", "short"}:
             dominant = str(exposure.get("dominant_side") or "")
             opposite_dominant = "short" if dominant == "long" else "long"
@@ -698,6 +715,96 @@ class EntryOpportunityScoringPolicy:
             - fee_pct
             - slippage_pct
         )
+        expected_net_breakdown = {
+            "formula": "ai + local_ml + server_profit + timeseries - fee - slippage",
+            "unit": "pct",
+            "components": [
+                {
+                    "key": "ai",
+                    "label": "AI风险收益",
+                    "available": True,
+                    "side": side,
+                    "raw_return_pct": round(ai_expected_return_pct, 6),
+                    "weight": ENTRY_NET_WEIGHT_AI,
+                    "contribution_pct": round(ai_only_profit_bias, 6),
+                    "note": (
+                        "缺少 ML/盈利模型同向确认时，AI 贡献封顶 0.15%。"
+                        if ai_only_profit_bias < ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
+                        else "按置信度、止盈和止损估算。"
+                    ),
+                },
+                {
+                    "key": "local_ml",
+                    "label": "本地ML",
+                    "available": side_influence_enabled and bool(primary),
+                    "side": side,
+                    "raw_return_pct": round(expected_pct, 6),
+                    "weight": ENTRY_NET_WEIGHT_LOCAL_ML,
+                    "contribution_pct": round(expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML, 6),
+                    "note": (
+                        "ML 达标并参与收益公式。"
+                        if side_influence_enabled
+                        else "ML 当前 learning_only，不参与收益公式。"
+                    ),
+                },
+                {
+                    "key": "server_profit",
+                    "label": "服务器盈利模型",
+                    "available": local_available,
+                    "side": local_best_side or "unknown",
+                    "raw_return_pct": round(local_expected, 6),
+                    "weight": ENTRY_NET_WEIGHT_SERVER_PROFIT,
+                    "contribution_pct": round(local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT, 6),
+                    "loss_probability": round(local_loss_probability, 6),
+                    "note": (
+                        "同向正期望。" if local_aligned else "未同向或期望为负，会拉低净收益。"
+                    ),
+                },
+                {
+                    "key": "timeseries",
+                    "label": "时序模型",
+                    "available": signal_available(ts_prediction),
+                    "side": ts_best_side or "unknown",
+                    "raw_return_pct": round(ts_expected, 6),
+                    "weight": ENTRY_NET_WEIGHT_TIMESERIES,
+                    "contribution_pct": round(ts_expected * ENTRY_NET_WEIGHT_TIMESERIES, 6),
+                    "note": "同向参与收益公式。" if ts_aligned else "未形成同向正期望。",
+                },
+                {
+                    "key": "fee",
+                    "label": "双边手续费估算",
+                    "available": True,
+                    "side": "cost",
+                    "raw_return_pct": round(fee_pct, 6),
+                    "weight": -1.0,
+                    "contribution_pct": round(-fee_pct, 6),
+                    "note": "固定从预期收益中扣除。",
+                },
+                {
+                    "key": "slippage",
+                    "label": "滑点预算",
+                    "available": True,
+                    "side": "cost",
+                    "raw_return_pct": round(slippage_pct, 6),
+                    "weight": -1.0,
+                    "contribution_pct": round(-slippage_pct, 6),
+                    "note": "按配置最大滑点扣除。",
+                },
+            ],
+            "observed_not_in_formula": [
+                {
+                    "key": "sentiment",
+                    "label": "情绪模型",
+                    "available": signal_available(sentiment_prediction),
+                    "side": sentiment_best_side or "unknown",
+                    "raw_return_pct": round(sentiment_expected, 6),
+                    "aligned": bool(sentiment_aligned),
+                    "note": "参与证据评分和专家意见，当前不直接进入 expected_net 公式。",
+                }
+            ],
+            "net_pct": round(expected_net_return_pct, 6),
+            "model_net_pct": round(model_expected_net_return_pct, 6),
+        }
         expected_loss_pct = max(
             stop_loss_pct * 100 * max(1.0 - confidence, 0.0),
             max(local_loss_probability - 0.50, 0.0) * stop_loss_pct * 100 * 2.0,
@@ -877,6 +984,7 @@ class EntryOpportunityScoringPolicy:
             "ai_expected_return_contribution_pct": round(ai_only_profit_bias, 6),
             "model_expected_net_return_pct": round(model_expected_net_return_pct, 6),
             "expected_net_return_pct": round(expected_net_return_pct, 6),
+            "expected_net_breakdown": expected_net_breakdown,
             "expected_loss_pct": round(expected_loss_pct, 6),
             "expected_net_weights": {
                 "ai_expected_return": ENTRY_NET_WEIGHT_AI,

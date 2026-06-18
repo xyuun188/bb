@@ -9,9 +9,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
-from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 
 def main() -> None:
@@ -23,7 +23,9 @@ def main() -> None:
                 "sudo systemctl restart local-ai-tools.service",
                 "sleep 3",
                 "systemctl is-active local-ai-tools.service",
-                "curl -s http://127.0.0.1:8001/health",
+                "set -a; . /data/trade_ai/local_ai_tools.env; set +a; "
+                'curl -sS -H "Authorization: Bearer ${LOCAL_AI_TOOLS_API_KEY}" '
+                "http://127.0.0.1:8001/health",
                 "echo",
                 "grep -n 'review_backend\\|RISK_REVIEW_BASE\\|local_review_backend' /data/trade_ai/tools/local_ai_tools_api.py | head -20",
             ]

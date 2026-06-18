@@ -48,6 +48,8 @@ PLATFORM_SERVICE_NAMES = (
     "redis-server.service",
     "redis.service",
 )
+ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE = "http://127.0.0.1:18001"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 InfoLoader = Callable[[Path], Any]
 SshConnector = Callable[..., Any]
@@ -73,6 +75,79 @@ def _host_from_api_base(value: Any) -> str:
     except Exception:
         return ""
     return host
+
+
+def _normalized_base_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _http_probe_error(status_code: int, data: Any) -> str:
+    if 200 <= status_code < 300:
+        return ""
+    detail = ""
+    if isinstance(data, dict):
+        raw_detail = data.get("detail") or data.get("message") or data.get("error")
+        if raw_detail:
+            detail = safe_error_text(raw_detail, limit=180)
+    if detail:
+        return detail
+    if status_code == 401:
+        return "HTTP 401：本地量化工具 API Key 不匹配或未同步。"
+    if status_code == 403:
+        return "HTTP 403：本地量化工具拒绝访问。"
+    if status_code == 404:
+        return "HTTP 404：接口路径不存在。"
+    if status_code >= 500:
+        return f"HTTP {status_code}：服务端异常或模型正在启动。"
+    if status_code > 0:
+        return f"HTTP {status_code}"
+    return ""
+
+
+def _http_probe_category(status_code: int) -> str:
+    if 200 <= status_code < 300:
+        return "ok"
+    if status_code == 401:
+        return "auth_failed"
+    if status_code == 403:
+        return "auth_forbidden"
+    if status_code == 404:
+        return "not_found"
+    if status_code >= 500:
+        return "server_error"
+    if status_code > 0:
+        return "http_error"
+    return "network_error"
+
+
+def _platform_tunnel_contract(actual_base: str, expected_base: str) -> dict[str, Any]:
+    actual = _normalized_base_url(actual_base)
+    expected = _normalized_base_url(expected_base)
+    host = _host_from_api_base(actual)
+    if not actual:
+        return {
+            "ok": False,
+            "actual": actual,
+            "expected": expected,
+            "status": "not_configured",
+            "message": "未配置平台调用地址。",
+        }
+    if host and host not in LOOPBACK_HOSTS:
+        return {
+            "ok": True,
+            "actual": actual,
+            "expected": expected,
+            "status": "external_or_dev_endpoint",
+            "message": "当前不是线上平台 loopback 隧道地址，跳过 18001 契约检查。",
+        }
+    ok = actual == expected
+    return {
+        "ok": ok,
+        "actual": actual,
+        "expected": expected,
+        "status": "ok" if ok else "wrong_loopback_port",
+        "message": "平台本地量化工具必须通过 127.0.0.1:18001 隧道访问。" if not ok else "",
+    }
 
 
 def _model_access_host_from_platform_runtime(platform_runtime: dict[str, Any]) -> str:
@@ -353,11 +428,10 @@ def get_server_monitor_status_sync() -> dict[str, Any]:
 
 def _safe_run_platform_command(args: list[str], *, timeout: float = 2.0) -> tuple[int, str, str]:
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - args come from fixed platform probe allowlists.
             args,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
         )
@@ -376,15 +450,16 @@ def _platform_cpu_snapshot() -> dict[str, Any]:
     usage_pct = 0.0
     if sys.platform.startswith("linux"):
         try:
-            with open("/proc/stat", "r", encoding="utf-8") as handle:
+            with open("/proc/stat", encoding="utf-8") as handle:
                 first = [int(item) for item in handle.readline().split()[1:]]
             time.sleep(0.15)
-            with open("/proc/stat", "r", encoding="utf-8") as handle:
+            with open("/proc/stat", encoding="utf-8") as handle:
                 second = [int(item) for item in handle.readline().split()[1:]]
             idle_delta = (second[3] + second[4]) - (first[3] + first[4])
             total_delta = sum(second) - sum(first)
             usage_pct = round((1 - idle_delta / max(total_delta, 1)) * 100, 1)
-        except Exception:
+        except Exception as exc:
+            _ = exc
             usage_pct = 0.0
     return {
         "usage_pct": usage_pct,
@@ -399,7 +474,7 @@ def _platform_memory_snapshot() -> dict[str, Any]:
     if sys.platform.startswith("linux"):
         try:
             values: dict[str, int] = {}
-            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
                 for line in handle:
                     key, value = line.split(":", 1)
                     values[key] = int(value.strip().split()[0])
@@ -412,8 +487,8 @@ def _platform_memory_snapshot() -> dict[str, Any]:
                 "available_mb": round(available_mb, 1),
                 "used_pct": round((used_mb / total_mb * 100) if total_mb else 0.0, 1),
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            _ = exc
     return {"total_mb": 0.0, "used_mb": 0.0, "available_mb": 0.0, "used_pct": 0.0}
 
 
@@ -435,7 +510,7 @@ def _platform_disk_snapshot(path: Path) -> dict[str, Any]:
 def _platform_uptime_seconds() -> float | None:
     if sys.platform.startswith("linux"):
         try:
-            with open("/proc/uptime", "r", encoding="utf-8") as handle:
+            with open("/proc/uptime", encoding="utf-8") as handle:
                 return round(float(handle.readline().split()[0]), 1)
         except Exception:
             return None
@@ -524,6 +599,8 @@ async def _probe_platform_json(
             "ok": 200 <= response.status_code < 300,
             "status_code": response.status_code,
             "latency_ms": latency_ms,
+            "status_category": _http_probe_category(response.status_code),
+            "error": _http_probe_error(response.status_code, data),
             "data": data if isinstance(data, dict) else None,
         }
     except Exception as exc:
@@ -531,6 +608,7 @@ async def _probe_platform_json(
             "ok": False,
             "status_code": 0,
             "latency_ms": round((monotonic() - started) * 1000, 1),
+            "status_category": "network_error",
             "error": safe_error_text(exc, limit=180),
             "data": None,
         }
@@ -608,6 +686,7 @@ async def _probe_local_ai_tools_child_endpoints(
             "path": path,
             "status_code": result.get("status_code"),
             "latency_ms": result.get("latency_ms"),
+            "status_category": result.get("status_category"),
             "error": result.get("error", ""),
         }
 
@@ -673,6 +752,10 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         local_tools: dict[str, Any] = {"configured": bool(settings.local_ai_tools_api_base)}
         local_base = str(settings.local_ai_tools_api_base or "").strip().rstrip("/")
         if local_base:
+            tunnel_contract = _platform_tunnel_contract(
+                local_base,
+                ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE,
+            )
             health = await _probe_platform_json(
                 client,
                 f"{local_base}/health",
@@ -697,17 +780,27 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             local_tools.update(
                 {
                     "api_base": local_base,
-                    "available": bool(health.get("ok") or status.get("ok") or child_available),
+                    "expected_platform_api_base": ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE,
+                    "tunnel_contract": tunnel_contract,
+                    "available": bool(
+                        tunnel_contract.get("ok")
+                        and (health.get("ok") or status.get("ok") or child_available)
+                    ),
+                    "config_issue": (
+                        "" if tunnel_contract.get("ok") else tunnel_contract.get("message", "")
+                    ),
                     "health": {
                         "ok": bool(health.get("ok")),
                         "status_code": health.get("status_code"),
                         "latency_ms": health.get("latency_ms"),
+                        "status_category": health.get("status_category"),
                         "error": health.get("error", ""),
                     },
                     "status": {
                         "ok": bool(status.get("ok")),
                         "status_code": status.get("status_code"),
                         "latency_ms": status.get("latency_ms"),
+                        "status_category": status.get("status_category"),
                         "error": status.get("error", ""),
                     },
                     "model_bundle_available": bool(metadata.get("available")),

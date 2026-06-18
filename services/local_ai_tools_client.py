@@ -325,10 +325,11 @@ class LocalAIToolsClient:
                 "/models/status",
                 request_timeout=self._request_timeout(),
             )
+            status.setdefault("api_base", self._public_api_base())
             status_ok = True
             status_error = ""
         except Exception as exc:
-            status = {}
+            status = {"api_base": self._public_api_base()}
             status_ok = False
             status_error = safe_error_text(exc, limit=180)
 
@@ -345,6 +346,7 @@ class LocalAIToolsClient:
         status["service_available"] = service_available
         status["child_endpoints"] = child_endpoints
         status["available"] = bool(model_bundle_available or child_available)
+        status.setdefault("api_base", self._public_api_base())
         if status_error:
             status["status_error"] = status_error
         if child_available and not model_bundle_available:
@@ -365,6 +367,7 @@ class LocalAIToolsClient:
                 "available": False,
                 "status": "error",
                 "error": error,
+                "api_base": self._public_api_base(),
                 "model_bundle_available": False,
                 "service_available": False,
                 "child_endpoints": child_endpoints,

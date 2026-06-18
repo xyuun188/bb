@@ -356,6 +356,7 @@ async def test_local_ai_tools_status_failure_is_redacted(
     assert result["status"] == "error"
     assert leaked_value not in str(result)
     assert result["error"] == "Authorization: *** failed"
+    assert result["api_base"] == "http://local-ai-tools.test"
     assert client._last_failure == "Authorization: *** failed"
 
 
@@ -396,6 +397,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert result["available"] is True
     assert result["model_bundle_available"] is False
     assert result["service_available"] is True
+    assert result["api_base"] == "http://local-ai-tools.test"
     assert result["status"] == "heuristic_fallback_available"
     assert result["child_endpoints"]["profit_prediction"]["available"] is True
 

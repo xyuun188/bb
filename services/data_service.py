@@ -6,6 +6,7 @@ Provides a unified interface for the trading loop to get the latest data.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 from datetime import UTC, datetime
@@ -32,6 +33,14 @@ logger = structlog.get_logger(__name__)
 
 ABNORMAL_WICK_LOOKBACK_HOURS = 72.0
 ABNORMAL_WICK_MIN_RATIO = 1.50
+INDICATOR_FEATURE_TIMEFRAME = "1h"
+KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
+    "1m": 120,
+    "5m": 120,
+    "15m": 120,
+    "1h": 100,
+}
+TICKER_PERSIST_THROTTLE_SECONDS = 30.0
 
 
 class DataService:
@@ -63,14 +72,73 @@ class DataService:
         self._last_articles: list[dict] = []
         self._last_social_posts: list[dict] = []
         self._sentiment_refresh_task: asyncio.Task | None = None
+        self._ticker_persisted_at: dict[str, datetime] = {}
+        self._ticker_persist_inflight: set[str] = set()
 
         # Register ticker callback for real-time price updates
         self.ws_client.on_ticker(self._on_ticker_update)
 
     def _on_ticker_update(self, symbol: str, data: dict) -> None:
         """Callback invoked by WebSocket client on each ticker update."""
-        # Update price in all dependent services
-        pass  # Data is stored in ws_client.latest_tickers, accessed on demand
+        try:
+            normalized = self._normalize_symbols([symbol])[0]
+            last_persisted = getattr(self, "_ticker_persisted_at", {}).get(normalized)
+            now = datetime.now(UTC)
+            inflight = getattr(self, "_ticker_persist_inflight", set())
+            if normalized in inflight:
+                return
+            if (
+                last_persisted
+                and (now - last_persisted).total_seconds() < TICKER_PERSIST_THROTTLE_SECONDS
+            ):
+                return
+            loop = asyncio.get_running_loop()
+            inflight.add(normalized)
+            loop.create_task(self._persist_ticker_snapshot(symbol, data))
+        except RuntimeError:
+            return
+        except Exception as exc:
+            logger.debug(
+                "ticker callback persist scheduling failed",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+
+    async def _persist_ticker_snapshot(self, symbol: str, data: dict[str, Any]) -> None:
+        try:
+            normalized = self._normalize_symbols([symbol])[0]
+            payload = {
+                "last_price": self._safe_float(data.get("last_price"), 0.0),
+                "bid": self._safe_float(data.get("bid"), 0.0),
+                "ask": self._safe_float(data.get("ask"), 0.0),
+                "high_24h": self._safe_float(data.get("high_24h"), 0.0),
+                "low_24h": self._safe_float(data.get("low_24h"), 0.0),
+                "volume_24h": self._safe_float(data.get("volume_24h"), 0.0),
+                "change_24h_pct": self._safe_float(data.get("change_24h_pct"), 0.0),
+                "raw_data": json.dumps(
+                    {
+                        "symbol": normalized,
+                        "timestamp": data.get("timestamp"),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+            async with get_session_ctx() as session:
+                repo = MarketRepository(session)
+                await repo.upsert_ticker(normalized, payload)
+            self._ticker_persisted_at[normalized] = datetime.now(UTC)
+        except Exception as exc:
+            logger.debug(
+                "persist ticker snapshot failed",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+        finally:
+            getattr(self, "_ticker_persist_inflight", set()).discard(symbol)
+            normalized = self._normalize_symbols([symbol])[0] if symbol else ""
+            if normalized and normalized != symbol:
+                getattr(self, "_ticker_persist_inflight", set()).discard(normalized)
 
     async def start(self) -> None:
         """Start all data feed connections."""
@@ -548,10 +616,16 @@ class DataService:
 
     async def _get_indicator_snapshot(self, symbol: str) -> dict[str, float]:
         try:
-            klines = await self.rest_client.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+            kline_results = await asyncio.gather(
+                *(
+                    self._fetch_and_persist_klines(symbol, timeframe, limit)
+                    for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
+                )
+            )
+            klines_by_timeframe = {timeframe: rows for timeframe, rows in kline_results if rows}
+            klines = klines_by_timeframe.get(INDICATOR_FEATURE_TIMEFRAME) or []
             if not klines:
                 return {}
-            await self._persist_klines(symbol, "1h", klines)
             df = pd.DataFrame(
                 klines,
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
@@ -564,6 +638,31 @@ class DataService:
         except Exception as e:
             logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))
             return {}
+
+    async def _fetch_and_persist_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> tuple[str, list]:
+        """Fetch one timeframe and persist it for local model training."""
+        try:
+            klines = await self.rest_client.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                limit=limit,
+            )
+            if klines:
+                await self._persist_klines(symbol, timeframe, klines)
+            return timeframe, klines or []
+        except Exception as exc:
+            logger.debug(
+                "failed to fetch kline timeframe",
+                symbol=symbol,
+                timeframe=timeframe,
+                error=safe_error_text(exc),
+            )
+            return timeframe, []
 
     def _kline_anomaly_snapshot(self, df: pd.DataFrame) -> dict[str, float]:
         """Detect repeat extreme wicks that can make stop losses fill far away."""

@@ -367,3 +367,49 @@ def test_run_remote_text_caps_success_output() -> None:
     assert "a" * 30 not in output
     assert "b" * 30 not in output
     assert "remote output truncated at 16 characters" in output
+
+
+class FakeTransientSSH:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def exec_command(self, command: str, timeout: int):
+        self.calls += 1
+        if self.calls == 1:
+            import paramiko
+
+            raise paramiko.SSHException("Timeout opening channel.")
+        channel = FakeChannel(0)
+        return None, FakeStream("ok\n", channel), FakeStream("")
+
+
+def test_exec_remote_command_retries_transient_channel_open_error(monkeypatch) -> None:
+    class LocalSSHException(Exception):
+        pass
+
+    fake_ssh = FakeTransientSSH()
+    monkeypatch.setitem(sys.modules, "paramiko", SimpleNamespace(SSHException=LocalSSHException))
+    result = exec_remote_command(fake_ssh, "echo ok", timeout=12)
+
+    assert result.status == 0
+    assert fake_ssh.calls == 2
+    assert result.stdout == "ok\n"
+
+
+def test_exec_remote_command_does_not_retry_non_transient_errors(monkeypatch) -> None:
+    class LocalSSHException(Exception):
+        pass
+
+    class FakeFailureSSH:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def exec_command(self, command: str, timeout: int):
+            self.calls += 1
+            raise LocalSSHException("some other ssh error")
+
+    monkeypatch.setitem(sys.modules, "paramiko", SimpleNamespace(SSHException=LocalSSHException))
+    fake_ssh = FakeFailureSSH()
+    with pytest.raises(LocalSSHException):
+        exec_remote_command(fake_ssh, "echo ok", timeout=12)
+    assert fake_ssh.calls == 1

@@ -2039,6 +2039,9 @@ class TradingService:
                 "strategy_learning_recovery_probe_reason", ""
             ),
             "strategy_learning_sizing": strategy_mode_context.get("strategy_learning_sizing", {}),
+            "strategy_learning_release_pressure_detail": strategy_mode_context.get(
+                "strategy_learning_release_pressure_detail", {}
+            ),
             "strategy_learning": strategy_mode_context.get("strategy_learning"),
         }
         decision.raw_response = raw

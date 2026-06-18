@@ -2916,11 +2916,40 @@ select.form-input { cursor: pointer; }
     line-height: 1.4;
     overflow-wrap: anywhere;
 }
+.decision-score-formula-item em {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.45;
+    font-style: normal;
+    overflow-wrap: anywhere;
+}
 .decision-score-formula-item.good strong {
     color: var(--green);
 }
 .decision-score-formula-item.bad strong {
     color: var(--red);
+}
+.decision-score-formula-item.muted strong {
+    color: var(--text-muted);
+}
+.decision-score-observed {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+.decision-score-observed strong, .decision-score-observed span {
+    border: 1px solid var(--border-light);
+    border-radius: 999px;
+    padding: 3px 8px;
+    background: rgba(15,23,42,0.45);
+    color: var(--text-dim);
+    font-weight: 600;
+    overflow-wrap: anywhere;
 }
 .decision-score-reason > span {
     color: var(--text-muted);
@@ -3307,6 +3336,55 @@ select.form-input { cursor: pointer; }
     color: var(--text-dim);
     font-size: 12px;
     line-height: 1.55;
+}
+.analysis-opportunity-card {
+    display: grid;
+    gap: 10px;
+    margin-top: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.025);
+    min-width: 0;
+}
+.analysis-opportunity-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 800;
+}
+.analysis-opportunity-head em {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: normal;
+}
+.analysis-opportunity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 7px;
+}
+.analysis-opportunity-metric {
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: rgba(0,0,0,0.12);
+}
+.analysis-opportunity-metric span, .analysis-opportunity-metric strong {
+    display: block;
+    overflow-wrap: anywhere;
+}
+.analysis-opportunity-metric span {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+.analysis-opportunity-metric strong {
+    margin-top: 3px;
+    color: var(--text);
+    font-size: 12px;
 }
 .analysis-skill-head, .analysis-skill-body {
     min-width: 0;

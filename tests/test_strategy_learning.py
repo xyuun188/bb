@@ -405,6 +405,61 @@ def test_strategy_learning_single_low_quality_open_position_does_not_global_rele
     assert context["strategy_learning_sizing"].get("release_pressure_active") is not True
 
 
+def test_strategy_learning_historical_capacity_blocks_do_not_trigger_release_without_current_pressure(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-8.0, position_id=91)],
+        open_positions=[
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "OP/USDT",
+                "side": "long",
+                "entry_price": 100.0,
+                "current_price": 101.0,
+                "quantity": 1.0,
+                "unrealized_pnl": 1.0,
+                "created_at": datetime.now(UTC) - timedelta(minutes=30),
+            }
+        ],
+        orders=[],
+        decisions=[_healthy_decision("hold")],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "capacity_block",
+                status="blocked",
+                reason="max_position capacity reached earlier",
+            ),
+        ],
+        max_open_positions=20,
+    )
+    context = engine.apply_to_context({}, payload)
+
+    pressure = payload["feedback"]["open_position_pressure"]
+    problem_keys = {item["key"] for item in payload["feedback"]["problems"]}
+
+    assert "max_position_blocks" in problem_keys
+    assert pressure["full_position_pressure"] is False
+    assert pressure["fragmentation_pressure"] is False
+    assert pressure["low_quality_open_count"] == 0
+    assert payload["schedule"]["active_profile"]["id"] != "loss_release"
+    assert context["strategy_learning_release_pressure_active"] is False
+    assert context["strategy_learning_sizing"].get("release_pressure_active") is not True
+    assert context["strategy_learning_release_pressure_detail"]["current_pressure"] is False
+    assert (
+        context["strategy_learning_release_pressure_detail"]["policy"]
+        == "current_position_pressure_only"
+    )
+
+
 def test_llm_candidate_status_exposes_sanitized_cached_candidates(tmp_path) -> None:
 
     state_store = StrategyLearningStateStore(tmp_path / "state.json")
@@ -709,7 +764,7 @@ def test_strategy_learning_uses_trade_reflections_and_excludes_manual_samples(
 
     assert "trade_reflection_mistakes" in problem_keys
 
-    assert payload["schedule"]["active_profile"]["id"] == "loss_release"
+    assert payload["schedule"]["active_profile"]["id"] != "loss_release"
 
     assert any(
         "reflection_loss_hold_too_long" in row["matched_fixes"]

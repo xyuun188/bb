@@ -128,12 +128,13 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
     assert "if (Number.isFinite(net)) return { label: '预期净收益', value: net };" in script
     assert "function opportunityScoreFormulaItems" in script
     assert "function opportunityScoreFormulaHtml" in script
-    assert "净收益来源" in script
+    assert "净收益拆解" in script
+    assert "只参与证据评分" in script
     assert "AI贡献" in script
     assert "最终净收益" in script
     assert "预期收益：${opportunityScoreValue(score.expected_return_pct, 4)}%" not in script
     assert "`预期收益 ${opportunityScoreValue(score.expected_return_pct, 4)}%`" not in script
-    assert "收益来源" in script
+    assert "原始" in script
 
 
 def test_opportunity_score_execution_state_uses_final_status() -> None:
