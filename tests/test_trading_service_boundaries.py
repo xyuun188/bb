@@ -61,6 +61,25 @@ def _decision(action: Action) -> DecisionOutput:
     )
 
 
+def test_trading_service_detects_policy_skipped_execution_result() -> None:
+    result = ExecutionResult(
+        order_id="rejected",
+        symbol="BTC/USDT",
+        side="long",
+        order_type="market",
+        quantity=0.0,
+        price=0.0,
+        status=OrderStatus.REJECTED,
+        raw_response={
+            "execution_skipped": True,
+            "skip_kind": "entry_evidence_shadow_only",
+        },
+    )
+
+    assert TradingService._is_policy_skipped_execution_result(result) is True
+    assert TradingService._is_policy_skipped_execution_result(None) is False
+
+
 async def _async_value(value: Any) -> Any:
     return value
 
@@ -2438,6 +2457,43 @@ async def test_execution_service_serializes_candidate_execution():
     assert ("exit_policy", "ensemble_trader", 1, False) in calls
     assert ("exit_cooldown", "ensemble_trader", "BTC/USDT") in calls
     assert exit_results["executions"][0]["order_id"] == "order-1"
+
+    calls.clear()
+    stages.clear()
+    blocked_reason = "动态证据仍处于弱证据学习档，本轮只记录影子样本。"
+
+    async def evaluate_entry_policy_blocked(decision, model_name, model_mode, open_positions):
+        calls.append(("entry_policy_blocked", model_name, model_mode, len(open_positions or [])))
+        return PolicyGateResult.block(
+            "entry_evidence_shadow_only",
+            blocked_reason,
+            {
+                "stage_status": "skipped",
+                "skip_kind": "entry_evidence_shadow_only",
+                "shadow_only": True,
+            },
+        )
+
+    service.entry_policy_evaluator = evaluate_entry_policy_blocked
+    blocked_results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+    blocked_result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _decision(Action.LONG),
+        SimpleNamespace(warnings=[]),
+        125,
+        blocked_results,
+        open_positions=[],
+    )
+
+    assert blocked_result is not None
+    assert blocked_result.status == OrderStatus.REJECTED
+    assert blocked_result.raw_response["execution_skipped"] is True
+    assert blocked_result.raw_response["skip_kind"] == "entry_evidence_shadow_only"
+    assert blocked_results["decisions"][0]["execution_status"] == "skipped"
+    assert ("entry_policy_blocked", "ensemble_trader", "paper", 0) in calls
+    assert not any(call[0] in {"executor", "place_order"} for call in calls)
+    assert ("risk_check", "skipped", blocked_reason) in stages
 
 
 @pytest.mark.asyncio

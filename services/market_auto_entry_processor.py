@@ -15,6 +15,12 @@ from services.market_decision_result_recorder import MarketDecisionResultRecorde
 
 logger = structlog.get_logger(__name__)
 
+ENTRY_EVIDENCE_SHADOW_ONLY_TIERS = frozenset({"weak_conflict_probe", "degraded_missing_probe"})
+ENTRY_EVIDENCE_SHADOW_ONLY_REASON = (
+    "动态证据仍处于弱证据学习档，本轮只记录影子样本和复盘数据，"
+    "不提交 OKX 真实/模拟订单；需要更多同向模型证据或更高预期收益后再开仓。"
+)
+
 ScoreCandidate = Callable[[DecisionOutput, dict[str, Any] | None], float]
 GateReason = Callable[[DecisionOutput], str | None]
 CandidateSelectionAnnotator = Callable[..., dict[str, Any]]
@@ -70,6 +76,22 @@ class MarketAutoEntryProcessor:
     ) -> MarketAutoEntryProcessResult:
         self.clear_market_no_opportunity_symbol(symbol)
         self.score_candidate(decision, strategy_mode_context)
+        shadow_only_reason = self._entry_evidence_shadow_only_reason(decision)
+        if shadow_only_reason:
+            await self._record_skip(
+                symbol=symbol,
+                model_name=model_name,
+                decision=decision,
+                decision_db_id=decision_db_id,
+                results=results,
+                model_mode=model_mode,
+                reason=shadow_only_reason,
+            )
+            return MarketAutoEntryProcessResult(
+                handled=True,
+                execution_attempted=False,
+                reason=shadow_only_reason,
+            )
         if decision_db_id is not None:
             await self.mark_decision_raw_response(decision_db_id, decision.raw_response)
 
@@ -175,6 +197,32 @@ class MarketAutoEntryProcessor:
             execution_attempted=True,
             reason=immediate_plan.reason,
         )
+
+    @staticmethod
+    def _entry_evidence_shadow_only_reason(decision: DecisionOutput) -> str | None:
+        """Return the explicit observation-only reason for weak evidence entries."""
+
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
+        if not isinstance(opportunity, dict):
+            return None
+        evidence_score = opportunity.get("evidence_score")
+        if not isinstance(evidence_score, dict):
+            return None
+        evidence_tier = str(evidence_score.get("tier") or "")
+        if evidence_tier not in ENTRY_EVIDENCE_SHADOW_ONLY_TIERS:
+            return None
+        raw["entry_evidence_shadow_only"] = {
+            "applied": True,
+            "stage_status": "skipped",
+            "skip_kind": "entry_evidence_shadow_only",
+            "shadow_only": True,
+            "evidence_tier": evidence_tier,
+            "evidence_score": evidence_score,
+            "position_size_pct_before_execution": float(decision.position_size_pct or 0.0),
+        }
+        decision.raw_response = raw
+        return ENTRY_EVIDENCE_SHADOW_ONLY_REASON
 
     @staticmethod
     def _entry_gate_skip_reason(gate_reason: str) -> str:

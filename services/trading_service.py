@@ -3717,6 +3717,24 @@ class TradingService:
             return "short"
         return "hold"
 
+    @staticmethod
+    def _is_policy_skipped_execution_result(result: ExecutionResult | None) -> bool:
+        return TradingService._policy_execution_terminal_status(result) is not None
+
+    @staticmethod
+    def _policy_execution_terminal_status(result: ExecutionResult | None) -> str | None:
+        raw_response = result.raw_response if result is not None else None
+        if not isinstance(raw_response, dict):
+            return None
+        stage_status = str(raw_response.get("stage_status") or "").lower()
+        if stage_status in {"skipped", "blocked"}:
+            return stage_status
+        if raw_response.get("execution_skipped"):
+            return "skipped"
+        if raw_response.get("execution_policy_terminal") or raw_response.get("policy_blocker"):
+            return "blocked"
+        return None
+
     async def _execute_candidate(
         self,
         symbol: str,
@@ -3755,9 +3773,13 @@ class TradingService:
         )
         status = result.status.value if result is not None else "missing_result"
         exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        policy_terminal_status = self._policy_execution_terminal_status(result)
         event_status = "executed" if exchange_confirmed else "rejected"
         severity = "info" if exchange_confirmed else "warn"
-        if result is None:
+        if policy_terminal_status:
+            event_status = policy_terminal_status
+            severity = "info" if policy_terminal_status == "skipped" else "warn"
+        elif result is None:
             event_status = "failed"
             severity = "error"
         execution_links = await self._strategy_learning_execution_links(
@@ -3787,6 +3809,13 @@ class TradingService:
                 "status": status,
                 **execution_links,
                 "exchange_confirmed": exchange_confirmed,
+                "execution_skipped": policy_terminal_status == "skipped",
+                "policy_terminal_status": policy_terminal_status,
+                "skip_kind": (
+                    result.raw_response.get("skip_kind")
+                    if result is not None and isinstance(result.raw_response, dict)
+                    else None
+                ),
             },
         )
         return result
@@ -3825,9 +3854,13 @@ class TradingService:
             refresh_exit_positions=refresh_exit_positions,
         )
         exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        policy_terminal_status = self._policy_execution_terminal_status(result)
         event_status = "executed" if exchange_confirmed else "rejected"
         severity = "info" if exchange_confirmed else "warn"
-        if result is None:
+        if policy_terminal_status:
+            event_status = policy_terminal_status
+            severity = "info" if policy_terminal_status == "skipped" else "warn"
+        elif result is None:
             event_status = "failed"
             severity = "error"
         execution_links = await self._strategy_learning_execution_links(
@@ -3857,6 +3890,13 @@ class TradingService:
                 "status": result.status.value if result is not None else "missing_result",
                 **execution_links,
                 "exchange_confirmed": exchange_confirmed,
+                "execution_skipped": policy_terminal_status == "skipped",
+                "policy_terminal_status": policy_terminal_status,
+                "skip_kind": (
+                    result.raw_response.get("skip_kind")
+                    if result is not None and isinstance(result.raw_response, dict)
+                    else None
+                ),
             },
         )
         return result

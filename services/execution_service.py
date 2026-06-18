@@ -603,13 +603,19 @@ class ExecutionService:
                 data,
             )
 
-        async def block_before_submit(policy_result: PolicyGateResult) -> None:
+        async def block_before_submit(policy_result: PolicyGateResult) -> ExecutionResult:
             reason = str(policy_result.reason or "策略或风控检查未通过，未提交 OKX 订单。")
             blocker = str(policy_result.blocker or "policy_gate")
             data = {"blocker": blocker}
             if isinstance(policy_result.data, dict):
                 data.update(policy_result.data)
-            if data.get("stage_status") == DecisionStageStatus.SKIPPED:
+            stage_status = str(data.get("stage_status") or "").lower()
+            is_skipped = (
+                stage_status == DecisionStageStatus.SKIPPED
+                or bool(data.get("shadow_only"))
+                or bool(data.get("skip_kind"))
+            )
+            if is_skipped:
                 await mark_skipped(reason, data)
             else:
                 await mark_blocked(reason, data)
@@ -641,6 +647,22 @@ class ExecutionService:
                     "is_paper": (model_mode == "paper"),
                 }
             )
+            result = rejected_execution_result(decision, reason)
+            raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+            raw_response.update(
+                {
+                    "execution_skipped": is_skipped,
+                    "execution_policy_terminal": True,
+                    "policy_blocker": blocker,
+                    "stage_status": (
+                        DecisionStageStatus.SKIPPED if is_skipped else DecisionStageStatus.BLOCKED
+                    ),
+                    "skip_kind": data.get("skip_kind") or blocker,
+                    "reason": reason,
+                }
+            )
+            result.raw_response = raw_response
+            return result
 
         arbitration = arbitrate_decision(decision)
         await mark_stage(
@@ -659,13 +681,12 @@ class ExecutionService:
         if decision_db_id is not None:
             duplicate_reason = await duplicate_decision_order_reason(decision_db_id, decision)
             if duplicate_reason:
-                await block_before_submit(
+                return await block_before_submit(
                     PolicyGateResult.block(
                         "duplicate_decision_order",
                         duplicate_reason,
                     )
                 )
-                return None
 
         if decision.is_exit:
             exit_policy_result = await evaluate_exit_policy(
@@ -675,8 +696,7 @@ class ExecutionService:
                 refresh_positions=refresh_exit_positions,
             )
             if not exit_policy_result.passed:
-                await block_before_submit(exit_policy_result)
-                return None
+                return await block_before_submit(exit_policy_result)
 
         if decision.is_entry:
             entry_policy_result = await evaluate_entry_policy(
@@ -686,8 +706,7 @@ class ExecutionService:
                 open_positions,
             )
             if not entry_policy_result.passed:
-                await block_before_submit(entry_policy_result)
-                return None
+                return await block_before_submit(entry_policy_result)
             if decision_db_id is not None:
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
 
@@ -765,9 +784,7 @@ class ExecutionService:
                     {
                         "has_execution_result": execution_result is not None,
                         "status": getattr(getattr(execution_result, "status", None), "value", None),
-                        "exchange_order_id": getattr(
-                            execution_result, "exchange_order_id", None
-                        ),
+                        "exchange_order_id": getattr(execution_result, "exchange_order_id", None),
                     },
                 )
             if decision.is_entry and execution_result is not None:

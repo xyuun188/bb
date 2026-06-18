@@ -6,7 +6,10 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
-from services.market_auto_entry_processor import MarketAutoEntryProcessor
+from services.market_auto_entry_processor import (
+    ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
+    MarketAutoEntryProcessor,
+)
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 
@@ -114,6 +117,45 @@ def _processor(
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
     )
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    decision = _decision()
+    decision.position_size_pct = 0.02
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 1.2,
+            "expected_net_return_pct": 0.9,
+            "evidence_score": {
+                "tier": "weak_conflict_probe",
+                "effective_score": 42.0,
+            },
+        }
+    }
+
+    result = await _processor(calls).process(
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=decision,
+        assessment=object(),
+        decision_db_id=12,
+        results=results,
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts={},
+        strategy_mode_context=None,
+    )
+
+    assert result.handled is True
+    assert result.execution_attempted is False
+    assert result.reason == ENTRY_EVIDENCE_SHADOW_ONLY_REASON
+    assert results["decisions"][0]["execution_status"] == "skipped"
+    assert decision.raw_response["entry_evidence_shadow_only"]["shadow_only"] is True
+    assert ("reason", 12, ENTRY_EVIDENCE_SHADOW_ONLY_REASON) in calls
+    assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
 
 
 @pytest.mark.asyncio
