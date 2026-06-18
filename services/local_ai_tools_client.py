@@ -445,6 +445,8 @@ class LocalAIToolsClient:
         text_sentiment_samples: list[dict[str, Any]] | None = None,
         *,
         source: str = "local_trading_system_auto",
+        completed_shadow_sample_count: int | None = None,
+        completed_trade_sample_count: int | None = None,
     ) -> dict[str, Any]:
         if not self.enabled():
             return {"trained": False, "reason": "disabled"}
@@ -457,6 +459,8 @@ class LocalAIToolsClient:
             "trade_samples": trade_samples,
             "sequence_samples": sequence_samples or [],
             "text_sentiment_samples": text_sentiment_samples or [],
+            "completed_shadow_sample_count": completed_shadow_sample_count,
+            "completed_trade_sample_count": completed_trade_sample_count,
         }
         payload = self._json_safe(payload)
         try:

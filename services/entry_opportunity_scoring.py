@@ -16,6 +16,7 @@ from config.settings import settings
 from services.entry_evidence import build_entry_evidence_score
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_signal_extraction import (
+    directional_expected_return_pct,
     expected_return_pct as signal_expected_return_pct,
     first_tool_payload,
     payload_side,
@@ -320,9 +321,7 @@ class EntryOpportunityScoringPolicy:
             MIN_ENTRY_OPPORTUNITY_SCORE,
         )
         min_score_required = base_min_score_required
-        dynamic_score_reason = (
-            f"分歧大、波动异常或没有盈利模型同向确认，保持 {base_min_score_required:.2f}+ 基础门槛。"
-        )
+        dynamic_score_reason = f"分歧大、波动异常或没有盈利模型同向确认，保持 {base_min_score_required:.2f}+ 基础门槛。"
         local_tools = self._safe_dict(raw.get("local_ai_tools"))
         local_profit = _tool_signal(
             raw,
@@ -358,7 +357,7 @@ class EntryOpportunityScoringPolicy:
             "time_series",
         )
         ts_best_side = payload_side(ts_prediction)
-        ts_expected = signal_expected_return_pct(ts_prediction, side)
+        ts_expected = directional_expected_return_pct(ts_prediction, side)
         ts_aligned = signal_available(ts_prediction) and ts_best_side == side and ts_expected > 0
         if exposure.get("dominant_side") in {"long", "short"}:
             dominant = str(exposure.get("dominant_side") or "")
@@ -681,8 +680,18 @@ class EntryOpportunityScoringPolicy:
             historical_adjustment = historical_adjustment_cap
         historical_adjustment += symbol_tier_score_adjustment
 
+        model_expected_net_return_pct = (
+            expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML
+            + local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT
+            + ts_expected * ENTRY_NET_WEIGHT_TIMESERIES
+            - fee_pct
+            - slippage_pct
+        )
+        ai_only_profit_bias = ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
+        if not (ml_aligned or local_aligned):
+            ai_only_profit_bias = min(ai_only_profit_bias, 0.15)
         expected_net_return_pct = (
-            ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
+            ai_only_profit_bias
             + expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML
             + local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT
             + ts_expected * ENTRY_NET_WEIGHT_TIMESERIES
@@ -865,10 +874,13 @@ class EntryOpportunityScoringPolicy:
             "timeseries_aligned": bool(ts_aligned),
             "confidence": round(confidence, 6),
             "ai_expected_return_pct": round(ai_expected_return_pct, 6),
+            "ai_expected_return_contribution_pct": round(ai_only_profit_bias, 6),
+            "model_expected_net_return_pct": round(model_expected_net_return_pct, 6),
             "expected_net_return_pct": round(expected_net_return_pct, 6),
             "expected_loss_pct": round(expected_loss_pct, 6),
             "expected_net_weights": {
                 "ai_expected_return": ENTRY_NET_WEIGHT_AI,
+                "ai_expected_return_cap_without_quant": 0.15,
                 "local_ml_expected_return": ENTRY_NET_WEIGHT_LOCAL_ML,
                 "server_profit_expected_return": ENTRY_NET_WEIGHT_SERVER_PROFIT,
                 "timeseries_expected_return": ENTRY_NET_WEIGHT_TIMESERIES,

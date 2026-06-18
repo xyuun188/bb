@@ -66,6 +66,17 @@ def test_local_ai_tools_generated_service_uses_trusted_model_artifact_boundary()
     assert "joblib.dump(bundle, BUNDLE_PATH)" not in SERVICE_CODE
 
 
+def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
+    assert "completed_shadow_sample_count: int | None = None" in SERVICE_CODE
+    assert (
+        '"completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows))'
+        in SERVICE_CODE
+    )
+    assert '"last_trained_completed_shadow_sample_count": int(' in SERVICE_CODE
+    assert '"completed_trade_sample_count": int(' in SERVICE_CODE
+    assert '"last_trained_completed_trade_sample_count": int(' in SERVICE_CODE
+
+
 def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
     source = (ROOT / "scripts" / "deploy_local_ai_tools_service.py").read_text(encoding="utf-8")
 

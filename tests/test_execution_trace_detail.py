@@ -48,3 +48,20 @@ def test_execution_trace_synthesizes_legacy_order_snapshot() -> None:
     ]
     assert trace["execution_steps"][0]["duration_sec"] == 3.0
     assert trace["execution_steps"][0]["data"]["source"] == "order_snapshot"
+
+
+def test_execution_trace_labels_okx_50001_as_transient_exchange_error() -> None:
+    trace = build_execution_trace(
+        {},
+        order_status="rejected",
+        fallback_reason=(
+            'Max retries exceeded: okx {"code":"50001","data":[],'
+            '"msg":"Service temporarily unavailable. Please try again later."}'
+        ),
+    )
+
+    assert trace["final_result"]["status"] == "transient_exchange_error"
+    assert trace["final_result"]["status_label"] == "交易所临时不可用"
+    assert trace["repair_suggestions"] == [
+        "OKX 交易所服务临时不可用：系统未拿到成交确认，本地仓位未改动；已临时跳过该币种，稍后自动重试。"
+    ]

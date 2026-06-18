@@ -619,6 +619,32 @@ class ExecutionService:
                 await mark_skipped(reason, data)
             else:
                 await mark_blocked(reason, data)
+            final_stage_status = (
+                DecisionStageStatus.SKIPPED if is_skipped else DecisionStageStatus.BLOCKED
+            )
+            raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw_response = dict(raw_response)
+            if decision.is_entry:
+                opportunity = raw_response.get("opportunity_score")
+                if not isinstance(opportunity, dict):
+                    opportunity = {}
+                opportunity = dict(opportunity)
+                opportunity["selected_for_execution"] = False
+                opportunity["selection_reason"] = reason
+                opportunity["execution_final_state"] = final_stage_status
+                opportunity["execution_final_blocker"] = blocker
+                raw_response["opportunity_score"] = opportunity
+            raw_response.update(
+                {
+                    "execution_skipped": is_skipped,
+                    "execution_policy_terminal": True,
+                    "policy_blocker": blocker,
+                    "stage_status": final_stage_status,
+                    "skip_kind": data.get("skip_kind") or blocker,
+                    "reason": reason,
+                }
+            )
+            decision.raw_response = raw_response
             if decision_db_id is not None:
                 await mark_decision_reason(decision_db_id, reason)
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -648,19 +674,6 @@ class ExecutionService:
                 }
             )
             result = rejected_execution_result(decision, reason)
-            raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
-            raw_response.update(
-                {
-                    "execution_skipped": is_skipped,
-                    "execution_policy_terminal": True,
-                    "policy_blocker": blocker,
-                    "stage_status": (
-                        DecisionStageStatus.SKIPPED if is_skipped else DecisionStageStatus.BLOCKED
-                    ),
-                    "skip_kind": data.get("skip_kind") or blocker,
-                    "reason": reason,
-                }
-            )
             result.raw_response = raw_response
             return result
 
@@ -956,9 +969,12 @@ class ExecutionService:
                     execution_result.status.value,
                 )
             )
+            transient_entry_exchange_error = bool(
+                decision.is_entry and is_transient_entry_exchange_error(result_text)
+            )
             if decision.is_entry and is_untradable_exchange_error(result_text):
                 remember_untradable_symbol(symbol, result_text)
-            elif decision.is_entry and is_transient_entry_exchange_error(result_text):
+            elif transient_entry_exchange_error:
                 remember_temporary_entry_block(
                     symbol,
                     result_text,
@@ -995,12 +1011,21 @@ class ExecutionService:
             else:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.FAILED,
+                    (
+                        DecisionStageStatus.SKIPPED
+                        if transient_entry_exchange_error
+                        else DecisionStageStatus.FAILED
+                    ),
                     confirm_reason,
                     {
                         "order_id": execution_result.order_id,
                         "exchange_order_id": execution_result.exchange_order_id,
                         "status": execution_result.status.value,
+                        "error_type": (
+                            "transient_exchange_error"
+                            if transient_entry_exchange_error
+                            else "execution_not_confirmed"
+                        ),
                     },
                 )
             if (

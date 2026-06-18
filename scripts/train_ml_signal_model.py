@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services.ml_signal_service import (
     MIN_TRAINING_SAMPLES,
     build_training_frame,
+    count_shadow_training_rows,
     load_shadow_training_rows,
     train_from_frame,
 )
@@ -28,7 +29,12 @@ async def _main() -> None:
 
     rows = await load_shadow_training_rows(limit=args.limit)
     frame = build_training_frame(rows)
-    metadata = train_from_frame(frame, min_samples=args.min_samples)
+    completed_count = await count_shadow_training_rows()
+    metadata = train_from_frame(
+        frame,
+        min_samples=args.min_samples,
+        completed_sample_count=completed_count,
+    )
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
 
 

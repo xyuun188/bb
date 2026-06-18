@@ -22,11 +22,13 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.pipeline import Pipeline
+from sqlalchemy import func, select
 
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
+from models.learning import ShadowBacktest
 
 logger = structlog.get_logger(__name__)
 
@@ -36,6 +38,8 @@ METADATA_PATH = MODEL_DIR / "winrate_model_metadata.json"
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = 30 * 60
 AUTO_TRAIN_MIN_INTERVAL_SECONDS = 6 * 60 * 60
 AUTO_TRAIN_MIN_NEW_SAMPLES = 500
+AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = 2 * 60 * 60
+AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = 120
 
 FEATURE_KEYS = [
     "change_24h_pct",
@@ -368,7 +372,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
 
 
 def train_from_frame(
-    frame: pd.DataFrame, *, min_samples: int = MIN_TRAINING_SAMPLES
+    frame: pd.DataFrame,
+    *,
+    min_samples: int = MIN_TRAINING_SAMPLES,
+    completed_sample_count: int | None = None,
 ) -> dict[str, Any]:
     if len(frame) < min_samples:
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
@@ -401,13 +408,17 @@ def train_from_frame(
     short_pred = (short_scores >= 0.50).astype(int)
 
     now = datetime.now(UTC).isoformat()
+    completed_count = int(completed_sample_count or len(frame))
     metadata = {
         "version": now,
         "trained_at": now,
         "sample_count": int(len(frame)),
+        "completed_shadow_sample_count": completed_count,
+        "last_trained_completed_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
         "training_shadow_sample_limit": 20000,
         "training_sample_note": "sample_count is the latest training window, not the all-time total.",
+        "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
         "train_count": int(len(train)),
         "test_count": int(len(test)),
         "feature_count": len(FEATURE_KEYS),
@@ -535,19 +546,58 @@ class MLSignalService:
                 completed_count = await self._completed_shadow_sample_count()
                 metadata = self._current_metadata()
                 last_sample_count = int(metadata.get("sample_count") or 0)
+                last_completed_count = int(
+                    metadata.get("last_trained_completed_shadow_sample_count")
+                    or metadata.get("completed_shadow_sample_count")
+                    or metadata.get("completed_sample_count")
+                    or last_sample_count
+                    or 0
+                )
+                influence = _influence_policy(metadata) if metadata else {"enabled": False}
+                learning_only = not bool(influence.get("enabled"))
+                min_interval_seconds = (
+                    AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS
+                    if learning_only
+                    else AUTO_TRAIN_MIN_INTERVAL_SECONDS
+                )
+                min_new_samples = (
+                    AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES
+                    if learning_only
+                    else AUTO_TRAIN_MIN_NEW_SAMPLES
+                )
                 trained_at = self._parse_datetime(
                     metadata.get("trained_at") or metadata.get("version")
                 )
                 age_seconds = (
                     (now - trained_at).total_seconds()
                     if trained_at is not None
-                    else AUTO_TRAIN_MIN_INTERVAL_SECONDS
+                    else min_interval_seconds
                 )
-                new_samples = max(completed_count - last_sample_count, 0)
+                new_samples = max(completed_count - last_completed_count, 0)
+                training_policy = {
+                    "learning_only": learning_only,
+                    "min_interval_seconds": min_interval_seconds,
+                    "min_new_samples": min_new_samples,
+                    "min_training_samples": MIN_TRAINING_SAMPLES,
+                    "cursor_source": "last_trained_completed_shadow_sample_count",
+                }
+                if completed_count < MIN_TRAINING_SAMPLES:
+                    result = {
+                        "trained": False,
+                        "reason": "not_enough_samples",
+                        "completed_sample_count": completed_count,
+                        "last_trained_sample_count": last_sample_count,
+                        "last_trained_completed_sample_count": last_completed_count,
+                        "new_sample_count": new_samples,
+                        "training_policy": training_policy,
+                        "message": f"本地 ML 自动训练样本不足：{completed_count} < {MIN_TRAINING_SAMPLES}。继续累计影子复盘样本。",
+                    }
+                    self._last_train_result = result
+                    return result
 
                 should_train = force or (
-                    age_seconds >= AUTO_TRAIN_MIN_INTERVAL_SECONDS
-                    or new_samples >= AUTO_TRAIN_MIN_NEW_SAMPLES
+                    age_seconds >= min_interval_seconds
+                    or new_samples >= min_new_samples
                 )
                 if not should_train:
                     result = {
@@ -555,11 +605,13 @@ class MLSignalService:
                         "reason": "not_due",
                         "completed_sample_count": completed_count,
                         "last_trained_sample_count": last_sample_count,
+                        "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
                         "model_age_seconds": round(age_seconds, 1),
+                        "training_policy": training_policy,
                         "message": (
-                            "未达到自动训练条件：需要距离上次训练至少 6 小时，"
-                            "或新增 completed 影子复盘样本不少于 500 条。"
+                            f"未达到自动训练条件：需要距离上次训练至少 {min_interval_seconds // 3600} 小时，"
+                            f"或新增 completed 影子复盘样本不少于 {min_new_samples} 条。"
                         ),
                     }
                     self._last_train_result = result
@@ -569,7 +621,11 @@ class MLSignalService:
                 self._last_train_started_at = datetime.now(UTC).isoformat()
                 rows = await load_shadow_training_rows(limit=20000)
                 frame = build_training_frame(rows)
-                trained_metadata = await asyncio.to_thread(train_from_frame, frame)
+                trained_metadata = await asyncio.to_thread(
+                    train_from_frame,
+                    frame,
+                    completed_sample_count=completed_count,
+                )
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
@@ -578,8 +634,14 @@ class MLSignalService:
                     "reason": "trained",
                     "completed_sample_count": completed_count,
                     "previous_sample_count": last_sample_count,
+                    "previous_completed_sample_count": last_completed_count,
                     "new_sample_count": new_samples,
                     "sample_count": int(trained_metadata.get("sample_count") or 0),
+                    "last_trained_completed_sample_count": int(
+                        trained_metadata.get("last_trained_completed_shadow_sample_count")
+                        or completed_count
+                    ),
+                    "training_policy": training_policy,
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": "本地 ML 盈亏质量模型已自动完成训练并热加载。",
                 }
@@ -716,6 +778,8 @@ class MLSignalService:
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
             "auto_train_min_interval_seconds": AUTO_TRAIN_MIN_INTERVAL_SECONDS,
             "auto_train_min_new_samples": AUTO_TRAIN_MIN_NEW_SAMPLES,
+            "auto_train_learning_only_interval_seconds": AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS,
+            "auto_train_learning_only_min_new_samples": AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES,
             "auto_training": self._training,
             "auto_train_last_check_at": self._last_check_at,
             "auto_train_next_check_at": self._next_check_at,
@@ -743,9 +807,7 @@ class MLSignalService:
         return {}
 
     async def _completed_shadow_sample_count(self) -> int:
-        async with get_session_ctx() as session:
-            repo = MemoryRepository(session)
-            return await repo.count_shadow_backtests(status="completed")
+        return await count_shadow_training_rows()
 
     async def completed_shadow_sample_count(self) -> int:
         """Return completed shadow samples through a public dashboard boundary."""
@@ -794,3 +856,15 @@ async def load_shadow_training_rows(limit: int = 20000) -> list[Any]:
         repo = MemoryRepository(session)
         rows = await repo.list_shadow_backtests(status="completed", limit=limit, offset=0)
         return rows
+
+
+async def count_shadow_training_rows() -> int:
+    async with get_session_ctx() as session:
+        result = await session.execute(
+            select(func.count(ShadowBacktest.id)).where(
+                ShadowBacktest.status == "completed",
+                ShadowBacktest.long_return_pct.is_not(None),
+                ShadowBacktest.short_return_pct.is_not(None),
+            )
+        )
+        return int(result.scalar() or 0)

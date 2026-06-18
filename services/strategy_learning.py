@@ -35,6 +35,7 @@ from models.learning import (
 from models.trade import Order, Position
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.execution_result_classifier import ExecutionResultClassifier
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
@@ -1278,7 +1279,18 @@ class StrategyFeedbackCompiler:
                 token in lower_text for token in ("fallback", "expert_integrity", "partial_batch")
             ):
                 fallback_blocks += 1
-            if status in {"error", "failed", "rejected"} or event_type == "execution_error":
+            is_transient_exchange_error = is_okx_temporary_service_error(
+                {
+                    "event_type": event_type,
+                    "status": status,
+                    "reason": reason,
+                    "attribution": attribution,
+                }
+            )
+            is_execution_error = bool(
+                status in {"error", "failed", "rejected"} or event_type == "execution_error"
+            )
+            if is_execution_error and not is_transient_exchange_error:
                 execution_errors += 1
             is_execution_event = event_type in {
                 "execution_attempt",
@@ -1305,10 +1317,7 @@ class StrategyFeedbackCompiler:
                             attribution=attribution,
                             reason_info=reason_info,
                         ),
-                        "is_error": bool(
-                            status in {"error", "failed", "rejected"}
-                            or event_type == "execution_error"
-                        ),
+                        "is_error": bool(is_execution_error and not is_transient_exchange_error),
                         "is_success": bool(
                             event_type == "execution_result"
                             and status in {"executed", "filled", "success"}
@@ -1475,6 +1484,8 @@ class StrategyFeedbackCompiler:
                 reason_info.get("label"),
             )
         ).lower()
+        if is_okx_temporary_service_error(text):
+            return False
         non_systemic_tokens = (
             "minimum contract size",
             "below okx minimum",
@@ -1536,6 +1547,12 @@ class StrategyFeedbackCompiler:
         lower = combined.lower()
         if not raw:
             return {"category": "unknown", "label": "未记录事件原因"}
+        if is_okx_temporary_service_error(raw):
+            translated = EXECUTION_REASON_CLASSIFIER.translate_execution_error_text(raw)
+            return {
+                "category": "okx_transient_exchange_error",
+                "label": translated or "OKX 交易所服务临时不可用，系统会稍后自动重试。",
+            }
         translated = EXECUTION_REASON_CLASSIFIER.translate_execution_error_text(raw)
         if translated:
             return {"category": "okx_execution_error", "label": translated}

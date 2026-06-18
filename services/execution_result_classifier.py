@@ -18,6 +18,10 @@ from collections.abc import Callable
 from typing import Any
 
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.okx_error_classifier import (
+    is_okx_temporary_service_error,
+    okx_temporary_service_error_message,
+)
 from web_dashboard.api.text_sanitize import sanitize_text
 
 
@@ -91,6 +95,8 @@ class ExecutionResultClassifier:
         okx_detail = " ".join(self._extract_okx_error_fragments(message))
         normalized = f"{message} {okx_detail}".strip()
         normalized_lower = normalized.lower()
+        if is_okx_temporary_service_error(normalized):
+            return okx_temporary_service_error_message(normalized)
         if "51008" in normalized or "Insufficient USDT margin" in normalized:
             return (
                 "OKX 返回错误码 51008：账户可用 USDT 保证金不足，订单没有提交成功。"

@@ -1032,8 +1032,7 @@ function renderRecentExecutions(executions, total) {
                 <tbody>
                     ${state.executions.map(t => {
                         const success = t.success === true || t.status === 'filled';
-                        const statusText = success ? '执行成功' : '执行失败';
-                        const statusColor = success ? 'var(--green)' : 'var(--red)';
+                        const statusInfo = executionStatusPresentation(t, success);
                         return `
                             <tr>
                                 <td>${toBeijingTime(t.filled_at || t.created_at)}</td>
@@ -1042,7 +1041,7 @@ function renderRecentExecutions(executions, total) {
                                 <td>${Number(t.leverage || 1).toFixed(1)}x</td>
                                 <td>${fmtNum(t.quantity)}</td>
                                 <td>${fmtPrice(t.price)}</td>
-                                <td style="color:${statusColor};font-weight:600;">${statusText}</td>
+                                <td style="color:${statusInfo.color};font-weight:600;">${escHtml(statusInfo.label)}</td>
                             </tr>
                         `;
                     }).join('')}
@@ -1778,14 +1777,79 @@ function opportunityScorePrimaryReturn(score) {
 
 function opportunityScoreReturnDetail(score) {
     if (!score || typeof score !== 'object') return '';
-    const raw = Number(score.raw_expected_return_pct ?? score.expected_return_pct);
-    const server = Number(score.server_profit_expected_return_pct);
-    const timeseries = Number(score.timeseries_expected_return_pct);
-    const parts = [];
-    if (Number.isFinite(raw)) parts.push(`ML毛收益 ${opportunityScoreValue(raw, 4)}%`);
-    if (Number.isFinite(server)) parts.push(`服务器盈利 ${opportunityScoreValue(server, 4)}%`);
-    if (Number.isFinite(timeseries)) parts.push(`时序 ${opportunityScoreValue(timeseries, 4)}%`);
-    return parts.join(' / ');
+    const items = opportunityScoreFormulaItems(score);
+    if (!items.length) return '';
+    return items.map(item => `${item.label} ${item.text}`).join(' / ');
+}
+
+function opportunityScoreFormulaItems(score) {
+    if (!score || typeof score !== 'object') return [];
+    const weights = score.expected_net_weights || {};
+    const weightOf = (key) => Number(weights[key] ?? 0);
+    const signed = (value) => `${Number(value) >= 0 ? '+' : ''}${opportunityScoreValue(value, 4)}%`;
+    const items = [];
+    const ai = Number(score.ai_expected_return_contribution_pct);
+    if (Number.isFinite(ai)) {
+        items.push({ label: 'AI贡献', value: ai, text: signed(ai), tone: ai >= 0 ? 'good' : 'bad' });
+    }
+    const mlRaw = Number(score.expected_return_pct);
+    const mlWeight = weightOf('local_ml_expected_return');
+    const ml = Number.isFinite(mlRaw) ? mlRaw * mlWeight : NaN;
+    if (Number.isFinite(ml)) {
+        items.push({ label: '本地ML', value: ml, text: `${signed(ml)}（${opportunityScoreValue(mlRaw, 4)}% × ${opportunityScoreValue(mlWeight, 2)}）`, tone: ml >= 0 ? 'good' : 'bad' });
+    }
+    const serverRaw = Number(score.server_profit_expected_return_pct);
+    const serverWeight = weightOf('server_profit_expected_return');
+    const server = Number.isFinite(serverRaw) ? serverRaw * serverWeight : NaN;
+    if (Number.isFinite(server)) {
+        items.push({ label: '服务器盈利', value: server, text: `${signed(server)}（${opportunityScoreValue(serverRaw, 4)}% × ${opportunityScoreValue(serverWeight, 2)}）`, tone: server >= 0 ? 'good' : 'bad' });
+    }
+    const timeseriesRaw = Number(score.timeseries_expected_return_pct);
+    const timeseriesWeight = weightOf('timeseries_expected_return');
+    const timeseries = Number.isFinite(timeseriesRaw) ? timeseriesRaw * timeseriesWeight : NaN;
+    if (Number.isFinite(timeseries)) {
+        items.push({ label: '时序', value: timeseries, text: `${signed(timeseries)}（${opportunityScoreValue(timeseriesRaw, 4)}% × ${opportunityScoreValue(timeseriesWeight, 2)}）`, tone: timeseries >= 0 ? 'good' : 'bad' });
+    }
+    const fee = Number(score.fee_pct || 0);
+    const slippage = Number(score.slippage_pct || 0);
+    const cost = fee + slippage;
+    if (Number.isFinite(cost) && cost > 0) {
+        items.push({ label: '成本', value: -cost, text: `-${opportunityScoreValue(cost, 4)}%`, tone: 'bad' });
+    }
+    return items;
+}
+
+function opportunityScoreFormulaHtml(score) {
+    const items = opportunityScoreFormulaItems(score);
+    if (!items.length) return '';
+    const net = Number(score.expected_net_return_pct);
+    const modelNet = Number(score.model_expected_net_return_pct);
+    const rows = items.map(item => `
+        <div class="decision-score-formula-item ${escHtml(item.tone || '')}">
+            <span>${escHtml(item.label)}</span>
+            <strong>${escHtml(item.text)}</strong>
+        </div>
+    `).join('');
+    const modelNetText = Number.isFinite(modelNet) ? `模型净值 ${signedPctValueLabel(modelNet)}` : '';
+    const netText = Number.isFinite(net) ? `最终净收益 ${signedPctValueLabel(net)}` : '';
+    return `
+        <div class="decision-score-formula">
+            <div class="decision-score-formula-head"><span>净收益来源</span><em>${escHtml([modelNetText, netText].filter(Boolean).join(' · '))}</em></div>
+            <div class="decision-score-formula-grid">${rows}</div>
+        </div>
+    `;
+}
+
+function opportunityScoreExecutionState(score, decision = null) {
+    const wasExecuted = decision?.was_executed === true;
+    const hasFinalSkip = decision && decision.was_executed === false && !!(decision.execution_reason || score?.selection_reason);
+    const finalState = String(score?.execution_final_state || '').toLowerCase();
+    if (wasExecuted) return { label: '已执行完成', tone: 'good' };
+    if (hasFinalSkip || ['skipped', 'blocked'].includes(finalState) || score?.selected_for_execution === false) {
+        return { label: '最终未执行', tone: 'warn' };
+    }
+    if (score?.selected_for_execution === true) return { label: '执行检查中', tone: 'neutral' };
+    return { label: '等待排序', tone: 'neutral' };
 }
 
 function evidenceTierLabel(tier) {
@@ -1903,15 +1967,11 @@ function decisionMetricItem(label, value, hint = '', tone = '') {
 
 function opportunityScoreBlock(score, decision = null) {
     if (!score || typeof score !== 'object') return '';
-    const selected = score.selected_for_execution === true
-        ? '已进入执行队列'
-        : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
-    const selectedTone = score.selected_for_execution === true
-        ? 'good'
-        : (score.selected_for_execution === false ? 'warn' : 'neutral');
+    const executionState = opportunityScoreExecutionState(score, decision);
     const reason = score.selection_reason || score.rule || '系统按预期净收益、方向优势、AI 信心、ML 盈亏质量、手续费、滑点、止损风险和当前敞口综合排序。';
     const primaryReturn = opportunityScorePrimaryReturn(score);
     const returnDetail = opportunityScoreReturnDetail(score);
+    const formulaHtml = opportunityScoreFormulaHtml(score);
     const confidence = Number(decision?.confidence ?? score.confidence);
     const feeAndSlippage = Number(score.fee_pct || 0) + Number(score.slippage_pct || 0);
     const winRate = Number(score.win_rate || 0) * 100;
@@ -1923,7 +1983,7 @@ function opportunityScoreBlock(score, decision = null) {
                     <strong>${opportunityScoreValue(score.score, 6)}</strong>
                     <span>${escHtml(actionLabel(score.side || '-'))} · ${primaryReturn.label} ${opportunityScoreValue(primaryReturn.value, 4)}%</span>
                 </div>
-                <span class="decision-score-state ${selectedTone}">${escHtml(selected)}</span>
+                <span class="decision-score-state ${executionState.tone}">${escHtml(executionState.label)}</span>
             </div>
             <div class="decision-score-grid">
                 ${decisionMetricItem('分析信心', evidencePercentLabel(confidence), 'AI/专家最终置信度，不等于动态证据分')}
@@ -1933,6 +1993,7 @@ function opportunityScoreBlock(score, decision = null) {
                 ${decisionMetricItem('仓位 x 杠杆', opportunityScoreValue(score.size_x_leverage, 4))}
                 ${decisionMetricItem('手续费+滑点', `${opportunityScoreValue(feeAndSlippage, 4)}%`)}
             </div>
+            ${formulaHtml}
             <div class="decision-score-reason">
                 <span>排序原因</span>
                 <div>${escapeMultiline(reason)}</div>
@@ -2294,11 +2355,9 @@ function analysisMetric(label, value, tone = 'muted') {
         </div>`;
 }
 
-function analysisOpportunityScoreHtml(score) {
+function analysisOpportunityScoreHtml(score, record = null) {
     if (!score || typeof score !== 'object') return '';
-    const selected = score.selected_for_execution === true
-        ? '已进入执行队列'
-        : (score.selected_for_execution === false ? '未进入执行队列' : '等待排序');
+    const executionState = opportunityScoreExecutionState(score, record);
     const rank = score.rank && score.candidate_count ? `${score.rank}/${score.candidate_count}` : '-';
     const primaryReturn = opportunityScorePrimaryReturn(score);
     const returnDetail = opportunityScoreReturnDetail(score);
@@ -2310,7 +2369,7 @@ function analysisOpportunityScoreHtml(score) {
         ...(returnDetail ? [`收益来源 ${returnDetail}`] : []),
         `相对反向优势 ${opportunityScoreValue(score.profit_edge_pct, 4)}%`,
         `ML胜率 ${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%`,
-        `状态 ${selected}`,
+        `状态 ${executionState.label}`,
     ].join('；');
     const reason = score.selection_reason || '用于把多个开仓候选按预期净收益排序，不替代 AI 对方向、仓位、杠杆和平仓的裁决。';
     return `
@@ -3524,7 +3583,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
                             <span>综合分：${escHtml(record.weighted_score ?? '-')}</span>
                             <span>分歧度：${escHtml(record.disagreement ?? '-')}</span>
                         </div>
-                        ${analysisOpportunityScoreHtml(record.opportunity_score)}
+                        ${analysisOpportunityScoreHtml(record.opportunity_score, record)}
                         ${record.execution_reason ? `<div class="analysis-note"><span>未执行原因</span>${analysisText(record.execution_reason)}</div>` : ''}
                         ${record.confidence_note ? `<div class="analysis-note analysis-note-muted"><span>信心说明</span>${analysisText(record.confidence_note)}</div>` : ''}
                         <div class="analysis-note analysis-note-muted"><span>裁决理由</span>${analysisText(record.final_reasoning || '-')}</div>
@@ -3901,6 +3960,12 @@ function mlSampleCounts() {
         || completedMl
         || trainingLocal
     );
+    const trainingLocalTrade = Number(local.trade_sample_count || 0);
+    const completedLocalTrade = Number(
+        local.completed_trade_sample_count
+        || local.total_trade_sample_count
+        || trainingLocalTrade
+    );
     const limit = Number(ml.training_shadow_sample_limit || local.training_shadow_sample_limit || 20000);
     const newCount = Number(
         ml.new_shadow_sample_count
@@ -3912,6 +3977,8 @@ function mlSampleCounts() {
         completedMl,
         trainingLocal,
         completedLocal,
+        trainingLocalTrade,
+        completedLocalTrade,
         limit,
         newCount,
     };
@@ -4434,6 +4501,19 @@ function renderServerModelRuntime(data, container) {
     const platformModelPublicUrl = (modelId, fallbackPort = '21840') => {
         return MODEL_PUBLIC_ENDPOINTS[modelId] || `http://${MODEL_PUBLIC_HOST}:${fallbackPort}/v1`; 
     };
+    const configuredOrPublicModelEndpoint = (modelId, configuredBaseValue = '', fallbackPort = '21840') => {
+        const configuredBase = String(configuredBaseValue || '').trim().replace(/\/$/, '');
+        if (
+            !configuredBase
+            || configuredBase.includes('127.0.0.1')
+            || configuredBase.includes('localhost')
+            || configuredBase.includes(':18000')
+            || configuredBase.includes(':18002')
+        ) {
+            return platformModelPublicUrl(modelId, fallbackPort);
+        }
+        return configuredBase;
+    };
     const localToolsPublicUrl = () => {
         return MODEL_PUBLIC_ENDPOINTS.local_ai_tools; 
     }; 
@@ -4443,7 +4523,11 @@ function renderServerModelRuntime(data, container) {
             const healthLine = runtimeEndpointSummary(item.health);
             const targetModel = item.provider_model || (String(item.label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : '-');
             const publicPort = targetModel === 'deepseek-r1-14b-risk' ? '21842' : '21840';
-            const publicEndpoint = platformModelPublicUrl(targetModel, publicPort);
+            const publicEndpoint = configuredOrPublicModelEndpoint(
+                targetModel,
+                item.api_base || item.endpoint,
+                publicPort
+            );
             const state = item.available ? '模型命中' : (item.endpoint_available ? '端点正常/模型不匹配' : '不可达');
             return `
                 <div class="server-monitor-process server-monitor-endpoint-row">
@@ -4474,7 +4558,7 @@ function renderServerModelRuntime(data, container) {
             <div class="server-monitor-runtime-card">
                 <strong>${escHtml(vllmLabel)} / vLLM ${runtimeStatusBadge(vllm.available)}</strong>
                 <div>内网地址：${escHtml(vllm.endpoint || '-')}</div>
-                <div>外网地址：${escHtml(platformModelPublicUrl(vllm.provider_model, vllm.provider_model === 'deepseek-r1-14b-risk' ? '21842' : '21840'))}</div>
+                <div>外网地址：${escHtml(configuredOrPublicModelEndpoint(vllm.provider_model, vllm.api_base || vllm.endpoint, vllm.provider_model === 'deepseek-r1-14b-risk' ? '21842' : '21840'))}</div>
                 <div>状态：${escHtml(vllm.status || '-')}${vllmHealthLine ? ` · ${escHtml(vllmHealthLine)}` : ''}</div>
                 <div>配置模型：${escHtml(vllm.provider_model || '-')}</div>
                 <div>模型：${escHtml(models)}</div>
@@ -4493,7 +4577,8 @@ function renderServerModelRuntime(data, container) {
                 <div>健康接口：${escHtml(toolsHealthLine || '-')}</div>
                 <div>平台子接口：${platformToolChildEntries.length ? `${platformToolChildAvailable}/${platformToolChildEntries.length} 正常` : '-'}</div>
                 <div>训练时间：${tools.trained_at ? toBeijingTime(tools.trained_at) : '-'}</div>
-                <div>影子样本：${monitorNumber(tools.shadow_sample_count, 0)} · 交易样本：${monitorNumber(tools.trade_sample_count, 0)}</div>
+                <div>影子样本：窗口 ${monitorNumber(tools.shadow_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_shadow_sample_count, monitorNumber(tools.shadow_sample_count, 0))}</div>
+                <div>交易样本：窗口 ${monitorNumber(tools.trade_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_trade_sample_count, monitorNumber(tools.trade_sample_count, 0))}</div>
                 <div>盈利模型：${escHtml(toolsModels.profit || '未返回')}</div>
                 <div>平仓模型：${escHtml(toolsModels.exit || '未返回')}</div>
                 ${tools.error ? `<div style="color:var(--red);">错误：${escHtml(tools.error)}</div>` : ''}
@@ -4588,6 +4673,15 @@ function sideLabel(s) {
 function statusLabel(s) {
     const map = { filled: '已成交', rejected: '已拒绝', pending: '待成交', open: '待成交', partial: '部分成交', canceled: '已取消', cancelled: '已取消' };
     return map[s] || s || '-';
+}
+
+function executionStatusPresentation(record, explicitSuccess = null) {
+    const success = explicitSuccess ?? (record?.success === true || record?.status === 'filled');
+    const kind = String(record?.execution_failure_kind || record?.final_result?.status || '').toLowerCase();
+    const isTransientExchange = kind === 'transient_exchange_error';
+    const label = record?.execution_status_label || (success ? '执行成功' : (isTransientExchange ? '交易所临时不可用' : '执行失败'));
+    const color = success ? 'var(--green)' : (isTransientExchange ? 'var(--orange)' : 'var(--red)');
+    return { label, color, kind, success, isTransientExchange };
 }
 function fmtPrice(p) { return p ? Number(p).toFixed(4) : '0.0000'; }
 function fmtPct(p) { return p ? Number(p).toFixed(2) + '%' : '0.00%'; }
@@ -5887,8 +5981,7 @@ function renderTradePage() {
     tbody.innerHTML = pageData.map(t => {
         const time = t.filled_at || t.created_at || '';
         const success = t.success === true || t.status === 'filled';
-        const statusText = success ? '执行成功' : '执行失败';
-        const statusColor = success ? 'var(--green)' : 'var(--red)';
+        const statusInfo = executionStatusPresentation(t, success);
         const sourceLabel = t.execution_source_label || (t.execution_source === 'okx' ? 'OKX执行' : '系统执行');
         const sourceColor = t.execution_source === 'okx' ? 'var(--accent-light)' : 'var(--text-muted)';
         return `
@@ -5899,7 +5992,7 @@ function renderTradePage() {
             <td>${leverageDetailCell(t)}</td>
             <td>${fmtNum(t.quantity)}</td>
             <td>${fmtPrice(t.price)}</td>
-            <td style="color:${statusColor};font-weight:600;">${statusText}</td>
+            <td style="color:${statusInfo.color};font-weight:600;">${escHtml(statusInfo.label)}</td>
             <td style="color:${sourceColor};font-weight:600;">${escHtml(sourceLabel)}</td>
             <td><button class="btn btn-sm" onclick="showExecutionDetail(${Number(t.id)})">查看</button></td>
         </tr>`;
@@ -6155,11 +6248,21 @@ function renderExecutionDetailModal(trade, detailData = null) {
     const timelineHtml = detailData
         ? renderExecutionTimeline(detailData.execution_steps, failedStep)
         : '<div class="reason-block">正在读取每一步执行耗时和失败节点...</div>';
+    const detailStatusInfo = executionStatusPresentation(
+        { ...trade, ...(detailData || {}), final_result: finalResult },
+        success
+    );
+    const finalTitle = finalResult?.success
+        ? '执行成功'
+        : (detailStatusInfo.isTransientExchange ? '交易所临时不可用' : '执行未完成/失败');
+    const reasonLabel = success
+        ? '执行原因'
+        : (detailStatusInfo.isTransientExchange ? '临时故障原因' : '失败原因');
     const finalHtml = finalResult ? `
         <div class="reason-block">
             <div class="reason-label">最终结果</div>
             <div class="execution-result-grid">
-                <div><strong>${escHtml(finalResult.success ? '执行成功' : '执行未完成/失败')}</strong><br><span class="reason-meta">${escHtml(finalResult.stage_label || '-')}</span></div>
+                <div><strong>${escHtml(finalTitle)}</strong><br><span class="reason-meta">${escHtml(finalResult.stage_label || '-')}</span></div>
                 <div><strong>${escHtml(finalResult.status_label || '-')}</strong><br><span class="reason-meta">最终状态</span></div>
                 <div><strong>${escHtml(analysisDurationLabel(finalResult.total_duration_sec))}</strong><br><span class="reason-meta">总耗时</span></div>
             </div>
@@ -6167,7 +6270,7 @@ function renderExecutionDetailModal(trade, detailData = null) {
         </div>` : '';
     const reasonHtml = `
         <div class="reason-block execution-reason-primary">
-            <div class="reason-label">${success ? '执行原因' : '失败原因'}</div>
+            <div class="reason-label">${reasonLabel}</div>
             <div>${escapeMultiline(executionReason || detail)}</div>
             ${aiReason ? `<div class="reason-meta">AI 裁决依据：${escapeMultiline(aiReason)}</div>` : ''}
         </div>`;
@@ -6184,7 +6287,7 @@ function renderExecutionDetailModal(trade, detailData = null) {
         </div>` : '';
 
     document.getElementById('decision-reason-title').textContent =
-        `${trade.display_symbol || trade.symbol || '-'} / ${actionTitle} / ${success ? '执行成功' : '执行失败'}`;
+        `${trade.display_symbol || trade.symbol || '-'} / ${actionTitle} / ${detailStatusInfo.label}`;
     document.getElementById('decision-reason-body').innerHTML = `
         ${finalHtml}
         ${reasonHtml}
@@ -6636,7 +6739,7 @@ function renderLocalAIToolsStatus() {
     const childTotalCount = Object.keys(childEndpoints).length;
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
-            ? `累计 ${samples.completedLocal} 条影子样本 / 训练窗口 ${samples.trainingLocal} 条 / 子接口 ${childAvailableCount}/${childTotalCount || 4}`
+            ? `累计 ${samples.completedLocal} 条影子 / ${samples.completedLocalTrade} 条交易；训练窗口 ${samples.trainingLocal} / ${samples.trainingLocalTrade} 条；子接口 ${childAvailableCount}/${childTotalCount || 4}`
             : '服务不可用';
     }
 
@@ -6667,9 +6770,9 @@ function renderLocalAIToolsStatus() {
         },
         {
             label: '交易/平仓样本',
-            value: String(Number(status.trade_sample_count || 0)),
-            subtitle: '用于币种画像和平仓建议',
-            tone: Number(status.trade_sample_count || 0) > 0 ? 'good' : 'warn',
+            value: `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}`,
+            subtitle: '训练窗口 / 累计；已按仓位去重，手动平仓不参与训练',
+            tone: samples.completedLocalTrade > 0 ? 'good' : 'warn',
         },
         {
             label: '序列样本',
@@ -6724,6 +6827,7 @@ function renderTrainableModels() {
         : '自动训练未开启';
     const windowText = `${samples.trainingMl} / ${samples.completedMl}（训练窗口/累计）`;
     const localWindowText = `${samples.trainingLocal || Number(local.shadow_sample_count || 0)} / ${samples.completedLocal}（训练窗口/累计）`;
+    const localTradeWindowText = `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}（训练窗口/累计）`;
     const models = [
         {
             title: '本地 ML 盈亏质量',
@@ -6804,11 +6908,12 @@ function renderTrainableModels() {
             type: mlTechName(modelsMap.exit),
             ready: localModelStatus(local, 'exit'),
             description: '结合真实持仓盈亏、持仓时间和历史交易画像，判断止盈、止损、减仓或继续持有。',
-            samples: `${Number(local.trade_sample_count || 0)} 条交易/平仓样本`,
+            samples: localTradeWindowText,
             trainedAt: localTrainedAt,
             usage: '持仓复盘 + 平仓建议',
             metrics: [
-                { label: '交易样本', value: String(Number(local.trade_sample_count || 0)) },
+                { label: '训练窗口', value: String(samples.trainingLocalTrade) },
+                { label: '累计去重样本', value: String(samples.completedLocalTrade) },
                 { label: '币种画像', value: String(Number(local.profile_count || 0)) },
             ],
             note: '它服务于已实现净利润，不是单纯追求持仓浮盈。',

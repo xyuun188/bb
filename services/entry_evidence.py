@@ -10,6 +10,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_signal_extraction import (
+    directional_expected_return_pct,
     entry_signal_payloads,
     expected_return_pct,
     payload_side,
@@ -393,7 +394,10 @@ def build_entry_evidence_score(
             side=timeseries_side,
             entry_side=entry_side,
             weight=20.0,
-            expected_return_pct=expected_return_pct(timeseries, timeseries_side or entry_side),
+            expected_return_pct=directional_expected_return_pct(
+                timeseries,
+                timeseries_side or entry_side,
+            ),
             missing_penalty=5.0,
             opposite_penalty_ratio=1.05,
         ),

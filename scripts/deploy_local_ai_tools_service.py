@@ -152,6 +152,8 @@ class TrainRequest(BaseModel):
     sequence_samples: list[dict[str, Any]] = []
     text_sentiment_samples: list[dict[str, Any]] = []
     source: str = "local_trading_system"
+    completed_shadow_sample_count: int | None = None
+    completed_trade_sample_count: int | None = None
 
 
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -647,6 +649,8 @@ def health() -> dict[str, Any]:
         "trained_at": metadata.get("trained_at"),
         "shadow_sample_count": metadata.get("shadow_sample_count", 0),
         "trade_sample_count": metadata.get("trade_sample_count", 0),
+        "completed_shadow_sample_count": metadata.get("completed_shadow_sample_count", 0),
+        "completed_trade_sample_count": metadata.get("completed_trade_sample_count", 0),
         "review_backend": "disabled_use_trading_app_online_model",
     }
 
@@ -758,7 +762,17 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "source": req.source,
         "shadow_sample_count": len(rows),
+        "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
+        "last_trained_completed_shadow_sample_count": int(
+            req.completed_shadow_sample_count or len(rows)
+        ),
         "trade_sample_count": len(req.trade_samples or []),
+        "completed_trade_sample_count": int(
+            req.completed_trade_sample_count or len(req.trade_samples or [])
+        ),
+        "last_trained_completed_trade_sample_count": int(
+            req.completed_trade_sample_count or len(req.trade_samples or [])
+        ),
         "sequence_sample_count": int((deep_sequence_model or {}).get("samples") or 0),
         "text_sentiment_sample_count": int((text_sentiment_model or {}).get("samples") or 0),
         "torch_patch_available": bool((torch_patch_model or {}).get("available")),

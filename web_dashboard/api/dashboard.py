@@ -407,6 +407,36 @@ def _display_execution_reason(decision, order=None) -> str | None:
     return sanitized
 
 
+def _display_opportunity_score(
+    decision,
+    raw: dict[str, Any],
+    execution_reason: str | None = None,
+) -> dict[str, Any] | None:
+    opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else None
+    if not isinstance(opportunity, dict):
+        return None
+    payload = dict(opportunity)
+    if bool(getattr(decision, "was_executed", False)):
+        return payload
+    reason_text = sanitize_text(execution_reason or getattr(decision, "execution_reason", None))
+    final_state = str(
+        payload.get("execution_final_state")
+        or raw.get("stage_status")
+        or raw.get("execution_status")
+        or ""
+    ).lower()
+    if reason_text or final_state in {"skipped", "blocked", "rejected"}:
+        payload["selected_for_execution"] = False
+        if reason_text:
+            payload["selection_reason"] = reason_text
+        payload["execution_final_state"] = final_state or "skipped"
+        payload.setdefault(
+            "execution_final_blocker",
+            raw.get("policy_blocker") or raw.get("skip_kind") or "not_executed",
+        )
+    return payload
+
+
 def _side_from_action(action: str | None) -> str:
     value = str(action or "").lower()
     if "short" in value:
@@ -2928,6 +2958,7 @@ async def get_decisions(
         decision_type, decision_type_label = _decision_type(d.action)
         raw = d.raw_llm_response if isinstance(d.raw_llm_response, dict) else {}
         order = order_map.get(d.id)
+        display_reason = _display_execution_reason(d, order)
         order_quantity = _safe_float(getattr(order, "quantity", None), 0.0) if order else None
         order_price = _safe_float(getattr(order, "price", None), 0.0) if order else None
         order_notional = (
@@ -2954,7 +2985,7 @@ async def get_decisions(
                     "position_size_pct_label": "保证金占当前执行账户可用余额比例",
                     "suggested_leverage": d.suggested_leverage,
                     "was_executed": d.was_executed,
-                    "execution_reason": _display_execution_reason(d, order),
+                    "execution_reason": display_reason,
                     "executed_at": d.executed_at.isoformat() if d.executed_at else None,
                     "execution_price": d.execution_price,
                     "order_quantity": order_quantity,
@@ -2967,11 +2998,7 @@ async def get_decisions(
                     "created_at": d.created_at.isoformat() if d.created_at else None,
                     "outcome": d.outcome,
                     "is_paper": d.is_paper,
-                    "opportunity_score": (
-                        raw.get("opportunity_score")
-                        if isinstance(raw.get("opportunity_score"), dict)
-                        else None
-                    ),
+                    "opportunity_score": _display_opportunity_score(d, raw, display_reason),
                 }
             )
         )
@@ -3551,6 +3578,7 @@ async def get_analysis_records(
                 continue
 
         local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
+        display_execution_reason = _display_execution_reason(d)
         detail_payload = (
             {
                 "experts": experts,
@@ -3573,10 +3601,10 @@ async def get_analysis_records(
                 "news_context": (
                     raw.get("news_context") if isinstance(raw.get("news_context"), dict) else None
                 ),
-                "opportunity_score": (
-                    raw.get("opportunity_score")
-                    if isinstance(raw.get("opportunity_score"), dict)
-                    else None
+                "opportunity_score": _display_opportunity_score(
+                    d,
+                    raw,
+                    display_execution_reason,
                 ),
                 "position_review_policy": (
                     raw.get("position_review_policy")
@@ -3648,7 +3676,7 @@ async def get_analysis_records(
             "weighted_score": raw.get("weighted_score"),
             "disagreement": raw.get("disagreement"),
             "was_executed": d.was_executed,
-            "execution_reason": _display_execution_reason(d),
+            "execution_reason": display_execution_reason,
             "is_paper": d.is_paper,
             "flow_summary": (
                 "持仓快速扫描：未调用 5 个专家；发现强平仓、强加仓或高风险信号时才进入专家深度复盘。"

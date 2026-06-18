@@ -191,9 +191,7 @@ def test_entry_opportunity_scoring_reads_wrapped_server_quant_payloads() -> None
                 }
             },
         },
-        "time_series_prediction": {
-            "result": {"best_side": "long", "expected_return_pct": 0.37}
-        },
+        "time_series_prediction": {"result": {"best_side": "long", "expected_return_pct": 0.37}},
     }
 
     _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
@@ -204,3 +202,37 @@ def test_entry_opportunity_scoring_reads_wrapped_server_quant_payloads() -> None
     assert opportunity["timeseries_expected_return_pct"] == 0.37
     assert opportunity["timeseries_aligned"] is True
     assert "鏈" not in opportunity["dynamic_score_reason"]
+
+
+def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.action = Action.SHORT
+    decision.confidence = 0.92
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.12
+    decision.raw_response["ml_signal"] = {"influence_enabled": False, "predictions": []}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": {
+            "available": True,
+            "best_side": "short",
+            "adjusted_short_return_pct": -0.28,
+            "short_loss_probability": 0.54,
+            "profit_quality_score": -0.06,
+        },
+        "time_series_prediction": {
+            "available": True,
+            "best_side": "short",
+            "direction": "down",
+            "expected_move_pct": -0.05,
+            "expected_return_pct": -0.05,
+        },
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["ai_expected_return_pct"] > 10.0
+    assert opportunity["ai_expected_return_contribution_pct"] == 0.15
+    assert opportunity["timeseries_expected_return_pct"] == 0.05
+    assert opportunity["expected_net_return_pct"] < 0.05

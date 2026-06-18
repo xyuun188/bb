@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.entry_signal_extraction import (
+    directional_expected_return_pct,
     expected_return_pct as signal_expected_return_pct,
     first_tool_payload,
     payload_side,
@@ -239,7 +240,7 @@ class EntryDirectionCompetitionPolicy:
 
         weight = self._source_weight(strategy, "timeseries_model")
         predicted_side = payload_side(prediction)
-        expected = signal_expected_return_pct(prediction, predicted_side)
+        expected = directional_expected_return_pct(prediction, predicted_side)
         if predicted_side not in {"long", "short"}:
             return
 

@@ -18,12 +18,15 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
 from services.decision_execution_trace import build_execution_trace
+from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.position_open_time import parse_position_time
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
 
 router = APIRouter()
+EXECUTION_REASON_CLASSIFIER = ExecutionResultClassifier()
 
 
 def _normalize_display_symbol(symbol: str | None) -> str:
@@ -81,6 +84,10 @@ def _translate_execution_text(message: str | None) -> str:
     text = str(message or "").strip()
     if not text:
         return "交易接口未返回具体原因。"
+
+    translated = EXECUTION_REASON_CLASSIFIER.translate_execution_error_text(text)
+    if translated:
+        return translated
 
     lower_text = text.lower()
     if (
@@ -156,6 +163,21 @@ def _translate_execution_text(message: str | None) -> str:
     if _looks_mojibake(text):
         return sanitize_text(text)
     return sanitize_text(text)
+
+
+def _execution_failure_kind(message: str | None) -> str | None:
+    if is_okx_temporary_service_error(message):
+        return "transient_exchange_error"
+    return None
+
+
+def _execution_status_label(status: str | None, reason: str | None) -> str:
+    normalized_status = str(status or "").lower()
+    if normalized_status == "filled":
+        return "执行成功"
+    if _execution_failure_kind(reason) == "transient_exchange_error":
+        return "交易所临时不可用"
+    return "执行失败"
 
 
 CORRUPTED_HISTORY_REASON = "该笔历史记录的原始说明已损坏，无法准确还原"
@@ -642,6 +664,8 @@ async def get_trades(
             1.0,
         )
         reason = sanitize_text(display_reason(order))
+        failure_kind = _execution_failure_kind(reason)
+        execution_status_label = _execution_status_label(order.status, reason)
         return {
             "id": order.id,
             "decision_id": order.decision_id,
@@ -669,6 +693,8 @@ async def get_trades(
             "execution_source_label": source[1],
             "reason": reason,
             "detail": reason,
+            "execution_failure_kind": failure_kind,
+            "execution_status_label": execution_status_label,
             "success": order.status == "filled",
             "filled_at": order.filled_at.isoformat() if order.filled_at else None,
             "created_at": order.created_at.isoformat() if order.created_at else None,
@@ -719,6 +745,8 @@ async def get_trade_detail(trade_id: int):
         order_filled_at=order.filled_at,
         fallback_reason=fallback_reason,
     )
+    failure_kind = _execution_failure_kind(fallback_reason)
+    execution_status_label = _execution_status_label(order.status, fallback_reason)
 
     return sanitize_payload(
         {
@@ -738,6 +766,8 @@ async def get_trade_detail(trade_id: int):
             "reason": fallback_reason,
             "detail": fallback_reason,
             "display_reason": fallback_reason,
+            "execution_failure_kind": failure_kind,
+            "execution_status_label": execution_status_label,
             "success": order.status == "filled",
             "decision": (
                 {

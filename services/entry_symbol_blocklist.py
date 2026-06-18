@@ -9,6 +9,7 @@ from typing import Any
 
 import structlog
 
+from services.okx_error_classifier import is_okx_temporary_service_error
 from web_dashboard.api.text_sanitize import sanitize_text
 
 NormalizeSymbol = Callable[[str | None], str | None]
@@ -60,7 +61,8 @@ class EntrySymbolBlocklistPolicy:
     def is_transient_entry_exchange_error(self, text: Any) -> bool:
         value = str(text or "").lower()
         return (
-            "51290" in value
+            is_okx_temporary_service_error(text)
+            or "51290" in value
             or "trading bot engine currently upgrading" in value
             or "engine currently upgrading" in value
             or ("open interest" in value and "platform" in value and "limit" in value)
@@ -70,6 +72,8 @@ class EntrySymbolBlocklistPolicy:
 
     def transient_entry_block_minutes(self, text: Any) -> float:
         value = str(text or "").lower()
+        if is_okx_temporary_service_error(text):
+            return 12.0
         if (
             "open interest" in value and "platform" in value and "limit" in value
         ) or "has reached the platform's limit" in value:

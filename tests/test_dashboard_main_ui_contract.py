@@ -65,6 +65,7 @@ def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
         PROJECT_ROOT / "web_dashboard/static/js/strategy_learning_view.js",
         PROJECT_ROOT / "web_dashboard/static/css/dashboard.css",
         PROJECT_ROOT / "web_dashboard/static/css/strategy_learning.css",
+        PROJECT_ROOT / "web_dashboard/app.py",
     ]
     mojibake_markers = (
         "????",
@@ -76,6 +77,9 @@ def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
         "澶辫触",
         "棰勬湡",
         "鏀剁泭",
+        "鑻嶉府",
+        "鐪嬫澘",
+        "绔彛",
         "�",
     )
 
@@ -117,11 +121,28 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "function opportunityScorePrimaryReturn" in script
+    assert "completedLocalTrade" in script
+    assert "累计去重样本" in script
+    assert "手动平仓不参与训练" in script
     assert "const net = Number(score.expected_net_return_pct);" in script
     assert "if (Number.isFinite(net)) return { label: '预期净收益', value: net };" in script
+    assert "function opportunityScoreFormulaItems" in script
+    assert "function opportunityScoreFormulaHtml" in script
+    assert "净收益来源" in script
+    assert "AI贡献" in script
+    assert "最终净收益" in script
     assert "预期收益：${opportunityScoreValue(score.expected_return_pct, 4)}%" not in script
     assert "`预期收益 ${opportunityScoreValue(score.expected_return_pct, 4)}%`" not in script
     assert "收益来源" in script
+
+
+def test_opportunity_score_execution_state_uses_final_status() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "function opportunityScoreExecutionState" in script
+    assert "最终未执行" in script
+    assert "执行检查中" in script
+    assert "已进入执行队列" not in script
 
 
 def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
@@ -131,6 +152,8 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     assert "function decisionMetricItem" in script
     assert "decision-score-grid" in script
     assert "decision-score-reason" in script
+    assert "decision-score-formula" in script
+    assert "decision-score-formula-grid" in script
     opportunity_start = script.index("function opportunityScoreBlock")
     opportunity_end = script.index("function showDecisionReason", opportunity_start)
     opportunity_block = script[opportunity_start:opportunity_end]
@@ -143,6 +166,8 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     assert "AI、ML、时序、情绪、服务器盈利、影子记忆和币种历史" in script
     assert ".decision-score-grid" in style
     assert ".decision-score-metric" in style
+    assert ".decision-score-formula" in style
+    assert ".decision-score-formula-grid" in style
     assert "max-width: min(1120px, 96vw);" in style
     assert "overflow-x: hidden;" in style
     assert "overflow-wrap: anywhere;" in style

@@ -298,6 +298,32 @@ def expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
     return 0.0
 
 
+def directional_expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
+    """Return expected return from the perspective of the requested trade side.
+
+    Directional models often report price movement: a negative move is adverse for
+    long entries but favorable for short entries. Profit models already expose
+    side-adjusted fields such as ``short_expected_return_pct``; this helper only
+    flips generic movement fields for short-side directional signals.
+    """
+
+    side = str(side or "").lower()
+    if side not in {"long", "short"}:
+        return expected_return_pct(payload, side)
+    for key in (
+        f"adjusted_{side}_return_pct",
+        f"{side}_expected_return_pct",
+        f"expected_{side}_return_pct",
+        f"{side}_return_pct",
+    ):
+        if key in payload:
+            return safe_float(payload.get(key), 0.0)
+    move = expected_return_pct(payload, side)
+    if side == "short":
+        return -move
+    return move
+
+
 def side_has_positive_expected_return(payload: dict[str, Any], side: str) -> bool:
     """True when a side has positive adjusted/side expected return evidence."""
     return expected_return_pct(payload, side) > 0.0

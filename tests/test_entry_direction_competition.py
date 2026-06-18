@@ -119,6 +119,24 @@ def test_ml_influence_disabled_ignores_ml_signal() -> None:
     assert not any(note.startswith("ML ") for note in all_evidence)
 
 
+def test_timeseries_down_move_counts_as_positive_short_directional_return() -> None:
+    context = _context(
+        feature=_feature(returns_5=-0.003, returns_20=-0.006, adx_14=24.0),
+        tools={
+            "time_series_prediction": {
+                "available": True,
+                "best_side": "short",
+                "direction": "down",
+                "expected_move_pct": -0.42,
+                "expected_return_pct": -0.42,
+            },
+        },
+    )
+
+    assert context["short"]["expected_return_pct"] == 0.42
+    assert context["short"]["score"] > context["long"]["score"]
+
+
 def test_degraded_source_performance_reduces_model_weight() -> None:
     ml = {
         "predictions": [

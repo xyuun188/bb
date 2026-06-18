@@ -25,8 +25,12 @@ def test_entry_symbol_blocklist_classifies_exchange_errors() -> None:
     assert policy.is_untradable_exchange_error("not available for trading")
     assert policy.is_transient_entry_exchange_error("51290 engine currently upgrading")
     assert policy.is_transient_entry_exchange_error(
+        'Max retries exceeded: okx {"code":"50001","data":[],"msg":"Service temporarily unavailable. Please try again later."}'
+    )
+    assert policy.is_transient_entry_exchange_error(
         "open interest has reached the platform's limit"
     )
+    assert policy.transient_entry_block_minutes("okx 50001 service temporarily unavailable") == 12.0
     assert (
         policy.transient_entry_block_minutes("open interest has reached the platform's limit")
         == 45.0

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -261,6 +261,85 @@ async def _load_closed_position_samples(limit: int) -> list[dict[str, Any]]:
     return samples
 
 
+def _trade_sample_key(sample: dict[str, Any]) -> str | None:
+    position_id = int(sample.get("position_id") or 0)
+    if position_id > 0:
+        return f"position:{position_id}"
+    source = str(sample.get("source") or "sample").strip()
+    sample_id = int(sample.get("id") or 0)
+    if sample_id > 0:
+        return f"{source}:{sample_id}"
+    return None
+
+
+def _merge_trade_samples(
+    reflection_samples: list[dict[str, Any]],
+    closed_position_samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sample in [*reflection_samples, *closed_position_samples]:
+        key = _trade_sample_key(sample)
+        if key and key in seen:
+            continue
+        merged.append(sample)
+        if key:
+            seen.add(key)
+    return merged
+
+
+async def _completed_shadow_sample_count() -> int:
+    async with get_session_ctx() as session:
+        result = await session.execute(
+            select(func.count(ShadowBacktest.id)).where(
+                ShadowBacktest.status == "completed",
+                ShadowBacktest.long_return_pct.is_not(None),
+                ShadowBacktest.short_return_pct.is_not(None),
+            )
+        )
+        return int(result.scalar() or 0)
+
+
+async def _completed_trade_sample_count() -> int:
+    async with get_session_ctx() as session:
+        reflection_result = await session.execute(select(func.count(TradeReflection.id)))
+        reflection_count = int(reflection_result.scalar() or 0)
+
+        reflected_position_result = await session.execute(select(TradeReflection.position_id))
+        reflected_position_ids = {
+            int(position_id or 0)
+            for position_id in reflected_position_result.scalars().all()
+            if int(position_id or 0) > 0
+        }
+
+        closed_stmt = select(Position).where(
+            Position.is_open.is_(False),
+            Position.closed_at.is_not(None),
+        )
+        if reflected_position_ids:
+            closed_stmt = closed_stmt.where(Position.id.notin_(reflected_position_ids))
+        closed_result = await session.execute(closed_stmt)
+        closed_positions = list(closed_result.scalars().all())
+        symbols = {row.symbol for row in closed_positions if row.symbol}
+        manual_orders = []
+        if symbols:
+            manual_order_result = await session.execute(
+                select(Order).where(
+                    Order.symbol.in_(symbols),
+                    Order.exchange_order_id.like("manual_close:%"),
+                )
+            )
+            manual_orders = list(manual_order_result.scalars().all())
+
+        eligible_closed_count = sum(
+            1
+            for position in closed_positions
+            if not position_has_manual_close_order(position, manual_orders)
+        )
+        return reflection_count + eligible_closed_count
+
+
+
 async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
     row_limit = max(int(limit), 1)
     async with get_session_ctx() as session:
@@ -376,10 +455,13 @@ async def _main() -> None:
     args = parser.parse_args()
 
     shadow_samples = await _load_shadow_samples(args.shadow_limit)
-    trade_samples = await _load_trade_reflection_samples(args.trade_limit)
-    trade_samples.extend(await _load_closed_position_samples(args.trade_limit))
+    trade_reflection_samples = await _load_trade_reflection_samples(args.trade_limit)
+    closed_position_samples = await _load_closed_position_samples(args.trade_limit)
+    trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
     sequence_samples = await _load_sequence_samples(args.sequence_limit)
     text_sentiment_samples = await _load_text_sentiment_samples(args.text_limit)
+    completed_shadow_count = await _completed_shadow_sample_count()
+    completed_trade_count = await _completed_trade_sample_count()
 
     payload = {
         "source": "local_trading_system",
@@ -387,6 +469,8 @@ async def _main() -> None:
         "trade_samples": trade_samples,
         "sequence_samples": sequence_samples,
         "text_sentiment_samples": text_sentiment_samples,
+        "completed_shadow_sample_count": completed_shadow_count,
+        "completed_trade_sample_count": completed_trade_count,
     }
     result = await _post_training_payload(
         args.base_url,

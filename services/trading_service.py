@@ -3576,7 +3576,8 @@ class TradingService:
         server_trade_count = int((status or {}).get("trade_sample_count") or 0)
         completed_shadow_total = await self._completed_shadow_backtest_total()
         previous_completed_shadow_total = int(
-            (status or {}).get("completed_shadow_sample_count")
+            (status or {}).get("last_trained_completed_shadow_sample_count")
+            or (status or {}).get("completed_shadow_sample_count")
             or self._local_tools_last_completed_shadow_count
             or server_shadow_count
             or 0
@@ -3584,18 +3585,22 @@ class TradingService:
 
         try:
             from scripts.train_local_ai_tools_models import (
+                _completed_trade_sample_count,
                 _load_closed_position_samples,
                 _load_sequence_samples,
                 _load_shadow_samples,
                 _load_text_sentiment_samples,
                 _load_trade_reflection_samples,
+                _merge_trade_samples,
             )
 
             shadow_samples = await _load_shadow_samples(20000)
-            trade_samples = await _load_trade_reflection_samples(8000)
-            trade_samples.extend(await _load_closed_position_samples(8000))
+            trade_reflection_samples = await _load_trade_reflection_samples(8000)
+            closed_position_samples = await _load_closed_position_samples(8000)
+            trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
             sequence_samples = await _load_sequence_samples(12000)
             text_sentiment_samples = await _load_text_sentiment_samples(8000)
+            completed_trade_total = await _completed_trade_sample_count()
         except Exception as exc:
             return {
                 "trained": False,
@@ -3605,8 +3610,48 @@ class TradingService:
 
         training_shadow_count = len(shadow_samples)
         new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
-        new_trade = max(len(trade_samples) - server_trade_count, 0)
-        should_train = force or age_seconds >= 6 * 60 * 60 or new_shadow >= 500 or new_trade >= 50
+        previous_completed_trade_total = int(
+            (status or {}).get("last_trained_completed_trade_sample_count")
+            or (status or {}).get("completed_trade_sample_count")
+            or server_trade_count
+            or 0
+        )
+        new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
+        learning_only = not bool(
+            (status or {}).get("model_bundle_available", (status or {}).get("available"))
+        )
+        min_interval_seconds = 2 * 60 * 60 if learning_only else 6 * 60 * 60
+        min_new_shadow = 120 if learning_only else 500
+        min_new_trade = 15 if learning_only else 50
+        training_policy = {
+            "learning_only": learning_only,
+            "min_interval_seconds": min_interval_seconds,
+            "min_new_shadow_samples": min_new_shadow,
+            "min_new_trade_samples": min_new_trade,
+            "min_training_shadow_samples": 200,
+            "cursor_source": "last_trained_completed_shadow_sample_count",
+            "trade_cursor_source": "last_trained_completed_trade_sample_count",
+        }
+        if completed_shadow_total < 200:
+            return {
+                "trained": False,
+                "reason": "not_enough_shadow_samples",
+                "server_shadow_sample_count": server_shadow_count,
+                "local_shadow_sample_count": training_shadow_count,
+                "completed_shadow_sample_count": completed_shadow_total,
+                "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
+                "completed_trade_sample_count": completed_trade_total,
+                "last_trained_completed_trade_sample_count": previous_completed_trade_total,
+                "new_shadow_sample_count": new_shadow,
+                "new_trade_sample_count": new_trade,
+                "training_policy": training_policy,
+            }
+        should_train = (
+            force
+            or age_seconds >= min_interval_seconds
+            or new_shadow >= min_new_shadow
+            or new_trade >= min_new_trade
+        )
         if not should_train:
             return {
                 "trained": False,
@@ -3614,9 +3659,14 @@ class TradingService:
                 "server_shadow_sample_count": server_shadow_count,
                 "local_shadow_sample_count": training_shadow_count,
                 "completed_shadow_sample_count": completed_shadow_total,
+                "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
                 "training_shadow_sample_limit": 20000,
+                "completed_trade_sample_count": completed_trade_total,
+                "last_trained_completed_trade_sample_count": previous_completed_trade_total,
                 "new_shadow_sample_count": new_shadow,
                 "new_trade_sample_count": new_trade,
+                "model_age_seconds": round(age_seconds, 1),
+                "training_policy": training_policy,
             }
 
         self._local_tools_last_train_started_at = now
@@ -3626,11 +3676,17 @@ class TradingService:
             sequence_samples,
             text_sentiment_samples,
             source="local_trading_system_auto",
+            completed_shadow_sample_count=completed_shadow_total,
+            completed_trade_sample_count=completed_trade_total,
         )
         if result.get("trained"):
             result["completed_shadow_sample_count"] = completed_shadow_total
+            result["last_trained_completed_shadow_sample_count"] = completed_shadow_total
+            result["completed_trade_sample_count"] = completed_trade_total
+            result["last_trained_completed_trade_sample_count"] = completed_trade_total
             result["training_shadow_sample_count"] = training_shadow_count
             result["training_shadow_sample_limit"] = 20000
+            result["training_policy"] = training_policy
             self._local_tools_last_completed_shadow_count = completed_shadow_total
             logger.info(
                 "server-side local AI tools auto-trained",

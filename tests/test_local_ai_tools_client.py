@@ -110,6 +110,40 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_train_sends_training_cursors(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    captured: dict[str, Any] = {}
+
+    async def succeed(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["request_timeout"] = request_timeout
+        return {"trained": True}
+
+    monkeypatch.setattr(client, "_post", succeed)
+
+    result = await client.train(
+        [{"id": 1}],
+        [{"id": 2}],
+        completed_shadow_sample_count=1234,
+        completed_trade_sample_count=56,
+    )
+
+    assert result["trained"] is True
+    assert captured["path"] == "/train"
+    assert captured["payload"]["completed_shadow_sample_count"] == 1234
+    assert captured["payload"]["completed_trade_sample_count"] == 56
+    assert captured["request_timeout"] == 180.0
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_readtimeout_does_not_open_circuit(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

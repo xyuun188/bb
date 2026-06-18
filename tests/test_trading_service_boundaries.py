@@ -2006,6 +2006,45 @@ async def test_ml_signal_service_completed_shadow_sample_boundary_calls_internal
 
 
 @pytest.mark.asyncio
+async def test_ml_signal_auto_train_uses_completed_cursor_for_new_samples() -> None:
+    service = MLSignalService()
+
+    async def completed_shadow_sample_count() -> int:
+        return 1120
+
+    def current_metadata() -> dict[str, Any]:
+        return {
+            "sample_count": 1000,
+            "last_trained_completed_shadow_sample_count": 1050,
+            "trained_at": datetime.now(UTC).isoformat(),
+            "test_count": 250,
+            "metrics": {
+                "long_auc": 0.40,
+                "short_auc": 0.41,
+                "long_accuracy": 0.48,
+                "short_accuracy": 0.49,
+                "top_long_avg_return_pct": -0.10,
+                "top_short_avg_return_pct": -0.08,
+                "top_long_win_rate": 0.40,
+                "bottom_long_win_rate": 0.45,
+                "top_short_win_rate": 0.42,
+                "bottom_short_win_rate": 0.46,
+            },
+        }
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = current_metadata  # type: ignore[method-assign]
+
+    result = await service.maybe_auto_train()
+
+    assert result["reason"] == "not_due"
+    assert result["new_sample_count"] == 70
+    assert result["last_trained_completed_sample_count"] == 1050
+    assert result["training_policy"]["learning_only"] is True
+    assert result["training_policy"]["min_new_samples"] == 120
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_uses_injected_high_risk_review_gate_boundary():
     calls: list[tuple[str, str, int]] = []
 
@@ -2490,6 +2529,9 @@ async def test_execution_service_serializes_candidate_execution():
     assert blocked_result.status == OrderStatus.REJECTED
     assert blocked_result.raw_response["execution_skipped"] is True
     assert blocked_result.raw_response["skip_kind"] == "entry_evidence_shadow_only"
+    assert blocked_result.raw_response["opportunity_score"]["selected_for_execution"] is False
+    assert blocked_result.raw_response["opportunity_score"]["selection_reason"] == blocked_reason
+    assert blocked_result.raw_response["opportunity_score"]["execution_final_state"] == "skipped"
     assert blocked_results["decisions"][0]["execution_status"] == "skipped"
     assert ("entry_policy_blocked", "ensemble_trader", "paper", 0) in calls
     assert not any(call[0] in {"executor", "place_order"} for call in calls)

@@ -76,6 +76,27 @@ def test_execution_reason_translates_known_okx_errors() -> None:
     assert "账户可用 USDT 保证金不足" in policy.reason_from_result(result)
 
 
+def test_execution_reason_translates_okx_50001_as_transient_exchange_error() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.REJECTED,
+        raw_response={
+            "error": (
+                'Max retries exceeded: okx {"code":"50001","data":[],'
+                '"msg":"Service temporarily unavailable. Please try again later."}'
+            )
+        },
+        exchange_order_id=None,
+    )
+
+    reason = policy.reason_from_result(result)
+
+    assert "交易所服务临时不可用" in reason
+    assert "不计为策略质量失败" in reason
+    assert "最小张数" in reason
+    assert "仓位计算错误" in reason
+
+
 def test_execution_reason_translates_okx_json_parameter_errors() -> None:
     policy = ExecutionResultClassifier()
     result = _result(

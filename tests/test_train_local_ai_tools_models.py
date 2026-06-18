@@ -5,6 +5,7 @@ import pytest
 
 from scripts.train_local_ai_tools_models import (
     _build_auth_headers,
+    _merge_trade_samples,
     _normalize_base_url,
     _post_training_payload,
 )
@@ -28,6 +29,26 @@ def test_local_ai_tools_training_base_url_validation() -> None:
 
     with pytest.raises(RuntimeError, match="LOCAL_AI_TOOLS_API_BASE is empty"):
         _normalize_base_url("")
+
+
+def test_local_ai_tools_training_merges_trade_samples_without_duplicate_positions() -> None:
+    reflection_samples = [
+        {"source": "trade_reflection", "id": 11, "position_id": 7, "realized_pnl": -1.2},
+        {"source": "trade_reflection", "id": 12, "position_id": 8, "realized_pnl": 2.4},
+    ]
+    closed_position_samples = [
+        {"source": "closed_position", "id": 7, "position_id": 7, "realized_pnl": -1.2},
+        {"source": "closed_position", "id": 9, "position_id": 9, "realized_pnl": 0.4},
+    ]
+
+    merged = _merge_trade_samples(reflection_samples, closed_position_samples)
+
+    assert [item["source"] for item in merged] == [
+        "trade_reflection",
+        "trade_reflection",
+        "closed_position",
+    ]
+    assert [item["position_id"] for item in merged] == [7, 8, 9]
 
 
 @pytest.mark.asyncio

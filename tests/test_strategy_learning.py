@@ -1039,6 +1039,51 @@ def test_strategy_learning_okx_rule_errors_do_not_hard_pause_entries(tmp_path) -
     assert state_store.load()["manual_active_profile"] == "balanced_probe"
 
 
+def test_strategy_learning_okx_50001_is_external_transient_not_strategy_error(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    service = StrategyLearningService(engine=engine, state_store=state_store)
+    state_store.set_manual_active_profile("balanced_probe")
+    okx_50001 = (
+        'Max retries exceeded: okx {"code":"50001","data":[],'
+        '"msg":"Service temporarily unavailable. Please try again later."}'
+    )
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("long", executed=False)],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "execution_result",
+                status="failed",
+                reason=okx_50001,
+            ),
+        ],
+        max_open_positions=14,
+    )
+
+    event_feedback = payload["feedback"]["event_feedback"]
+    guard = service._runtime_guard(payload, mutate=True)
+    recent = event_feedback["recent_events"][0]
+
+    assert event_feedback["execution_errors"] == 0
+    assert event_feedback["unresolved_execution_errors"] == 0
+    assert event_feedback["unresolved_execution_guard_errors"] == 0
+    assert recent["reason_category"] == "okx_transient_exchange_error"
+    assert "交易所服务临时不可用" in recent["reason_label"]
+    assert "execution_error_guard" not in guard["reasons"]
+    assert guard["should_rollback"] is False
+
+
 def test_strategy_learning_auto_rollback_pressure_holds_baseline(tmp_path) -> None:
 
     state_store = StrategyLearningStateStore(tmp_path / "state.json")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.decision_state import (
     ORDERED_STAGES,
     STAGE_LABELS,
@@ -111,7 +112,8 @@ def _synthesized_order_steps(
             "stage_label": _stage_label(DecisionStage.LOCAL_SYNC),
             "status": local_status,
             "status_label": _status_label(local_status),
-            "reason": reason or ("订单已成交并同步。" if success else "订单未成交，本地仓位未改动。"),
+            "reason": reason
+            or ("订单已成交并同步。" if success else "订单未成交，本地仓位未改动。"),
             "at": _iso(order_filled_at or order_created_at),
             "duration_sec": 0.0 if success else None,
             "duration_missing": not success,
@@ -187,10 +189,16 @@ def build_execution_trace(
             or str(order_status or "").lower() == "filled"
         )
     )
+    final_reason = " ".join(
+        str(part or "")
+        for part in (
+            final_step.get("reason") if final_step else "",
+            fallback_reason,
+        )
+    )
+    transient_exchange_error = is_okx_temporary_service_error(final_reason)
     total_duration = sum(
-        float(step["duration_sec"])
-        for step in steps
-        if step.get("duration_sec") is not None
+        float(step["duration_sec"]) for step in steps if step.get("duration_sec") is not None
     )
     repair_suggestions = repair_suggestions_for_trace(
         failed_step=failed_step,
@@ -202,10 +210,18 @@ def build_execution_trace(
         "stage_events": events,
         "final_result": {
             "success": success,
-            "status": "success" if success else "failed",
+            "status": (
+                "success"
+                if success
+                else ("transient_exchange_error" if transient_exchange_error else "failed")
+            ),
             "stage": final_step.get("stage") if final_step else None,
             "stage_label": final_step.get("stage_label") if final_step else "",
-            "status_label": final_step.get("status_label") if final_step else "",
+            "status_label": (
+                "交易所临时不可用"
+                if transient_exchange_error
+                else (final_step.get("status_label") if final_step else "")
+            ),
             "reason": final_step.get("reason") if final_step else fallback_reason,
             "total_duration_sec": round(total_duration, 3),
         },
@@ -231,19 +247,29 @@ def repair_suggestions_for_trace(
         )
     ).lower()
     suggestions: list[str] = []
+    if is_okx_temporary_service_error(reason):
+        return [
+            "OKX 交易所服务临时不可用：系统未拿到成交确认，本地仓位未改动；已临时跳过该币种，稍后自动重试。"
+        ]
     if failed_step:
         stage = str(failed_step.get("stage") or "")
         if stage == DecisionStage.RISK_CHECK:
-            suggestions.append("检查该步骤的 blocker/data 字段，确认是风控拦截、重复订单还是账户配置问题。")
+            suggestions.append(
+                "检查该步骤的 blocker/data 字段，确认是风控拦截、重复订单还是账户配置问题。"
+            )
         elif stage in {DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM}:
-            suggestions.append("检查 OKX 返回码、交易对最小张数/最小名义价值、杠杆模式和账户可用保证金。")
+            suggestions.append(
+                "检查 OKX 返回码、交易对最小张数/最小名义价值、杠杆模式和账户可用保证金。"
+            )
         elif stage == DecisionStage.LOCAL_SYNC:
             suggestions.append("刷新持仓同步任务并核对 OKX 实际仓位，避免本地记录与交易所不一致。")
 
     if any(code in reason for code in ("51008", "51004", "insufficient")):
         suggestions.append("OKX 保证金不足：降低订单名义价值或释放占用保证金后再执行。")
     if any(code in reason for code in ("51155", "51169", "minimum", "min size")):
-        suggestions.append("下单数量不符合交易规则：按 OKX 合约最小张数、精度和最小名义价值重新计算。")
+        suggestions.append(
+            "下单数量不符合交易规则：按 OKX 合约最小张数、精度和最小名义价值重新计算。"
+        )
     if "open interest" in reason or "platform" in reason and "limit" in reason:
         suggestions.append("OKX 合约总持仓上限触发：暂时跳过该交易对，等待交易所限制解除。")
     if "timeout" in reason or "超时" in reason:

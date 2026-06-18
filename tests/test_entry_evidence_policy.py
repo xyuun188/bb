@@ -6,7 +6,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.entry_evidence import build_entry_evidence_score
 from services.entry_opportunity_gate import EntryOpportunityGatePolicy
 from services.entry_payoff_quality import EntryLowPayoffQualityPolicy
-from services.entry_signal_extraction import expected_return_pct
+from services.entry_signal_extraction import directional_expected_return_pct, expected_return_pct
 from services.entry_sizing import apply_evidence_sizing_policy, evidence_is_low_payoff_quality
 from services.entry_stop_loss_budget import EntryStopLossBudgetPolicy
 from services.entry_stress_stop import EntryStressStopPolicy
@@ -42,6 +42,19 @@ def _decision(action: Action, raw: dict, *, confidence: float = 0.8) -> Decision
         raw_response=raw,
         feature_snapshot={"current_price": 100.0},
     )
+
+
+def test_directional_expected_return_flips_generic_short_move() -> None:
+    payload = {
+        "best_side": "short",
+        "direction": "down",
+        "expected_move_pct": -0.42,
+        "expected_return_pct": -0.42,
+    }
+
+    assert expected_return_pct(payload, "short") == -0.42
+    assert directional_expected_return_pct(payload, "short") == 0.42
+    assert directional_expected_return_pct(payload, "long") == -0.42
 
 
 def test_entry_evidence_uses_structured_review_feedback():
