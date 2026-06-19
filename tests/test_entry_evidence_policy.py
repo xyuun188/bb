@@ -230,6 +230,49 @@ def test_entry_evidence_blocks_weak_probe_without_three_aligned_sources():
     assert any("观望" in item or "探针" in item for item in evidence["advisory_wait_reasons"])
 
 
+def test_gate_blocks_selected_side_negative_even_when_aggregate_is_positive() -> None:
+    decision = _decision(
+        Action.LONG,
+        {
+            "opportunity_score": {
+                "score": 3.2,
+                "min_score_required": 0.95,
+                "expected_net_return_pct": 2.4,
+                "profit_quality_ratio": 1.6,
+                "server_profit_loss_probability": 0.25,
+                "tail_risk_score": 0.20,
+                "ml_aligned": True,
+                "local_profit_aligned": True,
+            },
+            "entry_candidate_evidence": {
+                "long": {
+                    "expected_net_return_pct": -0.05,
+                    "profit_quality_ratio": -0.1,
+                    "loss_probability": 0.62,
+                    "tail_risk_score": 0.40,
+                },
+                "short": {
+                    "expected_net_return_pct": 2.4,
+                    "profit_quality_ratio": 1.6,
+                    "loss_probability": 0.25,
+                    "tail_risk_score": 0.20,
+                },
+            },
+        },
+        confidence=0.88,
+    )
+
+    reason = _gate_reason(decision)
+
+    assert reason is not None
+    assert "-0.0500%" in reason
+    gate = _raw_response(decision)["opportunity_score"]["selected_side_quality_gate"]
+    assert gate["blocked"] is True
+    assert gate["side"] == "long"
+    assert gate["selected_expected_net_return_pct"] == pytest.approx(-0.05)
+    assert gate["aggregate_expected_net_return_pct"] == pytest.approx(2.4)
+
+
 def test_positive_net_return_relieves_blocked_evidence_to_controlled_probe():
     decision = _decision(
         Action.SHORT,

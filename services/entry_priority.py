@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.entry_direction_metrics import selected_entry_metrics
 
 MIN_ENTRY_OPPORTUNITY_SCORE = 0.95
 
@@ -49,6 +50,10 @@ class EntryExecutionPriorityPolicy:
         )
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         confidence = max(
             float(decision.confidence or 0.0), _safe_float(opportunity.get("confidence"), 0.0)
         )
@@ -178,6 +183,9 @@ class EntryExecutionPriorityPolicy:
             self.min_entry_opportunity_score,
         )
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
         confidence = max(
             float(decision.confidence or 0.0), _safe_float(opportunity.get("confidence"), 0.0)
         )

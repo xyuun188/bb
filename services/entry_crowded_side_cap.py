@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 
 
@@ -146,6 +147,10 @@ class EntryCrowdedSideCapPolicy:
         min_score = _safe_float(opportunity.get("min_score_required"), MIN_ENTRY_OPPORTUNITY_SCORE)
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         confidence = max(
             float(decision.confidence or 0.0),
             _safe_float(opportunity.get("confidence"), 0.0),
@@ -177,6 +182,10 @@ class EntryCrowdedSideCapPolicy:
         min_score = _safe_float(opportunity.get("min_score_required"), MIN_ENTRY_OPPORTUNITY_SCORE)
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         confidence = max(
             float(decision.confidence or 0.0),
             _safe_float(opportunity.get("confidence"), 0.0),
@@ -184,7 +193,9 @@ class EntryCrowdedSideCapPolicy:
         probe_fraction = _safe_float(opportunity.get("probe_fraction"), 0.0)
         max_probe_size_pct = _safe_float(opportunity.get("max_probe_size_pct"), 0.0)
         if probe_fraction <= 0.0:
-            probe_fraction = _safe_float(_safe_dict(decision.raw_response).get("probe_fraction"), 0.0)
+            probe_fraction = _safe_float(
+                _safe_dict(decision.raw_response).get("probe_fraction"), 0.0
+            )
         if max_probe_size_pct <= 0.0:
             max_probe_size_pct = _safe_float(
                 _safe_dict(decision.raw_response).get("max_probe_size_pct"),

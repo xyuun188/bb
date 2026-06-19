@@ -132,3 +132,37 @@ async def test_entry_price_guard_rechecks_bad_snapshot_quality_before_blocking()
 
     assert reason is not None
     assert "行情质量复核未通过" in reason
+
+
+@pytest.mark.asyncio
+async def test_entry_price_guard_does_not_rescue_with_negative_selected_side_net() -> None:
+    decision = _decision(
+        current_price=100.0,
+        raw_response={
+            "opportunity_score": {
+                "expected_net_return_pct": 1.5,
+                "profit_quality_ratio": 1.0,
+            },
+            "entry_candidate_evidence": {
+                "long": {
+                    "expected_net_return_pct": -0.1,
+                    "profit_quality_ratio": -0.2,
+                }
+            },
+        },
+    )
+
+    reason = await _policy(
+        latest_price=100.4,
+        fresh_snapshot={
+            "current_price": 100.4,
+            "close": 100.4,
+            "returns_1": 0.0,
+            "returns_5": 0.0,
+        },
+        max_slippage_pct=0.003,
+    ).guard_reason(decision)
+
+    assert reason is not None
+    assert decision.raw_response["pre_execution_price_check"]["expected_net_return_pct"] == -0.1
+    assert decision.raw_response["pre_execution_price_recheck"]["rescued"] is False

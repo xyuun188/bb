@@ -10,6 +10,7 @@ import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
+from services.entry_direction_metrics import selected_entry_metrics
 
 logger = structlog.get_logger(__name__)
 
@@ -130,6 +131,10 @@ class EntryPriceGuardPolicy:
         quant_probe = _safe_dict(raw.get("quant_profit_probe"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         if quant_probe.get("triggered") and expected_net > 0:
             if quant_probe.get("strong_probe") and expected_net >= 1.20 and profit_quality >= 1.20:
                 allowed = max(allowed, 0.012)
@@ -153,6 +158,8 @@ class EntryPriceGuardPolicy:
             "allowed_pct": round(allowed * 100, 4),
             "expected_net_return_pct": round(expected_net, 6),
             "profit_quality_ratio": round(profit_quality, 6),
+            "selected_side": selected_metrics.side,
+            "selected_metrics_source": selected_metrics.source,
         }
         decision.raw_response = raw
 

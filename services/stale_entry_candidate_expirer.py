@@ -17,6 +17,7 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_freshness import ENTRY_DECISION_MAX_AGE_SECONDS
+from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from web_dashboard.api.text_sanitize import sanitize_text
 
@@ -197,6 +198,13 @@ class StaleEntryCandidateExpirer:
             opportunity.get("expected_net_return_pct"),
             0.0,
         )
+        side = entry_side_from_action(str(row.action or ""))
+        side_evidence = selected_side_evidence(raw, side)
+        if side_evidence:
+            expected_net = self.float_parser(
+                side_evidence.get("expected_net_return_pct"),
+                expected_net,
+            )
         if expected_net <= 0:
             return (
                 f"候选排序超时后复核：{row.symbol} 本次{action_label(row.action)}"

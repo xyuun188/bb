@@ -103,3 +103,34 @@ async def test_stale_entry_candidate_expirer_marks_pending_rows_by_order_state()
     assert (
         pending_with_order.raw_llm_response["opportunity_score"]["selected_for_execution"] is False
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_expirer_uses_selected_side_net_not_aggregate() -> None:
+    waiting = [
+        _row(
+            action="long",
+            raw={
+                "opportunity_score": {
+                    "score": 1.4,
+                    "min_score_required": 0.8,
+                    "expected_net_return_pct": 1.2,
+                },
+                "entry_candidate_evidence": {
+                    "long": {"expected_net_return_pct": -0.04},
+                },
+            },
+        )
+    ]
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        waiting,
+        [],
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    assert "-0.0400%" in waiting[0].execution_reason

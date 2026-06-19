@@ -14,6 +14,10 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
+from services.entry_direction_metrics import (
+    selected_entry_metrics,
+    write_selected_metrics_snapshot,
+)
 from services.entry_loss_cooldown import EntryLossCooldownPolicy
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 
@@ -112,6 +116,7 @@ class EntryOpportunityGatePolicy:
         if entry_pause_reason:
             decision.raw_response = raw
         opportunity = _safe_dict(raw.get("opportunity_score"))
+        selected_metrics = selected_entry_metrics(decision)
         confidence = max(
             float(decision.confidence or 0.0),
             _safe_float(opportunity.get("confidence"), 0.0),
@@ -168,6 +173,16 @@ class EntryOpportunityGatePolicy:
 
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality_ratio = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality_ratio = selected_metrics.profit_quality_ratio
+            write_selected_metrics_snapshot(
+                raw,
+                selected_metrics,
+                blocked=False,
+                policy="selected_side_expected_net_quality_gate",
+            )
+            opportunity = _safe_dict(raw.get("opportunity_score"))
         min_profit_quality_ratio = _safe_float(
             opportunity.get("min_profit_quality_ratio_required"),
             ENTRY_MIN_NET_PROFIT_QUALITY_RATIO,
@@ -392,10 +407,17 @@ class EntryOpportunityGatePolicy:
                 size_cap=0.02,
             )
         if expected_net <= 0:
-            add_advisory(
-                f"扣除手续费、滑点和尾部亏损风险后，预期净收益 {expected_net:.4f}% 不为正，"
-                "本次按 AI 决策继续进入执行检查，但仓位降为极小仓。",
-                size_cap=0.015,
+            write_selected_metrics_snapshot(
+                raw,
+                selected_metrics,
+                blocked=True,
+                policy="selected_side_expected_net_hard_gate",
+            )
+            decision.raw_response = raw
+            side_label = self._side_label(selected_metrics.side or entry_side)
+            return (
+                f"实际下单方向{side_label}费后预期净收益 {expected_net:.4f}% 不为正，"
+                "系统禁止提交开仓订单；下一轮会用最新行情和模型证据重新评估。"
             )
         if (
             profit_quality_ratio < min_profit_quality_ratio

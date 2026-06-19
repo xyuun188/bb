@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryLossCooldownParams
 
@@ -87,12 +88,21 @@ class EntryLossCooldownPolicy:
         )
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         reward_risk = _safe_float(opportunity.get("reward_risk_ratio"), 0.0)
         server_expected = _safe_float(opportunity.get("server_profit_expected_return_pct"), 0.0)
         server_loss_probability = _safe_float(
             opportunity.get("server_profit_loss_probability"), 1.0
         )
+        if selected_metrics.has_selected_side:
+            server_expected = selected_metrics.server_profit_expected_return_pct
+            server_loss_probability = selected_metrics.loss_probability
         tail_risk = _safe_float(opportunity.get("tail_risk_score"), 0.0)
+        if selected_metrics.has_selected_side:
+            tail_risk = selected_metrics.tail_risk_score
         score_required = max(
             self.params.override_min_score,
             max(min_score, MIN_ENTRY_OPPORTUNITY_SCORE) * self.params.override_score_multiple,

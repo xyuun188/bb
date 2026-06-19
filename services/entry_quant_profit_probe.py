@@ -7,13 +7,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_direction_metrics import selected_entry_metrics
+from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
 from services.entry_signal_extraction import (
     expected_return_pct as signal_expected_return_pct,
+)
+from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
     signal_available,
 )
-from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryQuantProfitProbeParams
 
 ScoreCandidate = Callable[[DecisionOutput, dict[str, Any]], float]
@@ -327,4 +330,9 @@ class EntryQuantProfitProbePolicy:
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
         tail_risk = _safe_float(opportunity.get("tail_risk_score"), 1.0)
+        metrics = selected_entry_metrics(candidate)
+        if metrics.has_selected_side:
+            expected_net = metrics.expected_net_return_pct
+            profit_quality = metrics.profit_quality_ratio
+            tail_risk = metrics.tail_risk_score
         return bool(expected_net > 0 and profit_quality > 0 and tail_risk < 0.95)

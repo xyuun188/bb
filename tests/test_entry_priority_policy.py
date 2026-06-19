@@ -81,3 +81,44 @@ def test_wait_sort_reason_includes_rank_and_threshold() -> None:
     assert "历史候选排名参考 2/5" in reason
     assert "当前机会评分 1.10" in reason
     assert "执行门槛 0.95" in reason
+
+
+def test_immediate_execution_uses_selected_side_net_not_aggregate() -> None:
+    decision = _decision(
+        confidence=0.9,
+        raw_response={
+            "opportunity_score": {
+                "score": 5.0,
+                "expected_net_return_pct": 2.0,
+                "profit_quality_ratio": 2.0,
+            },
+            "entry_candidate_evidence": {
+                "long": {
+                    "expected_net_return_pct": -0.2,
+                    "profit_quality_ratio": -0.3,
+                }
+            },
+        },
+    )
+
+    assert EntryExecutionPriorityPolicy().immediate_execution_reason(decision) is None
+
+
+def test_wait_sort_reason_uses_selected_side_net_not_aggregate() -> None:
+    decision = _decision(
+        confidence=0.7,
+        raw_response={
+            "opportunity_score": {
+                "score": 1.1,
+                "min_score_required": 0.95,
+                "expected_net_return_pct": 1.5,
+            },
+            "entry_candidate_evidence": {
+                "long": {"expected_net_return_pct": -0.33},
+            },
+        },
+    )
+
+    reason = EntryExecutionPriorityPolicy().wait_sort_reason(decision)
+
+    assert "-0.33%" in reason

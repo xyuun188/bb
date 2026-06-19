@@ -16,6 +16,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.safe_output import safe_error_text
 from core.url_safety import normalize_http_base_url
+from services.entry_direction_metrics import selected_entry_metrics
 from services.high_risk_review_service import HighRiskReviewService
 
 QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO = 0.12
@@ -97,6 +98,10 @@ class EntryHighRiskReviewGatePolicy:
         quant_probe = _safe_dict(raw.get("quant_profit_probe"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         loss_probability = _safe_float(
             quant_probe.get(
                 "loss_probability",
@@ -104,6 +109,8 @@ class EntryHighRiskReviewGatePolicy:
             ),
             1.0,
         )
+        if selected_metrics.has_selected_side:
+            loss_probability = selected_metrics.loss_probability
         if (
             quant_probe.get("triggered")
             and expected_net > 0

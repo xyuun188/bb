@@ -14,6 +14,7 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 from config.settings import settings
+from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_sizing import apply_evidence_sizing_policy
 
@@ -461,6 +462,11 @@ class EntryProfitRiskSizingPolicy:
         )
         expected_net = self._safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         tail_risk = self._safe_float(opportunity.get("tail_risk_score"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality_ratio = selected_metrics.profit_quality_ratio
+            tail_risk = selected_metrics.tail_risk_score
         score = self._safe_float(opportunity.get("score"), 0.0)
         min_score_required = self._safe_float(
             opportunity.get("min_score_required"),
@@ -476,6 +482,8 @@ class EntryProfitRiskSizingPolicy:
             0.0,
         )
         loss_probability = self._safe_float(opportunity.get("server_profit_loss_probability"), 1.0)
+        if selected_metrics.has_selected_side:
+            loss_probability = selected_metrics.loss_probability
         contribution_adjustment = self._safe_dict(opportunity.get("model_contribution_adjustment"))
         hard_contribution_caution = bool(contribution_adjustment.get("hard_caution"))
         quant_probe = self._safe_dict(raw.get("quant_profit_probe"))

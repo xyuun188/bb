@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_direction_metrics import selected_entry_metrics
 
 ENTRY_POST_CRASH_REBOUND_1M = 0.030
 ENTRY_POST_CRASH_REBOUND_5M_DROP = -0.18
@@ -52,6 +53,10 @@ class EntryPostCrashReboundGuardPolicy:
         opportunity = _safe_dict(raw.get("opportunity_score"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         profit_quality = _safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+        selected_metrics = selected_entry_metrics(decision)
+        if selected_metrics.has_selected_side:
+            expected_net = selected_metrics.expected_net_return_pct
+            profit_quality = selected_metrics.profit_quality_ratio
         raw["post_crash_rebound_guard"] = {
             "blocked": True,
             "action": decision.action.value,
@@ -60,6 +65,8 @@ class EntryPostCrashReboundGuardPolicy:
             "returns_20": round(returns_20, 6),
             "expected_net_return_pct": round(expected_net, 6),
             "profit_quality_ratio": round(profit_quality, 6),
+            "selected_side": selected_metrics.side,
+            "selected_metrics_source": selected_metrics.source,
             "policy": "暴跌后 1 分钟强反弹时不追空，等待新一轮行情确认方向。",
         }
         decision.raw_response = raw
