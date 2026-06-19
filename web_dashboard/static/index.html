@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -18,7 +18,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260619-data-collection-layout">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260619-data-source-manager">
     <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260616-cangxiao-ui-fix2">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1117,6 +1117,7 @@
                     <button class="settings-menu-item" data-settings-tab="model-server">模型服务器</button>
                     <button class="settings-menu-item" data-settings-tab="trading">交易参数</button>
                     <button class="settings-menu-item" data-settings-tab="models">AI 专家模型</button>
+                    <button class="settings-menu-item" data-settings-tab="external-events">外部事件采集</button>
                     <button class="settings-menu-item" data-settings-tab="security">账号安全</button>
                 </aside>
                 <div class="settings-content">
@@ -1434,13 +1435,19 @@
                 </div>
                 <div id="okx-balance-info" style="font-size:11px;color:var(--text-muted);padding:8px 12px;border-top:1px solid var(--border);"></div>
             </div>
+            </section>
+
+            <section class="settings-section" data-settings-section="external-events">
             <div class="card settings-data-collection-card">
                 <div class="card-header">
                     <div>
                         <span class="card-title">外部事件采集设置</span>
-                        <span class="card-subtitle">Scrapling 可选增强源；只写入训练/情绪样本，不直接触发下单</span>
+                        <span class="card-subtitle">Scrapling 可选增强源；只写入训练/情绪样本，不直接触发下单；默认关闭</span>
                     </div>
-                    <button class="btn btn-sm btn-accent" onclick="saveDataCollectionSettings()">保存设置</button>
+                    <div class="settings-actions compact">
+                        <button class="btn btn-sm" onclick="applyRecommendedDataCollectionSources()">填入推荐源</button>
+                        <button class="btn btn-sm btn-accent" onclick="saveDataCollectionSettings()">保存设置</button>
+                    </div>
                 </div>
                 <div class="data-collection-settings settings-embedded">
                     <label class="data-collection-toggle">
@@ -1468,10 +1475,31 @@
                             <input type="number" class="form-input" id="data-external-max-items" min="1" max="50" step="1">
                         </label>
                     </div>
+                    <div class="data-channel-config">
+                        <div class="settings-panel-title">付费 API 通道</div>
+                        <div class="settings-form-grid">
+                            <label class="form-group">
+                                <span>CryptoPanic API Key</span>
+                                <input type="password" class="form-input" id="data-cryptopanic-api-key" placeholder="留空表示不修改">
+                            </label>
+                            <label class="form-group">
+                                <span>CoinMarketCal API Key</span>
+                                <input type="password" class="form-input" id="data-coinmarketcal-api-key" placeholder="留空表示不修改">
+                            </label>
+                            <label class="form-group">
+                                <span>NewsAPI Key</span>
+                                <input type="password" class="form-input" id="data-newsapi-api-key" placeholder="留空表示不修改">
+                            </label>
+                        </div>
+                        <div class="settings-readonly-note">密钥会写入加密运行时配置；未填写时保持原配置，不会在页面展示明文。</div>
+                    </div>
                     <div class="form-group">
-                        <span>采集源 JSON</span>
-                        <textarea class="form-input data-source-json" id="data-external-sources" rows="7" spellcheck="false" placeholder='[{"name":"ethereum_blog","url":"https://blog.ethereum.org/","symbols":["ETH"],"weight":0.72}]'></textarea>
-                        <div class="settings-readonly-note">只允许 HTTPS 公网页面；内网、localhost、带账号密码的 URL 会被后端拒绝。</div>
+                        <div class="data-source-manager-head">
+                            <span>Scrapling 采集源管理（HTTPS 公网白名单）</span>
+                            <button class="btn btn-sm" type="button" onclick="addDataCollectionSource()">新增源</button>
+                        </div>
+                        <div class="data-source-manager" id="data-external-source-list"></div>
+                        <div class="settings-readonly-note">每个源只允许 HTTPS 公网页面；内网、localhost、带账号密码的 URL 会被后端拒绝。推荐源不会自动保存，确认后再点“保存设置”。</div>
                     </div>
                     <div class="settings-inline-status" id="data-collection-save-status"></div>
                 </div>
@@ -1585,7 +1613,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260619-data-collection-layout"></script>
+    <script src="/static/js/dashboard.js?v=20260619-data-source-manager"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260619-llm-error-kind"></script>
 </body>
 </html>

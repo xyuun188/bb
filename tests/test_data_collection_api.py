@@ -41,7 +41,18 @@ async def test_data_collection_status_exposes_sources_and_training(
     body = response.json()
     assert body["config"]["external_event_scraper_enabled"] is False
     assert body["config"]["external_event_scraper_uses_default_sources"] is True
-    assert any(source["key"] == "scrapling" for source in body["sources"])
+    recommended = body["config"]["recommended_external_event_sources"]
+    recommended_names = {source["name"] for source in recommended}
+    assert len(recommended) >= 10
+    assert {"binance_announcements", "okx_latest_announcements", "ethereum_blog"}.issubset(
+        recommended_names
+    )
+    assert all(source["url"].startswith("https://") for source in recommended)
+    sources_by_key = {source["key"]: source for source in body["sources"]}
+    assert sources_by_key["rss"]["group"] == "system"
+    assert sources_by_key["cryptopanic"]["group"] == "api"
+    assert sources_by_key["scrapling"]["group"] == "scrapling"
+    assert body["config"]["api_channels"]["cryptopanic"]["configured"] is False
     assert "news" in body["stats"]
     assert "text_sentiment_quality_sample" in body["training"]
     assert "local_ai_tools" in body["training"]
@@ -72,6 +83,52 @@ async def test_data_collection_normalizes_unknown_local_ai_status(
     assert status["status"] == "learning_only"
     assert status["raw_status"] == "unknown"
     assert status["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_data_collection_unknown_local_ai_without_samples_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "status": "unknown",
+                "shadow_sample_count": 0,
+                "trade_sample_count": 0,
+                "text_sentiment_sample_count": 0,
+            }
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["status"] == "ready"
+    assert status["raw_status"] == "unknown"
+    assert status["available"] is True
+
+
+def test_data_collection_marks_scrapling_invalid_without_valid_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", True)
+    monkeypatch.setattr(
+        settings,
+        "external_event_scraper_sources",
+        [{"name": "broken", "url": "https://example.com/" + ("x" * 520)}],
+    )
+    monkeypatch.setattr(settings, "external_event_scraper_max_sources", 4)
+    monkeypatch.setattr(data_collection_module, "_scrapling_installed", lambda: True)
+
+    sources = data_collection_module._collection_sources_summary()
+    scrapling = next(source for source in sources if source["key"] == "scrapling")
+
+    assert scrapling["status"] == "invalid_config"
+    assert "没有有效 HTTPS" in scrapling["detail"]
 
 
 @pytest.mark.asyncio
@@ -110,6 +167,7 @@ async def test_data_collection_settings_persists_safe_values(
 ) -> None:
     await _use_temp_db(monkeypatch, tmp_path)
     captured_updates: list[dict[str, Any]] = []
+    captured_secrets: list[tuple[str, str]] = []
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
     monkeypatch.setattr(settings, "external_event_scraper_sources", [])
@@ -117,7 +175,11 @@ async def test_data_collection_settings_persists_safe_values(
     def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
         captured_updates.append(updates)
 
+    async def capture_runtime_secret(key: str, value: str, *, actor: str = "dashboard") -> None:
+        captured_secrets.append((key, value))
+
     monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
+    monkeypatch.setattr(data_collection_module, "set_runtime_secret", capture_runtime_secret)
 
     try:
         app = create_app()
@@ -139,6 +201,9 @@ async def test_data_collection_settings_persists_safe_values(
                             "weight": 0.72,
                         }
                     ],
+                    "cryptopanic_api_key": "cryptopanic-secret",
+                    "coinmarketcal_api_key": "coinmarketcal-secret",
+                    "newsapi_api_key": "newsapi-secret",
                 },
             )
     finally:
@@ -152,4 +217,10 @@ async def test_data_collection_settings_persists_safe_values(
     assert persisted["EXTERNAL_EVENT_SCRAPER_ENABLED"] == "true"
     assert persisted["EXTERNAL_EVENT_SCRAPER_INTERVAL_SECONDS"] == "600"
     assert "ethereum_blog" in persisted["EXTERNAL_EVENT_SCRAPER_SOURCES"]
+    assert "CRYPTOPANIC_API_KEY" not in persisted
+    assert "COINMARKETCAL_API_KEY" not in persisted
+    assert "NEWSAPI_API_KEY" not in persisted
+    assert ("data_collection.cryptopanic_api_key", "cryptopanic-secret") in captured_secrets
+    assert ("data_collection.coinmarketcal_api_key", "coinmarketcal-secret") in captured_secrets
+    assert ("data_collection.newsapi_api_key", "newsapi-secret") in captured_secrets
     assert "api_key" not in str(persisted).lower()

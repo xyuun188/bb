@@ -290,7 +290,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260619-data-collection-layout" in html
+    assert "dashboard.js?v=20260619-data-source-manager" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -311,21 +311,46 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert 'id="page-data-collection"' in html
     assert "\u6570\u636e\u91c7\u96c6\u7ba1\u7406" in html
     assert "\u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6\u8bbe\u7f6e" in html
+    assert 'data-settings-tab="external-events"' in html
+    assert 'data-settings-section="external-events"' in html
+    assert html.index('data-settings-tab="models"') < html.index(
+        'data-settings-tab="external-events"'
+    )
+    assert html.index('data-settings-tab="external-events"') < html.index(
+        'data-settings-tab="security"'
+    )
     page_start = html.index('id="page-data-collection"')
     page_end = html.index('id="page-server-monitor"')
     settings_start = html.index('data-settings-section="models"')
-    settings_end = html.index('data-settings-section="security"')
+    settings_end = html.index('data-settings-section="external-events"')
+    external_start = html.index('data-settings-section="external-events"')
+    external_end = html.index('data-settings-section="security"')
     data_page_html = html[page_start:page_end]
     model_settings_html = html[settings_start:settings_end]
+    external_settings_html = html[external_start:external_end]
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in data_page_html
-    assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" in model_settings_html
-    assert model_settings_html.index(
-        "AI \u4e13\u5bb6\u6a21\u578b\u914d\u7f6e"
-    ) < model_settings_html.index("\u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6\u8bbe\u7f6e")
+    assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in model_settings_html
+    assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" in external_settings_html
+    assert "applyRecommendedDataCollectionSources()" in external_settings_html
+    assert 'id="data-external-source-list"' in external_settings_html
+    assert 'id="data-external-sources"' not in external_settings_html
+    assert 'id="data-cryptopanic-api-key"' in external_settings_html
+    assert 'id="data-coinmarketcal-api-key"' in external_settings_html
+    assert 'id="data-newsapi-api-key"' in external_settings_html
     assert "fetchDataCollectionStatus()" in html
     assert "saveDataCollectionSettings()" in html
     assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
-    assert "fetchDataCollectionStatus({ silent: true })" in script
+    assert "selected === 'external-events'" in script
+    assert "selected === 'models') fetchDataCollectionStatus" not in script
+    assert "applyRecommendedDataCollectionSources" in script
+    assert "recommended_external_event_sources" in script
+    assert "renderDataCollectionSourceManager" in script
+    assert "addDataCollectionSource" in script
+    assert "removeDataCollectionSource" in script
+    assert "data-source-editor-status" in script
+    assert "source.valid === false" in script
+    assert "cryptopanic_api_key" in script
+    assert "groupDataCollectionSources" in script
     assert "fetchJSON('/api/data-collection/status')" in script
     assert "postJSON('/api/data-collection/settings', body)" in script
     assert "unknown: '\u5df2\u8fde\u63a5'" in script
@@ -334,8 +359,10 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-collection-health-strip" in style
     assert ".settings-data-collection-card" in style
     assert ".data-source-line" in style
-    assert "dashboard.css?v=20260619-data-collection-layout" in html
-    assert "dashboard.js?v=20260619-data-collection-layout" in html
+    assert ".data-source-editor-row" in style
+    assert ".data-source-editor-status" in style
+    assert "dashboard.css?v=20260619-data-source-manager" in html
+    assert "dashboard.js?v=20260619-data-source-manager" in html
     assert "overflow-wrap: anywhere;" in style
 
 

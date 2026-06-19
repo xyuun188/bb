@@ -24,6 +24,9 @@ STATIC_SECRET_KEYS: dict[str, str] = {
     "ai.api_key": "ai_api_key",
     "local_ai_tools.api_key": "local_ai_tools_api_key",
     "high_risk_review.api_key": "high_risk_review_api_key",
+    "data_collection.cryptopanic_api_key": "cryptopanic_api_key",
+    "data_collection.coinmarketcal_api_key": "coinmarketcal_api_key",
+    "data_collection.newsapi_api_key": "newsapi_api_key",
 }
 
 _MODEL_KEY_RE = re.compile(r"[^a-z0-9_.:-]+")
@@ -73,7 +76,9 @@ async def _load_ai_model_keys(service: SecureSettingsService, loaded: dict[str, 
         for item in settings.ai_models
         if isinstance(item, dict) and item.get("name")
     )
-    by_name = {str(item.get("name") or ""): item for item in settings.ai_models if isinstance(item, dict)}
+    by_name = {
+        str(item.get("name") or ""): item for item in settings.ai_models if isinstance(item, dict)
+    }
     for name in sorted(model_names):
         key = secure_ai_model_key(name)
         value = await service.get_secret(key)
@@ -98,6 +103,9 @@ def strip_secret_env_updates(updates: dict[str, Any]) -> dict[str, Any]:
         "AI_API_KEY",
         "LOCAL_AI_TOOLS_API_KEY",
         "HIGH_RISK_REVIEW_API_KEY",
+        "CRYPTOPANIC_API_KEY",
+        "COINMARKETCAL_API_KEY",
+        "NEWSAPI_API_KEY",
     }
     return {key: value for key, value in updates.items() if key not in secret_keys}
 

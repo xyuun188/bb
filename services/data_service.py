@@ -161,7 +161,7 @@ class DataService:
 
         await self.ws_client.connect()
         asyncio.create_task(self.ws_client.listen())
-        await self.external_event_service.start()
+        await self.external_event_service.start_controller()
         logger.info("data service started")
 
     async def stop(self) -> None:

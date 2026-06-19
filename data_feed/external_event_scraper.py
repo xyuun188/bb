@@ -91,6 +91,67 @@ DEFAULT_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = (
         "weight": 0.70,
     },
 )
+RECOMMENDED_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = DEFAULT_EXTERNAL_EVENT_SOURCES + (
+    {
+        "name": "okx_latest_announcements",
+        "url": "https://www.okx.com/en-us/help/section/announcements-latest-announcements",
+        "symbols": ["BTC", "ETH", "OKB"],
+        "weight": 0.88,
+    },
+    {
+        "name": "okx_new_listings",
+        "url": "https://www.okx.com/en-us/help/section/announcements-new-listings",
+        "weight": 0.90,
+    },
+    {
+        "name": "avalanche_blog",
+        "url": "https://www.avax.network/about/blog",
+        "symbols": ["AVAX"],
+        "weight": 0.72,
+    },
+    {
+        "name": "chainlink_blog",
+        "url": "https://chain.link/blog",
+        "symbols": ["LINK"],
+        "weight": 0.70,
+    },
+    {
+        "name": "uniswap_blog",
+        "url": "https://blog.uniswap.org/",
+        "symbols": ["UNI", "ETH"],
+        "weight": 0.68,
+    },
+    {
+        "name": "base_blog",
+        "url": "https://blog.base.org/",
+        "symbols": ["ETH"],
+        "weight": 0.66,
+    },
+    {
+        "name": "optimism_blog",
+        "url": "https://www.optimism.io/blog",
+        "symbols": ["OP", "ETH"],
+        "weight": 0.68,
+    },
+    {
+        "name": "arbitrum_foundation_blog",
+        "url": "https://blog.arbitrum.foundation/",
+        "symbols": ["ARB", "ETH"],
+        "weight": 0.68,
+    },
+    {
+        "name": "sui_blog",
+        "url": "https://blog.sui.io/",
+        "symbols": ["SUI"],
+        "weight": 0.68,
+    },
+    {
+        "name": "aptos_currents",
+        "url": "https://aptosnetwork.com/currents",
+        "symbols": ["APT"],
+        "weight": 0.68,
+    },
+)
 
 _SCRIPT_STYLE_RE = re.compile(
     r"<(script|style|noscript|svg|canvas)\b[^>]*>.*?</\1>",
@@ -201,6 +262,63 @@ def configured_external_event_sources() -> list[ExternalEventSource]:
         except ValueError as exc:
             logger.warning("external event scraper source rejected", error=safe_error_text(exc))
     return sources
+
+
+def configured_external_event_source_diagnostics() -> list[dict[str, Any]]:
+    """Return validation status for every configured external event source."""
+
+    raw_sources = settings.external_event_scraper_sources or list(DEFAULT_EXTERNAL_EVENT_SOURCES)
+    diagnostics: list[dict[str, Any]] = []
+    limit = max(int(settings.external_event_scraper_max_sources or 1), 1)
+    for index, raw in enumerate(raw_sources):
+        if not isinstance(raw, dict):
+            diagnostics.append(
+                {
+                    "index": index,
+                    "enabled": index < limit,
+                    "valid": False,
+                    "status": "invalid",
+                    "error": "采集源必须是包含 URL 的对象。",
+                }
+            )
+            continue
+        try:
+            source = _normalize_source(raw)
+        except ValueError as exc:
+            diagnostics.append(
+                {
+                    "index": index,
+                    "name": str(raw.get("name") or "").strip(),
+                    "url": str(raw.get("url") or "").strip(),
+                    "symbols": raw.get("symbols") or [],
+                    "weight": raw.get("weight", 0.60),
+                    "enabled": index < limit,
+                    "valid": False,
+                    "status": "invalid",
+                    "error": safe_error_text(exc, limit=180),
+                }
+            )
+            continue
+        diagnostics.append(
+            {
+                **_source_diagnostic_payload(source),
+                "index": index,
+                "enabled": index < limit,
+                "valid": True,
+                "status": "active" if index < limit else "over_limit",
+                "error": "",
+            }
+        )
+    return diagnostics
+
+
+def _source_diagnostic_payload(source: ExternalEventSource) -> dict[str, Any]:
+    return {
+        "name": source.name,
+        "url": source.url,
+        "symbols": list(source.symbols),
+        "weight": source.weight,
+    }
 
 
 class ExternalEventScraper:

@@ -1512,7 +1512,7 @@ function activateSettingsTab(name = 'okx') {
     document.querySelectorAll('.settings-section[data-settings-section]').forEach(section => {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
-    if (selected === 'models') fetchDataCollectionStatus({ silent: true });
+    if (selected === 'external-events') fetchDataCollectionStatus({ silent: true });
 }
 
 function loadPageData(page) {
@@ -4194,7 +4194,16 @@ async function fetchDataCollectionStatus(options = {}) {
     const updated = document.getElementById('data-collection-updated');
     if (updated && !options.silent) updated.textContent = '读取中...';
     const data = await fetchJSON('/api/data-collection/status');
-    state.dataCollectionStatus = data || null;
+    if (!data) {
+        if (updated) {
+            updated.textContent = state.dataCollectionStatus?.checked_at
+                ? `${toBeijingTime(state.dataCollectionStatus.checked_at)} · 本次刷新失败`
+                : '读取失败';
+        }
+        renderDataCollectionDashboard({ failedRefresh: true });
+        return;
+    }
+    state.dataCollectionStatus = data;
     renderDataCollectionDashboard();
 }
 
@@ -4202,7 +4211,7 @@ function collectionStatusTone(status, enabled = true) {
     const value = String(status || '').toLowerCase();
     if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
     if (['active', 'ok', 'ready', 'running', 'unknown', 'learning_only'].includes(value)) return 'good';
-    if (['missing_dependency', 'timeout', 'warning', 'degraded'].includes(value)) return 'warn';
+    if (['missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config'].includes(value)) return 'warn';
     return 'bad';
 }
 
@@ -4213,6 +4222,7 @@ function collectionStatusLabel(status, enabled = true) {
         disabled: '未启用',
         not_configured: '未配置',
         missing_dependency: '缺少依赖',
+        invalid_config: '配置异常',
         timeout: '超时',
         error: '异常',
         client_not_ready: '客户端未就绪',
@@ -4250,13 +4260,15 @@ function fillDataCollectionSettings(config) {
     setInputValue('data-external-timeout', config.external_event_scraper_timeout_seconds);
     setInputValue('data-external-max-sources', config.external_event_scraper_max_sources);
     setInputValue('data-external-max-items', config.external_event_scraper_max_items_per_source);
-    const sourcesEl = document.getElementById('data-external-sources');
-    if (sourcesEl) {
-        const sources = Array.isArray(config.external_event_scraper_sources)
+    const apiChannels = config.api_channels || {};
+    setInputValue('data-cryptopanic-api-key', apiChannels.cryptopanic?.api_key || '');
+    setInputValue('data-coinmarketcal-api-key', apiChannels.coinmarketcal?.api_key || '');
+    setInputValue('data-newsapi-api-key', apiChannels.newsapi?.api_key || '');
+    renderDataCollectionSourceManager(
+        Array.isArray(config.external_event_scraper_sources)
             ? config.external_event_scraper_sources
-            : [];
-        sourcesEl.value = JSON.stringify(sources, null, 2);
-    }
+            : []
+    );
     const note = document.getElementById('data-external-runtime-note');
     if (note) {
         const dependency = config.external_event_scraper_dependency_installed ? '依赖已安装' : '依赖未安装';
@@ -4266,13 +4278,13 @@ function fillDataCollectionSettings(config) {
     }
 }
 
-function renderDataCollectionDashboard() {
+function renderDataCollectionDashboard(options = {}) {
     const data = state.dataCollectionStatus || {};
     const config = data.config || {};
     const stats = data.stats || {};
     const training = data.training || {};
     const updated = document.getElementById('data-collection-updated');
-    if (updated) {
+    if (updated && !options.failedRefresh) {
         updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '未返回时间';
     }
     if (!Object.keys(data).length) {
@@ -4335,7 +4347,7 @@ function renderDataCollectionOverview(data, config, stats, training) {
         </div>
         <div class="data-collection-guide">
             <strong>数据采集页只看状态</strong>
-            <span>Scrapling 启停和白名单源已移动到：系统设置 → AI 专家模型 → 外部事件采集设置。</span>
+            <span>Scrapling 启停和白名单源已移动到：系统设置 → 外部事件采集。</span>
         </div>`;
 }
 
@@ -4343,24 +4355,23 @@ function renderDataCollectionSources(data, stats) {
     const container = document.getElementById('data-collection-sources');
     if (!container) return;
     const sources = Array.isArray(data.sources) ? data.sources : [];
+    const byGroup = groupDataCollectionSources(sources);
     const newsSources = (stats.news?.sources || []).slice(0, 12);
     const socialPlatforms = (stats.social?.platforms || []).slice(0, 8);
     const klines = stats.market?.klines || [];
     container.innerHTML = `
         <div class="data-quality-grid">
             <div class="data-quality-panel data-source-panel">
-                <strong>采集通道</strong>
-                <div class="data-source-list">
-                    ${sources.map(source => {
-                        const tone = collectionStatusTone(source.status, source.enabled);
-                        return `
-                            <div class="data-source-line data-source-${tone}">
-                                <span>${escHtml(source.name || source.key || '-')}</span>
-                                <strong>${escHtml(collectionStatusLabel(source.status, source.enabled))}</strong>
-                                <em>${escHtml(source.detail || '')}</em>
-                            </div>`;
-                    }).join('')}
-                </div>
+                <strong>系统内置通道</strong>
+                <div class="data-source-list">${renderDataCollectionChannelRows(byGroup.system)}</div>
+            </div>
+            <div class="data-quality-panel data-source-panel">
+                <strong>付费 API 通道</strong>
+                <div class="data-source-list">${renderDataCollectionChannelRows(byGroup.api)}</div>
+            </div>
+            <div class="data-quality-panel data-source-panel">
+                <strong>Scrapling 白名单源</strong>
+                <div class="data-source-list">${renderDataCollectionChannelRows(byGroup.scrapling)}</div>
             </div>
             <div class="data-quality-panel">
                 <strong>新闻来源新鲜度</strong>
@@ -4375,6 +4386,30 @@ function renderDataCollectionSources(data, stats) {
                 ${collectionRows(klines, 'timeframe', 'rows', row => `${monitorNumber(row.symbols, 0)} 个币种 · 最新 ${collectionAgeLabel(row.age_minutes)}`)}
             </div>
         </div>`;
+}
+
+function groupDataCollectionSources(sources) {
+    return sources.reduce((groups, source) => {
+        const group = source.group || 'system';
+        if (!groups[group]) groups[group] = [];
+        groups[group].push(source);
+        return groups;
+    }, { system: [], api: [], scrapling: [] });
+}
+
+function renderDataCollectionChannelRows(sources) {
+    if (!Array.isArray(sources) || !sources.length) {
+        return '<div class="analysis-empty compact">暂无通道。</div>';
+    }
+    return sources.map(source => {
+        const tone = collectionStatusTone(source.status, source.enabled);
+        return `
+            <div class="data-source-line data-source-${tone}">
+                <span>${escHtml(source.name || source.key || '-')}</span>
+                <strong>${escHtml(collectionStatusLabel(source.status, source.enabled))}</strong>
+                <em>${escHtml(source.detail || '')}</em>
+            </div>`;
+    }).join('');
 }
 
 function collectionRows(rows, labelKey, valueKey, subtitleFn = null) {
@@ -4431,19 +4466,88 @@ function renderDataCollectionTraining(training) {
         </div>`;
 }
 
+function renderDataCollectionSourceManager(sources) {
+    const container = document.getElementById('data-external-source-list');
+    if (!container) return;
+    const rows = Array.isArray(sources) ? sources : [];
+    container.innerHTML = rows.length
+        ? rows.map((source, index) => dataCollectionSourceRow(source, index)).join('')
+        : '<div class="analysis-empty compact">暂无自定义源。可点击“填入推荐源”或“新增源”。</div>';
+}
+
+function dataCollectionSourceRow(source = {}, index = 0) {
+    const symbols = Array.isArray(source.symbols) ? source.symbols.join(',') : '';
+    const status = source.status || (source.valid === false ? 'invalid' : 'active');
+    const statusText = source.valid === false
+        ? `无效：${source.error || '请检查 URL、名称或权重'}`
+        : (status === 'over_limit' ? '有效，但超出本轮采集源数量上限' : '有效');
+    const statusClass = source.valid === false
+        ? 'bad'
+        : (status === 'over_limit' ? 'warn' : 'good');
+    return `
+        <div class="data-source-editor-row" data-source-index="${index}">
+            <label><span>名称</span><input class="form-input" data-source-field="name" value="${escHtml(source.name || '')}" placeholder="ethereum_blog"></label>
+            <label><span>URL</span><input class="form-input" data-source-field="url" value="${escHtml(source.url || '')}" placeholder="https://example.com/news"></label>
+            <label><span>币种</span><input class="form-input" data-source-field="symbols" value="${escHtml(symbols)}" placeholder="ETH,SOL"></label>
+            <label><span>权重</span><input type="number" class="form-input" data-source-field="weight" min="0.2" max="1" step="0.01" value="${escHtml(source.weight ?? 0.6)}"></label>
+            <span class="data-source-editor-status data-source-${statusClass}">${escHtml(statusText)}</span>
+            <button class="btn btn-sm" type="button" onclick="removeDataCollectionSource(${index})">删除</button>
+        </div>`;
+}
+
+function currentDataCollectionSourcesFromForm() {
+    return Array.from(document.querySelectorAll('#data-external-source-list .data-source-editor-row')).map(row => {
+        const read = field => row.querySelector(`[data-source-field="${field}"]`)?.value?.trim() || '';
+        return {
+            name: read('name') || null,
+            url: read('url'),
+            symbols: read('symbols').split(',').map(item => item.trim().toUpperCase()).filter(Boolean),
+            weight: Number(read('weight') || 0.6),
+        };
+    }).filter(item => item.url);
+}
+
 function readDataCollectionSources() {
-    const raw = String(document.getElementById('data-external-sources')?.value || '').trim();
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-        throw new Error('采集源 JSON 必须是数组。');
+    return currentDataCollectionSourcesFromForm();
+}
+
+function addDataCollectionSource(source = {}) {
+    const sources = currentDataCollectionSourcesFromForm();
+    sources.push(source);
+    renderDataCollectionSourceManager(sources);
+}
+
+function removeDataCollectionSource(index) {
+    const sources = currentDataCollectionSourcesFromForm();
+    sources.splice(Number(index), 1);
+    renderDataCollectionSourceManager(sources);
+}
+
+function applyRecommendedDataCollectionSources() {
+    const status = document.getElementById('data-collection-save-status');
+    const sourcesEl = document.getElementById('data-external-source-list');
+    const config = state.dataCollectionStatus?.config || {};
+    const recommended = Array.isArray(config.recommended_external_event_sources)
+        ? config.recommended_external_event_sources
+        : [];
+    if (!sourcesEl) return;
+    if (!recommended.length) {
+        if (status) {
+            status.style.color = 'var(--red)';
+            status.textContent = '推荐源未返回，请先刷新外部事件采集状态。';
+        }
+        return;
     }
-    return parsed.map(item => ({
-        name: item?.name || null,
-        url: item?.url || '',
-        symbols: Array.isArray(item?.symbols) ? item.symbols : [],
-        weight: item?.weight ?? null,
-    }));
+    renderDataCollectionSourceManager(recommended);
+    const maxSourcesInput = document.getElementById('data-external-max-sources');
+    if (maxSourcesInput) {
+        const currentMaxSources = Number(maxSourcesInput.value || 0);
+        maxSourcesInput.value = String(Math.min(20, Math.max(currentMaxSources, recommended.length)));
+    }
+    if (status) {
+        status.style.color = 'var(--accent-light)';
+        status.textContent = `已填入 ${recommended.length} 个推荐源，并同步调整每轮源数量；确认后请点击“保存设置”。`;
+    }
 }
 
 async function saveDataCollectionSettings() {
@@ -4460,6 +4564,9 @@ async function saveDataCollectionSettings() {
             external_event_scraper_max_sources: readNumberInput('data-external-max-sources'),
             external_event_scraper_max_items_per_source: readNumberInput('data-external-max-items'),
             external_event_scraper_sources: readDataCollectionSources(),
+            cryptopanic_api_key: document.getElementById('data-cryptopanic-api-key')?.value?.trim() || null,
+            coinmarketcal_api_key: document.getElementById('data-coinmarketcal-api-key')?.value?.trim() || null,
+            newsapi_api_key: document.getElementById('data-newsapi-api-key')?.value?.trim() || null,
         };
         const data = await postJSON('/api/data-collection/settings', body);
         state.dataCollectionStatus = data || null;

@@ -9,29 +9,48 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from config.settings import settings
 from core.safe_output import safe_error_text
+from core.secret_utils import is_masked_secret, mask_secret
 from data_feed.external_event_scraper import (
+    RECOMMENDED_EXTERNAL_EVENT_SOURCES,
     SCRAPLING_SOURCE_PREFIX,
     _normalize_source,
-    configured_external_event_sources,
+    configured_external_event_source_diagnostics,
 )
 from data_feed.news_fetcher import RSS_FEEDS
 from db.session import get_session_ctx
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
+from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.training_data_quality import assess_text_sentiment_sample
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 TRAINING_SAMPLE_LIMIT = 240
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
+
+
+def _visible_local_ai_training_status(
+    raw_status: str,
+    *,
+    available: bool,
+    shadow_count: int,
+    trade_count: int,
+    text_count: int,
+) -> str:
+    normalized = str(raw_status or "unknown").lower()
+    if normalized == "unknown" and available:
+        return "learning_only" if shadow_count or trade_count or text_count else "ready"
+    return normalized
 
 
 class ExternalEventSourcePayload(BaseModel):
@@ -48,6 +67,9 @@ class DataCollectionSettingsRequest(BaseModel):
     external_event_scraper_max_sources: int | None = None
     external_event_scraper_max_items_per_source: int | None = None
     external_event_scraper_sources: list[ExternalEventSourcePayload] | None = None
+    cryptopanic_api_key: str | None = None
+    coinmarketcal_api_key: str | None = None
+    newsapi_api_key: str | None = None
 
 
 def _scrapling_installed() -> bool:
@@ -281,9 +303,13 @@ async def _local_ai_training_status() -> dict[str, Any]:
     trade_count = int(status.get("trade_sample_count") or 0)
     text_count = int(status.get("text_sentiment_sample_count") or 0)
     raw_status = str(status.get("status") or "unknown")
-    visible_status = raw_status
-    if raw_status == "unknown" and bool(status.get("available")):
-        visible_status = "learning_only" if shadow_count or trade_count or text_count else "ready"
+    visible_status = _visible_local_ai_training_status(
+        raw_status,
+        available=bool(status.get("available")),
+        shadow_count=shadow_count,
+        trade_count=trade_count,
+        text_count=text_count,
+    )
     return {
         "available": bool(status.get("available")),
         "status": visible_status,
@@ -302,15 +328,52 @@ async def _local_ai_training_status() -> dict[str, Any]:
 
 
 def _configured_source_cards() -> list[dict[str, Any]]:
-    sources = configured_external_event_sources()
-    return [_source_payload(source) for source in sources]
+    return configured_external_event_source_diagnostics()
+
+
+def _recommended_source_cards() -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for raw_source in RECOMMENDED_EXTERNAL_EVENT_SOURCES:
+        try:
+            cards.append(_safe_source_payload(raw_source))
+        except ValueError as exc:
+            logger.warning(
+                "recommended external event source rejected",
+                error=safe_error_text(exc),
+            )
+    return cards
 
 
 def _collection_sources_summary() -> list[dict[str, Any]]:
+    scrapling_installed = _scrapling_installed()
+    scrapling_sources = _configured_source_cards()
+    valid_scrapling_sources = [
+        source for source in scrapling_sources if source.get("valid") and source.get("enabled")
+    ]
+    invalid_scrapling_sources = [source for source in scrapling_sources if not source.get("valid")]
+    if not settings.external_event_scraper_enabled:
+        scrapling_status = "disabled"
+        scrapling_detail = "用于交易所公告、项目博客、事件网页增强；默认关闭。"
+    elif not scrapling_installed:
+        scrapling_status = "missing_dependency"
+        scrapling_detail = "Scrapling 依赖未安装，无法采集外部网页。"
+    elif not valid_scrapling_sources:
+        scrapling_status = "invalid_config"
+        scrapling_detail = "已启用，但没有有效 HTTPS 公网采集源；请在外部事件采集设置中修复。"
+    elif invalid_scrapling_sources:
+        scrapling_status = "degraded"
+        scrapling_detail = (
+            f"有效源 {len(valid_scrapling_sources)} 个，"
+            f"无效源 {len(invalid_scrapling_sources)} 个；请修复无效源。"
+        )
+    else:
+        scrapling_status = "active"
+        scrapling_detail = f"有效源 {len(valid_scrapling_sources)} 个，后台热加载采集中。"
     return [
         {
             "key": "rss",
             "name": "新闻 RSS",
+            "group": "system",
             "enabled": True,
             "status": "active",
             "detail": f"{len(RSS_FEEDS)} 个公开 RSS 源，默认采集。",
@@ -318,6 +381,7 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
         {
             "key": "okx_announcements",
             "name": "OKX 公告",
+            "group": "system",
             "enabled": True,
             "status": "active",
             "detail": "OKX 官方公告 API，默认采集。",
@@ -325,6 +389,7 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
         {
             "key": "reddit",
             "name": "Reddit 舆情",
+            "group": "system",
             "enabled": True,
             "status": "active",
             "detail": "Reddit JSON/RSS，默认采集。",
@@ -332,34 +397,34 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
         {
             "key": "cryptopanic",
             "name": "CryptoPanic",
+            "group": "api",
             "enabled": bool(settings.cryptopanic_api_key),
             "status": "active" if settings.cryptopanic_api_key else "not_configured",
-            "detail": "需要 CRYPTOPANIC_API_KEY。",
+            "detail": "外部新闻聚合 API，可在系统设置 → 外部事件采集中配置。",
         },
         {
             "key": "coinmarketcal",
             "name": "CoinMarketCal",
+            "group": "api",
             "enabled": bool(settings.coinmarketcal_api_key),
             "status": "active" if settings.coinmarketcal_api_key else "not_configured",
-            "detail": "需要 COINMARKETCAL_API_KEY。",
+            "detail": "事件日历 API，可在系统设置 → 外部事件采集中配置。",
         },
         {
             "key": "newsapi",
             "name": "NewsAPI",
+            "group": "api",
             "enabled": bool(settings.newsapi_api_key),
             "status": "active" if settings.newsapi_api_key else "not_configured",
-            "detail": "需要 NEWSAPI_API_KEY。",
+            "detail": "宏观/新闻补充 API，可在系统设置 → 外部事件采集中配置。",
         },
         {
             "key": "scrapling",
             "name": "Scrapling 外部事件",
+            "group": "scrapling",
             "enabled": bool(settings.external_event_scraper_enabled),
-            "status": (
-                "active"
-                if settings.external_event_scraper_enabled and _scrapling_installed()
-                else "missing_dependency" if settings.external_event_scraper_enabled else "disabled"
-            ),
-            "detail": "用于交易所公告、项目博客、事件网页增强；不进入交易热路径。",
+            "status": scrapling_status,
+            "detail": scrapling_detail,
         },
     ]
 
@@ -372,14 +437,27 @@ async def get_data_collection_status() -> dict[str, Any]:
         _local_ai_training_status(),
     )
     scrapling_installed = _scrapling_installed()
+    configured_source_cards = _configured_source_cards()
+    valid_scrapling_sources = [
+        source
+        for source in configured_source_cards
+        if source.get("valid") and source.get("enabled")
+    ]
+    invalid_scrapling_sources = [
+        source for source in configured_source_cards if not source.get("valid")
+    ]
     payload = {
         "checked_at": datetime.now(UTC).isoformat(),
         "config": {
             "external_event_scraper_enabled": bool(settings.external_event_scraper_enabled),
             "external_event_scraper_dependency_installed": scrapling_installed,
             "external_event_scraper_runtime_active": bool(
-                settings.external_event_scraper_enabled and scrapling_installed
+                settings.external_event_scraper_enabled
+                and scrapling_installed
+                and valid_scrapling_sources
             ),
+            "external_event_scraper_valid_source_count": len(valid_scrapling_sources),
+            "external_event_scraper_invalid_source_count": len(invalid_scrapling_sources),
             "external_event_scraper_interval_seconds": int(
                 settings.external_event_scraper_interval_seconds
             ),
@@ -390,10 +468,28 @@ async def get_data_collection_status() -> dict[str, Any]:
             "external_event_scraper_max_items_per_source": int(
                 settings.external_event_scraper_max_items_per_source
             ),
-            "external_event_scraper_sources": _configured_source_cards(),
+            "external_event_scraper_sources": configured_source_cards,
+            "recommended_external_event_sources": _recommended_source_cards(),
             "external_event_scraper_uses_default_sources": not bool(
                 settings.external_event_scraper_sources
             ),
+            "api_channels": {
+                "cryptopanic": {
+                    "label": "CryptoPanic",
+                    "configured": bool(settings.cryptopanic_api_key),
+                    "api_key": mask_secret(settings.cryptopanic_api_key),
+                },
+                "coinmarketcal": {
+                    "label": "CoinMarketCal",
+                    "configured": bool(settings.coinmarketcal_api_key),
+                    "api_key": mask_secret(settings.coinmarketcal_api_key),
+                },
+                "newsapi": {
+                    "label": "NewsAPI",
+                    "configured": bool(settings.newsapi_api_key),
+                    "api_key": mask_secret(settings.newsapi_api_key),
+                },
+            },
         },
         "sources": _collection_sources_summary(),
         "stats": source_stats,
@@ -411,13 +507,16 @@ async def _sync_runtime_external_event_service(enabled: bool) -> dict[str, Any]:
     if service is None:
         return {
             "attached": False,
-            "message": "配置已保存；Dashboard 与交易主循环分离运行时，需要重启交易服务后完全生效。",
+            "message": "配置已保存；交易主循环会在数秒内自动热加载采集配置。",
         }
+    reload_runtime_settings = getattr(service, "reload_runtime_settings", None)
+    if callable(reload_runtime_settings):
+        await reload_runtime_settings()
     if enabled:
         await service.start()
-        return {"attached": True, "message": "已尝试启动当前进程的数据采集后台任务。"}
+        return {"attached": True, "message": "已热加载并启动当前进程的数据采集后台任务。"}
     await service.stop()
-    return {"attached": True, "message": "已停止当前进程的数据采集后台任务。"}
+    return {"attached": True, "message": "已热加载并停止当前进程的数据采集后台任务。"}
 
 
 @router.post("/data-collection/settings")
@@ -472,8 +571,27 @@ async def update_data_collection_settings(req: DataCollectionSettingsRequest) ->
             separators=(",", ":"),
         )
 
+    for field_name, env_key, secure_key in (
+        ("cryptopanic_api_key", "CRYPTOPANIC_API_KEY", "data_collection.cryptopanic_api_key"),
+        (
+            "coinmarketcal_api_key",
+            "COINMARKETCAL_API_KEY",
+            "data_collection.coinmarketcal_api_key",
+        ),
+        ("newsapi_api_key", "NEWSAPI_API_KEY", "data_collection.newsapi_api_key"),
+    ):
+        raw_value = getattr(req, field_name)
+        if raw_value is None:
+            continue
+        value = raw_value.strip()
+        if not value or is_masked_secret(value):
+            continue
+        setattr(settings, field_name, value)
+        updates[env_key] = value
+        await set_runtime_secret(secure_key, value)
+
     if updates:
-        settings.update_env_file(updates)
+        settings.update_env_file(strip_secret_env_updates(updates))
 
     runtime = await _sync_runtime_external_event_service(settings.external_event_scraper_enabled)
     payload = await get_data_collection_status()

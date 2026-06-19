@@ -505,6 +505,72 @@ td .ml-bar-row .ml-bar-label {
     font-size: 12px;
     line-height: 1.55;
 }
+.data-channel-config {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-panel);
+}
+.data-source-manager-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.data-source-manager-head span {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+}
+.data-source-manager {
+    display: grid;
+    gap: 10px;
+}
+.data-source-editor-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 0.9fr) minmax(260px, 2fr) minmax(120px, 0.8fr) minmax(90px, 0.5fr) minmax(150px, 1fr) auto;
+    gap: 10px;
+    align-items: end;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-panel);
+}
+.data-source-editor-row label {
+    min-width: 0;
+}
+.data-source-editor-row label span {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+.data-source-editor-row .form-input {
+    width: 100%;
+    min-width: 0;
+}
+.data-source-editor-status {
+    align-self: center;
+    min-width: 0;
+    padding: 7px 9px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+.data-source-editor-status.data-source-good {
+    color: var(--green);
+    background: var(--green-dim);
+}
+.data-source-editor-status.data-source-warn {
+    color: var(--accent-light);
+    background: var(--accent-dim);
+}
+.data-source-editor-status.data-source-bad {
+    color: var(--red);
+    background: var(--red-dim);
+}
 .data-source-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
@@ -675,6 +741,9 @@ td .ml-bar-row .ml-bar-label {
     .data-collection-guide {
         align-items: flex-start;
         flex-direction: column;
+    }
+    .data-source-editor-row {
+        grid-template-columns: 1fr;
     }
 }
 
