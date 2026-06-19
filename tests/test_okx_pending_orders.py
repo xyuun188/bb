@@ -229,7 +229,7 @@ async def test_entry_size_lifts_to_okx_min_contracts_when_affordable():
     decision.position_size_pct = 0.001
     decision.suggested_leverage = 1.0
 
-    await executor.place_order(
+    result = await executor.place_order(
         decision,
         account_id="ensemble_trader",
         override_balance=1_000.0,
@@ -237,6 +237,12 @@ async def test_entry_size_lifts_to_okx_min_contracts_when_affordable():
 
     assert fake_ccxt.create_calls
     assert fake_ccxt.create_calls[0][3] == pytest.approx(10.0)
+    assert result.raw_response is not None
+    rules = result.raw_response["okx_order_rules"]
+    assert rules["amount_min_contracts"] == pytest.approx(10.0)
+    assert rules["planned_contracts_raw"] == pytest.approx(3.0)
+    assert rules["final_contracts"] == pytest.approx(10.0)
+    assert rules["system_adjusted_to_min_contracts"] is True
 
 
 @pytest.mark.asyncio
@@ -258,6 +264,13 @@ async def test_entry_size_rejects_before_okx_when_min_contracts_unaffordable():
     assert result.raw_response is not None
     assert "\u63d0\u4ea4\u524d\u62e6\u622a" in result.raw_response["error"]
     assert result.raw_response["okx_min_order_notional_usdt"] > 0
+    assert result.raw_response["system_pre_submit_rejection"] is True
+    assert result.raw_response["okx_rejection"] is False
+    rules = result.raw_response["okx_order_rules"]
+    assert rules["pre_submit_valid"] is False
+    assert rules["amount_min_contracts"] == pytest.approx(10.0)
+    assert rules["affordable_notional_usdt"] == pytest.approx(1.0)
+    assert rules["min_notional_usdt"] == pytest.approx(10.0)
 
 
 @pytest.mark.asyncio

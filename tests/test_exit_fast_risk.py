@@ -212,3 +212,23 @@ def test_fast_adverse_does_not_partially_reduce_ordinary_losing_positions() -> N
     assert plan["should_exit"] is False
     assert plan["fraction"] == 0.0
     assert "不因普通短线噪音全平" in plan["note"] or "不再做部分减仓" in plan["note"]
+
+
+def test_fast_adverse_fresh_loser_requires_hard_evidence_even_with_predictive_score() -> None:
+    plan = _policy().fast_adverse_exit_plan(
+        side="long",
+        entry_price=100.0,
+        current_price=98.6,
+        stop_loss=92.0,
+        returns_1=-0.006,
+        returns_5=-0.009,
+        hold_minutes=7.0,
+        volume_ratio=1.1,
+        current_unrealized_pnl=-1.4,
+        predictive_reversal_score=90.0,
+    )
+
+    assert plan["should_exit"] is False
+    assert plan["fraction"] == 0.0
+    assert plan["fresh_review_window"] is True
+    assert plan["fresh_exit_strong_evidence_required"] is True

@@ -25,6 +25,7 @@ from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
+from services.training_data_quality import annotate_training_payload
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
@@ -339,7 +340,6 @@ async def _completed_trade_sample_count() -> int:
         return reflection_count + eligible_closed_count
 
 
-
 async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
     row_limit = max(int(limit), 1)
     async with get_session_ctx() as session:
@@ -460,17 +460,24 @@ async def _main() -> None:
     trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
     sequence_samples = await _load_sequence_samples(args.sequence_limit)
     text_sentiment_samples = await _load_text_sentiment_samples(args.text_limit)
+    training_payload = annotate_training_payload(
+        shadow_samples=shadow_samples,
+        trade_samples=trade_samples,
+        sequence_samples=sequence_samples,
+        text_sentiment_samples=text_sentiment_samples,
+    )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = await _completed_trade_sample_count()
 
     payload = {
         "source": "local_trading_system",
-        "shadow_samples": shadow_samples,
-        "trade_samples": trade_samples,
-        "sequence_samples": sequence_samples,
-        "text_sentiment_samples": text_sentiment_samples,
+        "shadow_samples": training_payload["shadow_samples"],
+        "trade_samples": training_payload["trade_samples"],
+        "sequence_samples": training_payload["sequence_samples"],
+        "text_sentiment_samples": training_payload["text_sentiment_samples"],
         "completed_shadow_sample_count": completed_shadow_count,
         "completed_trade_sample_count": completed_trade_count,
+        "quality_report": training_payload["quality_report"],
     }
     result = await _post_training_payload(
         args.base_url,

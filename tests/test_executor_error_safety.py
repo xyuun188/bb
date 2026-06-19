@@ -463,10 +463,10 @@ async def test_okx_leverage_open_order_limit_with_unknown_actual_rejects_entry()
     assert "Authorization: ***" in rendered
     assert "password=***" in rendered
 
+
 class _FloorAmountPrecisionCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(int(amount)))
-
 
 
 def test_okx_amount_min_uses_raw_okx_min_size() -> None:

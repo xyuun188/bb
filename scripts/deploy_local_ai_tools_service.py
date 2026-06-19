@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
-from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 SERVICE_CODE = r'''
 from __future__ import annotations
@@ -154,6 +154,7 @@ class TrainRequest(BaseModel):
     source: str = "local_trading_system"
     completed_shadow_sample_count: int | None = None
     completed_trade_sample_count: int | None = None
+    quality_report: dict[str, Any] = {}
 
 
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -338,6 +339,8 @@ def symbol_key(symbol: str | None) -> str:
 def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
     profile: dict[str, Any] = {}
     for row in trade_samples:
+        if bool(row.get("exclude_from_training")):
+            continue
         symbol = symbol_key(row.get("symbol"))
         side = str(row.get("side") or "").lower()
         if not symbol or side not in {"long", "short"}:
@@ -489,6 +492,8 @@ def sequence_deep_features(close_sequence: Any, volume_sequence: Any | None = No
 def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     rows = []
     for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
         x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         y = f(sample, "future_return_pct")
         if not x:
@@ -513,6 +518,8 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
 
     rows = []
     for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
         x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         y = f(sample, "future_return_pct")
         if x:
@@ -597,7 +604,11 @@ def _text_value(row: dict[str, Any]) -> str:
 
 
 def _train_text_sentiment_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
-    rows = [(_text_value(sample), f(sample, "sentiment_score")) for sample in samples or []]
+    rows = [
+        (_text_value(sample), f(sample, "sentiment_score"))
+        for sample in samples or []
+        if not bool(sample.get("exclude_from_training"))
+    ]
     rows = [(text, score) for text, score in rows if text]
     if len(rows) < 80:
         return None
@@ -651,6 +662,7 @@ def health() -> dict[str, Any]:
         "trade_sample_count": metadata.get("trade_sample_count", 0),
         "completed_shadow_sample_count": metadata.get("completed_shadow_sample_count", 0),
         "completed_trade_sample_count": metadata.get("completed_trade_sample_count", 0),
+        "quality_report": metadata.get("quality_report", {}),
         "review_backend": "disabled_use_trading_app_online_model",
     }
 
@@ -675,6 +687,8 @@ def local_models_status() -> dict[str, Any]:
 def train(req: TrainRequest) -> dict[str, Any]:
     rows = []
     for sample in req.shadow_samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
         features = sample.get("features") or {}
         horizon = int(sample.get("horizon_minutes") or features.get("horizon_minutes") or 10)
         raw_long_return = f(sample, "long_return_pct")
@@ -694,6 +708,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "best_side": "long" if long_return >= short_return else "short",
             "lossy_long": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
             "lossy_short": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
+            "sample_weight": max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
         })
     if len(rows) < 200:
         return {
@@ -708,15 +723,16 @@ def train(req: TrainRequest) -> dict[str, Any]:
     short_y = [r["short_return"] for r in rows]
     long_loss_y = [r["lossy_long"] for r in rows]
     short_loss_y = [r["lossy_short"] for r in rows]
+    sample_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in rows]
 
     long_return_model = _make_regressor()
     short_return_model = _make_regressor()
     long_loss_model = _make_classifier(long_loss_y)
     short_loss_model = _make_classifier(short_loss_y)
-    long_return_model.fit(X, long_y)
-    short_return_model.fit(X, short_y)
-    long_loss_model.fit(X, long_loss_y)
-    short_loss_model.fit(X, short_loss_y)
+    long_return_model.fit(X, long_y, model__sample_weight=sample_weights)
+    short_return_model.fit(X, short_y, model__sample_weight=sample_weights)
+    long_loss_model.fit(X, long_loss_y, model__sample_weight=sample_weights)
+    short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
 
     horizon_models: dict[int, dict[str, Any]] = {}
     for horizon in sorted({int(r["horizon"]) for r in rows}):
@@ -725,8 +741,9 @@ def train(req: TrainRequest) -> dict[str, Any]:
             continue
         hX = [r["x"] for r in h_rows]
         net_y = [max(r["long_return"], r["short_return"], key=abs) for r in h_rows]
+        h_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in h_rows]
         model = _make_regressor()
-        model.fit(hX, net_y)
+        model.fit(hX, net_y, model__sample_weight=h_weights)
         horizon_models[horizon] = {"model": model, "samples": len(h_rows)}
 
     deep_sequence_model = _train_sequence_model(req.sequence_samples or [])
@@ -735,12 +752,15 @@ def train(req: TrainRequest) -> dict[str, Any]:
     sentiment_model = None
     sentiment_samples = []
     for sample in req.shadow_samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
         features = sample.get("features") or {}
         if not features:
             continue
         sentiment_samples.append((
             [feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS],
             max(net_return_pct(f(sample, "long_return_pct")), net_return_pct(f(sample, "short_return_pct"))),
+            max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
         ))
     if len(sentiment_samples) >= 200:
         sentiment_model = Pipeline([
@@ -753,11 +773,18 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 n_jobs=-1,
             )),
         ])
-        sentiment_model.fit([x for x, _ in sentiment_samples], [y for _, y in sentiment_samples])
+        sentiment_model.fit(
+            [x for x, _, _ in sentiment_samples],
+            [y for _, y, _ in sentiment_samples],
+            model__sample_weight=[weight for _, _, weight in sentiment_samples],
+        )
     text_sentiment_model = _train_text_sentiment_model(req.text_sentiment_samples or [])
     transformers_sentiment_backend = _probe_transformers_sentiment_backend()
 
-    profiles = _train_profiles(req.trade_samples or [])
+    trainable_trade_samples = [
+        sample for sample in (req.trade_samples or []) if not bool(sample.get("exclude_from_training"))
+    ]
+    profiles = _train_profiles(trainable_trade_samples)
     metadata = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "source": req.source,
@@ -766,12 +793,12 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "last_trained_completed_shadow_sample_count": int(
             req.completed_shadow_sample_count or len(rows)
         ),
-        "trade_sample_count": len(req.trade_samples or []),
+        "trade_sample_count": len(trainable_trade_samples),
         "completed_trade_sample_count": int(
-            req.completed_trade_sample_count or len(req.trade_samples or [])
+            req.completed_trade_sample_count or len(trainable_trade_samples)
         ),
         "last_trained_completed_trade_sample_count": int(
-            req.completed_trade_sample_count or len(req.trade_samples or [])
+            req.completed_trade_sample_count or len(trainable_trade_samples)
         ),
         "sequence_sample_count": int((deep_sequence_model or {}).get("samples") or 0),
         "text_sentiment_sample_count": int((text_sentiment_model or {}).get("samples") or 0),
@@ -783,6 +810,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "profile_count": len(profiles),
         "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
+        "quality_report": req.quality_report or {},
         "training_objective": "Predict executable net return after estimated fees/slippage; win rate is auxiliary.",
         "models": {
             "profit": "ExtraTreesRegressor long/short expected return",
@@ -1224,8 +1252,7 @@ def main() -> None:
         python_bin = "/home/linux/anaconda3/envs/trade_ml/bin/python"
         env_bin = "/home/linux/anaconda3/envs/trade_ml/bin"
         service = (
-            textwrap.dedent(
-                """
+            textwrap.dedent("""
             [Unit]
             Description=Trade Local AI Tools API
             After=network-online.target qwen3-32b-main.service
@@ -1247,11 +1274,7 @@ def main() -> None:
 
             [Install]
             WantedBy=multi-user.target
-            """
-            )
-            .strip()
-            .replace("__ENV_BIN__", env_bin)
-            .replace("__PYTHON_BIN__", python_bin)
+            """).strip().replace("__ENV_BIN__", env_bin).replace("__PYTHON_BIN__", python_bin)
             + "\n"
         )
         remote_service_path = "/data/trade_ai/systemd/local-ai-tools.service"

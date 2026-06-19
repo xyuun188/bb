@@ -51,6 +51,18 @@ class EntryLossCooldownPolicy:
         if side_reason:
             return side_reason
         if symbol_profile and not side_profile:
+            entry_side = self._entry_side(decision, opportunity)
+            profile_scope_side = str(symbol_profile.get("side") or "").lower()
+            last_loss_side = str(
+                symbol_profile.get("last_loss_side")
+                or symbol_profile.get("dominant_loss_side")
+                or ""
+            ).lower()
+            profile_side = (
+                profile_scope_side if profile_scope_side in {"long", "short"} else last_loss_side
+            )
+            if profile_side in {"long", "short"} and profile_side != entry_side:
+                return None
             symbol_reason = self._profile_reason(decision, raw, opportunity, symbol_profile)
             if symbol_reason:
                 return symbol_reason

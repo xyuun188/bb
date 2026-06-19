@@ -3596,6 +3596,7 @@ class TradingService:
                 _load_trade_reflection_samples,
                 _merge_trade_samples,
             )
+            from services.training_data_quality import annotate_training_payload
 
             shadow_samples = await _load_shadow_samples(20000)
             trade_reflection_samples = await _load_trade_reflection_samples(8000)
@@ -3603,6 +3604,12 @@ class TradingService:
             trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
             sequence_samples = await _load_sequence_samples(12000)
             text_sentiment_samples = await _load_text_sentiment_samples(8000)
+            training_payload = annotate_training_payload(
+                shadow_samples=shadow_samples,
+                trade_samples=trade_samples,
+                sequence_samples=sequence_samples,
+                text_sentiment_samples=text_sentiment_samples,
+            )
             completed_trade_total = await _completed_trade_sample_count()
         except Exception as exc:
             return {
@@ -3612,6 +3619,9 @@ class TradingService:
             }
 
         training_shadow_count = len(shadow_samples)
+        quality_report = training_payload["quality_report"]
+        trainable_shadow_count = len(training_payload["shadow_samples"])
+        trainable_trade_count = len(training_payload["trade_samples"])
         new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
         previous_completed_trade_total = int(
             (status or {}).get("last_trained_completed_trade_sample_count")
@@ -3641,6 +3651,9 @@ class TradingService:
                 "reason": "not_enough_shadow_samples",
                 "server_shadow_sample_count": server_shadow_count,
                 "local_shadow_sample_count": training_shadow_count,
+                "trainable_shadow_sample_count": trainable_shadow_count,
+                "trainable_trade_sample_count": trainable_trade_count,
+                "quality_report": quality_report,
                 "completed_shadow_sample_count": completed_shadow_total,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
                 "completed_trade_sample_count": completed_trade_total,
@@ -3662,6 +3675,9 @@ class TradingService:
                 "server_shadow_sample_count": server_shadow_count,
                 "local_shadow_sample_count": training_shadow_count,
                 "completed_shadow_sample_count": completed_shadow_total,
+                "trainable_shadow_sample_count": trainable_shadow_count,
+                "trainable_trade_sample_count": trainable_trade_count,
+                "quality_report": quality_report,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
                 "training_shadow_sample_limit": 20000,
                 "completed_trade_sample_count": completed_trade_total,
@@ -3674,13 +3690,14 @@ class TradingService:
 
         self._local_tools_last_train_started_at = now
         result = await self.local_ai_tools.train(
-            shadow_samples,
-            trade_samples,
-            sequence_samples,
-            text_sentiment_samples,
+            training_payload["shadow_samples"],
+            training_payload["trade_samples"],
+            training_payload["sequence_samples"],
+            training_payload["text_sentiment_samples"],
             source="local_trading_system_auto",
             completed_shadow_sample_count=completed_shadow_total,
             completed_trade_sample_count=completed_trade_total,
+            quality_report=quality_report,
         )
         if result.get("trained"):
             result["completed_shadow_sample_count"] = completed_shadow_total
@@ -3688,6 +3705,9 @@ class TradingService:
             result["completed_trade_sample_count"] = completed_trade_total
             result["last_trained_completed_trade_sample_count"] = completed_trade_total
             result["training_shadow_sample_count"] = training_shadow_count
+            result["trainable_shadow_sample_count"] = trainable_shadow_count
+            result["trainable_trade_sample_count"] = trainable_trade_count
+            result["quality_report"] = quality_report
             result["training_shadow_sample_limit"] = 20000
             result["training_policy"] = training_policy
             self._local_tools_last_completed_shadow_count = completed_shadow_total

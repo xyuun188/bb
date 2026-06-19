@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -71,6 +73,26 @@ async def test_local_ai_tools_training_post_sends_auth_header() -> None:
     assert result == {"trained": True}
     assert captured["url"] == "https://local-ai-tools.test/train"
     assert captured["authorization"] == "Bearer test-local-tools-key"
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_training_post_preserves_quality_report() -> None:
+    captured_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payload.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"trained": True}, request=request)
+
+    quality_report = {"data_quality_version": "test", "totals": {"excluded": 2}}
+    result = await _post_training_payload(
+        "https://local-ai-tools.test/",
+        {"shadow_samples": [], "quality_report": quality_report},
+        request_timeout=3.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result == {"trained": True}
+    assert captured_payload["quality_report"] == quality_report
 
 
 @pytest.mark.asyncio

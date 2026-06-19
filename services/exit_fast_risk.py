@@ -415,6 +415,12 @@ class ExitFastRiskPolicy:
                 "risk_progress": risk_progress,
                 "loss_usdt": loss_usdt,
                 "fresh_review_window": True,
+                "fresh_exit_strong_evidence_required": True,
+                "stop_breached": stop_breached,
+                "force_full_by_loss": force_full_by_loss,
+                "strong_adverse_momentum": strong_adverse_momentum,
+                "volume_confirmed": volume_confirmed,
+                "predictive_reversal_score": predictive_reversal_score,
                 "note": (
                     f"开仓不足 {FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES:.0f} 分钟，"
                     "且未破止损、未达到强制亏损扩大条件；不因普通短线噪音全平。"

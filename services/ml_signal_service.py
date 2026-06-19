@@ -29,6 +29,7 @@ from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
+from services.training_data_quality import assess_shadow_sample, quality_report
 
 logger = structlog.get_logger(__name__)
 
@@ -344,6 +345,21 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         raw_short_return = getattr(row, "short_return_pct", None)
         if raw_long_return is None or raw_short_return is None:
             continue
+        quality_sample = {
+            "symbol": getattr(row, "symbol", ""),
+            "analysis_type": getattr(row, "analysis_type", ""),
+            "decision_action": getattr(row, "decision_action", ""),
+            "decision_confidence": _safe_float(getattr(row, "decision_confidence", 0.0)),
+            "horizon_minutes": int(getattr(row, "horizon_minutes", 10) or 10),
+            "features": snapshot,
+            "long_return_pct": _safe_float(raw_long_return),
+            "short_return_pct": _safe_float(raw_short_return),
+            "best_action": getattr(row, "best_action", ""),
+            "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
+        }
+        assessment = assess_shadow_sample(quality_sample)
+        if assessment.exclude_from_training:
+            continue
         long_return = _net_return_pct(_safe_float(raw_long_return))
         short_return = _net_return_pct(_safe_float(raw_short_return))
         feature_row: dict[str, Any] = dict(
@@ -365,6 +381,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "short_tail_loss": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
                 "long_win": int(long_return > WIN_RETURN_THRESHOLD_PCT),
                 "short_win": int(short_return > WIN_RETURN_THRESHOLD_PCT),
+                "sample_weight": assessment.weight,
+                "data_quality_status": assessment.status,
+                "data_quality_score": assessment.score,
+                "quality_reasons": list(assessment.reasons),
             }
         )
         data.append(feature_row)
@@ -389,16 +409,17 @@ def train_from_frame(
     test = frame.iloc[split:].copy()
     x_train = train[FEATURE_KEYS]
     x_test = test[FEATURE_KEYS]
+    train_weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
 
     long_classifier = _make_classifier(train["long_win"])
     short_classifier = _make_classifier(train["short_win"])
     long_regressor = _make_regressor(train["long_return_pct"])
     short_regressor = _make_regressor(train["short_return_pct"])
 
-    long_classifier.fit(x_train, train["long_win"])
-    short_classifier.fit(x_train, train["short_win"])
-    long_regressor.fit(x_train, train["long_return_pct"])
-    short_regressor.fit(x_train, train["short_return_pct"])
+    long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
+    short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
+    long_regressor.fit(x_train, train["long_return_pct"], model__sample_weight=train_weights)
+    short_regressor.fit(x_train, train["short_return_pct"], model__sample_weight=train_weights)
 
     long_scores = _positive_proba(long_classifier, x_test)
     short_scores = _positive_proba(short_classifier, x_test)
@@ -409,6 +430,18 @@ def train_from_frame(
 
     now = datetime.now(UTC).isoformat()
     completed_count = int(completed_sample_count or len(frame))
+    frame_quality_report = quality_report(
+        {
+            "shadow": [
+                {
+                    "data_quality_status": row.get("data_quality_status", "included"),
+                    "sample_weight": row.get("sample_weight", 1.0),
+                    "quality_reasons": row.get("quality_reasons", []),
+                }
+                for row in frame.to_dict("records")
+            ]
+        }
+    )
     metadata = {
         "version": now,
         "trained_at": now,
@@ -416,6 +449,7 @@ def train_from_frame(
         "completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
+        "quality_report": frame_quality_report,
         "training_shadow_sample_limit": 20000,
         "training_sample_note": "sample_count is the latest training window, not the all-time total.",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
@@ -596,8 +630,7 @@ class MLSignalService:
                     return result
 
                 should_train = force or (
-                    age_seconds >= min_interval_seconds
-                    or new_samples >= min_new_samples
+                    age_seconds >= min_interval_seconds or new_samples >= min_new_samples
                 )
                 if not should_train:
                     result = {

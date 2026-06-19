@@ -177,3 +177,31 @@ def test_entry_opportunity_gate_uses_injected_loss_cooldown_policy() -> None:
 
     assert reason is not None
     assert decision.raw_response["loss_cooldown_override"]["allowed"] is False
+
+
+def test_entry_loss_cooldown_does_not_use_all_symbol_profile_for_opposite_side() -> None:
+    decision = _decision(
+        {
+            "score": 1.7,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.45,
+            "profit_quality_ratio": 0.65,
+            "reward_risk_ratio": 1.05,
+            "server_profit_expected_return_pct": 0.35,
+            "server_profit_loss_probability": 0.48,
+            "tail_risk_score": 0.45,
+            "symbol_profile": {
+                **_cooldown_profile(),
+                "side": "all",
+                "profile_scope": "symbol",
+                "last_loss_side": "short",
+                "cooldown_reason": "short-side recent loss",
+            },
+        },
+        action=Action.LONG,
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is None
+    assert "loss_cooldown_override" not in decision.raw_response

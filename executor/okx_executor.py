@@ -11,7 +11,7 @@ import os
 import re
 import time
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
 import structlog
@@ -335,6 +335,16 @@ class OKXExecutor(AbstractExecutor):
                     balance,
                     decision.suggested_leverage,
                 )
+                okx_order_rules = self._entry_order_rule_snapshot(
+                    market,
+                    price=price,
+                    balance=balance,
+                    leverage=decision.suggested_leverage,
+                    planned_notional_usdt=position_value,
+                    final_contracts=order_quantity,
+                )
+            else:
+                okx_order_rules = {}
 
             if order_quantity <= 0 and decision.is_entry:
                 min_notional = self._minimum_order_notional(market, price)
@@ -352,8 +362,12 @@ class OKXExecutor(AbstractExecutor):
                             "该交易对的 OKX 最小下单张数超过当前可用余额或风险预算，"
                             "系统已在提交前拦截，未向 OKX 发送无效订单。"
                         ),
+                        "execution_blocker": "system_pre_submit_order_rule",
+                        "system_pre_submit_rejection": True,
+                        "okx_rejection": False,
                         "okx_symbol": okx_symbol,
                         "contract_size": contract_size,
+                        "okx_order_rules": okx_order_rules,
                         "okx_min_order_notional_usdt": round(min_notional, 8),
                         "affordable_notional_usdt": round(affordable_notional, 8),
                         "planned_order_notional_usdt": round(position_value, 8),
@@ -409,6 +423,7 @@ class OKXExecutor(AbstractExecutor):
                             "remaining_contracts": remaining_contracts,
                             "planned_order_contracts": order_quantity,
                             "planned_base_quantity": base_quantity,
+                            "okx_order_rules": okx_order_rules,
                         },
                     )
 
@@ -671,6 +686,7 @@ class OKXExecutor(AbstractExecutor):
                             "contract_size": contract_size,
                             "planned_order_contracts": order_quantity,
                             "planned_base_quantity": base_quantity,
+                            "okx_order_rules": okx_order_rules,
                         },
                     )
                 actual_leverage = self._safe_float(
@@ -692,6 +708,14 @@ class OKXExecutor(AbstractExecutor):
                         balance,
                         decision.suggested_leverage,
                     )
+                    okx_order_rules = self._entry_order_rule_snapshot(
+                        market,
+                        price=price,
+                        balance=balance,
+                        leverage=decision.suggested_leverage,
+                        planned_notional_usdt=position_value,
+                        final_contracts=order_quantity,
+                    )
                     if order_quantity <= 0:
                         return ExecutionResult(
                             order_id="rejected",
@@ -706,11 +730,15 @@ class OKXExecutor(AbstractExecutor):
                                     "杠杆按 OKX 上限回退后，该交易对最小下单张数仍超过当前可用余额或风险预算，"
                                     "系统已在提交前拦截，未向 OKX 发送无效订单。"
                                 ),
+                                "execution_blocker": "system_pre_submit_order_rule",
+                                "system_pre_submit_rejection": True,
+                                "okx_rejection": False,
                                 "leverage_check": leverage_check,
                                 "okx_symbol": okx_symbol,
                                 "contract_size": contract_size,
                                 "planned_order_contracts": order_quantity,
                                 "planned_base_quantity": base_quantity,
+                                "okx_order_rules": okx_order_rules,
                             },
                         )
                 stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
@@ -854,6 +882,7 @@ class OKXExecutor(AbstractExecutor):
                         "order_contracts": order_quantity,
                         "filled_contracts": filled_contracts,
                         "planned_base_quantity": base_quantity,
+                        "okx_order_rules": okx_order_rules,
                         "order_status": status.value,
                     },
                 )
@@ -1059,6 +1088,7 @@ class OKXExecutor(AbstractExecutor):
                     "contract_size": contract_size,
                     "order_contracts": order_quantity,
                     "filled_contracts": filled_contracts,
+                    "okx_order_rules": okx_order_rules,
                     "base_quantity": (
                         filled_base_quantity
                         if filled_base_quantity > 0
@@ -1413,6 +1443,51 @@ class OKXExecutor(AbstractExecutor):
         contracts = self._normalize_order_contracts(ccxt, market, contracts, min_contracts)
 
         return contracts, contracts * contract_size
+
+    def _entry_order_rule_snapshot(
+        self,
+        market: dict[str, Any],
+        *,
+        price: float,
+        balance: float,
+        leverage: float,
+        planned_notional_usdt: float,
+        final_contracts: float,
+    ) -> dict[str, Any]:
+        contract_size = self._contract_size(market)
+        amount_min = self._amount_min(market)
+        amount_step = self._amount_step(market)
+        planned_contracts = (
+            planned_notional_usdt / (price * contract_size)
+            if price > 0 and contract_size > 0 and planned_notional_usdt > 0
+            else 0.0
+        )
+        min_notional = amount_min * contract_size * price if price > 0 else 0.0
+        final_notional = max(final_contracts, 0.0) * contract_size * max(price, 0.0)
+        effective_leverage = max(float(leverage or 1.0), 1.0)
+        return {
+            "okx_symbol": market.get("symbol"),
+            "price": round(max(price, 0.0), 12),
+            "contract_size": round(contract_size, 12),
+            "amount_min_contracts": round(amount_min, 12),
+            "amount_step_contracts": round(amount_step, 12),
+            "min_notional_usdt": round(min_notional, 8),
+            "available_balance_usdt": round(max(balance, 0.0), 8),
+            "leverage": round(effective_leverage, 6),
+            "affordable_notional_usdt": round(max(balance, 0.0) * effective_leverage, 8),
+            "planned_notional_usdt": round(max(planned_notional_usdt, 0.0), 8),
+            "planned_contracts_raw": round(max(planned_contracts, 0.0), 12),
+            "final_contracts": round(max(final_contracts, 0.0), 12),
+            "final_base_quantity": round(max(final_contracts, 0.0) * contract_size, 12),
+            "final_notional_usdt": round(final_notional, 8),
+            "required_margin_usdt": round(final_notional / effective_leverage, 8),
+            "system_adjusted_to_min_contracts": bool(
+                amount_min > 0 and 0 < planned_contracts < amount_min <= final_contracts
+            ),
+            "pre_submit_valid": bool(
+                final_contracts > 0 and (amount_min <= 0 or final_contracts >= amount_min)
+            ),
+        }
 
     def _minimum_order_notional(self, market: dict[str, Any], price: float) -> float:
         min_contracts = self._amount_min(market)

@@ -6195,23 +6195,62 @@ function executionStepDuration(step) {
 
 function executionStepDataText(data) {
     if (!data || typeof data !== 'object' || !Object.keys(data).length) return '';
+    const formatRuleValue = (value, suffix = '') => {
+        if (value === null || value === undefined || value === '') return '';
+        if (typeof value === 'number' && Number.isFinite(value)) return `${value}${suffix}`;
+        return `${value}${suffix}`;
+    };
+    const formatOkxRules = (rules) => {
+        if (!rules || typeof rules !== 'object') return '';
+        const rows = [
+            ['OKX\u4ea4\u6613\u5bf9', rules.okx_symbol],
+            ['\u5f53\u524d\u4ef7\u683c', rules.price],
+            ['\u5408\u7ea6\u9762\u503c', rules.contract_size],
+            ['\u6700\u5c0f\u5f20\u6570', rules.amount_min_contracts],
+            ['\u4e0b\u5355\u6b65\u8fdb', rules.amount_step_contracts],
+            ['\u6700\u5c0f\u540d\u4e49\u4ef7\u503c', formatRuleValue(rules.min_notional_usdt, ' USDT')],
+            ['\u53ef\u7528\u4f59\u989d', formatRuleValue(rules.available_balance_usdt, ' USDT')],
+            ['\u6760\u6746', formatRuleValue(rules.leverage, 'x')],
+            ['\u53ef\u627f\u53d7\u540d\u4e49\u4ef7\u503c', formatRuleValue(rules.affordable_notional_usdt, ' USDT')],
+            ['\u8ba1\u5212\u540d\u4e49\u4ef7\u503c', formatRuleValue(rules.planned_notional_usdt, ' USDT')],
+            ['\u8ba1\u5212\u5f20\u6570', rules.planned_contracts_raw],
+            ['\u6700\u7ec8\u5f20\u6570', rules.final_contracts],
+            ['\u6700\u7ec8\u5e01\u6570', rules.final_base_quantity],
+            ['\u6700\u7ec8\u540d\u4e49\u4ef7\u503c', formatRuleValue(rules.final_notional_usdt, ' USDT')],
+            ['\u9884\u8ba1\u4fdd\u8bc1\u91d1', formatRuleValue(rules.required_margin_usdt, ' USDT')],
+            ['\u662f\u5426\u62ac\u5230\u6700\u5c0f\u5f20\u6570', rules.system_adjusted_to_min_contracts ? '\u662f' : '\u5426'],
+            ['\u63d0\u4ea4\u524d\u6821\u9a8c', rules.pre_submit_valid ? '\u901a\u8fc7' : '\u672a\u901a\u8fc7'],
+        ].filter(([, value]) => value !== null && value !== undefined && value !== '');
+        return rows.map(([label, value]) => `${label}: ${value}`).join('\n');
+    };
     const labels = {
-        source: '来源',
-        order_status: '订单状态',
-        blocker: '拦截类型',
-        okx_code: 'OKX 返回码',
-        min_size: '最小数量',
-        min_notional: '最小名义价值',
-        requested_qty: '请求数量',
-        adjusted_qty: '调整后数量',
-        available_balance: '可用余额',
-        required_margin: '所需保证金',
-        symbol: '交易对',
-        side: '方向',
+        source: '\u6765\u6e90',
+        order_status: '\u8ba2\u5355\u72b6\u6001',
+        blocker: '\u62e6\u622a\u7c7b\u578b',
+        execution_blocker: '\u6267\u884c\u62e6\u622a\u5668',
+        system_pre_submit_rejection: '\u7cfb\u7edf\u63d0\u4ea4\u524d\u62e6\u622a',
+        okx_rejection: 'OKX\u5b9e\u9645\u62d2\u7edd',
+        okx_order_rules: 'OKX\u4e0b\u5355\u89c4\u5219',
+        okx_code: 'OKX \u8fd4\u56de\u7801',
+        min_size: '\u6700\u5c0f\u6570\u91cf',
+        min_notional: '\u6700\u5c0f\u540d\u4e49\u4ef7\u503c',
+        requested_qty: '\u8bf7\u6c42\u6570\u91cf',
+        adjusted_qty: '\u8c03\u6574\u540e\u6570\u91cf',
+        available_balance: '\u53ef\u7528\u4f59\u989d',
+        required_margin: '\u6240\u9700\u4fdd\u8bc1\u91d1',
+        symbol: '\u4ea4\u6613\u5bf9',
+        side: '\u65b9\u5411',
     };
     return Object.entries(data)
         .filter(([, value]) => value !== null && value !== undefined && value !== '')
-        .map(([key, value]) => `${labels[key] || key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+        .map(([key, value]) => {
+            if (key === 'okx_order_rules') {
+                const rulesText = formatOkxRules(value);
+                return rulesText ? `${labels[key]}:\n${rulesText}` : '';
+            }
+            return `${labels[key] || key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`;
+        })
+        .filter(Boolean)
         .join('\n');
 }
 
