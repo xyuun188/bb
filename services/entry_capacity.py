@@ -8,6 +8,7 @@ from ai_brain.base_model import Action, DecisionOutput
 
 NormalizeSymbol = Callable[[Any], str | None]
 MaxOpenPositionsProvider = Callable[[], Any]
+StagedEntryCounts = dict[str, dict[Any, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,7 +18,7 @@ class EntryCapacityPolicy:
     normalize_symbol: NormalizeSymbol
     max_open_positions_per_model_provider: MaxOpenPositionsProvider
 
-    def empty_staged_counts(self) -> dict[str, dict[Any, int]]:
+    def empty_staged_counts(self) -> StagedEntryCounts:
         """Return the per-round staged-entry counters used before orders are submitted."""
 
         return {"model_totals": {}, "symbol_side": {}, "side_totals": {}}
@@ -27,19 +28,20 @@ class EntryCapacityPolicy:
         model_name: str,
         decision: DecisionOutput,
         open_positions: list[dict],
-        staged_entry_counts: dict[str, dict],
+        staged_entry_counts: StagedEntryCounts,
     ) -> str | None:
         if not decision.is_entry:
             return None
 
         side = "long" if decision.action == Action.LONG else "short"
         symbol_key = self.normalize_symbol(decision.symbol)
-        staged_symbol_side = staged_entry_counts.get("symbol_side", {})
-        staged_model_totals = staged_entry_counts.get("model_totals", {})
+        staged_symbol_side = self._stage_dict(staged_entry_counts, "symbol_side")
+        staged_model_totals = self._stage_dict(staged_entry_counts, "model_totals")
         existing_same_symbol = sum(
             1
             for position in open_positions
-            if position.get("model_name") == model_name
+            if self._is_effective_open_position(position)
+            and position.get("model_name") == model_name
             and self.normalize_symbol(position.get("symbol")) == symbol_key
             and position.get("side") == side
         )
@@ -47,25 +49,26 @@ class EntryCapacityPolicy:
         existing_same_symbol += int(staged_symbol_side.get(staged_key, 0))
         is_same_symbol_add = existing_same_symbol > 0
 
-        model_open_count = self._model_open_group_count(model_name, open_positions)
-        model_open_count += int(staged_model_totals.get(model_name, 0))
-        if not is_same_symbol_add and staged_symbol_side.get(staged_key):
-            model_open_count = max(model_open_count - 1, 0)
-            is_same_symbol_add = True
+        live_open_count = self._model_open_group_count(model_name, open_positions)
+        staged_open_count = int(staged_model_totals.get(model_name, 0))
+        model_open_count = live_open_count + staged_open_count
         capacity = self._capacity_context()
         max_open_positions = int(
-            capacity.get("entry_limit")
-            or capacity.get("effective_limit")
-            or 0
+            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
         )
         if (
             not is_same_symbol_add
             and max_open_positions > 0
             and model_open_count >= max_open_positions
         ):
+            capacity_detail = self._capacity_count_text(
+                live_open_count,
+                staged_open_count,
+                max_open_positions,
+            )
             return (
-                "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
-                f"当前 {model_open_count} 组，限制 {max_open_positions} 组。"
+                "策略执行容量已达到本轮动态上限，暂停新开不同币种/方向仓位。"
+                f"{capacity_detail}"
                 f"{self._capacity_suffix(capacity)}"
             )
         return None
@@ -122,12 +125,49 @@ class EntryCapacityPolicy:
             return "容量由策略学习、持仓质量和账户风险动态计算。"
         return reason
 
+    @staticmethod
+    def _capacity_count_text(
+        live_open_count: int,
+        staged_open_count: int,
+        max_open_positions: int,
+    ) -> str:
+        if staged_open_count > 0:
+            return (
+                f"真实持仓 {live_open_count} 组，本轮待确认开仓 {staged_open_count} 组，"
+                f"合计占用 {live_open_count + staged_open_count} 组，执行容量 {max_open_positions} 组。"
+            )
+        return f"当前真实持仓 {live_open_count} 组，执行容量 {max_open_positions} 组。"
+
+    @staticmethod
+    def _is_effective_open_position(position: dict[str, Any]) -> bool:
+        if position.get("is_open", True) is False:
+            return False
+        if "quantity" not in position:
+            return True
+        try:
+            return float(position.get("quantity") or 0.0) > 1e-12
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _stage_dict(staged_entry_counts: StagedEntryCounts, key: str) -> dict[Any, int]:
+        value = staged_entry_counts.get(key)
+        if isinstance(value, dict):
+            return value
+        value = {}
+        staged_entry_counts[key] = value
+        return value
+
     def _model_open_group_count(self, model_name: str, open_positions: list[dict]) -> int:
         groups: set[tuple[str | None, str]] = set()
         for position in open_positions:
+            if not self._is_effective_open_position(position):
+                continue
             if position.get("model_name") != model_name:
                 continue
             symbol_key = self.normalize_symbol(position.get("symbol"))
+            if not symbol_key:
+                continue
             side = str(position.get("side") or "unknown").lower().strip() or "unknown"
             groups.add((symbol_key, side))
         return len(groups)
@@ -136,26 +176,56 @@ class EntryCapacityPolicy:
         self,
         model_name: str,
         decision: DecisionOutput,
-        staged_entry_counts: dict[str, dict[Any, int]],
+        staged_entry_counts: StagedEntryCounts,
     ) -> None:
         """Reserve capacity for an entry selected earlier in the current round."""
 
         if not decision.is_entry:
             return
 
-        staged_entry_counts.setdefault("model_totals", {})
-        staged_entry_counts.setdefault("symbol_side", {})
-        staged_entry_counts.setdefault("side_totals", {})
+        staged_model_totals = self._stage_dict(staged_entry_counts, "model_totals")
+        staged_symbol_side = self._stage_dict(staged_entry_counts, "symbol_side")
+        staged_side_totals = self._stage_dict(staged_entry_counts, "side_totals")
 
         side = "long" if decision.action == Action.LONG else "short"
-        staged_entry_counts["side_totals"][side] = (
-            int(staged_entry_counts["side_totals"].get(side, 0)) + 1
-        )
+        staged_side_totals[side] = int(staged_side_totals.get(side, 0)) + 1
         staged_key = (model_name, self.normalize_symbol(decision.symbol), side)
-        if staged_key not in staged_entry_counts["symbol_side"]:
-            staged_entry_counts["model_totals"][model_name] = (
-                int(staged_entry_counts["model_totals"].get(model_name, 0)) + 1
-            )
-        staged_entry_counts["symbol_side"][staged_key] = (
-            int(staged_entry_counts["symbol_side"].get(staged_key, 0)) + 1
-        )
+        if staged_key not in staged_symbol_side:
+            staged_model_totals[model_name] = int(staged_model_totals.get(model_name, 0)) + 1
+        staged_symbol_side[staged_key] = int(staged_symbol_side.get(staged_key, 0)) + 1
+
+    def release_slot(
+        self,
+        model_name: str,
+        decision: DecisionOutput,
+        staged_entry_counts: StagedEntryCounts,
+    ) -> None:
+        """Release a staged entry when it did not become a real or pending order."""
+
+        if not decision.is_entry:
+            return
+
+        staged_model_totals = self._stage_dict(staged_entry_counts, "model_totals")
+        staged_symbol_side = self._stage_dict(staged_entry_counts, "symbol_side")
+        staged_side_totals = self._stage_dict(staged_entry_counts, "side_totals")
+        side = "long" if decision.action == Action.LONG else "short"
+        staged_key = (model_name, self.normalize_symbol(decision.symbol), side)
+        symbol_side_count = int(staged_symbol_side.get(staged_key, 0))
+        if symbol_side_count <= 0:
+            return
+
+        if symbol_side_count <= 1:
+            staged_symbol_side.pop(staged_key, None)
+            model_total = int(staged_model_totals.get(model_name, 0)) - 1
+            if model_total > 0:
+                staged_model_totals[model_name] = model_total
+            else:
+                staged_model_totals.pop(model_name, None)
+        else:
+            staged_symbol_side[staged_key] = symbol_side_count - 1
+
+        side_total = int(staged_side_totals.get(side, 0)) - 1
+        if side_total > 0:
+            staged_side_totals[side] = side_total
+        else:
+            staged_side_totals.pop(side, None)

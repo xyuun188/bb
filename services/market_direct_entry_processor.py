@@ -14,11 +14,12 @@ CapacityReasonProvider = Callable[
     str | None,
 ]
 CapacityReserver = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
+CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
 CandidateSelectionAnnotator = Callable[..., dict[str, Any]]
 DecisionRawResponseMarker = Callable[[int, dict[str, Any]], Awaitable[None]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 MarketNoOpportunityClearer = Callable[[str], None]
-CandidateExecutor = Callable[..., Awaitable[None]]
+CandidateExecutor = Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class MarketDirectEntryProcessResult:
 
     handled: bool
     execution_attempted: bool = False
+    execution_confirmed: bool = False
     reason: str | None = None
 
 
@@ -42,6 +44,8 @@ class MarketDirectEntryProcessor:
     result_recorder: MarketDecisionResultRecorder
     clear_market_no_opportunity_symbol: MarketNoOpportunityClearer
     candidate_executor: CandidateExecutor
+    capacity_releaser: CapacityReleaser | None = None
+    execution_confirmed_checker: Callable[[Any], bool] | None = None
 
     async def process(
         self,
@@ -89,7 +93,7 @@ class MarketDirectEntryProcessor:
 
         self.capacity_reserver(model_name, executed, staged_entry_counts)
         self.clear_market_no_opportunity_symbol(symbol)
-        await self.candidate_executor(
+        execution_result = await self.candidate_executor(
             symbol,
             model_name,
             executed,
@@ -98,7 +102,25 @@ class MarketDirectEntryProcessor:
             results,
             open_positions=open_positions,
         )
+        execution_confirmed = self._execution_confirmed(execution_result)
+        if not execution_confirmed and self.capacity_releaser is not None:
+            self.capacity_releaser(model_name, executed, staged_entry_counts)
         return MarketDirectEntryProcessResult(
             handled=True,
             execution_attempted=True,
+            execution_confirmed=execution_confirmed,
+        )
+
+    def _execution_confirmed(self, execution_result: Any) -> bool:
+        if self.execution_confirmed_checker is not None:
+            return bool(self.execution_confirmed_checker(execution_result))
+        if execution_result is None:
+            return False
+        status = getattr(getattr(execution_result, "status", None), "value", None)
+        if status is None:
+            status = str(getattr(execution_result, "status", "") or "").lower()
+        return bool(
+            status == "filled"
+            and str(getattr(execution_result, "exchange_order_id", "") or "").strip()
+            and float(getattr(execution_result, "quantity", 0.0) or 0.0) > 0
         )

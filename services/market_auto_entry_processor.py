@@ -28,9 +28,10 @@ DecisionRawResponseMarker = Callable[[int, dict[str, Any]], Awaitable[None]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 PendingExecutionMarker = Callable[[int, str], Awaitable[None]]
 LoopStageSetter = Callable[[str], None]
-CandidateExecutor = Callable[..., Awaitable[None]]
+CandidateExecutor = Callable[..., Awaitable[Any]]
 FinalStateEnsurer = Callable[[int, str, str, DecisionOutput, dict[str, Any]], Awaitable[None]]
 MarketNoOpportunityClearer = Callable[[str], None]
+CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ class MarketAutoEntryProcessResult:
 
     handled: bool
     execution_attempted: bool = False
+    execution_confirmed: bool = False
     execution_error: str | None = None
     reason: str | None = None
 
@@ -59,6 +61,8 @@ class MarketAutoEntryProcessor:
     set_loop_stage: LoopStageSetter
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
+    capacity_releaser: CapacityReleaser | None = None
+    execution_confirmed_checker: Callable[[Any], bool] | None = None
 
     async def process(
         self,
@@ -139,7 +143,7 @@ class MarketAutoEntryProcessor:
 
         self.set_loop_stage(f"execute:{symbol}")
         try:
-            await self.candidate_executor(
+            execution_result = await self.candidate_executor(
                 symbol,
                 model_name,
                 decision,
@@ -148,6 +152,9 @@ class MarketAutoEntryProcessor:
                 results,
                 open_positions=open_positions,
             )
+            execution_confirmed = self._execution_confirmed(execution_result)
+            if not execution_confirmed:
+                self._release_capacity(model_name, decision, staged_entry_counts)
             if decision_db_id is not None:
                 await self.final_state_ensurer(
                     decision_db_id,
@@ -156,7 +163,14 @@ class MarketAutoEntryProcessor:
                     decision,
                     results,
                 )
+            return MarketAutoEntryProcessResult(
+                handled=True,
+                execution_attempted=True,
+                execution_confirmed=execution_confirmed,
+                reason=immediate_plan.reason,
+            )
         except Exception as exc:
+            self._release_capacity(model_name, decision, staged_entry_counts)
             error_text = safe_error_text(exc, limit=160)
             reason = self._execution_error_reason(
                 error_text,
@@ -188,14 +202,32 @@ class MarketAutoEntryProcessor:
             return MarketAutoEntryProcessResult(
                 handled=True,
                 execution_attempted=True,
+                execution_confirmed=False,
                 execution_error=error_text,
                 reason=reason,
             )
 
-        return MarketAutoEntryProcessResult(
-            handled=True,
-            execution_attempted=True,
-            reason=immediate_plan.reason,
+    def _release_capacity(
+        self,
+        model_name: str,
+        decision: DecisionOutput,
+        staged_entry_counts: dict[str, dict[Any, int]],
+    ) -> None:
+        if self.capacity_releaser is not None:
+            self.capacity_releaser(model_name, decision, staged_entry_counts)
+
+    def _execution_confirmed(self, execution_result: Any) -> bool:
+        if self.execution_confirmed_checker is not None:
+            return bool(self.execution_confirmed_checker(execution_result))
+        if execution_result is None:
+            return False
+        status = getattr(getattr(execution_result, "status", None), "value", None)
+        if status is None:
+            status = str(getattr(execution_result, "status", "") or "").lower()
+        return bool(
+            status == "filled"
+            and str(getattr(execution_result, "exchange_order_id", "") or "").strip()
+            and float(getattr(execution_result, "quantity", 0.0) or 0.0) > 0
         )
 
     @staticmethod

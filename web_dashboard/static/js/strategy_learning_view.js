@@ -313,12 +313,21 @@ function renderStrategyLearningSummary(data) {
     const guardLabel = guard.should_rollback ? '护栏预警' : '护栏正常';
     const source = profile.source || (profile.id === 'baseline_current' ? 'baseline' : 'feedback_generator');
     const llmError = String(llm.last_error || '').trim();
+    const llmErrorKind = String(llm.last_error_kind || '').trim();
     const llmCached = Array.isArray(llm.cached_candidates) ? llm.cached_candidates : [];
+    const llmErrorMessages = {
+        timeout: '候选模型响应超时，本轮没有采用动态候选；系统会在下一次策略窗口重试。',
+        http_error: '候选模型接口请求失败，本轮没有采用动态候选；请检查模型服务和隧道状态。',
+        invalid_json: '候选模型返回格式不符合 JSON 结构要求，本轮没有采用动态候选。',
+        empty_candidates: '候选模型没有生成可通过边界校验的策略候选，本轮继续使用已验证策略。',
+        unknown: '候选模型本轮生成失败，系统保留当前已验证策略。',
+    };
+    const llmErrorMessage = llmErrorMessages[llmErrorKind] || llmErrorMessages.unknown;
     const llmStateLabel = llm.cache_status === 'current'
         ? '缓存匹配当前反馈'
         : (llm.cache_status === 'stale' ? '缓存已过期' : '暂无缓存');
     const llmNotice = llmError
-        ? `<div class="strategy-learning-inline-alert warn"><strong>\u52a8\u6001\u5019\u9009\u672a\u751f\u6548</strong><span>\u5019\u9009\u6a21\u578b\u672a\u8fd4\u56de\u53ef\u89e3\u6790 JSON\uff0c\u5f53\u524d\u4f7f\u7528\u5185\u7f6e\u53d7\u63a7\u7b56\u7565\u515c\u5e95\u3002</span><em>${strategyLearningEsc(strategyLearningShort(llmError, 96))}</em></div>`
+        ? `<div class="strategy-learning-inline-alert warn"><strong>动态候选未生效</strong><span>${strategyLearningEsc(llmErrorMessage)}</span><em>${strategyLearningEsc(strategyLearningShort(llmError, 96))}</em></div>`
         : '';
     const llmCacheNotice = llmCached.length
         ? `<div class="strategy-learning-inline-alert ${llm.cache_status === 'current' ? '' : 'warn'}"><strong>LLM 结构化候选</strong><span>${strategyLearningEsc(llmStateLabel)} · ${strategyLearningEsc(llm.last_model || llm.source || '-')} · ${strategyLearningEsc(strategyLearningTime(llm.cached_at))}</span><em>${llmCached.map(item => strategyLearningEsc(item.label || item.id || '-')).join(' / ')}</em></div>`

@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+
 from services.strategy_learning import (
     AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS,
     StrategyLearningEngine,
@@ -1727,9 +1729,74 @@ def test_strategy_learning_llm_candidate_retries_next_model_after_http_error(
 
     assert cache["last_error"] == ""
 
+    assert cache["last_error_kind"] == ""
+
     assert cache["attempts"][0]["status"] == "failed"
 
+    assert cache["attempts"][0]["error_kind"] == "http_error"
+
     assert cache["attempts"][1]["status"] == "completed"
+
+
+def test_strategy_learning_llm_candidate_timeout_is_classified(tmp_path, monkeypatch) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+    feedback = service.engine.compiler.compile(
+        mode="paper",
+        window_hours=24,
+        positions=[_position(side="long", pnl=-1.2)],
+        open_positions=[],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity")],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event("entry_block", status="blocked", reason="expert fallback")
+        ],
+        reflections=[_reflection(position_id=182, pnl=-1.2, mistake="entry quality weak")],
+        max_open_positions=20,
+    )
+    monkeypatch.setattr(
+        service,
+        "_llm_candidate_configs",
+        lambda: [
+            {
+                "name": "decision_maker",
+                "api_base": "http://model-a/v1",
+                "api_key": "key-a",
+                "model": "qwen3-14b-trade",
+            }
+        ],
+    )
+    calls = 0
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, url: str, headers: dict[str, str], json: dict[str, Any]) -> None:
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("model took too long")
+
+    import asyncio
+
+    monkeypatch.setattr("services.strategy_learning.httpx.AsyncClient", FakeClient)
+
+    profiles = asyncio.run(service._generate_llm_profiles(mode="paper", feedback=feedback))
+
+    assert profiles == []
+    assert calls == 2
+    cache = state_store.load()["llm_candidate_cache"]
+    assert cache["last_error_kind"] == "timeout"
+    assert "timed out" in cache["last_error"]
+    assert cache["attempts"][0]["error_kind"] == "timeout"
 
 
 def test_strategy_learning_llm_candidate_retries_short_prompt_after_incomplete_json(

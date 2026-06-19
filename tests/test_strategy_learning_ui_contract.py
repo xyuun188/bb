@@ -56,6 +56,16 @@ def test_strategy_learning_profile_actions_show_immediate_feedback() -> None:
     assert "????" not in script
 
 
+def test_strategy_learning_ui_classifies_llm_candidate_errors() -> None:
+    script = Path("web_dashboard/static/js/strategy_learning_view.js").read_text(encoding="utf-8")
+
+    assert "llm.last_error_kind" in script
+    assert "候选模型响应超时" in script
+    assert "候选模型接口请求失败" in script
+    assert "候选模型返回格式不符合 JSON 结构要求" in script
+    assert "候选模型未返回可解析 JSON" not in script
+
+
 def test_strategy_learning_console_uses_clear_stage_layout() -> None:
     html = Path("web_dashboard/static/index.html").read_text(encoding="utf-8")
     style = Path("web_dashboard/static/css/strategy_learning.css").read_text(encoding="utf-8")

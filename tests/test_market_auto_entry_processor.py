@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from executor.base_executor import ExecutionResult, OrderStatus
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.market_auto_entry_processor import (
     ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
@@ -24,6 +25,32 @@ def _decision() -> DecisionOutput:
     )
 
 
+def _filled_result() -> ExecutionResult:
+    return ExecutionResult(
+        order_id="local-1",
+        symbol="BTC/USDT",
+        side="long",
+        order_type="market",
+        quantity=1.0,
+        price=100.0,
+        status=OrderStatus.FILLED,
+        exchange_order_id="exchange-1",
+    )
+
+
+def _rejected_result() -> ExecutionResult:
+    return ExecutionResult(
+        order_id="local-1",
+        symbol="BTC/USDT",
+        side="long",
+        order_type="market",
+        quantity=0.0,
+        price=0.0,
+        status=OrderStatus.REJECTED,
+        exchange_order_id="rejected",
+    )
+
+
 def _processor(
     calls: list[tuple[str, Any]],
     *,
@@ -31,6 +58,7 @@ def _processor(
     immediate_reason: str | None = "强信号",
     capacity_reason: str | None = None,
     execute_error: Exception | None = None,
+    execution_result: ExecutionResult | None = None,
 ) -> MarketAutoEntryProcessor:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
         calls.append(("score", decision.symbol, strategy))
@@ -62,6 +90,14 @@ def _processor(
         calls.append(("reserve", model_name, decision.symbol))
         staged_counts.setdefault("reserved", {})[model_name] = 1
 
+    def release(
+        model_name: str,
+        decision: DecisionOutput,
+        staged_counts: dict[str, dict[Any, int]],
+    ) -> None:
+        calls.append(("release", model_name, decision.symbol))
+        staged_counts.setdefault("reserved", {})[model_name] = 0
+
     def annotate(decision: DecisionOutput, **kwargs: Any) -> dict[str, Any]:
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         raw["candidate_selection"] = kwargs
@@ -84,11 +120,12 @@ def _processor(
     def set_stage(stage: str) -> None:
         calls.append(("stage", stage))
 
-    async def execute_candidate(*args: Any, **kwargs: Any) -> None:
+    async def execute_candidate(*args: Any, **kwargs: Any) -> ExecutionResult | None:
         decision = args[2]
         calls.append(("execute", args[0], args[1], decision.action.value, bool(kwargs)))
         if execute_error is not None:
             raise execute_error
+        return execution_result
 
     async def ensure_final(
         decision_id: int,
@@ -116,6 +153,10 @@ def _processor(
         set_loop_stage=set_stage,
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
+        capacity_releaser=release,
+        execution_confirmed_checker=lambda result: bool(
+            result and result.status == OrderStatus.FILLED and result.exchange_order_id
+        ),
     )
 
 
@@ -206,7 +247,7 @@ async def test_market_auto_entry_processor_preserves_dynamic_evidence_wait_reaso
     assert result.handled is True
     assert result.execution_attempted is False
     assert result.reason == wait_reason
-    assert "候选评分未达执行标准" not in results["decisions"][0]["reason"]
+    assert "入场候选暂未满足执行条件" not in results["decisions"][0]["reason"]
     assert ("reason", 11, wait_reason) in calls
 
 
@@ -235,12 +276,12 @@ async def test_market_auto_entry_processor_records_capacity_skip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_market_auto_entry_processor_executes_and_ensures_final_state() -> None:
+async def test_market_auto_entry_processor_keeps_capacity_on_confirmed_execution() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
     staged_counts: dict[str, dict[Any, int]] = {}
 
-    result = await _processor(calls).process(
+    result = await _processor(calls, execution_result=_filled_result()).process(
         symbol="BTC/USDT",
         model_name="ensemble_trader",
         decision=_decision(),
@@ -253,20 +294,44 @@ async def test_market_auto_entry_processor_executes_and_ensures_final_state() ->
         strategy_mode_context=None,
     )
 
-    assert result.handled is True
     assert result.execution_attempted is True
+    assert result.execution_confirmed is True
     assert staged_counts["reserved"]["ensemble_trader"] == 1
+    assert ("release", "ensemble_trader", "BTC/USDT") not in calls
     assert ("pending", 9, "强信号") in calls
-    assert ("stage", "execute:BTC/USDT") in calls
-    assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
     assert ("ensure", 9, "BTC/USDT", "ensemble_trader", "long") in calls
-    assert results["decisions"] == []
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_releases_capacity_on_unconfirmed_execution() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    staged_counts: dict[str, dict[Any, int]] = {}
+
+    result = await _processor(calls, execution_result=_rejected_result()).process(
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=_decision(),
+        assessment=object(),
+        decision_db_id=9,
+        results=results,
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts=staged_counts,
+        strategy_mode_context=None,
+    )
+
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is False
+    assert staged_counts["reserved"]["ensemble_trader"] == 0
+    assert ("release", "ensemble_trader", "BTC/USDT") in calls
 
 
 @pytest.mark.asyncio
 async def test_market_auto_entry_processor_records_execution_error() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
+    staged_counts: dict[str, dict[Any, int]] = {}
 
     result = await _processor(calls, execute_error=RuntimeError("boom")).process(
         symbol="BTC/USDT",
@@ -277,13 +342,15 @@ async def test_market_auto_entry_processor_records_execution_error() -> None:
         results=results,
         model_mode="paper",
         open_positions=[],
-        staged_entry_counts={},
+        staged_entry_counts=staged_counts,
         strategy_mode_context=None,
     )
 
     assert result.handled is True
     assert result.execution_attempted is True
+    assert result.execution_confirmed is False
     assert result.execution_error == "boom"
     assert results["decisions"][0]["execution_status"] == "error"
     assert "强信号已进入即时执行" in results["decisions"][0]["reason"]
+    assert ("release", "ensemble_trader", "BTC/USDT") in calls
     assert any(call[0] == "reason" and call[1] == 10 for call in calls)

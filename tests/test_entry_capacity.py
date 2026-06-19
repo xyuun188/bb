@@ -31,7 +31,8 @@ def test_entry_capacity_blocks_new_symbol_when_model_limit_reached() -> None:
     )
 
     assert reason is not None
-    assert "1" in reason
+    assert "真实持仓 1 组" in reason
+    assert "执行容量 1 组" in reason
 
 
 def test_entry_capacity_allows_same_symbol_add_even_at_model_limit() -> None:
@@ -47,7 +48,7 @@ def test_entry_capacity_allows_same_symbol_add_even_at_model_limit() -> None:
     assert reason is None
 
 
-def test_entry_capacity_counts_staged_entries() -> None:
+def test_entry_capacity_counts_staged_entries_as_pending_not_real_positions() -> None:
     policy = EntryCapacityPolicy(_normalize, lambda: 2)
 
     reason = policy.reason(
@@ -58,6 +59,36 @@ def test_entry_capacity_counts_staged_entries() -> None:
     )
 
     assert reason is not None
+    assert "真实持仓 1 组" in reason
+    assert "本轮待确认开仓 1 组" in reason
+    assert "合计占用 2 组" in reason
+
+
+def test_entry_capacity_ignores_closed_and_zero_quantity_positions() -> None:
+    policy = EntryCapacityPolicy(_normalize, lambda: 2)
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("SOL/USDT"),
+        [
+            {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"},
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "ETH/USDT",
+                "side": "long",
+                "is_open": False,
+            },
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "XRP/USDT",
+                "side": "long",
+                "quantity": 0.0,
+            },
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is None
 
 
 def test_entry_capacity_counts_fragmented_positions_as_one_group() -> None:
@@ -75,7 +106,7 @@ def test_entry_capacity_counts_fragmented_positions_as_one_group() -> None:
     )
 
     assert reason is not None
-    assert "2" in reason
+    assert "真实持仓 2 组" in reason
 
 
 def test_entry_capacity_reserves_same_symbol_group_once_for_model_total() -> None:
@@ -99,6 +130,22 @@ def test_entry_capacity_reserves_staged_entry_slot() -> None:
         _decision("BTC/USDT", Action.LONG),
         staged,
     )
+
+    assert staged["model_totals"] == {"ensemble_trader": 1}
+    assert staged["side_totals"] == {"long": 1}
+    assert staged["symbol_side"] == {("ensemble_trader", "BTC-USDT", "long"): 1}
+
+
+def test_entry_capacity_releases_unconfirmed_staged_entry_slot() -> None:
+    policy = EntryCapacityPolicy(_normalize, lambda: 3)
+    staged = policy.empty_staged_counts()
+
+    policy.reserve_slot("ensemble_trader", _decision("BTC/USDT", Action.LONG), staged)
+    policy.reserve_slot("ensemble_trader", _decision("BTC/USDT", Action.LONG), staged)
+    policy.reserve_slot("ensemble_trader", _decision("ETH/USDT", Action.LONG), staged)
+
+    policy.release_slot("ensemble_trader", _decision("BTC/USDT", Action.LONG), staged)
+    policy.release_slot("ensemble_trader", _decision("ETH/USDT", Action.LONG), staged)
 
     assert staged["model_totals"] == {"ensemble_trader": 1}
     assert staged["side_totals"] == {"long": 1}
@@ -139,9 +186,7 @@ def test_entry_capacity_prefers_entry_limit_when_rotation_slots_are_open() -> No
             "effective_limit": 4,
             "entry_limit": 5,
             "reason": "rotation_entry_expansion=1",
-            "factors": {
-                "reason_codes": ["rotation_entry_expansion", "release_rotation_slots"]
-            },
+            "factors": {"reason_codes": ["rotation_entry_expansion", "release_rotation_slots"]},
         },
     )
 

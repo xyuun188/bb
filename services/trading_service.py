@@ -769,6 +769,8 @@ class TradingService:
             set_loop_stage=self._set_loop_stage,
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
+            capacity_releaser=self.entry_capacity.release_slot,
+            execution_confirmed_checker=self._is_exchange_confirmed_execution,
         )
         self.market_direct_entry_processor = MarketDirectEntryProcessor(
             capacity_reason_provider=self.entry_capacity.reason,
@@ -779,6 +781,8 @@ class TradingService:
             result_recorder=self.market_decision_result_recorder,
             clear_market_no_opportunity_symbol=self._clear_market_no_opportunity_symbol,
             candidate_executor=self._execute_candidate,
+            capacity_releaser=self.entry_capacity.release_slot,
+            execution_confirmed_checker=self._is_exchange_confirmed_execution,
         )
         self.market_queued_entry_processor = MarketQueuedEntryProcessor(
             normalize_symbol=self._normalize_position_symbol,
@@ -792,6 +796,8 @@ class TradingService:
             set_loop_stage=self._set_loop_stage,
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
+            capacity_releaser=self.entry_capacity.release_slot,
+            execution_confirmed_checker=self._is_exchange_confirmed_execution,
         )
         self.pending_exit_recovery_processor = PendingExitDecisionRecoveryProcessor(
             set_loop_stage=self._set_loop_stage,
@@ -3427,6 +3433,7 @@ class TradingService:
                     results=results,
                     open_positions=open_positions,
                     claimed_symbol_keys=claimed_symbol_keys,
+                    staged_entry_counts=staged_entry_counts,
                 )
                 if process_result.claimed_symbol:
                     claimed_analysis_symbols.append(process_result.claimed_symbol)

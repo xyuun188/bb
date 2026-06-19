@@ -21,9 +21,10 @@ DecisionRawResponseMarker = Callable[[int, dict[str, Any]], Awaitable[None]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 PendingExecutionMarker = Callable[[int, str], Awaitable[None]]
 LoopStageSetter = Callable[[str], None]
-CandidateExecutor = Callable[..., Awaitable[None]]
+CandidateExecutor = Callable[..., Awaitable[Any]]
 FinalStateEnsurer = Callable[[int, str, str, DecisionOutput, dict[str, Any]], Awaitable[None]]
 ModelExecutionModeProvider = Callable[[str], str]
+CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
 
 QUEUED_ENTRY_EXECUTION_REASON = (
     "排序后进入执行：该信号不是即时强信号，但在本轮候选比较后通过机会评分、"
@@ -42,6 +43,7 @@ class MarketQueuedEntryProcessResult:
     handled: bool
     claimed_symbol: str | None = None
     execution_attempted: bool = False
+    execution_confirmed: bool = False
     execution_error: str | None = None
     reason: str | None = None
 
@@ -61,6 +63,8 @@ class MarketQueuedEntryProcessor:
     set_loop_stage: LoopStageSetter
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
+    capacity_releaser: CapacityReleaser | None = None
+    execution_confirmed_checker: Callable[[Any], bool] | None = None
 
     async def process(
         self,
@@ -73,9 +77,11 @@ class MarketQueuedEntryProcessor:
         results: dict[str, Any],
         open_positions: list[dict[str, Any]],
         claimed_symbol_keys: set[str],
+        staged_entry_counts: dict[str, dict[Any, int]] | None = None,
     ) -> MarketQueuedEntryProcessResult:
         normalized_symbol = self.normalize_symbol(symbol)
-        if normalized_symbol not in claimed_symbol_keys:
+        claimed_this_call = normalized_symbol not in claimed_symbol_keys
+        if claimed_this_call:
             claimed = await self.analysis_symbol_claimer(symbol, "market")
             if not claimed:
                 reason = "该币种正在被另一条分析流程处理，本次开仓执行跳过，等待下一轮重新评估。"
@@ -114,7 +120,7 @@ class MarketQueuedEntryProcessor:
             )
 
         try:
-            await self.candidate_executor(
+            execution_result = await self.candidate_executor(
                 symbol,
                 model_name,
                 decision,
@@ -123,6 +129,9 @@ class MarketQueuedEntryProcessor:
                 results,
                 open_positions=open_positions,
             )
+            execution_confirmed = self._execution_confirmed(execution_result)
+            if not execution_confirmed:
+                self._release_capacity(model_name, decision, staged_entry_counts)
             if decision_db_id is not None:
                 await self.final_state_ensurer(
                     decision_db_id,
@@ -131,7 +140,15 @@ class MarketQueuedEntryProcessor:
                     decision,
                     results,
                 )
+            return MarketQueuedEntryProcessResult(
+                handled=True,
+                claimed_symbol=symbol if claimed_this_call else None,
+                execution_attempted=True,
+                execution_confirmed=execution_confirmed,
+                reason=QUEUED_ENTRY_EXECUTION_REASON,
+            )
         except Exception as exc:
+            self._release_capacity(model_name, decision, staged_entry_counts)
             error_text = safe_error_text(exc, limit=160)
             reason = (
                 "候选进入执行流程后异常中断："
@@ -159,13 +176,30 @@ class MarketQueuedEntryProcessor:
             return MarketQueuedEntryProcessResult(
                 handled=True,
                 execution_attempted=True,
+                execution_confirmed=False,
                 execution_error=error_text,
                 reason=reason,
             )
 
-        return MarketQueuedEntryProcessResult(
-            handled=True,
-            claimed_symbol=symbol if normalized_symbol not in claimed_symbol_keys else None,
-            execution_attempted=True,
-            reason=QUEUED_ENTRY_EXECUTION_REASON,
+    def _release_capacity(
+        self,
+        model_name: str,
+        decision: DecisionOutput,
+        staged_entry_counts: dict[str, dict[Any, int]] | None,
+    ) -> None:
+        if self.capacity_releaser is not None and staged_entry_counts is not None:
+            self.capacity_releaser(model_name, decision, staged_entry_counts)
+
+    def _execution_confirmed(self, execution_result: Any) -> bool:
+        if self.execution_confirmed_checker is not None:
+            return bool(self.execution_confirmed_checker(execution_result))
+        if execution_result is None:
+            return False
+        status = getattr(getattr(execution_result, "status", None), "value", None)
+        if status is None:
+            status = str(getattr(execution_result, "status", "") or "").lower()
+        return bool(
+            status == "filled"
+            and str(getattr(execution_result, "exchange_order_id", "") or "").strip()
+            and float(getattr(execution_result, "quantity", 0.0) or 0.0) > 0
         )

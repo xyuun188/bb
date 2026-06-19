@@ -73,6 +73,11 @@ LLM_CANDIDATE_MAX_COUNT = 2
 LLM_CANDIDATE_PROMPT_VERSION = 3
 LLM_CANDIDATE_PROMPT_MAX_CHARS = 9000
 LLM_CANDIDATE_FAILURE_RETRY_SECONDS = 300
+LLM_CANDIDATE_ERROR_TIMEOUT = "timeout"
+LLM_CANDIDATE_ERROR_HTTP = "http_error"
+LLM_CANDIDATE_ERROR_INVALID_JSON = "invalid_json"
+LLM_CANDIDATE_ERROR_EMPTY = "empty_candidates"
+LLM_CANDIDATE_ERROR_UNKNOWN = "unknown"
 AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS = 6 * 60 * 60
 NON_ATTRIBUTABLE_EVENT_TYPES = {
     "manual_close",
@@ -186,6 +191,14 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
 def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+class StrategyCandidateModelError(RuntimeError):
+    """Structured error raised by the LLM strategy-candidate generator."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind or LLM_CANDIDATE_ERROR_UNKNOWN
 
 
 def _material_low_quality_pressure(open_pressure: dict[str, Any]) -> bool:
@@ -3699,6 +3712,7 @@ class StrategyLearningService:
             "cache_matches_feedback": cache_matches,
             "cache_status": "current" if cache_matches else ("stale" if candidates else "empty"),
             "last_error": entry.get("last_error", ""),
+            "last_error_kind": entry.get("last_error_kind", ""),
             "last_model": entry.get("model", ""),
             "attempts": _safe_list(entry.get("attempts")),
             "source": entry.get("source", "llm_structured_candidate" if candidates else "none"),
@@ -3806,6 +3820,7 @@ class StrategyLearningService:
         signature = self._feedback_signature(feedback)
         attempts: list[dict[str, Any]] = []
         last_error = ""
+        last_error_kind = ""
         for cfg in self._llm_candidate_configs():
             model = cfg["model"]
             try:
@@ -3817,12 +3832,14 @@ class StrategyLearningService:
                 )
             except Exception as exc:
                 last_error = safe_error_text(exc, limit=260)
+                last_error_kind = self._llm_candidate_error_kind(exc)
                 attempts.append(
                     {
                         "name": cfg.get("name", ""),
                         "model": model,
                         "api_base": cfg.get("api_base", ""),
                         "status": "failed",
+                        "error_kind": last_error_kind,
                         "error": last_error,
                     }
                 )
@@ -3847,6 +3864,7 @@ class StrategyLearningService:
                 signature=signature,
                 candidates=[profile.to_dict() for profile in profiles],
                 error="" if profiles else "LLM returned no valid bounded strategy candidates",
+                error_kind="" if profiles else LLM_CANDIDATE_ERROR_EMPTY,
                 attempts=attempts,
                 model=model,
             )
@@ -3856,6 +3874,7 @@ class StrategyLearningService:
             signature=signature,
             candidates=[],
             error=last_error or "all LLM candidate models failed",
+            error_kind=last_error_kind or LLM_CANDIDATE_ERROR_UNKNOWN,
             attempts=attempts,
             model="",
         )
@@ -4546,59 +4565,136 @@ class StrategyLearningService:
                 20.0,
             ),
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{api_base}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=body,
+        try:
+            response = await self._post_llm_candidate_request(
+                api_base=api_base,
+                api_key=api_key,
+                body=body,
+                timeout_seconds=timeout,
+                retry=False,
             )
-        if not response.is_success:
-            detail = safe_response_error_text(response, limit=300)
-            message = f"strategy candidate request failed with HTTP {response.status_code}"
-            if detail:
-                message = f"{message}: {detail}"
-            raise RuntimeError(message)
-        payload = response.json()
+        except StrategyCandidateModelError as exc:
+            if exc.kind != LLM_CANDIDATE_ERROR_TIMEOUT:
+                raise
+            retry_prompt = _json_safe(self._llm_candidate_retry_prompt(prompt))
+            retry_body = self._llm_candidate_retry_body(
+                model=model,
+                prompt=retry_prompt,
+                max_tokens=max_tokens,
+            )
+            response = await self._post_llm_candidate_request(
+                api_base=api_base,
+                api_key=api_key,
+                body=retry_body,
+                timeout_seconds=timeout,
+                retry=True,
+            )
+        payload = self._response_json(response)
         content = self._extract_llm_content(payload)
         try:
             parsed = self._parse_json_object(content)
         except RuntimeError as exc:
             if "JSON was incomplete" not in str(exc) and "did not contain JSON" not in str(exc):
-                raise
+                raise StrategyCandidateModelError(
+                    safe_error_text(exc, limit=220),
+                    kind=LLM_CANDIDATE_ERROR_INVALID_JSON,
+                ) from exc
             retry_prompt = _json_safe(self._llm_candidate_retry_prompt(prompt))
-            retry_body = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是量化交易策略参数编译器。只输出一个完整 JSON 对象，"
-                            "不要 Markdown，不要解释，不要代码。"
-                        ),
-                    },
-                    {"role": "user", "content": json.dumps(retry_prompt, ensure_ascii=False)},
-                ],
-                "temperature": 0.1,
-                "max_tokens": min(max_tokens, 260),
-                "stream": False,
-            }
-            retry_body = apply_non_thinking_request_controls(model, retry_body)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                retry_response = await client.post(
+            retry_body = self._llm_candidate_retry_body(
+                model=model,
+                prompt=retry_prompt,
+                max_tokens=max_tokens,
+            )
+            retry_response = await self._post_llm_candidate_request(
+                api_base=api_base,
+                api_key=api_key,
+                body=retry_body,
+                timeout_seconds=timeout,
+                retry=True,
+            )
+            retry_payload = self._response_json(retry_response)
+            retry_content = self._extract_llm_content(retry_payload)
+            try:
+                parsed = self._parse_json_object(retry_content)
+            except RuntimeError as retry_exc:
+                raise StrategyCandidateModelError(
+                    safe_error_text(retry_exc, limit=220),
+                    kind=LLM_CANDIDATE_ERROR_INVALID_JSON,
+                ) from retry_exc
+        return _safe_list(parsed.get("candidates"))[:LLM_CANDIDATE_MAX_COUNT]
+
+    async def _post_llm_candidate_request(
+        self,
+        *,
+        api_base: str,
+        api_key: str,
+        body: dict[str, Any],
+        timeout_seconds: float,
+        retry: bool,
+    ) -> httpx.Response:
+        label = "retry" if retry else "request"
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(
                     f"{api_base}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json=retry_body,
+                    json=body,
                 )
-            if not retry_response.is_success:
-                detail = safe_response_error_text(retry_response, limit=300)
-                message = f"strategy candidate retry failed with HTTP {retry_response.status_code}"
-                if detail:
-                    message = f"{message}: {detail}"
-                raise RuntimeError(message) from exc
-            retry_payload = retry_response.json()
-            retry_content = self._extract_llm_content(retry_payload)
-            parsed = self._parse_json_object(retry_content)
-        return _safe_list(parsed.get("candidates"))[:LLM_CANDIDATE_MAX_COUNT]
+        except httpx.TimeoutException as exc:
+            raise StrategyCandidateModelError(
+                f"strategy candidate {label} timed out after {timeout_seconds:.1f}s",
+                kind=LLM_CANDIDATE_ERROR_TIMEOUT,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise StrategyCandidateModelError(
+                f"strategy candidate {label} transport failed: {safe_error_text(exc, limit=180)}",
+                kind=LLM_CANDIDATE_ERROR_HTTP,
+            ) from exc
+        if not response.is_success:
+            detail = safe_response_error_text(response, limit=300)
+            message = f"strategy candidate {label} failed with HTTP {response.status_code}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise StrategyCandidateModelError(message, kind=LLM_CANDIDATE_ERROR_HTTP)
+        return response
+
+    @staticmethod
+    def _response_json(response: httpx.Response) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise StrategyCandidateModelError(
+                "strategy candidate HTTP response body was not valid JSON",
+                kind=LLM_CANDIDATE_ERROR_INVALID_JSON,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise StrategyCandidateModelError(
+                "strategy candidate HTTP response body was not a JSON object",
+                kind=LLM_CANDIDATE_ERROR_INVALID_JSON,
+            )
+        return payload
+
+    @staticmethod
+    def _llm_candidate_retry_body(
+        *, model: str, prompt: dict[str, Any], max_tokens: int
+    ) -> dict[str, Any]:
+        retry_body = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是量化交易策略参数编译器。只输出一个完整 JSON 对象，"
+                        "不要 Markdown，不要解释，不要代码。"
+                    ),
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            "temperature": 0.1,
+            "max_tokens": min(max_tokens, 260),
+            "stream": False,
+        }
+        return apply_non_thinking_request_controls(model, retry_body)
 
     @staticmethod
     def _extract_llm_content(payload: dict[str, Any]) -> str:
@@ -4671,6 +4767,7 @@ class StrategyLearningService:
         signature: str,
         candidates: list[dict[str, Any]],
         error: str,
+        error_kind: str = "",
         attempts: list[dict[str, Any]] | None = None,
         model: str = "",
     ) -> None:
@@ -4682,12 +4779,24 @@ class StrategyLearningService:
             "generated_at": datetime.now(UTC).isoformat(),
             "candidates": _json_safe(sanitized_candidates),
             "last_error": str(sanitize_text(error) or ""),
+            "last_error_kind": str(error_kind or ""),
             "attempts": sanitize_payload(_json_safe(attempts or [])),
             "model": model,
             "prompt_version": LLM_CANDIDATE_PROMPT_VERSION,
             "source": "llm_structured_candidate" if candidates else "none",
         }
         self.state_store.save(state)
+
+    @staticmethod
+    def _llm_candidate_error_kind(exc: BaseException) -> str:
+        kind = getattr(exc, "kind", "")
+        if isinstance(kind, str) and kind:
+            return kind
+        if isinstance(exc, httpx.TimeoutException):
+            return LLM_CANDIDATE_ERROR_TIMEOUT
+        if isinstance(exc, httpx.HTTPError):
+            return LLM_CANDIDATE_ERROR_HTTP
+        return LLM_CANDIDATE_ERROR_UNKNOWN
 
     @staticmethod
     def _sanitize_cached_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
