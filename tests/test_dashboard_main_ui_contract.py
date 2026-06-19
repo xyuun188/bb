@@ -290,7 +290,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260619-data-collection" in html
+    assert "dashboard.js?v=20260619-data-collection-layout" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -309,17 +309,33 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
 
     assert 'data-page="data-collection"' in html
     assert 'id="page-data-collection"' in html
-    assert "数据采集管理" in html
-    assert "Scrapling 外部事件采集" in html
+    assert "\u6570\u636e\u91c7\u96c6\u7ba1\u7406" in html
+    assert "\u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6\u8bbe\u7f6e" in html
+    page_start = html.index('id="page-data-collection"')
+    page_end = html.index('id="page-server-monitor"')
+    settings_start = html.index('data-settings-section="models"')
+    settings_end = html.index('data-settings-section="security"')
+    data_page_html = html[page_start:page_end]
+    model_settings_html = html[settings_start:settings_end]
+    assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in data_page_html
+    assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" in model_settings_html
+    assert model_settings_html.index(
+        "AI \u4e13\u5bb6\u6a21\u578b\u914d\u7f6e"
+    ) < model_settings_html.index("\u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6\u8bbe\u7f6e")
     assert "fetchDataCollectionStatus()" in html
     assert "saveDataCollectionSettings()" in html
     assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
+    assert "fetchDataCollectionStatus({ silent: true })" in script
     assert "fetchJSON('/api/data-collection/status')" in script
     assert "postJSON('/api/data-collection/settings', body)" in script
+    assert "unknown: '\u5df2\u8fde\u63a5'" in script
     assert "collectionStatusLabel" in script
     assert "readDataCollectionSources" in script
-    assert ".data-source-grid" in style
-    assert ".data-quality-grid" in style
+    assert ".data-collection-health-strip" in style
+    assert ".settings-data-collection-card" in style
+    assert ".data-source-line" in style
+    assert "dashboard.css?v=20260619-data-collection-layout" in html
+    assert "dashboard.js?v=20260619-data-collection-layout" in html
     assert "overflow-wrap: anywhere;" in style
 
 

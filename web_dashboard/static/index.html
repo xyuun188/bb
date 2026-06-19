@@ -18,7 +18,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260616-cangxiao-ui-fix2">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260619-data-collection-layout">
     <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260616-cangxiao-ui-fix2">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1020,48 +1020,6 @@
             </div>
             <div class="card">
                 <div class="card-header">
-                    <div>
-                        <span class="card-title">Scrapling 外部事件采集</span>
-                        <span class="card-subtitle">默认关闭；启用后后台抓取白名单 HTTPS 页面，不进入交易热路径</span>
-                    </div>
-                    <button class="btn btn-sm btn-accent" onclick="saveDataCollectionSettings()">保存设置</button>
-                </div>
-                <div class="data-collection-settings">
-                    <label class="data-collection-toggle">
-                        <input type="checkbox" id="data-external-enabled">
-                        <span>
-                            <strong>启用 Scrapling 外部事件采集</strong>
-                            <em id="data-external-runtime-note">未读取运行状态</em>
-                        </span>
-                    </label>
-                    <div class="settings-form-grid">
-                        <label class="form-group">
-                            <span>采集间隔（秒）</span>
-                            <input type="number" class="form-input" id="data-external-interval" min="60" max="86400" step="60">
-                        </label>
-                        <label class="form-group">
-                            <span>单源超时（秒）</span>
-                            <input type="number" class="form-input" id="data-external-timeout" min="1" max="30" step="0.5">
-                        </label>
-                        <label class="form-group">
-                            <span>每轮最多源数量</span>
-                            <input type="number" class="form-input" id="data-external-max-sources" min="1" max="20" step="1">
-                        </label>
-                        <label class="form-group">
-                            <span>每源最多条数</span>
-                            <input type="number" class="form-input" id="data-external-max-items" min="1" max="50" step="1">
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <span>采集源 JSON</span>
-                        <textarea class="form-input data-source-json" id="data-external-sources" rows="8" spellcheck="false" placeholder='[{"name":"ethereum_blog","url":"https://blog.ethereum.org/","symbols":["ETH"],"weight":0.72}]'></textarea>
-                        <div class="settings-readonly-note">只允许 HTTPS 公网页面；内网、localhost、带账号密码的 URL 会被后端拒绝。</div>
-                    </div>
-                    <div class="settings-inline-status" id="data-collection-save-status"></div>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-header">
                     <span class="card-title">数据来源与样本新鲜度</span>
                     <span class="card-subtitle">看哪些源在产出、最新数据多久前更新</span>
                 </div>
@@ -1476,6 +1434,48 @@
                 </div>
                 <div id="okx-balance-info" style="font-size:11px;color:var(--text-muted);padding:8px 12px;border-top:1px solid var(--border);"></div>
             </div>
+            <div class="card settings-data-collection-card">
+                <div class="card-header">
+                    <div>
+                        <span class="card-title">外部事件采集设置</span>
+                        <span class="card-subtitle">Scrapling 可选增强源；只写入训练/情绪样本，不直接触发下单</span>
+                    </div>
+                    <button class="btn btn-sm btn-accent" onclick="saveDataCollectionSettings()">保存设置</button>
+                </div>
+                <div class="data-collection-settings settings-embedded">
+                    <label class="data-collection-toggle">
+                        <input type="checkbox" id="data-external-enabled">
+                        <span>
+                            <strong>启用 Scrapling 外部事件采集</strong>
+                            <em id="data-external-runtime-note">未读取运行状态</em>
+                        </span>
+                    </label>
+                    <div class="settings-form-grid">
+                        <label class="form-group">
+                            <span>采集间隔（秒）</span>
+                            <input type="number" class="form-input" id="data-external-interval" min="60" max="86400" step="60">
+                        </label>
+                        <label class="form-group">
+                            <span>单源超时（秒）</span>
+                            <input type="number" class="form-input" id="data-external-timeout" min="1" max="30" step="0.5">
+                        </label>
+                        <label class="form-group">
+                            <span>每轮最多源数量</span>
+                            <input type="number" class="form-input" id="data-external-max-sources" min="1" max="20" step="1">
+                        </label>
+                        <label class="form-group">
+                            <span>每源最多条数</span>
+                            <input type="number" class="form-input" id="data-external-max-items" min="1" max="50" step="1">
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <span>采集源 JSON</span>
+                        <textarea class="form-input data-source-json" id="data-external-sources" rows="7" spellcheck="false" placeholder='[{"name":"ethereum_blog","url":"https://blog.ethereum.org/","symbols":["ETH"],"weight":0.72}]'></textarea>
+                        <div class="settings-readonly-note">只允许 HTTPS 公网页面；内网、localhost、带账号密码的 URL 会被后端拒绝。</div>
+                    </div>
+                    <div class="settings-inline-status" id="data-collection-save-status"></div>
+                </div>
+            </div>
             </section>
 
             <!-- Dashboard Account Management -->
@@ -1585,7 +1585,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260619-data-collection"></script>
+    <script src="/static/js/dashboard.js?v=20260619-data-collection-layout"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260619-llm-error-kind"></script>
 </body>
 </html>

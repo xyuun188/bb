@@ -277,13 +277,21 @@ async def _local_ai_training_status() -> dict[str, Any]:
         return {"available": False, "status": "error", "error": safe_error_text(exc, limit=180)}
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
+    shadow_count = int(status.get("shadow_sample_count") or 0)
+    trade_count = int(status.get("trade_sample_count") or 0)
+    text_count = int(status.get("text_sentiment_sample_count") or 0)
+    raw_status = str(status.get("status") or "unknown")
+    visible_status = raw_status
+    if raw_status == "unknown" and bool(status.get("available")):
+        visible_status = "learning_only" if shadow_count or trade_count or text_count else "ready"
     return {
         "available": bool(status.get("available")),
-        "status": status.get("status") or "unknown",
-        "shadow_sample_count": int(status.get("shadow_sample_count") or 0),
-        "trade_sample_count": int(status.get("trade_sample_count") or 0),
+        "status": visible_status,
+        "raw_status": raw_status,
+        "shadow_sample_count": shadow_count,
+        "trade_sample_count": trade_count,
         "sequence_sample_count": int(status.get("sequence_sample_count") or 0),
-        "text_sentiment_sample_count": int(status.get("text_sentiment_sample_count") or 0),
+        "text_sentiment_sample_count": text_count,
         "completed_shadow_sample_count": int(status.get("completed_shadow_sample_count") or 0),
         "completed_trade_sample_count": int(status.get("completed_trade_sample_count") or 0),
         "quality_report": (

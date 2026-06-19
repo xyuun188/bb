@@ -8,6 +8,7 @@ import pytest
 
 from config.settings import settings
 from db.session import close_db, init_db
+from web_dashboard.api import data_collection as data_collection_module
 from web_dashboard.app import create_app
 
 
@@ -44,6 +45,33 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert "news" in body["stats"]
     assert "text_sentiment_quality_sample" in body["training"]
     assert "local_ai_tools" in body["training"]
+
+
+@pytest.mark.asyncio
+async def test_data_collection_normalizes_unknown_local_ai_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "status": "unknown",
+                "shadow_sample_count": 12,
+                "trade_sample_count": 3,
+                "text_sentiment_sample_count": 8,
+            }
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["status"] == "learning_only"
+    assert status["raw_status"] == "unknown"
+    assert status["available"] is True
 
 
 @pytest.mark.asyncio

@@ -1512,6 +1512,7 @@ function activateSettingsTab(name = 'okx') {
     document.querySelectorAll('.settings-section[data-settings-section]').forEach(section => {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
+    if (selected === 'models') fetchDataCollectionStatus({ silent: true });
 }
 
 function loadPageData(page) {
@@ -1551,6 +1552,7 @@ function loadPageData(page) {
         fetchExecutionAccountSettings();
         fetchAIModels();
         fetchTradingParams();
+        fetchDataCollectionStatus({ silent: true });
     }
 }
 
@@ -4188,9 +4190,9 @@ function changeMLSignalPage(page) {
 
 // ========== Data Collection Dashboard ==========
 
-async function fetchDataCollectionStatus() {
+async function fetchDataCollectionStatus(options = {}) {
     const updated = document.getElementById('data-collection-updated');
-    if (updated) updated.textContent = '读取中...';
+    if (updated && !options.silent) updated.textContent = '读取中...';
     const data = await fetchJSON('/api/data-collection/status');
     state.dataCollectionStatus = data || null;
     renderDataCollectionDashboard();
@@ -4199,7 +4201,7 @@ async function fetchDataCollectionStatus() {
 function collectionStatusTone(status, enabled = true) {
     const value = String(status || '').toLowerCase();
     if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
-    if (['active', 'ok', 'ready', 'running'].includes(value)) return 'good';
+    if (['active', 'ok', 'ready', 'running', 'unknown', 'learning_only'].includes(value)) return 'good';
     if (['missing_dependency', 'timeout', 'warning', 'degraded'].includes(value)) return 'warn';
     return 'bad';
 }
@@ -4215,6 +4217,8 @@ function collectionStatusLabel(status, enabled = true) {
         error: '异常',
         client_not_ready: '客户端未就绪',
         invalid_status: '状态异常',
+        unknown: '已连接',
+        learning_only: '学习中',
         ready: '可用',
         running: '运行中',
     };
@@ -4297,11 +4301,11 @@ function renderDataCollectionOverview(data, config, stats, training) {
         ? (config.external_event_scraper_dependency_installed ? 'active' : 'missing_dependency')
         : 'disabled';
     container.innerHTML = `
-        <div class="data-collection-summary">
+        <div class="data-collection-health-strip">
             ${collectionMetric(
                 'Scrapling 外部事件',
                 collectionStatusLabel(scraplingStatus, scraplingEnabled),
-                scraplingEnabled ? `间隔 ${monitorNumber(config.external_event_scraper_interval_seconds, 0)} 秒` : '默认关闭，不占交易热路径',
+                scraplingEnabled ? `间隔 ${monitorNumber(config.external_event_scraper_interval_seconds, 0)} 秒 · 在系统设置中管理` : '默认关闭 · 在系统设置中管理',
                 collectionStatusTone(scraplingStatus, scraplingEnabled)
             )}
             ${collectionMetric(
@@ -4325,13 +4329,13 @@ function renderDataCollectionOverview(data, config, stats, training) {
             ${collectionMetric(
                 '本地量化训练',
                 collectionStatusLabel(localTools.status, localTools.available),
-                `影子 ${monitorNumber(localTools.shadow_sample_count, 0)} · 交易 ${monitorNumber(localTools.trade_sample_count, 0)}`,
+                `影子 ${monitorNumber(localTools.shadow_sample_count, 0)} · 交易 ${monitorNumber(localTools.trade_sample_count, 0)} · 文本 ${monitorNumber(localTools.text_sentiment_sample_count, 0)}`,
                 collectionStatusTone(localTools.status, localTools.available)
             )}
         </div>
-        <div class="analysis-note analysis-note-muted data-collection-note">
-            <span>说明</span>
-            这个页面管理“数据来源和训练可观测”。Scrapling 是可选增强源：启用后只采集白名单 HTTPS 公网页面，写入新闻样本，不直接触发下单。
+        <div class="data-collection-guide">
+            <strong>数据采集页只看状态</strong>
+            <span>Scrapling 启停和白名单源已移动到：系统设置 → AI 专家模型 → 外部事件采集设置。</span>
         </div>`;
 }
 
@@ -4343,20 +4347,21 @@ function renderDataCollectionSources(data, stats) {
     const socialPlatforms = (stats.social?.platforms || []).slice(0, 8);
     const klines = stats.market?.klines || [];
     container.innerHTML = `
-        <div class="data-source-grid">
-            ${sources.map(source => {
-                const tone = collectionStatusTone(source.status, source.enabled);
-                return `
-                    <div class="data-source-card data-source-${tone}">
-                        <div class="data-source-head">
-                            <strong>${escHtml(source.name || source.key || '-')}</strong>
-                            <span class="analysis-pill analysis-pill-${tone === 'bad' ? 'bad' : tone === 'warn' ? 'warn' : tone === 'good' ? 'good' : 'muted'}">${escHtml(collectionStatusLabel(source.status, source.enabled))}</span>
-                        </div>
-                        <p>${escHtml(source.detail || '')}</p>
-                    </div>`;
-            }).join('')}
-        </div>
         <div class="data-quality-grid">
+            <div class="data-quality-panel data-source-panel">
+                <strong>采集通道</strong>
+                <div class="data-source-list">
+                    ${sources.map(source => {
+                        const tone = collectionStatusTone(source.status, source.enabled);
+                        return `
+                            <div class="data-source-line data-source-${tone}">
+                                <span>${escHtml(source.name || source.key || '-')}</span>
+                                <strong>${escHtml(collectionStatusLabel(source.status, source.enabled))}</strong>
+                                <em>${escHtml(source.detail || '')}</em>
+                            </div>`;
+                    }).join('')}
+                </div>
+            </div>
             <div class="data-quality-panel">
                 <strong>新闻来源新鲜度</strong>
                 ${collectionRows(newsSources, 'name', 'count')}
@@ -4459,6 +4464,7 @@ async function saveDataCollectionSettings() {
         const data = await postJSON('/api/data-collection/settings', body);
         state.dataCollectionStatus = data || null;
         renderDataCollectionDashboard();
+        if (isPageActive('data-collection')) fetchDataCollectionStatus({ silent: true });
         if (status) {
             status.style.color = 'var(--green)';
             const runtime = data?.runtime_sync?.message ? ` ${data.runtime_sync.message}` : '';
