@@ -223,6 +223,10 @@ def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> No
     assert "execution-reason-primary" in script
     assert "\u6267\u884c\u539f\u56e0" in script
     assert "\u6267\u884c\u6b65\u9aa4\u8bf4\u660e" in script
+    assert "function selfCheckGroupedItems" in script
+    assert "function selfCheckItemHtml" in script
+    assert "self-check-group-list" in script
+    assert "self-check-group-grid" in script
     assert "failed_step" in script
     assert "execution_steps" in script
     assert "\u65e7\u8bb0\u5f55\u672a\u91c7\u96c6\u8017\u65f6" in script
@@ -230,6 +234,9 @@ def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> No
     assert ".execution-timeline" in style
     assert ".self-check-card" in style
     assert ".self-check-card.info" in style
+    assert ".self-check-group-list" in style
+    assert ".self-check-group-grid" in style
+    assert ".self-check-repair-note" in style
     assert ".execution-reason-primary" in style
 
 
@@ -277,6 +284,26 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     assert "'deepseek-r1-14b-risk': `http://${MODEL_PUBLIC_HOST}:21842/v1`" in script
     assert "local_ai_tools: `http://${MODEL_PUBLIC_HOST}:21841`" in script
     assert "data.model_access_host" not in script
+
+
+def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
+    style = (PROJECT_ROOT / "web_dashboard/static/css/strategy_learning.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));" in style
+    assert ".strategy-learning-profile-chips span" in style
+    assert "overflow-wrap: anywhere;" in style
+    assert "white-space: normal;" in style
+    assert (
+        "text-overflow: ellipsis;"
+        not in style[
+            style.index(".strategy-learning-profile-footer") : style.index(
+                ".strategy-learning-guard-state"
+            )
+        ]
+    )
 
 
 def test_position_history_symbol_variants_include_okx_swap_suffix() -> None:

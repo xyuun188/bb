@@ -14,6 +14,8 @@ from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from db.session import get_session_ctx
 from models.decision import AIDecision
+from models.market_data import Kline, Ticker
+from models.news import NewsArticle, SocialPost
 from models.trade import Order
 from services.server_monitor_status import (
     clear_server_monitor_cache,
@@ -34,6 +36,11 @@ MODEL_ACCESS_ENDPOINTS = {
     "local_ai_tools": "103.85.84.147:21841",
     "deepseek-r1-14b-risk": "103.85.84.147:21842",
 }
+EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
+TICKER_FRESH_SECONDS = 10 * 60
+KLINE_FRESH_SECONDS = 2 * 60 * 60
+NEWS_FRESH_SECONDS = 24 * 60 * 60
+SOCIAL_FRESH_SECONDS = 24 * 60 * 60
 ISSUE_ORDER = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 
 
@@ -80,6 +87,26 @@ def _finite_score(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _age_seconds(value: Any) -> float | None:
+    dt = _utc_datetime(value)
+    if dt is None:
+        return None
+    return max((datetime.now(UTC) - dt).total_seconds(), 0.0)
+
+
+def _age_minutes(value: Any) -> float | None:
+    age = _age_seconds(value)
+    return round(age / 60.0, 1) if age is not None else None
 
 
 async def _recent_trading_activity_snapshot(hours: int = 2) -> dict[str, Any]:
@@ -259,6 +286,176 @@ def _configured_endpoint_items() -> list[dict[str, Any]]:
                     },
                 )
             )
+    return items
+
+
+async def _data_source_items() -> list[dict[str, Any]]:
+    async with get_session_ctx() as session:
+        ticker_row = (
+            await session.execute(
+                select(
+                    func.count(Ticker.id),
+                    func.max(func.coalesce(Ticker.updated_at, Ticker.created_at)),
+                )
+            )
+        ).one()
+        kline_rows = list(
+            (
+                await session.execute(
+                    select(
+                        Kline.timeframe,
+                        func.count(Kline.id),
+                        func.count(func.distinct(Kline.symbol)),
+                        func.max(Kline.open_time),
+                    )
+                    .where(Kline.timeframe.in_(EXPECTED_KLINE_TIMEFRAMES))
+                    .group_by(Kline.timeframe)
+                )
+            ).all()
+        )
+        news_row = (
+            await session.execute(
+                select(
+                    func.count(NewsArticle.id),
+                    func.count(func.distinct(NewsArticle.source)),
+                    func.max(func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)),
+                )
+            )
+        ).one()
+        social_row = (
+            await session.execute(
+                select(
+                    func.count(SocialPost.id),
+                    func.count(func.distinct(SocialPost.platform)),
+                    func.max(SocialPost.posted_at),
+                )
+            )
+        ).one()
+
+    ticker_count = int(ticker_row[0] or 0)
+    ticker_latest = _utc_datetime(ticker_row[1])
+    ticker_age = _age_seconds(ticker_latest)
+    kline_by_timeframe = {
+        str(timeframe): {
+            "rows": int(row_count or 0),
+            "symbols": int(symbol_count or 0),
+            "latest_open_time": _utc_datetime(latest_open_time),
+            "age_minutes": _age_minutes(latest_open_time),
+        }
+        for timeframe, row_count, symbol_count, latest_open_time in kline_rows
+    }
+    missing_timeframes = [
+        timeframe
+        for timeframe in EXPECTED_KLINE_TIMEFRAMES
+        if not kline_by_timeframe.get(timeframe, {}).get("rows")
+    ]
+    stale_timeframes = [
+        timeframe
+        for timeframe, row in kline_by_timeframe.items()
+        if (_age_seconds(row.get("latest_open_time")) or 0) > KLINE_FRESH_SECONDS
+    ]
+    news_count = int(news_row[0] or 0)
+    news_source_count = int(news_row[1] or 0)
+    news_latest = _utc_datetime(news_row[2])
+    news_age = _age_seconds(news_latest)
+    social_count = int(social_row[0] or 0)
+    social_platform_count = int(social_row[1] or 0)
+    social_latest = _utc_datetime(social_row[2])
+    social_age = _age_seconds(social_latest)
+
+    items: list[dict[str, Any]] = []
+    ticker_ok = bool(ticker_count and ticker_age is not None and ticker_age <= TICKER_FRESH_SECONDS)
+    items.append(
+        _check_item(
+            "market_ticker_freshness",
+            "实时行情数据源",
+            "ok" if ticker_ok else "critical",
+            (
+                f"已沉淀 {ticker_count} 个 ticker，最新更新时间约 {_age_minutes(ticker_latest)} 分钟前。"
+                if ticker_ok
+                else "实时行情 ticker 不新鲜或为空，会导致余额、持仓估值和开仓判断失真。"
+            ),
+            details={
+                "ticker_count": ticker_count,
+                "latest_at": ticker_latest.isoformat() if ticker_latest else None,
+                "age_minutes": _age_minutes(ticker_latest),
+                "fresh_limit_minutes": round(TICKER_FRESH_SECONDS / 60, 1),
+            },
+        )
+    )
+    kline_ok = not missing_timeframes and not stale_timeframes
+    items.append(
+        _check_item(
+            "market_kline_coverage",
+            "分钟级 K 线覆盖",
+            "ok" if kline_ok else "warning",
+            (
+                "1m/5m/15m/1h K 线均有沉淀，短线训练和复盘具备基础行情上下文。"
+                if kline_ok
+                else "分钟级 K 线存在缺口或过旧，短线开仓/平仓学习可能偏保守或失真。"
+            ),
+            details={
+                "expected_timeframes": list(EXPECTED_KLINE_TIMEFRAMES),
+                "missing_timeframes": missing_timeframes,
+                "stale_timeframes": stale_timeframes,
+                "timeframes": {
+                    key: {
+                        **{k: v for k, v in value.items() if k != "latest_open_time"},
+                        "latest_open_time": (
+                            value["latest_open_time"].isoformat()
+                            if value.get("latest_open_time")
+                            else None
+                        ),
+                    }
+                    for key, value in kline_by_timeframe.items()
+                },
+            },
+        )
+    )
+    news_ok = bool(news_count and news_age is not None and news_age <= NEWS_FRESH_SECONDS)
+    news_diverse = news_source_count >= 2
+    items.append(
+        _check_item(
+            "news_source_freshness",
+            "新闻训练数据源",
+            "ok" if news_ok and news_diverse else "warning",
+            (
+                f"新闻源 {news_source_count} 类、样本 {news_count} 条，最新约 {_age_minutes(news_latest)} 分钟前。"
+                if news_ok
+                else "新闻样本为空或过旧，情绪/事件模型会更依赖行情与历史样本。"
+            ),
+            details={
+                "news_count": news_count,
+                "source_count": news_source_count,
+                "latest_at": news_latest.isoformat() if news_latest else None,
+                "age_minutes": _age_minutes(news_latest),
+                "fresh_limit_hours": round(NEWS_FRESH_SECONDS / 3600, 1),
+                "source_diversity_ok": news_diverse,
+            },
+        )
+    )
+    social_ok = bool(social_count and social_age is not None and social_age <= SOCIAL_FRESH_SECONDS)
+    social_diverse = social_platform_count >= 2
+    items.append(
+        _check_item(
+            "social_source_freshness",
+            "社媒训练数据源",
+            "ok" if social_ok and social_diverse else "warning",
+            (
+                f"社媒平台 {social_platform_count} 类、样本 {social_count} 条，最新约 {_age_minutes(social_latest)} 分钟前。"
+                if social_ok
+                else "社媒样本为空、过旧或平台过少，情绪模型存在来源偏置风险。"
+            ),
+            details={
+                "social_count": social_count,
+                "platform_count": social_platform_count,
+                "latest_at": social_latest.isoformat() if social_latest else None,
+                "age_minutes": _age_minutes(social_latest),
+                "fresh_limit_hours": round(SOCIAL_FRESH_SECONDS / 3600, 1),
+                "platform_diversity_ok": social_diverse,
+            },
+        )
+    )
     return items
 
 
@@ -530,6 +727,18 @@ async def system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [await _trading_service_running_item()]
     items.extend([_okx_config_item("paper"), _okx_config_item("live")])
     items.extend(_configured_endpoint_items())
+    try:
+        items.extend(await _data_source_items())
+    except Exception as exc:
+        items.append(
+            _check_item(
+                "training_data_sources",
+                "训练数据源覆盖",
+                "warning",
+                "训练数据源自检失败，请检查行情、K 线、新闻和社媒数据表。",
+                details={"error": safe_error_text(exc, limit=180)},
+            )
+        )
     try:
         monitor_status = await get_server_monitor_status_async()
         items.extend(_server_monitor_items(monitor_status))

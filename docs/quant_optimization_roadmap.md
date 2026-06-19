@@ -36,7 +36,7 @@
 | 6 | 开仓与仓位质量 | 第二批完成并上线 | 每个新仓解释为什么开、为什么该仓位、为什么该杠杆 |
 | 7 | 平仓与持仓复盘 | 第二批完成并上线 | 平仓详情展示触发条件、持仓时长、手续费后净收益、模型意见、执行步骤 |
 | 8 | OKX 执行规则 | 第二批完成并上线 | 区分系统主动拦截与 OKX 拒绝，记录 OKX 规则快照 |
-| 9 | UI 与可观测性 | 第三批待继续 | 页面能直接看出为什么没开仓、哪一步失败、是否需人工处理 |
+| 9 | UI 与可观测性 | 第三批完成并上线 | 页面能直接看出为什么没开仓、哪一步失败、是否需人工处理 |
 | 10 | 安全规范部署闭环 | 持续执行 | 测试、密钥扫描、线上同步、冒烟、Git、Hindsight 全部完成 |
 
 ## 第一批已完成
@@ -171,17 +171,34 @@ runuser -u bb --preserve-environment -- /data/bb/app/.venv/bin/python scripts/ex
 - 线上本地量化工具：`/health` 返回 `200`，`/models/status`、`/profit/predict`、`/timeseries/deep/predict`、`/sentiment/deep/analyze`、`/exit/advise` 调用正常。
 - 线上基线：按服务用户 `bb` 导出成功。
 
-## 第三批计划
+## 第三批已完成
 
-状态：待继续。
+状态：代码完成、本地验证通过、已同步线上、线上冒烟通过，Git 提交 `635e9e0` 已推送。
 
-范围：
+已完成范围：
 
-1. UI 全面整理：策略调度、候选策略实验室、执行记录详情、Agent/Skills 守门、服务器监控、自检自动修复菜单继续统一信息架构。
-2. 策略实验室排版：解决剩余卡片溢出、长文本挤压、状态标签堆叠问题。
-3. 自检自动修复增强：把线上服务、模型隧道、18001 健康、数据库连接、行情入库、OKX 规则读取纳入一键检查。
-4. 训练数据源扩展：新闻/社媒去偏、分源权重、更多外部训练数据源；保留训练数据共享，模拟盘/实盘订单收益隔离。
-5. 可观测性增强：把“为什么没开仓/为什么小仓/为什么平仓/为什么复开被拦截”从日志沉淀为页面时间线。
+1. 候选策略实验室排版：策略卡片改为容器自适应网格，状态标签、按钮、chip、footer 和统计格允许换行，避免长文本和中文标签撑出卡片。
+2. 系统自检页面：自检详情改为“总览 + 异常/需关注/提示/正常分组”，详情字段可滚动展示，安全修复说明单独高亮。
+3. 执行记录详情：执行步骤头部改为自适应网格，原因和数据块支持长文本换行，避免 OKX 规则快照或错误详情挤乱弹窗。
+4. 数据源自检增强：新增 `market_ticker_freshness`、`market_kline_coverage`、`news_source_freshness`、`social_source_freshness`，可直接看到行情、K 线、新闻、社媒训练数据是否新鲜和覆盖是否偏。
+5. 契约测试增强：新增策略实验室防溢出契约、自检分组契约、数据源自检测试，防止后续 UI 和自检链路回退。
+
+本地验证：
+
+- 全量测试：`1019 passed`。
+- 聚焦 `ruff check`：通过。
+- `node --check web_dashboard/static/js/dashboard.js`：通过。
+- 密钥泄露扫描：`source safety scan ok: scanned 454 files`。
+- `git diff --check`：通过。
+
+线上验证：
+
+- 同步命令：`python scripts\sync_to_online_server.py --split-services`。
+- 上传文件：`web_dashboard/api/system_health.py`、`web_dashboard/static/css/dashboard.css`、`web_dashboard/static/css/strategy_learning.css`、`web_dashboard/static/js/dashboard.js`。
+- 服务状态：`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均为 `active`。
+- Dashboard：`http://127.0.0.1:8002/` 返回 `302`，符合登录保护预期。
+- 线上自检：`status=ok`，`critical=0`、`warning=0`、`ok=15`。
+- 数据源复核：ticker `108` 个、最新约 `0.7` 分钟；K 线 `1m/5m/15m/1h` 均有沉淀；新闻源 `9` 类、样本 `8143` 条；社媒平台 `2` 类、样本 `2619` 条。
 
 ## 每次继续开发前检查
 

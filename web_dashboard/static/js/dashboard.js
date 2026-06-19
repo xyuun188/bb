@@ -4234,6 +4234,46 @@ function selfCheckStatusLabel(status) {
     return labels[status] || status || '-';
 }
 
+function selfCheckStatusGroupTitle(status, count) {
+    const titles = {
+        critical: '\u5f02\u5e38\u95ee\u9898',
+        warning: '\u9700\u5173\u6ce8\u9879',
+        info: '\u8fd0\u884c\u63d0\u793a',
+        ok: '\u6b63\u5e38\u9879',
+    };
+    return `${titles[status] || selfCheckStatusLabel(status)} \u00b7 ${Number(count || 0)} \u9879`;
+}
+
+function selfCheckStatusRank(status) {
+    return { critical: 0, warning: 1, info: 2, ok: 3 }[status] ?? 4;
+}
+
+function selfCheckGroupedItems(items) {
+    const groups = { critical: [], warning: [], info: [], ok: [] };
+    items.forEach(item => {
+        const status = String(item?.status || 'info');
+        if (!groups[status]) groups[status] = [];
+        groups[status].push(item);
+    });
+    return Object.entries(groups)
+        .filter(([, rows]) => rows.length)
+        .sort(([left], [right]) => selfCheckStatusRank(left) - selfCheckStatusRank(right));
+}
+
+function selfCheckItemHtml(item) {
+    const detailText = selfCheckDetailText(item.details);
+    return `
+        <div class="self-check-card ${escHtml(item.status || 'info')}">
+            <div class="self-check-title">
+                <span>${escHtml(item.title || item.key || '-')}</span>
+                <strong>${escHtml(selfCheckStatusLabel(item.status))}</strong>
+            </div>
+            <div class="self-check-message">${escHtml(item.message || '-')}</div>
+            ${detailText ? `<div class="self-check-details">${escHtml(detailText)}</div>` : ''}
+            ${item.repairable ? '<div class="self-check-repair-note">\u53ef\u6267\u884c\u5b89\u5168\u4fee\u590d\uff1a\u6e05\u7f13\u5b58 / \u91cd\u7f6e\u7194\u65ad\uff0c\u4e0d\u4f1a\u6539\u8d44\u91d1\u548c\u8ba2\u5355\u3002</div>' : ''}
+        </div>`;
+}
+
 function selfCheckDetailText(details) {
     if (!details || typeof details !== 'object' || !Object.keys(details).length) return '';
     const lines = [];
@@ -4262,37 +4302,28 @@ function renderSystemSelfCheck() {
         return;
     }
     const summary = data.summary || {};
+    const groupedItems = selfCheckGroupedItems(items);
+    const problemItems = items.filter(item => ['critical', 'warning'].includes(String(item.status || '')));
+    const highlightItems = (problemItems.length ? problemItems : items).slice(0, 3);
     const summaryHtml = `
         <div class="self-check-summary">
-            <div class="self-check-card ${data.status || 'info'}">
-                <div class="self-check-title"><span>总体状态</span><strong>${escHtml(selfCheckStatusLabel(data.status))}</strong></div>
+            <div class="self-check-card self-check-overview ${data.status || 'info'}">
+                <div class="self-check-title"><span>\u603b\u4f53\u72b6\u6001</span><strong>${escHtml(selfCheckStatusLabel(data.status))}</strong></div>
                 <div class="self-check-message">\u5f02\u5e38 ${Number(summary.critical || 0)} \u00b7 \u9700\u5173\u6ce8 ${Number(summary.warning || 0)} \u00b7 \u63d0\u793a ${Number(summary.info || 0)} \u00b7 \u6b63\u5e38 ${Number(summary.ok || 0)}</div>
             </div>
-            ${items.slice(0, 3).map(item => `
-                <div class="self-check-card ${escHtml(item.status || 'info')}">
-                    <div class="self-check-title">
-                        <span>${escHtml(item.title || item.key || '-')}</span>
-                        <strong>${escHtml(selfCheckStatusLabel(item.status))}</strong>
-                    </div>
-                    <div class="self-check-message">${escHtml(item.message || '-')}</div>
-                </div>
-            `).join('')}
+            ${highlightItems.map(item => selfCheckItemHtml(item)).join('')}
         </div>`;
     const detailHtml = `
-        <div class="server-monitor-services" style="padding:0 12px 12px;">
-            ${items.map(item => {
-                const detailText = selfCheckDetailText(item.details);
-                return `
-                    <div class="self-check-card ${escHtml(item.status || 'info')}">
-                        <div class="self-check-title">
-                            <span>${escHtml(item.title || item.key || '-')}</span>
-                            <strong>${escHtml(selfCheckStatusLabel(item.status))}</strong>
-                        </div>
-                        <div class="self-check-message">${escHtml(item.message || '-')}</div>
-                        ${detailText ? `<div class="self-check-details">${escHtml(detailText)}</div>` : ''}
-                        ${item.repairable ? '<div class="self-check-message">可执行安全修复：清缓存 / 重置熔断，不会改资金和订单。</div>' : ''}
-                    </div>`;
-            }).join('')}
+        <div class="self-check-group-list">
+            ${groupedItems.map(([status, rows]) => `
+                <section class="self-check-group self-check-group-${escHtml(status)}">
+                    <div class="self-check-group-head">
+                        <strong>${escHtml(selfCheckStatusGroupTitle(status, rows.length))}</strong>
+                        <span>${escHtml(selfCheckStatusLabel(status))}</span>
+                    </div>
+                    <div class="self-check-group-grid">${rows.map(item => selfCheckItemHtml(item)).join('')}</div>
+                </section>
+            `).join('')}
         </div>`;
     panel.innerHTML = summaryHtml + detailHtml;
 }

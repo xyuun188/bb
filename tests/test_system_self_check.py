@@ -103,8 +103,19 @@ async def test_self_check_api_returns_recent_execution_problem(
             )
         ]
 
+    async def data_source_items() -> list[dict[str, Any]]:
+        return [
+            system_health._check_item(
+                "market_ticker_freshness",
+                "ticker",
+                "ok",
+                "fresh",
+            )
+        ]
+
     monkeypatch.setattr(system_health, "get_server_monitor_status_async", monitor_status)
     monkeypatch.setattr(system_health, "_recent_execution_items", recent_items)
+    monkeypatch.setattr(system_health, "_data_source_items", data_source_items)
 
     async def running_item() -> dict[str, Any]:
         return system_health._check_item("trading_service", "trading service", "ok", "running")
@@ -123,6 +134,64 @@ async def test_self_check_api_returns_recent_execution_problem(
     assert payload["summary"]["warning"] >= 1
     assert payload["summary"]["info"] == 0
     assert any(item["key"] == "recent_failed_orders" for item in payload["items"])
+
+
+@pytest.mark.asyncio
+async def test_data_source_self_check_reports_market_news_and_social_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = system_health.datetime.now(system_health.UTC)
+
+    class FakeResult:
+        def __init__(
+            self, *, one_row: tuple[Any, ...] | None = None, rows: list[Any] | None = None
+        ) -> None:
+            self._one_row = one_row
+            self._rows = rows or []
+
+        def one(self) -> tuple[Any, ...]:
+            assert self._one_row is not None
+            return self._one_row
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(one_row=(12, now))
+            if self.calls == 2:
+                return FakeResult(
+                    rows=[
+                        ("1m", 1200, 20, now),
+                        ("5m", 1200, 20, now),
+                        ("15m", 1200, 20, now),
+                        ("1h", 1000, 20, now),
+                    ]
+                )
+            if self.calls == 3:
+                return FakeResult(one_row=(200, 3, now))
+            return FakeResult(one_row=(0, 0, None))
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._data_source_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["market_ticker_freshness"]["status"] == "ok"
+    assert by_key["market_kline_coverage"]["status"] == "ok"
+    assert by_key["news_source_freshness"]["status"] == "ok"
+    assert by_key["social_source_freshness"]["status"] == "warning"
+    assert by_key["market_kline_coverage"]["details"]["missing_timeframes"] == []
+    assert by_key["social_source_freshness"]["details"]["platform_count"] == 0
 
 
 @pytest.mark.asyncio
