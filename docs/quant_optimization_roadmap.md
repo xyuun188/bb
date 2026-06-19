@@ -1,6 +1,6 @@
 # 苍鸮量化整体优化台账
 
-更新时间：2026-06-19 13:30 CST
+更新时间：2026-06-19 19:45 CST
 项目根目录：`F:\BB`
 
 ## 使用规则
@@ -199,6 +199,28 @@ runuser -u bb --preserve-environment -- /data/bb/app/.venv/bin/python scripts/ex
 - Dashboard：`http://127.0.0.1:8002/` 返回 `302`，符合登录保护预期。
 - 线上自检：`status=ok`，`critical=0`、`warning=0`、`ok=15`。
 - 数据源复核：ticker `108` 个、最新约 `0.7` 分钟；K 线 `1m/5m/15m/1h` 均有沉淀；新闻源 `9` 类、样本 `8143` 条；社媒平台 `2` 类、样本 `2619` 条。
+
+### 3.1 Scrapling 外部事件数据源增强与采集管理页
+
+状态：本地代码完成，已新增 Dashboard 管理入口；默认仍关闭，待线上按需安装可选依赖并配置源后启用。
+
+已完成内容：
+
+1. 新增 `data_feed/external_event_scraper.py`：Scrapling 可选适配层，支持 HTTPS 白名单源、同域链接提取、超时、限量、去重、源码级安全降级。
+2. 新增 `services/external_event_service.py`：后台采集入库服务，复用 `news_articles`，不进入交易热路径。
+3. `DataService` 生命周期挂载后台服务，默认关闭，只有 `EXTERNAL_EVENT_SCRAPER_ENABLED=true` 时启动。
+4. 新增 `requirements-scraping.txt` 与 `docs/external_event_scraping.md`，说明安装、配置、安全边界和训练作用。
+5. 新增 `tests/test_external_event_scraper.py`，覆盖默认关闭、非公网/非 HTTPS 拦截、页面解析、入库去重。
+6. 新增 `web_dashboard/api/data_collection.py` 与侧栏“数据采集”页面：可查看 Scrapling 依赖/运行状态、新闻/社媒/K 线/ticker 新鲜度、文本情绪样本质量、本地量化工具训练样本，并可保存 Scrapling 启停、间隔、超时、源数量和白名单源 JSON。
+7. 数据采集设置保存仍走 Dashboard 写权限与 `.env` 配置管理；后端继续拒绝非 HTTPS、localhost、内网、带账号密码等高风险 URL，不暴露密钥。
+
+本地验证：
+
+- `pytest tests/test_external_event_scraper.py tests/test_data_collection_api.py tests/test_dashboard_main_ui_contract.py::test_data_collection_page_is_wired_to_api_and_safe_layout`：`8 passed`。
+- `black --check web_dashboard/api/data_collection.py web_dashboard/api/router.py data_feed/external_event_scraper.py services/external_event_service.py tests/test_data_collection_api.py`：通过。
+- `ruff check web_dashboard/api/data_collection.py web_dashboard/api/router.py data_feed/external_event_scraper.py services/external_event_service.py tests/test_data_collection_api.py`：通过。
+- `node --check web_dashboard/static/js/dashboard.js`：通过。
+- 密钥泄露扫描：`source safety scan ok: scanned 461 files`。
 
 ## 每次继续开发前检查
 

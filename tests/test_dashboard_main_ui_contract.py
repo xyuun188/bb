@@ -290,7 +290,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260619-dual-vllm-monitor" in html
+    assert "dashboard.js?v=20260619-data-collection" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -300,6 +300,27 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     assert "document.getElementById('server-monitor-model-panel')" not in script
     assert "刷新大模型服务器监控失败" in script
     assert "刷新系统自检失败" in script
+
+
+def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert 'data-page="data-collection"' in html
+    assert 'id="page-data-collection"' in html
+    assert "数据采集管理" in html
+    assert "Scrapling 外部事件采集" in html
+    assert "fetchDataCollectionStatus()" in html
+    assert "saveDataCollectionSettings()" in html
+    assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
+    assert "fetchJSON('/api/data-collection/status')" in script
+    assert "postJSON('/api/data-collection/settings', body)" in script
+    assert "collectionStatusLabel" in script
+    assert "readDataCollectionSources" in script
+    assert ".data-source-grid" in style
+    assert ".data-quality-grid" in style
+    assert "overflow-wrap: anywhere;" in style
 
 
 def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:

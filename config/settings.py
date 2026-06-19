@@ -321,6 +321,14 @@ class Settings(BaseSettings):
     cryptopanic_api_key: str = ""
     coinmarketcal_api_key: str = ""
     newsapi_api_key: str = ""
+    external_event_scraper_enabled: bool = False
+    external_event_scraper_sources: Annotated[list[dict[str, Any]], NoDecode] = Field(
+        default_factory=list
+    )
+    external_event_scraper_interval_seconds: int = 900
+    external_event_scraper_timeout_seconds: float = 6.0
+    external_event_scraper_max_sources: int = 6
+    external_event_scraper_max_items_per_source: int = 8
 
     # --- Risk Management ---
     max_position_pct: float = 0.25
@@ -426,6 +434,30 @@ class Settings(BaseSettings):
             return [item.strip() for item in v.split(",") if item.strip()]
         if isinstance(v, list):
             return [str(item).strip() for item in v if str(item).strip()]
+        return []
+
+    @field_validator("external_event_scraper_sources", mode="before")
+    @classmethod
+    def parse_external_event_scraper_sources(cls, v: Any) -> list[dict[str, Any]]:
+        if isinstance(v, str):
+            if not v.strip():
+                return []
+            parsed = _parse_complex_env_value(v)
+            if isinstance(parsed, dict):
+                return [dict(parsed)]
+            if isinstance(parsed, list):
+                sources: list[dict[str, Any]] = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        sources.append(dict(item))
+                    elif str(item or "").strip():
+                        sources.append({"url": str(item).strip()})
+                return sources
+            return [{"url": item.strip()} for item in v.split(",") if item.strip()]
+        if isinstance(v, dict):
+            return [dict(v)]
+        if isinstance(v, list):
+            return [dict(item) for item in v if isinstance(item, dict)]
         return []
 
     def dashboard_allowed_origins(self) -> list[str]:

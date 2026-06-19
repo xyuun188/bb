@@ -28,6 +28,7 @@ from data_feed.technical_indicators import compute_all_indicators, extract_lates
 from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
 from models.news import NewsArticle, SocialPost
+from services.external_event_service import ExternalEventService
 
 logger = structlog.get_logger(__name__)
 
@@ -58,6 +59,7 @@ class DataService:
         self.rest_client = OKXRestClient()
         self.news_fetcher = NewsFetcher()
         self.sentiment_scraper = SentimentScraper()
+        self.external_event_service = ExternalEventService()
 
         # Caches
         self._sentiment_cache: dict[str, dict] = {}  # symbol -> {news_sent, social_sent, ...}
@@ -159,6 +161,7 @@ class DataService:
 
         await self.ws_client.connect()
         asyncio.create_task(self.ws_client.listen())
+        await self.external_event_service.start()
         logger.info("data service started")
 
     async def stop(self) -> None:
@@ -167,6 +170,7 @@ class DataService:
         await self.rest_client.close()
         await self.news_fetcher.close()
         await self.sentiment_scraper.close()
+        await self.external_event_service.stop()
         logger.info("data service stopped")
 
     async def refresh_sentiment(self, symbols: list[str] | None = None) -> None:

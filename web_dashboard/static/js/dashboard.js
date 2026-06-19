@@ -61,6 +61,7 @@ const state = {
     shadowBacktestStatus: '',
     mlSignalStatus: null,
     localAIToolsStatus: null,
+    dataCollectionStatus: null,
     serverMonitorStatus: null,
     serverMonitorTab: 'self-check',
     systemSelfCheck: null,
@@ -1539,6 +1540,7 @@ function loadPageData(page) {
     if (page === 'expert-memory') fetchExpertMemories();
     if (page === 'shadow-backtest') fetchShadowBacktests();
     if (page === 'ml-signal') fetchMLSignalDashboard();
+    if (page === 'data-collection') fetchDataCollectionStatus();
     if (page === 'server-monitor') {
         refreshServerMonitorPage();
     }
@@ -4182,6 +4184,292 @@ function renderMLSignalRecent() {
 function changeMLSignalPage(page) {
     state.mlSignalPage = Math.max(1, Number(page) || 1);
     renderMLSignalRecent();
+}
+
+// ========== Data Collection Dashboard ==========
+
+async function fetchDataCollectionStatus() {
+    const updated = document.getElementById('data-collection-updated');
+    if (updated) updated.textContent = '读取中...';
+    const data = await fetchJSON('/api/data-collection/status');
+    state.dataCollectionStatus = data || null;
+    renderDataCollectionDashboard();
+}
+
+function collectionStatusTone(status, enabled = true) {
+    const value = String(status || '').toLowerCase();
+    if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
+    if (['active', 'ok', 'ready', 'running'].includes(value)) return 'good';
+    if (['missing_dependency', 'timeout', 'warning', 'degraded'].includes(value)) return 'warn';
+    return 'bad';
+}
+
+function collectionStatusLabel(status, enabled = true) {
+    if (!enabled) return '未启用';
+    const map = {
+        active: '运行中',
+        disabled: '未启用',
+        not_configured: '未配置',
+        missing_dependency: '缺少依赖',
+        timeout: '超时',
+        error: '异常',
+        client_not_ready: '客户端未就绪',
+        invalid_status: '状态异常',
+        ready: '可用',
+        running: '运行中',
+    };
+    return map[String(status || '').toLowerCase()] || String(status || '未知');
+}
+
+function collectionAgeLabel(minutes) {
+    const n = Number(minutes);
+    if (!Number.isFinite(n)) return '无数据';
+    if (n < 1) return '刚刚更新';
+    if (n < 60) return `${monitorNumber(n, 1)} 分钟前`;
+    if (n < 1440) return `${monitorNumber(n / 60, 1)} 小时前`;
+    return `${monitorNumber(n / 1440, 1)} 天前`;
+}
+
+function collectionMetric(label, value, subtitle = '', tone = 'muted') {
+    return `
+        <div class="data-collection-metric data-collection-${tone}">
+            <span>${escHtml(label)}</span>
+            <strong>${escHtml(value)}</strong>
+            ${subtitle ? `<em>${escHtml(subtitle)}</em>` : ''}
+        </div>`;
+}
+
+function fillDataCollectionSettings(config) {
+    const enabled = document.getElementById('data-external-enabled');
+    if (enabled) enabled.checked = Boolean(config.external_event_scraper_enabled);
+    setInputValue('data-external-interval', config.external_event_scraper_interval_seconds);
+    setInputValue('data-external-timeout', config.external_event_scraper_timeout_seconds);
+    setInputValue('data-external-max-sources', config.external_event_scraper_max_sources);
+    setInputValue('data-external-max-items', config.external_event_scraper_max_items_per_source);
+    const sourcesEl = document.getElementById('data-external-sources');
+    if (sourcesEl) {
+        const sources = Array.isArray(config.external_event_scraper_sources)
+            ? config.external_event_scraper_sources
+            : [];
+        sourcesEl.value = JSON.stringify(sources, null, 2);
+    }
+    const note = document.getElementById('data-external-runtime-note');
+    if (note) {
+        const dependency = config.external_event_scraper_dependency_installed ? '依赖已安装' : '依赖未安装';
+        const runtime = config.external_event_scraper_runtime_active ? '后台可运行' : '后台未运行';
+        const sourceMode = config.external_event_scraper_uses_default_sources ? '使用默认源' : '使用自定义源';
+        note.textContent = `${dependency} · ${runtime} · ${sourceMode}`;
+    }
+}
+
+function renderDataCollectionDashboard() {
+    const data = state.dataCollectionStatus || {};
+    const config = data.config || {};
+    const stats = data.stats || {};
+    const training = data.training || {};
+    const updated = document.getElementById('data-collection-updated');
+    if (updated) {
+        updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '未返回时间';
+    }
+    if (!Object.keys(data).length) {
+        setText('data-collection-updated', '读取失败');
+        const overview = document.getElementById('data-collection-overview');
+        if (overview) {
+            overview.innerHTML = '<div class="analysis-empty">数据采集状态读取失败，请检查 Dashboard API 或登录状态。</div>';
+        }
+        return;
+    }
+    fillDataCollectionSettings(config);
+    renderDataCollectionOverview(data, config, stats, training);
+    renderDataCollectionSources(data, stats);
+    renderDataCollectionTraining(training);
+}
+
+function renderDataCollectionOverview(data, config, stats, training) {
+    const container = document.getElementById('data-collection-overview');
+    if (!container) return;
+    const news = stats.news || {};
+    const social = stats.social || {};
+    const market = stats.market || {};
+    const localTools = training.local_ai_tools || {};
+    const scraplingEnabled = Boolean(config.external_event_scraper_enabled);
+    const scraplingStatus = scraplingEnabled
+        ? (config.external_event_scraper_dependency_installed ? 'active' : 'missing_dependency')
+        : 'disabled';
+    container.innerHTML = `
+        <div class="data-collection-summary">
+            ${collectionMetric(
+                'Scrapling 外部事件',
+                collectionStatusLabel(scraplingStatus, scraplingEnabled),
+                scraplingEnabled ? `间隔 ${monitorNumber(config.external_event_scraper_interval_seconds, 0)} 秒` : '默认关闭，不占交易热路径',
+                collectionStatusTone(scraplingStatus, scraplingEnabled)
+            )}
+            ${collectionMetric(
+                '新闻样本',
+                `${monitorNumber(news.total, 0)} 条`,
+                `最新 ${collectionAgeLabel(news.age_minutes)}`,
+                Number(news.total || 0) > 0 ? 'good' : 'warn'
+            )}
+            ${collectionMetric(
+                '社媒样本',
+                `${monitorNumber(social.total, 0)} 条`,
+                `最新 ${collectionAgeLabel(social.age_minutes)}`,
+                Number(social.total || 0) > 0 ? 'good' : 'warn'
+            )}
+            ${collectionMetric(
+                'Ticker 快照',
+                `${monitorNumber(market.ticker_count, 0)} 个`,
+                `最新 ${collectionAgeLabel(market.ticker_age_minutes)}`,
+                Number(market.ticker_count || 0) > 0 ? 'good' : 'warn'
+            )}
+            ${collectionMetric(
+                '本地量化训练',
+                collectionStatusLabel(localTools.status, localTools.available),
+                `影子 ${monitorNumber(localTools.shadow_sample_count, 0)} · 交易 ${monitorNumber(localTools.trade_sample_count, 0)}`,
+                collectionStatusTone(localTools.status, localTools.available)
+            )}
+        </div>
+        <div class="analysis-note analysis-note-muted data-collection-note">
+            <span>说明</span>
+            这个页面管理“数据来源和训练可观测”。Scrapling 是可选增强源：启用后只采集白名单 HTTPS 公网页面，写入新闻样本，不直接触发下单。
+        </div>`;
+}
+
+function renderDataCollectionSources(data, stats) {
+    const container = document.getElementById('data-collection-sources');
+    if (!container) return;
+    const sources = Array.isArray(data.sources) ? data.sources : [];
+    const newsSources = (stats.news?.sources || []).slice(0, 12);
+    const socialPlatforms = (stats.social?.platforms || []).slice(0, 8);
+    const klines = stats.market?.klines || [];
+    container.innerHTML = `
+        <div class="data-source-grid">
+            ${sources.map(source => {
+                const tone = collectionStatusTone(source.status, source.enabled);
+                return `
+                    <div class="data-source-card data-source-${tone}">
+                        <div class="data-source-head">
+                            <strong>${escHtml(source.name || source.key || '-')}</strong>
+                            <span class="analysis-pill analysis-pill-${tone === 'bad' ? 'bad' : tone === 'warn' ? 'warn' : tone === 'good' ? 'good' : 'muted'}">${escHtml(collectionStatusLabel(source.status, source.enabled))}</span>
+                        </div>
+                        <p>${escHtml(source.detail || '')}</p>
+                    </div>`;
+            }).join('')}
+        </div>
+        <div class="data-quality-grid">
+            <div class="data-quality-panel">
+                <strong>新闻来源新鲜度</strong>
+                ${collectionRows(newsSources, 'name', 'count')}
+            </div>
+            <div class="data-quality-panel">
+                <strong>社媒来源新鲜度</strong>
+                ${collectionRows(socialPlatforms, 'name', 'count')}
+            </div>
+            <div class="data-quality-panel">
+                <strong>K 线覆盖</strong>
+                ${collectionRows(klines, 'timeframe', 'rows', row => `${monitorNumber(row.symbols, 0)} 个币种 · 最新 ${collectionAgeLabel(row.age_minutes)}`)}
+            </div>
+        </div>`;
+}
+
+function collectionRows(rows, labelKey, valueKey, subtitleFn = null) {
+    if (!Array.isArray(rows) || !rows.length) {
+        return '<div class="analysis-empty compact">暂无数据。</div>';
+    }
+    return `
+        <div class="data-collection-table">
+            ${rows.map(row => `
+                <div class="data-collection-row">
+                    <span>${escHtml(row[labelKey] || '-')}</span>
+                    <strong>${monitorNumber(row[valueKey], 0)}</strong>
+                    <em>${escHtml(subtitleFn ? subtitleFn(row) : `最新 ${collectionAgeLabel(row.age_minutes)}`)}</em>
+                </div>
+            `).join('')}
+        </div>`;
+}
+
+function renderDataCollectionTraining(training) {
+    const container = document.getElementById('data-collection-training');
+    if (!container) return;
+    const quality = training.text_sentiment_quality_sample || {};
+    const localTools = training.local_ai_tools || {};
+    const reasons = Array.isArray(quality.top_reasons) ? quality.top_reasons : [];
+    const models = localTools.models && typeof localTools.models === 'object'
+        ? Object.entries(localTools.models)
+        : [];
+    container.innerHTML = `
+        <div class="data-quality-grid">
+            <div class="data-quality-panel">
+                <strong>文本情绪样本质量</strong>
+                <div class="data-collection-summary data-collection-summary-compact">
+                    ${collectionMetric('抽样', `${monitorNumber(quality.sampled, 0)} 条`, '最近新闻 + 社媒', 'muted')}
+                    ${collectionMetric('纳入', `${monitorNumber(quality.included, 0)} 条`, `有效率 ${monitorNumber((quality.effective_ratio || 0) * 100, 1)}%`, Number(quality.effective_ratio || 0) >= 0.55 ? 'good' : 'warn')}
+                    ${collectionMetric('降权', `${monitorNumber(quality.downweighted, 0)} 条`, '弱文本/重复/低信息量', 'warn')}
+                    ${collectionMetric('排除', `${monitorNumber(quality.excluded, 0)} 条`, '不进入训练', Number(quality.excluded || 0) ? 'bad' : 'good')}
+                </div>
+                <div class="data-chip-list">
+                    ${reasons.length ? reasons.map(item => `<span>${escHtml(item.reason)} × ${monitorNumber(item.count, 0)}</span>`).join('') : '<span>暂无质量问题原因</span>'}
+                </div>
+            </div>
+            <div class="data-quality-panel">
+                <strong>本地量化工具训练样本</strong>
+                <div class="data-collection-summary data-collection-summary-compact">
+                    ${collectionMetric('服务状态', collectionStatusLabel(localTools.status, localTools.available), localTools.available ? '训练接口可用' : (localTools.error || '训练接口不可用'), collectionStatusTone(localTools.status, localTools.available))}
+                    ${collectionMetric('影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, `完成 ${monitorNumber(localTools.completed_shadow_sample_count, 0)}`, 'muted')}
+                    ${collectionMetric('交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, `完成 ${monitorNumber(localTools.completed_trade_sample_count, 0)}`, 'muted')}
+                    ${collectionMetric('文本样本', `${monitorNumber(localTools.text_sentiment_sample_count, 0)} 条`, '新闻/社媒训练输入', 'muted')}
+                </div>
+                <div class="data-chip-list">
+                    ${models.length ? models.map(([name, ready]) => `<span>${escHtml(name)}：${ready ? '已就绪' : '学习中'}</span>`).join('') : '<span>模型状态未返回</span>'}
+                </div>
+            </div>
+        </div>`;
+}
+
+function readDataCollectionSources() {
+    const raw = String(document.getElementById('data-external-sources')?.value || '').trim();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+        throw new Error('采集源 JSON 必须是数组。');
+    }
+    return parsed.map(item => ({
+        name: item?.name || null,
+        url: item?.url || '',
+        symbols: Array.isArray(item?.symbols) ? item.symbols : [],
+        weight: item?.weight ?? null,
+    }));
+}
+
+async function saveDataCollectionSettings() {
+    const status = document.getElementById('data-collection-save-status');
+    if (status) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = '正在保存数据采集配置...';
+    }
+    try {
+        const body = {
+            external_event_scraper_enabled: Boolean(document.getElementById('data-external-enabled')?.checked),
+            external_event_scraper_interval_seconds: readNumberInput('data-external-interval'),
+            external_event_scraper_timeout_seconds: readNumberInput('data-external-timeout'),
+            external_event_scraper_max_sources: readNumberInput('data-external-max-sources'),
+            external_event_scraper_max_items_per_source: readNumberInput('data-external-max-items'),
+            external_event_scraper_sources: readDataCollectionSources(),
+        };
+        const data = await postJSON('/api/data-collection/settings', body);
+        state.dataCollectionStatus = data || null;
+        renderDataCollectionDashboard();
+        if (status) {
+            status.style.color = 'var(--green)';
+            const runtime = data?.runtime_sync?.message ? ` ${data.runtime_sync.message}` : '';
+            status.textContent = `${data?.message || '数据采集配置已保存。'}${runtime}`;
+        }
+    } catch (err) {
+        if (status) {
+            status.style.color = 'var(--red)';
+            status.textContent = err?.message || '数据采集配置保存失败。';
+        }
+    }
 }
 
 // ========== Server Monitor ==========
