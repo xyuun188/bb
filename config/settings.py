@@ -336,6 +336,8 @@ class Settings(BaseSettings):
     vector_memory_decision_index_limit: int = 1200
     vector_memory_news_index_limit: int = 1500
     vector_memory_min_score: float = 0.18
+    vector_memory_auto_reindex_enabled: bool = True
+    vector_memory_auto_reindex_interval_seconds: int = 1800
 
     # --- Risk Management ---
     max_position_pct: float = 0.25

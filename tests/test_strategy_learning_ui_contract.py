@@ -64,6 +64,8 @@ def test_strategy_learning_ui_classifies_llm_candidate_errors() -> None:
     assert "候选模型接口请求失败" in script
     assert "候选模型返回格式不符合 JSON 结构要求" in script
     assert "候选模型未返回可解析 JSON" not in script
+    assert "上次候选已过期，后台会按策略窗口自动刷新" in script
+    assert "过期候选仅作观察参考，不会强行开仓" in script
 
 
 def test_strategy_learning_console_uses_clear_stage_layout() -> None:

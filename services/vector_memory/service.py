@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -29,6 +29,8 @@ class VectorMemoryService:
         self._lock = asyncio.Lock()
         self._last_reindex_at: datetime | None = None
         self._last_error: str = ""
+        self._auto_reindex_task: asyncio.Task | None = None
+        self._auto_reindex_started_at: datetime | None = None
 
     @property
     def enabled(self) -> bool:
@@ -50,6 +52,7 @@ class VectorMemoryService:
         async with self._lock:
             self._store = None
             self._last_error = ""
+            self._last_reindex_at = None
 
     async def status(self) -> dict[str, Any]:
         """Return current vector memory status."""
@@ -64,19 +67,26 @@ class VectorMemoryService:
                 "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                "auto_reindex_enabled": False,
+                "auto_reindex_due": False,
+                "auto_reindex_running": False,
             }
         try:
+            self.ensure_fresh_index(reason="status")
             stats = self._get_store().stats()
+            document_count = int(stats.get("document_count") or 0)
+            auto_state = self._auto_reindex_state(document_count)
             return {
                 "enabled": True,
                 "backend": stats.get("backend", "unknown"),
                 "status": "ready",
-                "document_count": int(stats.get("document_count") or 0),
+                "document_count": document_count,
                 "configured_backend": settings.vector_memory_backend,
                 "min_score": float(settings.vector_memory_min_score),
                 "path": stats.get("path"),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                **auto_state,
             }
         except Exception as exc:
             self._last_error = safe_error_text(exc, limit=180)
@@ -89,6 +99,9 @@ class VectorMemoryService:
                 "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
+                "auto_reindex_due": False,
+                "auto_reindex_running": self._auto_reindex_running(),
             }
 
     async def reindex_recent(self) -> dict[str, Any]:
@@ -108,6 +121,9 @@ class VectorMemoryService:
                     "indexed": indexed,
                     "last_reindex_at": _iso(self._last_reindex_at),
                     "store": self._get_store().stats(),
+                    "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
+                    "auto_reindex_due": False,
+                    "auto_reindex_running": False,
                 }
             except Exception as exc:
                 self._last_error = safe_error_text(exc, limit=240)
@@ -135,6 +151,7 @@ class VectorMemoryService:
         text = str(query or "").strip()
         if not text:
             return {"enabled": True, "status": "empty_query", "hits": []}
+        self.ensure_fresh_index(reason="search")
         filters = {
             key: value
             for key, value in {
@@ -160,6 +177,77 @@ class VectorMemoryService:
             "hits": [_hit_payload(hit) for hit in filtered[: max(int(top_k or 8), 1)]],
             "min_score": threshold,
         }
+
+    def ensure_fresh_index(self, *, reason: str = "") -> None:
+        """Schedule a non-blocking reindex when the index is empty or stale."""
+
+        if not self.enabled or not bool(settings.vector_memory_auto_reindex_enabled):
+            return
+        if self._auto_reindex_running():
+            return
+        try:
+            stats = self._get_store().stats()
+            document_count = int(stats.get("document_count") or 0)
+        except Exception as exc:
+            self._last_error = safe_error_text(exc, limit=180)
+            logger.warning("vector memory stats failed", error=self._last_error)
+            return
+        if not self._auto_reindex_due(document_count):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._auto_reindex_started_at = datetime.now(UTC)
+        self._auto_reindex_task = loop.create_task(self._run_auto_reindex(reason=reason))
+
+    async def _run_auto_reindex(self, *, reason: str = "") -> None:
+        try:
+            result = await self.reindex_recent()
+            if result.get("status") == "ok":
+                logger.info(
+                    "vector memory auto reindex completed",
+                    reason=reason,
+                    indexed=result.get("indexed"),
+                )
+        finally:
+            self._auto_reindex_started_at = None
+
+    def _auto_reindex_state(self, document_count: int) -> dict[str, Any]:
+        interval = self._auto_reindex_interval()
+        next_at = (
+            self._last_reindex_at + timedelta(seconds=interval)
+            if self._last_reindex_at is not None
+            else None
+        )
+        return {
+            "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
+            "auto_reindex_interval_seconds": interval,
+            "auto_reindex_due": self._auto_reindex_due(document_count),
+            "auto_reindex_running": self._auto_reindex_running(),
+            "auto_reindex_started_at": _iso(self._auto_reindex_started_at),
+            "next_auto_reindex_after": _iso(next_at),
+        }
+
+    def _auto_reindex_due(self, document_count: int) -> bool:
+        if not bool(settings.vector_memory_auto_reindex_enabled):
+            return False
+        if self._auto_reindex_running():
+            return False
+        if document_count <= 0:
+            return True
+        if self._last_reindex_at is None:
+            return True
+        return datetime.now(UTC) - self._last_reindex_at >= timedelta(
+            seconds=self._auto_reindex_interval()
+        )
+
+    def _auto_reindex_running(self) -> bool:
+        return self._auto_reindex_task is not None and not self._auto_reindex_task.done()
+
+    @staticmethod
+    def _auto_reindex_interval() -> int:
+        return max(int(settings.vector_memory_auto_reindex_interval_seconds or 1800), 300)
 
     async def similar_decision_context(
         self, decision: AIDecision, raw: dict[str, Any]

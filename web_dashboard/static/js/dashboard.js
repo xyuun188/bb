@@ -4309,6 +4309,22 @@ function collectionAgeLabel(minutes) {
     return `${monitorNumber(n / 1440, 1)} 天前`;
 }
 
+function collectionFreshnessTone(minutes) {
+    const n = Number(minutes);
+    if (!Number.isFinite(n)) return 'muted';
+    if (n <= 360) return 'good';
+    if (n <= 1440) return 'warn';
+    return 'bad';
+}
+
+function collectionFreshnessLabel(minutes) {
+    const n = Number(minutes);
+    if (!Number.isFinite(n)) return '无最新数据';
+    if (n <= 360) return `正常 · 最新 ${collectionAgeLabel(n)}`;
+    if (n <= 1440) return `延迟 · 最新 ${collectionAgeLabel(n)}`;
+    return `旧源待关注 · 最新 ${collectionAgeLabel(n)}`;
+}
+
 function collectionMetric(label, value, subtitle = '', tone = 'muted') {
     return `
         <div class="data-collection-metric data-collection-${tone}">
@@ -4484,10 +4500,10 @@ function collectionRows(rows, labelKey, valueKey, subtitleFn = null) {
     return `
         <div class="data-collection-table">
             ${rows.map(row => `
-                <div class="data-collection-row">
+                <div class="data-collection-row data-source-${collectionFreshnessTone(row.age_minutes)}">
                     <span>${escHtml(row[labelKey] || '-')}</span>
                     <strong>${monitorNumber(row[valueKey], 0)}</strong>
-                    <em>${escHtml(subtitleFn ? subtitleFn(row) : `最新 ${collectionAgeLabel(row.age_minutes)}`)}</em>
+                    <em>${escHtml(subtitleFn ? subtitleFn(row) : collectionFreshnessLabel(row.age_minutes))}</em>
                 </div>
             `).join('')}
         </div>`;
@@ -4502,6 +4518,12 @@ function renderDataCollectionTraining(training) {
     const models = localTools.models && typeof localTools.models === 'object'
         ? Object.entries(localTools.models)
         : [];
+    const completedShadowText = Number(localTools.completed_shadow_sample_count || 0) > 0
+        ? `复盘完成 ${monitorNumber(localTools.completed_shadow_sample_count, 0)}`
+        : '复盘完成口径暂未返回';
+    const completedTradeText = Number(localTools.completed_trade_sample_count || 0) > 0
+        ? `复盘完成 ${monitorNumber(localTools.completed_trade_sample_count, 0)}`
+        : '复盘完成口径暂未返回';
     container.innerHTML = `
         <div class="data-quality-grid">
             <div class="data-quality-panel">
@@ -4520,8 +4542,8 @@ function renderDataCollectionTraining(training) {
                 <strong>本地量化工具训练样本</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
                     ${collectionMetric('服务状态', collectionStatusLabel(localTools.status, localTools.available), localTools.available ? '训练接口可用' : (localTools.error || '训练接口不可用'), collectionStatusTone(localTools.status, localTools.available))}
-                    ${collectionMetric('影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, `完成 ${monitorNumber(localTools.completed_shadow_sample_count, 0)}`, 'muted')}
-                    ${collectionMetric('交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, `完成 ${monitorNumber(localTools.completed_trade_sample_count, 0)}`, 'muted')}
+                    ${collectionMetric('影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, completedShadowText, 'muted')}
+                    ${collectionMetric('交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, completedTradeText, 'muted')}
                     ${collectionMetric('文本样本', `${monitorNumber(localTools.text_sentiment_sample_count, 0)} 条`, '新闻/社媒训练输入', 'muted')}
                 </div>
                 <div class="data-chip-list">
@@ -4671,8 +4693,11 @@ function renderVectorMemoryStatus(data) {
     if (minScore && minScore.value === '') minScore.value = String(data?.min_score ?? 0.18);
     const note = document.getElementById('vector-memory-runtime-note');
     if (note) {
+        const autoLabel = data?.auto_reindex_enabled
+            ? (data.auto_reindex_running ? '自动索引中' : '自动维护')
+            : '手动维护';
         note.textContent = data
-            ? `${collectionStatusLabel(data.status, data.enabled)} · ${data.backend || 'unknown'} · ${monitorNumber(data.document_count, 0)} 条`
+            ? `${collectionStatusLabel(data.status, data.enabled)} · ${data.backend || 'unknown'} · ${monitorNumber(data.document_count, 0)} 条 · ${autoLabel}`
             : '读取失败';
     }
     const panel = document.getElementById('vector-memory-status-panel');
@@ -4690,7 +4715,12 @@ function renderVectorMemoryStatus(data) {
         <div class="data-source-line data-source-muted">
             <span>索引文档</span>
             <strong>${monitorNumber(data.document_count, 0)} 条</strong>
-            <em>${data.last_reindex_at ? `上次重建 ${toBeijingTime(data.last_reindex_at)}` : '尚未重建'}</em>
+            <em>${data.last_reindex_at ? `上次索引 ${toBeijingTime(data.last_reindex_at)}` : (data.auto_reindex_enabled ? '等待后台自动索引' : '尚未索引')}</em>
+        </div>
+        <div class="data-source-line data-source-${data.auto_reindex_running ? 'warn' : (data.auto_reindex_enabled ? 'good' : 'muted')}">
+            <span>自动维护</span>
+            <strong>${data.auto_reindex_enabled ? (data.auto_reindex_running ? '索引中' : '已启用') : '未启用'}</strong>
+            <em>${data.auto_reindex_enabled ? `约每 ${monitorNumber((data.auto_reindex_interval_seconds || 1800) / 60, 0)} 分钟检查；手动重建只用于立即刷新` : '关闭后需要手动重建'}</em>
         </div>
         ${data.last_error ? `<div class="data-source-line data-source-bad"><span>最近错误</span><strong>需要关注</strong><em>${escHtml(data.last_error)}</em></div>` : ''}
     `;
@@ -4713,7 +4743,7 @@ async function saveVectorMemorySettings() {
         status.style.color = data?.status === 'error' ? 'var(--red)' : 'var(--green)';
         status.textContent = data?.status === 'error'
             ? `保存后状态异常：${data.last_error || '未知错误'}`
-            : '向量记忆设置已保存；启用后可点击“重建索引”。';
+            : '向量记忆设置已保存；启用后后台会自动维护索引，手动重建只用于立即刷新。';
     }
 }
 
@@ -6788,6 +6818,9 @@ function closeModelModal() {
 function cleanExecutionDetailText(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback;
     const text = String(value);
+    if (/^\d{12,}$/.test(text.trim())) {
+        return fallback || '未记录可读执行原因；该数字是交易所/本地订单标识，不是策略原因。';
+    }
     if (/(OKX|okx).*(code|sCode|返回码|51004|51155|51169|59670)/i.test(text)) {
         return text;
     }
@@ -6956,7 +6989,7 @@ function renderExecutionDetailModal(trade, detailData = null) {
         ? `${actionLabel(trade.action || trade.side)} / ${closeStatus}`
         : actionLabel(trade.action || trade.side);
     const detail = cleanExecutionDetailText(
-        detailData?.display_reason || detailData?.detail || detailData?.reason || trade.display_reason || trade.detail || trade.reason,
+        detailData?.display_reason || detailData?.detail || trade.display_reason || trade.detail || trade.reason,
         success ? '订单执行成功。' : '订单执行失败，暂无详细原因。'
     );
     const decision = detailData?.decision || trade.decision || {};
@@ -6965,7 +6998,7 @@ function renderExecutionDetailModal(trade, detailData = null) {
         ''
     );
     const executionReason = cleanExecutionDetailText(
-        detailData?.display_reason || decision.execution_reason || detailData?.reason || trade.execution_reason || trade.reason || detail,
+        detailData?.display_reason || decision.execution_reason || trade.execution_reason || trade.reason || detail,
         detail
     );
     const aiLev = Number(trade.ai_suggested_leverage ?? trade.leverage ?? 1).toFixed(1);

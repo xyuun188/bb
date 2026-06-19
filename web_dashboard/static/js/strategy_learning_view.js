@@ -325,12 +325,12 @@ function renderStrategyLearningSummary(data) {
     const llmErrorMessage = llmErrorMessages[llmErrorKind] || llmErrorMessages.unknown;
     const llmStateLabel = llm.cache_status === 'current'
         ? '缓存匹配当前反馈'
-        : (llm.cache_status === 'stale' ? '缓存已过期' : '暂无缓存');
+        : (llm.cache_status === 'stale' ? '上次候选已过期，后台会按策略窗口自动刷新' : '暂无缓存');
     const llmNotice = llmError
         ? `<div class="strategy-learning-inline-alert warn"><strong>动态候选未生效</strong><span>${strategyLearningEsc(llmErrorMessage)}</span><em>${strategyLearningEsc(strategyLearningShort(llmError, 96))}</em></div>`
         : '';
     const llmCacheNotice = llmCached.length
-        ? `<div class="strategy-learning-inline-alert ${llm.cache_status === 'current' ? '' : 'warn'}"><strong>LLM 结构化候选</strong><span>${strategyLearningEsc(llmStateLabel)} · ${strategyLearningEsc(llm.last_model || llm.source || '-')} · ${strategyLearningEsc(strategyLearningTime(llm.cached_at))}</span><em>${llmCached.map(item => strategyLearningEsc(item.label || item.id || '-')).join(' / ')}</em></div>`
+        ? `<div class="strategy-learning-inline-alert ${llm.cache_status === 'current' ? '' : 'warn'}"><strong>LLM 结构化候选</strong><span>${strategyLearningEsc(llmStateLabel)} · ${strategyLearningEsc(llm.last_model || llm.source || '-')} · ${strategyLearningEsc(strategyLearningTime(llm.cached_at))}</span><em>${llm.cache_status === 'current' ? '当前可参与调度参考' : '过期候选仅作观察参考，不会强行开仓'} · ${llmCached.map(item => strategyLearningEsc(item.label || item.id || '-')).join(' / ')}</em></div>`
         : '';
 
     el.innerHTML = `

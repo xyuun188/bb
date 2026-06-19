@@ -187,11 +187,38 @@ def _text_is_unusable(text: str | None) -> bool:
     value = str(text or "").strip()
     if not value:
         return True
+    if re.fullmatch(r"\d{12,}", value):
+        return True
     if CORRUPTED_HISTORY_REASON in value:
         return True
     if value.count("?") >= max(6, int(len(value) * 0.25)):
         return True
     return _looks_mojibake(value)
+
+
+def _readable_execution_reason(
+    *,
+    execution_reason: str | None,
+    reasoning: str | None,
+    exchange_order_id: str | None,
+    status: str | None,
+) -> str:
+    """Choose a human-readable reason without treating order ids as reasons."""
+
+    for candidate in (execution_reason, reasoning):
+        text = sanitize_text(candidate)
+        if text and not _text_is_unusable(text):
+            return _translate_execution_text(text)
+    exchange_text = sanitize_text(exchange_order_id)
+    if (
+        exchange_text
+        and exchange_text.lower() != "rejected"
+        and not re.fullmatch(r"\d{12,}", exchange_text)
+    ):
+        return _translate_execution_text(exchange_text)
+    if str(status or "").lower() == "filled":
+        return "订单已成交，本地订单与持仓记录已同步；具体交易原因请查看 AI 裁决依据和执行步骤。"
+    return "订单未成交或执行失败，交易接口未返回更详细原因。"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -576,13 +603,12 @@ async def get_trades(
         if not isinstance(snapshot, dict):
             snapshot = {}
         if order.status != "filled":
-            if meta.get("execution_reason"):
-                return _translate_execution_text(meta["execution_reason"])
-            if order.exchange_order_id and order.exchange_order_id not in {"", "rejected"}:
-                return _translate_execution_text(order.exchange_order_id)
-            if meta.get("execution_reason"):
-                return _translate_execution_text(meta["execution_reason"])
-            return "订单未成交或执行失败，交易接口未返回更详细原因。"
+            return _readable_execution_reason(
+                execution_reason=meta.get("execution_reason"),
+                reasoning=meta.get("reasoning"),
+                exchange_order_id=order.exchange_order_id,
+                status=order.status,
+            )
 
         p = matching_closed_position(order)
         if p:
@@ -634,7 +660,9 @@ async def get_trades(
         reasoning = meta.get("reasoning")
         if reasoning and not _text_is_unusable(str(reasoning)):
             return _repair_position_reason_hold_hours(reasoning, hold_minutes)
-        if meta.get("execution_reason"):
+        if meta.get("execution_reason") and not _text_is_unusable(
+            str(meta.get("execution_reason"))
+        ):
             return _repair_position_reason_hold_hours(
                 _translate_execution_text(meta["execution_reason"]),
                 hold_minutes,
@@ -729,14 +757,11 @@ async def get_trade_detail(trade_id: int):
 
     raw_response = _safe_dict(getattr(decision, "raw_llm_response", None))
     execution_reason = sanitize_text(getattr(decision, "execution_reason", None))
-    fallback_reason = (
-        _translate_execution_text(execution_reason)
-        if execution_reason
-        else (
-            _translate_execution_text(order.exchange_order_id)
-            if order.exchange_order_id and order.exchange_order_id not in {"", "rejected"}
-            else ("订单执行成功。" if order.status == "filled" else "订单未成交或执行失败。")
-        )
+    fallback_reason = _readable_execution_reason(
+        execution_reason=execution_reason,
+        reasoning=sanitize_text(getattr(decision, "reasoning", None)),
+        exchange_order_id=order.exchange_order_id,
+        status=order.status,
     )
     trace = build_execution_trace(
         raw_response,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -85,6 +85,8 @@ def test_vector_memory_settings_defaults_are_safe() -> None:
     assert settings.vector_memory_enabled is False
     assert settings.vector_memory_backend == "auto"
     assert settings.vector_memory_dimension >= 16
+    assert settings.vector_memory_auto_reindex_enabled is True
+    assert settings.vector_memory_auto_reindex_interval_seconds >= 300
 
 
 def test_vector_memory_document_fields_strip_invalid_control_text() -> None:
@@ -190,3 +192,24 @@ def test_vector_memory_influence_is_explainable_soft_score() -> None:
     assert influence["same_action_loss_count"] == 2
     assert influence["is_hard_gate"] is False
     assert "硬拦截" in influence["reason"] or "不作为硬拦截" in influence["reason"]
+
+
+def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    service = VectorMemoryService()
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_interval_seconds", 1800)
+
+    assert service._auto_reindex_due(0) is True
+
+    service._last_reindex_at = None
+    assert service._auto_reindex_due(12) is True
+
+    service._last_reindex_at = datetime.now(UTC)
+    assert service._auto_reindex_due(12) is False
+
+    service._last_reindex_at = datetime.now(UTC) - timedelta(seconds=1801)
+    assert service._auto_reindex_due(12) is True

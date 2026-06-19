@@ -290,7 +290,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260619-vector-memory" in html
+    assert "dashboard.js?v=20260620-vector-auto-index" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -365,6 +365,9 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "postJSON('/api/data-collection/settings', body)" in script
     assert "fetchJSON('/api/vector-memory/status')" in script
     assert "postJSON('/api/vector-memory/reindex', {})" in script
+    assert "后台会自动维护索引" in script
+    assert "手动重建只用于立即刷新" in script
+    assert "立即刷新索引" in vector_settings_html
     assert "renderAnalysisVectorMemory" in script
     assert "\u975e\u786c\u62e6\u622a" in script
     assert "\u5f71\u54cd ${deltaLabel}" in script
@@ -378,8 +381,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260619-vector-memory-sources" in html
-    assert "dashboard.js?v=20260619-vector-memory-sources" in html
+    assert "dashboard.css?v=20260620-vector-auto-index" in html
+    assert "dashboard.js?v=20260620-vector-auto-index" in html
     assert "overflow-wrap: anywhere;" in style
 
 

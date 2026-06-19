@@ -359,6 +359,8 @@ def _execution_reason_is_unusable(reason: str | None) -> bool:
     text = str(reason or "").strip()
     if not text:
         return False
+    if re.fullmatch(r"\d{12,}", text):
+        return True
     return any(
         marker in text
         for marker in (
