@@ -286,6 +286,22 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     assert "data.model_access_host" not in script
 
 
+def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "dashboard.js?v=20260619-server-monitor-render-fix" in html
+    assert "const rawDigits = Number(digits);" in script
+    assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
+    assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
+    assert "monitorNumber(tools.completed_trade_sample_count, monitorNumber(" not in script
+    assert "Promise.allSettled([" in script
+    assert "document.getElementById('server-monitor-model-runtime')" in script
+    assert "document.getElementById('server-monitor-model-panel')" not in script
+    assert "刷新大模型服务器监控失败" in script
+    assert "刷新系统自检失败" in script
+
+
 def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
     style = (PROJECT_ROOT / "web_dashboard/static/css/strategy_learning.css").read_text(
         encoding="utf-8"

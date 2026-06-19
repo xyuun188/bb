@@ -4207,8 +4207,31 @@ async function fetchSystemSelfCheck() {
 async function refreshServerMonitorPage() {
     if (serverMonitorRefreshInFlight) return serverMonitorRefreshInFlight;
     serverMonitorRefreshInFlight = (async () => {
-        await fetchServerMonitor();
-        await fetchSystemSelfCheck();
+        const results = await Promise.allSettled([
+            fetchServerMonitor(),
+            fetchSystemSelfCheck(),
+        ]);
+        const [monitorResult, selfCheckResult] = results;
+        if (monitorResult.status === 'rejected') {
+            const updated = document.getElementById('server-monitor-updated');
+            const panel = document.getElementById('server-monitor-model-runtime');
+            const message = monitorResult.reason?.message || String(monitorResult.reason || '监控渲染失败');
+            if (updated) updated.textContent = '读取失败';
+            if (panel) {
+                panel.innerHTML = `<div style="color:var(--red);font-size:12px;padding:16px;">大模型服务器监控渲染失败：${escHtml(message)}</div>`;
+            }
+            console.error('刷新大模型服务器监控失败', monitorResult.reason);
+        }
+        if (selfCheckResult.status === 'rejected') {
+            const updated = document.getElementById('system-self-check-updated');
+            const panel = document.getElementById('system-self-check-panel');
+            const message = selfCheckResult.reason?.message || String(selfCheckResult.reason || '系统自检失败');
+            if (updated) updated.textContent = '自检失败';
+            if (panel) {
+                panel.innerHTML = `<div style="color:var(--red);font-size:12px;padding:16px;">系统自检失败：${escHtml(message)}</div>`;
+            }
+            console.error('刷新系统自检失败', selfCheckResult.reason);
+        }
     })().finally(() => {
         serverMonitorRefreshInFlight = null;
     });
@@ -4331,8 +4354,12 @@ function renderSystemSelfCheck() {
 function monitorNumber(value, digits = 1) {
     const n = Number(value || 0);
     if (!Number.isFinite(n)) return '0';
+    const rawDigits = Number(digits);
+    const fractionDigits = Number.isFinite(rawDigits)
+        ? Math.max(0, Math.min(Math.trunc(rawDigits), 6))
+        : 1;
     return n.toLocaleString('zh-CN', {
-        maximumFractionDigits: digits,
+        maximumFractionDigits: fractionDigits,
         minimumFractionDigits: 0,
     });
 }
@@ -4658,8 +4685,8 @@ function renderServerModelRuntime(data, container) {
                 <div>健康接口：${escHtml(toolsHealthLine || '-')}</div>
                 <div>平台子接口：${platformToolChildEntries.length ? `${platformToolChildAvailable}/${platformToolChildEntries.length} 正常` : '-'}</div>
                 <div>训练时间：${tools.trained_at ? toBeijingTime(tools.trained_at) : '-'}</div>
-                <div>影子样本：窗口 ${monitorNumber(tools.shadow_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_shadow_sample_count, monitorNumber(tools.shadow_sample_count, 0))}</div>
-                <div>交易样本：窗口 ${monitorNumber(tools.trade_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_trade_sample_count, monitorNumber(tools.trade_sample_count, 0))}</div>
+                <div>影子样本：窗口 ${monitorNumber(tools.shadow_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_shadow_sample_count, 0)}</div>
+                <div>交易样本：窗口 ${monitorNumber(tools.trade_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_trade_sample_count, 0)}</div>
                 <div>盈利模型：${escHtml(toolsModels.profit || '未返回')}</div>
                 <div>平仓模型：${escHtml(toolsModels.exit || '未返回')}</div>
                 ${tools.error ? `<div style="color:var(--red);">错误：${escHtml(tools.error)}</div>` : ''}
