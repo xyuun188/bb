@@ -97,6 +97,8 @@ def _source_payload(source: Any) -> dict[str, Any]:
         "url": source.url,
         "symbols": list(source.symbols),
         "weight": source.weight,
+        "category": getattr(source, "category", "project"),
+        "description": getattr(source, "description", ""),
     }
 
 

@@ -176,6 +176,10 @@ class VectorMemoryService:
             min_score=float(settings.vector_memory_min_score),
         )
         result["query_summary"] = query[:320]
+        result["influence"] = _influence_payload(
+            result.get("hits") if isinstance(result.get("hits"), list) else [],
+            action=str(decision.action or ""),
+        )
         return result
 
     async def _load_recent_documents(self) -> list[VectorMemoryDocument]:
@@ -353,4 +357,70 @@ def _hit_payload(hit: VectorMemoryHit) -> dict[str, Any]:
         "created_at": hit.created_at,
         "source_ref": hit.source_ref,
         "metadata": hit.metadata,
+    }
+
+
+def _influence_payload(hits: list[dict[str, Any]], *, action: str) -> dict[str, Any]:
+    """Explain how similar historical cases should influence this decision."""
+
+    if not hits:
+        return {
+            "score_delta": 0.0,
+            "level": "neutral",
+            "label": "未命中相似历史",
+            "reason": "没有足够相似的历史案例，本次不调整策略评分。",
+            "matched_count": 0,
+            "loss_count": 0,
+            "profit_count": 0,
+        }
+    normalized_action = str(action or "").lower()
+    weighted = 0.0
+    weight_total = 0.0
+    loss_count = 0
+    profit_count = 0
+    same_action_loss_count = 0
+    for hit in hits:
+        score = max(float(hit.get("score") or 0.0), 0.0)
+        pnl = hit.get("pnl_pct")
+        try:
+            pnl_value = float(pnl)
+        except (TypeError, ValueError):
+            pnl_value = 0.0
+        if pnl_value < 0:
+            loss_count += 1
+        elif pnl_value > 0:
+            profit_count += 1
+        same_action = (
+            normalized_action and str(hit.get("action") or "").lower() == normalized_action
+        )
+        if same_action and pnl_value < 0:
+            same_action_loss_count += 1
+        direction = 1.0 if pnl_value > 0 else -1.0 if pnl_value < 0 else 0.0
+        action_multiplier = 1.25 if same_action else 0.75
+        weighted += direction * score * action_multiplier
+        weight_total += score * action_multiplier
+    ratio = weighted / weight_total if weight_total > 0 else 0.0
+    score_delta = round(max(min(ratio * 8.0, 6.0), -6.0), 2)
+    if same_action_loss_count >= 2 or score_delta <= -2.5:
+        level = "negative"
+        label = "相似历史偏负向"
+        reason = "过去相似案例亏损较多，建议降低仓位或要求更强证据，不作为硬拦截。"
+    elif score_delta >= 2.5:
+        level = "positive"
+        label = "相似历史偏正向"
+        reason = "过去相似案例盈利占优，可作为轻量加分，但仍需服从实时风控和收益评估。"
+    else:
+        level = "neutral"
+        label = "相似历史中性"
+        reason = "相似历史结果分化，本次仅作解释参考，不明显调整评分。"
+    return {
+        "score_delta": score_delta,
+        "level": level,
+        "label": label,
+        "reason": reason,
+        "matched_count": len(hits),
+        "loss_count": loss_count,
+        "profit_count": profit_count,
+        "same_action_loss_count": same_action_loss_count,
+        "is_hard_gate": False,
     }

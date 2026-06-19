@@ -66,29 +66,43 @@ _DEFAULT_SYMBOL_ALIASES: dict[str, tuple[str, ...]] = {
     "ARB": ("ARB", "Arbitrum"),
     "OP": ("OP", "Optimism"),
     "TON": ("TON", "Toncoin"),
+    "MATIC": ("MATIC", "Polygon", "POL"),
+    "POL": ("POL", "Polygon", "MATIC"),
+    "NEAR": ("NEAR", "Near"),
+    "TIA": ("TIA", "Celestia"),
+    "EIGEN": ("EIGEN", "EigenLayer", "EigenCloud"),
+    "KCS": ("KCS", "KuCoin"),
 }
 DEFAULT_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = (
     {
         "name": "binance_announcements",
         "url": "https://www.binance.com/en/support/announcement/c-48",
         "weight": 0.88,
+        "category": "exchange",
+        "description": "Binance 官方公告，覆盖上币、下架、维护和产品更新。",
     },
     {
         "name": "coinbase_blog",
         "url": "https://www.coinbase.com/blog",
         "weight": 0.72,
+        "category": "exchange",
+        "description": "Coinbase 官方博客，覆盖资产、合规和机构采用事件。",
     },
     {
         "name": "ethereum_blog",
         "url": "https://blog.ethereum.org/",
         "symbols": ["ETH"],
         "weight": 0.72,
+        "category": "project",
+        "description": "Ethereum 官方博客，覆盖协议升级和生态核心事件。",
     },
     {
         "name": "solana_news",
         "url": "https://solana.com/news",
         "symbols": ["SOL"],
         "weight": 0.70,
+        "category": "project",
+        "description": "Solana 官方新闻，覆盖生态、升级和合作事件。",
     },
 )
 RECOMMENDED_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = DEFAULT_EXTERNAL_EVENT_SOURCES + (
@@ -97,59 +111,154 @@ RECOMMENDED_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = DEFAULT_EXTERNA
         "url": "https://www.okx.com/en-us/help/section/announcements-latest-announcements",
         "symbols": ["BTC", "ETH", "OKB"],
         "weight": 0.88,
+        "category": "exchange",
+        "description": "OKX 最新公告，覆盖交易、充提、维护和产品事件。",
     },
     {
         "name": "okx_new_listings",
         "url": "https://www.okx.com/en-us/help/section/announcements-new-listings",
         "weight": 0.90,
+        "category": "exchange",
+        "description": "OKX 新币上线公告，适合捕捉短线催化。",
+    },
+    {
+        "name": "kucoin_announcements",
+        "url": "https://www.kucoin.com/announcement",
+        "symbols": ["KCS"],
+        "weight": 0.82,
+        "category": "exchange",
+        "description": "KuCoin 官方公告，覆盖上币、下架和产品调整。",
+    },
+    {
+        "name": "kraken_asset_listings",
+        "url": "https://blog.kraken.com/category/product/asset-listings",
+        "weight": 0.78,
+        "category": "exchange",
+        "description": "Kraken 资产上线博客，适合补充海外主流交易所上币事件。",
+    },
+    {
+        "name": "kraken_status",
+        "url": "https://status.kraken.com/",
+        "weight": 0.74,
+        "category": "exchange",
+        "description": "Kraken 状态页，覆盖交易、充提和维护异常。",
     },
     {
         "name": "avalanche_blog",
         "url": "https://www.avax.network/about/blog",
         "symbols": ["AVAX"],
         "weight": 0.72,
+        "category": "project",
+        "description": "Avalanche 官方博客，覆盖生态和链上项目事件。",
     },
     {
         "name": "chainlink_blog",
         "url": "https://chain.link/blog",
         "symbols": ["LINK"],
         "weight": 0.70,
+        "category": "project",
+        "description": "Chainlink 官方博客，覆盖预言机、RWA 和机构合作。",
     },
     {
         "name": "uniswap_blog",
         "url": "https://blog.uniswap.org/",
         "symbols": ["UNI", "ETH"],
         "weight": 0.68,
+        "category": "project",
+        "description": "Uniswap 官方博客，覆盖 DEX、治理和协议更新。",
     },
     {
         "name": "base_blog",
         "url": "https://blog.base.org/",
         "symbols": ["ETH"],
         "weight": 0.66,
+        "category": "project",
+        "description": "Base 官方博客，覆盖 L2 生态和应用增长。",
     },
     {
         "name": "optimism_blog",
         "url": "https://www.optimism.io/blog",
         "symbols": ["OP", "ETH"],
         "weight": 0.68,
+        "category": "project",
+        "description": "Optimism 官方博客，覆盖 Superchain、治理和升级。",
     },
     {
         "name": "arbitrum_foundation_blog",
         "url": "https://blog.arbitrum.foundation/",
         "symbols": ["ARB", "ETH"],
         "weight": 0.68,
+        "category": "project",
+        "description": "Arbitrum Foundation 博客，覆盖 L2 生态和治理事件。",
     },
     {
         "name": "sui_blog",
         "url": "https://blog.sui.io/",
         "symbols": ["SUI"],
         "weight": 0.68,
+        "category": "project",
+        "description": "Sui 官方博客，覆盖生态、协议和合作事件。",
     },
     {
         "name": "aptos_currents",
         "url": "https://aptosnetwork.com/currents",
         "symbols": ["APT"],
         "weight": 0.68,
+        "category": "project",
+        "description": "Aptos 官方动态，覆盖生态和协议更新。",
+    },
+    {
+        "name": "polygon_blog",
+        "url": "https://polygon.technology/blog",
+        "symbols": ["POL", "MATIC"],
+        "weight": 0.70,
+        "category": "project",
+        "description": "Polygon 官方博客，覆盖 POL/MATIC、RWA、支付和生态事件。",
+    },
+    {
+        "name": "near_blog",
+        "url": "https://www.near.org/blog",
+        "symbols": ["NEAR"],
+        "weight": 0.68,
+        "category": "project",
+        "description": "NEAR 官方博客，覆盖 AI、链抽象和生态更新。",
+    },
+    {
+        "name": "celestia_blog",
+        "url": "https://blog.celestia.org/",
+        "symbols": ["TIA"],
+        "weight": 0.66,
+        "category": "project",
+        "description": "Celestia 官方博客，覆盖模块化链和 DA 事件。",
+    },
+    {
+        "name": "eigencloud_blog",
+        "url": "https://blog.eigencloud.xyz/",
+        "symbols": ["EIGEN", "ETH"],
+        "weight": 0.66,
+        "category": "project",
+        "description": "EigenCloud/EigenLayer 博客，覆盖再质押和 AVS 生态。",
+    },
+    {
+        "name": "certik_blog",
+        "url": "https://www.certik.com/blog",
+        "weight": 0.72,
+        "category": "security",
+        "description": "CertiK 安全博客，覆盖攻击、漏洞和风险复盘。",
+    },
+    {
+        "name": "slowmist_medium",
+        "url": "https://slowmist.medium.com/",
+        "weight": 0.70,
+        "category": "security",
+        "description": "SlowMist 安全事件源，覆盖被盗、钓鱼和链上攻击分析。",
+    },
+    {
+        "name": "chainalysis_blog",
+        "url": "https://www.chainalysis.com/blog/",
+        "weight": 0.64,
+        "category": "security",
+        "description": "Chainalysis 博客，覆盖监管、犯罪资金流和重大风险事件。",
     },
 )
 
@@ -185,6 +294,8 @@ class ExternalEventSource:
     url: str
     symbols: tuple[str, ...] = ()
     weight: float = 0.60
+    category: str = "project"
+    description: str = ""
 
 
 def _load_async_fetcher() -> type[AsyncFetcherLike] | None:
@@ -243,11 +354,17 @@ def _normalize_source(raw: dict[str, Any]) -> ExternalEventSource:
         weight = float(raw.get("weight", 0.60))
     except (TypeError, ValueError):
         weight = 0.60
+    category = str(raw.get("category") or "project").strip().lower()
+    if category not in {"exchange", "project", "security", "macro", "media"}:
+        category = "project"
+    description = str(raw.get("description") or "").strip()
     return ExternalEventSource(
         name=name,
         url=url,
         symbols=symbols,
         weight=max(min(weight, 1.0), 0.2),
+        category=category,
+        description=description[:180],
     )
 
 
@@ -318,6 +435,8 @@ def _source_diagnostic_payload(source: ExternalEventSource) -> dict[str, Any]:
         "url": source.url,
         "symbols": list(source.symbols),
         "weight": source.weight,
+        "category": source.category,
+        "description": source.description,
     }
 
 
@@ -533,8 +652,9 @@ class ExternalEventScraper:
             "symbols_mentioned": symbols,
             "published_at": published_at,
             "source_weight": source.weight,
+            "source_category": source.category,
             "event_type": "external_event",
-            "impact_level": 2 if symbols else 1,
+            "impact_level": self._impact_level(source, text, symbols),
             "sentiment_score": self._lexicon_sentiment(text),
         }
 
@@ -609,6 +729,19 @@ class ExternalEventScraper:
         if score == 0:
             return 0.0
         return max(min(score / 3.0, 1.0), -1.0)
+
+    def _impact_level(
+        self,
+        source: ExternalEventSource,
+        text: str,
+        symbols: list[str],
+    ) -> int:
+        lowered = str(text or "").lower()
+        if source.category == "security":
+            return 3 if any(term in lowered for term in ("hack", "exploit", "breach")) else 2
+        if any(term in lowered for term in ("listing", "delist", "mainnet", "upgrade", "sec")):
+            return 3
+        return 2 if symbols else 1
 
     def _dedup_key(self, article: dict[str, Any]) -> str:
         url = str(article.get("url") or "")

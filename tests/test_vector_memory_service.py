@@ -6,6 +6,7 @@ import pytest
 
 from config.settings import settings
 from services.vector_memory.embedding import deterministic_text_vector
+from services.vector_memory.service import _influence_payload
 from services.vector_memory.store import (
     JsonVectorMemoryStore,
     ZvecVectorMemoryStore,
@@ -172,3 +173,20 @@ def test_zvec_store_writes_large_batches(tmp_path) -> None:
 
     assert indexed == 1100
     assert stats["document_count"] >= 1100
+
+
+def test_vector_memory_influence_is_explainable_soft_score() -> None:
+    influence = _influence_payload(
+        [
+            {"score": 0.72, "action": "long", "pnl_pct": -0.8},
+            {"score": 0.61, "action": "long", "pnl_pct": -0.3},
+            {"score": 0.42, "action": "short", "pnl_pct": 0.5},
+        ],
+        action="long",
+    )
+
+    assert influence["level"] == "negative"
+    assert influence["score_delta"] < 0
+    assert influence["same_action_loss_count"] == 2
+    assert influence["is_hard_gate"] is False
+    assert "硬拦截" in influence["reason"] or "不作为硬拦截" in influence["reason"]

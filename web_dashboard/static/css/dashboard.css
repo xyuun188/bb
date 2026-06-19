@@ -3689,6 +3689,14 @@ select.form-input { cursor: pointer; }
 .analysis-note-muted {
     border-left-color: var(--border-light);
 }
+.analysis-note-positive {
+    border-left-color: var(--green);
+    background: rgba(34,197,94,0.08);
+}
+.analysis-note-warning {
+    border-left-color: var(--orange);
+    background: rgba(245,158,11,0.08);
+}
 .analysis-question {
     color: var(--text);
     margin-bottom: 7px;

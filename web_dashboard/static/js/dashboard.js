@@ -3218,6 +3218,13 @@ function renderAnalysisVectorMemory(memory) {
     if (!hits.length) {
         return '<div class="analysis-empty">没有检索到足够相似的历史案例。</div>';
     }
+    const influence = memory.influence || {};
+    const influenceLevel = String(influence.level || 'neutral');
+    const influenceTone = influenceLevel === 'positive' ? 'good'
+        : influenceLevel === 'negative' ? 'warn'
+            : 'muted';
+    const delta = Number(influence.score_delta || 0);
+    const deltaLabel = delta > 0 ? `+${delta.toFixed(2)} 分` : `${delta.toFixed(2)} 分`;
     const rows = hits.map(hit => {
         const outcomeTone = Number(hit.pnl_pct || 0) > 0 ? 'good' : Number(hit.pnl_pct || 0) < 0 ? 'warn' : 'muted';
         const kindLabel = hit.kind === 'news' ? '新闻/事件' : '历史决策';
@@ -3244,11 +3251,19 @@ function renderAnalysisVectorMemory(memory) {
                 <div class="analysis-card-tags">
                     ${analysisPill(memory.backend || 'vector', 'muted')}
                     ${analysisPill(`命中 ${hits.length} 条`, hits.length ? 'good' : 'muted')}
+                    ${analysisPill(`影响 ${deltaLabel}`, influenceTone)}
+                    ${analysisPill('非硬拦截', 'muted')}
                     ${memory.min_score !== undefined ? analysisPill(`阈值 ${(Number(memory.min_score || 0) * 100).toFixed(0)}%`, 'muted') : ''}
                 </div>
             </div>
             <div class="analysis-card-text">
                 <div class="analysis-note analysis-note-muted"><span>作用</span>${analysisText('用于提醒系统不要重复过去相似亏损模式，也帮助解释为什么降仓、观望或需要更强证据。')}</div>
+                <div class="analysis-note analysis-note-${influenceTone === 'good' ? 'positive' : influenceTone === 'warn' ? 'warning' : 'muted'}">
+                    <span>${escHtml(influence.label || '相似历史影响')}</span>
+                    ${analysisText(influence.reason || '相似历史仅作为轻量加减分因子，不直接拦截开仓。')}
+                    <br>
+                    ${analysisText(`命中 ${Number(influence.matched_count || hits.length)} 条，历史盈利 ${Number(influence.profit_count || 0)} 条，历史亏损 ${Number(influence.loss_count || 0)} 条，同方向亏损 ${Number(influence.same_action_loss_count || 0)} 条。`)}
+                </div>
                 <div class="analysis-resolution-list">${rows}</div>
             </div>
         </div>`;

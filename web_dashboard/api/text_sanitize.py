@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+_CONTROL_TEXT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
 MOJIBAKE_MARKERS = (
     "\u9351",
     "\u95c4",
@@ -236,6 +238,7 @@ def sanitize_text(value: Any) -> Any:
         text = text[:-1]
     if looks_mojibake(text) and _mojibake_score(text) >= 6:
         return "该笔历史记录的原始说明已损坏，无法准确还原；请以当前执行状态、成交价格和 OKX 订单状态为准。"
+    text = _CONTROL_TEXT_RE.sub(" ", text)
     return text
 
 

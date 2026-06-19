@@ -366,6 +366,10 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "fetchJSON('/api/vector-memory/status')" in script
     assert "postJSON('/api/vector-memory/reindex', {})" in script
     assert "renderAnalysisVectorMemory" in script
+    assert "\u975e\u786c\u62e6\u622a" in script
+    assert "\u5f71\u54cd ${deltaLabel}" in script
+    assert ".analysis-note-positive" in style
+    assert ".analysis-note-warning" in style
     assert "unknown: '\u5df2\u8fde\u63a5'" in script
     assert "collectionStatusLabel" in script
     assert "readDataCollectionSources" in script
@@ -374,8 +378,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260619-vector-memory" in html
-    assert "dashboard.js?v=20260619-vector-memory" in html
+    assert "dashboard.css?v=20260619-vector-memory-sources" in html
+    assert "dashboard.js?v=20260619-vector-memory-sources" in html
     assert "overflow-wrap: anywhere;" in style
 
 

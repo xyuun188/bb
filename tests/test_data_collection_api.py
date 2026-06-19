@@ -43,11 +43,23 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert body["config"]["external_event_scraper_uses_default_sources"] is True
     recommended = body["config"]["recommended_external_event_sources"]
     recommended_names = {source["name"] for source in recommended}
-    assert len(recommended) >= 10
-    assert {"binance_announcements", "okx_latest_announcements", "ethereum_blog"}.issubset(
-        recommended_names
-    )
+    assert len(recommended) >= 20
+    assert {
+        "binance_announcements",
+        "okx_latest_announcements",
+        "ethereum_blog",
+        "kucoin_announcements",
+        "kraken_asset_listings",
+        "polygon_blog",
+        "near_blog",
+        "certik_blog",
+        "slowmist_medium",
+    }.issubset(recommended_names)
     assert all(source["url"].startswith("https://") for source in recommended)
+    assert {"exchange", "project", "security"}.issubset(
+        {source["category"] for source in recommended}
+    )
+    assert all("description" in source for source in recommended)
     sources_by_key = {source["key"]: source for source in body["sources"]}
     assert sources_by_key["rss"]["group"] == "system"
     assert sources_by_key["cryptopanic"]["group"] == "api"
