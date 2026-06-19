@@ -39,6 +39,14 @@ def test_sync_to_online_server_syncs_local_ai_tools_key_without_logging_secret()
     assert "{local_ai_tools_api_key}" not in source
 
 
+def test_sync_to_online_server_installs_updated_requirements() -> None:
+    source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
+
+    assert "_install_requirements_command" in source
+    assert "pip install --disable-pip-version-check -r requirements.txt" in source
+    assert 'path.endswith("/requirements.txt")' in source
+
+
 def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 

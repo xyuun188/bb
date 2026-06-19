@@ -380,6 +380,16 @@ def upload_runtime_secret(sftp, *, value: str, remote_path: str) -> None:
     sftp.chmod(remote_path, 0o600)
 
 
+def _install_requirements_command(remote_app_dir: str) -> str:
+    return (
+        f"cd {_remote_quote(remote_app_dir)} && "
+        "PYBIN=python3; "
+        "if [ -x .venv/bin/python ]; then PYBIN=.venv/bin/python; "
+        "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "
+        "$PYBIN -m pip install --disable-pip-version-check -r requirements.txt"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-app-dir", default=REMOTE_APP_DIR)
@@ -450,6 +460,14 @@ def main() -> None:
         finally:
             sftp.close()
         safe_print(f"Uploaded {len(uploaded)} changed files.")
+        if any(path.endswith("/requirements.txt") for path in uploaded):
+            safe_print("Installing updated Python requirements on online server.")
+            run_remote_text(
+                ssh,
+                _install_requirements_command(args.remote_app_dir),
+                timeout=300,
+                check=True,
+            )
         if uploaded:
             quoted_paths = " ".join(_remote_quote(path) for path in uploaded)
             run_remote_text(

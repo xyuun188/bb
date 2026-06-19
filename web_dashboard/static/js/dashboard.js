@@ -1513,6 +1513,7 @@ function activateSettingsTab(name = 'okx') {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
     if (selected === 'external-events') fetchDataCollectionStatus({ silent: true });
+    if (selected === 'vector-memory') refreshVectorMemoryStatus({ silent: true });
 }
 
 function loadPageData(page) {
@@ -3206,6 +3207,53 @@ function showAnalysisReasonLoading(recordId) {
     document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
 }
 
+function renderAnalysisVectorMemory(memory) {
+    if (!memory || memory.enabled === false) {
+        return '<div class="analysis-empty">向量记忆未启用；启用后会检索相似历史决策、新闻和复盘案例。</div>';
+    }
+    if (memory.status && memory.status !== 'ok') {
+        return `<div class="analysis-empty">向量记忆状态：${escHtml(memory.status)}${memory.error ? `；${escHtml(memory.error)}` : ''}</div>`;
+    }
+    const hits = Array.isArray(memory.hits) ? memory.hits : [];
+    if (!hits.length) {
+        return '<div class="analysis-empty">没有检索到足够相似的历史案例。</div>';
+    }
+    const rows = hits.map(hit => {
+        const outcomeTone = Number(hit.pnl_pct || 0) > 0 ? 'good' : Number(hit.pnl_pct || 0) < 0 ? 'warn' : 'muted';
+        const kindLabel = hit.kind === 'news' ? '新闻/事件' : '历史决策';
+        const pnl = hit.pnl_pct !== null && hit.pnl_pct !== undefined
+            ? `收益 ${signedPctValueLabel(hit.pnl_pct)}`
+            : '无收益结果';
+        return `
+            <div class="analysis-resolution-item">
+                <strong>${escHtml(hit.symbol || kindLabel)}</strong>
+                <span>
+                    ${analysisPill(kindLabel, hit.kind === 'decision' ? 'good' : 'muted')}
+                    ${hit.action ? analysisPill(analysisDecisionLabel(hit.action), analysisTone(hit.action)) : ''}
+                    ${analysisPill(`相似度 ${(Number(hit.score || 0) * 100).toFixed(0)}%`, Number(hit.score || 0) >= 0.45 ? 'good' : 'muted')}
+                    ${analysisPill(pnl, outcomeTone)}
+                    ${hit.created_at ? ` · ${toBeijingTime(hit.created_at)}` : ''}
+                    <br>${analysisText(hit.text || '-')}
+                </span>
+            </div>`;
+    }).join('');
+    return `
+        <div class="analysis-card analysis-final-card">
+            <div class="analysis-card-head">
+                <div class="analysis-card-title">相似历史记忆</div>
+                <div class="analysis-card-tags">
+                    ${analysisPill(memory.backend || 'vector', 'muted')}
+                    ${analysisPill(`命中 ${hits.length} 条`, hits.length ? 'good' : 'muted')}
+                    ${memory.min_score !== undefined ? analysisPill(`阈值 ${(Number(memory.min_score || 0) * 100).toFixed(0)}%`, 'muted') : ''}
+                </div>
+            </div>
+            <div class="analysis-card-text">
+                <div class="analysis-note analysis-note-muted"><span>作用</span>${analysisText('用于提醒系统不要重复过去相似亏损模式，也帮助解释为什么降仓、观望或需要更强证据。')}</div>
+                <div class="analysis-resolution-list">${rows}</div>
+            </div>
+        </div>`;
+}
+
 function showAnalysisReasonLoadError(recordId, message = '没有找到这条分析记录的详情。') {
     setDecisionModalWide(true);
     document.getElementById('decision-reason-title').textContent = `分析流程 ${recordId || ''}`.trim();
@@ -3285,6 +3333,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
     const localAiTools = record.local_ai_tools || null;
     const agentSkills = record.agent_skills || null;
     const newsContext = record.news_context || null;
+    const vectorMemory = record.vector_memory || null;
     const attribution = record.decision_attribution || null;
  
     const expertsHtml = isFastScan ? `
@@ -3603,6 +3652,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
             ${analysisSection('本地ML盈亏质量', renderAnalysisMlSignal(mlSignal))}
             ${analysisSection('服务器量化工具', renderAnalysisLocalAiTools(localAiTools, record.analysis_type))}
             ${analysisSection('新闻与事件', renderAnalysisNewsContext(newsContext))}
+            ${analysisSection('相似历史记忆', renderAnalysisVectorMemory(vectorMemory))}
             ${analysisSection(isFastScan ? '持仓快速扫描' : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
             ${missingHtml ? analysisSection('未返回专家', `<div class="analysis-grid">${missingHtml}</div>`) : ''}
             ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `请求 ${Number(record.cross_requested || 0)} 个，完成 ${completedCross} 个，无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
@@ -4583,6 +4633,119 @@ async function saveDataCollectionSettings() {
             status.textContent = err?.message || '数据采集配置保存失败。';
         }
     }
+}
+
+// ========== Vector Memory Settings ==========
+
+async function refreshVectorMemoryStatus(options = {}) {
+    const statusEl = document.getElementById('vector-memory-runtime-note');
+    if (statusEl && !options.silent) statusEl.textContent = '读取中...';
+    const data = await fetchJSON('/api/vector-memory/status');
+    renderVectorMemoryStatus(data);
+}
+
+function renderVectorMemoryStatus(data) {
+    const enabled = document.getElementById('vector-memory-enabled');
+    const backend = document.getElementById('vector-memory-backend');
+    const minScore = document.getElementById('vector-memory-min-score');
+    if (enabled) enabled.checked = Boolean(data?.enabled);
+    const configuredBackend = data?.configured_backend || data?.backend;
+    if (backend && configuredBackend && ['auto', 'zvec', 'jsonl'].includes(String(configuredBackend))) {
+        backend.value = configuredBackend;
+    }
+    if (minScore && minScore.value === '') minScore.value = String(data?.min_score ?? 0.18);
+    const note = document.getElementById('vector-memory-runtime-note');
+    if (note) {
+        note.textContent = data
+            ? `${collectionStatusLabel(data.status, data.enabled)} · ${data.backend || 'unknown'} · ${monitorNumber(data.document_count, 0)} 条`
+            : '读取失败';
+    }
+    const panel = document.getElementById('vector-memory-status-panel');
+    if (!panel) return;
+    if (!data) {
+        panel.innerHTML = '<div class="analysis-empty compact">状态读取失败</div>';
+        return;
+    }
+    panel.innerHTML = `
+        <div class="data-source-line data-source-${collectionStatusTone(data.status, data.enabled)}">
+            <span>运行状态</span>
+            <strong>${escHtml(collectionStatusLabel(data.status, data.enabled))}</strong>
+            <em>${escHtml(data.backend || '-')}</em>
+        </div>
+        <div class="data-source-line data-source-muted">
+            <span>索引文档</span>
+            <strong>${monitorNumber(data.document_count, 0)} 条</strong>
+            <em>${data.last_reindex_at ? `上次重建 ${toBeijingTime(data.last_reindex_at)}` : '尚未重建'}</em>
+        </div>
+        ${data.last_error ? `<div class="data-source-line data-source-bad"><span>最近错误</span><strong>需要关注</strong><em>${escHtml(data.last_error)}</em></div>` : ''}
+    `;
+}
+
+async function saveVectorMemorySettings() {
+    const status = document.getElementById('vector-memory-save-status');
+    if (status) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = '正在保存向量记忆设置...';
+    }
+    const body = {
+        enabled: Boolean(document.getElementById('vector-memory-enabled')?.checked),
+        backend: document.getElementById('vector-memory-backend')?.value || 'auto',
+        min_score: readNumberInput('vector-memory-min-score'),
+    };
+    const data = await postJSON('/api/vector-memory/settings', body);
+    renderVectorMemoryStatus(data);
+    if (status) {
+        status.style.color = data?.status === 'error' ? 'var(--red)' : 'var(--green)';
+        status.textContent = data?.status === 'error'
+            ? `保存后状态异常：${data.last_error || '未知错误'}`
+            : '向量记忆设置已保存；启用后可点击“重建索引”。';
+    }
+}
+
+async function reindexVectorMemory() {
+    const status = document.getElementById('vector-memory-save-status');
+    if (status) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = '正在重建向量记忆索引...';
+    }
+    const data = await postJSON('/api/vector-memory/reindex', {});
+    if (status) {
+        status.style.color = data?.status === 'ok' ? 'var(--green)' : 'var(--red)';
+        status.textContent = data?.status === 'ok'
+            ? `已索引 ${monitorNumber(data.indexed, 0)} 条历史文档。`
+            : `重建失败：${data?.error || data?.status || '未知错误'}`;
+    }
+    await refreshVectorMemoryStatus({ silent: true });
+}
+
+async function searchVectorMemory() {
+    const status = document.getElementById('vector-memory-search-status');
+    const resultEl = document.getElementById('vector-memory-search-results');
+    const query = document.getElementById('vector-memory-query')?.value?.trim() || '';
+    if (!query) {
+        if (status) status.textContent = '请输入检索关键词';
+        return;
+    }
+    if (status) status.textContent = '检索中...';
+    const data = await postJSON('/api/vector-memory/search', {
+        query,
+        top_k: 8,
+        min_score: readNumberInput('vector-memory-min-score'),
+    });
+    const hits = Array.isArray(data?.hits) ? data.hits : [];
+    if (status) status.textContent = `命中 ${hits.length} 条`;
+    if (!resultEl) return;
+    if (!hits.length) {
+        resultEl.innerHTML = '<div class="analysis-empty compact">没有足够相似的历史案例</div>';
+        return;
+    }
+    resultEl.innerHTML = hits.map(hit => `
+        <div class="data-source-line data-source-${Number(hit.pnl_pct || 0) < 0 ? 'warn' : 'good'}">
+            <span>${escHtml(hit.symbol || hit.kind || '-')}</span>
+            <strong>${escHtml(hit.kind === 'news' ? '新闻/事件' : '历史决策')}</strong>
+            <em>相似度 ${(Number(hit.score || 0) * 100).toFixed(0)}% · ${hit.action ? analysisDecisionLabel(hit.action) : '-'} · ${hit.pnl_pct !== null && hit.pnl_pct !== undefined ? signedPctValueLabel(hit.pnl_pct) : '无收益'}</em>
+        </div>
+    `).join('');
 }
 
 // ========== Server Monitor ==========

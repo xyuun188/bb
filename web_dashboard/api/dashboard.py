@@ -45,6 +45,7 @@ from services.entry_signal_extraction import (
 )
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.server_monitor_status import get_server_monitor_status_async
+from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -3579,6 +3580,11 @@ async def get_analysis_records(
 
         local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
         display_execution_reason = _display_execution_reason(d)
+        vector_memory_context = (
+            await get_vector_memory_service().similar_decision_context(d, raw)
+            if include_detail and settings.vector_memory_enabled
+            else {"enabled": False, "status": "disabled", "hits": []}
+        )
         detail_payload = (
             {
                 "experts": experts,
@@ -3629,6 +3635,7 @@ async def get_analysis_records(
                 "conflict_resolution": (
                     conflict_resolution if isinstance(conflict_resolution, dict) else {}
                 ),
+                "vector_memory": vector_memory_context,
             }
             if include_detail
             else {}

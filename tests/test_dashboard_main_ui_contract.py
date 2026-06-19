@@ -290,7 +290,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260619-data-source-manager" in html
+    assert "dashboard.js?v=20260619-vector-memory" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -317,6 +317,9 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
         'data-settings-tab="external-events"'
     )
     assert html.index('data-settings-tab="external-events"') < html.index(
+        'data-settings-tab="vector-memory"'
+    )
+    assert html.index('data-settings-tab="vector-memory"') < html.index(
         'data-settings-tab="security"'
     )
     page_start = html.index('id="page-data-collection"')
@@ -324,10 +327,13 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     settings_start = html.index('data-settings-section="models"')
     settings_end = html.index('data-settings-section="external-events"')
     external_start = html.index('data-settings-section="external-events"')
-    external_end = html.index('data-settings-section="security"')
+    external_end = html.index('data-settings-section="vector-memory"')
+    vector_start = html.index('data-settings-section="vector-memory"')
+    vector_end = html.index('data-settings-section="security"')
     data_page_html = html[page_start:page_end]
     model_settings_html = html[settings_start:settings_end]
     external_settings_html = html[external_start:external_end]
+    vector_settings_html = html[vector_start:vector_end]
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in data_page_html
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in model_settings_html
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" in external_settings_html
@@ -337,10 +343,14 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert 'id="data-cryptopanic-api-key"' in external_settings_html
     assert 'id="data-coinmarketcal-api-key"' in external_settings_html
     assert 'id="data-newsapi-api-key"' in external_settings_html
+    assert "\u5411\u91cf\u8bb0\u5fc6\u8bbe\u7f6e" in vector_settings_html
+    assert 'id="vector-memory-enabled"' in vector_settings_html
+    assert 'id="vector-memory-status-panel"' in vector_settings_html
     assert "fetchDataCollectionStatus()" in html
     assert "saveDataCollectionSettings()" in html
     assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
     assert "selected === 'external-events'" in script
+    assert "selected === 'vector-memory'" in script
     assert "selected === 'models') fetchDataCollectionStatus" not in script
     assert "applyRecommendedDataCollectionSources" in script
     assert "recommended_external_event_sources" in script
@@ -353,6 +363,9 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "groupDataCollectionSources" in script
     assert "fetchJSON('/api/data-collection/status')" in script
     assert "postJSON('/api/data-collection/settings', body)" in script
+    assert "fetchJSON('/api/vector-memory/status')" in script
+    assert "postJSON('/api/vector-memory/reindex', {})" in script
+    assert "renderAnalysisVectorMemory" in script
     assert "unknown: '\u5df2\u8fde\u63a5'" in script
     assert "collectionStatusLabel" in script
     assert "readDataCollectionSources" in script
@@ -361,8 +374,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260619-data-source-manager" in html
-    assert "dashboard.js?v=20260619-data-source-manager" in html
+    assert "dashboard.css?v=20260619-vector-memory" in html
+    assert "dashboard.js?v=20260619-vector-memory" in html
     assert "overflow-wrap: anywhere;" in style
 
 
