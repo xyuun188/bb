@@ -125,6 +125,34 @@ def test_zvec_store_accepts_colon_ids_and_cleaned_text(tmp_path) -> None:
     assert hits[0].kind == "decision"
 
 
+def test_zvec_store_filters_slash_symbols_without_query_expression(tmp_path) -> None:
+    pytest.importorskip("zvec")
+    store = ZvecVectorMemoryStore(tmp_path / "zvec-filter", dimension=32, max_documents=20)
+    store.upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:crcl",
+                kind="decision",
+                text="CRCL/USDT 做空 弱证据 亏损复盘",
+                symbol="CRCL/USDT",
+                action="short",
+            ),
+            VectorMemoryDocument(
+                id="decision:btc",
+                kind="decision",
+                text="BTC/USDT 做多 强趋势 盈利复盘",
+                symbol="BTC/USDT",
+                action="long",
+            ),
+        ]
+    )
+
+    hits = store.search("弱证据 亏损复盘", top_k=3, filters={"symbol": "CRCL/USDT"})
+
+    assert hits
+    assert {hit.symbol for hit in hits} == {"CRCL/USDT"}
+
+
 def test_zvec_store_writes_large_batches(tmp_path) -> None:
     pytest.importorskip("zvec")
     store = ZvecVectorMemoryStore(tmp_path / "zvec-large", dimension=24, max_documents=2000)

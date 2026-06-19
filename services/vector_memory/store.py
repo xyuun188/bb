@@ -258,22 +258,23 @@ class ZvecVectorMemoryStore:
         top_k: int = 8,
         filters: dict[str, str] | None = None,
     ) -> list[VectorMemoryHit]:
-        filter_expression = self._filter_expression(filters)
+        fetch_limit = _zvec_fetch_limit(top_k, filters)
         results = self._collection.query(
             self._zvec.Query(
                 field_name="embedding",
                 vector=deterministic_text_vector(query, dimension=self.dimension),
             ),
-            topk=max(int(top_k or 8), 1),
-            filter=filter_expression,
+            topk=fetch_limit,
             include_vector=False,
         )
-        return [
+        hits = [
             fields_to_hit(
                 doc.id, _zvec_score_to_similarity(float(doc.score or 0.0)), doc.fields or {}
             )
             for doc in results
         ]
+        hits = [hit for hit in hits if _hit_matches_filters(hit, filters)]
+        return hits[: max(int(top_k or 8), 1)]
 
     def stats(self) -> dict[str, Any]:
         try:
@@ -284,18 +285,6 @@ class ZvecVectorMemoryStore:
             count = 0
         count = max(count, self._last_known_count)
         return {"backend": self.backend_name, "document_count": count, "path": str(self.path)}
-
-    @staticmethod
-    def _filter_expression(filters: dict[str, str] | None) -> str | None:
-        if not filters:
-            return None
-        clauses = []
-        for key, value in filters.items():
-            if key not in {"kind", "symbol", "action", "outcome"} or not value:
-                continue
-            safe_value = str(value).replace("\\", "\\\\").replace('"', '\\"')
-            clauses.append(f'{key} == "{safe_value}"')
-        return " and ".join(clauses) if clauses else None
 
 
 def _zvec_score_to_similarity(score: float) -> float:
@@ -334,6 +323,30 @@ def build_vector_memory_store(
         dimension=dimension,
         max_documents=max_documents,
     )
+
+
+def _zvec_fetch_limit(top_k: int, filters: dict[str, str] | None) -> int:
+    requested = max(int(top_k or 8), 1)
+    if not filters:
+        return requested
+    return min(max(requested * 20, 100), 1000)
+
+
+def _hit_matches_filters(hit: VectorMemoryHit, filters: dict[str, str] | None) -> bool:
+    if not filters:
+        return True
+    values = {
+        "kind": hit.kind,
+        "symbol": hit.symbol,
+        "action": hit.action,
+        "outcome": hit.outcome,
+    }
+    for key, value in filters.items():
+        if not value or key not in values:
+            continue
+        if str(values[key] or "").upper() != str(value).upper():
+            return False
+    return True
 
 
 def _clean_scalar_text(value: Any, *, limit: int) -> str:
