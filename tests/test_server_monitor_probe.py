@@ -171,11 +171,25 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     assert cast(dict[str, object], tools["health"])["ok"] is True
 
 
+def test_server_monitor_probe_reports_each_vllm_endpoint_as_service() -> None:
+    script = render_server_monitor_probe("qwen3-14b-trade", "Qwen3-14B-Instruct")
+
+    assert "for item in runtime.get(\"vllm_endpoints\", [])" in script
+    assert "vllm_model_service_status(item)" in script
+    assert "runtime.get(\"vllm\", {}).get(\"models\")" not in script
+    assert '"provider_model": provider_model' in script
+    assert "DeepSeek R1 14B" in script
+    assert "deepseek-r1-14b-risk" in script
+
+
 def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> None:
     source = (ROOT / "web_dashboard" / "static" / "js" / "dashboard.js").read_text(encoding="utf-8")
 
     assert "DeepSeek 14B / vLLM" not in source
-    assert "vllm.label || vllm.provider_model || 'vLLM'" in source
+    assert "const vllmInstanceCards = vllmRows.map(item =>" in source
+    assert "item.label || item.provider_model || 'vLLM'" in source
+    assert "qwen3-14b-trade" in source
+    assert "deepseek-r1-14b-risk" in source
     assert "runtimeEndpointSummary" in source
     assert "配置模型" in source
     assert "独立失败回退" not in source

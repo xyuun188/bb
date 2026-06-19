@@ -4581,7 +4581,6 @@ function renderServerModelRuntime(data, container) {
     const vllmEndpoints = Array.isArray(runtime.vllm_endpoints) ? runtime.vllm_endpoints : [];
     const tools = runtime.local_ai_tools || {};
     const processes = data.gpu_processes || [];
-    const models = Array.isArray(vllm.models) && vllm.models.length ? vllm.models.join('、') : '未返回模型名';
     const platformTools = platformRuntime.local_ai_tools || {};
     const platformToolChildren = platformTools.child_endpoints || {};
     const platformToolChildEntries = Object.entries(platformToolChildren);
@@ -4592,8 +4591,6 @@ function renderServerModelRuntime(data, container) {
         tools.available || (platformToolContractOk && (platformTools.available || platformToolChildAvailable > 0))
     );
     const toolsModels = tools.models || platformTools.models || {};
-    const vllmLabel = vllm.label || vllm.provider_model || 'vLLM';
-    const vllmHealthLine = runtimeEndpointSummary(vllm.health);
     const toolsStatusLine = runtimeEndpointSummary(tools.status_health);
     const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
@@ -4622,6 +4619,24 @@ function renderServerModelRuntime(data, container) {
     const localToolsPublicUrl = () => {
         return MODEL_PUBLIC_ENDPOINTS.local_ai_tools; 
     }; 
+    const vllmRows = vllmEndpoints.length ? vllmEndpoints : [vllm];
+    const vllmInstanceCards = vllmRows.map(item => {
+        const label = item.label || item.provider_model || 'vLLM';
+        const targetModel = item.provider_model || (String(label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : 'qwen3-14b-trade');
+        const publicPort = targetModel === 'deepseek-r1-14b-risk' ? '21842' : '21840';
+        const healthLine = runtimeEndpointSummary(item.health);
+        const modelNames = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
+        return `
+            <div class="server-monitor-runtime-card">
+                <strong>${escHtml(label)} / vLLM ${runtimeStatusBadge(item.available)}</strong>
+                <div>内网地址：${escHtml(item.endpoint || '-')}</div>
+                <div>外网地址：${escHtml(configuredOrPublicModelEndpoint(targetModel, item.api_base || item.endpoint, publicPort))}</div>
+                <div>状态：${escHtml(item.status || '-')}${healthLine ? ` · ${escHtml(healthLine)}` : ''}</div>
+                <div>配置模型：${escHtml(targetModel || '-')}</div>
+                <div>模型：${escHtml(modelNames)}</div>
+                ${item.error ? `<div style="color:var(--red);">错误：${escHtml(item.error)}</div>` : ''}
+            </div>`;
+    }).join('');
     const vllmEndpointRows = vllmEndpoints.length
         ? `<div class="server-monitor-process-list">${vllmEndpoints.map(item => {
             const endpointModels = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
@@ -4660,15 +4675,7 @@ function renderServerModelRuntime(data, container) {
 
     container.innerHTML = `
         <div class="server-monitor-runtime">
-            <div class="server-monitor-runtime-card">
-                <strong>${escHtml(vllmLabel)} / vLLM ${runtimeStatusBadge(vllm.available)}</strong>
-                <div>内网地址：${escHtml(vllm.endpoint || '-')}</div>
-                <div>外网地址：${escHtml(configuredOrPublicModelEndpoint(vllm.provider_model, vllm.api_base || vllm.endpoint, vllm.provider_model === 'deepseek-r1-14b-risk' ? '21842' : '21840'))}</div>
-                <div>状态：${escHtml(vllm.status || '-')}${vllmHealthLine ? ` · ${escHtml(vllmHealthLine)}` : ''}</div>
-                <div>配置模型：${escHtml(vllm.provider_model || '-')}</div>
-                <div>模型：${escHtml(models)}</div>
-                ${vllm.error ? `<div style="color:var(--red);">错误：${escHtml(vllm.error)}</div>` : ''}
-            </div>
+            ${vllmInstanceCards}
             <div class="server-monitor-runtime-card">
                 <strong>vLLM 端点列表</strong>
                 ${vllmEndpointRows}

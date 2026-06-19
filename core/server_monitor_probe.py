@@ -274,8 +274,12 @@ def render_server_monitor_probe(
             }}
 
 
-        def vllm_model_service_status(models, endpoint):
-            wanted = (PRIMARY_MODEL_ID or "").lower()
+        def vllm_model_service_status(runtime_item):
+            if not isinstance(runtime_item, dict):
+                runtime_item = {{}}
+            models = runtime_item.get("models") or []
+            provider_model = runtime_item.get("provider_model") or PRIMARY_MODEL_ID
+            wanted = (provider_model or "").lower()
             model_ids = [str(m or "") for m in (models or []) if str(m or "")]
             active = bool(model_ids) and (
                 not wanted
@@ -285,15 +289,15 @@ def render_server_monitor_probe(
                 )
             )
             return {{
-                "name": PRIMARY_MODEL_LABEL or PRIMARY_MODEL_ID or "Local LLM",
+                "name": runtime_item.get("label") or provider_model or "Local LLM",
                 "service_name": "vllm-openai-api",
-                "provider_model": PRIMARY_MODEL_ID,
+                "provider_model": provider_model,
                 "active": active,
                 "status": "active" if active else "model_not_available",
                 "pid": "",
                 "active_since": "",
                 "elapsed": "",
-                "endpoint": endpoint,
+                "endpoint": runtime_item.get("endpoint") or "",
                 "models": model_ids,
             }}
 
@@ -485,10 +489,11 @@ def render_server_monitor_probe(
             "gpu": gpu_status(),
             "gpu_processes": gpu_processes(),
             "services": [
-                vllm_model_service_status(
-                    runtime.get("vllm", {{}}).get("models") or [],
-                    runtime.get("vllm", {{}}).get("endpoint") or "127.0.0.1:8000/v1",
-                ),
+                *[
+                    vllm_model_service_status(item)
+                    for item in runtime.get("vllm_endpoints", [])
+                    if isinstance(item, dict)
+                ],
                 service_status("local-ai-tools.service"),
             ],
             "model_runtime": runtime,
