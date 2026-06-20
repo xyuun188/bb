@@ -169,8 +169,6 @@ async def _trading_service_running_item() -> dict[str, Any]:
             if started_at is not None and (finished_at is None or finished_at < started_at):
                 round_active = True
                 round_running_seconds = max((datetime.now(UTC) - started_at).total_seconds(), 0.0)
-            round_stuck_limit = max(float(decision_interval) * 2.5, 90.0)
-            round_stuck = round_active and round_running_seconds >= round_stuck_limit
             market_started = _as_utc_datetime(runtime_status.get("last_market_round_started_at"))
             market_finished = _as_utc_datetime(runtime_status.get("last_market_round_finished_at"))
             market_round_active = bool(runtime_status.get("market_round_active", False)) or (
@@ -205,10 +203,25 @@ async def _trading_service_running_item() -> dict[str, Any]:
                 if position_round_active and position_started is not None
                 else 0.0
             )
-            position_stuck_limit = max(float(decision_interval) * 3.0, 60.0)
+            position_stuck_limit = max(
+                float(runtime_status.get("position_analysis_watchdog_seconds") or 0.0),
+                float(decision_interval) * 3.0,
+                60.0,
+            )
             position_round_stuck = (
                 position_round_active and position_round_running_seconds >= position_stuck_limit
             )
+            active_scope_limits = []
+            if market_round_active:
+                active_scope_limits.append(market_stuck_limit)
+            if position_round_active:
+                active_scope_limits.append(position_stuck_limit)
+            round_stuck_limit = max(
+                *(active_scope_limits or [0.0]),
+                float(decision_interval) * 2.5,
+                90.0,
+            )
+            round_stuck = round_active and round_running_seconds >= round_stuck_limit
             last_round_error = str(
                 runtime_status.get("last_round_error")
                 or runtime_status.get("market_last_error")
@@ -276,6 +289,9 @@ async def _trading_service_running_item() -> dict[str, Any]:
                     "market_batch_policy": runtime_status.get("market_batch_policy"),
                     "market_analysis_watchdog_seconds": runtime_status.get(
                         "market_analysis_watchdog_seconds"
+                    ),
+                    "position_analysis_watchdog_seconds": runtime_status.get(
+                        "position_analysis_watchdog_seconds"
                     ),
                     "market_round_active": market_round_active,
                     "market_round_running_seconds": round(market_round_running_seconds, 3),

@@ -378,7 +378,9 @@ async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_position_review_loop_uses_timeout_provider_as_round_watchdog(monkeypatch):
+async def test_position_review_loop_keeps_stage_timeout_separate_from_round_watchdog(
+    monkeypatch,
+):
     calls: list[str] = []
     running = True
     sleeps: list[float] = []
@@ -399,6 +401,41 @@ async def test_position_review_loop_uses_timeout_provider_as_round_watchdog(monk
         run_once_provider=run_once,
         is_running_provider=lambda: running,
         timeout_provider=lambda: 0.05,
+        round_watchdog_provider=lambda: 0.2,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert calls == ["position"]
+    assert sleeps == [0.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_position_review_loop_without_round_watchdog_does_not_use_stage_timeout(
+    monkeypatch,
+):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope):
+        calls.append(scope)
+        await original_sleep(0.02)
+        return {"scope": scope}
+
+    service = PositionReviewService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        timeout_provider=lambda: 0.001,
     )
     service.initial_delay_seconds = 0.0
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)

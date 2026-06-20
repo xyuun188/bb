@@ -9,12 +9,14 @@ import ast
 import json
 import os
 import re
+import time
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from dotenv import dotenv_values
 
 from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
@@ -22,6 +24,7 @@ ENSEMBLE_TRADER_NAME = "ensemble_trader"
 DECISION_MAKER_NAME = "decision_maker"
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
+RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -286,6 +289,8 @@ class Settings(BaseSettings):
     decision_interval_seconds: int = 60
     confidence_threshold: float = 0.50
     auto_scan_symbol_limit: int = 20
+    market_analysis_watchdog_seconds: int = 180
+    position_analysis_watchdog_seconds: int = 180
     max_auto_trades_per_round: int = 3
     max_open_positions_per_model: int = 20
     max_same_symbol_positions_per_side: int = 2
@@ -375,6 +380,9 @@ class Settings(BaseSettings):
     log_backup_count: int = 5
 
     # --- Derived paths ---
+    _runtime_env_last_mtime: float = 0.0
+    _runtime_env_last_checked: float = 0.0
+
     @property
     def project_root(self) -> Path:
         return Path(__file__).resolve().parent.parent
@@ -694,6 +702,59 @@ class Settings(BaseSettings):
         tmp_path = env_path.with_name(f"{env_path.name}.tmp")
         tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         os.replace(tmp_path, env_path)
+
+    def refresh_runtime_env(self, *, force: bool = False) -> bool:
+        """Refresh safe runtime knobs from .env for long-lived worker processes."""
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._runtime_env_last_checked < RUNTIME_ENV_REFRESH_MIN_SECONDS
+        ):
+            return False
+        self._runtime_env_last_checked = now
+
+        env_path = self.project_root / ".env"
+        if not env_path.exists():
+            return False
+        try:
+            mtime = env_path.stat().st_mtime
+        except OSError:
+            return False
+        if not force and mtime <= self._runtime_env_last_mtime:
+            return False
+
+        values = dotenv_values(env_path)
+        changed = False
+
+        def update_int(key: str, attr: str, min_value: int, max_value: int) -> None:
+            nonlocal changed
+            raw = values.get(key)
+            if raw is None:
+                return
+            try:
+                value = int(str(raw).strip())
+            except (TypeError, ValueError):
+                return
+            value = min(max(value, min_value), max_value)
+            if getattr(self, attr) != value:
+                setattr(self, attr, value)
+                changed = True
+
+        update_int("DECISION_INTERVAL_SECONDS", "decision_interval_seconds", 10, 3600)
+        update_int(
+            "MARKET_ANALYSIS_WATCHDOG_SECONDS",
+            "market_analysis_watchdog_seconds",
+            60,
+            1800,
+        )
+        update_int(
+            "POSITION_ANALYSIS_WATCHDOG_SECONDS",
+            "position_analysis_watchdog_seconds",
+            60,
+            1800,
+        )
+        self._runtime_env_last_mtime = mtime
+        return changed
 
     def update_symbols(self, new_symbols: list[str]) -> None:
         """Update symbols at runtime and persist to .env."""

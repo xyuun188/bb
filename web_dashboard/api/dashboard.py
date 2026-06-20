@@ -369,6 +369,33 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized pre-expert skip state for analysis-flow rendering."""
+    fast_prefilter = _safe_dict(raw.get("fast_prefilter"))
+    if fast_prefilter.get("skipped_llm"):
+        return {
+            "skipped": True,
+            "kind": "market_prefilter",
+            "label": "行情预检未进入专家",
+            "reason": sanitize_text(
+                fast_prefilter.get("reason")
+                or "本轮行情数据或机会质量未通过预检，因此没有把该交易对送入大模型专家。"
+            ),
+        }
+    position_fast_scan = _safe_dict(raw.get("position_fast_scan"))
+    if position_fast_scan.get("skipped_llm"):
+        return {
+            "skipped": True,
+            "kind": "position_fast_scan",
+            "label": "持仓快速扫描未进入专家",
+            "reason": sanitize_text(
+                position_fast_scan.get("reason")
+                or "本轮是持仓快速扫描；只有出现强平仓、强加仓或高风险信号时才进入专家深度复盘。"
+            ),
+        }
+    return {"skipped": False, "kind": "", "label": "", "reason": ""}
+
+
 def _execution_reason_is_unusable(reason: str | None) -> bool:
     text = str(reason or "").strip()
     if not text:
@@ -879,6 +906,15 @@ async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any
         "current_stage_label": "独立交易进程运行中" if running else "等待交易心跳",
         "round_active": round_active,
         "round_running_seconds": round_running_seconds,
+        "market_analysis_watchdog_seconds": int(
+            runtime_status.get("market_analysis_watchdog_seconds")
+            or settings.market_analysis_watchdog_seconds
+        ),
+        "position_analysis_watchdog_seconds": int(
+            runtime_status.get("position_analysis_watchdog_seconds")
+            or settings.position_analysis_watchdog_seconds
+            or settings.market_analysis_watchdog_seconds
+        ),
         "market_current_stage": runtime_status.get("market_current_stage"),
         "market_round_active": runtime_status.get("market_round_active"),
         "market_last_error": runtime_status.get("market_last_error"),
@@ -3213,6 +3249,24 @@ def _opening_funnel_reason_bucket(reason: str | None) -> str:
     if any(
         token in text
         for token in (
+            "预期净收益",
+            "净收益",
+            "不为正",
+            "收益期望",
+            "正期望",
+            "盈利质量",
+            "expected_net",
+            "expected net",
+            "expected return",
+            "profit_quality",
+            "profit quality",
+            "system_pre_submit_rejection",
+        )
+    ):
+        return "profit_expectancy"
+    if any(
+        token in text
+        for token in (
             "动态证据不足",
             "保持观望",
             "极小探针",
@@ -3240,6 +3294,16 @@ def _opening_funnel_reason_bucket(reason: str | None) -> str:
     if any(
         token in text
         for token in (
+            "下单前价格",
+            "价格已比",
+            "允许偏移",
+            "价格偏移",
+            "即时刷新",
+            "行情复核",
+            "盘口",
+            "动量",
+            "追多",
+            "追空",
             "risk",
             "风控",
             "熔断",
@@ -3357,6 +3421,7 @@ async def get_opening_funnel(
 
     action_counts = {"hold": 0, "long": 0, "short": 0, "other": 0}
     reason_buckets = {
+        "profit_expectancy": 0,
         "evidence_gate": 0,
         "risk_or_precheck": 0,
         "waiting_queue": 0,
@@ -3441,6 +3506,7 @@ async def get_opening_funnel(
             top_bucket = max(reason_buckets.items(), key=lambda item: item[1])[0]
             bottleneck = top_bucket
             label_map = {
+                "profit_expectancy": "收益期望不足，费后预期净收益未转正",
                 "evidence_gate": "动态证据强冲突硬拦",
                 "risk_or_precheck": "风控或入场预检未通过",
                 "waiting_queue": "动态证据不足，观望等待",
@@ -3722,17 +3788,19 @@ async def get_analysis_records(
         returned_names = {e["expert_name"] for e in experts}
         attempted_names = {str(name) for name in attempted_experts}
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
-        fast_scan_skipped_llm = bool(fast_scan_payload.get("skipped_llm"))
+        pre_expert_skip = _analysis_pre_expert_skip(raw)
         attempted_expert_count = (
-            0 if fast_scan_skipped_llm else (len(attempted_names) or len(expected_experts))
+            0
+            if pre_expert_skip.get("skipped")
+            else (len(attempted_names) or len(expected_experts))
         )
         missing_experts = [
             {
                 **e,
                 "latency": timings_by_name.get(e["expert_name"]),
                 "reason": (
-                    "本轮是持仓快速扫描记录，没有调用慢专家；只有出现强平仓、强加仓或高风险信号时才会插队进入专家深度复盘。"
-                    if fast_scan_skipped_llm
+                    pre_expert_skip.get("reason")
+                    if pre_expert_skip.get("skipped")
                     else failures_by_name.get(e["expert_name"])
                     or (
                         "未发起调用，可能是该专家未启用或未配置 API Key。"
@@ -3740,6 +3808,10 @@ async def get_analysis_records(
                         else "本轮未返回结果，可能是模型调用失败、超时或返回格式不符合 JSON 要求。"
                     )
                 ),
+                "status": (
+                    "pre_expert_skipped" if pre_expert_skip.get("skipped") else "missing"
+                ),
+                "skip_kind": pre_expert_skip.get("kind") or "",
             }
             for e in expected_experts
             if e["expert_name"] not in returned_names
@@ -3847,6 +3919,7 @@ async def get_analysis_records(
             "expected_expert_count": len(expected_experts),
             "attempted_expert_count": attempted_expert_count,
             "attempted_experts": attempted_experts,
+            "expert_call_status": pre_expert_skip,
             "position_fast_scan": fast_scan_payload,
             "cross_requested": cross_requested,
             "cross_summary": {
@@ -3877,8 +3950,8 @@ async def get_analysis_records(
             "execution_reason": display_execution_reason,
             "is_paper": d.is_paper,
             "flow_summary": (
-                "持仓快速扫描：未调用 5 个专家；发现强平仓、强加仓或高风险信号时才进入专家深度复盘。"
-                if fast_scan_skipped_llm
+                f"{pre_expert_skip.get('label')}：{pre_expert_skip.get('reason')}"
+                if pre_expert_skip.get("skipped")
                 else (
                     f"{len(experts)}/{len(expected_experts)} 个专家返回，"
                     f"{cross_requested} 个交叉验证请求，"

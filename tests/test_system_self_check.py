@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import json
 import pytest
 
 from config.settings import settings
@@ -44,6 +46,36 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
     assert by_key["endpoint_qwen3-14b-trade"]["details"]["expected_platform_endpoint"] == (
         "http://127.0.0.1:18000/v1"
     )
+    assert by_key["endpoint_local_ai_tools"]["status"] == "ok"
+    assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
+
+
+def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_models", [])
+    monkeypatch.setattr(settings, "local_ai_tools_api_base", "")
+    monkeypatch.setattr(settings, "high_risk_review_api_base", "")
+    monitor_status = {
+        "platform_runtime": {
+            "ai_models": [
+                {
+                    "model": "qwen3-14b-trade",
+                    "api_base": "http://127.0.0.1:18000/v1",
+                },
+                {
+                    "model": "deepseek-r1-14b-risk",
+                    "api_base": "http://127.0.0.1:18002/v1",
+                },
+            ],
+            "local_ai_tools": {"api_base": "http://127.0.0.1:18001"},
+        }
+    }
+
+    items = system_health._configured_endpoint_items(monitor_status)
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "ok"
     assert by_key["endpoint_local_ai_tools"]["status"] == "ok"
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
 
@@ -265,6 +297,285 @@ async def test_trading_service_split_process_uses_recent_activity_heartbeat(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_summary_uses_split_process_runtime_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "uptime_seconds": 3661,
+        "decision_interval": 30,
+        "market_analysis_watchdog_seconds": 240,
+        "position_analysis_watchdog_seconds": 300,
+        "current_stage": "idle",
+        "round_active": True,
+        "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=45)).isoformat(),
+        "last_round_finished_at": (datetime.now(UTC) - timedelta(seconds=10)).isoformat(),
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    async def recent_activity(_hours: int = 6) -> dict[str, Any]:
+        return {
+            "decision_count": 2,
+            "order_count": 0,
+            "heartbeat_age_seconds": 10.0,
+            "latest_activity_at": heartbeat["last_round_finished_at"],
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(dashboard, "_recent_trading_activity_stats", recent_activity)
+
+    stats = await dashboard._split_process_trading_stats("paper")
+
+    assert stats["running"] is True
+    assert stats["uptime_seconds"] == 3661
+    assert stats["decision_interval"] == 30
+    assert stats["market_analysis_watchdog_seconds"] == 240
+    assert stats["position_analysis_watchdog_seconds"] == 300
+    assert stats["uptime_source"] == "split_process_heartbeat"
+    assert stats["round_active"] is True
+    assert stats["round_running_seconds"] >= 40
+
+
+@pytest.mark.asyncio
+async def test_dashboard_summary_computes_uptime_from_started_at(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    started_at = datetime.now(UTC) - timedelta(minutes=12)
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "started_at": started_at.isoformat(),
+        "uptime_seconds": 0,
+        "decision_interval": 30,
+        "current_stage": "fetch_features",
+        "round_active": True,
+        "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=8)).isoformat(),
+        "last_round_finished_at": None,
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    async def recent_activity(_hours: int = 6) -> dict[str, Any]:
+        return {
+            "decision_count": 0,
+            "order_count": 0,
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(dashboard, "_recent_trading_activity_stats", recent_activity)
+
+    stats = await dashboard._split_process_trading_stats("paper")
+
+    assert stats["running"] is True
+    assert stats["decision_interval"] == 30
+    assert stats["uptime_seconds"] >= 700
+    assert stats["started_at"] == heartbeat["started_at"]
+    assert stats["last_heartbeat_at"] == heartbeat["heartbeat_at"]
+
+
+@pytest.mark.asyncio
+async def test_self_check_uses_split_process_runtime_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "uptime_seconds": 7200,
+        "decision_interval": 30,
+        "current_stage": "review_open_positions",
+        "round_active": True,
+        "last_round_started_at": datetime.now(UTC).isoformat(),
+        "last_round_finished_at": None,
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    monkeypatch.setattr(system_health._dash, "_trading_service", None)
+
+    async def recent_activity(_hours: int = 2) -> dict[str, Any]:
+        return {
+            "decision_count": 0,
+            "order_count": 0,
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(system_health, "_recent_trading_activity_snapshot", recent_activity)
+
+    item = await system_health._trading_service_running_item()
+
+    assert item["status"] == "ok"
+    assert item["details"]["source"] == "runtime_heartbeat"
+    assert item["details"]["decision_interval"] == 30
+    assert "心跳正常" in item["message"]
+
+
+@pytest.mark.asyncio
+async def test_self_check_warns_when_split_process_round_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "uptime_seconds": 7200,
+        "decision_interval": 30,
+        "current_stage": "fetch_features",
+        "round_active": True,
+        "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=180)).isoformat(),
+        "last_round_finished_at": (datetime.now(UTC) - timedelta(seconds=240)).isoformat(),
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    monkeypatch.setattr(system_health._dash, "_trading_service", None)
+
+    async def recent_activity(_hours: int = 2) -> dict[str, Any]:
+        return {
+            "decision_count": 0,
+            "order_count": 0,
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(system_health, "_recent_trading_activity_snapshot", recent_activity)
+
+    item = await system_health._trading_service_running_item()
+
+    assert item["status"] == "warning"
+    assert item["details"]["source"] == "runtime_heartbeat"
+    assert item["details"]["round_stuck"] is True
+    assert item["details"]["current_stage"] == "fetch_features"
+    assert "耗时过长" in item["message"]
+
+
+@pytest.mark.asyncio
+async def test_self_check_warns_when_market_round_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "uptime_seconds": 7200,
+        "decision_interval": 30,
+        "current_stage": "analyze:BTC/USDT",
+        "round_active": True,
+        "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        "last_round_finished_at": None,
+        "last_market_round_started_at": (
+            datetime.now(UTC) - timedelta(seconds=240)
+        ).isoformat(),
+        "last_market_round_finished_at": None,
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    monkeypatch.setattr(system_health._dash, "_trading_service", None)
+
+    async def recent_activity(_hours: int = 2) -> dict[str, Any]:
+        return {
+            "decision_count": 0,
+            "order_count": 0,
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(system_health, "_recent_trading_activity_snapshot", recent_activity)
+
+    item = await system_health._trading_service_running_item()
+
+    assert item["status"] == "warning"
+    assert item["details"]["market_round_stuck"] is True
+    assert item["details"]["market_round_active"] is True
+    assert item["details"]["current_stage"] == "analyze:BTC/USDT"
+    assert "市场分析轮次耗时过长" in item["message"]
+
+
+@pytest.mark.asyncio
+async def test_self_check_uses_position_watchdog_for_position_round(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "uptime_seconds": 7200,
+        "decision_interval": 30,
+        "current_stage": "review_open_positions",
+        "position_current_stage": "review_open_positions",
+        "round_active": True,
+        "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=105)).isoformat(),
+        "last_round_finished_at": None,
+        "last_position_round_started_at": (
+            datetime.now(UTC) - timedelta(seconds=105)
+        ).isoformat(),
+        "last_position_round_finished_at": None,
+        "position_analysis_watchdog_seconds": 180,
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    monkeypatch.setattr(system_health._dash, "_trading_service", None)
+
+    async def recent_activity(_hours: int = 2) -> dict[str, Any]:
+        return {
+            "decision_count": 1,
+            "order_count": 0,
+            "window_hours": _hours,
+        }
+
+    monkeypatch.setattr(system_health, "_recent_trading_activity_snapshot", recent_activity)
+
+    item = await system_health._trading_service_running_item()
+
+    assert item["status"] == "ok"
+    assert item["details"]["position_round_stuck"] is False
+    assert item["details"]["position_round_stuck_limit_seconds"] == 180
+    assert item["details"]["position_analysis_watchdog_seconds"] == 180
+
+
+@pytest.mark.asyncio
 async def test_recent_execution_old_missing_score_downgrades_after_new_scored_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -317,6 +628,38 @@ async def test_recent_execution_old_missing_score_downgrades_after_new_scored_en
 
     assert by_key["entry_opportunity_score_coverage"]["status"] == "warning"
     assert by_key["entry_opportunity_score_coverage"]["details"]["sample_decision_ids"] == [101]
+
+
+@pytest.mark.asyncio
+async def test_recent_execution_no_orders_is_info_not_system_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        async def execute(self, _stmt: Any) -> FakeResult:
+            return FakeResult([])
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_execution"]["status"] == "info"
+    assert by_key["recent_execution"]["details"]["filled_orders"] == 0
+    assert by_key["recent_execution"]["details"]["is_system_failure"] is False
 
 
 @pytest.mark.asyncio

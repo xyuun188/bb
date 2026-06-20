@@ -118,11 +118,12 @@ class PositionReviewService(_ScopedAnalysisService):
         symbol_normalizer: Callable[[str], str] | None = None,
         candidate_executor: Callable[..., Awaitable[Any]] | None = None,
         timeout_provider: TimeoutProvider | None = None,
+        round_watchdog_provider: TimeBudgetProvider | None = None,
     ) -> None:
         super().__init__(
             run_once_provider=run_once_provider,
             is_running_provider=is_running_provider,
-            time_budget_provider=timeout_provider,
+            time_budget_provider=round_watchdog_provider,
         )
         self.loop_stage_setter = loop_stage_setter
         self.sl_tp_enforcer = sl_tp_enforcer
@@ -132,6 +133,7 @@ class PositionReviewService(_ScopedAnalysisService):
         self.symbol_normalizer = symbol_normalizer
         self.candidate_executor = candidate_executor
         self.timeout_provider = timeout_provider
+        self.round_watchdog_provider = round_watchdog_provider
 
     def _required_loop_stage_setter(self) -> Callable[[str], None]:
         if self.loop_stage_setter is None:

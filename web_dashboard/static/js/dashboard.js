@@ -2217,6 +2217,27 @@ function analysisIsFastPositionScan(record) {
         && !!(record?.position_fast_scan && record.position_fast_scan.skipped_llm);
 }
 
+function analysisPreExpertSkip(record) {
+    const status = record?.expert_call_status || {};
+    if (status && status.skipped) {
+        return {
+            skipped: true,
+            kind: status.kind || '',
+            label: status.label || '行情预检未进入专家',
+            reason: status.reason || record?.flow_summary || '',
+        };
+    }
+    if (analysisIsFastPositionScan(record)) {
+        return {
+            skipped: true,
+            kind: 'position_fast_scan',
+            label: '持仓快速扫描未进入专家',
+            reason: record?.flow_summary || '本轮是持仓快速扫描；只有出现强信号才进入专家深度复盘。',
+        };
+    }
+    return { skipped: false, kind: '', label: '', reason: '' };
+}
+
 function analysisViewLabel(view = state.analysisView) {
     return view === 'position' ? '持仓分析' : '市场分析';
 }
@@ -2606,8 +2627,9 @@ function analysisTimingStatusLabel(status) {
 }
 
 function analysisExpertStatusLine(record, missingCount) {
-    if (analysisIsFastPositionScan(record)) {
-        return '快速扫全部持仓，未调用 5 个专家；有强信号时才进入深度复盘';
+    const preExpertSkip = analysisPreExpertSkip(record);
+    if (preExpertSkip.skipped) {
+        return `${preExpertSkip.label}；没有消耗大模型专家`;
     }
     if (missingCount) return `${missingCount} 个未返回，点详情查看原因`;
     return '5 个专家都已返回';
@@ -2825,7 +2847,7 @@ function renderAnalysisAgentSkills(agentSkills) {
         return '<div class="analysis-empty">本条记录没有可展示的 Skills 阶段。</div>';
     }
     const phaseLabel = {
-        market_prefilter: '市场预筛',
+        market_prefilter: '行情预检',
         market_analysis: '市场分析',
         position_review: '持仓分析',
         position_fast_scan: '持仓快速扫描',
@@ -3146,6 +3168,12 @@ function analysisMissingExpertReason(missing, record) {
     const cfg = analysisExpertConfig(name);
     const rawReason = String(missing?.reason || '').trim();
     const lowerReason = rawReason.toLowerCase();
+    const skipKind = missing?.skip_kind || record?.expert_call_status?.kind || '';
+
+    if (missing?.status === 'pre_expert_skipped' || skipKind) {
+        const skipLabel = record?.expert_call_status?.label || '行情预检未进入专家';
+        return `${label} 本轮没有发起调用，不是模型故障：${skipLabel}。原因：${rawReason || record?.expert_call_status?.reason || '预检阶段已确定暂不需要大模型专家。'}`;
+    }
 
     if (cfg && cfg.loading === true) {
         return `${label} 的系统配置还在加载中，暂时无法判断具体原因。`;
@@ -3213,21 +3241,21 @@ function renderAnalysisPage() {
         const conf = Number(r.final_confidence || 0);
         const score = r.weighted_score === null || r.weighted_score === undefined ? '-' : Number(r.weighted_score).toFixed(2);
         const cross = r.cross_summary || {};
-        const isFastScan = analysisIsFastPositionScan(r);
+        const preExpertSkip = analysisPreExpertSkip(r);
         const expertCount = Number(r.expert_count || (r.experts || []).length || 0); 
         const expectedCount = Number(r.expected_expert_count || 5); 
-        const attemptedCount = isFastScan ? 0 : Number(r.attempted_expert_count || expectedCount);  
-        const missingCount = isFastScan ? 0 : Math.max(expectedCount - expertCount, 0);  
+        const attemptedCount = preExpertSkip.skipped ? 0 : Number(r.attempted_expert_count || expectedCount);  
+        const missingCount = preExpertSkip.skipped ? 0 : Math.max(expectedCount - expertCount, 0);  
         const hasMajorConflict = Number(cross.major_conflicts || 0) > 0;  
         const completedCross = Number(cross.completed ?? cross.total ?? 0);
         const unavailableCross = Number(cross.unavailable || 0);
-        const crossText = isFastScan
-            ? '快速扫描未发起交叉验证'
+        const crossText = preExpertSkip.skipped
+            ? '预检阶段未发起交叉验证'
             : `请求 ${Number(r.cross_requested || 0)}，完成 ${completedCross}，无法验证 ${unavailableCross}，分歧 ${Number(cross.divergent || 0)}`;  
         const expertStatusLine = analysisExpertStatusLine(r, missingCount);
         const expertStatusColor = missingCount ? 'var(--yellow)' : 'var(--text-muted)';
-        const expertSummary = isFastScan
-            ? '快速扫描，未调用专家'
+        const expertSummary = preExpertSkip.skipped
+            ? preExpertSkip.label
             : `发起 ${attemptedCount}/${expectedCount}，返回 ${expertCount}`;
         return ` 
         <tr> 
@@ -3370,34 +3398,46 @@ async function fetchAnalysisRecordDetail(recordId, decisionId) {
 }
 
 async function showAnalysisReason(recordId, decisionId = null) {
-    let record = state.analysisRecords.find(r => analysisRecordKeyMatches(r, recordId, decisionId));
-    if (!record || !Array.isArray(record.experts)) {
-        showAnalysisReasonLoading(recordId || decisionId);
-        const detailed = await fetchAnalysisRecordDetail(
-            recordId || record?.id,
-            decisionId || record?.decision_id || record?.id
-        );
-        if (detailed) {
-            record = detailed;
-            const idx = state.analysisRecords.findIndex(r => analysisRecordKeyMatches(r, recordId, decisionId));
-            if (idx >= 0) state.analysisRecords[idx] = detailed;
+    try {
+        let record = state.analysisRecords.find(r => analysisRecordKeyMatches(r, recordId, decisionId));
+        if (!record || !Array.isArray(record.experts)) {
+            showAnalysisReasonLoading(recordId || decisionId);
+            const detailed = await fetchAnalysisRecordDetail(
+                recordId || record?.id,
+                decisionId || record?.decision_id || record?.id
+            );
+            if (detailed) {
+                record = detailed;
+                const idx = state.analysisRecords.findIndex(r => analysisRecordKeyMatches(r, recordId, decisionId));
+                if (idx >= 0) state.analysisRecords[idx] = detailed;
+            }
         }
+        if (!record) {
+            showAnalysisReasonLoadError(recordId || decisionId);
+            return;
+        }
+        if (!Array.isArray(record.experts)) {
+            showAnalysisReasonLoadError(recordId || decisionId, '详情接口暂未返回专家流程数据。');
+            return;
+        }
+        renderAnalysisReasonModal(record);
+    } catch (error) {
+        console.error('Failed to render analysis reason detail', error);
+        showAnalysisReasonLoadError(
+            recordId || decisionId,
+            `详情渲染失败：${error?.message || error || '未知错误'}。请刷新后重试；如果连续出现，请检查该条记录的详情数据结构。`
+        );
     }
-    if (!record) {
-        showAnalysisReasonLoadError(recordId || decisionId);
-        return;
-    }
-    if (!Array.isArray(record.experts)) {
-        showAnalysisReasonLoadError(recordId || decisionId, '详情接口暂未返回专家流程数据。');
-        return;
-    }
+}
+
+function renderAnalysisReasonModal(record) {
     setDecisionModalWide(true);
-    const experts = record.experts || []; 
+    const experts = Array.isArray(record.experts) ? record.experts : [];
     const crossSummary = record.cross_summary || {};
-    const isFastScan = analysisIsFastPositionScan(record);
+    const preExpertSkip = analysisPreExpertSkip(record);
     const expertCount = Number(record.expert_count || experts.length || 0);  
     const expectedCount = Number(record.expected_expert_count || 5);  
-    const attemptedCount = isFastScan ? 0 : Number(record.attempted_expert_count || expectedCount);  
+    const attemptedCount = preExpertSkip.skipped ? 0 : Number(record.attempted_expert_count || expectedCount);  
     const completedCross = Number(crossSummary.completed ?? crossSummary.total ?? 0);
     const unavailableCross = Number(crossSummary.unavailable || 0);
     const majorConflicts = Number(crossSummary.major_conflicts || 0);
@@ -3411,8 +3451,8 @@ async function showAnalysisReason(recordId, decisionId = null) {
         || endToEndDuration
         || 0
     );
-    const expertSectionSubtitle = isFastScan
-        ? '快速扫描，未调用专家'
+    const expertSectionSubtitle = preExpertSkip.skipped
+        ? preExpertSkip.label
         : `发起 ${attemptedCount} 个，返回 ${expertCount} 个`;
     const mlSignal = record.ml_signal || null;
     const localAiTools = record.local_ai_tools || null;
@@ -3421,14 +3461,14 @@ async function showAnalysisReason(recordId, decisionId = null) {
     const vectorMemory = record.vector_memory || null;
     const attribution = record.decision_attribution || null;
  
-    const expertsHtml = isFastScan ? `
+    const expertsHtml = preExpertSkip.skipped ? `
         <div class="analysis-card analysis-card-warning">
             <div class="analysis-card-head">
-                <div class="analysis-card-title">持仓快速扫描</div>
-                ${analysisPill('未调用专家', 'muted')}
+                <div class="analysis-card-title">${escHtml(preExpertSkip.label)}</div>
+                ${analysisPill('预检跳过专家', 'muted')}
             </div>
             <div class="analysis-card-text">
-                ${analysisText(record.flow_summary || '本轮是持仓快速扫描：系统先快速扫全部持仓，没有调用 5 个慢专家；只有出现强平仓、强加仓或高风险信号时才插队进入专家深度复盘。')}
+                ${analysisText(preExpertSkip.reason || record.flow_summary || '预检阶段已确定本轮暂不需要进入大模型专家。')}
             </div>
         </div>
     ` : experts.map(e => { 
@@ -3463,7 +3503,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
             </div>`;  
     }).join('');  
  
-    const missingHtml = isFastScan ? '' : (record.missing_experts || []).map(e => {
+    const missingHtml = preExpertSkip.skipped ? '' : (record.missing_experts || []).map(e => {
         const reason = analysisMissingExpertReason(e, record);
         const notCalled = !Array.isArray(record.attempted_experts)
             || !record.attempted_experts.map(String).includes(String(e.expert_name || ''));
@@ -3723,7 +3763,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
     document.getElementById('decision-reason-body').innerHTML = ` 
         <div class="analysis-flow">
             <div class="analysis-summary">
-                ${analysisMetric('专家返回', isFastScan ? '快速扫描' : `${expertCount}/${expectedCount}`, isFastScan || expertCount === expectedCount ? 'good' : 'warn')}
+                ${analysisMetric('专家返回', preExpertSkip.skipped ? preExpertSkip.label : `${expertCount}/${expectedCount}`, preExpertSkip.skipped || expertCount === expectedCount ? 'good' : 'warn')}
                 ${mlSignal?.available ? analysisMetric('ML盈亏', `预期 ${signedPctValueLabel(mlSignal.expected_return_pct)}`, Number(mlSignal.expected_return_pct || 0) > 0 ? 'good' : 'warn') : ''}
                 ${analysisMetric('交叉验证', `${completedCross}/${Number(record.cross_requested || 0)}`, unavailableCross ? 'warn' : 'good')}
                 ${analysisMetric('分析耗时', analysisDurationLabel(totalDuration), totalDuration > 60 ? 'warn' : 'muted')}
@@ -3738,7 +3778,7 @@ async function showAnalysisReason(recordId, decisionId = null) {
             ${analysisSection('服务器量化工具', renderAnalysisLocalAiTools(localAiTools, record.analysis_type))}
             ${analysisSection('新闻与事件', renderAnalysisNewsContext(newsContext))}
             ${analysisSection('相似历史记忆', renderAnalysisVectorMemory(vectorMemory))}
-            ${analysisSection(isFastScan ? '持仓快速扫描' : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
+            ${analysisSection(preExpertSkip.skipped ? preExpertSkip.label : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
             ${missingHtml ? analysisSection('未返回专家', `<div class="analysis-grid">${missingHtml}</div>`) : ''}
             ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `请求 ${Number(record.cross_requested || 0)} 个，完成 ${completedCross} 个，无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
             ${analysisSection('深度会诊', consultation)}
@@ -5568,6 +5608,12 @@ function loopErrorLabel(message) {
     if (!text) return '';
     if (text.includes('reconciliation timed out')) {
         return 'OKX 仓位/保护单同步超时：本轮已继续使用本地持仓快照；若连续出现，请检查 OKX 网络、API Key 权限或保护单接口响应。';
+    }
+    if (text.includes('position analysis round cancelled by hard watchdog')) {
+        return '持仓复盘整轮超时：本轮已被保护性中断，通常是 OKX 同步、行情刷新或持仓复盘阶段累计过慢；系统会进入下一轮继续处理。';
+    }
+    if (text.includes('market analysis round cancelled by hard watchdog')) {
+        return '市场分析整轮超时：本轮已被保护性中断，通常是行情刷新、模型调用或执行阶段累计过慢；系统会进入下一轮继续扫描。';
     }
     if (text.includes('Invalid OK-ACCESS-KEY') || text.includes('50111')) {
         return 'OKX API Key 无效，余额/仓位同步可能失败，请检查当前模式的 OKX Key 配置。';

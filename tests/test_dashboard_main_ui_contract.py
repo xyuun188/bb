@@ -109,6 +109,8 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "learning: '刷新策略学习上下文'" in script
     assert "市场分析线程：" in script
     assert "持仓复盘线程：" in script
+    assert "position analysis round cancelled by hard watchdog" in script
+    assert "持仓复盘整轮超时" in script
     assert "market_current_stage" in script
     assert "position_current_stage" in script
     assert "strategy_context:" in script
@@ -651,3 +653,51 @@ async def test_market_snapshot_builds_tickers_from_open_positions_when_feed_empt
             "ask": 0.0,
         }
     }
+
+
+def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "function analysisPreExpertSkip" in script
+    assert "expert_call_status" in script
+    assert "行情预检未进入专家" in script
+    assert "预检跳过专家" in script
+    assert "不是模型故障" in script
+    assert "没有消耗大模型专家" in script
+    assert "pre_expert_skipped" in script
+    assert "未配置 API Key" in script
+    assert script.index("pre_expert_skipped") < script.index("cfg && cfg.loading")
+    detail_start = script.index("async function showAnalysisReason")
+    detail_end = script.index("function changeAnalysisPage", detail_start)
+    assert "isFastScan" not in script[detail_start:detail_end]
+    assert "try {" in script[detail_start:detail_end]
+    assert "renderAnalysisReasonModal(record)" in script[detail_start:detail_end]
+    assert "详情渲染失败" in script[detail_start:detail_end]
+    assert "function renderAnalysisReasonModal" in script[detail_start:detail_end]
+
+
+def test_dashboard_api_normalizes_market_prefilter_expert_status() -> None:
+    raw = {
+        "fast_prefilter": {
+            "skipped_llm": True,
+            "reason": "短周期行情特征疑似缺失：1/5/20周期收益率和波动率都为0。",
+        }
+    }
+
+    status = dashboard._analysis_pre_expert_skip(raw)
+
+    assert status == {
+        "skipped": True,
+        "kind": "market_prefilter",
+        "label": "行情预检未进入专家",
+        "reason": "短周期行情特征疑似缺失：1/5/20周期收益率和波动率都为0。",
+    }
+
+
+def test_dashboard_api_normalizes_position_fast_scan_expert_status() -> None:
+    status = dashboard._analysis_pre_expert_skip({"position_fast_scan": {"skipped_llm": True}})
+
+    assert status["skipped"] is True
+    assert status["kind"] == "position_fast_scan"
+    assert status["label"] == "持仓快速扫描未进入专家"
+    assert "强平仓" in status["reason"]

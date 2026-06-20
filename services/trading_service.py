@@ -384,6 +384,7 @@ class TradingService:
             symbol_normalizer=self.normalize_position_symbol,
             candidate_executor=self.execute_position_review_candidate,
             timeout_provider=self.position_review_stage_timeout_seconds,
+            round_watchdog_provider=self.position_round_watchdog_seconds,
         )
         self._execution_lock = asyncio.Lock()
         self.entry_execution_pipeline = EntryExecutionPipeline(lambda: self.entry_policy)
@@ -940,6 +941,24 @@ class TradingService:
         )
         configured_watchdog = float(settings.market_analysis_watchdog_seconds or 180)
         return max(configured_watchdog, interval * 4.0, expert_budget * 2.0)
+
+    def position_round_watchdog_seconds(self) -> float:
+        """Return the hard watchdog for one full position-review round.
+
+        This must stay separate from ``position_review_stage_timeout_seconds``:
+        the stage timeout bounds one slow sub-step, while the round watchdog only
+        catches a genuinely stuck full position-review cycle.
+        """
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        stage_budget = self.position_review_stage_timeout_seconds()
+        configured_watchdog = float(
+            settings.position_analysis_watchdog_seconds
+            or settings.market_analysis_watchdog_seconds
+            or 180
+        )
+        return max(configured_watchdog, interval * 4.0, stage_budget * 2.0)
 
     def round_start_reconcile_timeout_seconds(self) -> float:
         """Return the short OKX sync boundary used at analysis round start."""
@@ -1936,6 +1955,9 @@ class TradingService:
                     "position_first_parallel_loops; actual market batch is dynamic"
                 ),
                 "market_analysis_watchdog_seconds": int(self.market_round_watchdog_seconds()),
+                "position_analysis_watchdog_seconds": int(
+                    self.position_round_watchdog_seconds()
+                ),
                 "current_stage": current_state.current_stage,
                 "round_active": round_active,
                 "market_current_stage": market_state.current_stage,
@@ -7387,6 +7409,10 @@ class TradingService:
             "current_stage_label": stage_label,
             "round_active": round_active,
             "round_running_seconds": round_running_seconds,
+            "market_analysis_watchdog_seconds": int(self.market_round_watchdog_seconds()),
+            "position_analysis_watchdog_seconds": int(
+                self.position_round_watchdog_seconds()
+            ),
             "market_current_stage": market_state.current_stage,
             "market_round_active": market_state.active,
             "market_last_error": market_state.last_error,
