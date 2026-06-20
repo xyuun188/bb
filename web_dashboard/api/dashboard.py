@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -45,6 +46,7 @@ from services.entry_signal_extraction import (
 )
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.server_monitor_status import get_server_monitor_status_async
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -52,6 +54,8 @@ from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 BEIJING_TZ = timezone(timedelta(hours=8))
+LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
 
 
 # In-memory reference to the trading service (set by main loop)
@@ -123,8 +127,18 @@ def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
     logger.debug(event, error=safe_error_text(exc), **fields)
 
 
-def _as_utc_datetime(value: datetime | None) -> datetime | None:
+def _as_utc_datetime(value: Any) -> datetime | None:
     if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -730,6 +744,163 @@ async def _get_today_ai_decision_count(mode: str) -> int:
             )
         )
         return int(result.scalar_one() or 0)
+
+
+async def _recent_trading_activity_stats(hours: int = 6) -> dict[str, Any]:
+    """Return recent DB activity as a heartbeat for split dashboard/trader deployments."""
+    from sqlalchemy import func, select
+
+    from db.session import get_session_ctx
+    from models.decision import AIDecision
+    from models.trade import Order
+
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    async with get_session_ctx() as session:
+        decision_row = (
+            await session.execute(
+                select(func.count(AIDecision.id), func.max(AIDecision.created_at)).where(
+                    AIDecision.created_at >= since
+                )
+            )
+        ).one()
+        order_row = (
+            await session.execute(
+                select(func.count(Order.id), func.max(Order.created_at)).where(
+                    Order.created_at >= since
+                )
+            )
+        ).one()
+
+    latest_values = [value for value in (decision_row[1], order_row[1]) if value is not None]
+    latest_at = max(latest_values) if latest_values else None
+    if latest_at and latest_at.tzinfo is None:
+        latest_at = latest_at.replace(tzinfo=UTC)
+    heartbeat_age_seconds = (
+        max((datetime.now(UTC) - latest_at).total_seconds(), 0.0) if latest_at else None
+    )
+    return {
+        "decision_count": int(decision_row[0] or 0),
+        "order_count": int(order_row[0] or 0),
+        "latest_decision_at": decision_row[1].isoformat() if decision_row[1] else None,
+        "latest_order_at": order_row[1].isoformat() if order_row[1] else None,
+        "latest_activity_at": latest_at.isoformat() if latest_at else None,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "window_hours": hours,
+    }
+
+
+def _load_trading_runtime_status() -> dict[str, Any]:
+    """Load latest split-process trading runtime heartbeat from disk."""
+    path = settings.data_dir / "trading_runtime_status.json"
+    try:
+        if not path.exists():
+            return {}
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        heartbeat_at = _as_utc_datetime(data.get("heartbeat_at"))
+        if heartbeat_at is not None:
+            data["heartbeat_age_seconds"] = max(
+                (datetime.now(UTC) - heartbeat_at).total_seconds(),
+                0.0,
+            )
+        elif path.exists():
+            data["heartbeat_age_seconds"] = max(
+                datetime.now(UTC).timestamp() - path.stat().st_mtime,
+                0.0,
+            )
+        return data
+    except Exception as exc:
+        logger.debug(
+            "failed to load trading runtime heartbeat",
+            error=safe_error_text(exc),
+        )
+        return {}
+
+
+async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any]:
+    """Fallback stats when dashboard and trading engine run as separate services."""
+    settings.refresh_runtime_env(force=True)
+    runtime_status = _load_trading_runtime_status()
+    try:
+        activity = await _recent_trading_activity_stats()
+    except Exception as exc:
+        logger.warning(
+            "failed to load split-process trading stats",
+            error=safe_error_text(exc),
+        )
+        activity = {}
+    runtime_age = runtime_status.get("heartbeat_age_seconds")
+    heartbeat_age = (
+        runtime_age if runtime_age is not None else activity.get("heartbeat_age_seconds")
+    )
+    running = heartbeat_age is not None and float(heartbeat_age) <= max(
+        float(settings.decision_interval_seconds) * 4,
+        180.0,
+    )
+    decision_interval = int(
+        runtime_status.get("decision_interval") or settings.decision_interval_seconds
+    )
+    started_at = _as_utc_datetime(runtime_status.get("started_at"))
+    uptime_seconds = int(runtime_status.get("uptime_seconds") or 0)
+    if uptime_seconds <= 0 and started_at is not None:
+        uptime_seconds = int(max((datetime.now(UTC) - started_at).total_seconds(), 0.0))
+    last_round_started = _as_utc_datetime(runtime_status.get("last_round_started_at"))
+    last_round_finished = _as_utc_datetime(runtime_status.get("last_round_finished_at"))
+    round_active = bool(runtime_status.get("round_active", False))
+    if last_round_started is not None and (
+        last_round_finished is None or last_round_finished < last_round_started
+    ):
+        round_active = True
+    round_running_seconds = (
+        int(max((datetime.now(UTC) - last_round_started).total_seconds(), 0.0))
+        if round_active and last_round_started is not None
+        else 0
+    )
+    return {
+        "running": running,
+        "mode": runtime_status.get("mode")
+        or ("live" if mode == "live" else mode_manager.mode.value),
+        "paused": bool(runtime_status.get("paused", mode_manager.is_paused)),
+        "uptime_source": "split_process_heartbeat",
+        "uptime_seconds": uptime_seconds,
+        "started_at": runtime_status.get("started_at"),
+        "heartbeat_at": runtime_status.get("heartbeat_at")
+        or runtime_status.get("last_heartbeat_at"),
+        "last_heartbeat_at": runtime_status.get("last_heartbeat_at")
+        or runtime_status.get("heartbeat_at"),
+        "decisions_total": int(activity.get("decision_count") or 0),
+        "trades_total": int(activity.get("order_count") or 0),
+        "recent_decisions": [],
+        "recent_executions": [],
+        "current_stage": runtime_status.get("current_stage")
+        or ("split_process" if running else "unknown"),
+        "current_stage_label": "独立交易进程运行中" if running else "等待交易心跳",
+        "round_active": round_active,
+        "round_running_seconds": round_running_seconds,
+        "market_current_stage": runtime_status.get("market_current_stage"),
+        "market_round_active": runtime_status.get("market_round_active"),
+        "market_last_error": runtime_status.get("market_last_error"),
+        "position_current_stage": runtime_status.get("position_current_stage"),
+        "position_round_active": runtime_status.get("position_round_active"),
+        "position_last_error": runtime_status.get("position_last_error"),
+        "last_round_started_at": runtime_status.get("last_round_started_at")
+        or activity.get("latest_activity_at"),
+        "last_round_finished_at": runtime_status.get("last_round_finished_at")
+        or activity.get("latest_activity_at"),
+        "last_market_round_started_at": runtime_status.get("last_market_round_started_at"),
+        "last_market_round_finished_at": runtime_status.get("last_market_round_finished_at"),
+        "last_position_round_started_at": runtime_status.get("last_position_round_started_at"),
+        "last_position_round_finished_at": runtime_status.get("last_position_round_finished_at"),
+        "last_round_error": runtime_status.get("last_round_error"),
+        "live_model": ENSEMBLE_TRADER_NAME,
+        "models": [ENSEMBLE_TRADER_NAME],
+        "risk": {},
+        "decision_interval": decision_interval,
+        "split_process_activity": activity,
+        "runtime_status": runtime_status,
+    }
 
 
 def _execution_risk_floor(allocated: float, max_loss_pct: float, max_loss_usdt: float) -> float:
@@ -1527,6 +1698,14 @@ def _trading_service_is_running() -> bool:
     return bool(is_running()) if callable(is_running) else False
 
 
+def _make_lightweight_okx_executor(cls: Any, mode: str):
+    """Create an OKX executor for balance-only reads without loading market rules."""
+    try:
+        return cls(mode=mode, load_markets_on_initialize=False)
+    except TypeError:
+        return cls(mode=mode)
+
+
 def _dashboard_ml_signal_service() -> Any | None:
     if _trading_service and getattr(_trading_service, "ml_signal_service", None):
         return _trading_service.ml_signal_service
@@ -1828,7 +2007,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                 source="trading_service_executor",
             )
 
-    fallback_executor = OKXExecutor(mode=selected_mode)
+    fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
     try:
         await asyncio.wait_for(fallback_executor.initialize(), timeout=12.0)
         snapshot = await fetch_with_executor(fallback_executor)
@@ -2318,9 +2497,11 @@ async def get_status(mode: str | None = None):
     trading_stats = {}
     if _trading_service:
         trading_stats = _trading_service.get_stats(mode_filter=mode)
+    else:
+        trading_stats = await _split_process_trading_stats(mode)
 
     return {
-        "status": "running" if _trading_service_is_running() else "stopped",
+        "status": "running" if bool(trading_stats.get("running")) else "stopped",
         "mode": mode_manager.mode.value,
         "paused": mode_manager.is_paused,
         "scan_mode": mode_manager.scan_mode,
@@ -2341,7 +2522,10 @@ async def get_ml_signal_status():
 
     training_count = int(status.get("sample_count") or status.get("trained_sample_count") or 0)
     status.setdefault("training_shadow_sample_count", training_count)
-    status.setdefault("training_shadow_sample_limit", 20000)
+    status.setdefault(
+        "training_shadow_sample_limit",
+        LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
+    )
     status.setdefault(
         "training_sample_note",
         "sample_count is the latest training window, not the all-time total.",
@@ -2381,7 +2565,10 @@ async def get_local_ai_tools_status():
             completed_total = await _completed_local_ai_shadow_backtest_total()
             status.setdefault("completed_shadow_sample_count", completed_total)
             status.setdefault("training_shadow_sample_count", status.get("shadow_sample_count"))
-            status.setdefault("training_shadow_sample_limit", 20000)
+            status.setdefault(
+                "training_shadow_sample_limit",
+                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
+            )
         except Exception as exc:
             _log_dashboard_fallback("local ai tools shadow count fallback", exc)
     return status
@@ -2463,6 +2650,8 @@ async def get_dashboard_summary():
     trading_stats = {}
     if _trading_service:
         trading_stats = _trading_service.get_stats(mode_filter=mode_manager.mode.value)
+    else:
+        trading_stats = await _split_process_trading_stats(mode_manager.mode.value)
     today_decisions_total = await _get_today_ai_decision_count(mode_manager.mode.value)
 
     return {
@@ -3722,8 +3911,8 @@ async def get_analysis_records(
 @router.get("/strategy-learning")
 async def get_strategy_learning(
     mode: str | None = None,
-    hours: int = 168,
-    limit: int = 3000,
+    hours: int = STRATEGY_LEARNING_PARAMS.default_lookback_hours,
+    limit: int = STRATEGY_LEARNING_PARAMS.dashboard_default_limit,
     detail: str = "summary",
 ):
     """Return the active strategy-learning feedback and scheduler state."""
@@ -3731,9 +3920,22 @@ async def get_strategy_learning(
 
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
     selected_detail = "full" if str(detail or "").lower() == "full" else "summary"
-    capped_hours = max(1, min(int(hours or 168), 24 * 90))
-    max_limit = 20000 if selected_detail == "full" else 1500
-    capped_limit = max(100, min(int(limit or 3000), max_limit))
+    strategy_params = STRATEGY_LEARNING_PARAMS
+    capped_hours = max(
+        1,
+        min(
+            int(hours or strategy_params.default_lookback_hours), strategy_params.max_lookback_hours
+        ),
+    )
+    max_limit = (
+        strategy_params.dashboard_full_limit
+        if selected_detail == "full"
+        else strategy_params.dashboard_summary_limit
+    )
+    capped_limit = max(
+        strategy_params.min_dashboard_limit,
+        min(int(limit or strategy_params.dashboard_default_limit), max_limit),
+    )
     max_open_positions = int(settings.max_open_positions_per_model or 20)
     cache_key = (
         "strategy-learning",

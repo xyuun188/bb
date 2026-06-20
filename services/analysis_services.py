@@ -19,7 +19,10 @@ logger = structlog.get_logger(__name__)
 
 RunOnceProvider = Callable[[str], Awaitable[dict[str, Any]]]
 RunningProvider = Callable[[], bool]
+IntervalProvider = Callable[[], float]
 ReviewCandidate = tuple[str, str, Any, Any, int | None]
+TimeoutProvider = Callable[[], float]
+TimeBudgetProvider = Callable[[], float]
 
 
 class _ScopedAnalysisService:
@@ -31,35 +34,62 @@ class _ScopedAnalysisService:
         *,
         run_once_provider: RunOnceProvider | None = None,
         is_running_provider: RunningProvider | None = None,
+        time_budget_provider: TimeBudgetProvider | None = None,
     ) -> None:
         self._run_once_provider = run_once_provider
         self._is_running_provider = is_running_provider
+        self._time_budget_provider = time_budget_provider
 
     async def run_once(self) -> dict[str, Any]:
         if self._run_once_provider is None:
             raise RuntimeError(f"{type(self).__name__} requires run_once_provider")
         return await self._run_once_provider(self.scope)
 
+    def _time_budget_seconds(self) -> float | None:
+        if self._time_budget_provider is None:
+            return None
+        try:
+            return max(0.05, float(self._time_budget_provider()))
+        except (TypeError, ValueError):
+            return None
+
     def is_running(self) -> bool:
         if self._is_running_provider is None:
             raise RuntimeError(f"{type(self).__name__} requires is_running_provider")
         return bool(self._is_running_provider())
 
-    async def loop(self, interval_seconds: float) -> None:
+    @staticmethod
+    def _resolve_interval(interval_seconds: float | IntervalProvider) -> float:
+        if callable(interval_seconds):
+            return max(1.0, float(interval_seconds()))
+        return max(1.0, float(interval_seconds))
+
+    async def loop(self, interval_seconds: float | IntervalProvider) -> None:
         await asyncio.sleep(self.initial_delay_seconds)
         while self.is_running():
             try:
-                await self.run_once()
-                await asyncio.sleep(interval_seconds)
+                time_budget = self._time_budget_seconds()
+                if time_budget is None:
+                    await self.run_once()
+                else:
+                    await asyncio.wait_for(self.run_once(), timeout=time_budget)
+                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except asyncio.CancelledError:
                 break
+            except TimeoutError:
+                logger.error(
+                    "analysis service loop timed out",
+                    scope=self.scope,
+                    timeout_seconds=self._time_budget_seconds(),
+                )
+                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except Exception as exc:
                 logger.error(
                     "analysis service loop error",
                     scope=self.scope,
                     error=safe_error_text(exc),
                 )
-                await asyncio.sleep(interval_seconds)
+                await asyncio.sleep(self._resolve_interval(interval_seconds))
 
 
 class MarketAnalysisService(_ScopedAnalysisService):
@@ -87,10 +117,12 @@ class PositionReviewService(_ScopedAnalysisService):
         analysis_symbol_claimer: Callable[[str, str], Awaitable[bool]] | None = None,
         symbol_normalizer: Callable[[str], str] | None = None,
         candidate_executor: Callable[..., Awaitable[Any]] | None = None,
+        timeout_provider: TimeoutProvider | None = None,
     ) -> None:
         super().__init__(
             run_once_provider=run_once_provider,
             is_running_provider=is_running_provider,
+            time_budget_provider=timeout_provider,
         )
         self.loop_stage_setter = loop_stage_setter
         self.sl_tp_enforcer = sl_tp_enforcer
@@ -99,6 +131,7 @@ class PositionReviewService(_ScopedAnalysisService):
         self.analysis_symbol_claimer = analysis_symbol_claimer
         self.symbol_normalizer = symbol_normalizer
         self.candidate_executor = candidate_executor
+        self.timeout_provider = timeout_provider
 
     def _required_loop_stage_setter(self) -> Callable[[str], None]:
         if self.loop_stage_setter is None:
@@ -143,6 +176,65 @@ class PositionReviewService(_ScopedAnalysisService):
             raise RuntimeError("PositionReviewService requires candidate_executor")
         return self.candidate_executor
 
+    def _timeout_seconds(self) -> float:
+        if self.timeout_provider is None:
+            return 30.0
+        try:
+            return max(1.0, float(self.timeout_provider()))
+        except (TypeError, ValueError):
+            return 30.0
+
+    async def _wait_stage(
+        self,
+        stage: str,
+        awaitable: Awaitable[Any],
+        *,
+        results: dict[str, Any],
+    ) -> Any | None:
+        timeout_seconds = self._timeout_seconds()
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+        except TimeoutError:
+            diagnostic = {
+                "stage": stage,
+                "timeout_seconds": timeout_seconds,
+                "message": f"持仓复盘阶段超时：{stage}，本轮跳过该阶段并继续下一轮。",
+            }
+            results.setdefault("position_review_diagnostics", []).append(diagnostic)
+            results.setdefault("warnings", []).append(
+                {
+                    "model": "position_review",
+                    "symbol": "ALL",
+                    "warning": diagnostic["message"],
+                }
+            )
+            logger.warning(
+                "position review stage timed out",
+                stage=stage,
+                timeout_seconds=timeout_seconds,
+            )
+            return None
+        except Exception as exc:
+            diagnostic = {
+                "stage": stage,
+                "error": safe_error_text(exc),
+                "message": f"持仓复盘阶段异常：{stage}，本轮跳过该阶段并继续下一轮。",
+            }
+            results.setdefault("position_review_diagnostics", []).append(diagnostic)
+            results.setdefault("warnings", []).append(
+                {
+                    "model": "position_review",
+                    "symbol": "ALL",
+                    "warning": diagnostic["message"],
+                }
+            )
+            logger.warning(
+                "position review stage failed",
+                stage=stage,
+                error=safe_error_text(exc),
+            )
+            return None
+
     async def review_open_positions(
         self,
         *,
@@ -166,7 +258,13 @@ class PositionReviewService(_ScopedAnalysisService):
         review_blocked_keys: set[tuple[str, str]] = set()
 
         set_loop_stage("enforce_sl_tp")
-        sl_tp_results = await enforce_sl_tp(feature_vectors)
+        sl_tp_results = await self._wait_stage(
+            "enforce_sl_tp",
+            enforce_sl_tp(feature_vectors),
+            results=results,
+        )
+        if sl_tp_results is None:
+            sl_tp_results = []
         for action in sl_tp_results:
             results["executions"].append(
                 {
@@ -180,20 +278,38 @@ class PositionReviewService(_ScopedAnalysisService):
             )
 
         set_loop_stage("review_open_positions")
-        open_positions = await get_open_positions_context()
-        review_candidates, review_blocked_keys = await review_positions(
-            open_positions,
-            feature_vectors,
+        refreshed_open_positions = await self._wait_stage(
+            "get_open_positions_context",
+            get_open_positions_context(),
             results=results,
-            round_decision_ids=round_decision_ids,
-            position_entry_pause_reason=position_entry_pause_reason,
-            max_groups_override=max_groups_override,
         )
+        if isinstance(refreshed_open_positions, list):
+            open_positions = refreshed_open_positions
+        review_result = await self._wait_stage(
+            "review_positions",
+            review_positions(
+                open_positions,
+                feature_vectors,
+                results=results,
+                round_decision_ids=round_decision_ids,
+                position_entry_pause_reason=position_entry_pause_reason,
+                max_groups_override=max_groups_override,
+            ),
+            results=results,
+        )
+        if review_result is None:
+            return open_positions, review_blocked_keys
+        review_candidates, review_blocked_keys = review_result
         if review_candidates:
             logger.info("review pass added execution candidates", count=len(review_candidates))
 
         for symbol, model_name, decision, assessment, decision_db_id in review_candidates:
-            if not await try_claim_analysis_symbol(symbol, "position"):
+            claim_result = await self._wait_stage(
+                f"claim_position_symbol:{symbol}",
+                try_claim_analysis_symbol(symbol, "position"),
+                results=results,
+            )
+            if not claim_result:
                 logger.info(
                     "position execution skipped because another analysis owns symbol", symbol=symbol
                 )
@@ -202,14 +318,18 @@ class PositionReviewService(_ScopedAnalysisService):
             if decision_db_id is not None:
                 round_decision_ids.add(decision_db_id)
             review_blocked_keys.add((model_name, normalize_symbol(symbol)))
-            await execute_candidate(
-                symbol,
-                model_name,
-                decision,
-                assessment,
-                decision_db_id,
-                results,
-                open_positions=open_positions,
+            await self._wait_stage(
+                f"execute_position_candidate:{symbol}",
+                execute_candidate(
+                    symbol,
+                    model_name,
+                    decision,
+                    assessment,
+                    decision_db_id,
+                    results,
+                    open_positions=open_positions,
+                ),
+                results=results,
             )
 
         return open_positions, review_blocked_keys

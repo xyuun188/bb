@@ -1,11 +1,13 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import services.trading_service as trading_service
 import services.sync_service as sync_module
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
@@ -44,7 +46,7 @@ from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.sync_service import OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND, OkxSyncService
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
-from services.trading_service import TradingService
+from services.trading_service import TradingService, _AnalysisRuntimeState
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -77,6 +79,52 @@ def test_trading_service_detects_policy_skipped_execution_result() -> None:
     )
 
     assert TradingService._is_policy_skipped_execution_result(result) is True
+
+
+def test_parallel_market_position_runtime_state_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._start_time = datetime.now(UTC) - timedelta(minutes=5)
+    service._current_stage = "idle"
+    service._last_round_started_at = None
+    service._last_round_finished_at = None
+    service._last_round_error = None
+    service._last_market_round_started_at = None
+    service._last_market_round_finished_at = None
+    service._last_position_round_started_at = None
+    service._last_position_round_finished_at = None
+    service._analysis_runtime = {
+        "market": _AnalysisRuntimeState(),
+        "position": _AnalysisRuntimeState(),
+        "full": _AnalysisRuntimeState(),
+    }
+
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    market_start = datetime.now(UTC) - timedelta(seconds=20)
+    position_start = datetime.now(UTC) - timedelta(seconds=5)
+    service._start_runtime_round("market", market_start)
+    service._set_loop_stage("fetch_features", scope="market")
+    service._start_runtime_round("position", position_start)
+    service._set_loop_stage("review_open_positions", scope="position")
+    service._finish_runtime_round("position", datetime.now(UTC), ok=True)
+    service._write_runtime_heartbeat()
+
+    payload = json.loads((data_dir / "trading_runtime_status.json").read_text(encoding="utf-8"))
+
+    assert payload["market_round_active"] is True
+    assert payload["market_current_stage"] == "fetch_features"
+    assert payload["position_round_active"] is False
+    assert payload["position_current_stage"] == "idle"
+    assert payload["round_active"] is True
+    assert payload["current_stage"] == "fetch_features"
     assert TradingService._is_policy_skipped_execution_result(None) is False
 
 
@@ -145,6 +193,53 @@ def test_ai_entry_candidate_evidence_exposes_profile_recency_to_model() -> None:
     assert side_profile["last_loss_at"] == "2026-06-08T11:00:00+00:00"
     assert side_profile["last_loss_age_hours"] == 23.5
     assert side_profile["lookback_days"] == 14
+
+
+@pytest.mark.asyncio
+async def test_memory_context_merges_vector_memory_soft_feedback(monkeypatch) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeExpertMemoryService:
+        async def context(self, symbol):
+            return {
+                "memory_feedback": {
+                    "enabled": True,
+                    "preferred_side_by_memory": "long",
+                }
+            }
+
+    class FakeVectorMemoryService:
+        async def search(self, query, *, top_k=8, symbol="", kind="", min_score=None):
+            assert "BTC/USDT" in query
+            assert symbol == "BTC/USDT"
+            return {
+                "enabled": True,
+                "status": "ok",
+                "hits": [
+                    {
+                        "score": 0.71,
+                        "action": "long",
+                        "outcome": "loss",
+                        "pnl_pct": -0.6,
+                    }
+                ],
+            }
+
+    service.expert_memory_service = FakeExpertMemoryService()
+    monkeypatch.setattr("services.trading_service.settings.vector_memory_enabled", True)
+    monkeypatch.setattr(
+        "services.trading_service.get_vector_memory_service",
+        lambda: FakeVectorMemoryService(),
+    )
+
+    context = await service._memory_context_with_vector_feedback("BTC/USDT")
+
+    vector = context["memory_feedback"]["vector_memory"]
+    assert vector["status"] == "ok"
+    assert vector["matched_count"] == 1
+    assert vector["is_hard_gate"] is False
+    assert "硬拦截" in vector["policy"]
+    assert context["vector_memory_feedback"] == vector
 
 
 def _noop_reconcile_close_boundaries() -> dict[str, Any]:
@@ -216,6 +311,102 @@ async def test_analysis_service_loop_uses_injected_lifecycle_boundary():
     await service.loop(0.0)
 
     assert calls == ["market"]
+
+
+@pytest.mark.asyncio
+async def test_analysis_service_loop_sleeps_interval_after_round_finishes(monkeypatch):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+    now = 100.0
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope):
+        nonlocal now
+        calls.append(scope)
+        now += 7.0
+        return {"scope": scope}
+
+    service = MarketAnalysisService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 10.0)
+
+    assert calls == ["market"]
+    assert sleeps == [0.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope):
+        calls.append(scope)
+        await original_sleep(60)
+        return {"scope": scope}
+
+    service = MarketAnalysisService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        time_budget_provider=lambda: 0.05,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert calls == ["market"]
+    assert sleeps == [0.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_position_review_loop_uses_timeout_provider_as_round_watchdog(monkeypatch):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope):
+        calls.append(scope)
+        await original_sleep(60)
+        return {"scope": scope}
+
+    service = PositionReviewService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        timeout_provider=lambda: 0.05,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert calls == ["position"]
+    assert sleeps == [0.0, 30.0]
 
 
 @pytest.mark.asyncio
@@ -1282,6 +1473,67 @@ async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_ca
 
 
 @pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_does_not_trap_strong_quality_in_release_probe():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.suggested_leverage = 5.0
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_release_pressure_active": True,
+            "strategy_learning_release_pressure_reason": "release old low quality slots",
+            "strategy_learning_sizing": {
+                "profile_id": "loss_release",
+                "position_size_multiplier": 0.45,
+                "probe_fraction": 0.08,
+                "max_probe_size_pct": 0.012,
+                "side_overrides": {"long": {"size_multiplier": 0.62}},
+            },
+        },
+        "opportunity_score": {
+            "score": 2.2,
+            "min_score_required": 1.0,
+            "expected_net_return_pct": 0.95,
+            "expected_loss_pct": 0.55,
+            "tail_risk_score": 0.32,
+            "raw_expected_return_pct": 0.95,
+            "profit_quality_ratio": 0.92,
+            "server_profit_loss_probability": 0.44,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    strategy_sizing = sizing["strategy_learning_sizing"]
+    assert sizing["strategy_quality_override"] is True
+    assert "strong_positive_strategy_signal" in sizing["strategy_quality_override_reasons"]
+    assert strategy_sizing["quality_override"] is True
+    assert strategy_sizing["probe_cap_applied"] is False
+    assert decision.position_size_pct > 0.012
+    assert sizing["final_notional_usdt"] > 60.0
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_fails_fast_without_profit_risk_sizing_dependency():
     policy = EntryPolicy()
 
@@ -1501,6 +1753,210 @@ async def test_trading_service_dashboard_async_boundaries_call_internal_owners()
     assert await service.get_okx_balance_snapshot_for_mode("live") == {"equity": 123.0}
     assert await service.completed_shadow_backtest_total() == 456
     assert calls == [("balance", "live"), ("shadow", "completed")]
+
+
+@pytest.mark.asyncio
+async def test_paper_balance_snapshot_uses_virtual_account_without_okx() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._okx_paper = None
+    service._okx_live = None
+    service._okx_balance_snapshot_cache = {}
+
+    class FakePaperExecutor:
+        async def get_account_summary(self, model_name: str) -> dict[str, Any]:
+            assert model_name == "ensemble_trader"
+            return {
+                "available_balance": 1234.5,
+                "used_margin": 100.0,
+                "wallet_balance": 1334.5,
+                "equity": 1320.0,
+            }
+
+    service.paper_executor = FakePaperExecutor()
+
+    snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
+
+    assert snapshot == {
+        "free": 1234.5,
+        "used": 100.0,
+        "total": 1334.5,
+        "cash": 1334.5,
+        "equity": 1334.5,
+        "allocatable": 1234.5,
+        "source": "paper_virtual_account",
+        "exchange_required": False,
+        "degraded": False,
+        "analysis_only_balance": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_paper_new_pair_pause_does_not_depend_on_okx_balance_timeout() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service.execution_allocation_state = lambda _mode: _async_value({"total_pnl": 0.0})
+    service.paper_executor = None
+    service._okx_paper = None
+    service._okx_live = None
+    service._okx_balance_snapshot_cache = {}
+    service._get_okx_executor_for_mode = lambda _mode: _async_value(None)
+    service.new_pair_loss_pause = NewPairLossPausePolicy(
+        balance_snapshot_provider=service._get_okx_balance_snapshot_for_mode
+    )
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+        position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
+    )
+
+    snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[],
+    )
+
+    assert snapshot is not None
+    assert snapshot["source"] == "paper_configured_budget"
+    assert snapshot["analysis_only_balance"] is True
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_latest_price_uses_ws_cache_before_okx_rest() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+
+    class FailingRestClient:
+        async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            raise AssertionError(f"REST should not be called for cached {symbol}")
+
+    service.data_service = SimpleNamespace(
+        ws_client=SimpleNamespace(
+            latest_tickers={"BTC/USDT": {"last_price": 43210.5}},
+        ),
+        rest_client=FailingRestClient(),
+    )
+
+    price = await service._latest_price_for_symbol("BTC/USDT")
+
+    assert price == 43210.5
+
+
+@pytest.mark.asyncio
+async def test_latest_price_falls_back_to_feature_vector_when_okx_rest_fails() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+
+    class FailingRestClient:
+        async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+            raise RuntimeError("okx public instruments timeout")
+
+    async def get_feature_vector(symbol: str) -> SimpleNamespace:
+        assert symbol == "ETH/USDT"
+        return SimpleNamespace(current_price=3210.75)
+
+    service.data_service = SimpleNamespace(
+        ws_client=SimpleNamespace(latest_tickers={}),
+        rest_client=FailingRestClient(),
+        get_feature_vector=get_feature_vector,
+    )
+
+    price = await service._latest_price_for_symbol("ETH/USDT")
+
+    assert price == 3210.75
+
+
+def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._auto_scan_feature_cursor = 0
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    symbols = [f"S{i}/USDT" for i in range(10)]
+
+    first = service._budget_auto_scan_feature_symbols(
+        symbols,
+        ["S8/USDT"],
+        configured_limit=2,
+    )
+    second = service._budget_auto_scan_feature_symbols(
+        symbols,
+        ["S8/USDT"],
+        configured_limit=2,
+    )
+
+    assert "S8/USDT" in first
+    assert "S8/USDT" in second
+    assert len(first) == 5
+    assert len(second) == 5
+    assert first != second
+    assert first[1:] == ["S0/USDT", "S1/USDT", "S2/USDT", "S3/USDT"]
+    assert second[1:] == ["S4/USDT", "S5/USDT", "S6/USDT", "S7/USDT"]
+
+
+def test_market_round_time_budget_tracks_runtime_decision_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    assert service.market_round_time_budget_seconds() == 27.0
+    assert service.market_round_watchdog_seconds() >= 180.0
+
+
+def test_market_round_budget_is_not_used_as_outer_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    assert service.market_round_watchdog_seconds() > service.market_round_time_budget_seconds()
+    assert service.market_round_watchdog_seconds() == 180.0
+
+
+@pytest.mark.asyncio
+async def test_feature_batch_wait_cancels_slow_tasks() -> None:
+    cancelled = False
+
+    async def slow_task() -> tuple[str, Any]:
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        return "SLOW/USDT", object()
+
+    async def fast_task() -> tuple[str, Any]:
+        return "FAST/USDT", object()
+
+    tasks = [asyncio.create_task(fast_task()), asyncio.create_task(slow_task())]
+    done, pending = await asyncio.wait(tasks, timeout=0.01)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    assert len(done) == 1
+    assert len(pending) == 1
+    assert cancelled is True
 
 
 @pytest.mark.asyncio
@@ -3699,6 +4155,61 @@ async def test_position_review_service_runs_sl_tp_and_executes_review_candidates
     assert claimed == ["BTC/USDT"]
     assert round_ids == {456}
     assert executions == [("BTC/USDT", "ensemble_trader", "close_long", 456, open_positions)]
+
+
+@pytest.mark.asyncio
+async def test_position_review_service_times_out_slow_review_without_stalling_round():
+    stages: list[str] = []
+
+    def set_loop_stage(stage):
+        stages.append(stage)
+
+    async def enforce_sl_tp(feature_vectors):
+        return []
+
+    async def open_positions_context():
+        return [{"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"}]
+
+    async def review_open_positions(
+        open_positions,
+        feature_vectors,
+        *,
+        results,
+        round_decision_ids,
+        position_entry_pause_reason,
+        max_groups_override,
+    ):
+        await asyncio.sleep(10)
+        return [], set()
+
+    service = PositionReviewService(
+        loop_stage_setter=set_loop_stage,
+        sl_tp_enforcer=enforce_sl_tp,
+        open_positions_context_provider=open_positions_context,
+        position_reviewer=review_open_positions,
+        analysis_symbol_claimer=lambda _symbol, _owner: asyncio.sleep(0, result=True),
+        symbol_normalizer=lambda symbol: symbol,
+        candidate_executor=lambda *args, **kwargs: asyncio.sleep(0),
+        timeout_provider=lambda: 0.01,
+    )
+    results: dict[str, Any] = {"executions": [], "warnings": []}
+    open_positions, blocked = await service.review_open_positions(
+        feature_vectors={"BTC/USDT": object()},
+        results=results,
+        round_decision_ids=set(),
+        open_positions=[],
+        position_entry_pause_reason=None,
+        max_groups_override=3,
+        claimed_analysis_symbols=[],
+    )
+
+    assert stages == ["enforce_sl_tp", "review_open_positions"]
+    assert open_positions == [
+        {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"}
+    ]
+    assert blocked == set()
+    assert results["position_review_diagnostics"][0]["stage"] == "review_positions"
+    assert "持仓复盘阶段超时" in results["warnings"][0]["warning"]
 
 
 @pytest.mark.asyncio

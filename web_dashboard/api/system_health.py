@@ -48,6 +48,21 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+
+
 def _check_item(
     key: str,
     title: str,
@@ -135,6 +150,168 @@ async def _trading_service_running_item() -> dict[str, Any]:
     running = _dash._trading_service_is_running()
     paused = mode_manager.is_paused
     if not _dash._trading_service:
+        settings.refresh_runtime_env(force=True)
+        runtime_status = _dash._load_trading_runtime_status()
+        runtime_age = runtime_status.get("heartbeat_age_seconds")
+        decision_interval = int(
+            runtime_status.get("decision_interval") or settings.decision_interval_seconds
+        )
+        heartbeat_fresh_limit = max(float(decision_interval) * 4, 180.0)
+        if runtime_age is not None and float(runtime_age) <= heartbeat_fresh_limit:
+            runtime_paused = bool(runtime_status.get("paused", False))
+            runtime_running = bool(runtime_status.get("running", True))
+            last_round_started = runtime_status.get("last_round_started_at")
+            last_round_finished = runtime_status.get("last_round_finished_at")
+            round_active = bool(runtime_status.get("round_active", False))
+            round_running_seconds = 0.0
+            started_at = _as_utc_datetime(last_round_started)
+            finished_at = _as_utc_datetime(last_round_finished)
+            if started_at is not None and (finished_at is None or finished_at < started_at):
+                round_active = True
+                round_running_seconds = max((datetime.now(UTC) - started_at).total_seconds(), 0.0)
+            round_stuck_limit = max(float(decision_interval) * 2.5, 90.0)
+            round_stuck = round_active and round_running_seconds >= round_stuck_limit
+            market_started = _as_utc_datetime(runtime_status.get("last_market_round_started_at"))
+            market_finished = _as_utc_datetime(runtime_status.get("last_market_round_finished_at"))
+            market_round_active = bool(runtime_status.get("market_round_active", False)) or (
+                market_started is not None
+                and (market_finished is None or market_finished < market_started)
+            )
+            market_round_running_seconds = (
+                max((datetime.now(UTC) - market_started).total_seconds(), 0.0)
+                if market_round_active and market_started is not None
+                else 0.0
+            )
+            market_stuck_limit = max(
+                float(runtime_status.get("market_analysis_watchdog_seconds") or 0.0),
+                float(decision_interval) * 3.0,
+                60.0,
+            )
+            market_round_stuck = (
+                market_round_active and market_round_running_seconds >= market_stuck_limit
+            )
+            position_started = _as_utc_datetime(
+                runtime_status.get("last_position_round_started_at")
+            )
+            position_finished = _as_utc_datetime(
+                runtime_status.get("last_position_round_finished_at")
+            )
+            position_round_active = bool(runtime_status.get("position_round_active", False)) or (
+                position_started is not None
+                and (position_finished is None or position_finished < position_started)
+            )
+            position_round_running_seconds = (
+                max((datetime.now(UTC) - position_started).total_seconds(), 0.0)
+                if position_round_active and position_started is not None
+                else 0.0
+            )
+            position_stuck_limit = max(float(decision_interval) * 3.0, 60.0)
+            position_round_stuck = (
+                position_round_active and position_round_running_seconds >= position_stuck_limit
+            )
+            last_round_error = str(
+                runtime_status.get("last_round_error")
+                or runtime_status.get("market_last_error")
+                or runtime_status.get("position_last_error")
+                or ""
+            ).strip()
+            runtime_error = bool(last_round_error)
+            status = (
+                "warning"
+                if (
+                    runtime_paused
+                    or not runtime_running
+                    or round_stuck
+                    or market_round_stuck
+                    or position_round_stuck
+                    or runtime_error
+                )
+                else "ok"
+            )
+            message = (
+                "独立交易进程心跳正常，但当前处于暂停状态；不会分析新的交易对。"
+                if runtime_paused
+                else (
+                    "独立交易进程心跳正常，但市场分析轮次耗时过长；请查看 market_current_stage 定位卡住步骤。"
+                    if market_round_stuck
+                    else (
+                        "独立交易进程心跳正常，但持仓分析轮次耗时过长；请查看 position_current_stage 定位卡住步骤。"
+                        if position_round_stuck
+                        else (
+                            "独立交易进程心跳正常，但本轮分析耗时过长；请查看 current_stage 定位卡住步骤。"
+                            if round_stuck
+                            else (
+                                "独立交易进程心跳正常，但上一轮分析异常结束；请查看 last_round_error。"
+                                if runtime_error
+                                else "Dashboard 与交易引擎分离运行；独立交易进程心跳正常。"
+                            )
+                        )
+                    )
+                )
+            )
+            return _check_item(
+                "trading_service",
+                "交易主循环",
+                status,
+                message,
+                details={
+                    "source": "runtime_heartbeat",
+                    "mode": runtime_status.get("mode"),
+                    "running": runtime_running,
+                    "paused": runtime_paused,
+                    "current_stage": runtime_status.get("current_stage"),
+                    "market_current_stage": runtime_status.get("market_current_stage"),
+                    "position_current_stage": runtime_status.get("position_current_stage"),
+                    "round_active": round_active,
+                    "round_running_seconds": round(round_running_seconds, 3),
+                    "round_stuck_limit_seconds": round_stuck_limit,
+                    "round_stuck": round_stuck,
+                    "market_configured_symbol_limit": runtime_status.get(
+                        "market_configured_symbol_limit",
+                        runtime_status.get("market_batch_symbol_limit"),
+                    ),
+                    "market_configured_symbol_limit_is_batch_size": runtime_status.get(
+                        "market_configured_symbol_limit_is_batch_size", False
+                    ),
+                    "market_batch_policy": runtime_status.get("market_batch_policy"),
+                    "market_analysis_watchdog_seconds": runtime_status.get(
+                        "market_analysis_watchdog_seconds"
+                    ),
+                    "market_round_active": market_round_active,
+                    "market_round_running_seconds": round(market_round_running_seconds, 3),
+                    "market_round_stuck_limit_seconds": market_stuck_limit,
+                    "market_round_stuck": market_round_stuck,
+                    "position_round_active": position_round_active,
+                    "position_round_running_seconds": round(
+                        position_round_running_seconds,
+                        3,
+                    ),
+                    "position_round_stuck_limit_seconds": position_stuck_limit,
+                    "position_round_stuck": position_round_stuck,
+                    "decision_interval": decision_interval,
+                    "heartbeat_age_seconds": round(float(runtime_age), 3),
+                    "heartbeat_fresh_limit_seconds": heartbeat_fresh_limit,
+                    "last_round_started_at": last_round_started,
+                    "last_round_finished_at": last_round_finished,
+                    "last_market_round_started_at": runtime_status.get(
+                        "last_market_round_started_at"
+                    ),
+                    "last_market_round_finished_at": runtime_status.get(
+                        "last_market_round_finished_at"
+                    ),
+                    "last_position_round_started_at": runtime_status.get(
+                        "last_position_round_started_at"
+                    ),
+                    "last_position_round_finished_at": runtime_status.get(
+                        "last_position_round_finished_at"
+                    ),
+                    "market_last_error": runtime_status.get("market_last_error"),
+                    "position_last_error": runtime_status.get("position_last_error"),
+                    "runtime_error": runtime_error,
+                    "last_round_error": last_round_error,
+                },
+                repairable=False,
+            )
         try:
             activity = await _recent_trading_activity_snapshot()
         except Exception as exc:
@@ -231,18 +408,40 @@ def _okx_config_item(mode: str) -> dict[str, Any]:
     )
 
 
-def _configured_endpoint_items() -> list[dict[str, Any]]:
+def _configured_endpoint_items(
+    monitor_status: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    runtime = (
+        monitor_status.get("platform_runtime")
+        if isinstance(monitor_status, dict)
+        and isinstance(monitor_status.get("platform_runtime"), dict)
+        else {}
+    )
     model_configs = settings.get_fixed_ai_models(include_empty=False)
     configured_by_model = {
         str(item.get("model") or "").strip(): _mask_endpoint(item.get("api_base"))
         for item in model_configs
         if isinstance(item, dict)
     }
+    runtime_models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
+    for item in runtime_models:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        api_base = _mask_endpoint(item.get("api_base"))
+        if model and api_base:
+            configured_by_model[model] = api_base
     configured_by_model["local_ai_tools"] = _mask_endpoint(settings.local_ai_tools_api_base)
-    configured_by_model[str(getattr(settings, "high_risk_review_model", "") or "").strip()] = (
-        _mask_endpoint(getattr(settings, "high_risk_review_api_base", ""))
+    runtime_local_tools = (
+        runtime.get("local_ai_tools") if isinstance(runtime.get("local_ai_tools"), dict) else {}
     )
+    if runtime_local_tools.get("api_base"):
+        configured_by_model["local_ai_tools"] = _mask_endpoint(runtime_local_tools.get("api_base"))
+    high_risk_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
+    high_risk_base = _mask_endpoint(getattr(settings, "high_risk_review_api_base", ""))
+    if high_risk_model and high_risk_base:
+        configured_by_model[high_risk_model] = high_risk_base
     for model, expected in EXPECTED_PLATFORM_ENDPOINTS.items():
         actual = configured_by_model.get(model, "")
         if not actual:
@@ -600,21 +799,24 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
                 hard_gate_decisions.append(decision)
                 break
 
+    execution_status = "ok" if executed_orders else "info"
+    execution_message = (
+        f"最近 6 小时已有 {len(executed_orders)} 条成交订单。"
+        if executed_orders
+        else "最近 6 小时没有成交订单；这只表示策略没有提交/成交订单，不代表交易主循环异常。"
+    )
     items = [
         _check_item(
             "recent_execution",
             "最近执行结果",
-            "ok" if executed_orders else "warning",
-            (
-                f"最近 6 小时已有 {len(executed_orders)} 条成交订单。"
-                if executed_orders
-                else "最近 6 小时没有成交订单，请结合策略漏斗和模型状态继续排查。"
-            ),
+            execution_status,
+            execution_message,
             details={
                 "window_hours": 6,
                 "orders": len(orders),
                 "filled_orders": len(executed_orders),
                 "failed_or_unfilled_orders": len(failed_orders),
+                "is_system_failure": False,
             },
         )
     ]
@@ -726,7 +928,16 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
 async def system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [await _trading_service_running_item()]
     items.extend([_okx_config_item("paper"), _okx_config_item("live")])
-    items.extend(_configured_endpoint_items())
+    monitor_status: dict[str, Any] | None = None
+    try:
+        monitor_status = await get_server_monitor_status_async()
+    except Exception:
+        monitor_status = None
+    try:
+        endpoint_items = _configured_endpoint_items(monitor_status)
+    except TypeError:
+        endpoint_items = _configured_endpoint_items()
+    items.extend(endpoint_items)
     try:
         items.extend(await _data_source_items())
     except Exception as exc:
@@ -740,7 +951,8 @@ async def system_self_check() -> dict[str, Any]:
             )
         )
     try:
-        monitor_status = await get_server_monitor_status_async()
+        if monitor_status is None:
+            monitor_status = await get_server_monitor_status_async()
         items.extend(_server_monitor_items(monitor_status))
     except Exception as exc:
         items.append(

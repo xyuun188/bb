@@ -7,7 +7,10 @@ into the main trading loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -187,9 +190,32 @@ from services.trade_order_log_service import TradeOrderLogService
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.trading_policies import EntryPolicy, ExitPolicy
+from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass(slots=True)
+class _AnalysisRuntimeState:
+    """Runtime status for one independent analysis loop."""
+
+    current_stage: str = "idle"
+    last_started_at: datetime | None = None
+    last_finished_at: datetime | None = None
+    last_error: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.last_started_at is not None and (
+            self.last_finished_at is None or self.last_finished_at < self.last_started_at
+        )
+
+
+_analysis_scope_context: ContextVar[str | None] = ContextVar(
+    "analysis_scope_context",
+    default=None,
+)
 
 PRE_AGENT_SKILLS_ROLLBACK_MODE = False
 AGENT_SKILLS_TRADING_EFFECTS_ENABLED = True
@@ -205,10 +231,9 @@ PROFIT_PROTECTION_MIN_NET_USDT = 3.00
 PROFIT_PROTECTION_MIN_FEE_MULTIPLE = 4.0
 PROFIT_PROTECTION_STRONG_FEE_MULTIPLE = 5.0
 UNCONFIRMED_EXCHANGE_CLOSE_GRACE_SECONDS = 180.0
-ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS = 5.0
-ENTRY_PRICE_RECHECK_RESCUE_MAX_MOVE_PCT = 0.012
-ENTRY_PRICE_RECHECK_EXCEPTIONAL_MAX_MOVE_PCT = 0.020
-ENTRY_PRICE_RECHECK_EXPECTED_BUFFER_MULTIPLE = 2.0
+ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS = (
+    DEFAULT_TRADING_PARAMS.entry_price_guard.recheck_timeout_seconds
+)
 ENTRY_BLACK_SWAN_RECHECK_SAFE_1M_DROP = -0.08
 ENTRY_BLACK_SWAN_RECHECK_SAFE_5M_DROP = -0.12
 ENTRY_BLACK_SWAN_REBOUND_MIN_1M = 0.001
@@ -217,69 +242,25 @@ ENTRY_BLACK_SWAN_REBOUND_MIN_EXPECTED_NET = 0.60
 ENTRY_BLACK_SWAN_REBOUND_MIN_PROFIT_QUALITY = 1.00
 ENTRY_BLACK_SWAN_REBOUND_MIN_CONFIDENCE = 0.72
 ENTRY_BLACK_SWAN_REBOUND_MAX_SPREAD = 0.015
-ENTRY_NET_WEIGHT_AI = 0.25
-ENTRY_NET_WEIGHT_LOCAL_ML = 0.40
-ENTRY_NET_WEIGHT_SERVER_PROFIT = 0.08
-ENTRY_NET_WEIGHT_TIMESERIES = 0.22
-ENTRY_SMALL_WIN_BIG_LOSS_PENALTY_CAP = 0.90
-ENTRY_REALIZED_EDGE_BONUS_CAP = 0.85
-ENTRY_REALIZED_EDGE_PENALTY_CAP = 1.15
-ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER = 0.55
-ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT = 1.50
-ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE = 0.65
-ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = 1.05
-ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = 1.35
-ML_EXPECTED_RETURN_SCORE_CAP_PCT = 3.0
-QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = 0.18
-QUANT_PROFIT_PROBE_MIN_EDGE_PCT = 0.22
-QUANT_PROFIT_PROBE_MIN_CONCENTRATED_SHORT_LOSS_USDT = 5.0
-QUANT_PROFIT_PROBE_MIN_SCORE = 0.35
-QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO = 0.12
-ENTRY_DIRECTION_HARD_CONFLICT_GAP = 0.12
-ENTRY_DIRECTION_MIN_SUPPORT_SCORE = 0.02
-DYNAMIC_ENTRY_SCORE_ML_ALIGNED_STRONG = 0.75
-DYNAMIC_ENTRY_SCORE_ML_ALIGNED = 0.85
-DYNAMIC_ENTRY_SCORE_EXPERT_ALIGNED = 0.90
-ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = 1.50
-ENTRY_WEAK_HISTORY_MIN_PROFIT_QUALITY_RATIO = 2.00
-ENTRY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = 0.85
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = 1.05
-ENTRY_WEAK_HISTORY_MIN_SCORE = 3.20
-ENTRY_WEAK_HISTORY_MAX_SIZE = 0.025
-ENTRY_WEAK_HISTORY_MAX_LEVERAGE = 5.0
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE = 0.045
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_LEVERAGE = 8.0
-ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE = 0.02
-ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE = 4.0
+QUANT_PROFIT_PROBE_PARAMS = DEFAULT_TRADING_PARAMS.entry_quant_profit_probe
+QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO = QUANT_PROFIT_PROBE_PARAMS.min_profit_quality_ratio
 SYMBOL_SIDE_PROFILE_LOOKBACK = 2000
 SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS = 7.0
 ENTRY_LOSS_COOLDOWN_PARAMS = DEFAULT_TRADING_PARAMS.entry_loss_cooldown
-ENTRY_LOW_QUALITY_MAX_SIZE = 0.018
-ENTRY_LOW_QUALITY_MAX_LEVERAGE = 3.0
-ENTRY_HIGH_QUALITY_MIN_NOTIONAL_BALANCE_RATIO = 0.10
-ENTRY_NORMAL_MIN_NOTIONAL_BALANCE_RATIO = 0.06
-ENTRY_NOTIONAL_FLOOR_MAX_SIZE_PCT = 0.12
-ENTRY_HIGH_PROFIT_MIN_NOTIONAL_BALANCE_RATIO = 0.75
-ENTRY_HIGH_PROFIT_MIN_LEVERAGE = 8.0
-ENTRY_HIGH_PROFIT_ELITE_MIN_LEVERAGE = 10.0
-ENTRY_GOOD_PROBE_MIN_NOTIONAL_BALANCE_RATIO = 0.25
-ENTRY_WINNER_ADD_MIN_NOTIONAL_BALANCE_RATIO = 0.35
-ENTRY_STRONG_PROBE_MIN_NOTIONAL_BALANCE_RATIO = 0.45
-ENTRY_ELITE_MIN_NOTIONAL_BALANCE_RATIO = 0.60
-PORTFOLIO_ROSTER_FILL_MIN_EXPECTED_PCT = 0.08
-PORTFOLIO_ROSTER_FILL_MIN_EDGE_PCT = 0.08
-PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = 0.66
-PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = 0.20
-PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = 0.25
-PORTFOLIO_ROSTER_FILL_NOTIONAL_BALANCE_RATIO = 0.18
+LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+AUTO_SCAN_PARAMS = DEFAULT_TRADING_PARAMS.auto_scan
 AUTO_TRADE_MIN_NOTIONAL_24H = 4_000_000.0
 AUTO_TRADE_MIN_VOLUME_RATIO = 0.65
 AUTO_TRADE_MAX_VOLATILITY_20 = 0.085
 AUTO_TRADE_MAX_ABS_CHANGE_24H = 12.0
 ABNORMAL_WICK_TAIL_RISK_MAX_PCT = 60.0
-AUTO_SCAN_ROTATION_POOL_MULTIPLIER = 20
-AUTO_SCAN_ROTATION_POOL_MIN = 240
-ALT_LONG_ALLOWED_SYMBOLS = {"BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"}
+AUTO_SCAN_ROTATION_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.rotation_pool_multiplier
+AUTO_SCAN_ROTATION_POOL_MIN = AUTO_SCAN_PARAMS.rotation_pool_min
+AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.feature_fetch_pool_multiplier
+AUTO_SCAN_FEATURE_FETCH_POOL_MIN = AUTO_SCAN_PARAMS.feature_fetch_pool_min
+AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS = AUTO_SCAN_PARAMS.feature_fetch_timeout_seconds
+AUTO_SCAN_FEATURE_FETCH_CONCURRENCY = AUTO_SCAN_PARAMS.feature_fetch_concurrency
+ALT_LONG_ALLOWED_SYMBOLS = set(AUTO_SCAN_PARAMS.major_symbols)
 
 
 class TradingService:
@@ -348,6 +329,7 @@ class TradingService:
         self.market_analysis_service = MarketAnalysisService(
             run_once_provider=self.run_once,
             is_running_provider=self.is_running,
+            time_budget_provider=self.market_round_watchdog_seconds,
         )
         self.position_review_service = PositionReviewService(
             run_once_provider=self.run_once,
@@ -359,6 +341,7 @@ class TradingService:
             analysis_symbol_claimer=self.claim_analysis_symbol,
             symbol_normalizer=self.normalize_position_symbol,
             candidate_executor=self.execute_position_review_candidate,
+            timeout_provider=self.position_review_stage_timeout_seconds,
         )
         self._execution_lock = asyncio.Lock()
         self.entry_execution_pipeline = EntryExecutionPipeline(lambda: self.entry_policy)
@@ -849,16 +832,27 @@ class TradingService:
         self._current_stage = "idle"
         self._last_round_started_at: datetime | None = None
         self._last_round_finished_at: datetime | None = None
+        self._last_market_round_started_at: datetime | None = None
+        self._last_market_round_finished_at: datetime | None = None
+        self._last_position_round_started_at: datetime | None = None
+        self._last_position_round_finished_at: datetime | None = None
         self._last_round_error: str | None = None
+        self._analysis_runtime: dict[str, _AnalysisRuntimeState] = {
+            "market": _AnalysisRuntimeState(),
+            "position": _AnalysisRuntimeState(),
+            "full": _AnalysisRuntimeState(),
+        }
         self._pnl_history: dict[str, list[dict]] = {}  # model_name -> [{time, equity}, ...]
         self._new_pair_pause_reasons: dict[str, str] = {}
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
+        self._auto_scan_feature_cursor = 0
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
         self._market_analysis_task: asyncio.Task | None = None
         self._position_analysis_task: asyncio.Task | None = None
+        self._runtime_heartbeat_task: asyncio.Task | None = None
         self._ml_auto_train_task: asyncio.Task | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
@@ -872,6 +866,57 @@ class TradingService:
         """Set loop stage through an explicit analysis-service boundary."""
 
         self._set_loop_stage(stage)
+
+    def position_review_stage_timeout_seconds(self) -> float:
+        """Return the configured hard boundary for one position-review stage."""
+
+        return max(
+            10.0,
+            float(settings.ai_batch_expert_timeout_seconds or 0.0)
+            + float(settings.ai_decision_maker_timeout_seconds or 0.0)
+            + float(settings.local_ai_tools_timeout_seconds or 0.0),
+        )
+
+    def market_round_time_budget_seconds(self) -> float:
+        """Return the soft per-round scan budget used inside market analysis."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(8.0, interval * 0.90)
+
+    def market_round_watchdog_seconds(self) -> float:
+        """Return the hard watchdog for a genuinely stuck market-analysis round."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        expert_budget = (
+            float(settings.ai_batch_expert_timeout_seconds or 0.0)
+            + float(settings.ai_decision_maker_timeout_seconds or 0.0)
+            + float(settings.local_ai_tools_timeout_seconds or 0.0)
+        )
+        configured_watchdog = float(settings.market_analysis_watchdog_seconds or 180)
+        return max(configured_watchdog, interval * 4.0, expert_budget * 2.0)
+
+    def round_start_reconcile_timeout_seconds(self) -> float:
+        """Return the short OKX sync boundary used at analysis round start."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(3.0, min(8.0, interval * 0.25))
+
+    @staticmethod
+    def _round_elapsed_seconds(started_at: datetime) -> float:
+        return max((datetime.now(UTC) - started_at).total_seconds(), 0.0)
+
+    def _round_budget_exhausted(self, started_at: datetime) -> bool:
+        return self._round_elapsed_seconds(started_at) >= self.market_round_time_budget_seconds()
+
+    async def _runtime_heartbeat_loop(self) -> None:
+        """Keep split-process dashboard heartbeat fresh while a round is busy."""
+
+        while self._running:
+            self._write_runtime_heartbeat()
+            await asyncio.sleep(5.0)
 
     async def enforce_sl_tp_for_position_review(
         self,
@@ -943,7 +988,10 @@ class TradingService:
     def record_round_error(self, reason: str) -> None:
         """Record the latest loop error through an explicit service boundary."""
 
-        self._last_round_error = str(reason)[:300]
+        error_text = str(reason)[:300]
+        self._last_round_error = error_text
+        self._runtime_state().last_error = error_text
+        self._write_runtime_heartbeat()
 
     def increment_decision_count(self) -> None:
         """Increment the decision counter through an explicit service boundary."""
@@ -1561,6 +1609,54 @@ class TradingService:
             memory_feedback,
         )
 
+    async def _memory_context_with_vector_feedback(
+        self,
+        symbol: str,
+        *,
+        action: str = "",
+    ) -> dict[str, Any]:
+        """Return expert memory plus optional zvec/json vector-memory soft evidence."""
+
+        context = await self.expert_memory_service.context(symbol)
+        if not bool(settings.vector_memory_enabled):
+            return context
+        try:
+            vector_result = await get_vector_memory_service().search(
+                f"{symbol} {action} 开仓 亏损 盈利 复盘 相似历史",
+                top_k=6,
+                symbol=symbol,
+            )
+        except Exception as exc:
+            vector_result = {
+                "enabled": True,
+                "status": "error",
+                "error": safe_error_text(exc, limit=180),
+                "hits": [],
+            }
+        hits = vector_result.get("hits") if isinstance(vector_result, dict) else []
+        memory_feedback = (
+            dict(context.get("memory_feedback"))
+            if isinstance(context.get("memory_feedback"), dict)
+            else {}
+        )
+        memory_feedback["vector_memory"] = {
+            "enabled": (
+                bool(vector_result.get("enabled")) if isinstance(vector_result, dict) else True
+            ),
+            "status": (
+                str(vector_result.get("status") or "unknown")
+                if isinstance(vector_result, dict)
+                else "error"
+            ),
+            "matched_count": len(hits) if isinstance(hits, list) else 0,
+            "hits": hits[:3] if isinstance(hits, list) else [],
+            "is_hard_gate": False,
+            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+        }
+        context["memory_feedback"] = memory_feedback
+        context["vector_memory_feedback"] = memory_feedback["vector_memory"]
+        return context
+
     def _is_valid_feature_vector(self, fv: Any) -> bool:
         """Only send market snapshots with usable price data to AI models."""
         try:
@@ -1572,10 +1668,160 @@ class TradingService:
             return False
         return max(price, close, bid, ask) > 0
 
-    def _set_loop_stage(self, stage: str, error: str | None = None) -> None:
-        self._current_stage = stage
+    def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
+        resolved_scope = scope or _analysis_scope_context.get() or "full"
+        if resolved_scope not in self._analysis_runtime:
+            resolved_scope = "full"
+        return self._analysis_runtime[resolved_scope]
+
+    def _start_runtime_round(self, scope: str, started_at: datetime) -> None:
+        state = self._runtime_state(scope)
+        state.current_stage = "starting"
+        state.last_started_at = started_at
+        state.last_finished_at = None
+        state.last_error = None
+        self._last_round_started_at = started_at
+        self._last_round_finished_at = None
+        self._last_round_error = None
+        if scope == "market":
+            self._last_market_round_started_at = started_at
+            self._last_market_round_finished_at = None
+        elif scope == "position":
+            self._last_position_round_started_at = started_at
+            self._last_position_round_finished_at = None
+
+    def _finish_runtime_round(self, scope: str, finished_at: datetime, *, ok: bool) -> None:
+        state = self._runtime_state(scope)
+        state.last_finished_at = finished_at
+        state.current_stage = "idle" if ok else "error"
+        if scope == "market":
+            self._last_market_round_finished_at = finished_at
+        elif scope == "position":
+            self._last_position_round_finished_at = finished_at
+        active_states = [
+            item
+            for item_scope, item in self._analysis_runtime.items()
+            if item_scope in {"market", "position"} and item.active
+        ]
+        if active_states:
+            newest = max(
+                active_states,
+                key=lambda item: item.last_started_at or datetime.min.replace(tzinfo=UTC),
+            )
+            self._last_round_started_at = newest.last_started_at
+            self._last_round_finished_at = None
+            self._current_stage = newest.current_stage
+        else:
+            self._last_round_finished_at = finished_at
+            self._current_stage = "idle" if ok else "error"
+
+    def _set_loop_stage(
+        self,
+        stage: str,
+        error: str | None = None,
+        *,
+        scope: str | None = None,
+    ) -> None:
+        resolved_scope = scope or _analysis_scope_context.get() or "full"
+        state = self._runtime_state(resolved_scope)
+        state.current_stage = stage
         if error is not None:
-            self._last_round_error = str(error)[:300]
+            state.last_error = str(error)[:300]
+            self._last_round_error = state.last_error
+        self._current_stage = stage
+        self._write_runtime_heartbeat()
+
+    def _write_runtime_heartbeat(self) -> None:
+        """Persist a lightweight status heartbeat for split dashboard deployments."""
+        try:
+            settings.refresh_runtime_env(force=True)
+            now = datetime.now(UTC)
+            uptime = (
+                int((now - self._start_time).total_seconds()) if self._start_time is not None else 0
+            )
+            market_state = self._runtime_state("market")
+            position_state = self._runtime_state("position")
+            active_scoped_states = [
+                state for state in (market_state, position_state) if state.active
+            ]
+            round_active = bool(active_scoped_states) or (
+                self._last_round_started_at is not None
+                and (
+                    self._last_round_finished_at is None
+                    or self._last_round_finished_at < self._last_round_started_at
+                )
+            )
+            current_state = (
+                max(
+                    active_scoped_states,
+                    key=lambda state: state.last_started_at or datetime.min.replace(tzinfo=UTC),
+                )
+                if active_scoped_states
+                else self._runtime_state(_analysis_scope_context.get())
+            )
+            last_round_error = (
+                market_state.last_error or position_state.last_error or self._last_round_error
+            )
+            payload = {
+                "running": bool(self._running),
+                "mode": mode_manager.mode.value,
+                "paused": mode_manager.is_paused,
+                "scan_mode": mode_manager.scan_mode,
+                "started_at": self._start_time.isoformat() if self._start_time else None,
+                "heartbeat_at": now.isoformat(),
+                "last_heartbeat_at": now.isoformat(),
+                "uptime_seconds": uptime,
+                "decision_interval": settings.decision_interval_seconds,
+                "market_configured_symbol_limit": settings.auto_scan_symbol_limit,
+                "market_configured_symbol_limit_is_batch_size": False,
+                "market_batch_policy": (
+                    "position_first_parallel_loops; actual market batch is dynamic"
+                ),
+                "market_analysis_watchdog_seconds": int(self.market_round_watchdog_seconds()),
+                "current_stage": current_state.current_stage,
+                "round_active": round_active,
+                "market_current_stage": market_state.current_stage,
+                "market_round_active": market_state.active,
+                "market_last_error": market_state.last_error,
+                "position_current_stage": position_state.current_stage,
+                "position_round_active": position_state.active,
+                "position_last_error": position_state.last_error,
+                "last_round_started_at": (
+                    self._last_round_started_at.isoformat() if self._last_round_started_at else None
+                ),
+                "last_round_finished_at": (
+                    self._last_round_finished_at.isoformat()
+                    if self._last_round_finished_at
+                    else None
+                ),
+                "last_market_round_started_at": (
+                    market_state.last_started_at.isoformat()
+                    if market_state.last_started_at
+                    else None
+                ),
+                "last_market_round_finished_at": (
+                    market_state.last_finished_at.isoformat()
+                    if market_state.last_finished_at
+                    else None
+                ),
+                "last_position_round_started_at": (
+                    position_state.last_started_at.isoformat()
+                    if position_state.last_started_at
+                    else None
+                ),
+                "last_position_round_finished_at": (
+                    position_state.last_finished_at.isoformat()
+                    if position_state.last_finished_at
+                    else None
+                ),
+                "last_round_error": last_round_error,
+            }
+            path = settings.data_dir / "trading_runtime_status.json"
+            tmp_path = path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(path)
+        except Exception as exc:
+            logger.debug("failed to write trading runtime heartbeat", error=safe_error_text(exc))
 
     async def _reconcile_exchange_positions_with_timeout(
         self,
@@ -1642,6 +1888,58 @@ class TradingService:
                 error=safe_error_text(e),
             )
         return None
+
+    def _budget_auto_scan_feature_symbols(
+        self,
+        fetch_symbols: list[str],
+        position_scan_symbols: list[str],
+        *,
+        configured_limit: int,
+    ) -> list[str]:
+        """Limit expensive feature fetches per round while rotating the full pool."""
+
+        if not fetch_symbols:
+            return []
+        normalized_position = {
+            self._normalize_position_symbol(symbol)
+            for symbol in position_scan_symbols
+            if self._normalize_position_symbol(symbol)
+        }
+        position_symbols = [
+            symbol
+            for symbol in fetch_symbols
+            if self._normalize_position_symbol(symbol) in normalized_position
+        ]
+        market_symbols = [
+            symbol
+            for symbol in fetch_symbols
+            if self._normalize_position_symbol(symbol) not in normalized_position
+        ]
+        market_budget = max(
+            configured_limit,
+            configured_limit * int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
+            int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
+        )
+        market_budget = min(len(market_symbols), market_budget)
+        if market_budget <= 0:
+            return self.entry_symbol_universe.dedupe_symbols(position_symbols)
+
+        cursor = int(getattr(self, "_auto_scan_feature_cursor", 0) or 0)
+        start = cursor % len(market_symbols)
+        rotated = market_symbols[start:] + market_symbols[:start]
+        selected_market = rotated[:market_budget]
+        self._auto_scan_feature_cursor = (start + market_budget) % len(market_symbols)
+        selected = self.entry_symbol_universe.dedupe_symbols([*position_symbols, *selected_market])
+        logger.info(
+            "auto scan feature fetch budget selected",
+            total_candidates=len(fetch_symbols),
+            position_symbols=len(position_symbols),
+            market_candidates=len(market_symbols),
+            selected=len(selected),
+            market_budget=market_budget,
+            next_cursor=self._auto_scan_feature_cursor,
+        )
+        return selected
 
     async def _price_action_black_swan_false_positive(
         self,
@@ -2520,14 +2818,18 @@ class TradingService:
         # and actual order execution. Paper mode means OKX demo trading, not a
         # local fake fill.
         self.okx_executor = None
-        self._okx_paper = OKXExecutor(mode="paper")
+        self._okx_paper = OKXExecutor(mode="paper", load_markets_on_initialize=False)
         try:
             await self._okx_paper.initialize()
             logger.info("okx paper executor initialized")
         except Exception as e:
             logger.warning("okx paper executor init failed", error=safe_error_text(e))
             self._okx_paper = None
-        self._okx_live = OKXExecutor(mode="live") if self._has_live_models() else None
+        self._okx_live = (
+            OKXExecutor(mode="live", load_markets_on_initialize=False)
+            if self._has_live_models()
+            else None
+        )
         if self._okx_live is not None:
             try:
                 await self._okx_live.initialize()
@@ -2566,6 +2868,7 @@ class TradingService:
 
         Returns a summary dict for dashboard/notifications.
         """
+        settings.refresh_runtime_env(force=True)
         if not self._running:
             return {"status": "stopped"}
 
@@ -2597,9 +2900,9 @@ class TradingService:
         round_decision_ids: set[int] = set()
         claimed_analysis_symbols: list[str] = []
         claimed_symbol_keys: set[str] = set()
-        self._last_round_started_at = round_start
-        self._last_round_finished_at = None
-        self._last_round_error = None
+        published_dashboard_update = False
+        scope_token = _analysis_scope_context.set(analysis_scope)
+        self._start_runtime_round(analysis_scope, round_start)
         self._set_loop_stage("starting")
 
         try:
@@ -2610,7 +2913,10 @@ class TradingService:
             # 0. Refresh per-model execution mode mapping from current config
             self._refresh_model_modes()
             self._set_loop_stage("sync_exchange_positions")
-            await self.okx_sync_service.reconcile_positions("round start")
+            await self.okx_sync_service.reconcile_positions(
+                f"{analysis_scope} round start",
+                timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+            )
             self._set_loop_stage("load_open_positions")
             open_positions = await self.okx_sync_service.get_open_positions_context()
             await self._recover_pending_exit_decisions(
@@ -2750,31 +3056,74 @@ class TradingService:
                     *position_scan_symbols,
                 ]
             )
+            if run_market_analysis and mode_manager.is_auto_scan:
+                fetch_symbols = self._budget_auto_scan_feature_symbols(
+                    fetch_symbols,
+                    position_scan_symbols,
+                    configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
+                )
             if not fetch_symbols:
+                diagnostics = {
+                    "scan_symbol_count": len(scan_symbols or []),
+                    "scan_symbol_sample": list(scan_symbols or [])[:10],
+                    "market_scan_after_blocked": len(blocked_filter.symbols),
+                    "blocked_count": len(blocked_filter.skipped),
+                    "blocked_sample": [
+                        {"symbol": item.symbol, "reason": item.reason}
+                        for item in blocked_filter.skipped[:5]
+                    ],
+                    "open_position_filtered_count": len(open_position_filter.skipped),
+                    "open_position_filtered_sample": open_position_filter.skipped[:10],
+                    "unclaimed_filtered_count": (
+                        len(unclaimed_filter.skipped) if run_market_analysis else 0
+                    ),
+                    "unclaimed_filtered_sample": (
+                        unclaimed_filter.skipped[:10] if run_market_analysis else []
+                    ),
+                    "position_scan_symbol_count": len(position_scan_symbols),
+                    "run_market_analysis": run_market_analysis,
+                    "run_position_analysis": run_position_analysis,
+                    "active_analysis_symbols_sample": (
+                        sorted(active_analysis_symbols)[:10] if run_market_analysis else []
+                    ),
+                    "new_pair_pause_reason": new_pair_pause_reason,
+                }
+                results["scan_filter_diagnostics"] = diagnostics
                 if new_pair_market_pause_applied and not run_position_analysis:
                     logger.info(
                         "market analysis skipped because new-pair pause is active",
                         reason=new_pair_pause_reason,
+                        **diagnostics,
                     )
                 elif open_positions and run_position_analysis:
-                    logger.warning("no feature symbols available for open-position review")
+                    logger.warning(
+                        "no feature symbols available for open-position review",
+                        **diagnostics,
+                    )
                 else:
-                    logger.warning("all scan symbols skipped before AI analysis")
-                round_duration = (datetime.now(UTC) - round_start).total_seconds()
-                results["duration_ms"] = round(round_duration * 1000)
-                self._last_round_finished_at = datetime.now(UTC)
-                self._set_loop_stage("idle")
+                    logger.warning("all scan symbols skipped before AI analysis", **diagnostics)
                 return results
 
             # 2. Get feature vectors for target symbols (parallel, with concurrency limit)
             self._set_loop_stage("fetch_features")
             feature_vectors = {}
-            sem = asyncio.Semaphore(8)  # Limit concurrent data fetches
+            sem = asyncio.Semaphore(max(1, int(AUTO_SCAN_FEATURE_FETCH_CONCURRENCY)))
+            feature_timeout = max(1.0, float(AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS))
 
             async def fetch_fv(sym):
                 async with sem:
                     try:
-                        return sym, await self.data_service.get_feature_vector(sym)
+                        return sym, await asyncio.wait_for(
+                            self.data_service.get_feature_vector(sym),
+                            timeout=feature_timeout,
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "feature vector timed out",
+                            symbol=sym,
+                            timeout_seconds=feature_timeout,
+                        )
+                        return sym, None
                     except Exception as e:
                         logger.warning(
                             "feature vector failed",
@@ -2783,8 +3132,47 @@ class TradingService:
                         )
                         return sym, None
 
-            tasks = [fetch_fv(s) for s in fetch_symbols]
-            fv_results = await asyncio.gather(*tasks)
+            tasks = [asyncio.create_task(fetch_fv(s)) for s in fetch_symbols]
+            batch_timeout = max(
+                feature_timeout + 2.0,
+                feature_timeout
+                * (max(1, len(fetch_symbols)) / max(1, int(AUTO_SCAN_FEATURE_FETCH_CONCURRENCY)))
+                + 2.0,
+            )
+            batch_timeout = min(
+                batch_timeout,
+                max(8.0, float(settings.decision_interval_seconds) * 0.80),
+            )
+            done, pending = await asyncio.wait(tasks, timeout=batch_timeout)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                logger.warning(
+                    "feature vector batch reached time budget; cancelling slow sources",
+                    symbol_count=len(fetch_symbols),
+                    completed=len(done),
+                    pending=len(pending),
+                    timeout_seconds=round(batch_timeout, 3),
+                )
+                results.setdefault("warnings", []).append(
+                    {
+                        "model": ENSEMBLE_TRADER_NAME,
+                        "symbol": "ALL",
+                        "warning": ("本轮行情特征批量拉取超时，系统已跳过剩余候选并进入下一轮。"),
+                    }
+                )
+            fv_results = []
+            for task in done:
+                try:
+                    fv_results.append(task.result())
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "feature vector task failed after batch wait",
+                        error=safe_error_text(exc),
+                    )
             feature_vectors = {s: fv for s, fv in fv_results if fv is not None}
             invalid_symbols = [
                 s for s, fv in feature_vectors.items() if not self._is_valid_feature_vector(fv)
@@ -2801,10 +3189,6 @@ class TradingService:
 
             if not feature_vectors:
                 logger.warning("no feature vectors available")
-                round_duration = (datetime.now(UTC) - round_start).total_seconds()
-                results["duration_ms"] = round(round_duration * 1000)
-                self._last_round_finished_at = datetime.now(UTC)
-                self._set_loop_stage("idle")
                 return results
 
             market_scan_keys = {
@@ -2925,6 +3309,7 @@ class TradingService:
             # 3. Collect all entry decisions from all symbols/models
             all_candidates: list[tuple[str, str, DecisionOutput, Any, int | None]] = []
             staged_entry_counts = self.entry_capacity.empty_staged_counts()
+            market_round_skipped_by_budget: list[str] = []
 
             if new_pair_market_pause_applied:
                 self.market_decision_result_recorder.append_result(
@@ -2938,7 +3323,37 @@ class TradingService:
                     reason=new_pair_pause_reason,
                 )
 
-            for symbol, fv in market_feature_vectors.items():
+            market_feature_items = list(market_feature_vectors.items())
+            for market_index, (symbol, fv) in enumerate(market_feature_items):
+                if market_index > 0 and self._round_budget_exhausted(round_start):
+                    remaining = [
+                        item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
+                    ]
+                    market_round_skipped_by_budget = remaining
+                    budget_seconds = self.market_round_time_budget_seconds()
+                    elapsed_seconds = self._round_elapsed_seconds(round_start)
+                    warning = (
+                        "本轮市场 AI 分析已达到调度时间预算，剩余候选顺延到后续轮次；"
+                        "这不是开仓门槛，只用于防止单轮分析拖住系统心跳。"
+                    )
+                    logger.warning(
+                        "market analysis round reached time budget",
+                        elapsed_seconds=round(elapsed_seconds, 3),
+                        budget_seconds=round(budget_seconds, 3),
+                        skipped_count=len(remaining),
+                        skipped_symbols=remaining[:10],
+                    )
+                    results.setdefault("warnings", []).append(
+                        {
+                            "model": ENSEMBLE_TRADER_NAME,
+                            "symbol": "ALL",
+                            "warning": warning,
+                            "elapsed_seconds": round(elapsed_seconds, 3),
+                            "budget_seconds": round(budget_seconds, 3),
+                            "skipped_symbols": remaining[:20],
+                        }
+                    )
+                    break
                 quarantine_reason = self.entry_symbol_profit_quarantine.reason(
                     symbol,
                     strategy_mode_context,
@@ -2967,7 +3382,7 @@ class TradingService:
                 feature_vectors[symbol] = fv
                 model_name = ENSEMBLE_TRADER_NAME
                 model_mode = self._get_model_execution_mode(model_name)
-                memory_context = await self.expert_memory_service.context(symbol)
+                memory_context = await self._memory_context_with_vector_feedback(symbol)
                 ml_signal_context = self.ml_signal_service.predict(fv)
                 local_ai_tools_context = await self._local_ai_tools_context(
                     fv,
@@ -3367,6 +3782,20 @@ class TradingService:
                 )
                 continue
 
+            if market_round_skipped_by_budget:
+                results["market_analysis_budget"] = {
+                    "budget_seconds": round(self.market_round_time_budget_seconds(), 3),
+                    "elapsed_seconds": round(self._round_elapsed_seconds(round_start), 3),
+                    "processed_symbols": int(results.get("symbols_processed") or 0),
+                    "deferred_symbols": market_round_skipped_by_budget[:50],
+                    "deferred_count": len(market_round_skipped_by_budget),
+                    "is_entry_gate": False,
+                    "reason": (
+                        "市场分析轮次达到调度预算，剩余币种通过滚动扫描顺延；"
+                        "该预算不参与开仓风控评分。"
+                    ),
+                }
+
             ranked_entry_candidates = self._entry_candidate_queue_policy().ranked(
                 all_candidates,
                 strategy_mode_context,
@@ -3453,7 +3882,22 @@ class TradingService:
 
             # 6. Push updates to dashboard
             await self._publish_dashboard_update(results)
+            published_dashboard_update = True
 
+        except asyncio.CancelledError:
+            error_text = (
+                f"{analysis_scope} analysis round cancelled by hard watchdog "
+                f"after {round(self._round_elapsed_seconds(round_start), 3)} seconds."
+            )
+            self._set_loop_stage("watchdog_cancelled", error_text)
+            results["status"] = "error"
+            results["error"] = error_text
+            logger.error(
+                "trading loop iteration cancelled by watchdog",
+                scope=analysis_scope,
+                elapsed_seconds=round(self._round_elapsed_seconds(round_start), 3),
+            )
+            raise
         except Exception as e:
             error_text = safe_error_text(e, limit=180)
             self._set_loop_stage("error", error_text)
@@ -3465,13 +3909,28 @@ class TradingService:
             results["status"] = "error"
             results["error"] = error_text
 
-        for symbol in claimed_analysis_symbols:
-            await self._release_analysis_symbol(symbol)
-        claimed_analysis_symbols.clear()
-        round_duration = (datetime.now(UTC) - round_start).total_seconds()
-        results["duration_ms"] = round(round_duration * 1000)
-        self._last_round_finished_at = datetime.now(UTC)
-        self._set_loop_stage("idle" if results.get("status") == "ok" else "error")
+        finally:
+            for symbol in claimed_analysis_symbols:
+                await self._release_analysis_symbol(symbol)
+            claimed_analysis_symbols.clear()
+            round_duration = (datetime.now(UTC) - round_start).total_seconds()
+            results["duration_ms"] = round(round_duration * 1000)
+            finished_at = datetime.now(UTC)
+            self._finish_runtime_round(
+                analysis_scope,
+                finished_at,
+                ok=results.get("status") == "ok",
+            )
+            self._write_runtime_heartbeat()
+            if not published_dashboard_update:
+                try:
+                    await self._publish_dashboard_update(results)
+                except Exception as exc:
+                    logger.debug(
+                        "dashboard update publish failed during loop finalization",
+                        error=safe_error_text(exc),
+                    )
+            _analysis_scope_context.reset(scope_token)
         return results
 
     async def start(self) -> None:
@@ -3480,22 +3939,35 @@ class TradingService:
         self._running = True
         self._start_time = datetime.now(UTC)
         self._start_ml_auto_train_loop()
+
+        def position_loop_interval() -> float:
+            settings.refresh_runtime_env(force=True)
+            return max(5.0, float(settings.decision_interval_seconds) * 0.65)
+
+        def market_loop_interval() -> float:
+            settings.refresh_runtime_env(force=True)
+            return max(8.0, float(settings.decision_interval_seconds))
+
         logger.info(
             "trading service started",
             mode=mode_manager.mode.value,
             scheduler="parallel_market_position",
+            decision_interval_seconds=settings.decision_interval_seconds,
         )
 
         self._position_analysis_task = asyncio.create_task(
-            self.position_review_service.loop(
-                max(5.0, float(settings.decision_interval_seconds) * 0.65)
-            )
+            self.position_review_service.loop(position_loop_interval)
         )
         self._market_analysis_task = asyncio.create_task(
-            self.market_analysis_service.loop(max(8.0, float(settings.decision_interval_seconds)))
+            self.market_analysis_service.loop(market_loop_interval)
         )
+        self._runtime_heartbeat_task = asyncio.create_task(self._runtime_heartbeat_loop())
         try:
-            await asyncio.gather(self._position_analysis_task, self._market_analysis_task)
+            await asyncio.gather(
+                self._position_analysis_task,
+                self._market_analysis_task,
+                self._runtime_heartbeat_task,
+            )
         except asyncio.CancelledError:
             pass
 
@@ -3503,7 +3975,11 @@ class TradingService:
         """Stop the trading loop gracefully."""
         self._running = False
         await self._stop_ml_auto_train_loop()
-        for task in (self._position_analysis_task, self._market_analysis_task):
+        for task in (
+            self._position_analysis_task,
+            self._market_analysis_task,
+            self._runtime_heartbeat_task,
+        ):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -3512,6 +3988,7 @@ class TradingService:
                     pass
         self._position_analysis_task = None
         self._market_analysis_task = None
+        self._runtime_heartbeat_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self.okx_executor, self._okx_paper, self._okx_live):
@@ -3605,12 +4082,22 @@ class TradingService:
             )
             from services.training_data_quality import annotate_training_payload
 
-            shadow_samples = await _load_shadow_samples(20000)
-            trade_reflection_samples = await _load_trade_reflection_samples(8000)
-            closed_position_samples = await _load_closed_position_samples(8000)
+            shadow_samples = await _load_shadow_samples(
+                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+            )
+            trade_reflection_samples = await _load_trade_reflection_samples(
+                LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+            )
+            closed_position_samples = await _load_closed_position_samples(
+                LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+            )
             trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
-            sequence_samples = await _load_sequence_samples(12000)
-            text_sentiment_samples = await _load_text_sentiment_samples(8000)
+            sequence_samples = await _load_sequence_samples(
+                LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
+            )
+            text_sentiment_samples = await _load_text_sentiment_samples(
+                LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
+            )
             training_payload = annotate_training_payload(
                 shadow_samples=shadow_samples,
                 trade_samples=trade_samples,
@@ -3640,19 +4127,37 @@ class TradingService:
         learning_only = not bool(
             (status or {}).get("model_bundle_available", (status or {}).get("available"))
         )
-        min_interval_seconds = 2 * 60 * 60 if learning_only else 6 * 60 * 60
-        min_new_shadow = 120 if learning_only else 500
-        min_new_trade = 15 if learning_only else 50
+        min_interval_seconds = (
+            LOCAL_ML_TRAINING_PARAMS.auto_train_learning_only_interval_seconds
+            if learning_only
+            else LOCAL_ML_TRAINING_PARAMS.auto_train_min_interval_seconds
+        )
+        min_new_shadow = (
+            LOCAL_ML_TRAINING_PARAMS.auto_train_learning_only_min_new_samples
+            if learning_only
+            else LOCAL_ML_TRAINING_PARAMS.auto_train_min_new_samples
+        )
+        min_new_trade = (
+            LOCAL_ML_TRAINING_PARAMS.local_tools_learning_only_min_new_trade_samples
+            if learning_only
+            else LOCAL_ML_TRAINING_PARAMS.local_tools_min_new_trade_samples
+        )
         training_policy = {
             "learning_only": learning_only,
             "min_interval_seconds": min_interval_seconds,
             "min_new_shadow_samples": min_new_shadow,
             "min_new_trade_samples": min_new_trade,
-            "min_training_shadow_samples": 200,
+            "min_training_shadow_samples": LOCAL_ML_TRAINING_PARAMS.min_training_samples,
+            "training_shadow_sample_limit": (LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit),
+            "training_trade_sample_limit": LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
+            "training_sequence_sample_limit": (
+                LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
+            ),
+            "training_text_sample_limit": LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
             "cursor_source": "last_trained_completed_shadow_sample_count",
             "trade_cursor_source": "last_trained_completed_trade_sample_count",
         }
-        if completed_shadow_total < 200:
+        if completed_shadow_total < LOCAL_ML_TRAINING_PARAMS.min_training_samples:
             return {
                 "trained": False,
                 "reason": "not_enough_shadow_samples",
@@ -3686,7 +4191,9 @@ class TradingService:
                 "trainable_trade_sample_count": trainable_trade_count,
                 "quality_report": quality_report,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
-                "training_shadow_sample_limit": 20000,
+                "training_shadow_sample_limit": (
+                    LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+                ),
                 "completed_trade_sample_count": completed_trade_total,
                 "last_trained_completed_trade_sample_count": previous_completed_trade_total,
                 "new_shadow_sample_count": new_shadow,
@@ -3715,7 +4222,9 @@ class TradingService:
             result["trainable_shadow_sample_count"] = trainable_shadow_count
             result["trainable_trade_sample_count"] = trainable_trade_count
             result["quality_report"] = quality_report
-            result["training_shadow_sample_limit"] = 20000
+            result["training_shadow_sample_limit"] = (
+                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+            )
             result["training_policy"] = training_policy
             self._local_tools_last_completed_shadow_count = completed_shadow_total
             logger.info(
@@ -4046,7 +4555,7 @@ class TradingService:
         open_positions = await self.okx_sync_service.get_open_positions_context()
 
         # Manual trades also use the unified multi-model ensemble.
-        memory_context = await self.expert_memory_service.context(symbol)
+        memory_context = await self._memory_context_with_vector_feedback(symbol)
         ml_signal_context = self.ml_signal_service.predict(fv)
         local_ai_tools_context = await self._local_ai_tools_context(
             fv,
@@ -5612,7 +6121,11 @@ class TradingService:
         max_loss_usdt = okx_allocatable * max_loss_pct if max_loss_pct > 0 else 0.0
         allocation_state = await self.execution_allocation_state(model_mode)
         total_pnl = float(allocation_state.get("total_pnl") or 0.0)
-        min_available = max(10.0, okx_allocatable * 0.005)
+        account_guard = DEFAULT_TRADING_PARAMS.entry_account_guard
+        min_available = max(
+            account_guard.min_available_balance_usdt,
+            okx_allocatable * account_guard.min_available_balance_ratio,
+        )
         if okx_available <= min_available:
             return (
                 f"OKX 可交易余额过低：当前可用 {okx_available:.2f} USDT，"
@@ -5633,11 +6146,15 @@ class TradingService:
             current_positions=model_positions,
             account_balance=okx_allocatable,
             min_new_margin_pct=min(
-                max(float(settings.max_position_pct or 0.12) / 6.0, 0.02),
+                max(
+                    float(settings.max_position_pct or 0.12)
+                    / account_guard.capacity_min_new_margin_divisor,
+                    account_guard.capacity_min_new_margin_floor_pct,
+                ),
                 float(settings.max_position_pct or 0.12),
             ),
-            default_leverage=5.0,
-            default_stop_loss_pct=0.05,
+            default_leverage=account_guard.capacity_default_leverage,
+            default_stop_loss_pct=account_guard.capacity_default_stop_loss_pct,
         )
         if capacity_reason:
             logger.info(
@@ -5711,18 +6228,81 @@ class TradingService:
         selected_mode = "live" if mode == "live" else "paper"
         if selected_mode == "paper":
             if self._okx_paper is None:
-                self._okx_paper = OKXExecutor(mode="paper")
+                self._okx_paper = OKXExecutor(
+                    mode="paper",
+                    load_markets_on_initialize=False,
+                )
                 await self._okx_paper.initialize()
             return self._okx_paper
 
         if self._okx_live is None:
-            self._okx_live = OKXExecutor(mode="live")
+            self._okx_live = OKXExecutor(
+                mode="live",
+                load_markets_on_initialize=False,
+            )
             await self._okx_live.initialize()
         return self._okx_live
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
         """Return the actual OKX free USDT balance used to cap new entries."""
         return await self.account_accounting_service.okx_available_balance_for_mode(mode)
+
+    async def _paper_analysis_balance_snapshot(self) -> dict[str, Any] | None:
+        """Return the paper account's analysis budget snapshot.
+
+        Paper/demo mode may still submit orders through OKX demo and validate
+        exchange rules at execution time. New-opportunity analysis, however,
+        must not stop for hours just because the OKX balance REST endpoint is
+        slow. When no in-process paper executor exists, fall back to the
+        configured paper execution budget so the strategy loop can keep
+        producing decisions with a clear degraded source marker.
+        """
+
+        executor = getattr(self, "paper_executor", None)
+        summary: dict[str, Any] = {}
+        source = "paper_configured_budget"
+        degraded = True
+        if executor is not None:
+            try:
+                summary = await executor.get_account_summary(ENSEMBLE_TRADER_NAME)
+            except Exception as exc:
+                logger.warning(
+                    "failed to build paper virtual balance snapshot",
+                    error=safe_error_text(exc),
+                )
+            else:
+                source = "paper_virtual_account"
+                degraded = False
+
+        cfg = settings.get_execution_account_config("paper")
+        configured_budget = self._safe_float(cfg.get("allocated_balance"), 0.0)
+        if configured_budget <= 0:
+            configured_budget = self._safe_float(settings.initial_virtual_balance, 0.0)
+
+        available = self._safe_float(summary.get("available_balance"), configured_budget)
+        equity = self._safe_float(summary.get("equity"), available)
+        wallet = self._safe_float(summary.get("wallet_balance"), max(equity, available))
+        used = self._safe_float(summary.get("used_margin"), 0.0)
+        total = (
+            max(equity, wallet, available)
+            if source == "paper_virtual_account"
+            else max(equity, wallet, available, configured_budget)
+        )
+        if total <= 0 and available <= 0:
+            return None
+
+        return {
+            "free": max(available, 0.0),
+            "used": max(used, 0.0),
+            "total": max(total, 0.0),
+            "cash": max(wallet, available, 0.0),
+            "equity": max(equity, total, 0.0),
+            "allocatable": max(available, 0.0),
+            "source": source,
+            "exchange_required": False,
+            "degraded": degraded,
+            "analysis_only_balance": True,
+        }
 
     async def _get_okx_balance_snapshot_for_mode(self, mode: str) -> dict[str, Any] | None:
         """Return OKX USDT balance fields for allocation and order sizing."""
@@ -5766,7 +6346,7 @@ class TradingService:
             CCXT request while a brand-new OKX client succeeds. Do one isolated
             balance pull before treating the account as unavailable.
             """
-            fallback = OKXExecutor(mode=selected_mode)
+            fallback = OKXExecutor(mode=selected_mode, load_markets_on_initialize=False)
             try:
                 await asyncio.wait_for(fallback.initialize(), timeout=12.0)
                 snapshot = await asyncio.wait_for(
@@ -5814,13 +6394,22 @@ class TradingService:
                         error=safe_error_text(exc),
                     )
 
-        executor = self._okx_live if selected_mode == "live" else self._okx_paper
+        executor = (
+            getattr(self, "_okx_live", None)
+            if selected_mode == "live"
+            else getattr(self, "_okx_paper", None)
+        )
         if not executor:
             try:
                 executor = await self._get_okx_executor_for_mode(selected_mode)
             except Exception as exc:
                 reason = f"executor unavailable: {safe_error_text(exc)}"
-                return cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                if fallback_snapshot:
+                    return fallback_snapshot
+                if selected_mode == "paper":
+                    return await self._paper_analysis_balance_snapshot()
+                return None
         try:
             snapshot = await asyncio.wait_for(
                 executor.get_balance_snapshot("USDT"),
@@ -5828,12 +6417,22 @@ class TradingService:
             )
             if snapshot.get("error"):
                 reason = safe_error_text(snapshot.get("error"))
-                return cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                if fallback_snapshot:
+                    return fallback_snapshot
+                if selected_mode == "paper":
+                    return await self._paper_analysis_balance_snapshot()
+                return None
             return remember_snapshot(snapshot)
         except TimeoutError:
             logger.warning("timed out fetching OKX balance snapshot", mode=selected_mode)
             reason = "OKX balance snapshot request timed out"
-            return cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+            fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+            if fallback_snapshot:
+                return fallback_snapshot
+            if selected_mode == "paper":
+                return await self._paper_analysis_balance_snapshot()
+            return None
         except Exception as exc:
             logger.warning(
                 "failed to fetch OKX balance snapshot",
@@ -5841,7 +6440,12 @@ class TradingService:
                 error=safe_error_text(exc),
             )
             reason = safe_error_text(exc)
-            return cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+            fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+            if fallback_snapshot:
+                return fallback_snapshot
+            if selected_mode == "paper":
+                return await self._paper_analysis_balance_snapshot()
+            return None
 
     async def _sync_paper_after_okx(
         self,
@@ -6022,6 +6626,33 @@ class TradingService:
     def _safe_list(self, value: Any) -> list[Any]:
         return value if isinstance(value, list) else []
 
+    def _price_from_feature_like(self, value: Any) -> float:
+        """Extract a usable current price from feature/ticker-like payloads."""
+
+        if value is None:
+            return 0.0
+        if isinstance(value, dict):
+            candidates = (
+                value.get("current_price"),
+                value.get("last_price"),
+                value.get("last"),
+                value.get("close"),
+                value.get("price"),
+            )
+        else:
+            candidates = (
+                getattr(value, "current_price", None),
+                getattr(value, "last_price", None),
+                getattr(value, "last", None),
+                getattr(value, "close", None),
+                getattr(value, "price", None),
+            )
+        for candidate in candidates:
+            price = self._safe_float(candidate, 0.0)
+            if price > 0:
+                return price
+        return 0.0
+
     def _attach_decision_timing(
         self,
         decision: DecisionOutput | None,
@@ -6043,12 +6674,23 @@ class TradingService:
 
     async def _latest_price_for_symbol(self, symbol: str) -> float:
         normalized = self._normalize_position_symbol(symbol) or symbol
+        candidates = [symbol, normalized]
+        try:
+            latest_tickers = getattr(self.data_service.ws_client, "latest_tickers", {}) or {}
+            for key in candidates:
+                price = self._price_from_feature_like(latest_tickers.get(key))
+                if price > 0:
+                    return price
+        except Exception as exc:
+            logger.debug(
+                "failed to read latest price from market cache",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+
         try:
             raw_ticker = await self.data_service.rest_client.fetch_ticker(normalized)
-            price = self._safe_float(
-                raw_ticker.get("last") or raw_ticker.get("close"),
-                0.0,
-            )
+            price = self._price_from_feature_like(raw_ticker)
             if price > 0:
                 return price
         except Exception as e:
@@ -6058,22 +6700,22 @@ class TradingService:
                 error=safe_error_text(e),
             )
 
-        candidates = [symbol, normalized]
         try:
-            latest_tickers = getattr(self.data_service.ws_client, "latest_tickers", {}) or {}
-            for key in candidates:
-                ticker = latest_tickers.get(key)
-                if not ticker:
-                    continue
-                price = self._safe_float(
-                    ticker.get("last_price") or ticker.get("last") or ticker.get("close"),
-                    0.0,
+            fresh = await asyncio.wait_for(
+                self.data_service.get_feature_vector(normalized),
+                timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
+            )
+            price = self._price_from_feature_like(fresh)
+            if price > 0:
+                logger.warning(
+                    "pre-order latest price recovered from feature snapshot",
+                    symbol=symbol,
+                    price=price,
                 )
-                if price > 0:
-                    return price
+                return price
         except Exception as exc:
-            logger.debug(
-                "failed to read latest price from market cache",
+            logger.warning(
+                "pre-order latest price feature fallback failed",
                 symbol=symbol,
                 error=safe_error_text(exc),
             )
@@ -6399,15 +7041,30 @@ class TradingService:
         }
 
     def get_stats(self, mode_filter: str | None = None) -> dict[str, Any]:
+        settings.refresh_runtime_env(force=True)
         uptime = (datetime.now(UTC) - self._start_time).total_seconds() if self._start_time else 0
         now = datetime.now(UTC)
-        round_active = self._last_round_started_at is not None and (
-            self._last_round_finished_at is None
-            or self._last_round_finished_at < self._last_round_started_at
+        market_state = self._runtime_state("market")
+        position_state = self._runtime_state("position")
+        active_scoped_states = [state for state in (market_state, position_state) if state.active]
+        round_active = bool(active_scoped_states) or (
+            self._last_round_started_at is not None
+            and (
+                self._last_round_finished_at is None
+                or self._last_round_finished_at < self._last_round_started_at
+            )
+        )
+        current_state = (
+            max(
+                active_scoped_states,
+                key=lambda state: state.last_started_at or datetime.min.replace(tzinfo=UTC),
+            )
+            if active_scoped_states
+            else self._runtime_state(_analysis_scope_context.get())
         )
         round_running_seconds = (
-            int((now - self._last_round_started_at).total_seconds())
-            if round_active and self._last_round_started_at
+            int((now - current_state.last_started_at).total_seconds())
+            if current_state.active and current_state.last_started_at
             else 0
         )
         stage_labels = {
@@ -6425,15 +7082,13 @@ class TradingService:
             "publish_results": "\u5199\u5165\u5e76\u63a8\u9001\u5206\u6790\u7ed3\u679c",
             "error": "\u672c\u8f6e\u5f02\u5e38",
         }
-        stage_label = stage_labels.get(self._current_stage)
-        if stage_label is None and self._current_stage.startswith("analyze:"):
-            stage_label = f"\u6b63\u5728\u5206\u6790 {self._current_stage.split(':', 1)[1]}"
-        elif stage_label is None and self._current_stage.startswith("execute:"):
-            stage_label = (
-                f"\u6b63\u5728\u6267\u884c {self._current_stage.split(':', 1)[1]} \u8ba2\u5355"
-            )
+        stage_label = stage_labels.get(current_state.current_stage)
+        if stage_label is None and current_state.current_stage.startswith("analyze:"):
+            stage_label = f"\u6b63\u5728\u5206\u6790 {current_state.current_stage.split(':', 1)[1]}"
+        elif stage_label is None and current_state.current_stage.startswith("execute:"):
+            stage_label = f"\u6b63\u5728\u6267\u884c {current_state.current_stage.split(':', 1)[1]} \u8ba2\u5355"
         elif stage_label is None:
-            stage_label = self._current_stage
+            stage_label = current_state.current_stage
 
         # Filter decisions/execs by mode if requested
         is_paper_filter = None if mode_filter is None else (mode_filter == "paper")
@@ -6448,28 +7103,57 @@ class TradingService:
             recent_decs = self._recent_decisions
             recent_execs = self._recent_executions
 
-        return {
+        stats = {
             "running": self._running,
             "mode": mode_manager.mode.value,
             "paused": mode_manager.is_paused,
             "uptime_seconds": int(uptime),
+            "started_at": self._start_time.isoformat() if self._start_time else None,
+            "heartbeat_at": now.isoformat(),
+            "last_heartbeat_at": now.isoformat(),
             "decisions_total": self._decision_count,
             "trades_total": self._trade_count,
             "recent_decisions": recent_decs,
             "recent_executions": recent_execs,
-            "current_stage": self._current_stage,
+            "current_stage": current_state.current_stage,
             "current_stage_label": stage_label,
             "round_active": round_active,
             "round_running_seconds": round_running_seconds,
+            "market_current_stage": market_state.current_stage,
+            "market_round_active": market_state.active,
+            "market_last_error": market_state.last_error,
+            "position_current_stage": position_state.current_stage,
+            "position_round_active": position_state.active,
+            "position_last_error": position_state.last_error,
             "last_round_started_at": (
                 self._last_round_started_at.isoformat() if self._last_round_started_at else None
             ),
             "last_round_finished_at": (
                 self._last_round_finished_at.isoformat() if self._last_round_finished_at else None
             ),
-            "last_round_error": self._last_round_error,
+            "last_market_round_started_at": (
+                market_state.last_started_at.isoformat() if market_state.last_started_at else None
+            ),
+            "last_market_round_finished_at": (
+                market_state.last_finished_at.isoformat() if market_state.last_finished_at else None
+            ),
+            "last_position_round_started_at": (
+                position_state.last_started_at.isoformat()
+                if position_state.last_started_at
+                else None
+            ),
+            "last_position_round_finished_at": (
+                position_state.last_finished_at.isoformat()
+                if position_state.last_finished_at
+                else None
+            ),
+            "last_round_error": (
+                market_state.last_error or position_state.last_error or self._last_round_error
+            ),
             "live_model": ENSEMBLE_TRADER_NAME,
             "models": [ENSEMBLE_TRADER_NAME],
             "risk": self.risk_engine.circuit_breaker.get_state(),
             "decision_interval": settings.decision_interval_seconds,
         }
+        self._write_runtime_heartbeat()
+        return stats
