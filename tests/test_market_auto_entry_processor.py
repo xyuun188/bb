@@ -177,7 +177,7 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
         }
     }
 
-    result = await _processor(calls).process(
+    result = await _processor(calls, execution_result=_filled_result()).process(
         symbol="BTC/USDT",
         model_name="ensemble_trader",
         decision=decision,
@@ -197,6 +197,46 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
     assert decision.raw_response["entry_evidence_shadow_only"]["shadow_only"] is True
     assert ("reason", 12, ENTRY_EVIDENCE_SHADOW_ONLY_REASON) in calls
     assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_executes_tradeable_weak_probe() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    decision = _decision()
+    decision.position_size_pct = 0.02
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 1.2,
+            "expected_net_return_pct": 0.9,
+            "evidence_score": {
+                "tier": "weak_conflict_probe",
+                "effective_score": 42.0,
+                "tradeable_probe": True,
+                "shadow_only": False,
+            },
+        }
+    }
+
+    result = await _processor(calls, execution_result=_filled_result()).process(
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=decision,
+        assessment=object(),
+        decision_db_id=12,
+        results=results,
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts={},
+        strategy_mode_context=None,
+    )
+
+    assert result.handled is True
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is True
+    assert decision.raw_response["entry_evidence_tradeable_probe"]["applied"] is True
+    assert not decision.raw_response.get("entry_evidence_shadow_only")
+    assert any(call[0] == "execute" for call in calls)
 
 
 @pytest.mark.asyncio

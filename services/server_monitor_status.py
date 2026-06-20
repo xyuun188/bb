@@ -858,28 +858,39 @@ async def get_server_monitor_status_async() -> dict[str, Any]:
     """Return cached server monitor status using async DB loading on the main loop."""
     checked_at = datetime.now(UTC).isoformat()
     platform_server = await asyncio.to_thread(collect_platform_server_status)
+    platform_runtime = await collect_platform_runtime_status()
     try:
         info = await load_model_server_info_from_secure_settings()
     except ModelServerConfigNotConfigured as exc:
         return {
-            "available": False,
+            "available": bool(
+                platform_runtime.get("ai_models")
+                or platform_runtime.get("local_ai_tools", {}).get("configured")
+            ),
             "status": "model_server_not_configured",
             "message": safe_error_text(exc),
             "checked_at": checked_at,
             "platform_server": platform_server,
+            "platform_runtime": platform_runtime,
+            "remote_monitor_available": False,
         }
     except ModelServerConfigError as exc:
         return {
-            "available": False,
+            "available": bool(
+                platform_runtime.get("ai_models")
+                or platform_runtime.get("local_ai_tools", {}).get("configured")
+            ),
             "status": "model_server_config_error",
             "message": safe_error_text(exc),
             "checked_at": checked_at,
             "platform_server": platform_server,
+            "platform_runtime": platform_runtime,
+            "remote_monitor_available": False,
         }
     payload = await asyncio.to_thread(_default_service.get_status_sync, info)
-    platform_runtime = await collect_platform_runtime_status()
     payload["platform_runtime"] = platform_runtime
     payload["platform_server"] = platform_server
+    payload["remote_monitor_available"] = bool(payload.get("available"))
     platform_access_host = _model_access_host_from_platform_runtime(platform_runtime)
     if platform_access_host:
         payload["model_access_host"] = platform_access_host

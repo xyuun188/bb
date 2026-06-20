@@ -238,6 +238,38 @@ def test_zvec_store_writes_large_batches(tmp_path) -> None:
     assert stats["document_count"] >= 1100
 
 
+def test_zvec_store_read_only_opens_existing_collection_and_rejects_writes(tmp_path) -> None:
+    pytest.importorskip("zvec")
+    path = tmp_path / "zvec-readonly"
+    writer = ZvecVectorMemoryStore(path, dimension=24, max_documents=20)
+    writer.upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:readonly",
+                kind="decision",
+                text="BTC/USDT 做多 盈利 复盘",
+                symbol="BTC/USDT",
+                action="long",
+            )
+        ]
+    )
+
+    reader = ZvecVectorMemoryStore(path, dimension=24, max_documents=20, read_only=True)
+    hits = reader.search("BTC 做多 盈利", top_k=3)
+
+    assert hits
+    with pytest.raises(RuntimeError):
+        reader.upsert(
+            [
+                VectorMemoryDocument(
+                    id="decision:blocked-write",
+                    kind="decision",
+                    text="should fail",
+                )
+            ]
+        )
+
+
 def test_vector_memory_influence_is_explainable_soft_score() -> None:
     influence = _influence_payload(
         [

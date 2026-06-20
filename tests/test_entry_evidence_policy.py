@@ -350,7 +350,51 @@ def test_positive_net_return_relieves_blocked_evidence_to_controlled_probe():
     assert evidence["size_multiplier"] > 0.0
     assert evidence["positive_net_probe_relief"]["applied"] is True
     assert evidence["positive_net_probe_relief"]["expected_net_return_pct"] == pytest.approx(1.60)
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
     assert not any("three aligned" in item for item in evidence["advisory_wait_reasons"])
+
+
+def test_positive_net_weak_conflict_probe_is_tradeable_even_without_score_lift():
+    decision = _decision(
+        Action.SHORT,
+        {
+            "ml_signal": {"predictions": [{"best_side": "long", "best_expected_return_pct": 0.8}]},
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "expected_return_pct": 0.2,
+                },
+                "profit_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "adjusted_short_return_pct": 0.9,
+                    "short_loss_probability": 0.40,
+                    "profit_quality_score": 0.75,
+                },
+            },
+        },
+        confidence=0.82,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 2.80,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.80,
+            "profit_quality_ratio": 0.65,
+            "server_profit_loss_probability": 0.40,
+            "tail_risk_score": 0.45,
+            "confidence": 0.82,
+        },
+    )
+
+    assert evidence["tier"] == "weak_conflict_probe"
+    assert evidence["positive_net_probe_relief"]["applied"] is True
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
 
 
 def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():

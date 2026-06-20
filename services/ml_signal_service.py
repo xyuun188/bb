@@ -292,26 +292,33 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     top_win = _safe_float(metrics.get(f"top_{side}_win_rate"), 0.0)
     bottom_win = _safe_float(metrics.get(f"bottom_{side}_win_rate"), 0.0)
 
-    reasons: list[str] = []
+    hard_reasons: list[str] = []
+    maturity_reasons: list[str] = []
     if sample_count < ML_INFLUENCE_MIN_SAMPLE_COUNT:
-        reasons.append(f"样本数 {sample_count} < {ML_INFLUENCE_MIN_SAMPLE_COUNT}")
+        maturity_reasons.append(f"样本数 {sample_count} < {ML_INFLUENCE_MIN_SAMPLE_COUNT}")
     if test_count < ML_INFLUENCE_MIN_TEST_COUNT:
-        reasons.append(f"测试样本 {test_count} < {ML_INFLUENCE_MIN_TEST_COUNT}")
+        maturity_reasons.append(f"测试样本 {test_count} < {ML_INFLUENCE_MIN_TEST_COUNT}")
     if auc < ML_INFLUENCE_MIN_AUC:
-        reasons.append(f"AUC {auc:.3f} < {ML_INFLUENCE_MIN_AUC:.2f}")
+        hard_reasons.append(f"AUC {auc:.3f} < {ML_INFLUENCE_MIN_AUC:.2f}")
     if accuracy < ML_INFLUENCE_MIN_ACCURACY:
-        reasons.append(f"准确率 {accuracy:.3f} < {ML_INFLUENCE_MIN_ACCURACY:.2f}")
+        hard_reasons.append(f"准确率 {accuracy:.3f} < {ML_INFLUENCE_MIN_ACCURACY:.2f}")
     if top_return <= ML_INFLUENCE_MIN_TOP_RETURN_PCT:
-        reasons.append(
+        hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%"
         )
     if top_win <= bottom_win:
-        reasons.append(f"高分组胜率 {top_win:.3f} 未优于低分组 {bottom_win:.3f}")
+        hard_reasons.append(f"高分组胜率 {top_win:.3f} 未优于低分组 {bottom_win:.3f}")
 
-    enabled = not reasons
+    reliable = not hard_reasons and not maturity_reasons
+    advisory = not hard_reasons and sample_count >= MIN_TRAINING_SAMPLES and test_count >= 40
+    influence_weight = 1.0 if reliable else 0.35 if advisory else 0.0
+    reasons = hard_reasons + maturity_reasons
+    status = "active" if reliable else "advisory" if advisory else "learning_only"
     return {
-        "enabled": enabled,
-        "status": "active" if enabled else "learning_only",
+        "enabled": reliable,
+        "advisory_enabled": advisory,
+        "influence_weight": round(influence_weight, 4),
+        "status": status,
         "side": side,
         "auc": round(auc, 4),
         "accuracy": round(accuracy, 4),
@@ -327,6 +334,9 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
     long_status = _side_influence_status(metadata, "long")
     short_status = _side_influence_status(metadata, "short")
     enabled = bool(long_status.get("enabled") or short_status.get("enabled"))
+    advisory_enabled = bool(
+        enabled or long_status.get("advisory_enabled") or short_status.get("advisory_enabled")
+    )
     disabled_reasons: list[str] = []
     if not long_status.get("enabled"):
         disabled_reasons.append("做多：" + "；".join(long_status.get("reasons") or ["未达标"]))
@@ -334,14 +344,19 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
         disabled_reasons.append("做空：" + "；".join(short_status.get("reasons") or ["未达标"]))
     return {
         "enabled": enabled,
-        "mode": "entry_profit_filter" if enabled else "learning_only",
-        "status": "active" if enabled else "learning_only",
+        "advisory_enabled": advisory_enabled,
+        "mode": (
+            "entry_profit_filter"
+            if enabled
+            else "advisory" if advisory_enabled else "learning_only"
+        ),
+        "status": "active" if enabled else "advisory" if advisory_enabled else "learning_only",
         "long": long_status,
         "short": short_status,
         "disabled_reason": "；".join(disabled_reasons) if disabled_reasons else "",
         "rule": (
-            "ML 只有在样本数、测试样本、AUC、准确率、高分组收益和分组胜率同时达标时，"
-            "才允许影响开仓过滤、加分和机会排序；否则继续预测、记录和训练，但不介入交易。"
+            "ML 指标完全达标时按完整权重参与；样本成熟度不足但 AUC/收益分层有效时，"
+            "只按小权重参与 expected_net 和证据解释，不作为硬否决；硬指标不达标时继续学习观察。"
         ),
     }
 
@@ -592,15 +607,22 @@ class MLSignalService:
             ),
             "training_sample_note": metadata.get("training_sample_note")
             or "sample_count is the latest training window, not the all-time total.",
-            "status": "ready" if influence.get("enabled") else "learning_only",
+            "status": (
+                "ready" if influence.get("enabled") else influence.get("status", "learning_only")
+            ),
             "mode": influence.get("mode"),
             "influence_enabled": bool(influence.get("enabled")),
+            "advisory_enabled": bool(influence.get("advisory_enabled")),
             "influence_policy": influence,
             "model_note": model_note,
             "note": (
                 "ML 指标达标，当前允许参与开仓过滤、加分和机会排序。"
                 if influence.get("enabled")
-                else "ML 指标未达标，当前只学习不介入；继续预测、影子复盘和自动训练，达标后自动恢复。"
+                else (
+                    "ML 硬指标有效但样本成熟度不足，当前按小权重提供收益解释，不做硬否决。"
+                    if influence.get("advisory_enabled")
+                    else "ML 指标未达标，当前只学习不介入；继续预测、影子复盘和自动训练，达标后自动恢复。"
+                )
             ),
             **auto_status,
         }
@@ -802,9 +824,18 @@ class MLSignalService:
         primary = predictions[0] if predictions else {}
         return {
             "available": True,
-            "status": "entry_profit_filter" if influence.get("enabled") else "learning_only",
-            "mode": "entry_profit_filter" if influence.get("enabled") else "learning_only",
+            "status": (
+                "entry_profit_filter"
+                if influence.get("enabled")
+                else "advisory" if influence.get("advisory_enabled") else "learning_only"
+            ),
+            "mode": (
+                "entry_profit_filter"
+                if influence.get("enabled")
+                else "advisory" if influence.get("advisory_enabled") else "learning_only"
+            ),
             "influence_enabled": bool(influence.get("enabled")),
+            "advisory_enabled": bool(influence.get("advisory_enabled")),
             "influence_policy": influence,
             "model_version": metadata.get("version"),
             "trained_sample_count": int(metadata.get("sample_count") or 0),
@@ -821,7 +852,11 @@ class MLSignalService:
             "note": (
                 "ML 当前指标达标，参与开仓门槛/否决和机会排序；不直接决定交易方向。"
                 if influence.get("enabled")
-                else "ML 当前处于学习观察中：继续预测、影子复盘和自动训练，但不影响开仓过滤、加分或机会排序。"
+                else (
+                    "ML 当前为建议权重模式：参与 expected_net 解释和轻量排序，不作为硬否决。"
+                    if influence.get("advisory_enabled")
+                    else "ML 当前处于学习观察中：继续预测、影子复盘和自动训练，但不影响开仓过滤、加分或机会排序。"
+                )
             ),
         }
 
@@ -906,6 +941,8 @@ class MLSignalService:
         if not primary:
             return "暂无 ML 预测。"
         if isinstance(influence, dict) and not influence.get("enabled"):
+            if influence.get("advisory_enabled"):
+                return "ML 样本成熟度不足但排序有效，当前仅按小权重辅助收益解释。"
             return "ML 当前评估未达标，自动降级为学习观察；继续训练，暂不介入交易决策。"
         win = float(primary.get("best_win_rate") or 0.0)
         expected = float(primary.get("best_expected_return_pct") or 0.0)

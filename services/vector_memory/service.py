@@ -42,6 +42,7 @@ class VectorMemoryService:
                 backend=settings.vector_memory_backend,
                 dimension=int(settings.vector_memory_dimension),
                 max_documents=int(settings.vector_memory_max_documents),
+                read_only=False,
             )
         return self._store
 

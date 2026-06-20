@@ -230,7 +230,9 @@ class EntryPolicy:
             evidence_score = opportunity_data["evidence_score"]
         evidence_tier = str(evidence_score.get("tier") or "")
         weak_shadow_tiers = {"weak_conflict_probe", "degraded_missing_probe"}
-        if evidence_tier in weak_shadow_tiers:
+        shadow_only = bool(evidence_score.get("shadow_only", True))
+        tradeable_probe = bool(evidence_score.get("tradeable_probe"))
+        if evidence_tier in weak_shadow_tiers and shadow_only and not tradeable_probe:
             return PolicyGateResult.block(
                 "entry_evidence_shadow_only",
                 (

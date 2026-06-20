@@ -685,7 +685,17 @@ async def _data_source_items() -> list[dict[str, Any]]:
 
 
 def _server_monitor_items(status: dict[str, Any]) -> list[dict[str, Any]]:
-    if not status.get("available"):
+    runtime = (
+        status.get("platform_runtime") if isinstance(status.get("platform_runtime"), dict) else {}
+    )
+    has_runtime = bool(
+        runtime.get("ai_models")
+        or (
+            isinstance(runtime.get("local_ai_tools"), dict)
+            and runtime["local_ai_tools"].get("configured")
+        )
+    )
+    if not status.get("available") and not has_runtime:
         monitor_status = str(status.get("status") or "")
         if monitor_status == "server_monitor_refreshing":
             return [
@@ -708,20 +718,28 @@ def _server_monitor_items(status: dict[str, Any]) -> list[dict[str, Any]]:
                 repair_action="clear_monitor_cache",
             )
         ]
-    runtime = (
-        status.get("platform_runtime") if isinstance(status.get("platform_runtime"), dict) else {}
-    )
     models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
     local_tools = (
         runtime.get("local_ai_tools") if isinstance(runtime.get("local_ai_tools"), dict) else {}
     )
+    remote_monitor_ok = bool(status.get("remote_monitor_available", status.get("available")))
+    monitor_status = str(status.get("status") or "")
     items: list[dict[str, Any]] = [
         _check_item(
             "server_monitor",
             "模型服务器监控",
-            "ok",
-            "模型服务器监控已返回状态。",
-            details={"checked_at": status.get("checked_at")},
+            "ok" if remote_monitor_ok else "info",
+            (
+                "模型服务器监控已返回状态。"
+                if remote_monitor_ok
+                else "远程 SSH 监控暂不可用，但平台运行端点已完成本地探测；不再把监控配置问题误判为模型不可用。"
+            ),
+            details={
+                "checked_at": status.get("checked_at"),
+                "status": monitor_status,
+                "remote_monitor_available": remote_monitor_ok,
+                "message": status.get("message"),
+            },
             repairable=True,
             repair_action="clear_monitor_cache",
         )

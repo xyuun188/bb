@@ -7,7 +7,9 @@ import pytest
 from config.settings import ENSEMBLE_TRADER_NAME, settings
 from db.session import close_db, get_session_ctx, init_db
 from models.trade import Position
+from services import server_monitor_status
 from services.model_server_config import (
+    ModelServerConfigError,
     ModelServerConfigNotConfigured,
     get_model_server_settings_public,
     load_model_server_info_from_secure_settings,
@@ -98,6 +100,45 @@ def test_server_monitor_reports_model_server_not_configured() -> None:
     assert result["available"] is False
     assert result["status"] == "model_server_not_configured"
     assert "系统设置" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_server_monitor_keeps_platform_runtime_when_remote_config_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_loader():
+        raise ModelServerConfigError("BB_SECURE_SETTINGS_KEY is required")
+
+    async def platform_runtime():
+        return {
+            "ai_models": [
+                {
+                    "model": "qwen3-14b-trade",
+                    "api_base": "http://127.0.0.1:18000/v1",
+                    "available": True,
+                }
+            ],
+            "local_ai_tools": {
+                "configured": True,
+                "api_base": "http://127.0.0.1:18001",
+                "available": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        server_monitor_status,
+        "load_model_server_info_from_secure_settings",
+        failing_loader,
+    )
+    monkeypatch.setattr(server_monitor_status, "collect_platform_server_status", lambda: {})
+    monkeypatch.setattr(server_monitor_status, "collect_platform_runtime_status", platform_runtime)
+
+    result = await server_monitor_status.get_server_monitor_status_async()
+
+    assert result["available"] is True
+    assert result["remote_monitor_available"] is False
+    assert result["status"] == "model_server_config_error"
+    assert result["platform_runtime"]["ai_models"][0]["model"] == "qwen3-14b-trade"
 
 
 @pytest.mark.asyncio

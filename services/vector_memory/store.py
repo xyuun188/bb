@@ -182,13 +182,20 @@ class ZvecVectorMemoryStore:
     backend_name = "zvec"
     write_batch_size = 500
 
-    def __init__(self, path: Path, *, dimension: int, max_documents: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        dimension: int,
+        max_documents: int,
+        read_only: bool = False,
+    ) -> None:
         self.path = path
         self.dimension = max(int(dimension), 16)
         self.max_documents = max(int(max_documents), 100)
+        self.read_only = bool(read_only)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._zvec = self._load_zvec()
-        self._collection = self._open_or_create()
         self._last_known_count = 0
 
     @staticmethod
@@ -200,9 +207,14 @@ class ZvecVectorMemoryStore:
     def _open_or_create(self) -> Any:
         if self.path.exists():
             try:
-                return self._zvec.open(str(self.path))
+                option = self._zvec.CollectionOption(read_only=1 if self.read_only else 0)
+                return self._zvec.open(str(self.path), option)
             except Exception as exc:
                 logger.warning("zvec collection open failed", error=safe_error_text(exc))
+                if self.read_only:
+                    raise
+        if self.read_only:
+            raise FileNotFoundError(f"zvec collection does not exist: {self.path}")
         schema = self._zvec.CollectionSchema(
             name="bb_vector_memory",
             fields=[
@@ -228,6 +240,8 @@ class ZvecVectorMemoryStore:
         return self._zvec.create_and_open(str(self.path), schema)
 
     def upsert(self, documents: Iterable[VectorMemoryDocument]) -> int:
+        if self.read_only:
+            raise RuntimeError("zvec store is opened read-only and cannot upsert documents")
         docs = []
         for document in documents:
             if not document.text.strip():
@@ -246,9 +260,13 @@ class ZvecVectorMemoryStore:
             )
         if not docs:
             return 0
-        for offset in range(0, len(docs), self.write_batch_size):
-            self._collection.upsert(docs[offset : offset + self.write_batch_size])
-        self._collection.flush()
+        collection = self._open_or_create()
+        try:
+            for offset in range(0, len(docs), self.write_batch_size):
+                collection.upsert(docs[offset : offset + self.write_batch_size])
+            collection.flush()
+        finally:
+            del collection
         self._last_known_count = max(self._last_known_count, len(docs))
         return len(docs)
 
@@ -260,14 +278,18 @@ class ZvecVectorMemoryStore:
         filters: dict[str, str] | None = None,
     ) -> list[VectorMemoryHit]:
         fetch_limit = _zvec_fetch_limit(top_k, filters)
-        results = self._collection.query(
-            self._zvec.Query(
-                field_name="embedding",
-                vector=deterministic_text_vector(query, dimension=self.dimension),
-            ),
-            topk=fetch_limit,
-            include_vector=False,
-        )
+        collection = self._open_or_create()
+        try:
+            results = collection.query(
+                self._zvec.Query(
+                    field_name="embedding",
+                    vector=deterministic_text_vector(query, dimension=self.dimension),
+                ),
+                topk=fetch_limit,
+                include_vector=False,
+            )
+        finally:
+            del collection
         hits = [
             fields_to_hit(
                 doc.id, _zvec_score_to_similarity(float(doc.score or 0.0)), doc.fields or {}
@@ -279,9 +301,11 @@ class ZvecVectorMemoryStore:
 
     def stats(self) -> dict[str, Any]:
         try:
-            raw_stats = self._collection.stats
+            collection = self._open_or_create()
+            raw_stats = collection.stats
             stats = raw_stats() if callable(raw_stats) else raw_stats
             count = int(getattr(stats, "doc_count", 0) or getattr(stats, "row_count", 0) or 0)
+            del collection
         except Exception:
             count = 0
         count = max(count, self._last_known_count)
@@ -302,6 +326,7 @@ def build_vector_memory_store(
     backend: str,
     dimension: int,
     max_documents: int,
+    read_only: bool = False,
 ) -> VectorMemoryStore:
     """Build the configured vector memory store with safe fallback."""
 
@@ -312,6 +337,7 @@ def build_vector_memory_store(
                 path / "zvec",
                 dimension=dimension,
                 max_documents=max_documents,
+                read_only=read_only,
             )
         except Exception as exc:
             if normalized == "zvec":

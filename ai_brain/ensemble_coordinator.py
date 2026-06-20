@@ -2657,6 +2657,15 @@ class EnsembleCoordinator:
         if not isinstance(ml_signal, dict) or not ml_signal.get("available"):
             return {"available": False, "strong": False, "reason": "ML 不可用。"}
         if not ml_signal.get("influence_enabled", True):
+            if ml_signal.get("advisory_enabled"):
+                return {
+                    "available": True,
+                    "influence_enabled": False,
+                    "advisory_enabled": True,
+                    "strong": False,
+                    "reason": "ML 当前为建议权重模式，只提供收益提示，不降低 AI 入场门槛。",
+                    "influence_policy": ml_signal.get("influence_policy") or {},
+                }
             return {
                 "available": True,
                 "influence_enabled": False,
@@ -2979,12 +2988,46 @@ class EnsembleCoordinator:
                 "reason": "本地 ML 暂无可用模型或预测，本轮不影响 AI 决策。",
             }
         if not ml_signal.get("influence_enabled", True):
+            if ml_signal.get("advisory_enabled"):
+                advisory_policy = ml_signal.get("influence_policy") or {}
+            else:
+                advisory_policy = {}
+            if not advisory_policy:
+                return {
+                    "enabled": False,
+                    "allow": True,
+                    "status": "learning_only",
+                    "reason": "本地 ML 当前评估未达标，自动降级为学习观察；继续训练，但本轮不影响 AI 决策。",
+                    "influence_policy": ml_signal.get("influence_policy") or {},
+                }
+            predictions = ml_signal.get("predictions")
+            primary = predictions[0] if isinstance(predictions, list) and predictions else {}
+            if not isinstance(primary, dict) or not primary:
+                return {
+                    "enabled": False,
+                    "allow": True,
+                    "status": "advisory_no_prediction",
+                    "reason": "本地 ML 处于建议权重模式，但没有返回可用预测，本轮不影响 AI 决策。",
+                }
+            direction = "long" if action == Action.LONG else "short"
+            side_policy = (
+                advisory_policy.get(direction) if isinstance(advisory_policy, dict) else {}
+            )
             return {
                 "enabled": False,
                 "allow": True,
-                "status": "learning_only",
-                "reason": "本地 ML 当前评估未达标，自动降级为学习观察；继续训练，但本轮不影响 AI 决策。",
-                "influence_policy": ml_signal.get("influence_policy") or {},
+                "status": f"{direction}_advisory",
+                "direction": direction,
+                "expected_return_pct": round(
+                    self._safe_float(primary.get(f"{direction}_expected_return_pct"), 0.0),
+                    4,
+                ),
+                "advisory_weight": round(
+                    self._safe_float((side_policy or {}).get("influence_weight"), 0.0),
+                    4,
+                ),
+                "reason": "本地 ML 样本成熟度不足，仅按建议权重参与收益解释；不作为开仓硬拦截。",
+                "influence_policy": advisory_policy,
             }
 
         predictions = ml_signal.get("predictions")

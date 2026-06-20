@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
 from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
@@ -276,6 +278,38 @@ def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned
     assert components["slippage"]["source"] == "dynamic_microstructure"
     assert components["slippage"]["raw_return_pct"] < 0.5
     assert breakdown["observed_not_in_formula"][0]["key"] == "sentiment"
+
+
+def test_entry_opportunity_scoring_uses_advisory_ml_with_reduced_weight() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.raw_response["ml_signal"].update(
+        {
+            "influence_enabled": False,
+            "advisory_enabled": True,
+            "influence_policy": {
+                "advisory_enabled": True,
+                "long": {
+                    "enabled": False,
+                    "advisory_enabled": True,
+                    "influence_weight": 0.35,
+                },
+            },
+        }
+    )
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = {row["key"]: row for row in opportunity["expected_net_breakdown"]["components"]}
+
+    assert opportunity["ml_influence_enabled"] is True
+    assert opportunity["ml_full_influence_enabled"] is False
+    assert opportunity["ml_advisory_enabled"] is True
+    assert opportunity["ml_influence_weight"] == 0.35
+    assert components["local_ml"]["available"] is True
+    assert components["local_ml"]["weight"] == pytest.approx(0.14)
+    assert components["local_ml"]["contribution_pct"] > 0
 
 
 def test_entry_opportunity_scoring_does_not_use_max_slippage_as_fixed_cost(monkeypatch) -> None:

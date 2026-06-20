@@ -80,6 +80,39 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
 
 
+def test_server_monitor_items_keep_runtime_models_when_remote_monitor_unavailable() -> None:
+    items = system_health._server_monitor_items(
+        {
+            "available": True,
+            "remote_monitor_available": False,
+            "status": "model_server_config_error",
+            "message": "BB_SECURE_SETTINGS_KEY is required",
+            "checked_at": "2026-06-20T00:00:00+00:00",
+            "platform_runtime": {
+                "ai_models": [
+                    {
+                        "model": "deepseek-r1-14b-risk",
+                        "api_base": "http://127.0.0.1:18002/v1",
+                        "available": True,
+                        "endpoint_ok": True,
+                        "model_available": True,
+                    }
+                ],
+                "local_ai_tools": {
+                    "configured": True,
+                    "api_base": "http://127.0.0.1:18001",
+                    "available": True,
+                },
+            },
+        }
+    )
+
+    by_key = {item["key"]: item for item in items}
+    assert by_key["server_monitor"]["status"] == "info"
+    assert by_key["runtime_model_deepseek-r1-14b-risk"]["status"] == "ok"
+    assert by_key["runtime_local_ai_tools"]["status"] == "ok"
+
+
 @pytest.mark.asyncio
 async def test_self_check_repair_only_resets_low_risk_caches(
     monkeypatch: pytest.MonkeyPatch,

@@ -557,8 +557,10 @@ def build_entry_evidence_score(
         if short_relief_allowed:
             original_effective_score = effective_score
             effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+            tradeable_probe = True
             short_probe_relief = {
                 "applied": True,
+                "tradeable_probe": True,
                 "from_effective_score": round(original_effective_score, 6),
                 "to_effective_score": round(effective_score, 6),
                 "server_expected_return_pct": round(server_expected, 6),
@@ -580,6 +582,7 @@ def build_entry_evidence_score(
     if "ml" in strong_opposites and "shadow_memory" in major_opposites:
         hard_block_reasons.append("ML 反向且影子/交易记忆偏负")
     positive_net_probe_relief: dict[str, Any] = {"applied": False}
+    tradeable_probe = False
     missing_key_degraded_relief: dict[str, Any] = {"applied": False}
     missing_key_degraded = bool(
         len(missing_key_sources) >= 2 and not major_opposites and not strong_opposites
@@ -594,8 +597,15 @@ def build_entry_evidence_score(
             original_effective_score = effective_score
             if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
                 effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+            tradeable_probe = bool(
+                expected_return_pct(profit, entry_side) > 0
+                or signal_available(timeseries)
+                or safe_float(decision.confidence, 0.0)
+                >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_confidence
+            )
             missing_key_degraded_relief = {
                 "applied": True,
+                "tradeable_probe": tradeable_probe,
                 "missing_key_sources": list(missing_key_sources),
                 "from_effective_score": round(original_effective_score, 6),
                 "to_effective_score": round(effective_score, 6),
@@ -628,11 +638,14 @@ def build_entry_evidence_score(
         and not {"ml", "timeseries"}.issubset(set(strong_opposites))
         and not ("ml" in strong_opposites and "timeseries" in major_opposites)
     )
-    if positive_net_probe_allowed and effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
+    if positive_net_probe_allowed:
         original_effective_score = effective_score
-        effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+        if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
+            effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+        tradeable_probe = True
         positive_net_probe_relief = {
             "applied": True,
+            "tradeable_probe": True,
             "from_effective_score": round(original_effective_score, 6),
             "to_effective_score": round(effective_score, 6),
             "expected_net_return_pct": round(expected_net_return, 6),
@@ -724,6 +737,10 @@ def build_entry_evidence_score(
         "missing_key_degraded_relief": missing_key_degraded_relief,
         "positive_net_probe_relief": positive_net_probe_relief,
         "short_probe_relief": short_probe_relief,
+        "tradeable_probe": bool(tradeable_probe),
+        "shadow_only": bool(
+            tier in {"weak_conflict_probe", "degraded_missing_probe"} and not tradeable_probe
+        ),
         "components": components,
         "policy": (
             "硬风控只拦严重方向冲突和交易安全风险；"

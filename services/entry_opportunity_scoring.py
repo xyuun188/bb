@@ -319,9 +319,24 @@ class EntryOpportunityScoringPolicy:
         influence_enabled = bool(ml_signal.get("influence_enabled", True))
         influence_policy = self._safe_dict(ml_signal.get("influence_policy"))
         side_policy: dict[str, Any] = self._safe_dict(influence_policy.get(side))
-        side_influence_enabled = influence_enabled and (
+        side_full_influence_enabled = influence_enabled and (
             not isinstance(side_policy, dict) or side_policy.get("enabled", True)
         )
+        side_advisory_enabled = (
+            not side_full_influence_enabled
+            and bool(ml_signal.get("advisory_enabled") or influence_policy.get("advisory_enabled"))
+            and bool(side_policy.get("advisory_enabled"))
+        )
+        side_influence_weight = (
+            1.0
+            if side_full_influence_enabled
+            else (
+                max(min(self._safe_float(side_policy.get("influence_weight"), 0.0), 0.45), 0.0)
+                if side_advisory_enabled
+                else 0.0
+            )
+        )
+        side_influence_enabled = side_influence_weight > 0
         raw_expected_pct = self._safe_float(primary.get(f"{side}_expected_return_pct"), 0.0)
         expected_pct = max(
             min(raw_expected_pct, ML_EXPECTED_RETURN_SCORE_CAP_PCT),
@@ -757,7 +772,7 @@ class EntryOpportunityScoringPolicy:
             historical_adjustment = historical_adjustment_cap
         historical_adjustment += symbol_tier_score_adjustment
 
-        ml_effective_weight = ENTRY_NET_WEIGHT_LOCAL_ML if side_influence_enabled else 0.0
+        ml_effective_weight = ENTRY_NET_WEIGHT_LOCAL_ML * side_influence_weight
         ml_contribution = expected_pct * ml_effective_weight
         server_profit_health_multiplier = 1.0
         if (
@@ -822,9 +837,13 @@ class EntryOpportunityScoringPolicy:
                     "configured_weight": ENTRY_NET_WEIGHT_LOCAL_ML,
                     "contribution_pct": round(ml_contribution, 6),
                     "note": (
-                        "ML 达标并参与收益公式。"
-                        if side_influence_enabled
-                        else "ML 当前 learning_only，不参与收益公式。"
+                        "ML 达标并按完整权重参与收益公式。"
+                        if side_full_influence_enabled
+                        else (
+                            "ML 样本成熟度不足但排序有效，按建议小权重参与收益公式，不做硬否决。"
+                            if side_advisory_enabled
+                            else "ML 当前 learning_only，不参与收益公式。"
+                        )
                     ),
                 },
                 {
@@ -1178,10 +1197,17 @@ class EntryOpportunityScoringPolicy:
                 6,
             ),
             "ml_influence_enabled": bool(side_influence_enabled),
+            "ml_full_influence_enabled": bool(side_full_influence_enabled),
+            "ml_advisory_enabled": bool(side_advisory_enabled),
+            "ml_influence_weight": round(side_influence_weight, 6),
             "ml_influence_reason": (
-                "ML 当前达标，参与机会评分。"
-                if side_influence_enabled
-                else "ML 当前处于学习观察中，或该方向未达标，本次机会评分不使用 ML 加减分。"
+                "ML 当前达标，按完整权重参与机会评分。"
+                if side_full_influence_enabled
+                else (
+                    "ML 当前为建议权重模式，只轻量影响收益公式和排序，不作为硬否决。"
+                    if side_advisory_enabled
+                    else "ML 当前处于学习观察中，或该方向未达标，本次机会评分不使用 ML 加减分。"
+                )
             ),
             "rule": (
                 "auto entries are ranked by expected net return, possible loss, fees, "
