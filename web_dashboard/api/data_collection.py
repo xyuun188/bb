@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -28,8 +28,11 @@ from db.session import get_session_ctx
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
+from services.vector_memory import get_vector_memory_service
 from web_dashboard.api import dashboard as _dash
+from web_dashboard.api.security import require_dashboard_write_access
 from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
@@ -37,6 +40,7 @@ logger = structlog.get_logger(__name__)
 
 TRAINING_SAMPLE_LIMIT = 240
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
+_LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 
 def _visible_local_ai_training_status(
@@ -341,8 +345,143 @@ async def _local_ai_training_status() -> dict[str, Any]:
         "quality_report": (
             status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
         ),
+        "governance_report": (
+            status.get("governance_report")
+            if isinstance(status.get("governance_report"), dict)
+            else {}
+        ),
         "models": status.get("models") if isinstance(status.get("models"), dict) else {},
     }
+
+
+async def _training_governance_snapshot() -> dict[str, Any]:
+    try:
+        from scripts.train_local_ai_tools_models import (
+            _load_closed_position_samples,
+            _load_sequence_samples,
+            _load_shadow_samples,
+            _load_text_sentiment_samples,
+            _load_trade_reflection_samples,
+            _merge_trade_samples,
+        )
+        from services.ml_signal_service import (
+            TRAINING_SHADOW_SAMPLE_LIMIT,
+            build_training_frame,
+            load_shadow_training_rows,
+            shadow_training_quality_report,
+        )
+        from services.training_data_quality import annotate_training_payload
+
+        shadow_samples = await _load_shadow_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+        )
+        trade_reflection_samples = await _load_trade_reflection_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+        )
+        closed_position_samples = await _load_closed_position_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+        )
+        sequence_samples = await _load_sequence_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
+        )
+        text_sentiment_samples = await _load_text_sentiment_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
+        )
+        payload = annotate_training_payload(
+            shadow_samples=shadow_samples,
+            trade_samples=_merge_trade_samples(trade_reflection_samples, closed_position_samples),
+            sequence_samples=sequence_samples,
+            text_sentiment_samples=text_sentiment_samples,
+        )
+        ml_rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
+        ml_quality = shadow_training_quality_report(ml_rows)
+        ml_frame = build_training_frame(ml_rows)
+        return {
+            "status": "ok",
+            "local_ai_tools": payload["governance_report"],
+            "local_ai_quality_report": payload["quality_report"],
+            "local_ml_signal": ml_quality["governance_report"],
+            "local_ml_quality_report": ml_quality["quality_report"],
+            "local_ml_trainable_shadow_sample_count": int(len(ml_frame)),
+            "cleanup_effective": True,
+            "artifact_refresh_targets": [
+                "local_ml_signal",
+                "local_ai_tools",
+                "vector_memory_reindex",
+            ],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": safe_error_text(exc, limit=180),
+            "cleanup_effective": False,
+        }
+
+
+async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
+    local_ai_tools = _dash._dashboard_local_ai_tools_client()
+    if local_ai_tools is None:
+        return {"trained": False, "reason": "client_not_ready"}
+    if not getattr(local_ai_tools, "enabled", lambda: False)():
+        return {"trained": False, "reason": "disabled"}
+    try:
+        from scripts.train_local_ai_tools_models import (
+            _completed_shadow_sample_count,
+            _completed_trade_sample_count,
+            _load_closed_position_samples,
+            _load_sequence_samples,
+            _load_shadow_samples,
+            _load_text_sentiment_samples,
+            _load_trade_reflection_samples,
+            _merge_trade_samples,
+        )
+        from services.training_data_quality import annotate_training_payload
+
+        shadow_samples = await _load_shadow_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+        )
+        trade_reflection_samples = await _load_trade_reflection_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+        )
+        closed_position_samples = await _load_closed_position_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+        )
+        trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
+        sequence_samples = await _load_sequence_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
+        )
+        text_sentiment_samples = await _load_text_sentiment_samples(
+            _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
+        )
+        payload = annotate_training_payload(
+            shadow_samples=shadow_samples,
+            trade_samples=trade_samples,
+            sequence_samples=sequence_samples,
+            text_sentiment_samples=text_sentiment_samples,
+        )
+        trainer = getattr(local_ai_tools, "train", None)
+        if not callable(trainer):
+            return {"trained": False, "reason": "train_method_missing"}
+        result = await trainer(
+            payload["shadow_samples"],
+            payload["trade_samples"],
+            payload["sequence_samples"],
+            payload["text_sentiment_samples"],
+            source="dashboard_training_governance_refresh",
+            completed_shadow_sample_count=await _completed_shadow_sample_count(),
+            completed_trade_sample_count=await _completed_trade_sample_count(),
+            quality_report=payload["quality_report"],
+            governance_report=payload["governance_report"],
+        )
+        result.setdefault("quality_report", payload["quality_report"])
+        result.setdefault("governance_report", payload["governance_report"])
+        return result
+    except Exception as exc:
+        return {
+            "trained": False,
+            "reason": "error",
+            "error": safe_error_text(exc, limit=180),
+        }
 
 
 def _configured_source_cards() -> list[dict[str, Any]]:
@@ -449,10 +588,11 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 
 @router.get("/data-collection/status")
 async def get_data_collection_status() -> dict[str, Any]:
-    source_stats, quality, local_ai_status = await asyncio.gather(
+    source_stats, quality, local_ai_status, governance = await asyncio.gather(
         _source_breakdown(),
         _training_sample_quality(),
         _local_ai_training_status(),
+        _training_governance_snapshot(),
     )
     scrapling_installed = _scrapling_installed()
     configured_source_cards = _configured_source_cards()
@@ -514,7 +654,46 @@ async def get_data_collection_status() -> dict[str, Any]:
         "training": {
             "text_sentiment_quality_sample": quality,
             "local_ai_tools": local_ai_status,
+            "governance": governance,
         },
+    }
+    return sanitize_payload(payload)
+
+
+@router.post("/data-collection/training-governance/refresh")
+async def refresh_training_governance(
+    _access: None = Depends(require_dashboard_write_access),
+) -> dict[str, Any]:
+    ml_signal_service = _dash._dashboard_ml_signal_service()
+    local_ai_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
+    ml_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
+    vector_result: dict[str, Any] = {"status": "skipped", "reason": "disabled_or_unavailable"}
+
+    if ml_signal_service is not None:
+        trainer = getattr(ml_signal_service, "maybe_auto_train", None)
+        if callable(trainer):
+            ml_result = await trainer(force=True)
+
+    trading_service = getattr(_dash, "_trading_service", None)
+    if trading_service is not None:
+        trainer = getattr(trading_service, "_maybe_train_local_ai_tools", None)
+        if callable(trainer):
+            local_ai_result = await trainer(force=True)
+    else:
+        local_ai_result = await _train_local_ai_tools_from_dashboard()
+
+    try:
+        vector_result = await get_vector_memory_service().reindex_recent()
+    except Exception as exc:
+        vector_result = {"status": "error", "error": safe_error_text(exc, limit=180)}
+
+    payload = await get_data_collection_status()
+    payload["status"] = "ok"
+    payload["message"] = "训练数据治理刷新已执行：按清洗视图重训本地模型并刷新向量索引。"
+    payload["refresh_result"] = {
+        "local_ml_signal": ml_result,
+        "local_ai_tools": local_ai_result,
+        "vector_memory": vector_result,
     }
     return sanitize_payload(payload)
 

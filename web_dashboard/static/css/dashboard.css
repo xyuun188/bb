@@ -454,6 +454,25 @@ td .ml-bar-row .ml-bar-label {
     line-height: 1.5;
     overflow-wrap: anywhere;
 }
+.data-governance-panel {
+    grid-column: 1 / -1;
+}
+.data-governance-notes {
+    display: grid;
+    gap: 7px;
+    margin-top: 10px;
+}
+.data-governance-notes span {
+    display: block;
+    padding: 8px 10px;
+    border: 1px solid rgba(6,182,212,0.18);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    background: rgba(6,182,212,0.06);
+    font-size: 12px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
 .settings-data-collection-card {
     margin-top: 14px;
     border-color: rgba(6,182,212,0.20);

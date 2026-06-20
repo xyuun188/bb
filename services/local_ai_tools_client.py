@@ -451,6 +451,7 @@ class LocalAIToolsClient:
         completed_shadow_sample_count: int | None = None,
         completed_trade_sample_count: int | None = None,
         quality_report: dict[str, Any] | None = None,
+        governance_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled():
             return {"trained": False, "reason": "disabled"}
@@ -466,6 +467,7 @@ class LocalAIToolsClient:
             "completed_shadow_sample_count": completed_shadow_sample_count,
             "completed_trade_sample_count": completed_trade_sample_count,
             "quality_report": quality_report or {},
+            "governance_report": governance_report or {},
         }
         payload = self._json_safe(payload)
         try:

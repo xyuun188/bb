@@ -123,6 +123,56 @@ def test_connect_remote_ssh_enables_keepalive_and_reconnect_metadata(
     assert fake_client._bb_keepalive_interval == 17
 
 
+def test_connect_remote_ssh_retries_transient_banner_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class LocalSSHException(Exception):
+        pass
+
+    reject_policy = object()
+    clients: list[FakeSSHClient] = [FakeSSHClient(), FakeSSHClient()]
+
+    def client_factory() -> FakeSSHClient:
+        return clients.pop(0)
+
+    def flaky_connect(self: FakeSSHClient, **kwargs) -> None:
+        self.connect_calls += 1
+        self.connect_kwargs = kwargs
+        if len(clients) == 1:
+            raise LocalSSHException("Error reading SSH protocol banner")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "paramiko",
+        SimpleNamespace(
+            RejectPolicy=lambda: reject_policy,
+            SSHClient=client_factory,
+            SSHException=LocalSSHException,
+        ),
+    )
+    monkeypatch.setattr(FakeSSHClient, "connect", flaky_connect)
+    monkeypatch.setattr("core.remote_ssh.time.sleep", lambda _seconds: None)
+    info = RemoteServerInfo(
+        host="203.0.113.17",
+        port=31822,
+        username="linux",
+        password="secret",
+        source_path=Path("<test>"),
+    )
+
+    ssh = connect_remote_ssh(
+        tmp_path,
+        timeout=7,
+        keepalive_interval=17,
+        retry_delay_seconds=0.01,
+        info=info,
+    )
+
+    assert ssh.connect_calls == 1
+    assert ssh.transport.keepalive_interval == 17
+
+
 def test_exec_remote_command_reconnects_before_retrying_channel_timeout(
     tmp_path: Path,
     monkeypatch,

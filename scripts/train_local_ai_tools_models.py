@@ -496,6 +496,7 @@ async def _main() -> None:
         "completed_shadow_sample_count": completed_shadow_count,
         "completed_trade_sample_count": completed_trade_count,
         "quality_report": training_payload["quality_report"],
+        "governance_report": training_payload["governance_report"],
     }
     result = await _post_training_payload(
         args.base_url,

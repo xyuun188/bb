@@ -5,6 +5,7 @@ from services.training_data_quality import (
     annotate_training_payload,
     assess_shadow_sample,
     assess_trade_sample,
+    governance_report,
 )
 
 
@@ -108,6 +109,12 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert report["by_kind"]["text_sentiment"]["sources"]["scrapling:ethereum_blog"] == 1
     assert report["by_kind"]["text_sentiment"]["trainable_sources"]["scrapling:ethereum_blog"] == 1
     assert report["policy"]["hold_observation_penalty"] == 0.55
+    governance = payload["governance_report"]
+    assert governance["cleanup_mode"] == "quarantine_not_delete"
+    assert governance["raw_records_preserved"] is True
+    assert governance["quarantine_applied"] is True
+    assert governance["requires_artifact_refresh"] is True
+    assert "local_ai_tools" in governance["refresh_targets"]
 
 
 def test_shadow_market_data_quality_issue_is_excluded_from_training() -> None:
@@ -129,3 +136,26 @@ def test_shadow_market_data_quality_issue_is_excluded_from_training() -> None:
     assert assessment.status == "excluded"
     assert assessment.weight == 0.0
     assert "market_data_quality:price_source_split" in assessment.reasons
+
+
+def test_training_governance_report_preserves_raw_records_and_targets_refresh() -> None:
+    report = governance_report(
+        {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {
+                "total": 10,
+                "included": 6,
+                "downweighted": 3,
+                "excluded": 1,
+                "effective_weight_ratio": 0.72,
+            },
+            "top_reasons": [{"reason": "trade:manual_or_test_trade", "count": 1}],
+        }
+    )
+
+    assert report["status"] == "quarantined"
+    assert report["raw_records_preserved"] is True
+    assert report["excluded_sample_count"] == 1
+    assert report["downweighted_sample_count"] == 3
+    assert report["contamination_risk"] == "high"
+    assert "vector_memory_reindex" in report["refresh_targets"]

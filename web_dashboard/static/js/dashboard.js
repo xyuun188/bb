@@ -1107,8 +1107,20 @@ function updateStats(stats, source = 'unknown') {
             state.lastStatsSource === 'summary' &&
             now - Number(state.lastStatsAt || 0) < 15000
         )
-            ? { ...stats, decision_interval: state.decisionInterval }
+            ? {
+                ...stats,
+                decision_interval: state.decisionInterval,
+                market_loop_interval_seconds: stats.market_loop_interval_seconds
+                    || state.lastStats?.market_loop_interval_seconds,
+                position_loop_interval_seconds: stats.position_loop_interval_seconds
+                    || state.lastStats?.position_loop_interval_seconds,
+                market_round_time_budget_seconds: stats.market_round_time_budget_seconds
+                    || state.lastStats?.market_round_time_budget_seconds,
+            }
             : stats;
+        if (isFullSummary || hasRuntimeFields) {
+            state.lastStats = { ...(state.lastStats || {}), ...stats };
+        }
         updateAutoStatus(autoStatusStats);
     }
     if (isFullSummary || hasRuntimeFields) {
@@ -4629,6 +4641,9 @@ function renderDataCollectionTraining(training) {
     if (!container) return;
     const quality = training.text_sentiment_quality_sample || {};
     const localTools = training.local_ai_tools || {};
+    const governance = training.governance || {};
+    const localGovernance = governance.local_ai_tools || localTools.governance_report || {};
+    const mlGovernance = governance.local_ml_signal || {};
     const reasons = Array.isArray(quality.top_reasons) ? quality.top_reasons : [];
     const qualitySources = Array.isArray(quality.top_sources) ? quality.top_sources : [];
     const models = localTools.models && typeof localTools.models === 'object'
@@ -4642,6 +4657,18 @@ function renderDataCollectionTraining(training) {
         : '复盘完成口径暂未返回';
     container.innerHTML = `
         <div class="data-quality-grid">
+            <div class="data-quality-panel data-governance-panel">
+                <strong>训练数据治理</strong>
+                <div class="data-collection-summary data-collection-summary-compact">
+                    ${collectionMetric('清洗状态', trainingGovernanceStatusLabel(localGovernance.status || governance.status), trainingGovernanceSummary(localGovernance), trainingGovernanceTone(localGovernance.status || governance.status))}
+                    ${collectionMetric('隔离样本', `${monitorNumber(localGovernance.excluded_sample_count, 0)} 条`, '保留原始记录，但不进训练', Number(localGovernance.excluded_sample_count || 0) ? 'warn' : 'good')}
+                    ${collectionMetric('降权样本', `${monitorNumber(localGovernance.downweighted_sample_count, 0)} 条`, '弱证据继续学习但降低权重', Number(localGovernance.downweighted_sample_count || 0) ? 'warn' : 'good')}
+                    ${collectionMetric('ML 可训练', `${monitorNumber(governance.local_ml_trainable_shadow_sample_count, 0)} 条`, trainingGovernanceSummary(mlGovernance), Number(governance.local_ml_trainable_shadow_sample_count || 0) > 0 ? 'good' : 'warn')}
+                </div>
+                <div class="data-governance-notes">
+                    ${trainingGovernanceNotes(localGovernance, mlGovernance)}
+                </div>
+            </div>
             <div class="data-quality-panel">
                 <strong>文本情绪样本质量</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
@@ -4670,6 +4697,71 @@ function renderDataCollectionTraining(training) {
                 </div>
             </div>
         </div>`;
+}
+
+function trainingGovernanceStatusLabel(status) {
+    const normalized = String(status || '').toLowerCase();
+    return {
+        ok: '已检查',
+        clean: '清洁',
+        quarantined: '已隔离',
+        downweighted: '已降权',
+        error: '检查失败',
+    }[normalized] || '待检查';
+}
+
+function trainingGovernanceTone(status) {
+    const normalized = String(status || '').toLowerCase();
+    if (normalized === 'error') return 'bad';
+    if (normalized === 'quarantined' || normalized === 'downweighted') return 'warn';
+    if (normalized === 'clean' || normalized === 'ok') return 'good';
+    return 'muted';
+}
+
+function trainingGovernanceSummary(report) {
+    if (!report || typeof report !== 'object') return '等待治理报告';
+    return report.summary || `有效权重 ${monitorNumber((report.effective_weight_ratio || 0) * 100, 1)}%`;
+}
+
+function trainingGovernanceNotes(localReport, mlReport) {
+    const notes = [];
+    if (localReport?.raw_records_preserved) {
+        notes.push('原始交易/分析记录保留，只隔离训练视图。');
+    }
+    if (localReport?.requires_artifact_refresh || mlReport?.requires_artifact_refresh) {
+        notes.push('清洗策略已生效，建议执行清洗刷新后观察新一轮模型表现。');
+    }
+    const targets = localReport?.refresh_targets || mlReport?.refresh_targets || [];
+    if (Array.isArray(targets) && targets.length) {
+        notes.push(`刷新目标：${targets.join(' / ')}`);
+    }
+    if (!notes.length) notes.push('暂无脏样本风险信号。');
+    return notes.map(note => `<span>${escHtml(note)}</span>`).join('');
+}
+
+async function refreshTrainingGovernance() {
+    const container = document.getElementById('data-collection-training');
+    if (container) {
+        const previous = document.getElementById('training-governance-refreshing');
+        if (previous) previous.remove();
+        container.insertAdjacentHTML(
+            'afterbegin',
+            '<div class="analysis-empty compact" id="training-governance-refreshing">正在按清洗视图重训/重建，请稍等...</div>'
+        );
+    }
+    try {
+        const data = await postJSON('/api/data-collection/training-governance/refresh', {});
+        state.dataCollectionStatus = data || null;
+        renderDataCollectionDashboard();
+        const message = data?.message || '训练数据治理刷新完成。';
+        const updated = document.getElementById('data-collection-updated');
+        if (updated) updated.textContent = message;
+    } catch (err) {
+        const refreshing = document.getElementById('training-governance-refreshing');
+        if (refreshing) {
+            refreshing.textContent = err?.message || '训练数据治理刷新失败。';
+        }
+    }
 }
 
 function renderDataCollectionSourceManager(sources) {
@@ -5531,6 +5623,12 @@ function executionStatusPresentation(record, explicitSuccess = null) {
 function fmtPrice(p) { return p ? Number(p).toFixed(4) : '0.0000'; }
 function fmtPct(p) { return p ? Number(p).toFixed(2) + '%' : '0.00%'; }
 function fmtNum(n) { return n ? Number(n).toFixed(4) : '0'; }
+function fmtSecondsLabel(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+    const rounded = Math.round(seconds * 10) / 10;
+    return `${rounded}${'\u79d2'}`;
+}
 function formatUptime(seconds) {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
@@ -5784,8 +5882,10 @@ function updateAutoStatus(stats) {
 
     const intervalEl = document.getElementById('status-interval');
     if (intervalEl) {
+        const marketInterval = stats?.market_loop_interval_seconds;
+        const positionInterval = stats?.position_loop_interval_seconds;
         intervalEl.textContent = state.decisionInterval
-            ? `${state.decisionInterval}\u79d2/\u8f6e`
+            ? `配置${fmtSecondsLabel(state.decisionInterval)} / 市场${fmtSecondsLabel(marketInterval)} / 持仓${fmtSecondsLabel(positionInterval)}`
             : '\u8bfb\u53d6\u4e2d';
     }
 

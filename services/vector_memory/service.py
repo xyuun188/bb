@@ -14,7 +14,6 @@ from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.news import NewsArticle
-from models.trade import Position
 from services.vector_memory.store import VectorMemoryStore, build_vector_memory_store
 from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
@@ -294,24 +293,11 @@ class VectorMemoryService:
                 .scalars()
                 .all()
             )
-            position_rows = list(
-                (
-                    await session.execute(
-                        select(Position)
-                        .where(Position.is_open.is_(False))
-                        .order_by(Position.id.desc())
-                        .limit(500)
-                    )
-                )
-                .scalars()
-                .all()
-            )
 
         documents: list[VectorMemoryDocument] = []
-        closed_pnl_by_symbol = _closed_pnl_by_symbol(position_rows)
         for decision in decision_rows:
             raw = decision.raw_llm_response if isinstance(decision.raw_llm_response, dict) else {}
-            documents.append(_decision_document(decision, raw, closed_pnl_by_symbol))
+            documents.append(_decision_document(decision, raw))
         for article in news_rows:
             document = _news_document(article)
             if document:
@@ -331,15 +317,10 @@ def get_vector_memory_service() -> VectorMemoryService:
 def _decision_document(
     decision: AIDecision,
     raw: dict[str, Any],
-    closed_pnl_by_symbol: dict[str, float],
 ) -> VectorMemoryDocument:
     symbol = _normalize_symbol(decision.symbol)
-    pnl_pct = decision.outcome_pnl_pct
-    if pnl_pct is None and symbol in closed_pnl_by_symbol:
-        pnl_pct = closed_pnl_by_symbol[symbol]
-    outcome = decision.outcome or (
-        "profit" if (pnl_pct or 0) > 0 else "loss" if (pnl_pct or 0) < 0 else ""
-    )
+    pnl_pct = _decision_realized_pnl_pct(decision)
+    outcome = _decision_realized_outcome(decision, pnl_pct)
     metadata = {
         "decision_id": decision.id,
         "analysis_type": decision.analysis_type or raw.get("analysis_type") or "",
@@ -347,6 +328,8 @@ def _decision_document(
         "position_size_pct": float(decision.position_size_pct or 0.0),
         "is_paper": bool(decision.is_paper),
         "was_executed": bool(decision.was_executed),
+        "has_realized_outcome": pnl_pct is not None,
+        "pnl_source": "decision_outcome" if pnl_pct is not None else "",
     }
     return VectorMemoryDocument(
         id=f"decision:{decision.id}",
@@ -411,13 +394,25 @@ def _decision_text(decision: AIDecision, raw: dict[str, Any]) -> str:
     return "；".join(part for part in parts if str(part).strip())
 
 
-def _closed_pnl_by_symbol(positions: list[Position]) -> dict[str, float]:
-    result: dict[str, float] = {}
-    for position in positions:
-        symbol = _normalize_symbol(position.symbol)
-        if symbol and symbol not in result:
-            result[symbol] = float(position.realized_pnl or 0.0)
-    return result
+def _decision_realized_pnl_pct(decision: AIDecision) -> float | None:
+    """Return realized PnL only when it belongs to this exact decision."""
+
+    if decision.outcome_pnl_pct is None:
+        return None
+    if not decision.outcome and not decision.was_executed:
+        return None
+    return float(decision.outcome_pnl_pct)
+
+
+def _decision_realized_outcome(decision: AIDecision, pnl_pct: float | None) -> str:
+    """Return an outcome label without inventing results for hold/unfilled rows."""
+
+    raw_outcome = str(decision.outcome or "").strip()
+    if raw_outcome:
+        return raw_outcome
+    if pnl_pct is None:
+        return ""
+    return "profit" if pnl_pct > 0 else "loss" if pnl_pct < 0 else "flat"
 
 
 def _normalize_symbol(symbol: str | None) -> str:
@@ -433,6 +428,8 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _hit_payload(hit: VectorMemoryHit) -> dict[str, Any]:
+    metadata = hit.metadata if isinstance(hit.metadata, dict) else {}
+    pnl_pct = hit.pnl_pct if metadata.get("has_realized_outcome") is True else None
     return {
         "id": hit.id,
         "score": hit.score,
@@ -441,10 +438,10 @@ def _hit_payload(hit: VectorMemoryHit) -> dict[str, Any]:
         "symbol": hit.symbol,
         "action": hit.action,
         "outcome": hit.outcome,
-        "pnl_pct": hit.pnl_pct,
+        "pnl_pct": pnl_pct,
         "created_at": hit.created_at,
         "source_ref": hit.source_ref,
-        "metadata": hit.metadata,
+        "metadata": metadata,
     }
 
 
@@ -473,7 +470,7 @@ def _influence_payload(hits: list[dict[str, Any]], *, action: str) -> dict[str, 
         try:
             pnl_value = float(pnl)
         except (TypeError, ValueError):
-            pnl_value = 0.0
+            continue
         if pnl_value < 0:
             loss_count += 1
         elif pnl_value > 0:

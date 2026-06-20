@@ -52,7 +52,7 @@ def document_to_fields(document: VectorMemoryDocument) -> dict[str, Any]:
         "symbol": _clean_scalar_text(document.symbol, limit=120),
         "action": _clean_scalar_text(document.action, limit=80),
         "outcome": _clean_scalar_text(document.outcome, limit=80),
-        "pnl_pct": float(document.pnl_pct) if document.pnl_pct is not None else 0.0,
+        "pnl_pct": float(document.pnl_pct) if document.pnl_pct is not None else None,
         "created_at": document.created_at.isoformat() if document.created_at else "",
         "source_ref": _clean_scalar_text(document.source_ref, limit=1000),
         "metadata_json": _clean_scalar_text(metadata, limit=3000),
@@ -72,8 +72,9 @@ def fields_to_hit(doc_id: str, score: float, fields: dict[str, Any]) -> VectorMe
         except json.JSONDecodeError:
             metadata = {}
     pnl_pct: float | None
+    raw_pnl = fields.get("pnl_pct")
     try:
-        pnl_pct = float(fields.get("pnl_pct"))
+        pnl_pct = float(raw_pnl) if raw_pnl is not None else None
     except (TypeError, ValueError):
         pnl_pct = None
     return VectorMemoryHit(

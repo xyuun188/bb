@@ -1954,6 +1954,23 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
     assert service.market_round_watchdog_seconds() >= 180.0
 
 
+def test_parallel_loop_intervals_are_not_market_throttles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    assert service.market_loop_interval_seconds() == pytest.approx(10.5)
+    assert service.position_loop_interval_seconds() == pytest.approx(19.5)
+    assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
+    assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
+
+
 def test_market_round_budget_is_not_used_as_outer_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

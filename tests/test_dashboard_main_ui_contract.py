@@ -286,6 +286,17 @@ def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> No
     assert ".mode-btn[data-scan]" not in script
 
 
+def test_dashboard_status_shows_split_scheduler_intervals() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "market_loop_interval_seconds" in script
+    assert "position_loop_interval_seconds" in script
+    assert "market_round_time_budget_seconds" in script
+    assert "配置${fmtSecondsLabel(state.decisionInterval)}" in script
+    assert "市场${fmtSecondsLabel(marketInterval)}" in script
+    assert "持仓${fmtSecondsLabel(positionInterval)}" in script
+
+
 def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")

@@ -69,6 +69,8 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert "text_sentiment_quality_sample" in body["training"]
     assert "top_sources" in body["training"]["text_sentiment_quality_sample"]
     assert "local_ai_tools" in body["training"]
+    assert "governance" in body["training"]
+    assert body["training"]["governance"]["status"] in {"ok", "error"}
 
 
 @pytest.mark.asyncio
@@ -237,3 +239,133 @@ async def test_data_collection_settings_persists_safe_values(
     assert ("data_collection.coinmarketcal_api_key", "coinmarketcal-secret") in captured_secrets
     assert ("data_collection.newsapi_api_key", "newsapi-secret") in captured_secrets
     assert "api_key" not in str(persisted).lower()
+
+
+@pytest.mark.asyncio
+async def test_training_governance_refresh_triggers_clean_artifact_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+
+    class FakeMLSignalService:
+        async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
+            calls.append(f"ml:{force}")
+            return {"trained": True, "force": force}
+
+    class FakeTradingService:
+        async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
+            calls.append(f"local_ai:{force}")
+            return {"trained": True, "force": force}
+
+    class FakeVectorMemoryService:
+        async def reindex_recent(self) -> dict[str, Any]:
+            calls.append("vector")
+            return {"status": "ok", "indexed": 2}
+
+    async def fake_status() -> dict[str, Any]:
+        return {
+            "checked_at": "2026-06-20T00:00:00+00:00",
+            "config": {},
+            "sources": [],
+            "stats": {},
+            "training": {"governance": {"status": "ok"}},
+        }
+
+    monkeypatch.setattr(data_collection_module._dash, "_trading_service", FakeTradingService())
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_ml_signal_service",
+        lambda: FakeMLSignalService(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "get_vector_memory_service",
+        lambda: FakeVectorMemoryService(),
+    )
+    monkeypatch.setattr(data_collection_module, "get_data_collection_status", fake_status)
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/data-collection/training-governance/refresh")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert calls == ["ml:True", "local_ai:True", "vector"]
+    assert body["refresh_result"]["vector_memory"]["indexed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_training_governance_refresh_trains_local_tools_without_trading_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(data_collection_module._dash, "_trading_service", None)
+
+    class FakeLocalAIToolsClient:
+        def enabled(self) -> bool:
+            return True
+
+        async def train(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return {"trained": True}
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+    async def fake_shadow(_limit: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "BTC/USDT",
+                "decision_action": "hold",
+                "decision_confidence": 0.01,
+                "horizon_minutes": 30,
+                "features": {"current_price": 100.0, "spread_pct": 0.01},
+                "long_return_pct": 0.1,
+                "short_return_pct": -0.2,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_shadow_samples",
+        fake_shadow,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_trade_reflection_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_closed_position_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_sequence_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_text_sentiment_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._completed_shadow_sample_count",
+        lambda: _async_value(9),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._completed_trade_sample_count",
+        lambda: _async_value(5),
+    )
+
+    result = await data_collection_module._train_local_ai_tools_from_dashboard()
+
+    assert result["trained"] is True
+    assert captured["kwargs"]["source"] == "dashboard_training_governance_refresh"
+    assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
+
+
+async def _async_value(value: Any) -> Any:
+    return value

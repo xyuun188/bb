@@ -96,6 +96,29 @@ async def test_local_ai_tools_training_post_preserves_quality_report() -> None:
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_training_post_preserves_governance_report() -> None:
+    captured_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payload.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"trained": True}, request=request)
+
+    governance_report = {
+        "cleanup_mode": "quarantine_not_delete",
+        "excluded_sample_count": 3,
+    }
+    result = await _post_training_payload(
+        "https://local-ai-tools.test/",
+        {"shadow_samples": [], "governance_report": governance_report},
+        request_timeout=3.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result == {"trained": True}
+    assert captured_payload["governance_report"] == governance_report
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_training_auth_failure_is_actionable_and_redacted() -> None:
     leaked_token = "abcdefghijklmnopqrstuvwxyz123456"
 

@@ -11,6 +11,11 @@ _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
 DATA_QUALITY_VERSION = "2026-06-20.v2"
 QualityStatus = Literal["included", "downweighted", "excluded"]
 SampleKind = Literal["shadow", "trade", "sequence", "text_sentiment"]
+_RETRAIN_TARGETS = (
+    "local_ml_signal",
+    "local_ai_tools",
+    "vector_memory_reindex",
+)
 
 
 @dataclass(frozen=True)
@@ -371,6 +376,73 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
     }
 
 
+def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
+    """Return an operator-facing cleanup report for historical training samples.
+
+    Historical rows are preserved for audit and PnL traceability.  Cleanup means
+    samples are quarantined from training or downweighted before any model sees
+    them, then dependent artifacts can be retrained/reindexed from the clean
+    view.
+    """
+
+    totals = quality.get("totals") if isinstance(quality.get("totals"), dict) else {}
+    total = int(totals.get("total") or 0)
+    included = int(totals.get("included") or 0)
+    downweighted = int(totals.get("downweighted") or 0)
+    excluded = int(totals.get("excluded") or 0)
+    trainable = included + downweighted
+    effective_weight_ratio = float(totals.get("effective_weight_ratio") or 0.0)
+    top_reasons = quality.get("top_reasons") if isinstance(quality.get("top_reasons"), list) else []
+    has_contamination = bool(excluded or downweighted or top_reasons)
+    blocked_reason_count = sum(
+        int(item.get("count") or 0)
+        for item in top_reasons
+        if isinstance(item, dict)
+        and any(
+            token in str(item.get("reason") or "")
+            for token in (
+                "manual_or_test_trade",
+                "market_data_quality",
+                "missing_features",
+                "abnormal",
+                "invalid",
+            )
+        )
+    )
+    status = "clean"
+    if excluded:
+        status = "quarantined"
+    elif downweighted:
+        status = "downweighted"
+    return {
+        "status": status,
+        "data_quality_version": quality.get("data_quality_version") or DATA_QUALITY_VERSION,
+        "raw_records_preserved": True,
+        "cleanup_mode": "quarantine_not_delete",
+        "quarantine_applied": bool(excluded),
+        "downweight_applied": bool(downweighted),
+        "trainable_sample_count": trainable,
+        "excluded_sample_count": excluded,
+        "downweighted_sample_count": downweighted,
+        "effective_weight_ratio": round(effective_weight_ratio, 4),
+        "contamination_risk": (
+            "high" if blocked_reason_count else "medium" if has_contamination else "low"
+        ),
+        "blocked_reason_count": blocked_reason_count,
+        "requires_artifact_refresh": bool(has_contamination),
+        "refresh_targets": list(_RETRAIN_TARGETS),
+        "summary": (
+            f"已保留 {total} 条原始样本；{excluded} 条隔离不训练，"
+            f"{downweighted} 条降权训练，{trainable} 条进入清洗后的训练视图。"
+        ),
+        "notes": [
+            "原始交易、分析和复盘记录不删除，避免审计链断裂。",
+            "模型训练、策略学习和向量记忆只消费清洗后的训练视图。",
+            "清洗策略变更后应重训本地 ML、服务器量化工具，并重建向量索引。",
+        ],
+    }
+
+
 def annotate_training_payload(
     *,
     shadow_samples: list[dict[str, Any]],
@@ -382,17 +454,19 @@ def annotate_training_payload(
     annotated_trade = annotate_samples(trade_samples, "trade")
     annotated_sequence = annotate_samples(sequence_samples, "sequence")
     annotated_text = annotate_samples(text_sentiment_samples, "text_sentiment")
+    report = quality_report(
+        {
+            "shadow": annotated_shadow,
+            "trade": annotated_trade,
+            "sequence": annotated_sequence,
+            "text_sentiment": annotated_text,
+        }
+    )
     return {
         "shadow_samples": trainable_samples(annotated_shadow),
         "trade_samples": trainable_samples(annotated_trade),
         "sequence_samples": trainable_samples(annotated_sequence),
         "text_sentiment_samples": trainable_samples(annotated_text),
-        "quality_report": quality_report(
-            {
-                "shadow": annotated_shadow,
-                "trade": annotated_trade,
-                "sequence": annotated_sequence,
-                "text_sentiment": annotated_text,
-            }
-        ),
+        "quality_report": report,
+        "governance_report": governance_report(report),
     }

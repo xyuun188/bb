@@ -310,6 +310,9 @@ async def test_dashboard_summary_uses_split_process_runtime_heartbeat(
         "heartbeat_at": datetime.now(UTC).isoformat(),
         "uptime_seconds": 3661,
         "decision_interval": 30,
+        "market_loop_interval_seconds": 10.5,
+        "position_loop_interval_seconds": 19.5,
+        "market_round_time_budget_seconds": 27.0,
         "market_analysis_watchdog_seconds": 240,
         "position_analysis_watchdog_seconds": 300,
         "current_stage": "idle",
@@ -339,11 +342,55 @@ async def test_dashboard_summary_uses_split_process_runtime_heartbeat(
     assert stats["running"] is True
     assert stats["uptime_seconds"] == 3661
     assert stats["decision_interval"] == 30
+    assert stats["market_loop_interval_seconds"] == 10.5
+    assert stats["position_loop_interval_seconds"] == 19.5
+    assert stats["market_round_time_budget_seconds"] == 27.0
     assert stats["market_analysis_watchdog_seconds"] == 240
     assert stats["position_analysis_watchdog_seconds"] == 300
     assert stats["uptime_source"] == "split_process_heartbeat"
     assert stats["round_active"] is True
     assert stats["round_running_seconds"] >= 40
+
+
+@pytest.mark.asyncio
+async def test_dashboard_stats_backfills_runtime_fields_when_service_is_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    heartbeat = {
+        "running": True,
+        "mode": "paper",
+        "paused": False,
+        "heartbeat_at": datetime.now(UTC).isoformat(),
+        "decision_interval": 30,
+        "market_loop_interval_seconds": 10.5,
+        "position_loop_interval_seconds": 19.5,
+        "market_round_time_budget_seconds": 27.0,
+    }
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(heartbeat),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    class PartialTradingService:
+        def get_stats(self, mode_filter=None):
+            return {"running": True, "decision_interval": None}
+
+    async def recent_activity(_hours: int = 6) -> dict[str, Any]:
+        return {"decision_count": 1, "order_count": 0, "heartbeat_age_seconds": 5.0}
+
+    monkeypatch.setattr(dashboard, "_trading_service", PartialTradingService())
+    monkeypatch.setattr(dashboard, "_recent_trading_activity_stats", recent_activity)
+
+    stats = await dashboard._trading_stats_with_runtime_heartbeat("paper")
+
+    assert stats["decision_interval"] == 30
+    assert stats["market_loop_interval_seconds"] == 10.5
+    assert stats["position_loop_interval_seconds"] == 19.5
+    assert stats["market_round_time_budget_seconds"] == 27.0
 
 
 @pytest.mark.asyncio
@@ -405,6 +452,9 @@ async def test_self_check_uses_split_process_runtime_heartbeat(
         "heartbeat_at": datetime.now(UTC).isoformat(),
         "uptime_seconds": 7200,
         "decision_interval": 30,
+        "market_loop_interval_seconds": 10.5,
+        "position_loop_interval_seconds": 19.5,
+        "market_round_time_budget_seconds": 27.0,
         "current_stage": "review_open_positions",
         "round_active": True,
         "last_round_started_at": datetime.now(UTC).isoformat(),
@@ -431,6 +481,9 @@ async def test_self_check_uses_split_process_runtime_heartbeat(
     assert item["status"] == "ok"
     assert item["details"]["source"] == "runtime_heartbeat"
     assert item["details"]["decision_interval"] == 30
+    assert item["details"]["market_loop_interval_seconds"] == 10.5
+    assert item["details"]["position_loop_interval_seconds"] == 19.5
+    assert item["details"]["market_round_time_budget_seconds"] == 27.0
     assert "心跳正常" in item["message"]
 
 
@@ -496,9 +549,7 @@ async def test_self_check_warns_when_market_round_is_stuck(
         "round_active": True,
         "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
         "last_round_finished_at": None,
-        "last_market_round_started_at": (
-            datetime.now(UTC) - timedelta(seconds=240)
-        ).isoformat(),
+        "last_market_round_started_at": (datetime.now(UTC) - timedelta(seconds=240)).isoformat(),
         "last_market_round_finished_at": None,
     }
     (data_dir / "trading_runtime_status.json").write_text(
@@ -545,9 +596,7 @@ async def test_self_check_uses_position_watchdog_for_position_round(
         "round_active": True,
         "last_round_started_at": (datetime.now(UTC) - timedelta(seconds=105)).isoformat(),
         "last_round_finished_at": None,
-        "last_position_round_started_at": (
-            datetime.now(UTC) - timedelta(seconds=105)
-        ).isoformat(),
+        "last_position_round_started_at": (datetime.now(UTC) - timedelta(seconds=105)).isoformat(),
         "last_position_round_finished_at": None,
         "position_analysis_watchdog_seconds": 180,
     }

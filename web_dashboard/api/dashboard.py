@@ -934,9 +934,41 @@ async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any
         "models": [ENSEMBLE_TRADER_NAME],
         "risk": {},
         "decision_interval": decision_interval,
+        "market_loop_interval_seconds": runtime_status.get("market_loop_interval_seconds"),
+        "position_loop_interval_seconds": runtime_status.get("position_loop_interval_seconds"),
+        "market_round_time_budget_seconds": runtime_status.get("market_round_time_budget_seconds"),
         "split_process_activity": activity,
         "runtime_status": runtime_status,
     }
+
+
+async def _trading_stats_with_runtime_heartbeat(mode: str | None = None) -> dict[str, Any]:
+    """Return trading stats and backfill split-process heartbeat fields when needed."""
+
+    if _trading_service:
+        stats = dict(_trading_service.get_stats(mode_filter=mode))
+        if stats.get("market_loop_interval_seconds") is not None:
+            return stats
+        runtime_stats = await _split_process_trading_stats(mode)
+        for key in (
+            "decision_interval",
+            "market_loop_interval_seconds",
+            "position_loop_interval_seconds",
+            "market_round_time_budget_seconds",
+            "market_current_stage",
+            "market_round_active",
+            "position_current_stage",
+            "position_round_active",
+            "last_market_round_started_at",
+            "last_market_round_finished_at",
+            "last_position_round_started_at",
+            "last_position_round_finished_at",
+        ):
+            if stats.get(key) is None and runtime_stats.get(key) is not None:
+                stats[key] = runtime_stats[key]
+        stats.setdefault("runtime_status", runtime_stats.get("runtime_status", {}))
+        return stats
+    return await _split_process_trading_stats(mode)
 
 
 def _execution_risk_floor(allocated: float, max_loss_pct: float, max_loss_usdt: float) -> float:
@@ -2530,11 +2562,7 @@ def _okx_display_change_pct(ticker: dict) -> float:
 @router.get("/status")
 async def get_status(mode: str | None = None):
     """System status overview. Optional mode filter for cumulative counts."""
-    trading_stats = {}
-    if _trading_service:
-        trading_stats = _trading_service.get_stats(mode_filter=mode)
-    else:
-        trading_stats = await _split_process_trading_stats(mode)
+    trading_stats = await _trading_stats_with_runtime_heartbeat(mode)
 
     return {
         "status": "running" if bool(trading_stats.get("running")) else "stopped",
@@ -2683,11 +2711,7 @@ async def get_dashboard_summary():
     )
     account_summaries = [execution_account]
 
-    trading_stats = {}
-    if _trading_service:
-        trading_stats = _trading_service.get_stats(mode_filter=mode_manager.mode.value)
-    else:
-        trading_stats = await _split_process_trading_stats(mode_manager.mode.value)
+    trading_stats = await _trading_stats_with_runtime_heartbeat(mode_manager.mode.value)
     today_decisions_total = await _get_today_ai_decision_count(mode_manager.mode.value)
 
     return {
@@ -3790,9 +3814,7 @@ async def get_analysis_records(
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
         pre_expert_skip = _analysis_pre_expert_skip(raw)
         attempted_expert_count = (
-            0
-            if pre_expert_skip.get("skipped")
-            else (len(attempted_names) or len(expected_experts))
+            0 if pre_expert_skip.get("skipped") else (len(attempted_names) or len(expected_experts))
         )
         missing_experts = [
             {
@@ -3808,9 +3830,7 @@ async def get_analysis_records(
                         else "本轮未返回结果，可能是模型调用失败、超时或返回格式不符合 JSON 要求。"
                     )
                 ),
-                "status": (
-                    "pre_expert_skipped" if pre_expert_skip.get("skipped") else "missing"
-                ),
+                "status": ("pre_expert_skipped" if pre_expert_skip.get("skipped") else "missing"),
                 "skip_kind": pre_expert_skip.get("kind") or "",
             }
             for e in expected_experts

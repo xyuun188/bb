@@ -155,6 +155,7 @@ class TrainRequest(BaseModel):
     completed_shadow_sample_count: int | None = None
     completed_trade_sample_count: int | None = None
     quality_report: dict[str, Any] = {}
+    governance_report: dict[str, Any] = {}
 
 
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -663,6 +664,7 @@ def health() -> dict[str, Any]:
         "completed_shadow_sample_count": metadata.get("completed_shadow_sample_count", 0),
         "completed_trade_sample_count": metadata.get("completed_trade_sample_count", 0),
         "quality_report": metadata.get("quality_report", {}),
+        "governance_report": metadata.get("governance_report", {}),
         "review_backend": "disabled_use_trading_app_online_model",
     }
 
@@ -811,6 +813,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
         "quality_report": req.quality_report or {},
+        "governance_report": req.governance_report or {},
         "training_objective": "Predict executable net return after estimated fees/slippage; win rate is auxiliary.",
         "models": {
             "profit": "ExtraTreesRegressor long/short expected return",

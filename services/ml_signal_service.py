@@ -30,7 +30,12 @@ from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.training_data_quality import assess_shadow_sample, quality_report
+from services.training_data_quality import (
+    assess_shadow_sample,
+    annotate_samples,
+    governance_report,
+    quality_report,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -397,11 +402,41 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
+    """Assess all candidate shadow rows, including rows excluded before fitting."""
+
+    samples: list[dict[str, Any]] = []
+    for row in rows:
+        snapshot = _parse_json(getattr(row, "feature_snapshot", None))
+        raw_long_return = getattr(row, "long_return_pct", None)
+        raw_short_return = getattr(row, "short_return_pct", None)
+        sample = {
+            "symbol": getattr(row, "symbol", ""),
+            "analysis_type": getattr(row, "analysis_type", ""),
+            "decision_action": getattr(row, "decision_action", ""),
+            "decision_confidence": _safe_float(getattr(row, "decision_confidence", 0.0)),
+            "horizon_minutes": int(getattr(row, "horizon_minutes", 10) or 10),
+            "features": snapshot,
+            "long_return_pct": None if raw_long_return is None else _safe_float(raw_long_return),
+            "short_return_pct": None if raw_short_return is None else _safe_float(raw_short_return),
+            "best_action": getattr(row, "best_action", ""),
+            "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
+        }
+        samples.append(sample)
+    annotated = annotate_samples(samples, "shadow")
+    report = quality_report({"shadow": annotated})
+    return {
+        "quality_report": report,
+        "governance_report": governance_report(report),
+    }
+
+
 def train_from_frame(
     frame: pd.DataFrame,
     *,
     min_samples: int = MIN_TRAINING_SAMPLES,
     completed_sample_count: int | None = None,
+    training_quality_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if len(frame) < min_samples:
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
@@ -436,7 +471,7 @@ def train_from_frame(
 
     now = datetime.now(UTC).isoformat()
     completed_count = int(completed_sample_count or len(frame))
-    frame_quality_report = quality_report(
+    frame_quality_report = training_quality_report or quality_report(
         {
             "shadow": [
                 {
@@ -456,6 +491,7 @@ def train_from_frame(
         "last_trained_completed_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
         "quality_report": frame_quality_report,
+        "governance_report": governance_report(frame_quality_report),
         "training_shadow_sample_limit": TRAINING_SHADOW_SAMPLE_LIMIT,
         "training_sample_note": "sample_count is the latest training window, not the all-time total.",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
@@ -659,11 +695,13 @@ class MLSignalService:
                 self._training = True
                 self._last_train_started_at = datetime.now(UTC).isoformat()
                 rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
+                quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
                 trained_metadata = await asyncio.to_thread(
                     train_from_frame,
                     frame,
                     completed_sample_count=completed_count,
+                    training_quality_report=quality_state["quality_report"],
                 )
                 self._bundle = None
                 self._loaded_mtime = None

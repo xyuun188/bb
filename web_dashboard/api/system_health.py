@@ -287,6 +287,16 @@ async def _trading_service_running_item() -> dict[str, Any]:
                         "market_configured_symbol_limit_is_batch_size", False
                     ),
                     "market_batch_policy": runtime_status.get("market_batch_policy"),
+                    "decision_interval": runtime_status.get("decision_interval"),
+                    "market_loop_interval_seconds": runtime_status.get(
+                        "market_loop_interval_seconds"
+                    ),
+                    "position_loop_interval_seconds": runtime_status.get(
+                        "position_loop_interval_seconds"
+                    ),
+                    "market_round_time_budget_seconds": runtime_status.get(
+                        "market_round_time_budget_seconds"
+                    ),
                     "market_analysis_watchdog_seconds": runtime_status.get(
                         "market_analysis_watchdog_seconds"
                     ),

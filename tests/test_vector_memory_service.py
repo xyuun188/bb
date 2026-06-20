@@ -6,11 +6,12 @@ import pytest
 
 from config.settings import settings
 from services.vector_memory.embedding import deterministic_text_vector
-from services.vector_memory.service import _influence_payload
+from services.vector_memory.service import _decision_document, _hit_payload, _influence_payload
 from services.vector_memory.store import (
     JsonVectorMemoryStore,
     ZvecVectorMemoryStore,
     document_to_fields,
+    fields_to_hit,
 )
 from services.vector_memory.types import VectorMemoryDocument
 
@@ -106,6 +107,66 @@ def test_vector_memory_document_fields_strip_invalid_control_text() -> None:
     assert "AI16Z" in fields["text"]
 
 
+def test_vector_memory_keeps_missing_pnl_as_missing() -> None:
+    fields = document_to_fields(
+        VectorMemoryDocument(
+            id="decision:hold",
+            kind="decision",
+            text="ETHW/USDT 观望 未成交",
+            symbol="ETHW/USDT",
+            action="hold",
+            pnl_pct=None,
+        )
+    )
+
+    assert fields["pnl_pct"] is None
+
+
+def test_vector_memory_decision_document_does_not_invent_unfilled_pnl() -> None:
+    class Decision:
+        id = 101
+        symbol = "ETHW/USDT"
+        action = "hold"
+        confidence = 0.0
+        position_size_pct = 0.0
+        is_paper = True
+        was_executed = False
+        outcome = None
+        outcome_pnl_pct = None
+        analysis_type = "market"
+        created_at = datetime.now(UTC)
+        reasoning = "保持观望"
+        execution_reason = "未提交订单"
+
+    document = _decision_document(Decision(), {})
+
+    assert document.pnl_pct is None
+    assert document.outcome == ""
+    assert document.metadata["has_realized_outcome"] is False
+    assert document.metadata["pnl_source"] == ""
+
+
+def test_vector_memory_hit_payload_hides_legacy_unverified_pnl() -> None:
+    hit = fields_to_hit(
+        "decision:legacy",
+        0.99,
+        {
+            "kind": "decision",
+            "text": "ETHW/USDT 观望 未提交订单",
+            "symbol": "ETHW/USDT",
+            "action": "hold",
+            "outcome": "",
+            "pnl_pct": -0.08407744,
+            "metadata_json": "{}",
+        },
+    )
+
+    payload = _hit_payload(hit)
+
+    assert payload["pnl_pct"] is None
+    assert payload["metadata"] == {}
+
+
 def test_zvec_store_accepts_colon_ids_and_cleaned_text(tmp_path) -> None:
     pytest.importorskip("zvec")
     store = ZvecVectorMemoryStore(tmp_path / "zvec", dimension=32, max_documents=20)
@@ -192,6 +253,21 @@ def test_vector_memory_influence_is_explainable_soft_score() -> None:
     assert influence["same_action_loss_count"] == 2
     assert influence["is_hard_gate"] is False
     assert "硬拦截" in influence["reason"] or "不作为硬拦截" in influence["reason"]
+
+
+def test_vector_memory_influence_ignores_missing_pnl_hits() -> None:
+    influence = _influence_payload(
+        [
+            {"score": 0.99, "action": "hold", "pnl_pct": None},
+            {"score": 0.88, "action": "long"},
+        ],
+        action="long",
+    )
+
+    assert influence["level"] == "neutral"
+    assert influence["score_delta"] == 0.0
+    assert influence["loss_count"] == 0
+    assert influence["profit_count"] == 0
 
 
 def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(

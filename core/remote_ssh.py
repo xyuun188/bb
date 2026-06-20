@@ -18,6 +18,10 @@ from core.safe_output import format_command_failure
 
 DEFAULT_SSH_TIMEOUT_SECONDS = 20
 DEFAULT_SSH_KEEPALIVE_SECONDS = 30
+DEFAULT_SSH_BANNER_TIMEOUT_SECONDS = 45
+DEFAULT_SSH_AUTH_TIMEOUT_SECONDS = 30
+DEFAULT_SSH_CONNECT_RETRIES = 5
+DEFAULT_SSH_CONNECT_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS = 180
 DEFAULT_REMOTE_OUTPUT_TEXT_LIMIT = 20_000
 DEFAULT_REMOTE_COMMAND_CHANNEL_OPEN_RETRIES = 2
@@ -26,6 +30,17 @@ REMOTE_STREAM_READ_CHUNK_BYTES = 8192
 TRANSIENT_CHANNEL_OPEN_ERROR_MARKERS = (
     "timeout opening channel",
     "ssh session not active",
+)
+TRANSIENT_CONNECT_ERROR_MARKERS = (
+    "error reading ssh protocol banner",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "no existing session",
+    "non-socket",
+    "非套接字",
+    "temporarily unavailable",
 )
 
 
@@ -91,14 +106,14 @@ def connect_remote_ssh(
     banner_timeout: int | None = None,
     auth_timeout: int | None = None,
     keepalive_interval: int = DEFAULT_SSH_KEEPALIVE_SECONDS,
+    connect_retries: int = DEFAULT_SSH_CONNECT_RETRIES,
+    retry_delay_seconds: float = DEFAULT_SSH_CONNECT_RETRY_DELAY_SECONDS,
     info: RemoteServerInfo | None = None,
 ) -> Any:
     """Create a strict SSH connection from the local ignored server-info file."""
     import paramiko
 
     server_info = info or load_remote_server_info(project_root)
-    ssh = paramiko.SSHClient()
-    configure_ssh_host_keys(ssh, project_root)
     connect_kwargs: dict[str, Any] = {
         "hostname": server_info.host,
         "port": server_info.port,
@@ -108,21 +123,58 @@ def connect_remote_ssh(
     }
     if banner_timeout is not None:
         connect_kwargs["banner_timeout"] = banner_timeout
+    else:
+        connect_kwargs["banner_timeout"] = max(DEFAULT_SSH_BANNER_TIMEOUT_SECONDS, timeout)
     if auth_timeout is not None:
         connect_kwargs["auth_timeout"] = auth_timeout
+    else:
+        connect_kwargs["auth_timeout"] = max(DEFAULT_SSH_AUTH_TIMEOUT_SECONDS, timeout)
+    attempts = _connect_attempts(connect_retries)
+    for attempt_index in range(attempts):
+        ssh = paramiko.SSHClient()
+        configure_ssh_host_keys(ssh, project_root)
+        try:
+            ssh.connect(**connect_kwargs)
+            _enable_ssh_keepalive(ssh, keepalive_interval)
+            _remember_reconnect_metadata(
+                ssh,
+                project_root,
+                connect_kwargs,
+                keepalive_interval,
+            )
+            return ssh
+        except Exception as exc:
+            ssh.close()
+            is_last_attempt = attempt_index >= attempts - 1
+            if is_last_attempt or not _is_transient_connect_error(exc):
+                raise
+            time.sleep(max(float(retry_delay_seconds or 0.0), 0.0) * (attempt_index + 1))
+    raise RuntimeError("SSH connection failed without an exception.")
+
+
+def _connect_attempts(connect_retries: int) -> int:
     try:
-        ssh.connect(**connect_kwargs)
-        _enable_ssh_keepalive(ssh, keepalive_interval)
-        _remember_reconnect_metadata(
-            ssh,
-            project_root,
-            connect_kwargs,
-            keepalive_interval,
-        )
+        retries = int(connect_retries)
+    except (TypeError, ValueError):
+        retries = DEFAULT_SSH_CONNECT_RETRIES
+    return max(1, min(retries, 10) + 1)
+
+
+def _is_transient_connect_error(exc: BaseException) -> bool:
+    try:
+        import paramiko
     except Exception:
-        ssh.close()
-        raise
-    return ssh
+        paramiko = None
+
+    message = str(exc).lower()
+    if isinstance(exc, (TimeoutError, OSError)) and any(
+        marker in message for marker in TRANSIENT_CONNECT_ERROR_MARKERS
+    ):
+        return True
+    ssh_exception = getattr(paramiko, "SSHException", None) if paramiko is not None else None
+    if ssh_exception is not None and isinstance(exc, ssh_exception):
+        return any(marker in message for marker in TRANSIENT_CONNECT_ERROR_MARKERS)
+    return any(marker in message for marker in TRANSIENT_CONNECT_ERROR_MARKERS)
 
 
 def _normalize_output_limit(max_output_chars: int | None) -> int:

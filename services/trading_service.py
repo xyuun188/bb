@@ -929,6 +929,20 @@ class TradingService:
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(8.0, interval * 0.90)
 
+    def position_loop_interval_seconds(self) -> float:
+        """Return the sleep interval between independent position-review rounds."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(5.0, interval * 0.65)
+
+    def market_loop_interval_seconds(self) -> float:
+        """Return the sleep interval between independent market-scan rounds."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(8.0, min(14.0, interval * 0.35))
+
     def market_round_watchdog_seconds(self) -> float:
         """Return the hard watchdog for a genuinely stuck market-analysis round."""
 
@@ -1949,6 +1963,11 @@ class TradingService:
                 "last_heartbeat_at": now.isoformat(),
                 "uptime_seconds": uptime,
                 "decision_interval": settings.decision_interval_seconds,
+                "market_loop_interval_seconds": round(self.market_loop_interval_seconds(), 3),
+                "position_loop_interval_seconds": round(self.position_loop_interval_seconds(), 3),
+                "market_round_time_budget_seconds": round(
+                    self.market_round_time_budget_seconds(), 3
+                ),
                 "market_configured_symbol_limit": settings.auto_scan_symbol_limit,
                 "market_configured_symbol_limit_is_batch_size": False,
                 "market_batch_policy": (
@@ -4238,26 +4257,20 @@ class TradingService:
         self._start_time = datetime.now(UTC)
         self._start_ml_auto_train_loop()
 
-        def position_loop_interval() -> float:
-            settings.refresh_runtime_env(force=True)
-            return max(5.0, float(settings.decision_interval_seconds) * 0.65)
-
-        def market_loop_interval() -> float:
-            settings.refresh_runtime_env(force=True)
-            return max(8.0, float(settings.decision_interval_seconds))
-
         logger.info(
             "trading service started",
             mode=mode_manager.mode.value,
             scheduler="parallel_market_position",
             decision_interval_seconds=settings.decision_interval_seconds,
+            market_loop_interval_seconds=self.market_loop_interval_seconds(),
+            position_loop_interval_seconds=self.position_loop_interval_seconds(),
         )
 
         self._position_analysis_task = asyncio.create_task(
-            self.position_review_service.loop(position_loop_interval)
+            self.position_review_service.loop(self.position_loop_interval_seconds)
         )
         self._market_analysis_task = asyncio.create_task(
-            self.market_analysis_service.loop(market_loop_interval)
+            self.market_analysis_service.loop(self.market_loop_interval_seconds)
         )
         self._runtime_heartbeat_task = asyncio.create_task(self._runtime_heartbeat_loop())
         try:
@@ -4412,6 +4425,7 @@ class TradingService:
 
         training_shadow_count = len(shadow_samples)
         quality_report = training_payload["quality_report"]
+        governance_report = training_payload["governance_report"]
         trainable_shadow_count = len(training_payload["shadow_samples"])
         trainable_trade_count = len(training_payload["trade_samples"])
         new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
@@ -4464,6 +4478,7 @@ class TradingService:
                 "trainable_shadow_sample_count": trainable_shadow_count,
                 "trainable_trade_sample_count": trainable_trade_count,
                 "quality_report": quality_report,
+                "governance_report": governance_report,
                 "completed_shadow_sample_count": completed_shadow_total,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
                 "completed_trade_sample_count": completed_trade_total,
@@ -4488,6 +4503,7 @@ class TradingService:
                 "trainable_shadow_sample_count": trainable_shadow_count,
                 "trainable_trade_sample_count": trainable_trade_count,
                 "quality_report": quality_report,
+                "governance_report": governance_report,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
                 "training_shadow_sample_limit": (
                     LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
@@ -4510,6 +4526,7 @@ class TradingService:
             completed_shadow_sample_count=completed_shadow_total,
             completed_trade_sample_count=completed_trade_total,
             quality_report=quality_report,
+            governance_report=governance_report,
         )
         if result.get("trained"):
             result["completed_shadow_sample_count"] = completed_shadow_total
@@ -4520,6 +4537,7 @@ class TradingService:
             result["trainable_shadow_sample_count"] = trainable_shadow_count
             result["trainable_trade_sample_count"] = trainable_trade_count
             result["quality_report"] = quality_report
+            result["governance_report"] = governance_report
             result["training_shadow_sample_limit"] = (
                 LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
             )
@@ -7454,6 +7472,9 @@ class TradingService:
             "models": [ENSEMBLE_TRADER_NAME],
             "risk": self.risk_engine.circuit_breaker.get_state(),
             "decision_interval": settings.decision_interval_seconds,
+            "market_loop_interval_seconds": round(self.market_loop_interval_seconds(), 3),
+            "position_loop_interval_seconds": round(self.position_loop_interval_seconds(), 3),
+            "market_round_time_budget_seconds": round(self.market_round_time_budget_seconds(), 3),
         }
         self._write_runtime_heartbeat()
         return stats
