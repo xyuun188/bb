@@ -23,7 +23,7 @@ const state = {
     todayDecisionsTotal: 0,
     tradesTotal: 0,
     openPositionsTotal: 0,
-    decisionInterval: 60,
+    decisionInterval: null,
     allTrades: [],
     tradesPage: 1,
     tradesPageMode: '',
@@ -72,6 +72,9 @@ const state = {
     profitAttribution: null,
     profitAttributionView: 'overview',
     profitAttributionRecordPage: 1,
+    runtimeStartedAt: null,
+    lastStatsSource: '',
+    lastStatsAt: 0,
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
@@ -153,6 +156,7 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchDashboardSummary();
         }
     }, 10000);
+    setInterval(updateRuntimeClock, 1000);
     setInterval(fetchPnlHistory, 60000);
     setInterval(fetchRecentDecisions, 30000);
     setInterval(fetchRecentExecutions, 30000);
@@ -206,7 +210,7 @@ function handleWSMessage(data) {
             const modeIsPaper = state.mode === 'paper';
             updateDecisions((data.decisions || []).filter(d => (d.is_paper !== false) === modeIsPaper));
             updateExecutions((data.executions || []).filter(e => (e.is_paper !== false) === modeIsPaper));
-            updateStats(data.stats || {});
+            updateStats(data.stats || {}, 'ws');
             break;
         case 'risk_alert':
             addRiskAlert(data);
@@ -428,7 +432,7 @@ async function fetchDashboardSummary() {
     updateExecutionAccountPanel(data.execution_account || {});
     updateAccounts(data.accounts || [], data.execution_account || null);
     updateMarketData(data.market || {}, data.accounts || []);
-    updateStats(data);
+    updateStats(data, 'summary');
     updateDashboardDecisionCounts(data);
     updateSymbolCount();
     fetchModeCounts();
@@ -1057,10 +1061,69 @@ function changeTradePage(page) {
     fetchTrades();
 }
 
-function updateStats(stats) {
+function parsedRuntimeSeconds(stats) {
+    const explicit = Number(stats?.uptime_seconds || 0);
+    if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+    const startedAt = stats?.started_at || state.runtimeStartedAt;
+    if (startedAt) {
+        const startedMs = Date.parse(startedAt);
+        if (Number.isFinite(startedMs)) {
+            return Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+        }
+    }
+    return 0;
+}
+
+function updateStats(stats, source = 'unknown') {
+    if (!stats || typeof stats !== 'object') return;
+    const now = Date.now();
+    const isFullSummary = source === 'summary' || stats.uptime_source === 'split_process_heartbeat';
+    const hasRuntimeFields = Boolean(
+        stats.started_at ||
+        stats.heartbeat_at ||
+        stats.last_heartbeat_at ||
+        stats.uptime_seconds ||
+        stats.decision_interval
+    );
+    if (
+        source === 'ws' &&
+        state.lastStatsSource === 'summary' &&
+        now - Number(state.lastStatsAt || 0) < 15000 &&
+        !hasRuntimeFields
+    ) {
+        return;
+    }
     if (stats.running !== undefined) {
-        document.getElementById('stat-uptime').textContent = formatUptime(stats.uptime_seconds || 0);
-        updateAutoStatus(stats);
+        const uptimeEl = document.getElementById('stat-uptime');
+        if (uptimeEl) {
+            if (stats.started_at) state.runtimeStartedAt = stats.started_at;
+            const uptimeSeconds = parsedRuntimeSeconds(stats);
+            uptimeEl.textContent = uptimeSeconds > 0
+                ? formatUptime(uptimeSeconds)
+                : (stats.uptime_source === 'split_process_heartbeat' ? '\u72ec\u7acb\u8fdb\u7a0b' : formatUptime(0));
+        }
+        const autoStatusStats = (
+            source === 'ws' &&
+            state.lastStatsSource === 'summary' &&
+            now - Number(state.lastStatsAt || 0) < 15000
+        )
+            ? { ...stats, decision_interval: state.decisionInterval }
+            : stats;
+        updateAutoStatus(autoStatusStats);
+    }
+    if (isFullSummary || hasRuntimeFields) {
+        state.lastStatsSource = source;
+        state.lastStatsAt = now;
+    }
+}
+
+function updateRuntimeClock() {
+    if (!state.runtimeStartedAt) return;
+    const uptimeEl = document.getElementById('stat-uptime');
+    if (!uptimeEl) return;
+    const seconds = parsedRuntimeSeconds({});
+    if (seconds > 0) {
+        uptimeEl.textContent = formatUptime(seconds);
     }
 }
 
@@ -2055,10 +2118,16 @@ function showDecisionReason(decisionId) {
         ? `<div class="reason-block"><div class="reason-label">AI 分析</div><div>${escapeMultiline(decision.reasoning)}</div></div>`
         : '';
     const opportunityHtml = opportunityScoreBlock(decision.opportunity_score, decision);
-    setDecisionModalWide(Boolean(decision.opportunity_score?.evidence_score));
+    const needsWideModal = Boolean(
+        decision.opportunity_score ||
+        decision.reasoning ||
+        decision.execution_reason
+    );
+    setDecisionModalWide(needsWideModal);
 
     document.getElementById('decision-reason-title').textContent = title;
     document.getElementById('decision-reason-body').innerHTML = `
+        <div class="decision-detail-stack">
         <div class="reason-block">
             <div class="reason-label">${decision.was_executed ? '执行状态' : '未执行原因'}</div>
             <div>${escapeMultiline(primaryReason)}</div>
@@ -2066,6 +2135,7 @@ function showDecisionReason(decisionId) {
         </div>
         ${opportunityHtml}
         ${aiReasoning}
+        </div>
     `;
     document.getElementById('decision-reason-modal-overlay').style.display = 'flex';
 }
@@ -3029,11 +3099,11 @@ function renderAnalysisNewsContext(news) {
     const directRows = renderNewsRows(items.filter(item => item && item.direct_match === true));
     const marketRows = renderNewsRows(items.filter(item => !item || item.direct_match !== true));
     const newsGroups = `
-        <details class="analysis-news-group" ${directRows ? 'open' : ''}>
+        <details class="analysis-news-group">
             <summary>直接相关新闻<span>${directCount} 条</span></summary>
             <div class="analysis-news-group-body">${directRows || '<div class="analysis-news-empty">本轮没有直接匹配该币种的新闻。</div>'}</div>
         </details>
-        <details class="analysis-news-group" ${!directRows && marketRows ? 'open' : ''}>
+        <details class="analysis-news-group">
             <summary>全市场背景新闻<span>${marketCount} 条</span></summary>
             <div class="analysis-news-group-body">${marketRows || '<div class="analysis-news-empty">暂无全市场背景新闻。</div>'}</div>
         </details>`;
@@ -4077,7 +4147,12 @@ function mlSampleCounts() {
         || local.total_trade_sample_count
         || trainingLocalTrade
     );
-    const limit = Number(ml.training_shadow_sample_limit || local.training_shadow_sample_limit || 20000);
+    const defaultTrainingWindow = 20000;
+    const limit = Number(
+        ml.training_shadow_sample_limit
+        || local.training_shadow_sample_limit
+        || defaultTrainingWindow
+    );
     const newCount = Number(
         ml.new_shadow_sample_count
         || autoLast.new_sample_count
@@ -4515,6 +4590,7 @@ function renderDataCollectionTraining(training) {
     const quality = training.text_sentiment_quality_sample || {};
     const localTools = training.local_ai_tools || {};
     const reasons = Array.isArray(quality.top_reasons) ? quality.top_reasons : [];
+    const qualitySources = Array.isArray(quality.top_sources) ? quality.top_sources : [];
     const models = localTools.models && typeof localTools.models === 'object'
         ? Object.entries(localTools.models)
         : [];
@@ -4536,6 +4612,9 @@ function renderDataCollectionTraining(training) {
                 </div>
                 <div class="data-chip-list">
                     ${reasons.length ? reasons.map(item => `<span>${escHtml(item.reason)} × ${monitorNumber(item.count, 0)}</span>`).join('') : '<span>暂无质量问题原因</span>'}
+                </div>
+                <div class="data-chip-list">
+                    ${qualitySources.length ? qualitySources.map(item => `<span>${escHtml(item.source)}：${monitorNumber(item.trainable, 0)} / ${monitorNumber(item.count, 0)} 可训练</span>`).join('') : '<span>暂无来源质量分布</span>'}
                 </div>
             </div>
             <div class="data-quality-panel">
@@ -5488,12 +5567,21 @@ function loopErrorLabel(message) {
     const text = String(message || '').trim();
     if (!text) return '';
     if (text.includes('reconciliation timed out')) {
-        return 'OKX 仓位/保护单同步超时，系统已跳过外部同步并继续分析，避免主循环卡死。';
+        return 'OKX 仓位/保护单同步超时：本轮已继续使用本地持仓快照；若连续出现，请检查 OKX 网络、API Key 权限或保护单接口响应。';
     }
     if (text.includes('Invalid OK-ACCESS-KEY') || text.includes('50111')) {
         return 'OKX API Key 无效，余额/仓位同步可能失败，请检查当前模式的 OKX Key 配置。';
     }
     return text;
+}
+
+function loopErrorScopeLabel(stats) {
+    const marketErr = loopErrorLabel(stats?.market_last_error);
+    const positionErr = loopErrorLabel(stats?.position_last_error);
+    const lastErr = loopErrorLabel(stats?.last_round_error);
+    if (marketErr) return `市场分析线程：${marketErr}`;
+    if (positionErr) return `持仓复盘线程：${positionErr}`;
+    return lastErr;
 }
 
 // ========== Auto Price Chart ==========
@@ -5570,6 +5658,11 @@ function cleanStatusText(value, fallback) {
 
 function autoStatusStageLabel(stats) {
     const stage = String(stats?.current_stage || '');
+    return stageLabelText(stage, '', stats?.running);
+}
+
+function stageLabelText(stageValue, fallbackLabel = '', running = true) {
+    const stage = String(stageValue || '');
     const labels = {
         idle: '\u7a7a\u95f2\uff0c\u7b49\u5f85\u4e0b\u4e00\u8f6e\u5206\u6790',
         starting: '\u51c6\u5907\u5f00\u59cb\u672c\u8f6e\u5206\u6790',
@@ -5584,6 +5677,7 @@ function autoStatusStageLabel(stats) {
         review_open_positions: '\u590d\u76d8\u5f53\u524d\u6301\u4ed3',
         publish_results: '\u5199\u5165\u5e76\u63a8\u9001\u5206\u6790\u7ed3\u679c',
         error: '\u672c\u8f6e\u5f02\u5e38',
+        watchdog_cancelled: '\u672c\u8f6e\u8d85\u65f6\u5df2\u4e2d\u65ad',
     };
     if (labels[stage]) return labels[stage];
     if (stage.startsWith('analyze:')) {
@@ -5592,10 +5686,37 @@ function autoStatusStageLabel(stats) {
     if (stage.startsWith('execute:')) {
         return `\u6b63\u5728\u6267\u884c ${stage.split(':').slice(1).join(':')} \u8ba2\u5355`;
     }
+    if (stage.startsWith('market_ai:')) {
+        return `市场扫描：正在分析 ${stage.split(':').slice(1).join(':')}`;
+    }
+    if (stage.startsWith('strategy_context:')) {
+        const contextLabels = {
+            daily_perf: '读取今日绩效',
+            today_side_perf: '读取今日多空表现',
+            multiday_side_perf: '读取多日多空表现',
+            symbol_side_perf: '读取币种方向表现',
+            model_contribution_perf: '读取模型贡献表现',
+            open_positions: '读取当前持仓',
+            account_equity: '读取账户权益',
+            learning: '刷新策略学习上下文',
+        };
+        const key = stage.split(':').slice(1).join(':');
+        return contextLabels[key] || `构建策略上下文：${key}`;
+    }
     return cleanStatusText(
-        stats?.current_stage_label,
-        stats?.running ? '\u7b49\u5f85\u4e0b\u4e00\u8f6e\u5206\u6790' : '\u670d\u52a1\u672a\u8fd0\u884c'
+        fallbackLabel,
+        running ? '\u7b49\u5f85\u4e0b\u4e00\u8f6e\u5206\u6790' : '\u670d\u52a1\u672a\u8fd0\u884c'
     );
+}
+
+function scopedStageText(stats, scope) {
+    const isMarket = scope === 'market';
+    const active = Boolean(isMarket ? stats?.market_round_active : stats?.position_round_active);
+    const stage = isMarket ? stats?.market_current_stage : stats?.position_current_stage;
+    const err = loopErrorLabel(isMarket ? stats?.market_last_error : stats?.position_last_error);
+    if (err) return `异常：${err}`;
+    const label = stageLabelText(stage, '', stats?.running !== false);
+    return active ? `运行中：${label}` : label;
 }
 
 function updateAutoStatus(stats) {
@@ -5611,12 +5732,15 @@ function updateAutoStatus(stats) {
     }
 
     if (stats && stats.decision_interval) {
-        state.decisionInterval = stats.decision_interval;
+        const interval = Number(stats.decision_interval);
+        state.decisionInterval = Number.isFinite(interval) && interval > 0 ? interval : null;
     }
 
     const intervalEl = document.getElementById('status-interval');
     if (intervalEl) {
-        intervalEl.textContent = `${state.decisionInterval}\u79d2/\u8f6e`;
+        intervalEl.textContent = state.decisionInterval
+            ? `${state.decisionInterval}\u79d2/\u8f6e`
+            : '\u8bfb\u53d6\u4e2d';
     }
 
     const dtEl = document.getElementById('status-decision-trade');
@@ -5631,6 +5755,16 @@ function updateAutoStatus(stats) {
             : stage;
     }
 
+    const marketStageEl = document.getElementById('status-market-stage');
+    if (marketStageEl) {
+        marketStageEl.textContent = scopedStageText(stats, 'market');
+    }
+
+    const positionStageEl = document.getElementById('status-position-stage');
+    if (positionStageEl) {
+        positionStageEl.textContent = scopedStageText(stats, 'position');
+    }
+
     const timingEl = document.getElementById('status-round-timing');
     if (timingEl) {
         const started = stats?.last_round_started_at ? shortBeijingTime(stats.last_round_started_at) : '-';
@@ -5643,7 +5777,7 @@ function updateAutoStatus(stats) {
     const errRow = document.getElementById('status-loop-error-row');
     const errEl = document.getElementById('status-loop-error');
     if (errRow && errEl) {
-        const err = loopErrorLabel(stats?.last_round_error);
+        const err = loopErrorScopeLabel(stats);
         errRow.style.display = err ? 'flex' : 'none';
         errEl.textContent = err || '-';
     }
@@ -7198,6 +7332,7 @@ async function fetchTradingParams() {
     const intervalInput = document.getElementById('cfg-decision-interval');
     const thresholdInput = document.getElementById('cfg-confidence-threshold');
     const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
+    const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -7254,12 +7389,17 @@ async function fetchTradingParams() {
         const pct = valueNumber(data.total_margin_limit_pct);
         totalMarginInput.value = pct !== null ? (pct * 100).toFixed(0) : '';
     }
+    if (maxSlippageInput) {
+        const pct = valueNumber(data.max_slippage_pct);
+        maxSlippageInput.value = pct !== null ? (pct * 100).toFixed(2) : '';
+    }
 }
 
 async function saveTradingParams() {
     const intervalInput = document.getElementById('cfg-decision-interval');
     const thresholdInput = document.getElementById('cfg-confidence-threshold');
     const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
+    const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -7365,6 +7505,14 @@ async function saveTradingParams() {
         }
         body.total_margin_limit_pct = pct / 100;
     }
+    if (maxSlippageInput && maxSlippageInput.value) {
+        const pct = parseFloat(maxSlippageInput.value);
+        if (!Number.isFinite(pct) || pct < 0.02 || pct > 2) {
+            alert('保存失败: 最大滑点上限必须在 0.02% 到 2% 之间');
+            return;
+        }
+        body.max_slippage_pct = pct / 100;
+    }
 
     const res = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
@@ -7382,6 +7530,9 @@ async function saveTradingParams() {
     state.decisionInterval = data.decision_interval;
     if (totalMarginInput && data.total_margin_limit_pct !== undefined) {
         totalMarginInput.value = (Number(data.total_margin_limit_pct) * 100).toFixed(0);
+    }
+    if (maxSlippageInput && data.max_slippage_pct !== undefined) {
+        maxSlippageInput.value = (Number(data.max_slippage_pct) * 100).toFixed(2);
     }
     alert('参数已保存，立即生效');
 }
@@ -7488,7 +7639,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
             ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
-            ${mlMetricCard('显示说明', '20000 是窗口', '不是样本没增长，而是只拿最新窗口训练，避免老行情污染模型', 'warn')}
+            ${mlMetricCard('显示说明', `${samples.limit} 是窗口`, '不是样本没增长，而是只拿最新窗口训练，避免老行情污染模型', 'warn')}
         </div>`;
 }
 
@@ -7533,7 +7684,7 @@ function renderLocalAIToolsStatus() {
         {
             label: '本次训练使用样本',
             value: String(samples.trainingLocal || Number(status.shadow_sample_count || 0)),
-            subtitle: `只取最新窗口训练，上限 ${Number(status.training_shadow_sample_limit || samples.limit || 20000)} 条`,
+            subtitle: `只取最新窗口训练，上限 ${Number(status.training_shadow_sample_limit || samples.limit)} 条`,
             tone: (samples.trainingLocal || Number(status.shadow_sample_count || 0)) > 0 ? 'good' : 'warn',
         },
         {
@@ -7573,7 +7724,7 @@ function renderLocalAIToolsStatus() {
             </div>
             <div class="ml-purpose-card ml-purpose-muted">
                 <div class="ml-purpose-title">训练窗口说明</div>
-                <div class="ml-purpose-desc">页面里看到的 20000 是最新样本窗口，不是累计样本停止增长。</div>
+                <div class="ml-purpose-desc">页面里看到的窗口上限是最新样本窗口，不是累计样本停止增长。</div>
                 <div class="ml-purpose-tech">累计样本看“累计影子复盘样本”。最近训练：${escHtml(trainedAt)}</div>
             </div>
         </div>`;
@@ -7770,6 +7921,7 @@ function renderOpeningFunnelUnavailable(data) {
 
 function openingFunnelReasonLabel(key) {
     const labels = {
+        profit_expectancy: '收益期望',
         evidence_gate: '证据评分',
         risk_or_precheck: '风控/预检',
         waiting_queue: '观望/等待',

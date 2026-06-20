@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
+import time
 from typing import Any
 
 import structlog
@@ -38,6 +40,12 @@ class ExchangePositionStatePolicy:
             return bool(position.get("symbol"))
 
 
+@dataclass(slots=True)
+class _ProtectionCacheEntry:
+    orders: list[dict[str, Any]]
+    expires_at: float
+
+
 class ExchangeProtectionMapProvider:
     """Fetch OKX TP/SL algo orders keyed by normalized symbol and position side."""
 
@@ -48,11 +56,14 @@ class ExchangeProtectionMapProvider:
         position_open_checker: Callable[[dict[str, Any]], bool],
         float_parser: Callable[[Any, float], float] | None = None,
         timeout_seconds: float = 2.5,
+        cache_ttl_seconds: float = 30.0,
     ) -> None:
         self.symbol_normalizer = symbol_normalizer
         self.position_open_checker = position_open_checker
         self.float_parser = float_parser or _default_float_parser
         self.timeout_seconds = timeout_seconds
+        self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._cache: dict[str, _ProtectionCacheEntry] = {}
 
     async def fetch(
         self,
@@ -91,17 +102,30 @@ class ExchangeProtectionMapProvider:
         return protection_by_key
 
     async def _fetch_symbol_orders(self, executor: Any, symbol: str) -> tuple[str, list[dict]]:
+        now = time.monotonic()
+        cached = self._cache.get(symbol)
+        if cached and cached.expires_at > now:
+            return symbol, list(cached.orders)
+
         try:
             orders = await asyncio.wait_for(
                 executor.get_position_protection_orders(symbol),
                 timeout=self.timeout_seconds,
             )
-            return symbol, orders or []
+            normalized_orders = list(orders or [])
+            if self.cache_ttl_seconds > 0:
+                self._cache[symbol] = _ProtectionCacheEntry(
+                    orders=normalized_orders,
+                    expires_at=now + self.cache_ttl_seconds,
+                )
+            return symbol, normalized_orders
         except TimeoutError:
             logger.warning(
                 "timed out fetching OKX TP/SL protection orders",
                 symbol=symbol,
             )
+            if cached:
+                return symbol, list(cached.orders)
             return symbol, []
         except Exception as exc:
             logger.warning(
@@ -109,4 +133,6 @@ class ExchangeProtectionMapProvider:
                 symbol=symbol,
                 error=safe_error_text(exc),
             )
+            if cached:
+                return symbol, list(cached.orders)
             return symbol, []

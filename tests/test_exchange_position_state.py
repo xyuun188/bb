@@ -1,5 +1,6 @@
 from typing import Any
 
+import asyncio
 import pytest
 
 from services.exchange_position_state import (
@@ -90,3 +91,38 @@ async def test_exchange_protection_map_provider_ignores_fetch_failures():
     assert (
         await provider.fetch(FakeExecutor(), [{"symbol": "ETH-USDT-SWAP", "contracts": "1"}]) == {}
     )
+
+
+@pytest.mark.asyncio
+async def test_exchange_protection_map_provider_reuses_cached_orders_on_timeout():
+    calls = 0
+
+    class FakeExecutor:
+        async def get_position_protection_orders(self, symbol):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return [
+                    {
+                        "symbol": symbol,
+                        "position_side": "short",
+                        "take_profit_price": 42.0,
+                        "updated_at_ms": "100",
+                    }
+                ]
+            await asyncio.sleep(0.05)
+            return []
+
+    provider = ExchangeProtectionMapProvider(
+        symbol_normalizer=_normalize,
+        position_open_checker=ExchangePositionStatePolicy().is_open,
+        timeout_seconds=0.01,
+        cache_ttl_seconds=60.0,
+    )
+    positions = [{"symbol": "TON-USDT-SWAP", "contracts": "1"}]
+
+    first = await provider.fetch(FakeExecutor(), positions)
+    second = await provider.fetch(FakeExecutor(), positions)
+
+    assert first == second
+    assert second[("TON/USDT", "short")]["take_profit_price"] == 42.0

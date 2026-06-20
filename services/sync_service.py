@@ -232,20 +232,45 @@ class OkxSyncService:
             raise RuntimeError("OkxSyncService requires memory_position_remover dependency")
         return self.memory_position_remover
 
-    async def reconcile_positions(self, reason: str, timeout_seconds: float = 25.0) -> list[dict]:
+    async def reconcile_positions(
+        self,
+        reason: str,
+        timeout_seconds: float = 25.0,
+        *,
+        lock_wait_seconds: float | None = None,
+        record_timeout_error: bool = True,
+    ) -> list[dict]:
+        lock = self._required_exchange_reconcile_lock()
+        wait_budget = (
+            min(max(float(timeout_seconds), 0.1), 1.0)
+            if lock_wait_seconds is None
+            else max(float(lock_wait_seconds), 0.0)
+        )
         try:
+            await asyncio.wait_for(lock.acquire(), timeout=wait_budget)
+        except TimeoutError:
+            logger.info(
+                "exchange position reconciliation already running; skipping duplicate request",
+                reason=reason,
+                lock_wait_seconds=round(wait_budget, 3),
+            )
+            return []
 
-            async def _locked_reconcile() -> list[dict]:
-                async with self._required_exchange_reconcile_lock():
-                    return await self.reconcile_exchange_positions()
-
-            return await asyncio.wait_for(_locked_reconcile(), timeout=timeout_seconds)
+        try:
+            try:
+                return await asyncio.wait_for(
+                    self.reconcile_exchange_positions(),
+                    timeout=timeout_seconds,
+                )
+            finally:
+                lock.release()
         except TimeoutError:
             timeout_reason = (
                 f"exchange position reconciliation timed out during {reason}; "
                 "continuing with local position state"
             )
-            self._record_round_error(timeout_reason)
+            if record_timeout_error:
+                self._record_round_error(timeout_reason)
             logger.warning(timeout_reason)
             return []
 
@@ -491,7 +516,7 @@ class OkxSyncService:
         try:
             exchange_positions = await asyncio.wait_for(
                 paper_okx.get_positions_strict(),
-                timeout=10.0,
+                timeout=6.0,
             )
         except TimeoutError:
             logger.warning("timed out fetching OKX positions for reconciliation")

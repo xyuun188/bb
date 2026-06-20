@@ -88,6 +88,32 @@ def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
         assert not any(marker in text for marker in mojibake_markers), asset
 
 
+def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "function parsedRuntimeSeconds" in script
+    assert "function updateRuntimeClock" in script
+    assert "setInterval(updateRuntimeClock, 1000);" in script
+    assert "updateStats(data.stats || {}, 'ws')" in script
+    assert "updateStats(data, 'summary')" in script
+    assert "state.lastStatsSource === 'summary'" in script
+    assert "!hasRuntimeFields" in script
+    assert "stats.started_at ||" in script
+    assert "stats.last_heartbeat_at ||" in script
+    assert 'id="status-market-stage"' in html
+    assert 'id="status-position-stage"' in html
+    assert "function scopedStageText" in script
+    assert "function loopErrorScopeLabel" in script
+    assert "return stageLabelText(stage, '', stats?.running);" in script
+    assert "learning: '刷新策略学习上下文'" in script
+    assert "市场分析线程：" in script
+    assert "持仓复盘线程：" in script
+    assert "market_current_stage" in script
+    assert "position_current_stage" in script
+    assert "strategy_context:" in script
+
+
 def test_live_mode_switch_requires_known_missing_okx_config() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
@@ -169,13 +195,45 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     assert ".decision-score-metric" in style
     assert ".decision-score-formula" in style
     assert ".decision-score-formula-grid" in style
-    assert "max-width: min(1120px, 96vw);" in style
+    assert "max-width: calc(100vw - 28px);" in style
+    assert "max-height: calc(100vh - 28px);" in style
+    assert "flex: 1 1 auto;" in style
     assert "overflow-x: hidden;" in style
     assert "overflow-wrap: anywhere;" in style
-    assert "grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));" in style
+    assert ".decision-score-formula-item:nth-child(2)" in style
+    assert "grid-column: 1 / -1;" in style
+    assert ".modal.modal-wide .modal-body" in style
+    assert ".decision-detail-stack" in style
+    assert "width: min(1480px, calc(100vw - 28px));" in style
+    assert ".modal.modal-wide .decision-score-grid" in style
+    assert ".decision-score-formula-item:nth-child(4)" in style
     assert "decision-evidence-summary" in script
     assert ".decision-evidence-summary" in style
     assert ".decision-evidence-components" in style
+
+
+def test_opening_funnel_profit_expectancy_is_not_exchange_error() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert (
+        dashboard._opening_funnel_reason_bucket(
+            "候选逻辑暂未满足执行条件：实际下单方向做多预期净收益 -0.0410% 不为正，系统禁止提交开仓订单"
+        )
+        == "profit_expectancy"
+    )
+    assert (
+        dashboard._opening_funnel_reason_bucket("OKX API timeout while submitting order")
+        == "execution_or_exchange"
+    )
+    assert (
+        dashboard._opening_funnel_reason_bucket(
+            "下单前价格已比分时分析下跌 0.54%，超过允许偏移 0.50%。系统已即时刷新该币种行情复核，但偏移仍过大或盘口/动量未通过复核；为避免追空，本次不执行。"
+        )
+        == "risk_or_precheck"
+    )
+    assert "profit_expectancy: '收益期望'" in script
 
 
 def test_agent_skill_detail_uses_readable_card_layout() -> None:
@@ -192,8 +250,24 @@ def test_agent_skill_detail_uses_readable_card_layout() -> None:
     assert "analysis-skill-data-chip" not in style
     assert ".analysis-agent-skills-grid" in style
     assert ".analysis-skill-item" in style
+    assert ".analysis-skill-head" in style
+    assert ".analysis-skill-badges" in style
+    assert ".analysis-skill-reason" in style
     assert ".analysis-skill-data-row" in style
     assert "overflow-wrap: anywhere" in style
+
+
+def test_analysis_news_context_is_collapsed_by_default() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    news_start = script.index("function renderAnalysisNewsContext")
+    news_end = script.index("function analysisExpertConfig", news_start)
+    news_block = script[news_start:news_end]
+
+    assert '<details class="analysis-news-group">' in news_block
+    assert '<details class="analysis-news-group" ${directRows ?' not in news_block
+    assert '<details class="analysis-news-group" ${!directRows' not in news_block
+    assert "<summary>直接相关新闻<span>${directCount} 条</span></summary>" in news_block
+    assert "<summary>全市场背景新闻<span>${marketCount} 条</span></summary>" in news_block
 
 
 def test_dashboard_keeps_single_auto_scan_status_after_execution_account() -> None:
@@ -393,7 +467,9 @@ def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
 
     assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 142px), 1fr));" in style
     assert ".strategy-learning-profile-chips span" in style
+    assert "text-overflow: clip;" in style
     assert "overflow-wrap: anywhere;" in style
     assert "white-space: normal;" in style
     assert (

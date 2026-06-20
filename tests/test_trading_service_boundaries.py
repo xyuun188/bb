@@ -1950,13 +1950,35 @@ async def test_feature_batch_wait_cancels_slow_tasks() -> None:
 
     tasks = [asyncio.create_task(fast_task()), asyncio.create_task(slow_task())]
     done, pending = await asyncio.wait(tasks, timeout=0.01)
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await trading_service.drain_cancelled_tasks(pending)
 
     assert len(done) == 1
     assert len(pending) == 1
     assert cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_feature_tasks_do_not_block_round_drain() -> None:
+    cleanup_started = asyncio.Event()
+
+    async def cancellation_resistant_task() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(cancellation_resistant_task())
+    await asyncio.sleep(0)
+
+    started_at = asyncio.get_running_loop().time()
+    await trading_service.drain_cancelled_tasks({task}, timeout_seconds=0.01)
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert cleanup_started.is_set()
+    assert elapsed < 0.5
+    assert task.cancelled() is False
+    task.cancel()
 
 
 @pytest.mark.asyncio
@@ -3173,6 +3195,40 @@ async def test_sync_service_records_reconcile_timeout_through_injected_boundary(
     assert len(recorded_errors) == 1
     assert "unit test" in recorded_errors[0]
     assert "timed out" in recorded_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_skips_duplicate_reconcile_without_recording_error():
+    lock = asyncio.Lock()
+    recorded_errors: list[str] = []
+    calls = 0
+
+    service = OkxSyncService(
+        exchange_reconcile_lock=lock,
+        round_error_recorder=recorded_errors.append,
+    )
+
+    async def slow_reconcile():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        return [{"symbol": "BTC/USDT"}]
+
+    service.reconcile_exchange_positions = slow_reconcile  # type: ignore[method-assign]
+
+    running = asyncio.create_task(service.reconcile_positions("market", timeout_seconds=1.0))
+    await asyncio.sleep(0)
+    duplicate = await service.reconcile_positions(
+        "position",
+        timeout_seconds=1.0,
+        lock_wait_seconds=0.001,
+    )
+    result = await running
+
+    assert result == [{"symbol": "BTC/USDT"}]
+    assert duplicate == []
+    assert calls == 1
+    assert recorded_errors == []
 
 
 @pytest.mark.asyncio

@@ -212,6 +212,48 @@ class _AnalysisRuntimeState:
         )
 
 
+PENDING_FEATURE_CANCEL_DRAIN_SECONDS = 0.25
+
+
+async def drain_cancelled_tasks(
+    tasks: set[asyncio.Task] | list[asyncio.Task],
+    *,
+    timeout_seconds: float = PENDING_FEATURE_CANCEL_DRAIN_SECONDS,
+) -> None:
+    """Cancel slow tasks without letting cancellation cleanup block the round watchdog."""
+
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+
+    done, still_pending = await asyncio.wait(
+        pending,
+        timeout=max(float(timeout_seconds), 0.0),
+    )
+    for task in done:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            continue
+    if still_pending:
+        for task in still_pending:
+            task.add_done_callback(_consume_task_result)
+        logger.warning(
+            "cancelled tasks did not drain before timeout; continuing round",
+            pending=len(still_pending),
+            timeout_seconds=round(max(float(timeout_seconds), 0.0), 3),
+        )
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+
+
 _analysis_scope_context: ContextVar[str | None] = ContextVar(
     "analysis_scope_context",
     default=None,
@@ -856,6 +898,8 @@ class TradingService:
         self._ml_auto_train_task: asyncio.Task | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
+        self._strategy_learning_context_cache: dict[str, Any] = {}
+        self._strategy_learning_context_refresh_tasks: dict[str, asyncio.Task] = {}
 
     def is_running(self) -> bool:
         """Expose lifecycle state without coupling loop services to private fields."""
@@ -902,7 +946,121 @@ class TradingService:
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        return max(3.0, min(8.0, interval * 0.25))
+        return max(8.0, min(14.0, interval * 0.35))
+
+    def strategy_learning_context_timeout_seconds(self) -> float:
+        """Return the hard budget for strategy-learning context in the trading loop."""
+
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        configured = float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_timeout_seconds)
+        return max(0.5, min(configured, interval * 0.20))
+
+    def strategy_learning_perf_timeout_seconds(self) -> float:
+        """Return the short budget for historical performance context."""
+
+        return max(
+            0.2,
+            float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_perf_timeout_seconds),
+        )
+
+    def strategy_learning_account_timeout_seconds(self) -> float:
+        """Return the short budget for account-equity context."""
+
+        return max(
+            0.2,
+            float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_account_timeout_seconds),
+        )
+
+    def _safe_set_strategy_context_stage(self, stage: str) -> None:
+        """Update strategy-context diagnostics without breaking the trading decision path."""
+
+        try:
+            self._set_loop_stage(stage)
+        except Exception:
+            logger.debug("strategy context stage update skipped", stage=stage)
+
+    async def _bounded_strategy_context_value(
+        self,
+        label: str,
+        awaitable: Any,
+        fallback: Any,
+        timeout_seconds: float,
+    ) -> Any:
+        """Read optional strategy context without letting slow IO block the round."""
+
+        task = asyncio.ensure_future(awaitable)
+        try:
+            self._safe_set_strategy_context_stage(f"strategy_context:{label}")
+            done, pending = await asyncio.wait({task}, timeout=max(float(timeout_seconds), 0.0))
+            if pending:
+                await drain_cancelled_tasks(pending, timeout_seconds=0.05)
+                logger.warning(
+                    "strategy context stage timed out; using baseline value",
+                    stage=label,
+                    timeout_seconds=round(timeout_seconds, 3),
+                )
+                return fallback
+            return next(iter(done)).result()
+        except Exception as exc:
+            logger.warning(
+                "strategy context stage failed; using baseline value",
+                stage=label,
+                error=safe_error_text(exc),
+            )
+            return fallback
+
+    def _strategy_learning_refresh_tasks(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_strategy_learning_context_refresh_tasks", None)
+        if isinstance(tasks, dict):
+            return tasks
+        tasks = {}
+        self._strategy_learning_context_refresh_tasks = tasks
+        return tasks
+
+    def _strategy_learning_context_cache_store(self) -> dict[str, Any]:
+        cache = getattr(self, "_strategy_learning_context_cache", None)
+        if isinstance(cache, dict):
+            return cache
+        cache = {}
+        self._strategy_learning_context_cache = cache
+        return cache
+
+    def _start_strategy_learning_context_refresh(
+        self,
+        *,
+        mode: str,
+        strategy_learning: Any,
+        context: dict[str, Any],
+        open_positions: list[dict[str, Any]],
+    ) -> asyncio.Task:
+        selected_mode = "live" if mode == "live" else "paper"
+        tasks = self._strategy_learning_refresh_tasks()
+        existing = tasks.get(selected_mode)
+        if existing is not None and not existing.done():
+            return existing
+
+        async def _refresh() -> dict[str, Any]:
+            learned_context = await strategy_learning.apply_to_strategy_context(
+                mode=selected_mode,
+                strategy_context=dict(context),
+                open_positions=open_positions,
+                max_open_positions=int(settings.max_open_positions_per_model or 20),
+                limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
+            )
+            learned_context["strategy_learning_cache_status"] = "fresh"
+            learned_context["strategy_learning_runtime_timeout_seconds"] = (
+                self.strategy_learning_context_timeout_seconds()
+            )
+            self._strategy_learning_context_cache_store()[selected_mode] = {
+                "created_at": datetime.now(UTC),
+                "context": self._json_safe_payload(learned_context),
+            }
+            return learned_context
+
+        task = asyncio.create_task(_refresh())
+        tasks[selected_mode] = task
+        task.add_done_callback(_consume_task_result)
+        return task
 
     @staticmethod
     def _round_elapsed_seconds(started_at: datetime) -> float:
@@ -2236,13 +2394,42 @@ class TradingService:
     ) -> dict[str, Any]:
         """Choose the trading posture automatically from PnL, regime, and side performance."""
         selected_mode = "live" if mode == "live" else "paper"
-        daily_state = await self.daily_performance_service.state(selected_mode)
-        side_perf = await self._today_side_performance(selected_mode)
-        side_perf_multiday = await self._multiday_side_performance(selected_mode)
-        symbol_side_perf = await self._recent_symbol_side_performance(selected_mode)
-        model_contribution_perf = await self._recent_model_contribution_performance(selected_mode)
+        perf_timeout = self.strategy_learning_perf_timeout_seconds()
+        account_timeout = self.strategy_learning_account_timeout_seconds()
+
+        daily_state = await self._bounded_strategy_context_value(
+            "daily_perf",
+            self.daily_performance_service.state(selected_mode),
+            {},
+            perf_timeout,
+        )
+        side_perf = await self._bounded_strategy_context_value(
+            "today_side_perf",
+            self._today_side_performance(selected_mode),
+            {},
+            perf_timeout,
+        )
+        side_perf_multiday = await self._bounded_strategy_context_value(
+            "multiday_side_perf",
+            self._multiday_side_performance(selected_mode),
+            {},
+            perf_timeout,
+        )
+        symbol_side_perf = await self._bounded_strategy_context_value(
+            "symbol_side_perf",
+            self._recent_symbol_side_performance(selected_mode),
+            {},
+            perf_timeout,
+        )
+        model_contribution_perf = await self._bounded_strategy_context_value(
+            "model_contribution_perf",
+            self._recent_model_contribution_performance(selected_mode),
+            {},
+            perf_timeout,
+        )
         if not open_positions:
             try:
+                self._safe_set_strategy_context_stage("strategy_context:open_positions")
                 open_positions = await self.okx_sync_service.get_open_positions_context()
             except Exception as exc:
                 logger.warning(
@@ -2253,7 +2440,12 @@ class TradingService:
         position_group_count = self.entry_symbol_universe.open_position_group_count(
             open_positions or []
         )
-        account_equity = await self.allocated_order_balance(selected_mode)
+        account_equity = await self._bounded_strategy_context_value(
+            "account_equity",
+            self.allocated_order_balance(selected_mode),
+            0.0,
+            account_timeout,
+        )
         context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
             daily_state=daily_state,
@@ -2267,6 +2459,10 @@ class TradingService:
             account_config=settings.get_execution_account_config(selected_mode),
         )
         context["account_equity"] = account_equity
+        context["strategy_context_runtime"] = {
+            "perf_timeout_seconds": perf_timeout,
+            "account_timeout_seconds": account_timeout,
+        }
         strategy_learning = getattr(self, "strategy_learning_service", None)
         if strategy_learning is None:
             return self._refresh_dynamic_capacity(
@@ -2276,15 +2472,71 @@ class TradingService:
                 account_equity=account_equity,
             )
         try:
-            learned_context = await strategy_learning.apply_to_strategy_context(
+            self._safe_set_strategy_context_stage("strategy_context:learning")
+            refresh_task = self._start_strategy_learning_context_refresh(
                 mode=selected_mode,
-                strategy_context=context,
+                strategy_learning=strategy_learning,
+                context=context,
                 open_positions=open_positions or [],
-                max_open_positions=int(settings.max_open_positions_per_model or 20),
+            )
+            done, _pending = await asyncio.wait(
+                {refresh_task},
+                timeout=self.strategy_learning_context_timeout_seconds(),
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+            learned_context = next(iter(done)).result()
+            refreshed_context = self._refresh_dynamic_capacity(
+                open_positions=open_positions or [],
+                strategy_context=dict(learned_context),
+                market_regime=market_regime,
+                account_equity=account_equity,
+            )
+            self._strategy_learning_context_cache_store()[selected_mode] = {
+                "created_at": datetime.now(UTC),
+                "context": self._json_safe_payload(refreshed_context),
+            }
+            return refreshed_context
+        except asyncio.TimeoutError:
+            cached_context = self._recent_strategy_learning_context(selected_mode)
+            if cached_context:
+                cached_context.update(
+                    {
+                        "strategy_learning_cache_status": "stale_timeout",
+                        "strategy_learning_error": (
+                            "策略学习上下文超过交易轮次预算，已使用最近一次可用学习上下文，"
+                            "后台继续刷新，不阻塞开仓决策。"
+                        ),
+                        "strategy_learning_runtime_timeout_seconds": (
+                            self.strategy_learning_context_timeout_seconds()
+                        ),
+                    }
+                )
+                logger.warning(
+                    "strategy learning context timed out; using cached strategy context",
+                    timeout_seconds=round(self.strategy_learning_context_timeout_seconds(), 3),
+                )
+                return self._refresh_dynamic_capacity(
+                    open_positions=open_positions or [],
+                    strategy_context=cached_context,
+                    market_regime=market_regime,
+                    account_equity=account_equity,
+                )
+            context["strategy_learning_cache_status"] = "baseline_timeout"
+            context["strategy_learning_error"] = (
+                "策略学习上下文超过交易轮次预算且暂无缓存，本轮使用基础策略上下文，"
+                "不会因为学习慢查询阻塞市场扫描。"
+            )
+            context["strategy_learning_runtime_timeout_seconds"] = (
+                self.strategy_learning_context_timeout_seconds()
+            )
+            logger.warning(
+                "strategy learning context timed out; using baseline strategy context",
+                timeout_seconds=round(self.strategy_learning_context_timeout_seconds(), 3),
             )
             return self._refresh_dynamic_capacity(
                 open_positions=open_positions or [],
-                strategy_context=learned_context,
+                strategy_context=context,
                 market_regime=market_regime,
                 account_equity=account_equity,
             )
@@ -2294,12 +2546,27 @@ class TradingService:
                 error=safe_error_text(exc),
             )
             context["strategy_learning_error"] = safe_error_text(exc, limit=160)
+            context["strategy_learning_cache_status"] = "baseline_error"
             return self._refresh_dynamic_capacity(
                 open_positions=open_positions or [],
                 strategy_context=context,
                 market_regime=market_regime,
                 account_equity=account_equity,
             )
+
+    def _recent_strategy_learning_context(self, mode: str) -> dict[str, Any] | None:
+        selected_mode = "live" if mode == "live" else "paper"
+        entry = self._strategy_learning_context_cache_store().get(selected_mode)
+        if not isinstance(entry, dict):
+            return None
+        created_at = entry.get("created_at")
+        if not isinstance(created_at, datetime):
+            return None
+        max_age = float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_cache_ttl_seconds)
+        if (datetime.now(UTC) - created_at).total_seconds() > max_age:
+            return None
+        context = entry.get("context")
+        return dict(context) if isinstance(context, dict) else None
 
     def _attach_strategy_learning_context(
         self,
@@ -2916,6 +3183,7 @@ class TradingService:
             await self.okx_sync_service.reconcile_positions(
                 f"{analysis_scope} round start",
                 timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+                lock_wait_seconds=0.35,
             )
             self._set_loop_stage("load_open_positions")
             open_positions = await self.okx_sync_service.get_open_positions_context()
@@ -3145,9 +3413,7 @@ class TradingService:
             )
             done, pending = await asyncio.wait(tasks, timeout=batch_timeout)
             if pending:
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                await drain_cancelled_tasks(pending)
                 logger.warning(
                     "feature vector batch reached time budget; cancelling slow sources",
                     symbol_count=len(fetch_symbols),
@@ -3191,6 +3457,7 @@ class TradingService:
                 logger.warning("no feature vectors available")
                 return results
 
+            self._set_loop_stage("build_strategy_context")
             market_scan_keys = {
                 self._normalize_position_symbol(s)
                 for s in market_scan_symbols
@@ -3285,6 +3552,7 @@ class TradingService:
             # 2.5 Enforce stop-loss / take-profit before AI decisions
             review_blocked_keys: set[tuple[str, str]] = set()
             if run_position_analysis:
+                self._set_loop_stage("position_review")
                 open_positions, review_blocked_keys = (
                     await self.position_review_service.review_open_positions(
                         feature_vectors=feature_vectors,
@@ -3371,7 +3639,7 @@ class TradingService:
                     continue
                 claimed_analysis_symbols.append(symbol)
                 claimed_symbol_keys.add(self._normalize_position_symbol(symbol))
-                self._set_loop_stage(f"analyze:{symbol}")
+                self._set_loop_stage(f"market_ai:{symbol}")
 
                 results["symbols_processed"] += 1
                 self._remember_market_analyzed_symbol(symbol)
