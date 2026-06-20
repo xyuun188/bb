@@ -56,6 +56,8 @@ class FeatureVector:
     volatility_20: float = 0.0
     price_vs_sma20: float = 0.0
     price_vs_sma50: float = 0.0
+    technical_indicator_timeframe: str = ""
+    short_returns_timeframe: str = ""
     abnormal_wick_count_72h: int = 0
     abnormal_wick_max_pct: float = 0.0
     abnormal_wick_recent_hours: float = 9999.0
@@ -147,6 +149,7 @@ Technical Indicators:
   Price vs SMA20: {self.price_vs_sma20*100:.2f}% | vs SMA50: {self.price_vs_sma50*100:.2f}%
   Returns: 1p={self.returns_1*100:.2f}%, 5p={self.returns_5*100:.2f}%, 20p={self.returns_20*100:.2f}%
   Volatility(20): {self.volatility_20*100:.2f}%
+  Feature Sources: short_returns={self.short_returns_timeframe or "unknown"}, trend={self.technical_indicator_timeframe or "unknown"}
   Abnormal Wick: count72h={self.abnormal_wick_count_72h}, max={self.abnormal_wick_max_pct:.2f}%, recent_hours={self.abnormal_wick_recent_hours:.1f}
 
 Perpetual Swap Data:

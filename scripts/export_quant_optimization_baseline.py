@@ -31,19 +31,36 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _load_trade_reflection_samples,
     _merge_trade_samples,
 )
+from services.trading_params import DEFAULT_TRADING_PARAMS  # noqa: E402
 from services.training_data_quality import annotate_training_payload  # noqa: E402
 
 DEFAULT_HOURS = 24
-DEFAULT_QUALITY_SHADOW_LIMIT = 3000
-DEFAULT_QUALITY_TRADE_REFLECTION_LIMIT = 1200
-DEFAULT_QUALITY_CLOSED_POSITION_LIMIT = 1200
-DEFAULT_QUALITY_SEQUENCE_LIMIT = 3000
-DEFAULT_QUALITY_TEXT_LIMIT = 1500
-DEEP_QUALITY_SHADOW_LIMIT = 20000
-DEEP_QUALITY_TRADE_REFLECTION_LIMIT = 8000
-DEEP_QUALITY_CLOSED_POSITION_LIMIT = 8000
-DEEP_QUALITY_SEQUENCE_LIMIT = 12000
-DEEP_QUALITY_TEXT_LIMIT = 8000
+_LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+DEFAULT_QUALITY_SHADOW_LIMIT = min(
+    3_000,
+    _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
+)
+DEFAULT_QUALITY_TRADE_REFLECTION_LIMIT = min(
+    1_200,
+    _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
+)
+DEFAULT_QUALITY_CLOSED_POSITION_LIMIT = min(
+    1_200,
+    _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
+)
+DEFAULT_QUALITY_SEQUENCE_LIMIT = min(
+    3_000,
+    _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit,
+)
+DEFAULT_QUALITY_TEXT_LIMIT = min(
+    1_500,
+    _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
+)
+DEEP_QUALITY_SHADOW_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+DEEP_QUALITY_TRADE_REFLECTION_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+DEEP_QUALITY_CLOSED_POSITION_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+DEEP_QUALITY_SEQUENCE_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
+DEEP_QUALITY_TEXT_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:

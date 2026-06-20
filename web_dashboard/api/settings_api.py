@@ -24,12 +24,6 @@ from core.model_runtime import (
 from core.safe_output import redact_output, safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
-from services.secure_runtime_config import (
-    scrub_ai_model_env,
-    secure_ai_model_key,
-    set_runtime_secret,
-    strip_secret_env_updates,
-)
 from services.model_server_config import (
     ModelServerConfigError,
     ModelServerConfigNotConfigured,
@@ -37,6 +31,12 @@ from services.model_server_config import (
     get_model_server_settings_public,
     load_model_server_info_from_secure_settings,
     save_model_server_settings,
+)
+from services.secure_runtime_config import (
+    scrub_ai_model_env,
+    secure_ai_model_key,
+    set_runtime_secret,
+    strip_secret_env_updates,
 )
 from services.server_monitor_status import ServerMonitorStatusService, clear_server_monitor_cache
 from web_dashboard.api import dashboard as _dash
@@ -132,6 +132,14 @@ def _model_server_error(exc: Exception) -> str:
     return safe_error_text(exc, limit=500)
 
 
+def _make_okx_executor(cls: Any, mode: str):
+    """Create OKX executor in lightweight-balance mode, compatible with test doubles."""
+    try:
+        return cls(mode=mode, load_markets_on_initialize=False)
+    except TypeError:
+        return cls(mode=mode)
+
+
 async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
     """Fetch the real OKX USDT balance snapshot for paper/demo or live mode."""
     mode = "live" if mode == "live" else "paper"
@@ -158,7 +166,7 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
 
     from executor.okx_executor import OKXExecutor
 
-    executor = OKXExecutor(mode=mode)
+    executor = _make_okx_executor(OKXExecutor, mode)
     try:
         await executor.initialize()
         snapshot = await executor.get_balance_snapshot("USDT")
@@ -584,7 +592,7 @@ async def update_okx_settings(req: OKXSettingsRequest):
                     mode=req.mode,
                     error=_connection_error_text(exc),
                 )
-        new_executor = OKXExecutor(mode=req.mode)
+        new_executor = _make_okx_executor(OKXExecutor, req.mode)
         try:
             await new_executor.initialize()
             setattr(_dash._trading_service, attr, new_executor)
@@ -617,7 +625,7 @@ async def test_okx_connection(req: OKXTestRequest):
 
     from executor.okx_executor import OKXExecutor
 
-    executor = OKXExecutor(mode=req.mode)
+    executor = _make_okx_executor(OKXExecutor, req.mode)
     try:
         await executor.initialize()
         snapshot = await executor.get_balance_snapshot("USDT")
@@ -1055,6 +1063,7 @@ class ThresholdsRequest(BaseModel):
     decision_interval: int | None = None
     confidence_threshold: float | None = None
     total_margin_limit_pct: float | None = None
+    max_slippage_pct: float | None = None
     local_ai_tools_enabled: bool | None = None
     local_ai_tools_api_base: str | None = None
     local_ai_tools_timeout_seconds: float | None = None
@@ -1073,6 +1082,7 @@ class ThresholdsRequest(BaseModel):
 @router.get("/settings/thresholds")
 async def get_thresholds():
     """Get current decision interval and confidence threshold."""
+    settings.refresh_runtime_env(force=True)
     total_margin_limit_pct = (
         float(settings.max_total_margin_pct)
         if float(settings.max_total_margin_pct or 0.0) > 0
@@ -1098,6 +1108,7 @@ async def get_thresholds():
         "high_risk_review_circuit_breaker_failures": settings.high_risk_review_circuit_breaker_failures,
         "high_risk_review_circuit_breaker_cooldown_seconds": settings.high_risk_review_circuit_breaker_cooldown_seconds,
         "total_margin_limit_pct": total_margin_limit_pct,
+        "max_slippage_pct": settings.max_slippage_pct,
     }
 
 
@@ -1121,6 +1132,14 @@ async def update_thresholds(req: ThresholdsRequest):
             raise HTTPException(status_code=400, detail="Confidence threshold must be at most 1.0")
         settings.confidence_threshold = req.confidence_threshold
         updates["CONFIDENCE_THRESHOLD"] = str(req.confidence_threshold)
+
+    if req.max_slippage_pct is not None:
+        if req.max_slippage_pct < 0.0002:
+            raise HTTPException(status_code=400, detail="最大滑点上限不能低于 0.02%")
+        if req.max_slippage_pct > 0.02:
+            raise HTTPException(status_code=400, detail="最大滑点上限不能超过 2%")
+        settings.max_slippage_pct = float(req.max_slippage_pct)
+        updates["MAX_SLIPPAGE_PCT"] = str(settings.max_slippage_pct)
 
     if req.local_ai_tools_enabled is not None:
         settings.local_ai_tools_enabled = bool(req.local_ai_tools_enabled)
@@ -1274,6 +1293,7 @@ async def update_thresholds(req: ThresholdsRequest):
         "high_risk_review_circuit_breaker_failures": settings.high_risk_review_circuit_breaker_failures,
         "high_risk_review_circuit_breaker_cooldown_seconds": settings.high_risk_review_circuit_breaker_cooldown_seconds,
         "total_margin_limit_pct": total_margin_limit_pct,
+        "max_slippage_pct": settings.max_slippage_pct,
     }
 
 

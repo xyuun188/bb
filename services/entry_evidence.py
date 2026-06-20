@@ -20,6 +20,7 @@ from services.entry_signal_extraction import (
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _ENTRY_TIER_PARAMS = DEFAULT_TRADING_PARAMS.entry_tiers
+_ENTRY_EVIDENCE_PARAMS = DEFAULT_TRADING_PARAMS.entry_evidence
 ENTRY_EVIDENCE_SCORE_NORMAL = _ENTRY_TIER_PARAMS.normal_score
 ENTRY_EVIDENCE_SCORE_MEDIUM = _ENTRY_TIER_PARAMS.medium_score
 ENTRY_EVIDENCE_SCORE_SMALL = _ENTRY_TIER_PARAMS.small_score
@@ -27,21 +28,29 @@ ENTRY_EVIDENCE_SCORE_PROBE = _ENTRY_TIER_PARAMS.exploration_score
 ENTRY_EVIDENCE_SCORE_WEAK_PROBE = _ENTRY_TIER_PARAMS.weak_probe_score
 ENTRY_EVIDENCE_SCORE_HARD_BLOCK = _ENTRY_TIER_PARAMS.weak_probe_score
 ENTRY_EVIDENCE_WEAK_PROBE_MIN_ALIGNED_SOURCES = _ENTRY_TIER_PARAMS.weak_probe_min_aligned_sources
-ENTRY_EVIDENCE_SHORT_SCORE_OFFSET = 10.0
-ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER = 0.60
-ENTRY_EVIDENCE_MAJOR_CONFLICT_SIZE_CAP = 0.025
+ENTRY_EVIDENCE_SHORT_SCORE_OFFSET = _ENTRY_EVIDENCE_PARAMS.short_score_offset
+ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER = _ENTRY_EVIDENCE_PARAMS.short_size_multiplier
+ENTRY_EVIDENCE_MAJOR_CONFLICT_SIZE_CAP = _ENTRY_EVIDENCE_PARAMS.major_conflict_size_cap
 ENTRY_EVIDENCE_EXPLORATION_SIZE_CAP = _ENTRY_TIER_PARAMS.exploration_size_cap
 ENTRY_EVIDENCE_WEAK_CONFLICT_SIZE_CAP = _ENTRY_TIER_PARAMS.weak_probe_size_cap
-ENTRY_EVIDENCE_MISSING_KEY_SIZE_CAP = 0.018
-ENTRY_EVIDENCE_WEAK_OPPOSITE_RETURN_PCT = 0.15
-ENTRY_EVIDENCE_STRONG_OPPOSITE_RETURN_PCT = 0.35
-ENTRY_EVIDENCE_WEAK_OPPOSITE_PENALTY_RATIO = 0.20
-ENTRY_EVIDENCE_NORMAL_OPPOSITE_PENALTY_RATIO = 0.70
+ENTRY_EVIDENCE_MISSING_KEY_SIZE_CAP = _ENTRY_EVIDENCE_PARAMS.missing_key_size_cap
+ENTRY_EVIDENCE_WEAK_OPPOSITE_RETURN_PCT = _ENTRY_EVIDENCE_PARAMS.weak_opposite_return_pct
+ENTRY_EVIDENCE_STRONG_OPPOSITE_RETURN_PCT = _ENTRY_EVIDENCE_PARAMS.strong_opposite_return_pct
+ENTRY_EVIDENCE_WEAK_OPPOSITE_PENALTY_RATIO = _ENTRY_EVIDENCE_PARAMS.weak_opposite_penalty_ratio
+ENTRY_EVIDENCE_NORMAL_OPPOSITE_PENALTY_RATIO = _ENTRY_EVIDENCE_PARAMS.normal_opposite_penalty_ratio
 ENTRY_EVIDENCE_AI_SUPPORT_EXCLUDED_EXPERTS = {"position_expert", "risk_expert"}
-ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_BASE_SCORE = 35.0
-ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_EFFECTIVE_SCORE = 30.0
-ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_DIRECTION_GAP = 0.08
-ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MAX_LOSS_PROBABILITY = 0.58
+ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_BASE_SCORE = (
+    _ENTRY_EVIDENCE_PARAMS.short_probe_relief_min_base_score
+)
+ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_EFFECTIVE_SCORE = (
+    _ENTRY_EVIDENCE_PARAMS.short_probe_relief_min_effective_score
+)
+ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_DIRECTION_GAP = (
+    _ENTRY_EVIDENCE_PARAMS.short_probe_relief_min_direction_gap
+)
+ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MAX_LOSS_PROBABILITY = (
+    _ENTRY_EVIDENCE_PARAMS.short_probe_relief_max_loss_probability
+)
 
 
 def _signal_component(
@@ -610,12 +619,12 @@ def build_entry_evidence_score(
     )
     positive_net_probe_allowed = bool(
         not hard_block_reasons
-        and expected_net_return >= 0.35
+        and expected_net_return >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct
         and opportunity_score >= max(min_score_required - 0.55, 0.35)
-        and confidence >= 0.62
-        and profit_quality_ratio >= 0.20
-        and loss_probability <= 0.62
-        and tail_risk_score <= 0.95
+        and confidence >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_confidence
+        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
+        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
+        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
         and not {"ml", "timeseries"}.issubset(set(strong_opposites))
         and not ("ml" in strong_opposites and "timeseries" in major_opposites)
     )

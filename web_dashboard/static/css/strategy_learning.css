@@ -706,13 +706,16 @@
     flex-wrap: wrap;
     gap: 5px;
     margin-top: 8px;
+    min-width: 0;
 }
 
 .strategy-learning-chip-row span {
     max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    min-width: 0;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
     border: 1px solid var(--border);
     border-radius: 999px;
     padding: 4px 7px;
@@ -897,6 +900,7 @@
     background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(15,23,42,0.26));
     overflow: hidden;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+    align-content: start;
 }
 
 .strategy-learning-profile-card.active {
@@ -953,6 +957,8 @@
     color: var(--text-muted);
     font-size: 11px;
     line-height: 1.35;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .strategy-learning-profile-card p {
@@ -978,8 +984,9 @@
 
 .strategy-learning-profile-card-stats {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 142px), 1fr));
     gap: 9px;
+    min-width: 0;
 }
 
 .strategy-learning-profile-card-stats .strategy-learning-profile-stat {
@@ -989,6 +996,18 @@
     border-radius: var(--radius-sm);
     background: var(--bg-panel);
     overflow: hidden;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.strategy-learning-profile-card-stats .strategy-learning-profile-stat b {
+    display: block;
+    margin-bottom: 3px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
 }
 
 .strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4) {
@@ -1010,6 +1029,8 @@
 
 .strategy-learning-profile-chips span {
     max-width: 100%;
+    overflow: visible;
+    text-overflow: clip;
     overflow-wrap: anywhere;
     white-space: normal;
 }
@@ -1017,12 +1038,17 @@
 .strategy-learning-profile-footer {
     align-items: stretch;
     grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
 }
 
 .strategy-learning-profile-footer > span {
     min-width: 0;
     overflow-wrap: anywhere;
     white-space: normal;
+    padding: 7px 8px;
+    border: 1px solid rgba(148,163,184,0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(2,6,23,0.16);
 }
 
 .strategy-learning-guard-state {

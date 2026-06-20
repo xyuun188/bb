@@ -39,6 +39,7 @@ from services.manual_close_marker import is_manual_close_order, position_has_man
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
 logger = structlog.get_logger(__name__)
@@ -64,8 +65,10 @@ REQUIRED_ENTRY_EXPERTS = {
 }
 CORE_ENTRY_EXPERTS = {"trend_expert", "momentum_expert", "risk_expert"}
 NON_CORE_ENTRY_EXPERTS = REQUIRED_ENTRY_EXPERTS - CORE_ENTRY_EXPERTS
-DEFAULT_MIN_TRADE_TARGET_FALLBACK = 8
-DEFAULT_LOOKBACK_HOURS = 168
+STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
+ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
+DEFAULT_MIN_TRADE_TARGET_FALLBACK = STRATEGY_LEARNING_PARAMS.min_trade_count_target_baseline
+DEFAULT_LOOKBACK_HOURS = STRATEGY_LEARNING_PARAMS.default_lookback_hours
 STATE_FILE_NAME = "strategy_learning_state.json"
 PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS = 600
 LLM_CANDIDATE_CACHE_SECONDS = 6 * 60 * 60
@@ -108,7 +111,7 @@ BOUNDED_FLOAT_PARAM_RANGES = {
     "global_min_score_delta": (-0.25, 0.35),
     "position_size_multiplier": (0.10, 1.25),
     "probe_fraction": (0.0, 0.10),
-    "max_probe_size_pct": (0.0, 0.03),
+    "max_probe_size_pct": (0.0, ENTRY_RISK_SIZING_PARAMS.strategy_probe_cap_max_pct),
     "position_review_priority_boost": (0.70, 1.80),
     "profit_lock_min_usdt_multiplier": (0.80, 1.80),
 }
@@ -124,18 +127,19 @@ ALLOWED_WINNER_HOLD = {"normal", "high"}
 def default_min_trade_target() -> int:
     """Return the advisory training-sample target used by strategy learning."""
 
+    params = STRATEGY_LEARNING_PARAMS
     return max(
-        1,
+        params.min_trade_count_target_min,
         min(
             _safe_int(
                 getattr(
                     settings,
                     "strategy_learning_min_trade_count_target",
-                    DEFAULT_MIN_TRADE_TARGET_FALLBACK,
+                    params.min_trade_count_target_baseline,
                 ),
-                DEFAULT_MIN_TRADE_TARGET_FALLBACK,
+                params.min_trade_count_target_baseline,
             ),
-            80,
+            params.min_trade_count_target_settings_cap,
         ),
     )
 
@@ -150,20 +154,36 @@ def learning_trade_count_target(
 ) -> int:
     """Return a dynamic, advisory sample target for strategy-confidence scoring."""
 
+    params = STRATEGY_LEARNING_PARAMS
     baseline = default_min_trade_target()
-    window_factor = max(0, min(int(window_hours or DEFAULT_LOOKBACK_HOURS), 24 * 90)) / 168.0
-    activity_target = math.ceil(
-        max(int(entry_signals or 0) * 0.60, int(shadow_opportunities or 0) * 0.35)
+    window_factor = (
+        max(0, min(int(window_hours or DEFAULT_LOOKBACK_HOURS), params.max_lookback_hours))
+        / params.dynamic_trade_target_reference_hours
     )
-    review_target = math.ceil(max(int(reflection_count or 0), 0) * 0.50)
-    scan_target = math.ceil(max(int(market_scans or 0), 0) * 0.08)
+    activity_target = math.ceil(
+        max(
+            int(entry_signals or 0) * params.entry_signal_target_ratio,
+            int(shadow_opportunities or 0) * params.shadow_opportunity_target_ratio,
+        )
+    )
+    review_target = math.ceil(max(int(reflection_count or 0), 0) * params.reflection_target_ratio)
+    scan_target = math.ceil(max(int(market_scans or 0), 0) * params.market_scan_target_ratio)
     dynamic_target = max(
-        math.ceil(baseline * min(max(window_factor, 0.50), 2.0)),
+        math.ceil(
+            baseline
+            * min(
+                max(window_factor, params.dynamic_trade_target_min_window_factor),
+                params.dynamic_trade_target_max_window_factor,
+            )
+        ),
         activity_target,
         review_target,
         scan_target,
     )
-    return max(3, min(dynamic_target, 40))
+    return max(
+        params.dynamic_trade_target_min,
+        min(dynamic_target, params.dynamic_trade_target_max),
+    )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -735,6 +755,9 @@ class StrategyFeedbackCompiler:
                 "low_trade_count_is_penalized": True,
                 "arbitrary_code_generation_allowed": False,
                 "candidate_profiles_only": True,
+                "strategy_learning_params": DEFAULT_TRADING_PARAMS.to_dict().get(
+                    "strategy_learning", {}
+                ),
             },
         )
 
@@ -1838,11 +1861,15 @@ class StrategyCandidateGenerator:
                     ),
                     params={
                         "global_min_score_delta": -0.08,
-                        "position_size_multiplier": 0.62,
+                        "position_size_multiplier": (
+                            ENTRY_RISK_SIZING_PARAMS.balanced_probe_position_size_multiplier
+                        ),
                         "probe_fraction": 0.08,
                         "min_trade_count_target": trade_target,
                         "expert_integrity_mode": "balanced_probe_allow_one_non_core_missing",
-                        "max_probe_size_pct": 0.018,
+                        "max_probe_size_pct": (
+                            ENTRY_RISK_SIZING_PARAMS.balanced_probe_max_position_size_pct
+                        ),
                         "fallback_tolerance": {
                             "allow_missing_non_core_experts": 1,
                             "core_experts_required": sorted(CORE_ENTRY_EXPERTS),
@@ -2038,8 +2065,14 @@ class StrategyCandidateGenerator:
                 if sanitized_weights:
                     clean[key] = sanitized_weights
         if _safe_float(clean.get("probe_fraction"), 0.0) > 0:
-            clean.setdefault("position_size_multiplier", 0.62)
-            clean.setdefault("max_probe_size_pct", 0.018)
+            clean.setdefault(
+                "position_size_multiplier",
+                ENTRY_RISK_SIZING_PARAMS.balanced_probe_position_size_multiplier,
+            )
+            clean.setdefault(
+                "max_probe_size_pct",
+                ENTRY_RISK_SIZING_PARAMS.balanced_probe_max_position_size_pct,
+            )
         return clean
 
     @staticmethod
@@ -3318,11 +3351,17 @@ class StrategyLearningEngine:
             )
             sizing["probe_fraction"] = max(
                 _safe_float(sizing.get("probe_fraction"), 0.0),
-                0.03,
+                ENTRY_RISK_SIZING_PARAMS.release_probe_fraction_floor,
             )
             sizing["max_probe_size_pct"] = min(
-                max(_safe_float(sizing.get("max_probe_size_pct"), 0.012), 0.008),
-                0.018,
+                max(
+                    _safe_float(
+                        sizing.get("max_probe_size_pct"),
+                        ENTRY_RISK_SIZING_PARAMS.release_probe_default_cap_pct,
+                    ),
+                    ENTRY_RISK_SIZING_PARAMS.release_probe_min_cap_pct,
+                ),
+                ENTRY_RISK_SIZING_PARAMS.release_probe_max_cap_pct,
             )
             sizing["reason"] = (
                 "满仓或低质量仓位压力存在：优先释放低质量仓位，" "同时只允许高质量小仓探针。"
@@ -3337,15 +3376,21 @@ class StrategyLearningEngine:
             )
             sizing["position_size_multiplier"] = min(
                 _safe_float(sizing.get("position_size_multiplier"), 1.0),
-                0.55,
+                ENTRY_RISK_SIZING_PARAMS.recovery_multiplier_cap,
             )
             sizing["probe_fraction"] = max(
                 _safe_float(sizing.get("probe_fraction"), 0.0),
-                0.03,
+                ENTRY_RISK_SIZING_PARAMS.recovery_probe_fraction_floor,
             )
             sizing["max_probe_size_pct"] = min(
-                max(_safe_float(sizing.get("max_probe_size_pct"), 0.018), 0.012),
-                0.024,
+                max(
+                    _safe_float(
+                        sizing.get("max_probe_size_pct"),
+                        ENTRY_RISK_SIZING_PARAMS.recovery_probe_default_cap_pct,
+                    ),
+                    ENTRY_RISK_SIZING_PARAMS.recovery_probe_min_cap_pct,
+                ),
+                ENTRY_RISK_SIZING_PARAMS.recovery_health_probe_max_cap_pct,
             )
             sizing["execution_guard_active"] = execution_guard_active
             sizing["reason"] = (
@@ -3484,12 +3529,19 @@ class StrategyLearningService:
         *,
         mode: str,
         hours: int = DEFAULT_LOOKBACK_HOURS,
-        limit: int = 3000,
+        limit: int = STRATEGY_LEARNING_PARAMS.dashboard_default_limit,
         max_open_positions: int | None = None,
         detail: str = "summary",
     ) -> dict[str, Any]:
         selected_detail = "full" if str(detail or "").lower() == "full" else "summary"
-        effective_limit = limit if selected_detail == "full" else min(int(limit or 3000), 1500)
+        params = STRATEGY_LEARNING_PARAMS
+        raw_limit = int(limit or params.dashboard_default_limit)
+        max_limit = (
+            params.dashboard_full_limit
+            if selected_detail == "full"
+            else params.dashboard_summary_limit
+        )
+        effective_limit = max(params.min_dashboard_limit, min(raw_limit, max_limit))
         rows = await self._load_rows(mode=mode, hours=hours, limit=effective_limit)
         feedback = self._compile_feedback(
             mode=mode,
@@ -3569,7 +3621,7 @@ class StrategyLearningService:
         strategy_context: dict[str, Any],
         open_positions: list[dict[str, Any]] | None,
         hours: int = DEFAULT_LOOKBACK_HOURS,
-        limit: int = 3000,
+        limit: int = STRATEGY_LEARNING_PARAMS.dashboard_default_limit,
         max_open_positions: int | None = None,
     ) -> dict[str, Any]:
         rows = await self._load_rows(mode=mode, hours=hours, limit=limit)
@@ -5163,8 +5215,12 @@ class StrategyLearningService:
     async def _load_rows(self, *, mode: str, hours: int, limit: int) -> dict[str, list[Any]]:
         selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
         is_paper = selected_mode == "paper"
-        capped_hours = max(1, min(int(hours or DEFAULT_LOOKBACK_HOURS), 24 * 90))
-        capped_limit = max(100, min(int(limit or 3000), 20000))
+        params = STRATEGY_LEARNING_PARAMS
+        capped_hours = max(1, min(int(hours or DEFAULT_LOOKBACK_HOURS), params.max_lookback_hours))
+        capped_limit = max(
+            params.min_dashboard_limit,
+            min(int(limit or params.dashboard_default_limit), params.dashboard_full_limit),
+        )
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with get_read_session_ctx() as session:
             closed_result = await session.execute(
@@ -5194,10 +5250,10 @@ class StrategyLearningService:
                 .where(
                     Order.model_name == ENSEMBLE_TRADER_NAME,
                     Order.execution_mode == selected_mode,
-                    Order.created_at >= since - timedelta(hours=2),
+                    Order.created_at >= since - timedelta(hours=params.order_extra_lookback_hours),
                 )
                 .order_by(Order.created_at.desc())
-                .limit(capped_limit * 3)
+                .limit(capped_limit * params.market_event_limit_multiplier)
             )
             decision_result = await session.execute(
                 select(AIDecision)
@@ -5221,11 +5277,14 @@ class StrategyLearningService:
             )
             memory_result = await session.execute(
                 select(ExpertMemory)
-                .where(ExpertMemory.created_at >= since - timedelta(days=30))
+                .where(
+                    ExpertMemory.created_at
+                    >= since - timedelta(days=params.expert_memory_lookback_days)
+                )
                 .order_by(
                     ExpertMemory.updated_at.desc().nullslast(), ExpertMemory.created_at.desc()
                 )
-                .limit(2000)
+                .limit(params.expert_memory_limit)
             )
             reflection_result = await session.execute(
                 select(TradeReflection)
@@ -5245,7 +5304,7 @@ class StrategyLearningService:
                     StrategyLearningEvent.created_at >= since,
                 )
                 .order_by(StrategyLearningEvent.created_at.desc())
-                .limit(capped_limit * 3)
+                .limit(capped_limit * params.market_event_limit_multiplier)
             )
             return {
                 "closed_positions": list(closed_result.scalars().all()),

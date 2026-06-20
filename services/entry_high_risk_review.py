@@ -74,6 +74,54 @@ def ml_ai_direction_conflict(decision: DecisionOutput) -> bool:
     return ml_side in {"long", "short"} and ml_side != entry_side_value(decision)
 
 
+def _review_opportunity_summary(opportunity: dict[str, Any]) -> dict[str, Any]:
+    breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
+    components = breakdown.get("components") if isinstance(breakdown, dict) else []
+    compact_components: list[dict[str, Any]] = []
+    if isinstance(components, list):
+        for component in components[:8]:
+            if not isinstance(component, dict):
+                continue
+            compact_components.append(
+                {
+                    "key": component.get("key"),
+                    "available": bool(component.get("available")),
+                    "side": component.get("side"),
+                    "raw_return_pct": round(_safe_float(component.get("raw_return_pct"), 0.0), 6),
+                    "weight": round(_safe_float(component.get("weight"), 0.0), 6),
+                    "contribution_pct": round(
+                        _safe_float(component.get("contribution_pct"), 0.0), 6
+                    ),
+                }
+            )
+    return {
+        "expected_net_return_pct": round(
+            _safe_float(opportunity.get("expected_net_return_pct"), 0.0), 6
+        ),
+        "profit_quality_ratio": round(_safe_float(opportunity.get("profit_quality_ratio"), 0.0), 6),
+        "server_profit_loss_probability": round(
+            _safe_float(opportunity.get("server_profit_loss_probability"), 0.5), 6
+        ),
+        "tail_risk_score": round(_safe_float(opportunity.get("tail_risk_score"), 0.0), 6),
+        "reward_risk_ratio": round(_safe_float(opportunity.get("reward_risk_ratio"), 0.0), 6),
+        "server_profit_expected_return_pct": round(
+            _safe_float(opportunity.get("server_profit_expected_return_pct"), 0.0), 6
+        ),
+        "ml_expected_return_pct": round(
+            _safe_float(opportunity.get("ml_expected_return_pct"), 0.0), 6
+        ),
+        "timeseries_expected_return_pct": round(
+            _safe_float(opportunity.get("timeseries_expected_return_pct"), 0.0), 6
+        ),
+        "expected_net_breakdown": {
+            "formula": breakdown.get("formula"),
+            "net_pct": round(_safe_float(breakdown.get("net_pct"), 0.0), 6),
+            "model_net_pct": round(_safe_float(breakdown.get("model_net_pct"), 0.0), 6),
+            "components": compact_components,
+        },
+    }
+
+
 @dataclass(slots=True)
 class EntryHighRiskReviewGatePolicy:
     """Apply high-risk review business rules for entry decisions."""
@@ -259,7 +307,7 @@ class EntryHighRiskReviewGatePolicy:
             "stop_loss_pct": decision.stop_loss_pct,
             "take_profit_pct": decision.take_profit_pct,
             "trigger_reasons": reasons,
-            "opportunity_score": opportunity,
+            "opportunity_score": _review_opportunity_summary(opportunity),
             "today_pnl": allocation_state.get("today_risk_pnl"),
             "open_position_count": len([p for p in open_positions or [] if p.get("is_open", True)]),
         }

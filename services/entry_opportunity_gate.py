@@ -20,17 +20,34 @@ from services.entry_direction_metrics import (
 )
 from services.entry_loss_cooldown import EntryLossCooldownPolicy
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 EntryOpportunityGateEvaluator = Callable[[DecisionOutput], str | None]
 
-ENTRY_DIRECTION_HARD_CONFLICT_GAP = 0.12
-ENTRY_DIRECTION_MIN_SUPPORT_SCORE = 0.02
-ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = 1.50
-QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = 0.18
-PORTFOLIO_ROSTER_FILL_MIN_EXPECTED_PCT = 0.08
-PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = 0.66
-PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = 0.20
-PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = 0.25
+_GATE_PARAMS = DEFAULT_TRADING_PARAMS.entry_opportunity_gate
+ENTRY_DIRECTION_HARD_CONFLICT_GAP = _GATE_PARAMS.direction_hard_conflict_gap
+ENTRY_DIRECTION_MIN_SUPPORT_SCORE = _GATE_PARAMS.direction_min_support_score
+ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = _GATE_PARAMS.min_net_profit_quality_ratio
+QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = _GATE_PARAMS.quant_profit_probe_min_expected_pct
+ADVISORY_DIRECTION_CONFLICT_SIZE_CAP = _GATE_PARAMS.advisory_direction_conflict_size_cap
+ADVISORY_RISK_SIZE_CAP = _GATE_PARAMS.advisory_risk_size_cap
+ADVISORY_LOW_QUALITY_SIZE_CAP = _GATE_PARAMS.advisory_low_quality_size_cap
+ADVISORY_STRONG_QUALITY_MIN_EXPECTED_NET_PCT = (
+    _GATE_PARAMS.advisory_strong_quality_min_expected_net_pct
+)
+ADVISORY_STRONG_QUALITY_MIN_PROFIT_QUALITY_RATIO = (
+    _GATE_PARAMS.advisory_strong_quality_min_profit_quality_ratio
+)
+ADVISORY_STRONG_QUALITY_MAX_LOSS_PROBABILITY = (
+    _GATE_PARAMS.advisory_strong_quality_max_loss_probability
+)
+ADVISORY_STRONG_QUALITY_MAX_TAIL_RISK = _GATE_PARAMS.advisory_strong_quality_max_tail_risk
+PORTFOLIO_ROSTER_FILL_MIN_EXPECTED_PCT = _GATE_PARAMS.portfolio_roster_fill_min_expected_pct
+PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = _GATE_PARAMS.portfolio_roster_fill_max_loss_probability
+PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = _GATE_PARAMS.portfolio_roster_fill_min_net_pct
+PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = (
+    _GATE_PARAMS.portfolio_roster_fill_min_profit_quality_ratio
+)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -127,7 +144,21 @@ class EntryOpportunityGatePolicy:
             item: dict[str, Any] = {"reason": reason}
             if size_cap is not None:
                 original_size = float(decision.position_size_pct or 0.0)
-                if original_size > size_cap > 0:
+                override = self._advisory_size_cap_override(
+                    expected_net_return_pct=expected_net,
+                    profit_quality_ratio=profit_quality_ratio,
+                    loss_probability=selected_loss_probability,
+                    tail_risk_score=tail_risk_score,
+                    opportunity=opportunity,
+                    quant_profit_probe_entry=quant_profit_probe_entry,
+                    roster_fill_entry=roster_fill_entry,
+                    contribution_positive_expected_relief=contribution_positive_expected_relief,
+                )
+                if override:
+                    item["size_cap_skipped"] = True
+                    item["size_cap"] = round(size_cap, 6)
+                    item["size_cap_override"] = override
+                elif original_size > size_cap > 0:
                     decision.position_size_pct = size_cap
                     item["original_position_size_pct"] = round(original_size, 6)
                     item["adjusted_position_size_pct"] = round(size_cap, 6)
@@ -223,6 +254,12 @@ class EntryOpportunityGatePolicy:
             ),
             0.0,
         )
+        selected_loss_probability = (
+            selected_metrics.loss_probability
+            if selected_metrics.has_selected_side
+            else _safe_float(opportunity.get("server_profit_loss_probability"), 1.0)
+        )
+        contribution_positive_expected_relief = False
         quant_profit_probe_entry = bool(
             quant_probe.get("triggered")
             and expected_net > 0
@@ -298,7 +335,7 @@ class EntryOpportunityGatePolicy:
                     f"{opposite_label}，方向分差 {direction_gap:.2f}，本方向分 "
                     f"{direction_side_score:.2f}，相反方向分 {direction_opposite_score:.2f}。"
                     "本次作为风险提示并降低仓位，不硬拦 AI 开仓。",
-                    size_cap=0.025,
+                    size_cap=ADVISORY_DIRECTION_CONFLICT_SIZE_CAP,
                 )
         if (
             entry_side in {"long", "short"}
@@ -310,7 +347,7 @@ class EntryOpportunityGatePolicy:
                 f"该币种本轮缺少提前支持{side_label}的方向证据：方向分 "
                 f"{direction_side_score:.2f}，未获得 ML、服务器盈利模型、时序模型或专家"
                 "同向确认。本次作为仓位降级提示，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
 
         server_profit_conflict_relief = bool(
@@ -331,7 +368,10 @@ class EntryOpportunityGatePolicy:
         if server_profit_conflict_relief:
             original_size = float(decision.position_size_pct or 0.0)
             if original_size > 0:
-                decision.position_size_pct = min(original_size, 0.025)
+                decision.position_size_pct = min(
+                    original_size,
+                    ADVISORY_DIRECTION_CONFLICT_SIZE_CAP,
+                )
             opportunity["server_profit_conflict_relief"] = {
                 "applied": True,
                 "original_position_size_pct": round(original_size, 6),
@@ -361,7 +401,7 @@ class EntryOpportunityGatePolicy:
                 f"服务器盈利模型不支持本次{side_label}：该方向预期收益 "
                 f"{server_profit_expected:.4f}%，模型更偏向 "
                 f"{server_profit_side or '观望/未知'}。本次作为极小仓风险提示，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
 
         contribution_adjustment = _safe_dict(opportunity.get("model_contribution_adjustment"))
@@ -404,7 +444,7 @@ class EntryOpportunityGatePolicy:
                 f"闭环贡献统计显示本轮信号组合里有 {negative_source_count} 个来源最近真实净亏，"
                 f"当前预期净收益 {expected_net:.2f}%、净盈亏比 {profit_quality_ratio:.2f} "
                 "还不足以覆盖该风险。本次只降低仓位，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
         if expected_net <= 0:
             write_selected_metrics_snapshot(
@@ -428,7 +468,7 @@ class EntryOpportunityGatePolicy:
             add_advisory(
                 f"净盈亏比 {profit_quality_ratio:.2f} 低于最低要求 {min_profit_quality_ratio:.2f}，"
                 "这类机会容易形成小盈大亏，本次只降低仓位，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
         if opportunity.get("weak_history_requires_stronger_edge") and not (
             opportunity.get("local_profit_aligned") or opportunity.get("ml_aligned")
@@ -436,7 +476,7 @@ class EntryOpportunityGatePolicy:
             add_advisory(
                 "该币种/方向近期真实盈亏偏弱，且本轮没有本地盈利模型或 ML 同向改善证据；"
                 "本次按 AI 决策进入执行检查，但降低仓位。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
         if tail_risk_score >= 1.15 and not (
             strong_support and profit_quality_ratio >= 0.55 and success_probability >= 0.58
@@ -448,7 +488,7 @@ class EntryOpportunityGatePolicy:
         if tail_risk_score >= 0.95:
             add_advisory(
                 f"尾部亏损风险 {tail_risk_score:.2f} 偏高，本次只降低仓位，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
         if (
             profit_quality_ratio <= 0.12
@@ -460,7 +500,7 @@ class EntryOpportunityGatePolicy:
             add_advisory(
                 f"盈利质量比 {profit_quality_ratio:.2f} 过低，相对可能亏损，预期收益不够有吸引力。"
                 "本次只降低仓位，不硬拦 AI 开仓。",
-                size_cap=0.015,
+                size_cap=ADVISORY_LOW_QUALITY_SIZE_CAP,
             )
         if (
             score <= min_score
@@ -471,7 +511,7 @@ class EntryOpportunityGatePolicy:
             add_advisory(
                 f"机会评分 {score:.4f} 低于当前执行门槛 {min_score:.2f}；"
                 "本次作为风险提示和仓位降级，不硬拦 AI 开仓。",
-                size_cap=0.02,
+                size_cap=ADVISORY_RISK_SIZE_CAP,
             )
         if roster_fill_entry:
             opportunity["portfolio_roster_fill_relief"] = {
@@ -549,6 +589,61 @@ class EntryOpportunityGatePolicy:
             f"动态证据强冲突硬拦截：{reason_text or 'ML/时序/记忆出现严重反向'}。"
             f"当前有效分 {effective_score:.1f}；本次不提交开仓，等待下一轮重新评估。"
         )
+
+    def _advisory_size_cap_override(
+        self,
+        *,
+        expected_net_return_pct: float,
+        profit_quality_ratio: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        opportunity: dict[str, Any],
+        quant_profit_probe_entry: bool,
+        roster_fill_entry: bool,
+        contribution_positive_expected_relief: bool,
+    ) -> dict[str, Any] | None:
+        """Skip soft advisory size caps when independent quality evidence is strong.
+
+        Advisory warnings should explain risk and reduce weak trades, but they
+        must not silently force every strong positive-expectancy trade into the
+        same 1.5%-2.5% bucket. Hard blockers still return before this method.
+        """
+
+        aligned_sources = [
+            source
+            for source, aligned in (
+                ("local_profit", opportunity.get("local_profit_aligned")),
+                ("ml", opportunity.get("ml_aligned")),
+                ("timeseries", opportunity.get("timeseries_aligned")),
+                ("expert", opportunity.get("expert_aligned")),
+            )
+            if aligned
+        ]
+        strong_quality = bool(
+            expected_net_return_pct >= ADVISORY_STRONG_QUALITY_MIN_EXPECTED_NET_PCT
+            and profit_quality_ratio >= ADVISORY_STRONG_QUALITY_MIN_PROFIT_QUALITY_RATIO
+            and loss_probability <= ADVISORY_STRONG_QUALITY_MAX_LOSS_PROBABILITY
+            and tail_risk_score <= ADVISORY_STRONG_QUALITY_MAX_TAIL_RISK
+            and len(aligned_sources) >= 2
+        )
+        if not (strong_quality or quant_profit_probe_entry or roster_fill_entry):
+            return None
+        if contribution_positive_expected_relief and not strong_quality:
+            return None
+        return {
+            "reason": (
+                "软风险提示已保留，但当前净收益、盈亏质量、亏损概率、尾部风险和多源同向证据达标；"
+                "本次不再被旧固定小仓上限压制，后续由收益/止损预算 sizing 统一决定实际仓位。"
+            ),
+            "strong_quality": strong_quality,
+            "quant_profit_probe_entry": bool(quant_profit_probe_entry),
+            "roster_fill_entry": bool(roster_fill_entry),
+            "aligned_sources": aligned_sources,
+            "expected_net_return_pct": round(expected_net_return_pct, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+        }
 
     def _entry_side(self, decision: DecisionOutput, opportunity: dict[str, Any]) -> str:
         if decision.action == Action.LONG:

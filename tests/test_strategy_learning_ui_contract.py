@@ -92,7 +92,7 @@ def test_strategy_learning_console_uses_clear_stage_layout() -> None:
     assert "columns: 2 420px;" in style
     assert "break-inside: avoid;" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));" in style
-    assert "grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));" in style
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 142px), 1fr));" in style
     assert (
         ".strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4)"
         in style

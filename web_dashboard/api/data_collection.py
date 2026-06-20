@@ -246,29 +246,35 @@ async def _training_sample_quality() -> dict[str, Any]:
         )
 
     assessments = []
+    source_counts: Counter[str] = Counter()
+    trainable_source_counts: Counter[str] = Counter()
     for row in news_rows:
         text = " ".join(part for part in (row.title, row.summary) if part)
-        assessments.append(
-            assess_text_sentiment_sample(
-                {
-                    "source": "news",
-                    "platform": row.source,
-                    "text": text,
-                    "sentiment_score": row.sentiment_score,
-                }
-            )
-        )
+        sample = {
+            "source": "news",
+            "platform": row.source,
+            "text": text,
+            "sentiment_score": row.sentiment_score,
+        }
+        assessment = assess_text_sentiment_sample(sample)
+        source = str(row.source or "news")
+        source_counts[source] += 1
+        if not assessment.exclude_from_training:
+            trainable_source_counts[source] += 1
+        assessments.append(assessment)
     for row in social_rows:
-        assessments.append(
-            assess_text_sentiment_sample(
-                {
-                    "source": "social",
-                    "platform": row.platform,
-                    "text": row.content,
-                    "sentiment_score": row.sentiment_score,
-                }
-            )
-        )
+        sample = {
+            "source": "social",
+            "platform": row.platform,
+            "text": row.content,
+            "sentiment_score": row.sentiment_score,
+        }
+        assessment = assess_text_sentiment_sample(sample)
+        source = str(row.platform or "social")
+        source_counts[source] += 1
+        if not assessment.exclude_from_training:
+            trainable_source_counts[source] += 1
+        assessments.append(assessment)
     status_counts = Counter(item.status for item in assessments)
     reason_counts: Counter[str] = Counter()
     effective_weight = 0.0
@@ -283,6 +289,16 @@ async def _training_sample_quality() -> dict[str, Any]:
         "excluded": int(status_counts.get("excluded", 0)),
         "effective_weight": round(effective_weight, 4),
         "effective_ratio": round(effective_weight / total, 4) if total else 0.0,
+        "sources": dict(source_counts),
+        "trainable_sources": dict(trainable_source_counts),
+        "top_sources": [
+            {
+                "source": source,
+                "count": count,
+                "trainable": int(trainable_source_counts.get(source, 0)),
+            }
+            for source, count in source_counts.most_common(12)
+        ],
         "top_reasons": [
             {"reason": reason, "count": count} for reason, count in reason_counts.most_common(8)
         ],

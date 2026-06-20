@@ -52,7 +52,7 @@ def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     assert qwen.port == 8000
     assert qwen.max_model_len == 8192
     assert qwen.gpu_memory_utilization == 0.34
-    assert qwen.max_num_seqs == 4
+    assert qwen.max_num_seqs == 2
     assert qwen.start_script_path == "/data/trade_ai/scripts/start_qwen3_14b_trade.sh"
 
     assert r1.model_repo == "casperhansen/deepseek-r1-distill-qwen-14b-awq"
@@ -62,8 +62,10 @@ def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     assert r1.port == 8002
     assert r1.max_model_len == 4096
     assert r1.gpu_memory_utilization == 0.62
+    assert r1.enforce_eager is True
     assert r1.max_num_seqs == 2
     assert r1.start_script_path == "/data/trade_ai/scripts/start_deepseek_r1_14b_risk.sh"
+    assert qwen.gpu_memory_utilization + r1.gpu_memory_utilization == pytest.approx(0.96)
 
 
 def test_remote_service_spec_rejects_system_disk_paths() -> None:
@@ -148,6 +150,19 @@ def test_qwen3_download_command_uses_quoted_spec_path() -> None:
     assert ".." not in command
 
 
+def test_model_download_scripts_keep_heredoc_markers_unindented() -> None:
+    for spec in (QWEN3_14B_TRADE_SERVICE, DEEPSEEK_R1_14B_RISK_SERVICE):
+        script = spec.render_download_script()
+        marker = "<<'PY'\n"
+        assert marker in script
+        assert "\nPY\n" in script
+        assert "\n            PY\n" not in script
+
+        start = script.index(marker) + len(marker)
+        end = script.index("\nPY\n", start)
+        compile(script[start:end], f"<{spec.download_script_name}>", "exec")
+
+
 def test_qwen3_install_command_waits_for_served_model_readiness() -> None:
     readiness = QWEN3_32B_MAIN_SERVICE.readiness_command(attempts=2, sleep_seconds=1)
     install = QWEN3_32B_MAIN_SERVICE.install_and_restart_command()
@@ -168,7 +183,7 @@ def test_dual_14b_start_scripts_are_short_context_awq_vllm() -> None:
     assert "--port 8000" in qwen_script
     assert "--max-model-len 8192" in qwen_script
     assert "--gpu-memory-utilization 0.34" in qwen_script
-    assert "--max-num-seqs 4" in qwen_script
+    assert "--max-num-seqs 2" in qwen_script
     assert "--quantization awq_marlin" in qwen_script
 
     assert "--model /data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq" in r1_script
@@ -176,6 +191,7 @@ def test_dual_14b_start_scripts_are_short_context_awq_vllm() -> None:
     assert "--port 8002" in r1_script
     assert "--max-model-len 4096" in r1_script
     assert "--gpu-memory-utilization 0.62" in r1_script
+    assert "--enforce-eager" in r1_script
     assert "--max-num-batched-tokens 4096" in r1_script
     assert "--max-num-seqs 2" in r1_script
     assert "--quantization awq_marlin" in r1_script
@@ -192,3 +208,4 @@ def test_dual_14b_deploy_script_is_plan_first() -> None:
     assert "QWEN3_14B_TRADE_SERVICE" in text
     assert "DEEPSEEK_R1_14B_RISK_SERVICE" in text
     assert "qwen3_main_cleanup_command" in text
+    assert "_stop_dual_14b_services_command" in text

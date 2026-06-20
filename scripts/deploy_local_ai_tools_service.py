@@ -56,8 +56,8 @@ FEATURE_KEYS = [
     "news_article_count", "decision_confidence", "horizon_minutes",
 ]
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
-ROUND_TRIP_COST_PCT = 0.12
-TAIL_LOSS_THRESHOLD_PCT = 0.18
+ROUND_TRIP_COST_PCT = float(os.environ.get("LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT", "0.12"))
+TAIL_LOSS_THRESHOLD_PCT = float(os.environ.get("LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT", "0.18"))
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
 SECRET_TEXT_RE = re.compile(
@@ -1264,6 +1264,8 @@ def main() -> None:
             Environment=PATH=__ENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002
+            Environment=LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT=0.12
+            Environment=LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT=0.18
             EnvironmentFile=-/data/trade_ai/local_ai_tools.env
             LimitNOFILE=65535
             ExecStart=__PYTHON_BIN__ -m uvicorn local_ai_tools_api:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 5
@@ -1292,7 +1294,10 @@ def main() -> None:
             run_remote_text(
                 ssh,
                 "systemctl is-active local-ai-tools.service && "
-                "sleep 2 && curl -s http://127.0.0.1:8001/health",
+                "sleep 2 && "
+                "set -a; . /data/trade_ai/local_ai_tools.env; set +a; "
+                'curl -s -H "Authorization: Bearer ${LOCAL_AI_TOOLS_API_KEY}" '
+                "http://127.0.0.1:8001/health",
                 timeout=120,
             )
         )

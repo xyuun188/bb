@@ -29,6 +29,79 @@ class _FailingBalanceCcxt:
         raise RuntimeError(self.error_text)
 
 
+class _BalanceOnlyCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.instrument_calls = 0
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.instrument_calls += 1
+        raise AssertionError("balance-only snapshot must not load OKX instruments")
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        return {
+            "USDT": {"free": 12.0, "used": 3.0, "total": 15.0},
+            "info": {"data": [{"details": [{"ccy": "USDT", "cashBal": "15", "eq": "16"}]}]},
+        }
+
+
+class _CcxtBalanceWouldLoadMarkets:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+    markets = None
+
+    def __init__(self) -> None:
+        self.instrument_calls = 0
+        self.markets_seen_by_fetch: Any = None
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.instrument_calls += 1
+        raise AssertionError("balance snapshot must not load OKX instruments")
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        self.markets_seen_by_fetch = self.markets
+        if self.markets is None:
+            await self.publicGetPublicInstruments({"instType": "SWAP"})
+        return {
+            "USDT": {"free": 7.0, "used": 1.0, "total": 8.0},
+            "info": {"data": [{"details": [{"ccy": "USDT", "cashBal": "8", "eq": "8"}]}]},
+        }
+
+
+class _NativeBalanceOnlyCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.instrument_calls = 0
+        self.balance_calls = 0
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.instrument_calls += 1
+        raise AssertionError("native balance snapshot must not load OKX instruments")
+
+    async def privateGetAccountBalance(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.balance_calls += 1
+        assert params == {"ccy": "USDT"}
+        return {
+            "data": [
+                {
+                    "details": [
+                        {
+                            "ccy": "USDT",
+                            "cashBal": "15",
+                            "eq": "16",
+                            "availBal": "12",
+                            "frozenBal": "3",
+                        }
+                    ]
+                }
+            ]
+        }
+
+
 class _FailingCancelCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -312,6 +385,41 @@ async def test_okx_balance_snapshot_error_is_redacted() -> None:
     assert hidden_value not in rendered
     assert "Authorization: ***" in result["error"]
     assert "password=***" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_okx_balance_snapshot_does_not_require_instrument_rules() -> None:
+    exchange = _BalanceOnlyCcxt()
+    result = await _executor(exchange).get_balance_snapshot()
+
+    assert result["free"] == 12.0
+    assert result["allocatable"] == 16.0
+    assert exchange.instrument_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_okx_balance_snapshot_prevents_ccxt_implicit_market_loading() -> None:
+    exchange = _CcxtBalanceWouldLoadMarkets()
+    result = await _executor(exchange).get_balance_snapshot()
+
+    assert result["free"] == 7.0
+    assert result["allocatable"] == 8.0
+    assert exchange.instrument_calls == 0
+    assert exchange.markets_seen_by_fetch == {}
+
+
+@pytest.mark.asyncio
+async def test_okx_native_balance_snapshot_avoids_ccxt_market_loading() -> None:
+    exchange = _NativeBalanceOnlyCcxt()
+    result = await _executor(exchange).get_balance_snapshot()
+
+    assert result["free"] == 12.0
+    assert result["used"] == 3.0
+    assert result["total"] == 16.0
+    assert result["cash"] == 15.0
+    assert result["allocatable"] == 16.0
+    assert exchange.balance_calls == 1
+    assert exchange.instrument_calls == 0
 
 
 @pytest.mark.asyncio

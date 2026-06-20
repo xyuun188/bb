@@ -6,15 +6,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.entry_sizing import evidence_is_low_payoff_quality
+from services.trading_params import DEFAULT_TRADING_PARAMS
+
+_PAYOFF_PARAMS = DEFAULT_TRADING_PARAMS.entry_payoff_quality
 
 
 @dataclass(frozen=True, slots=True)
 class EntryLowPayoffQualityPolicy:
     """Classify entry candidates that should be capped to small, defensive sizing."""
 
-    min_expected_net_return_pct: float = 0.45
-    min_profit_quality_ratio: float = 0.75
-    max_small_win_big_loss_penalty: float = 0.65
+    min_expected_net_return_pct: float = _PAYOFF_PARAMS.min_expected_net_return_pct
+    min_profit_quality_ratio: float = _PAYOFF_PARAMS.min_profit_quality_ratio
+    max_small_win_big_loss_penalty: float = _PAYOFF_PARAMS.max_small_win_big_loss_penalty
 
     def is_low_payoff(
         self,

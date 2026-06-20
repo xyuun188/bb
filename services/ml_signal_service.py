@@ -29,6 +29,7 @@ from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_shadow_sample, quality_report
 
 logger = structlog.get_logger(__name__)
@@ -36,11 +37,15 @@ logger = structlog.get_logger(__name__)
 MODEL_DIR = Path("data/ml_signal")
 MODEL_PATH = MODEL_DIR / "winrate_model.joblib"
 METADATA_PATH = MODEL_DIR / "winrate_model_metadata.json"
-AUTO_TRAIN_CHECK_INTERVAL_SECONDS = 30 * 60
-AUTO_TRAIN_MIN_INTERVAL_SECONDS = 6 * 60 * 60
-AUTO_TRAIN_MIN_NEW_SAMPLES = 500
-AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = 2 * 60 * 60
-AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = 120
+_LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
+AUTO_TRAIN_MIN_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_min_interval_seconds
+AUTO_TRAIN_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_min_new_samples
+AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = (
+    _LOCAL_ML_PARAMS.auto_train_learning_only_interval_seconds
+)
+AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_learning_only_min_new_samples
+TRAINING_SHADOW_SAMPLE_LIMIT = _LOCAL_ML_PARAMS.training_shadow_sample_limit
 
 FEATURE_KEYS = [
     "change_24h_pct",
@@ -75,16 +80,17 @@ FEATURE_KEYS = [
     "horizon_minutes",
 ]
 
-WIN_RETURN_THRESHOLD_PCT = 0.05
-ROUND_TRIP_COST_PCT = 0.12
-TAIL_LOSS_THRESHOLD_PCT = 0.18
-MIN_PROFIT_EDGE_PCT = 0.02
-MIN_PROFIT_SIGNAL_WIN_RATE = 0.0
-MIN_TRAINING_SAMPLES = 200
-ML_INFLUENCE_MIN_SAMPLE_COUNT = 1000
-ML_INFLUENCE_MIN_TEST_COUNT = 200
-ML_INFLUENCE_MIN_AUC = 0.53
-ML_INFLUENCE_MIN_ACCURACY = 0.52
+WIN_RETURN_THRESHOLD_PCT = _LOCAL_ML_PARAMS.win_return_threshold_pct
+_EXECUTION_COST_PARAMS = DEFAULT_TRADING_PARAMS.execution_cost
+ROUND_TRIP_COST_PCT = _EXECUTION_COST_PARAMS.local_ml_round_trip_cost_pct
+TAIL_LOSS_THRESHOLD_PCT = _EXECUTION_COST_PARAMS.local_ml_tail_loss_threshold_pct
+MIN_PROFIT_EDGE_PCT = _LOCAL_ML_PARAMS.min_profit_edge_pct
+MIN_PROFIT_SIGNAL_WIN_RATE = _LOCAL_ML_PARAMS.min_profit_signal_win_rate
+MIN_TRAINING_SAMPLES = _LOCAL_ML_PARAMS.min_training_samples
+ML_INFLUENCE_MIN_SAMPLE_COUNT = _LOCAL_ML_PARAMS.influence_min_sample_count
+ML_INFLUENCE_MIN_TEST_COUNT = _LOCAL_ML_PARAMS.influence_min_test_count
+ML_INFLUENCE_MIN_AUC = _LOCAL_ML_PARAMS.influence_min_auc
+ML_INFLUENCE_MIN_ACCURACY = _LOCAL_ML_PARAMS.influence_min_accuracy
 ML_INFLUENCE_MIN_TOP_RETURN_PCT = WIN_RETURN_THRESHOLD_PCT
 
 
@@ -401,9 +407,9 @@ def train_from_frame(
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
 
     frame = frame.sort_values("id").reset_index(drop=True)
-    split = max(int(len(frame) * 0.75), 1)
-    if len(frame) - split < 40:
-        split = max(len(frame) - 40, 1)
+    split = max(int(len(frame) * _LOCAL_ML_PARAMS.train_split_ratio), 1)
+    if len(frame) - split < _LOCAL_ML_PARAMS.min_test_rows:
+        split = max(len(frame) - _LOCAL_ML_PARAMS.min_test_rows, 1)
 
     train = frame.iloc[:split].copy()
     test = frame.iloc[split:].copy()
@@ -450,7 +456,7 @@ def train_from_frame(
         "last_trained_completed_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
         "quality_report": frame_quality_report,
-        "training_shadow_sample_limit": 20000,
+        "training_shadow_sample_limit": TRAINING_SHADOW_SAMPLE_LIMIT,
         "training_sample_note": "sample_count is the latest training window, not the all-time total.",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
         "train_count": int(len(train)),
@@ -546,7 +552,7 @@ class MLSignalService:
                 metadata.get("training_shadow_sample_count") or training_count
             ),
             "training_shadow_sample_limit": int(
-                metadata.get("training_shadow_sample_limit") or 20000
+                metadata.get("training_shadow_sample_limit") or TRAINING_SHADOW_SAMPLE_LIMIT
             ),
             "training_sample_note": metadata.get("training_sample_note")
             or "sample_count is the latest training window, not the all-time total.",
@@ -652,7 +658,7 @@ class MLSignalService:
 
                 self._training = True
                 self._last_train_started_at = datetime.now(UTC).isoformat()
-                rows = await load_shadow_training_rows(limit=20000)
+                rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
                 frame = build_training_frame(rows)
                 trained_metadata = await asyncio.to_thread(
                     train_from_frame,
@@ -884,7 +890,7 @@ class MLSignalService:
         return "ML 盈亏质量信号中性，暂不改变 AI 决策。"
 
 
-async def load_shadow_training_rows(limit: int = 20000) -> list[Any]:
+async def load_shadow_training_rows(limit: int = TRAINING_SHADOW_SAMPLE_LIMIT) -> list[Any]:
     async with get_session_ctx() as session:
         repo = MemoryRepository(session)
         rows = await repo.list_shadow_backtests(status="completed", limit=limit, offset=0)

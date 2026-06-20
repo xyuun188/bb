@@ -163,6 +163,49 @@ def test_entry_loss_cooldown_allows_high_quality_fresh_loss_override() -> None:
     assert override["metrics"]["fresh_loss"] is True
 
 
+def test_entry_loss_cooldown_requires_three_sources_for_fresh_loss_reentry() -> None:
+    profile = {
+        "cooldown": False,
+        "pnl": -7.5,
+        "today_pnl": -3.0,
+        "loss": 7.5,
+        "today_loss": 3.0,
+        "largest_loss": -2.4,
+        "count": 3,
+        "losses": 1,
+        "wins": 2,
+        "profit_factor": 0.8,
+        "cooldown_remaining_hours": 1.2,
+        "cooldown_reason": "fresh recent loss",
+        "last_loss_age_hours": 0.8,
+    }
+    decision = _decision(
+        {
+            "score": 4.8,
+            "min_score_required": 0.95,
+            "confidence": 0.84,
+            "expected_net_return_pct": 1.45,
+            "profit_quality_ratio": 1.2,
+            "reward_risk_ratio": 1.7,
+            "server_profit_expected_return_pct": 1.0,
+            "server_profit_loss_probability": 0.28,
+            "tail_risk_score": 0.35,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "symbol_side_profile": profile,
+        }
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is not None
+    override = decision.raw_response["loss_cooldown_override"]
+    assert override["allowed"] is False
+    assert "source_support" in override["failed"]
+    assert override["metrics"]["fresh_loss_min_aligned_sources"] == 3
+
+
 def test_entry_opportunity_gate_uses_injected_loss_cooldown_policy() -> None:
     decision = _decision(
         {

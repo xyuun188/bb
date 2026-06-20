@@ -1955,9 +1955,7 @@ class TradingService:
                     "position_first_parallel_loops; actual market batch is dynamic"
                 ),
                 "market_analysis_watchdog_seconds": int(self.market_round_watchdog_seconds()),
-                "position_analysis_watchdog_seconds": int(
-                    self.position_round_watchdog_seconds()
-                ),
+                "position_analysis_watchdog_seconds": int(self.position_round_watchdog_seconds()),
                 "current_stage": current_state.current_stage,
                 "round_active": round_active,
                 "market_current_stage": market_state.current_stage,
@@ -3707,12 +3705,22 @@ class TradingService:
                     local_ai_tools_context,
                     open_positions=open_positions,
                 )
+                market_data_quality_issue = (
+                    self.entry_market_data_quality.issue(fv, stage_label="AI分析前")
+                    if prefilter_reason
+                    else None
+                )
                 if prefilter_reason:
                     quick_raw = {
                         "analysis_type": "market",
                         "fast_prefilter": {
                             "skipped_llm": True,
                             "reason": prefilter_reason,
+                            "market_data_quality": (
+                                market_data_quality_issue.as_dict()
+                                if market_data_quality_issue
+                                else None
+                            ),
                             "feature_opportunity_score": round(
                                 self._feature_opportunity_score(fv), 4
                             ),
@@ -7410,9 +7418,7 @@ class TradingService:
             "round_active": round_active,
             "round_running_seconds": round_running_seconds,
             "market_analysis_watchdog_seconds": int(self.market_round_watchdog_seconds()),
-            "position_analysis_watchdog_seconds": int(
-                self.position_round_watchdog_seconds()
-            ),
+            "position_analysis_watchdog_seconds": int(self.position_round_watchdog_seconds()),
             "market_current_stage": market_state.current_stage,
             "market_round_active": market_state.active,
             "market_last_error": market_state.last_error,

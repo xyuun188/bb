@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -549,3 +550,94 @@ async def test_high_risk_review_requires_explicit_key_for_deepseek_base(
     review = _raw_response(decision)["high_risk_review"]
     assert review["status"] == "skipped_blocked"
     assert review["approved"] is False
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_compacts_oversized_expected_net_breakdown(
+    high_risk_settings: None,
+) -> None:
+    reviewer = CapturingReviewer()
+    huge_note = "oversized-breakdown-marker" * 200
+    components = [
+        {
+            "key": f"component_{index}",
+            "available": True,
+            "side": "long",
+            "raw_return_pct": 0.35 + index,
+            "weight": 0.1,
+            "contribution_pct": 0.01,
+            "large_debug_payload": huge_note,
+        }
+        for index in range(64)
+    ]
+
+    await reviewer.review_trade(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "confidence": 0.91,
+            "position_size_pct": 0.12,
+            "leverage": 12,
+            "opportunity_score": {
+                "expected_net_return_pct": 0.82,
+                "profit_quality_ratio": 1.5,
+                "expected_net_breakdown": {
+                    "formula": "test",
+                    "net_pct": 0.82,
+                    "model_net_pct": 1.2,
+                    "components": components,
+                },
+            },
+        },
+        api_base="https://api.deepseek.com",
+        api_key=settings.high_risk_review_api_key,
+        model="deepseek-reasoner",
+    )
+
+    user_content = reviewer.calls[0]["messages"][1]["content"]
+    payload = json.loads(user_content)
+    compact_components = (
+        payload["opportunity_score"].get("expected_net_breakdown", {}).get("components", [])
+    )
+    assert len(user_content) <= 3000
+    assert huge_note not in user_content
+    assert len(compact_components) <= 8
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_gate_sends_opportunity_summary_only(
+    high_risk_settings: None,
+) -> None:
+    reviewer = GateReviewer()
+    gate = _gate(reviewer)
+    decision = _high_risk_decision()
+    raw = _raw_response(decision)
+    marker = "raw-breakdown-marker" * 200
+    raw["opportunity_score"]["expected_net_breakdown"] = {
+        "formula": "test",
+        "net_pct": 0.8,
+        "model_net_pct": 1.1,
+        "components": [
+            {
+                "key": f"component_{index}",
+                "available": True,
+                "side": "long",
+                "raw_return_pct": index,
+                "weight": 0.1,
+                "contribution_pct": 0.01,
+                "large_debug_payload": marker,
+            }
+            for index in range(32)
+        ],
+    }
+    decision.raw_response = raw
+
+    reason = await gate.evaluate(decision, "paper", [])
+
+    assert reason is None
+    sent_prompt = reviewer.calls[0]["prompt"]
+    sent_text = json.dumps(sent_prompt, ensure_ascii=False)
+    components = sent_prompt["opportunity_score"]["expected_net_breakdown"]["components"]
+    assert marker not in sent_text
+    assert len(components) == 8
+    assert all("large_debug_payload" not in component for component in components)

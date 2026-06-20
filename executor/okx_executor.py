@@ -87,11 +87,13 @@ class OKXExecutor(AbstractExecutor):
     In production mode, real orders are placed.
     """
 
-    def __init__(self, mode: str | None = None) -> None:
+    def __init__(self, mode: str | None = None, *, load_markets_on_initialize: bool = True) -> None:
         self._mode_override = mode  # "paper" or "live", overrides global mode
         self._exchange: Any = None
         self._rate_limiter = TokenBucket(RATE_LIMIT_TOKENS, RATE_LIMIT_TOKENS * 2)
         self._connected = False
+        self._load_markets_on_initialize = load_markets_on_initialize
+        self._markets_loaded = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
 
     @property
@@ -130,13 +132,15 @@ class OKXExecutor(AbstractExecutor):
         self._ensure_rest_url()
 
         try:
-            await self._load_usdt_swap_markets()
+            if self._load_markets_on_initialize:
+                await self._load_usdt_swap_markets()
             self._connected = True
             logger.info(
                 "OKX executor initialized",
                 mode=mode,
                 demo=is_demo,
-                markets=len(self._exchange.markets),
+                markets=len(self._exchange.markets or {}),
+                markets_loaded=self._markets_loaded,
             )
         except Exception:
             await self.shutdown()
@@ -194,6 +198,17 @@ class OKXExecutor(AbstractExecutor):
         self._exchange.set_markets(markets)
         if not self._exchange.markets:
             raise ExchangeAPIError("No OKX USDT swap markets loaded")
+        self._markets_loaded = True
+
+    async def _ensure_markets_loaded(self) -> None:
+        """Load OKX swap contract rules before market/order/position operations."""
+        ccxt = await self._get_ccxt()
+        if self._markets_loaded and getattr(ccxt, "markets", None):
+            return
+        if not hasattr(ccxt, "publicGetPublicInstruments"):
+            self._markets_loaded = True
+            return
+        await self._load_usdt_swap_markets()
 
     async def reinitialize(self) -> None:
         """Close and re-create exchange with current settings."""
@@ -207,6 +222,7 @@ class OKXExecutor(AbstractExecutor):
                 )
         self._exchange = None
         self._connected = False
+        self._markets_loaded = False
         await self.initialize()
 
     async def _with_retry(self, fn, *args, **kwargs):
@@ -272,6 +288,7 @@ class OKXExecutor(AbstractExecutor):
     ) -> ExecutionResult:
         if not self._connected:
             await self.initialize()
+        await self._ensure_markets_loaded()
 
         if decision.is_hold:
             return ExecutionResult(
@@ -837,7 +854,18 @@ class OKXExecutor(AbstractExecutor):
                             params,
                         )
                     else:
-                        raise
+                        return self._entry_exchange_rejection_result(
+                            decision=decision,
+                            side=side,
+                            price=price,
+                            error_text=error_text,
+                            okx_symbol=okx_symbol,
+                            contract_size=contract_size,
+                            order_quantity=order_quantity,
+                            base_quantity=base_quantity,
+                            okx_order_rules=okx_order_rules,
+                            request_params=params,
+                        )
                 else:
                     raise
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
@@ -1163,6 +1191,19 @@ class OKXExecutor(AbstractExecutor):
                         "error": "OKX 提示当前没有对应方向的可平仓位，可能已被 OKX 止盈/止损、手动平仓或刚刚同步延迟；本轮未重复提交。",
                         "raw_error": error_text,
                     },
+                )
+            if decision.is_entry:
+                return self._entry_exchange_rejection_result(
+                    decision=decision,
+                    side=side,
+                    price=0.0,
+                    error_text=error_text,
+                    okx_symbol=okx_symbol,
+                    contract_size=contract_size,
+                    order_quantity=order_quantity,
+                    base_quantity=base_quantity,
+                    okx_order_rules=okx_order_rules,
+                    request_params=params,
                 )
             raise
         except RateLimitError:
@@ -1495,6 +1536,48 @@ class OKXExecutor(AbstractExecutor):
         if min_contracts <= 0 or contract_size <= 0 or price <= 0:
             return 0.0
         return min_contracts * contract_size * price
+
+    def _entry_exchange_rejection_result(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        error_text: str,
+        okx_symbol: str,
+        contract_size: float,
+        order_quantity: float,
+        base_quantity: float,
+        okx_order_rules: dict[str, Any],
+        request_params: dict[str, Any],
+    ) -> ExecutionResult:
+        """Return a structured rejected result when OKX still rejects an entry."""
+
+        return ExecutionResult(
+            order_id="okx_rejected",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=0.0,
+            price=price,
+            status=OrderStatus.REJECTED,
+            raw_response={
+                "error": (
+                    "OKX 拒绝了开仓订单；系统已记录提交前规则快照、计划张数、"
+                    "最终张数和交易所返回原因，供执行详情定位。"
+                ),
+                "raw_error": error_text,
+                "execution_blocker": "okx_exchange_rejection",
+                "system_pre_submit_rejection": False,
+                "okx_rejection": True,
+                "okx_symbol": okx_symbol,
+                "contract_size": contract_size,
+                "planned_order_contracts": order_quantity,
+                "planned_base_quantity": base_quantity,
+                "okx_order_rules": okx_order_rules,
+                "request_params": request_params,
+            },
+        )
 
     def _capped_quantity_from_position_limit_error(
         self,
@@ -2237,10 +2320,9 @@ class OKXExecutor(AbstractExecutor):
         }
 
     async def get_balance(self, asset: str = "USDT") -> float:
-        ccxt = await self._get_ccxt()
         try:
-            balance_data = await self._with_retry(ccxt.fetch_balance)
-            return float(balance_data.get(asset, {}).get("free", 0))
+            snapshot = await self.get_balance_snapshot(asset)
+            return float(snapshot.get("free") or 0.0)
         except Exception as e:
             logger.error("fetch balance failed", error=safe_error_text(e))
             return 0.0
@@ -2248,7 +2330,9 @@ class OKXExecutor(AbstractExecutor):
     async def get_balance_snapshot(self, asset: str = "USDT") -> dict[str, Any]:
         ccxt = await self._get_ccxt()
         try:
-            balance_data = await self._with_retry(ccxt.fetch_balance)
+            balance_data = await self._fetch_balance_without_markets(ccxt, asset)
+            if asset not in balance_data and isinstance(balance_data.get("data"), list):
+                balance_data = self._balance_response_to_ccxt_shape(balance_data, asset)
             asset_data = balance_data.get(asset, {}) or {}
             raw_detail = {}
             info = balance_data.get("info") or {}
@@ -2285,7 +2369,81 @@ class OKXExecutor(AbstractExecutor):
             logger.error("fetch balance snapshot failed", error=error_text)
             return {"free": 0.0, "used": 0.0, "total": 0.0, "error": error_text}
 
+    async def _fetch_balance_without_markets(
+        self,
+        ccxt: Any,
+        asset: str,
+    ) -> dict[str, Any]:
+        """Fetch account balance without loading OKX instrument metadata."""
+
+        if hasattr(ccxt, "privateGetAccountBalance"):
+            return await self._with_retry(
+                ccxt.privateGetAccountBalance,
+                {"ccy": asset},
+            )
+        if hasattr(ccxt, "fetch_balance"):
+            markets_before = getattr(ccxt, "markets", None)
+            if markets_before is None:
+                try:
+                    ccxt.markets = {}
+                except Exception:
+                    pass
+            try:
+                return await self._with_retry(ccxt.fetch_balance)
+            finally:
+                if markets_before is None:
+                    try:
+                        ccxt.markets = markets_before
+                    except Exception:
+                        pass
+        raise ExchangeAPIError("OKX balance API is unavailable on this client")
+
+    def _balance_response_to_ccxt_shape(
+        self,
+        response: dict[str, Any],
+        asset: str,
+    ) -> dict[str, Any]:
+        """Convert native OKX account balance response without loading markets."""
+
+        raw_detail: dict[str, Any] = {}
+        data = response.get("data") if isinstance(response, dict) else None
+        for item in data or []:
+            if not isinstance(item, dict):
+                continue
+            for detail in item.get("details", []) or []:
+                if isinstance(detail, dict) and detail.get("ccy") == asset:
+                    raw_detail = detail
+                    break
+            if raw_detail:
+                break
+
+        def raw_float(key: str, fallback: float = 0.0) -> float:
+            try:
+                return float(raw_detail.get(key) or fallback)
+            except Exception:
+                return fallback
+
+        cash = raw_float("cashBal")
+        equity = raw_float("eq", cash)
+        used = raw_float("frozenBal")
+        available = (
+            raw_float("availBal")
+            or raw_float("availEq")
+            or raw_float("disEq")
+            or max(equity - used, 0.0)
+        )
+        total = equity if equity > 0 else cash
+        return {
+            asset: {
+                "free": available,
+                "used": used,
+                "total": total,
+            },
+            "info": {"data": data or []},
+        }
+
     async def get_positions(self, symbol: str | None = None) -> list[dict]:
+        await self._ensure_markets_loaded()
         ccxt = await self._get_ccxt()
         try:
             symbols = [self._to_swap_symbol(symbol)] if symbol else None
@@ -2297,6 +2455,7 @@ class OKXExecutor(AbstractExecutor):
 
     async def get_positions_strict(self, symbol: str | None = None) -> list[dict]:
         """Fetch positions and let errors propagate so reconciliation can trust an empty result."""
+        await self._ensure_markets_loaded()
         ccxt = await self._get_ccxt()
         symbols = [self._to_swap_symbol(symbol)] if symbol else None
         return await self._with_retry(ccxt.fetch_positions, symbols)
@@ -2315,6 +2474,7 @@ class OKXExecutor(AbstractExecutor):
 
     async def get_open_orders_strict(self, symbol: str | None = None) -> list[dict]:
         """Fetch open orders and let errors propagate for reconciliation safety."""
+        await self._ensure_markets_loaded()
         ccxt = await self._get_ccxt()
         return await self._with_retry(
             ccxt.fetch_open_orders,
@@ -2323,6 +2483,7 @@ class OKXExecutor(AbstractExecutor):
 
     async def get_position_protection_orders(self, symbol: str | None = None) -> list[dict]:
         """Fetch active OKX TP/SL algo orders that protect open positions."""
+        await self._ensure_markets_loaded()
         ccxt = await self._get_ccxt()
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None
         protection_orders: list[dict] = []
@@ -2409,4 +2570,5 @@ class OKXExecutor(AbstractExecutor):
             await self._exchange.close()
             self._exchange = None
             self._connected = False
+            self._markets_loaded = False
         logger.info("OKX executor shut down")

@@ -19,7 +19,7 @@ DRAWDOWN_DEFENSIVE_RISK_USDT = 220.0
 DRAWDOWN_LIGHT_RISK_USDT = 30.0
 DRAWDOWN_HARD_PAUSE_USDT = 80.0
 PORTFOLIO_MIN_POSITION_GROUPS_TARGET = 10
-PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN = 36
+PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN = 6
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -232,10 +232,11 @@ class EntryStrategyModeContextPolicy:
                 "gap": roster_gap,
                 "underfilled": roster_fill_active,
                 "market_symbol_min": self.roster_fill_market_symbol_min,
+                "market_symbol_min_is_batch_size": False,
                 "policy": (
-                    "When grouped positions are below target, increase scanning and small-size "
-                    "execution bias for independent positive-expectancy opportunities; restore "
-                    "ordinary thresholds once the target is reached."
+                    "Portfolio underfill may increase the candidate pool only when position "
+                    "risk is low. The trading loop still applies position-first dynamic "
+                    "market batching before spending LLM capacity."
                 ),
             },
             "risk_mode": risk_mode,

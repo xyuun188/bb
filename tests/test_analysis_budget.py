@@ -61,7 +61,7 @@ def _position(symbol: str, side: str = "long", model_name: str = "ensemble_trade
     return {"symbol": symbol, "side": side, "model_name": model_name, "is_open": True}
 
 
-def test_analysis_budget_raises_market_budget_when_roster_is_underfilled() -> None:
+def test_analysis_budget_keeps_market_budget_small_when_positions_exist() -> None:
     policy, scans_seen = _policy(
         config=AnalysisBudgetConfig(target_position_groups=3, roster_fill_market_symbol_min=7)
     )
@@ -74,10 +74,39 @@ def test_analysis_budget_raises_market_budget_when_roster_is_underfilled() -> No
         run_market_analysis=True,
     )
 
-    assert result["risk_level"] == "none"
-    assert result["market_symbol_limit"] == 7
+    assert result["risk_level"] == "low"
+    assert result["market_symbol_limit"] == 2
+    assert result["configured_market_symbol_limit"] == 2
+    assert result["market_limit_policy"] == "position_first_low_risk_underfilled"
+    assert result["market_symbol_limit_is_entry_gate"] is False
+    assert result["position_first_scheduling"] is True
     assert result["roster_underfilled"] is True
-    assert "roster-fill" in result["reason"]
+    assert "持仓复盘由独立 position loop 并行负责" in result["reason"]
+    assert scans_seen == []
+
+
+def test_analysis_budget_without_positions_uses_dynamic_market_cap_not_full_pool() -> None:
+    policy, scans_seen = _policy(
+        config=AnalysisBudgetConfig(
+            target_position_groups=3,
+            roster_fill_market_symbol_min=36,
+            market_no_position_cap=6,
+        )
+    )
+
+    result = policy.context(
+        [],
+        {},
+        base_market_limit=20,
+        run_position_analysis=False,
+        run_market_analysis=True,
+    )
+
+    assert result["risk_level"] == "none"
+    assert result["market_symbol_limit"] == 6
+    assert result["configured_market_symbol_limit"] == 20
+    assert result["market_limit_policy"] == "no_position_dynamic_market_budget"
+    assert result["market_symbol_limit_is_entry_gate"] is False
     assert scans_seen == []
 
 
@@ -99,7 +128,8 @@ def test_analysis_budget_high_risk_position_protects_position_review_capacity() 
 
     assert result["risk_level"] == "high"
     assert result["position_max_groups"] == 8
-    assert result["market_symbol_limit"] == 2
+    assert result["market_symbol_limit"] == 1
+    assert result["market_limit_policy"] == "position_first_high_risk"
     assert result["forced_exit_groups"] == 2
     assert result["high_exit_groups"] == 1
     assert len(scans_seen[0]) == 3
@@ -123,7 +153,8 @@ def test_analysis_budget_medium_risk_keeps_limited_entry_exploration() -> None:
 
     assert result["risk_level"] == "medium"
     assert result["position_max_groups"] == 6
-    assert result["market_symbol_limit"] == 4
+    assert result["market_symbol_limit"] == 2
+    assert result["market_limit_policy"] == "position_first_medium_risk"
     assert result["priority_groups"] == 3
 
 
@@ -194,6 +225,7 @@ def test_analysis_budget_uses_strategy_learning_runtime_targets() -> None:
                     "position_high_risk_max_groups": 11,
                     "position_urgent_exit_max_groups": 12,
                     "roster_fill_market_symbol_min": 18,
+                    "market_low_risk_open_position_cap": 3,
                 },
             }
         },
@@ -210,7 +242,9 @@ def test_analysis_budget_uses_strategy_learning_runtime_targets() -> None:
     assert result["budget_source"] == "strategy_learning"
     assert result["target_position_groups"] == 5
     assert result["position_max_groups"] == 9
-    assert result["market_symbol_limit"] == 18
+    assert result["market_symbol_limit"] == 2
+    assert result["configured_market_symbol_limit"] == 2
+    assert result["market_limit_policy"] == "position_first_low_risk_underfilled"
     assert scans_seen
 
 

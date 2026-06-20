@@ -118,16 +118,25 @@ class EntryLossCooldownPolicy:
             for name in ("ml_aligned", "local_profit_aligned", "timeseries_aligned")
             if bool(opportunity.get(name))
         ]
-        source_support = (
+        strong_server_support = bool(
             server_expected >= self.params.override_min_server_expected
             and server_loss_probability <= self.params.override_max_loss_probability
-        ) or (
+        )
+        source_support = strong_server_support or (
             len(aligned_sources) >= 2
             and server_loss_probability <= self.params.override_max_loss_probability
         )
         if fresh_loss:
-            source_support = (
-                source_support
+            fresh_min_server_expected = max(
+                self.params.override_min_server_expected,
+                self.params.fresh_loss_reentry_min_expected_net * 0.75,
+            )
+            strong_server_support = bool(
+                server_expected >= fresh_min_server_expected
+                and server_loss_probability <= self.params.fresh_loss_reentry_max_loss_probability
+            )
+            source_support = bool(
+                strong_server_support
                 and len(aligned_sources) >= self.params.fresh_loss_reentry_min_aligned_sources
             )
         checks = {
@@ -178,6 +187,10 @@ class EntryLossCooldownPolicy:
             "server_profit_loss_probability": round(server_loss_probability, 6),
             "tail_risk_score": round(tail_risk, 6),
             "aligned_sources": aligned_sources,
+            "fresh_loss_min_aligned_sources": (
+                self.params.fresh_loss_reentry_min_aligned_sources if fresh_loss else None
+            ),
+            "strong_server_support": strong_server_support,
             "profile_pnl": round(_safe_float(profile.get("pnl"), 0.0), 6),
             "profile_today_pnl": round(_safe_float(profile.get("today_pnl"), 0.0), 6),
             "profile_loss": round(_safe_float(profile.get("loss"), 0.0), 6),

@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ai_service_spec import (  # noqa: E402
     DEEPSEEK_R1_14B_RISK_SERVICE,
     QWEN3_14B_TRADE_SERVICE,
@@ -26,9 +27,13 @@ from core.remote_ai_service_spec import (  # noqa: E402
 )
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
-from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 
 DUAL_14B_SPECS = (QWEN3_14B_TRADE_SERVICE, DEEPSEEK_R1_14B_RISK_SERVICE)
+
+
+def _stop_dual_14b_services_command() -> str:
+    services = " ".join(spec.service_name for spec in DUAL_14B_SPECS)
+    return f"sudo systemctl stop {services} 2>/dev/null || true"
 
 
 def _print_plan() -> None:
@@ -87,6 +92,7 @@ def main(argv: list[str] | None = None) -> None:
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         safe_print(run_remote_text(ssh, qwen3_main_cleanup_command()))
+        safe_print(run_remote_text(ssh, _stop_dual_14b_services_command()))
         for spec in DUAL_14B_SPECS:
             _deploy_one(ssh, spec)
     finally:

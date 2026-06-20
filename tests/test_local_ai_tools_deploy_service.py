@@ -21,6 +21,13 @@ def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None
     assert "Bearer {LOCAL_AI_TOOLS_API_KEY}" in SERVICE_CODE
 
 
+def test_local_ai_tools_training_costs_are_runtime_configurable() -> None:
+    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" in SERVICE_CODE
+    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" in SERVICE_CODE
+    assert "ROUND_TRIP_COST_PCT = 0.12" not in SERVICE_CODE
+    assert "TAIL_LOSS_THRESHOLD_PCT = 0.18" not in SERVICE_CODE
+
+
 def test_local_ai_tools_generated_service_disables_local_high_risk_review() -> None:
     assert "openai-compatible-risk-review" not in SERVICE_CODE
     assert "SERVED_REVIEW_MODEL" not in SERVICE_CODE
@@ -36,7 +43,7 @@ def test_local_ai_tools_health_returns_service_status_without_trained_bundle() -
     assert (
         'if bundle and isinstance(bundle.get("metadata"), dict):\n'
         '        metadata = bundle["metadata"]\n'
-        '    return {\n'
+        "    return {\n"
         '        "ok": True,'
     ) in SERVICE_CODE
     assert '"trained_models_available": bool(bundle)' in SERVICE_CODE
@@ -77,6 +84,14 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert '"last_trained_completed_trade_sample_count": int(' in SERVICE_CODE
 
 
+def test_local_ai_tools_generated_service_uses_quality_weights() -> None:
+    assert '"sample_weight": max(0.0, min(f(sample, "sample_weight", 1.0), 1.0))' in SERVICE_CODE
+    assert "model__sample_weight=sample_weights" in SERVICE_CODE
+    assert '"quality_report": req.quality_report or {}' in SERVICE_CODE
+    assert "trainable_trade_samples = [" in SERVICE_CODE
+    assert 'if not bool(sample.get("exclude_from_training"))' in SERVICE_CODE
+
+
 def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
     source = (ROOT / "scripts" / "deploy_local_ai_tools_service.py").read_text(encoding="utf-8")
 
@@ -84,6 +99,9 @@ def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
     assert "chmod 600 /data/trade_ai/local_ai_tools.env" in source
     assert "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true" in source
     assert "LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002" in source
+    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT=0.12" in source
+    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT=0.18" in source
+    assert "Authorization: Bearer ${LOCAL_AI_TOOLS_API_KEY}" in source
     assert "LimitNOFILE=65535" in source
     assert "--timeout-keep-alive 5" in source
 

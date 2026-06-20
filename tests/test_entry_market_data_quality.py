@@ -40,13 +40,25 @@ def test_market_value_reader_supports_dicts_and_objects():
 
 
 @pytest.mark.parametrize(
-    ("snapshot", "expected"),
+    ("snapshot", "expected", "code"),
     [
-        ({"current_price": 0, "close": 0, "bid": 0, "ask": 0}, "没有有效价格"),
-        (_valid_snapshot(close=130.0), "行情价格源分裂"),
-        (_valid_snapshot(current_price=80.0, close=0.0, bid=0.0, ask=0.0), "24小时区间"),
-        (_valid_snapshot(bid=100.0, ask=104.0), "盘口价差过大"),
-        (_valid_snapshot(orderbook_bid_depth=0.0, orderbook_imbalance=1.0), "盘口深度异常"),
+        (
+            {"current_price": 0, "close": 0, "bid": 0, "ask": 0},
+            "没有有效价格",
+            "missing_valid_price",
+        ),
+        (_valid_snapshot(close=130.0), "行情价格源分裂", "price_source_split"),
+        (
+            _valid_snapshot(current_price=80.0, close=0.0, bid=0.0, ask=0.0),
+            "24小时区间",
+            "price_outside_24h_range",
+        ),
+        (_valid_snapshot(bid=100.0, ask=104.0), "盘口价差过大", "spread_too_wide"),
+        (
+            _valid_snapshot(orderbook_bid_depth=0.0, orderbook_imbalance=1.0),
+            "盘口深度异常",
+            "orderbook_depth_invalid",
+        ),
         (
             _valid_snapshot(
                 returns_1=0.0,
@@ -56,19 +68,25 @@ def test_market_value_reader_supports_dicts_and_objects():
                 change_24h_pct=1.0,
             ),
             "短周期行情特征疑似缺失",
+            "short_cycle_features_missing",
         ),
         (
             _valid_snapshot(abnormal_wick_count_72h=1, abnormal_wick_max_pct=88.0),
             "异常插针",
+            "abnormal_wick_entry_block",
         ),
     ],
 )
-def test_entry_market_data_quality_policy_blocks_unusable_market_data(snapshot, expected):
-    reason = EntryMarketDataQualityPolicy().reason(snapshot, stage_label="测试阶段")
+def test_entry_market_data_quality_policy_blocks_unusable_market_data(snapshot, expected, code):
+    policy = EntryMarketDataQualityPolicy()
+    issue = policy.issue(snapshot, stage_label="测试阶段")
 
-    assert reason is not None
-    assert "测试阶段" in reason
-    assert expected in reason
+    assert issue is not None
+    assert issue.code == code
+    assert issue.as_dict()["exclude_from_training"] is True
+    assert "测试阶段" in issue.reason
+    assert expected in issue.reason
+    assert policy.reason(snapshot, stage_label="测试阶段") == issue.reason
 
 
 def test_entry_market_data_quality_policy_allows_consistent_market_data():
@@ -80,5 +98,8 @@ def test_entry_market_data_quality_policy_handles_reader_failures():
         raise AttributeError("bad payload")
 
     policy = EntryMarketDataQualityPolicy(market_value_reader=broken_reader)
+    issue = policy.issue({}, stage_label="复核")
 
-    assert "行情数据异常" in (policy.reason({}, stage_label="复核") or "")
+    assert issue is not None
+    assert issue.code == "market_payload_invalid"
+    assert "行情数据异常" in issue.reason

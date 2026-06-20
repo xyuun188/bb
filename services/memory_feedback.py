@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from services.trading_params import DEFAULT_TRADING_PARAMS
+
 SIDES = ("long", "short")
+ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
 POSITIVE_MEMORY_TYPES = {
     "profit_pattern",
     "shadow_good_signal",
@@ -139,10 +142,14 @@ class MemoryFeedbackPolicy:
             max_probe_size_pct = 0.0
         elif allow_probe:
             action_bias = "prefer_small_probe_when_current_ev_positive"
-            max_probe_size_pct = 0.025 if missed >= 6 and score_adjustment >= 0.08 else 0.015
+            max_probe_size_pct = (
+                ENTRY_RISK_SIZING_PARAMS.memory_feedback_strong_probe_size_pct
+                if missed >= 6 and score_adjustment >= 0.08
+                else ENTRY_RISK_SIZING_PARAMS.memory_feedback_normal_probe_size_pct
+            )
         elif score_adjustment > 0.02:
             action_bias = "slightly_improve_entry_confidence"
-            max_probe_size_pct = 0.012
+            max_probe_size_pct = ENTRY_RISK_SIZING_PARAMS.memory_feedback_light_probe_size_pct
         else:
             action_bias = "neutral"
             max_probe_size_pct = 0.0

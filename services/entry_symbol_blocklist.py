@@ -10,13 +10,14 @@ from typing import Any
 import structlog
 
 from services.okx_error_classifier import is_okx_temporary_service_error
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_text
 
 NormalizeSymbol = Callable[[str | None], str | None]
 
 UNTRADABLE_SYMBOL_BLOCK_HOURS = 24.0
 TRANSIENT_ENTRY_BLOCK_MINUTES = 20.0
-PRICE_GUARD_ENTRY_BLOCK_MINUTES = 8.0
+PRICE_GUARD_ENTRY_BLOCK_MINUTES = DEFAULT_TRADING_PARAMS.entry_price_guard.entry_block_minutes
 
 logger = structlog.get_logger(__name__)
 

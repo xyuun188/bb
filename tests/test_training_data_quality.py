@@ -82,7 +82,14 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
         shadow_samples=[_shadow_sample(), _shadow_sample(features={})],
         trade_samples=[_trade_sample(), _trade_sample(source="manual")],
         sequence_samples=[],
-        text_sentiment_samples=[],
+        text_sentiment_samples=[
+            {
+                "source": "news",
+                "platform": "scrapling:ethereum_blog",
+                "text": "Ethereum upgrade launch with ecosystem impact",
+                "sentiment_score": 0.2,
+            }
+        ],
     )
 
     assert len(payload["shadow_samples"]) == 1
@@ -90,5 +97,35 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     report = payload["quality_report"]
     assert report["data_quality_version"] == DATA_QUALITY_VERSION
     assert report["totals"]["excluded"] == 2
+    assert report["totals"]["effective_weight"] > 0
+    assert report["totals"]["effective_weight_ratio"] > 0
     assert report["by_kind"]["shadow"]["total"] == 2
     assert report["by_kind"]["trade"]["total"] == 2
+    assert report["by_kind"]["shadow"]["actions"]["long"] == 2
+    assert report["by_kind"]["shadow"]["trainable_actions"]["long"] == 1
+    assert report["by_kind"]["trade"]["sources"]["closed_position"] == 1
+    assert report["by_kind"]["trade"]["trainable_sources"]["closed_position"] == 1
+    assert report["by_kind"]["text_sentiment"]["sources"]["scrapling:ethereum_blog"] == 1
+    assert report["by_kind"]["text_sentiment"]["trainable_sources"]["scrapling:ethereum_blog"] == 1
+    assert report["policy"]["hold_observation_penalty"] == 0.55
+
+
+def test_shadow_market_data_quality_issue_is_excluded_from_training() -> None:
+    assessment = assess_shadow_sample(
+        _shadow_sample(
+            features={
+                "symbol": "BTC/USDT",
+                "current_price": 100.0,
+                "spread_pct": 0.03,
+                "market_data_quality": {
+                    "code": "price_source_split",
+                    "exclude_from_training": True,
+                    "training_quality_reason": "market_data_quality:price_source_split",
+                },
+            }
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert assessment.weight == 0.0
+    assert "market_data_quality:price_source_split" in assessment.reasons

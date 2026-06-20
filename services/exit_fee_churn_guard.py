@@ -435,6 +435,14 @@ class ExitFeeChurnGuardPolicy:
                     (invalidation.get("key_break") and invalidation.get("momentum_bad"))
                     or (invalidation.get("trend_reversal") and invalidation.get("momentum_bad"))
                 )
+                early_hard_risk_confirmed = bool(
+                    hit_stop
+                    or hit_profit
+                    or forced_exit
+                    or severe_invalidation
+                    or protective_downside_exit_intent
+                    or invalidation_confirmed
+                )
 
                 if (
                     age_minutes < MIN_DISCRETIONARY_HOLD_MINUTES
@@ -456,6 +464,7 @@ class ExitFeeChurnGuardPolicy:
                         and abs(notional) > 0
                         and abs(net_now) >= abs(notional) * FAST_RISK_REDUCE_LOSS_PCT
                         and confidence >= DISCRETIONARY_CLOSE_CONFIDENCE
+                        and early_hard_risk_confirmed
                     )
                     if not early_strong_profit and not early_deep_loss:
                         return (

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 AccountBalanceProvider = Callable[[str], Awaitable[float]]
 FalsePositiveChecker = Callable[[DecisionOutput, str | None, Any], Awaitable[bool]]
@@ -33,7 +34,9 @@ UNTRUSTED_EXPERT_TIMING_STATUSES = {
     "independent_provider_failed",
 }
 BALANCED_PROBE_EXPERT_INTEGRITY_MODE = "balanced_probe_allow_one_non_core_missing"
-BALANCED_PROBE_MAX_POSITION_SIZE_PCT = 0.018
+BALANCED_PROBE_MAX_POSITION_SIZE_PCT = (
+    DEFAULT_TRADING_PARAMS.entry_risk_sizing.balanced_probe_max_position_size_pct
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +127,7 @@ def expert_analysis_entry_block_reason(
         status = str(item.get("status") or "").lower()
         provider = str(item.get("provider_model") or "").lower()
         fallback_flag = bool(
-            item.get("batch_expert_fallback")
-            or item.get("fallback")
-            or item.get("local_fallback")
+            item.get("batch_expert_fallback") or item.get("fallback") or item.get("local_fallback")
         )
         if status == "completed" and provider != "local_fast_prefilter" and not fallback_flag:
             trusted_by_name.add(name)

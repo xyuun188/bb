@@ -264,6 +264,9 @@ class EntryCandidateEvidencePolicy:
         return {
             "enabled": bool(feedback.get("enabled")),
             "preferred_side_by_memory": feedback.get("preferred_side_by_memory"),
+            "vector_memory": EntryCandidateEvidencePolicy._compact_vector_memory(
+                _safe_dict(feedback.get("vector_memory"))
+            ),
             "decision_habit": EntryCandidateEvidencePolicy._compact_decision_habit(
                 _safe_dict(feedback.get("decision_habit"))
             ),
@@ -274,6 +277,27 @@ class EntryCandidateEvidencePolicy:
                 _safe_dict(by_side.get("short"))
             ),
             "policy": str(feedback.get("policy") or "")[:180],
+        }
+
+    @staticmethod
+    def _compact_vector_memory(item: dict[str, Any]) -> dict[str, Any]:
+        if not item:
+            return {}
+        return {
+            "enabled": bool(item.get("enabled")),
+            "status": str(item.get("status") or ""),
+            "matched_count": _safe_int(item.get("matched_count"), 0),
+            "policy": str(item.get("policy") or "")[:120],
+            "hits": [
+                {
+                    "score": round(_safe_float(hit.get("score"), 0.0), 6),
+                    "action": str(hit.get("action") or ""),
+                    "outcome": str(hit.get("outcome") or ""),
+                    "pnl_pct": hit.get("pnl_pct"),
+                }
+                for hit in (item.get("hits") if isinstance(item.get("hits"), list) else [])[:3]
+                if isinstance(hit, dict)
+            ],
         }
 
     @staticmethod

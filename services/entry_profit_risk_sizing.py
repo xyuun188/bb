@@ -17,6 +17,7 @@ from config.settings import settings
 from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_sizing import apply_evidence_sizing_policy
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 EntryProfitRiskSizingEvaluator = Callable[
     [DecisionOutput, str, list[dict[str, Any]]],
@@ -24,44 +25,99 @@ EntryProfitRiskSizingEvaluator = Callable[
 ]
 EntryBalanceProvider = Callable[[str, DecisionOutput | None], Awaitable[float | None]]
 
-ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = 1.50
-ENTRY_WEAK_HISTORY_MAX_SIZE = 0.025
-ENTRY_WEAK_HISTORY_MAX_LEVERAGE = 5.0
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE = 0.045
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_LEVERAGE = 8.0
-ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE = 0.02
-ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE = 4.0
-ENTRY_LOW_QUALITY_MAX_SIZE = 0.018
-ENTRY_LOW_QUALITY_MAX_LEVERAGE = 3.0
-ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER = 0.55
-ENTRY_HIGH_QUALITY_MIN_NOTIONAL_BALANCE_RATIO = 0.10
-ENTRY_NORMAL_MIN_NOTIONAL_BALANCE_RATIO = 0.06
-ENTRY_NOTIONAL_FLOOR_MAX_SIZE_PCT = 0.12
-ENTRY_HIGH_PROFIT_MIN_NOTIONAL_BALANCE_RATIO = 0.75
-ENTRY_HIGH_PROFIT_MIN_LEVERAGE = 8.0
-ENTRY_HIGH_PROFIT_ELITE_MIN_LEVERAGE = 10.0
-ENTRY_GOOD_PROBE_MIN_NOTIONAL_BALANCE_RATIO = 0.25
-ENTRY_WINNER_ADD_MIN_NOTIONAL_BALANCE_RATIO = 0.35
-ENTRY_STRONG_PROBE_MIN_NOTIONAL_BALANCE_RATIO = 0.45
-ENTRY_ELITE_MIN_NOTIONAL_BALANCE_RATIO = 0.60
-ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK = 0.82
-ENTRY_MEANINGFUL_SIZE_MIN_PROFIT_USDT = 0.75
-ENTRY_MEANINGFUL_SIZE_MIN_PROFIT_RATIO = 0.003
-PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = 0.66
-PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = 0.20
-PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = 0.25
-PORTFOLIO_ROSTER_FILL_NOTIONAL_BALANCE_RATIO = 0.18
-ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT = 1.50
-ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE = 0.65
-ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = 1.05
-ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = 1.35
-ENTRY_BALANCED_PROBE_MAX_LOSS_USDT = 5.0
-ENTRY_STRONG_PROBE_MAX_LOSS_USDT = 9.0
-ENTRY_QUALITY_RISK_BASE_CAP_PCT = 0.008
-ENTRY_QUALITY_RISK_MAX_CAP_PCT = 0.024
-ENTRY_QUALITY_RISK_ELITE_CAP_PCT = 0.030
-ENTRY_RECOVERY_PROBE_BASE_CAP_PCT = 0.012
-ENTRY_RECOVERY_PROBE_MAX_CAP_PCT = 0.060
+_ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
+ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = _ENTRY_RISK_SIZING_PARAMS.min_net_profit_quality_ratio
+ENTRY_WEAK_HISTORY_MAX_SIZE = _ENTRY_RISK_SIZING_PARAMS.weak_history_max_size
+ENTRY_WEAK_HISTORY_MAX_LEVERAGE = _ENTRY_RISK_SIZING_PARAMS.weak_history_max_leverage
+ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE = (
+    _ENTRY_RISK_SIZING_PARAMS.weak_history_strong_aligned_max_size
+)
+ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_LEVERAGE = (
+    _ENTRY_RISK_SIZING_PARAMS.weak_history_strong_aligned_max_leverage
+)
+ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE = _ENTRY_RISK_SIZING_PARAMS.negative_local_expected_max_size
+ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE = (
+    _ENTRY_RISK_SIZING_PARAMS.negative_local_expected_max_leverage
+)
+ENTRY_LOW_QUALITY_MAX_SIZE = _ENTRY_RISK_SIZING_PARAMS.low_quality_max_size
+ENTRY_LOW_QUALITY_MAX_LEVERAGE = _ENTRY_RISK_SIZING_PARAMS.low_quality_max_leverage
+ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER = _ENTRY_RISK_SIZING_PARAMS.symbol_loser_size_multiplier
+ENTRY_HIGH_QUALITY_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.high_quality_min_notional_balance_ratio
+)
+ENTRY_NORMAL_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.normal_min_notional_balance_ratio
+)
+ENTRY_NOTIONAL_FLOOR_MAX_SIZE_PCT = _ENTRY_RISK_SIZING_PARAMS.notional_floor_max_size_pct
+ENTRY_HIGH_PROFIT_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.high_profit_min_notional_balance_ratio
+)
+ENTRY_HIGH_PROFIT_MIN_LEVERAGE = _ENTRY_RISK_SIZING_PARAMS.high_profit_min_leverage
+ENTRY_HIGH_PROFIT_ELITE_MIN_LEVERAGE = _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_min_leverage
+ENTRY_GOOD_PROBE_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.good_probe_min_notional_balance_ratio
+)
+ENTRY_WINNER_ADD_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.winner_add_min_notional_balance_ratio
+)
+ENTRY_STRONG_PROBE_MIN_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.strong_probe_min_notional_balance_ratio
+)
+ENTRY_ELITE_MIN_NOTIONAL_BALANCE_RATIO = _ENTRY_RISK_SIZING_PARAMS.elite_min_notional_balance_ratio
+ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK = _ENTRY_RISK_SIZING_PARAMS.meaningful_size_max_tail_risk
+ENTRY_MEANINGFUL_SIZE_MIN_PROFIT_USDT = _ENTRY_RISK_SIZING_PARAMS.meaningful_size_min_profit_usdt
+ENTRY_MEANINGFUL_SIZE_MIN_PROFIT_RATIO = _ENTRY_RISK_SIZING_PARAMS.meaningful_size_min_profit_ratio
+PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = (
+    _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_max_loss_probability
+)
+PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_min_net_pct
+PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_min_profit_quality_ratio
+)
+PORTFOLIO_ROSTER_FILL_NOTIONAL_BALANCE_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_notional_balance_ratio
+)
+ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT = (
+    _ENTRY_RISK_SIZING_PARAMS.pnl_structure_min_expected_profit_usdt
+)
+ENTRY_PNL_STRUCTURE_LOW_QUALITY_MAX_LOSS_MULTIPLE = (
+    _ENTRY_RISK_SIZING_PARAMS.pnl_structure_low_quality_max_loss_multiple
+)
+ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE = (
+    _ENTRY_RISK_SIZING_PARAMS.pnl_structure_normal_max_loss_multiple
+)
+ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE = (
+    _ENTRY_RISK_SIZING_PARAMS.pnl_structure_high_quality_max_loss_multiple
+)
+ENTRY_BALANCED_PROBE_MAX_LOSS_USDT = _ENTRY_RISK_SIZING_PARAMS.balanced_probe_max_loss_usdt
+ENTRY_STRONG_PROBE_MAX_LOSS_USDT = _ENTRY_RISK_SIZING_PARAMS.strong_probe_max_loss_usdt
+ENTRY_QUALITY_RISK_BASE_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.quality_risk_base_cap_pct
+ENTRY_QUALITY_RISK_MAX_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.quality_risk_max_cap_pct
+ENTRY_QUALITY_RISK_ELITE_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.quality_risk_elite_cap_pct
+ENTRY_RECOVERY_PROBE_BASE_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.recovery_probe_base_cap_pct
+ENTRY_RECOVERY_PROBE_MAX_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.recovery_probe_max_cap_pct
+ENTRY_STRATEGY_SIZING_MIN_MULTIPLIER = _ENTRY_RISK_SIZING_PARAMS.strategy_sizing_min_multiplier
+ENTRY_STRATEGY_SIZING_MAX_MULTIPLIER = _ENTRY_RISK_SIZING_PARAMS.strategy_sizing_max_multiplier
+ENTRY_RELEASE_PROBE_FRACTION_FLOOR = _ENTRY_RISK_SIZING_PARAMS.release_probe_fraction_floor
+ENTRY_RELEASE_PROBE_DEFAULT_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.release_probe_default_cap_pct
+ENTRY_RELEASE_PROBE_MIN_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.release_probe_min_cap_pct
+ENTRY_RELEASE_PROBE_MAX_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.release_probe_max_cap_pct
+ENTRY_RECOVERY_MULTIPLIER_CAP = _ENTRY_RISK_SIZING_PARAMS.recovery_multiplier_cap
+ENTRY_RECOVERY_PROBE_FRACTION_FLOOR = _ENTRY_RISK_SIZING_PARAMS.recovery_probe_fraction_floor
+ENTRY_RECOVERY_PROBE_DEFAULT_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.recovery_probe_default_cap_pct
+ENTRY_RECOVERY_PROBE_MIN_CAP_PCT = _ENTRY_RISK_SIZING_PARAMS.recovery_probe_min_cap_pct
+ENTRY_RECOVERY_PROBE_MAX_LEARNING_CAP_PCT = (
+    _ENTRY_RISK_SIZING_PARAMS.recovery_learning_probe_max_cap_pct
+)
+ENTRY_STRATEGY_PROBE_FRACTION_MAX = _ENTRY_RISK_SIZING_PARAMS.strategy_probe_fraction_max
+ENTRY_STRATEGY_PROBE_CAP_MAX_PCT = _ENTRY_RISK_SIZING_PARAMS.strategy_probe_cap_max_pct
+ENTRY_ADAPTIVE_RECOVERY_MIN_PROFIT_QUALITY = (
+    _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_min_profit_quality
+)
+ENTRY_ADAPTIVE_RECOVERY_MAX_LOSS_PROBABILITY = (
+    _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_max_loss_probability
+)
+ENTRY_ADAPTIVE_RECOVERY_MAX_TAIL_RISK = _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_max_tail_risk
 
 
 def _settings_max_leverage() -> float:
@@ -126,16 +182,25 @@ class EntryProfitRiskSizingPolicy:
                     or "strategy learning release pressure is active"
                 ),
                 "position_size_multiplier": min(
-                    max(cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.10),
-                    1.25,
+                    max(
+                        cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
+                        ENTRY_STRATEGY_SIZING_MIN_MULTIPLIER,
+                    ),
+                    ENTRY_STRATEGY_SIZING_MAX_MULTIPLIER,
                 ),
                 "probe_fraction": max(
                     cls._safe_float(sizing.get("probe_fraction"), 0.0),
-                    0.03,
+                    ENTRY_RELEASE_PROBE_FRACTION_FLOOR,
                 ),
                 "max_probe_size_pct": min(
-                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.012), 0.008),
-                    0.018,
+                    max(
+                        cls._safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RELEASE_PROBE_DEFAULT_CAP_PCT,
+                        ),
+                        ENTRY_RELEASE_PROBE_MIN_CAP_PCT,
+                    ),
+                    ENTRY_RELEASE_PROBE_MAX_CAP_PCT,
                 ),
             }
         if (
@@ -159,12 +224,21 @@ class EntryProfitRiskSizingPolicy:
                 ),
                 "position_size_multiplier": min(
                     cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
-                    0.35,
+                    ENTRY_RECOVERY_MULTIPLIER_CAP,
                 ),
-                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "probe_fraction": max(
+                    cls._safe_float(sizing.get("probe_fraction"), 0.0),
+                    ENTRY_RECOVERY_PROBE_FRACTION_FLOOR,
+                ),
                 "max_probe_size_pct": min(
-                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
-                    0.012,
+                    max(
+                        cls._safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RECOVERY_PROBE_DEFAULT_CAP_PCT,
+                        ),
+                        ENTRY_RECOVERY_PROBE_MIN_CAP_PCT,
+                    ),
+                    ENTRY_RECOVERY_PROBE_MAX_LEARNING_CAP_PCT,
                 ),
             }
         if (
@@ -186,12 +260,22 @@ class EntryProfitRiskSizingPolicy:
                     or "strategy learning recovery probe is active"
                 ),
                 "position_size_multiplier": min(
-                    cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.35
+                    cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
+                    ENTRY_RECOVERY_MULTIPLIER_CAP,
                 ),
-                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "probe_fraction": max(
+                    cls._safe_float(sizing.get("probe_fraction"), 0.0),
+                    ENTRY_RECOVERY_PROBE_FRACTION_FLOOR,
+                ),
                 "max_probe_size_pct": min(
-                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
-                    0.012,
+                    max(
+                        cls._safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RECOVERY_PROBE_DEFAULT_CAP_PCT,
+                        ),
+                        ENTRY_RECOVERY_PROBE_MIN_CAP_PCT,
+                    ),
+                    ENTRY_RECOVERY_PROBE_MAX_LEARNING_CAP_PCT,
                 ),
             }
         runtime = cls._safe_dict(learning.get("runtime"))
@@ -227,12 +311,21 @@ class EntryProfitRiskSizingPolicy:
                 "health_guard_active": True,
                 "position_size_multiplier": min(
                     cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
-                    0.35,
+                    ENTRY_RECOVERY_MULTIPLIER_CAP,
                 ),
-                "probe_fraction": max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.02),
+                "probe_fraction": max(
+                    cls._safe_float(sizing.get("probe_fraction"), 0.0),
+                    ENTRY_RECOVERY_PROBE_FRACTION_FLOOR,
+                ),
                 "max_probe_size_pct": min(
-                    max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.01), 0.006),
-                    0.012,
+                    max(
+                        cls._safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RECOVERY_PROBE_DEFAULT_CAP_PCT,
+                        ),
+                        ENTRY_RECOVERY_PROBE_MIN_CAP_PCT,
+                    ),
+                    ENTRY_RECOVERY_PROBE_MAX_LEARNING_CAP_PCT,
                 ),
                 "reason": str(
                     sizing.get("reason")
@@ -240,15 +333,29 @@ class EntryProfitRiskSizingPolicy:
                 )[:240],
             }
         global_multiplier = min(
-            max(cls._safe_float(sizing.get("position_size_multiplier"), 1.0), 0.10), 1.25
+            max(
+                cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
+                ENTRY_STRATEGY_SIZING_MIN_MULTIPLIER,
+            ),
+            ENTRY_STRATEGY_SIZING_MAX_MULTIPLIER,
         )
         side_overrides = cls._safe_dict(sizing.get("side_overrides"))
         side_row = cls._safe_dict(side_overrides.get(action_side))
         side_multiplier = min(
-            max(cls._safe_float(side_row.get("size_multiplier"), 1.0), 0.10), 1.25
+            max(
+                cls._safe_float(side_row.get("size_multiplier"), 1.0),
+                ENTRY_STRATEGY_SIZING_MIN_MULTIPLIER,
+            ),
+            ENTRY_STRATEGY_SIZING_MAX_MULTIPLIER,
         )
-        probe_fraction = min(max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.0), 0.10)
-        max_probe_size = min(max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0), 0.03)
+        probe_fraction = min(
+            max(cls._safe_float(sizing.get("probe_fraction"), 0.0), 0.0),
+            ENTRY_STRATEGY_PROBE_FRACTION_MAX,
+        )
+        max_probe_size = min(
+            max(cls._safe_float(sizing.get("max_probe_size_pct"), 0.0), 0.0),
+            ENTRY_STRATEGY_PROBE_CAP_MAX_PCT,
+        )
         recovery_probe_active = bool(
             sizing.get("recovery_probe_allowed")
             or sizing.get("health_guard_active")
@@ -337,10 +444,22 @@ class EntryProfitRiskSizingPolicy:
         single-trade budget; weak or uncertain signals stay near the base cap.
         """
 
-        expected_component = min(max(expected_net_return_pct, 0.0) / 100.0 * 0.55, 0.012)
-        quality_component = min(max(profit_quality_ratio - 1.0, 0.0) * 0.004, 0.006)
-        probability_component = min(max(0.45 - loss_probability, 0.0) * 0.020, 0.006)
-        tail_risk_discount = min(max(tail_risk_score - 0.55, 0.0) * 0.012, 0.006)
+        expected_component = min(
+            max(expected_net_return_pct, 0.0) / 100.0 * 0.55,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_quality_expected_component_cap,
+        )
+        quality_component = min(
+            max(profit_quality_ratio - 1.0, 0.0) * 0.004,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_quality_profit_quality_component_cap,
+        )
+        probability_component = min(
+            max(0.45 - loss_probability, 0.0) * 0.020,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_quality_probability_component_cap,
+        )
+        tail_risk_discount = min(
+            max(tail_risk_score - 0.55, 0.0) * 0.012,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_quality_tail_discount_cap,
+        )
         raw_cap = (
             ENTRY_QUALITY_RISK_BASE_CAP_PCT
             + expected_component
@@ -377,19 +496,43 @@ class EntryProfitRiskSizingPolicy:
 
         if (
             expected_net_return_pct <= 0.0
-            or profit_quality_ratio < 0.75
-            or loss_probability > 0.58
-            or tail_risk_score >= 0.90
+            or profit_quality_ratio < ENTRY_ADAPTIVE_RECOVERY_MIN_PROFIT_QUALITY
+            or loss_probability > ENTRY_ADAPTIVE_RECOVERY_MAX_LOSS_PROBABILITY
+            or tail_risk_score >= ENTRY_ADAPTIVE_RECOVERY_MAX_TAIL_RISK
             or aligned_source_count <= 0
         ):
             return 0.0
         score_ratio = score / max(min_score_required, 1e-12)
-        expected_component = min(max(expected_net_return_pct, 0.0) * 0.010, 0.018)
-        quality_component = min(max(profit_quality_ratio - 0.75, 0.0) * 0.016, 0.018)
-        score_component = min(max(score_ratio - 1.0, 0.0) * 0.005, 0.012)
-        alignment_component = min(aligned_source_count * 0.004, 0.012)
-        loss_discount = max(loss_probability - 0.35, 0.0) * 0.018
-        tail_discount = max(tail_risk_score - 0.55, 0.0) * 0.014
+        expected_component = min(
+            max(expected_net_return_pct, 0.0) * 0.010,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_expected_component_cap,
+        )
+        quality_component = min(
+            max(profit_quality_ratio - ENTRY_ADAPTIVE_RECOVERY_MIN_PROFIT_QUALITY, 0.0) * 0.016,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_profit_quality_component_cap,
+        )
+        score_component = min(
+            max(score_ratio - 1.0, 0.0) * 0.005,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_score_component_cap,
+        )
+        alignment_component = min(
+            aligned_source_count * 0.004,
+            _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_alignment_component_cap,
+        )
+        loss_discount = (
+            max(
+                loss_probability - _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_loss_discount_anchor,
+                0.0,
+            )
+            * 0.018
+        )
+        tail_discount = (
+            max(
+                tail_risk_score - _ENTRY_RISK_SIZING_PARAMS.adaptive_recovery_tail_discount_anchor,
+                0.0,
+            )
+            * 0.014
+        )
         cap = (
             ENTRY_RECOVERY_PROBE_BASE_CAP_PCT
             + expected_component
@@ -615,29 +758,46 @@ class EntryProfitRiskSizingPolicy:
             )
             if aligned
         )
+        quality_override_reasons: list[str] = []
         strong_positive_strategy_signal = bool(
             not low_payoff_quality
             and aligned_source_count >= 2
             and score >= max(min_score_required, 1.0)
-            and expected_net >= 1.20
-            and profit_quality_ratio >= 0.85
-            and loss_probability <= 0.42
+            and expected_net >= 0.90
+            and profit_quality_ratio >= 0.80
+            and loss_probability <= 0.46
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
         )
+        if strong_positive_strategy_signal:
+            quality_override_reasons.append("strong_positive_strategy_signal")
+        high_quality_strategy_signal = bool(
+            high_quality_entry
+            and not low_payoff_quality
+            and aligned_source_count >= 2
+            and expected_net >= 0.70
+            and profit_quality_ratio >= 0.75
+            and loss_probability <= 0.48
+            and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
+        if high_quality_strategy_signal:
+            quality_override_reasons.append("high_quality_entry")
         strategy_quality_override = bool(
             strong_positive_strategy_signal
+            or high_quality_strategy_signal
             or (
                 high_quality_entry
                 and not low_payoff_quality
                 and (local_aligned or ml_aligned or timeseries_aligned)
                 and (
-                    expected_net >= 1.20
-                    or profit_quality_ratio >= max(min_profit_quality_ratio, 1.20)
+                    expected_net >= 0.90
+                    or profit_quality_ratio >= max(min_profit_quality_ratio, 1.05)
                 )
-                and loss_probability <= 0.40
+                and loss_probability <= 0.46
                 and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
             )
         )
+        if strategy_quality_override and not quality_override_reasons:
+            quality_override_reasons.append("quality_profit_risk_override")
         recovery_quality_cap_pct = self._adaptive_recovery_probe_cap_pct(
             expected_net_return_pct=expected_net,
             profit_quality_ratio=profit_quality_ratio,
@@ -727,37 +887,48 @@ class EntryProfitRiskSizingPolicy:
         has_existing_winner = bool(existing_winner.get("has_winner"))
         strong_probe_quality = bool(
             strong_probe
-            and expected_net >= 0.75
-            and profit_quality_ratio >= 0.85
-            and loss_probability <= 0.42
-            and (score >= 2.8 or evidence_probe_triggered)
+            and expected_net >= _ENTRY_RISK_SIZING_PARAMS.strong_probe_min_expected_net
+            and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.strong_probe_min_profit_quality
+            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.strong_probe_max_loss_probability
+            and (
+                score >= _ENTRY_RISK_SIZING_PARAMS.strong_probe_min_score_floor
+                or evidence_probe_triggered
+            )
         )
         elite_quality = bool(
-            expected_net >= 1.20
-            and profit_quality_ratio >= 1.20
-            and loss_probability <= 0.38
+            expected_net >= _ENTRY_RISK_SIZING_PARAMS.elite_min_expected_net
+            and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.elite_min_profit_quality
+            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.elite_max_loss_probability
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
             and (local_aligned or ml_aligned or timeseries_aligned)
         )
         high_profit_quality = bool(
-            expected_net >= 1.60
-            and profit_quality_ratio >= 1.45
-            and loss_probability <= 0.34
-            and tail_risk <= 0.72
+            expected_net >= _ENTRY_RISK_SIZING_PARAMS.high_profit_min_expected_net
+            and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.high_profit_min_profit_quality
+            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.high_profit_max_loss_probability
+            and tail_risk <= _ENTRY_RISK_SIZING_PARAMS.high_profit_max_tail_risk
             and score
             >= max(
                 self._safe_float(
                     opportunity.get("min_score_required"), MIN_ENTRY_OPPORTUNITY_SCORE
                 ),
-                1.15,
+                _ENTRY_RISK_SIZING_PARAMS.high_profit_min_score_floor,
             )
             and (local_aligned or ml_aligned or timeseries_aligned)
         )
+        meaningful_quality_override = bool(
+            strategy_quality_override
+            and expected_net >= _ENTRY_RISK_SIZING_PARAMS.quality_override_min_expected_net
+            and profit_quality_ratio
+            >= _ENTRY_RISK_SIZING_PARAMS.quality_override_min_profit_quality
+            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.quality_override_max_loss_probability
+            and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
         good_probe_quality = bool(
             (quant_probe_triggered or evidence_probe_triggered)
-            and expected_net >= 0.35
-            and profit_quality_ratio >= 0.20
-            and loss_probability <= 0.52
+            and expected_net >= _ENTRY_RISK_SIZING_PARAMS.good_probe_min_expected_net
+            and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.good_probe_min_profit_quality
+            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.good_probe_max_loss_probability
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
         )
         roster_fill_quality = bool(
@@ -771,7 +942,13 @@ class EntryProfitRiskSizingPolicy:
         if has_existing_winner and (
             strong_probe_quality
             or elite_quality
-            or (expected_net >= 0.55 and profit_quality_ratio >= 0.55 and loss_probability <= 0.48)
+            or (
+                expected_net >= _ENTRY_RISK_SIZING_PARAMS.same_side_winner_min_expected_net
+                and profit_quality_ratio
+                >= _ENTRY_RISK_SIZING_PARAMS.same_side_winner_min_profit_quality
+                and loss_probability
+                <= _ENTRY_RISK_SIZING_PARAMS.same_side_winner_max_loss_probability
+            )
         ):
             current_profit = self._safe_float(existing_winner.get("unrealized_pnl"), 0.0)
             profit_ratio = self._safe_float(existing_winner.get("pnl_ratio"), 0.0)
@@ -802,9 +979,11 @@ class EntryProfitRiskSizingPolicy:
             )
             target_leverage_floor = (
                 ENTRY_HIGH_PROFIT_ELITE_MIN_LEVERAGE
-                if expected_net >= 2.20
-                and profit_quality_ratio >= 1.80
-                and loss_probability <= 0.30
+                if expected_net >= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_expected_net
+                and profit_quality_ratio
+                >= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_profit_quality
+                and loss_probability
+                <= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_max_loss_probability
                 else ENTRY_HIGH_PROFIT_MIN_LEVERAGE
             )
             if leverage < target_leverage_floor:
@@ -830,6 +1009,20 @@ class EntryProfitRiskSizingPolicy:
             meaningful_size_reason = (
                 "普通量化探针质量达标，不再只做极小验证仓，抬到可产生有效收益的基础仓位。"
             )
+        elif (
+            quality_tier in {"probe", "base"}
+            and meaningful_quality_override
+            and not low_payoff_quality
+        ):
+            quality_tier = "quality_override"
+            notional_floor_ratio = max(
+                notional_floor_ratio,
+                ENTRY_HIGH_QUALITY_MIN_NOTIONAL_BALANCE_RATIO,
+            )
+            meaningful_size_reason = (
+                "策略学习处于释放或恢复压力，但当前净收益、盈亏质量、亏损概率和多源同向证据达标；"
+                "按质量驱动仓位执行，不再被旧的小仓探针档长期压住。"
+            )
         elif quality_tier in {"probe", "base"} and roster_fill_quality and not low_payoff_quality:
             quality_tier = "roster_fill"
             notional_floor_ratio = PORTFOLIO_ROSTER_FILL_NOTIONAL_BALANCE_RATIO
@@ -846,6 +1039,7 @@ class EntryProfitRiskSizingPolicy:
                 "strong_probe",
                 "winner_add",
                 "high_profit",
+                "quality_override",
             }
             if symbol_profit_tier in {"side_winner", "symbol_winner"} and quality_tier in {
                 "base",
@@ -853,7 +1047,7 @@ class EntryProfitRiskSizingPolicy:
                 "good_probe",
                 "roster_fill",
             }:
-                target_min_notional *= 1.15
+                target_min_notional *= _ENTRY_RISK_SIZING_PARAMS.winner_notional_lift_multiplier
                 notional_floor_reason = (
                     f"{notional_floor_reason} 该币种近期真实盈利，名义本金地板小幅上调。"
                     if notional_floor_reason
@@ -861,10 +1055,16 @@ class EntryProfitRiskSizingPolicy:
                 )
 
         if high_quality_entry and not low_payoff_quality:
-            quality_reference = max(min_profit_quality_ratio, 0.85)
+            quality_reference = max(
+                min_profit_quality_ratio,
+                _ENTRY_RISK_SIZING_PARAMS.strong_probe_min_profit_quality,
+            )
             quality_multiplier = min(
-                max(profit_quality_ratio / max(quality_reference, 1e-12), 0.75),
-                1.35,
+                max(
+                    profit_quality_ratio / max(quality_reference, 1e-12),
+                    _ENTRY_RISK_SIZING_PARAMS.high_quality_floor_min_multiplier,
+                ),
+                _ENTRY_RISK_SIZING_PARAMS.high_quality_floor_max_multiplier,
             )
             default_floor_ratio = ENTRY_HIGH_QUALITY_MIN_NOTIONAL_BALANCE_RATIO * quality_multiplier
             if default_floor_ratio > notional_floor_ratio:
@@ -875,10 +1075,17 @@ class EntryProfitRiskSizingPolicy:
                 )
         elif (
             expected_net > 0
-            and profit_quality_ratio >= 0.65
+            and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.normal_positive_min_profit_quality
             and (local_aligned or ml_aligned or timeseries_aligned)
         ):
-            quality_multiplier = min(max(profit_quality_ratio / 0.65, 0.75), 1.25)
+            quality_multiplier = min(
+                max(
+                    profit_quality_ratio
+                    / _ENTRY_RISK_SIZING_PARAMS.normal_positive_min_profit_quality,
+                    _ENTRY_RISK_SIZING_PARAMS.normal_positive_floor_min_multiplier,
+                ),
+                _ENTRY_RISK_SIZING_PARAMS.normal_positive_floor_max_multiplier,
+            )
             notional_floor_ratio = ENTRY_NORMAL_MIN_NOTIONAL_BALANCE_RATIO * quality_multiplier
             target_min_notional = balance * notional_floor_ratio
             notional_floor_reason = (
@@ -894,7 +1101,8 @@ class EntryProfitRiskSizingPolicy:
                 else (
                     ENTRY_PNL_STRUCTURE_HIGH_QUALITY_MAX_LOSS_MULTIPLE
                     if high_quality_entry
-                    or quality_tier in {"elite", "winner_add", "high_profit", "strong_probe"}
+                    or quality_tier
+                    in {"elite", "winner_add", "high_profit", "strong_probe", "quality_override"}
                     else ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE
                 )
             )
@@ -1008,6 +1216,9 @@ class EntryProfitRiskSizingPolicy:
             "probe_budget_guard": probe_budget_guard,
             "pnl_structure_guard": pnl_structure_guard,
             "strategy_learning_sizing": strategy_sizing_applied,
+            "strategy_quality_override": bool(strategy_quality_override),
+            "strategy_quality_override_reasons": quality_override_reasons,
+            "aligned_source_count": aligned_source_count,
             "notional_floor_applied": current_size > original_size_before_floor,
             "original_notional_usdt": round(original_notional, 6),
             "target_min_notional_usdt": round(target_min_notional, 6),

@@ -25,10 +25,12 @@ from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import annotate_training_payload
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
+_LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -447,10 +449,26 @@ async def _load_text_sentiment_samples(limit: int) -> list[dict[str, Any]]:
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train server-side local AI quant tools")
     parser.add_argument("--base-url", default=settings.local_ai_tools_api_base)
-    parser.add_argument("--shadow-limit", type=int, default=20000)
-    parser.add_argument("--trade-limit", type=int, default=8000)
-    parser.add_argument("--sequence-limit", type=int, default=12000)
-    parser.add_argument("--text-limit", type=int, default=8000)
+    parser.add_argument(
+        "--shadow-limit",
+        type=int,
+        default=_LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
+    )
+    parser.add_argument(
+        "--trade-limit",
+        type=int,
+        default=_LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
+    )
+    parser.add_argument(
+        "--sequence-limit",
+        type=int,
+        default=_LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit,
+    )
+    parser.add_argument(
+        "--text-limit",
+        type=int,
+        default=_LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
+    )
     parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args()
 

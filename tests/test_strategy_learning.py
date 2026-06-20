@@ -14,6 +14,7 @@ from services.strategy_learning import (
     StrategyLearningStateStore,
     StrategyProfile,
 )
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 COMPLETED_EXPERT_TIMINGS = [
     {"name": "trend_expert", "status": "completed", "provider_model": "qwen", "seconds": 1.2},
@@ -332,11 +333,17 @@ def test_strategy_learning_context_applies_profile_overrides(tmp_path) -> None:
 
     assert context["expert_integrity_mode"] == "balanced_probe_allow_one_non_core_missing"
 
-    assert context["position_size_multiplier"] == 0.62
+    assert (
+        context["position_size_multiplier"]
+        == DEFAULT_TRADING_PARAMS.entry_risk_sizing.balanced_probe_position_size_multiplier
+    )
 
     assert context["probe_fraction"] == 0.08
 
-    assert context["max_probe_size_pct"] == 0.018
+    assert (
+        context["max_probe_size_pct"]
+        == DEFAULT_TRADING_PARAMS.entry_risk_sizing.balanced_probe_max_position_size_pct
+    )
 
     assert context["strategy_learning_sizing"]["profile_id"] == "balanced_probe"
 
@@ -496,7 +503,7 @@ def test_llm_candidate_status_exposes_sanitized_cached_candidates(tmp_path) -> N
                     {
                         "id": "candidate_1",
                         "label": "减仓探针",
-                        "description": "闄嶄綆浠撲綅骞跺惎鐢ㄦ帰閽堘€?",
+                        "description": "降低仓位并启用探针",
                         "params": {"probe_fraction": 0.05},
                     }
                 ],
@@ -1014,7 +1021,11 @@ def test_strategy_learning_fallback_guard_allows_recovery_probe(tmp_path) -> Non
     assert context["strategy_learning_health_guard_active"] is True
     assert context["strategy_learning_recovery_probe_allowed"] is True
     assert context["strategy_learning_sizing"]["recovery_probe_allowed"] is True
-    assert 0.012 <= context["strategy_learning_sizing"]["max_probe_size_pct"] <= 0.024
+    assert (
+        DEFAULT_TRADING_PARAMS.entry_risk_sizing.recovery_probe_min_cap_pct
+        <= context["strategy_learning_sizing"]["max_probe_size_pct"]
+        <= DEFAULT_TRADING_PARAMS.entry_risk_sizing.recovery_health_probe_max_cap_pct
+    )
     assert "质量驱动恢复探针" in context["strategy_learning_sizing"]["reason"]
 
 

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.ml_signal_service import (
     MIN_TRAINING_SAMPLES,
+    TRAINING_SHADOW_SAMPLE_LIMIT,
     build_training_frame,
     count_shadow_training_rows,
     load_shadow_training_rows,
@@ -22,7 +23,10 @@ from services.ml_signal_service import (
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train local ML signal model")
     parser.add_argument(
-        "--limit", type=int, default=20000, help="Max completed shadow samples to load"
+        "--limit",
+        type=int,
+        default=TRAINING_SHADOW_SAMPLE_LIMIT,
+        help="Max completed shadow samples to load",
     )
     parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
     args = parser.parse_args()

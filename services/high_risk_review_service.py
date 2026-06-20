@@ -128,6 +128,7 @@ class HighRiskReviewService:
         model: str,
     ) -> HighRiskReviewResult:
         """Run the two-attempt online review flow and return a parsed decision."""
+        prompt = self.compact_prompt(prompt)
         api_base = normalize_http_base_url(
             api_base,
             field_name="High-risk review API base",
@@ -318,6 +319,7 @@ class HighRiskReviewService:
         return cleaned if cleaned.startswith("{") and cleaned.endswith("}") else ""
 
     def _primary_messages(self, prompt: dict[str, Any]) -> list[dict[str, str]]:
+        prompt = self.compact_prompt(prompt)
         return [
             {
                 "role": "system",
@@ -334,6 +336,7 @@ class HighRiskReviewService:
         ]
 
     def _retry_messages(self, prompt: dict[str, Any]) -> list[dict[str, str]]:
+        prompt = self.compact_prompt(prompt)
         return [
             {
                 "role": "system",
@@ -349,6 +352,85 @@ class HighRiskReviewService:
                 + json.dumps(prompt, ensure_ascii=False),
             },
         ]
+
+    def compact_prompt(self, prompt: dict[str, Any]) -> dict[str, Any]:
+        """Keep high-risk review prompts inside small-model context limits."""
+        opportunity = _safe_mapping(prompt.get("opportunity_score"))
+        selected_breakdown = _compact_expected_net_breakdown(
+            _safe_mapping(opportunity.get("expected_net_breakdown"))
+        )
+        compact = {
+            "symbol": prompt.get("symbol"),
+            "side": prompt.get("side"),
+            "confidence": _round_float(prompt.get("confidence")),
+            "position_size_pct": _round_float(prompt.get("position_size_pct")),
+            "leverage": _round_float(prompt.get("leverage")),
+            "stop_loss_pct": _round_float(prompt.get("stop_loss_pct")),
+            "take_profit_pct": _round_float(prompt.get("take_profit_pct")),
+            "trigger_reasons": _safe_list(prompt.get("trigger_reasons"))[:8],
+            "today_pnl": _round_float(prompt.get("today_pnl")),
+            "open_position_count": int(_safe_float(prompt.get("open_position_count"), 0.0)),
+            "opportunity_score": {
+                "expected_net_return_pct": _round_float(opportunity.get("expected_net_return_pct")),
+                "profit_quality_ratio": _round_float(opportunity.get("profit_quality_ratio")),
+                "loss_probability": _round_float(
+                    opportunity.get("server_profit_loss_probability")
+                    or opportunity.get("loss_probability")
+                ),
+                "tail_risk_score": _round_float(opportunity.get("tail_risk_score")),
+                "reward_risk_ratio": _round_float(opportunity.get("reward_risk_ratio")),
+                "server_profit_expected_return_pct": _round_float(
+                    opportunity.get("server_profit_expected_return_pct")
+                ),
+                "ml_expected_return_pct": _round_float(opportunity.get("ml_expected_return_pct")),
+                "timeseries_expected_return_pct": _round_float(
+                    opportunity.get("timeseries_expected_return_pct")
+                ),
+                "expected_net_breakdown": selected_breakdown,
+            },
+        }
+        text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        if len(text) <= 2_400:
+            return compact
+        compact["opportunity_score"].pop("expected_net_breakdown", None)
+        return compact
+
+
+def _safe_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _round_float(value: Any, default: float = 0.0) -> float:
+    return round(_safe_float(value, default), 6)
+
+
+def _compact_expected_net_breakdown(payload: dict[str, Any]) -> dict[str, Any]:
+    components = payload.get("components") if isinstance(payload, dict) else []
+    compact_components: list[dict[str, Any]] = []
+    if isinstance(components, list):
+        for component in components[:8]:
+            if not isinstance(component, Mapping):
+                continue
+            compact_components.append(
+                {
+                    "key": component.get("key"),
+                    "available": bool(component.get("available")),
+                    "side": component.get("side"),
+                    "raw_return_pct": _round_float(component.get("raw_return_pct")),
+                    "weight": _round_float(component.get("weight"), 0.0),
+                    "contribution_pct": _round_float(component.get("contribution_pct"), 0.0),
+                }
+            )
+    return {
+        "formula": payload.get("formula"),
+        "net_pct": _round_float(payload.get("net_pct")),
+        "model_net_pct": _round_float(payload.get("model_net_pct")),
+        "components": compact_components,
+    }
 
 
 def _safe_float(value: Any, default: float) -> float:

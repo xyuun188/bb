@@ -13,35 +13,49 @@ from services.exit_predictive_reversal import (
     PREDICTIVE_REVERSAL_REDUCE_FRACTION,
     ExitPredictiveReversalPolicy,
 )
-from services.trading_params import ESTIMATED_TAKER_FEE_PCT
+from services.trading_params import DEFAULT_TRADING_PARAMS, ESTIMATED_TAKER_FEE_PCT
 
-PROFIT_DRAWDOWN_MIN_HOLD_MINUTES = 8.0
-PROFIT_DRAWDOWN_MIN_PROFIT_RATIO = 0.006
-PROFIT_DRAWDOWN_STRONG_PROFIT_RATIO = 0.016
-PROFIT_DRAWDOWN_PARTIAL_RETRACE = 0.38
-PROFIT_DRAWDOWN_FULL_RETRACE = 0.68
-PROFIT_DRAWDOWN_PARTIAL_CLOSE_FRACTION = 0.35
-PROFIT_DRAWDOWN_MIN_NET_USDT = 5.0
-PROFIT_DRAWDOWN_MIN_FEE_MULTIPLE = 4.0
-PROFIT_DRAWDOWN_MIN_SECONDS_BETWEEN_EXITS = 600.0
-PROFIT_DRAWDOWN_VOLUME_CONFIRM_RATIO = 1.05
-PROFIT_DRAWDOWN_ACCELERATED_HOLD_MINUTES = 8.0
+_EXIT_FAST_RISK_PARAMS = DEFAULT_TRADING_PARAMS.exit_fast_risk
 
-FAST_RISK_1M_MOVE_PCT = 0.025
-FAST_RISK_5M_MOVE_PCT = 0.04
-FAST_RISK_MIN_HOLD_MINUTES = 4.0
-FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES = 12.0
-FAST_RISK_MIN_LOSS_PCT = 0.008
-FAST_RISK_REDUCE_LOSS_PCT = 0.012
-FAST_RISK_FULL_LOSS_PCT = 0.018
-FAST_RISK_NEAR_STOP_PROGRESS = 0.50
-FAST_RISK_FULL_STOP_PROGRESS = 0.78
-FAST_RISK_VOLUME_CONFIRM_RATIO = 1.05
-FAST_RISK_REDUCE_POSITION_PCT = 0.50
-FAST_RISK_FORCE_FULL_LOSS_USDT = 4.0
-FAST_RISK_FORCE_FULL_PROGRESS = 0.50
-FAST_RISK_MAX_FEATURE_POSITION_PRICE_GAP = 0.03
-FAST_RISK_PRICE_24H_RANGE_TOLERANCE_PCT = 0.03
+PROFIT_DRAWDOWN_MIN_HOLD_MINUTES = _EXIT_FAST_RISK_PARAMS.profit_drawdown_min_hold_minutes
+PROFIT_DRAWDOWN_MIN_PROFIT_RATIO = _EXIT_FAST_RISK_PARAMS.profit_drawdown_min_profit_ratio
+PROFIT_DRAWDOWN_STRONG_PROFIT_RATIO = _EXIT_FAST_RISK_PARAMS.profit_drawdown_strong_profit_ratio
+PROFIT_DRAWDOWN_PARTIAL_RETRACE = _EXIT_FAST_RISK_PARAMS.profit_drawdown_partial_retrace
+PROFIT_DRAWDOWN_FULL_RETRACE = _EXIT_FAST_RISK_PARAMS.profit_drawdown_full_retrace
+PROFIT_DRAWDOWN_PARTIAL_CLOSE_FRACTION = (
+    _EXIT_FAST_RISK_PARAMS.profit_drawdown_partial_close_fraction
+)
+PROFIT_DRAWDOWN_MIN_NET_USDT = _EXIT_FAST_RISK_PARAMS.profit_drawdown_min_net_usdt
+PROFIT_DRAWDOWN_MIN_FEE_MULTIPLE = _EXIT_FAST_RISK_PARAMS.profit_drawdown_min_fee_multiple
+PROFIT_DRAWDOWN_MIN_SECONDS_BETWEEN_EXITS = (
+    _EXIT_FAST_RISK_PARAMS.profit_drawdown_min_seconds_between_exits
+)
+PROFIT_DRAWDOWN_VOLUME_CONFIRM_RATIO = _EXIT_FAST_RISK_PARAMS.profit_drawdown_volume_confirm_ratio
+PROFIT_DRAWDOWN_ACCELERATED_HOLD_MINUTES = (
+    _EXIT_FAST_RISK_PARAMS.profit_drawdown_accelerated_hold_minutes
+)
+
+FAST_RISK_1M_MOVE_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_1m_move_pct
+FAST_RISK_5M_MOVE_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_5m_move_pct
+FAST_RISK_MIN_HOLD_MINUTES = _EXIT_FAST_RISK_PARAMS.fast_risk_min_hold_minutes
+FAST_RISK_FRESH_REVIEW_MIN_HOLD_MINUTES = (
+    _EXIT_FAST_RISK_PARAMS.fast_risk_fresh_review_min_hold_minutes
+)
+FAST_RISK_MIN_LOSS_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_min_loss_pct
+FAST_RISK_REDUCE_LOSS_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_reduce_loss_pct
+FAST_RISK_FULL_LOSS_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_full_loss_pct
+FAST_RISK_NEAR_STOP_PROGRESS = _EXIT_FAST_RISK_PARAMS.fast_risk_near_stop_progress
+FAST_RISK_FULL_STOP_PROGRESS = _EXIT_FAST_RISK_PARAMS.fast_risk_full_stop_progress
+FAST_RISK_VOLUME_CONFIRM_RATIO = _EXIT_FAST_RISK_PARAMS.fast_risk_volume_confirm_ratio
+FAST_RISK_REDUCE_POSITION_PCT = _EXIT_FAST_RISK_PARAMS.fast_risk_reduce_position_pct
+FAST_RISK_FORCE_FULL_LOSS_USDT = _EXIT_FAST_RISK_PARAMS.fast_risk_force_full_loss_usdt
+FAST_RISK_FORCE_FULL_PROGRESS = _EXIT_FAST_RISK_PARAMS.fast_risk_force_full_progress
+FAST_RISK_MAX_FEATURE_POSITION_PRICE_GAP = (
+    _EXIT_FAST_RISK_PARAMS.fast_risk_max_feature_position_price_gap
+)
+FAST_RISK_PRICE_24H_RANGE_TOLERANCE_PCT = (
+    _EXIT_FAST_RISK_PARAMS.fast_risk_price_24h_range_tolerance_pct
+)
 
 SecondsSinceProfitExit = Callable[[dict[str, Any]], float]
 
@@ -360,6 +374,15 @@ class ExitFastRiskPolicy:
             same_direction_pressure
             and (abs(returns_1) >= FAST_RISK_1M_MOVE_PCT or abs(returns_5) >= FAST_RISK_5M_MOVE_PCT)
         )
+        predictive_full_exit_confirmed = bool(
+            predictive_confirms
+            and adverse_pct >= FAST_RISK_FULL_LOSS_PCT
+            and (
+                risk_progress >= FAST_RISK_FORCE_FULL_PROGRESS
+                or (strong_adverse_momentum and volume_confirmed)
+                or hard_adverse_observed
+            )
+        )
 
         if adverse_pct <= 0:
             return {
@@ -430,7 +453,7 @@ class ExitFastRiskPolicy:
         if (
             full_stop_progress
             or force_full_by_loss
-            or predictive_confirms
+            or predictive_full_exit_confirmed
             or (
                 strong_adverse_momentum
                 and volume_confirmed
@@ -447,6 +470,7 @@ class ExitFastRiskPolicy:
                 "strong_adverse_momentum": strong_adverse_momentum,
                 "volume_confirmed": volume_confirmed,
                 "predictive_reversal_score": predictive_reversal_score,
+                "predictive_full_exit_confirmed": predictive_full_exit_confirmed,
                 "note": "价格已接近止损、亏损金额明显扩大，或出现持续同向恶化，直接全平控制风险。",
             }
 

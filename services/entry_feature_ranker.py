@@ -12,6 +12,7 @@ from services.entry_wick_guard import (
     ABNORMAL_WICK_ENTRY_BLOCK_MIN_COUNT,
     ABNORMAL_WICK_ENTRY_BLOCK_RECENT_HOURS,
 )
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 SuspiciousSymbolReason = Callable[[str], str | None]
 FloatProvider = Callable[[], float]
@@ -40,8 +41,10 @@ class EntryFeatureRankerPolicy:
     min_entry_volume_ratio_provider: FloatProvider
     min_entry_adx_provider: FloatProvider
     major_symbols: frozenset[str]
+    params: Any = DEFAULT_TRADING_PARAMS.entry_feature_ranker
 
     def feature_opportunity_score(self, feature: Any) -> float:
+        params = self.params
         try:
             volume_24h = float(getattr(feature, "volume_24h", 0) or 0)
             volume_ratio = float(getattr(feature, "volume_ratio", 0) or 0)
@@ -61,21 +64,45 @@ class EntryFeatureRankerPolicy:
             return 0.0
 
         notional_24h = max(volume_24h * max(current_price, 0.0), 0.0)
-        liquidity = math.log10(notional_24h + 1.0) * 10.0
-        participation = min(max(volume_ratio, 0.0), 5.0) * 10.0
-        trend_quality = min(max(adx_14, 0.0), 50.0) * 0.8
-        momentum = min((returns_1 * 1200) + (returns_5 * 700) + (returns_20 * 350), 45.0)
-        day_move = min(change_24h, 12.0) * 1.6
-        volatility_bonus = min(max(volatility_20, 0.0) * 900, 30.0)
-        trend_distance = min((price_vs_sma20 + price_vs_sma50) * 600, 25.0)
-        band_bonus = 8.0 if bb_pct <= 0.18 or bb_pct >= 0.82 else 0.0
+        liquidity = math.log10(notional_24h + 1.0) * params.liquidity_log_weight
+        participation = (
+            min(max(volume_ratio, 0.0), params.volume_ratio_score_cap) * params.participation_weight
+        )
+        trend_quality = min(max(adx_14, 0.0), params.adx_score_cap) * params.adx_weight
+        momentum = min(
+            (returns_1 * params.momentum_returns_1_weight)
+            + (returns_5 * params.momentum_returns_5_weight)
+            + (returns_20 * params.momentum_returns_20_weight),
+            params.momentum_score_cap,
+        )
+        day_move = min(change_24h, params.day_move_cap_pct) * params.day_move_weight
+        volatility_bonus = min(
+            max(volatility_20, 0.0) * params.volatility_weight,
+            params.volatility_score_cap,
+        )
+        trend_distance = min(
+            (price_vs_sma20 + price_vs_sma50) * params.trend_distance_weight,
+            params.trend_distance_cap,
+        )
+        band_bonus = (
+            params.bollinger_extreme_bonus
+            if bb_pct <= params.bollinger_extreme_low or bb_pct >= params.bollinger_extreme_high
+            else 0.0
+        )
         low_activity_penalty = (
-            80.0 if volume_ratio < self.min_entry_volume_ratio_provider() else 0.0
+            params.low_activity_penalty
+            if volume_ratio < self.min_entry_volume_ratio_provider()
+            else 0.0
         )
         extreme_vol_penalty = (
-            45.0
-            if volatility_20 > 0.12 and change_24h > 8
-            else 18.0 if volatility_20 > 0.08 else 0.0
+            params.extreme_volatility_penalty
+            if volatility_20 > params.extreme_volatility_threshold
+            and change_24h > params.extreme_volatility_day_move_pct
+            else (
+                params.elevated_volatility_penalty
+                if volatility_20 > params.elevated_volatility_threshold
+                else 0.0
+            )
         )
 
         return (
@@ -92,6 +119,7 @@ class EntryFeatureRankerPolicy:
         )
 
     def is_auto_tradeable_feature(self, feature: Any) -> bool:
+        params = self.params
         parsed = self._parse_filter_inputs(feature)
         if parsed is None:
             return False
@@ -100,26 +128,45 @@ class EntryFeatureRankerPolicy:
             return False
 
         notional_24h = current_price * volume_24h
-        min_notional = 800_000.0 if symbol in self.major_symbols else 1_200_000.0
+        min_notional = (
+            params.tradable_major_min_notional_usdt
+            if symbol in self.major_symbols
+            else params.tradable_alt_min_notional_usdt
+        )
         analysis_volume_floor = max(
-            min(max(float(self.min_entry_volume_ratio_provider() or 0.0), 0.16) * 0.55, 0.42),
-            0.18,
+            min(
+                max(
+                    float(self.min_entry_volume_ratio_provider() or 0.0),
+                    params.tradable_volume_provider_floor,
+                )
+                * params.tradable_volume_multiplier,
+                params.tradable_volume_cap,
+            ),
+            params.tradable_volume_floor,
         )
         analysis_adx_floor = max(
-            min(max(float(self.min_entry_adx_provider() or 0.0) - 6.0, 8.0), 16.0),
-            10.0,
+            min(
+                max(
+                    float(self.min_entry_adx_provider() or 0.0)
+                    - params.tradable_adx_provider_offset,
+                    params.tradable_adx_provider_floor,
+                ),
+                params.tradable_adx_cap,
+            ),
+            params.tradable_adx_floor,
         )
         if volume_ratio < analysis_volume_floor:
             return False
         if notional_24h < min_notional:
             return False
-        if volatility_20 > 0.12:
+        if volatility_20 > params.tradable_max_volatility:
             return False
-        if change_24h > 22.0:
+        if change_24h > params.tradable_max_day_change_pct:
             return False
         return not (symbol not in self.major_symbols and adx_14 < analysis_adx_floor)
 
     def is_auto_analysis_candidate_feature(self, feature: Any) -> bool:
+        params = self.params
         parsed = self._parse_filter_inputs(feature)
         if parsed is None:
             return False
@@ -128,22 +175,40 @@ class EntryFeatureRankerPolicy:
             return False
 
         notional_24h = current_price * volume_24h
-        min_notional = 500_000.0 if symbol in self.major_symbols else 700_000.0
+        min_notional = (
+            params.analysis_major_min_notional_usdt
+            if symbol in self.major_symbols
+            else params.analysis_alt_min_notional_usdt
+        )
         soft_volume_floor = max(
-            min(max(float(self.min_entry_volume_ratio_provider() or 0.0), 0.12) * 0.25, 0.24),
-            0.05,
+            min(
+                max(
+                    float(self.min_entry_volume_ratio_provider() or 0.0),
+                    params.analysis_volume_provider_floor,
+                )
+                * params.analysis_volume_multiplier,
+                params.analysis_volume_cap,
+            ),
+            params.analysis_volume_floor,
         )
         soft_adx_floor = max(
-            min(max(float(self.min_entry_adx_provider() or 0.0) - 9.0, 6.0), 14.0),
-            8.0,
+            min(
+                max(
+                    float(self.min_entry_adx_provider() or 0.0)
+                    - params.analysis_adx_provider_offset,
+                    params.analysis_adx_provider_floor,
+                ),
+                params.analysis_adx_cap,
+            ),
+            params.analysis_adx_floor,
         )
         if volume_ratio < soft_volume_floor:
             return False
         if notional_24h < min_notional:
             return False
-        if volatility_20 > 0.18:
+        if volatility_20 > params.analysis_max_volatility:
             return False
-        if change_24h > 32.0:
+        if change_24h > params.analysis_max_day_change_pct:
             return False
         return not (symbol not in self.major_symbols and adx_14 < soft_adx_floor)
 

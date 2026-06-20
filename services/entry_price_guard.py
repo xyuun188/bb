@@ -11,13 +11,15 @@ import structlog
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from services.entry_direction_metrics import selected_entry_metrics
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 logger = structlog.get_logger(__name__)
 
-ENTRY_PRICE_RECHECK_RESCUE_MAX_MOVE_PCT = 0.012
-ENTRY_PRICE_RECHECK_EXCEPTIONAL_MAX_MOVE_PCT = 0.020
-ENTRY_PRICE_RECHECK_EXPECTED_BUFFER_MULTIPLE = 2.0
-PRICE_GUARD_ENTRY_BLOCK_MINUTES = 8.0
+_PRICE_GUARD_PARAMS = DEFAULT_TRADING_PARAMS.entry_price_guard
+ENTRY_PRICE_RECHECK_RESCUE_MAX_MOVE_PCT = _PRICE_GUARD_PARAMS.recheck_rescue_max_move_pct
+ENTRY_PRICE_RECHECK_EXCEPTIONAL_MAX_MOVE_PCT = _PRICE_GUARD_PARAMS.recheck_exceptional_max_move_pct
+ENTRY_PRICE_RECHECK_EXPECTED_BUFFER_MULTIPLE = _PRICE_GUARD_PARAMS.recheck_expected_buffer_multiple
+PRICE_GUARD_ENTRY_BLOCK_MINUTES = _PRICE_GUARD_PARAMS.entry_block_minutes
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -57,6 +59,7 @@ class EntryPriceGuardPolicy:
     temporary_entry_block_recorder: Callable[[str, str, float], None] = _noop_temporary_block
     temporary_block_minutes: float = PRICE_GUARD_ENTRY_BLOCK_MINUTES
     config: Any = field(default_factory=lambda: settings)
+    params: Any = _PRICE_GUARD_PARAMS
 
     async def guard_reason(self, decision: DecisionOutput) -> str | None:
         """Return a blocker reason when the latest market state invalidates an entry."""
@@ -126,7 +129,13 @@ class EntryPriceGuardPolicy:
                     snapshot_price_source = "current_price_reconciled"
 
         move = (latest_price - snapshot_price) / snapshot_price
-        allowed = min(max(float(self.config.max_slippage_pct or 0.005), 0.003), 0.02)
+        allowed = min(
+            max(
+                float(self.config.max_slippage_pct or self.params.min_allowed_slippage_pct),
+                self.params.min_allowed_slippage_pct,
+            ),
+            self.params.max_allowed_slippage_pct,
+        )
         opportunity = _safe_dict(raw.get("opportunity_score"))
         quant_probe = _safe_dict(raw.get("quant_profit_probe"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
@@ -136,16 +145,32 @@ class EntryPriceGuardPolicy:
             expected_net = selected_metrics.expected_net_return_pct
             profit_quality = selected_metrics.profit_quality_ratio
         if quant_probe.get("triggered") and expected_net > 0:
-            if quant_probe.get("strong_probe") and expected_net >= 1.20 and profit_quality >= 1.20:
-                allowed = max(allowed, 0.012)
-            elif expected_net >= 0.35 and profit_quality >= 0.20:
-                allowed = max(allowed, 0.008)
-        if expected_net >= 4.0 and profit_quality >= 2.0:
-            allowed = max(allowed, 0.020)
-        elif expected_net >= 2.0 and profit_quality >= 1.20:
-            allowed = max(allowed, 0.016)
-        elif expected_net >= 1.0 and profit_quality >= 0.80:
-            allowed = max(allowed, 0.012)
+            if (
+                quant_probe.get("strong_probe")
+                and expected_net >= self.params.strong_probe_expected_net
+                and profit_quality >= self.params.strong_probe_profit_quality
+            ):
+                allowed = max(allowed, self.params.strong_probe_allowed_move_pct)
+            elif (
+                expected_net >= self.params.normal_probe_expected_net
+                and profit_quality >= self.params.normal_probe_profit_quality
+            ):
+                allowed = max(allowed, self.params.normal_probe_allowed_move_pct)
+        if (
+            expected_net >= self.params.exceptional_expected_net
+            and profit_quality >= self.params.exceptional_profit_quality
+        ):
+            allowed = max(allowed, self.params.exceptional_allowed_move_pct)
+        elif (
+            expected_net >= self.params.strong_expected_net
+            and profit_quality >= self.params.strong_profit_quality
+        ):
+            allowed = max(allowed, self.params.strong_allowed_move_pct)
+        elif (
+            expected_net >= self.params.normal_expected_net
+            and profit_quality >= self.params.normal_profit_quality
+        ):
+            allowed = max(allowed, self.params.normal_allowed_move_pct)
         raw["pre_execution_price_check"] = {
             "snapshot_price": snapshot_price,
             "snapshot_price_source": snapshot_price_source,
@@ -222,32 +247,37 @@ class EntryPriceGuardPolicy:
         )
         move_abs = abs(move)
         rescue_cap = (
-            ENTRY_PRICE_RECHECK_EXCEPTIONAL_MAX_MOVE_PCT
-            if expected_net >= 4.0 and profit_quality >= 2.0
-            else ENTRY_PRICE_RECHECK_RESCUE_MAX_MOVE_PCT
+            self.params.recheck_exceptional_max_move_pct
+            if expected_net >= self.params.exceptional_expected_net
+            and profit_quality >= self.params.exceptional_profit_quality
+            else self.params.recheck_rescue_max_move_pct
         )
         expected_buffer = (
-            ENTRY_PRICE_RECHECK_EXPECTED_BUFFER_MULTIPLE
-            if expected_net < 1.0
-            else 1.35 if expected_net < 2.0 else 1.05
+            self.params.recheck_expected_buffer_multiple
+            if expected_net < self.params.normal_expected_net
+            else (
+                self.params.medium_expected_buffer_multiple
+                if expected_net < self.params.strong_expected_net
+                else self.params.strong_expected_buffer_multiple
+            )
         )
         expected_covers_chase = expected_net >= move_abs * 100 * expected_buffer
         fresh_returns_1 = _safe_float(fresh_snapshot.get("returns_1"), 0.0)
         fresh_returns_5 = _safe_float(fresh_snapshot.get("returns_5"), 0.0)
         fresh_momentum_ok = (
             decision.action == Action.LONG
-            and fresh_returns_1 >= -0.002
-            and fresh_returns_5 >= -0.004
+            and fresh_returns_1 >= self.params.fresh_long_returns_1_floor
+            and fresh_returns_5 >= self.params.fresh_long_returns_5_floor
         ) or (
             decision.action == Action.SHORT
-            and fresh_returns_1 <= 0.002
-            and fresh_returns_5 <= 0.004
+            and fresh_returns_1 <= self.params.fresh_short_returns_1_ceiling
+            and fresh_returns_5 <= self.params.fresh_short_returns_5_ceiling
         )
         rescue_allowed = bool(
             fresh_snapshot
             and not fresh_quality_reason
             and fresh_price > 0
-            and fresh_latest_gap <= max(allowed, 0.006)
+            and fresh_latest_gap <= max(allowed, self.params.fresh_latest_gap_floor_pct)
             and move_abs <= rescue_cap
             and expected_covers_chase
             and fresh_momentum_ok

@@ -67,6 +67,7 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert body["config"]["api_channels"]["cryptopanic"]["configured"] is False
     assert "news" in body["stats"]
     assert "text_sentiment_quality_sample" in body["training"]
+    assert "top_sources" in body["training"]["text_sentiment_quality_sample"]
     assert "local_ai_tools" in body["training"]
 
 

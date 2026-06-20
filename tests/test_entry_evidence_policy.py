@@ -120,6 +120,49 @@ def test_entry_evidence_blocks_ml_and_timeseries_opposite():
     assert "动态证据强冲突硬拦截" in reason
 
 
+def test_entry_opportunity_advisory_keeps_strong_quality_size() -> None:
+    decision = _decision(
+        Action.LONG,
+        {
+            "opportunity_score": {
+                "score": 0.80,
+                "min_score_required": 0.95,
+                "confidence": 0.82,
+                "side": "long",
+                "expected_net_return_pct": 1.10,
+                "profit_quality_ratio": 1.10,
+                "server_profit_loss_probability": 0.35,
+                "tail_risk_score": 0.40,
+                "success_probability": 0.68,
+                "local_profit_aligned": True,
+                "ml_aligned": True,
+                "timeseries_aligned": True,
+                "direction_preferred_side": "short",
+                "direction_competition": {
+                    "preferred_side": "short",
+                    "score_gap": 0.18,
+                    "long": {"score": 0.05},
+                    "short": {"score": 0.23},
+                },
+                "server_profit_best_side": "short",
+                "server_profit_expected_return_pct": -0.10,
+            }
+        },
+        confidence=0.82,
+    )
+
+    reason = _gate_reason(decision)
+
+    assert reason is None
+    assert decision.position_size_pct == 0.08
+    warnings = decision.raw_response["opportunity_score"]["execution_advisory_warnings"]
+    assert warnings
+    assert any(item.get("size_cap_skipped") is True for item in warnings)
+    override = next(item["size_cap_override"] for item in warnings if item.get("size_cap_skipped"))
+    assert override["strong_quality"] is True
+    assert override["aligned_sources"] == ["local_profit", "ml", "timeseries"]
+
+
 def test_entry_evidence_allows_weak_conflict_probe_when_support_is_aligned():
     service = _service()
     decision = _decision(

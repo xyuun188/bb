@@ -29,12 +29,37 @@ from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
 from models.news import NewsArticle, SocialPost
 from services.external_event_service import ExternalEventService
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 logger = structlog.get_logger(__name__)
 
 ABNORMAL_WICK_LOOKBACK_HOURS = 72.0
 ABNORMAL_WICK_MIN_RATIO = 1.50
 INDICATOR_FEATURE_TIMEFRAME = "1h"
+_MARKET_DATA_PARAMS = DEFAULT_TRADING_PARAMS.entry_market_data_quality
+SHORT_RETURN_FEATURE_TIMEFRAME_PRIORITY = _MARKET_DATA_PARAMS.short_return_feature_timeframes
+TREND_FEATURE_TIMEFRAME_PRIORITY = _MARKET_DATA_PARAMS.trend_feature_timeframes
+SHORT_RETURN_FEATURE_KEYS = ("returns_1", "returns_5", "returns_20", "volatility_20")
+MIN_INDICATOR_ROWS = _MARKET_DATA_PARAMS.min_indicator_rows
+KLINE_CACHE_MAX_AGE_MULTIPLIER = _MARKET_DATA_PARAMS.kline_cache_max_age_multiplier
+KLINE_CACHE_MIN_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.kline_cache_min_max_age_seconds
+FEATURE_SNAPSHOT_TIMEOUT_SECONDS = _MARKET_DATA_PARAMS.feature_snapshot_timeout_seconds
+KLINE_REMOTE_FETCH_TIMEOUT_SECONDS = _MARKET_DATA_PARAMS.kline_remote_fetch_timeout_seconds
+INDICATOR_SNAPSHOT_CACHE_TTL_SECONDS = _MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds
+KLINE_BACKGROUND_REFRESH_MIN_INTERVAL_SECONDS = (
+    _MARKET_DATA_PARAMS.kline_background_refresh_min_interval_seconds
+)
+INDICATOR_REMOTE_REFRESH_CONCURRENCY = _MARKET_DATA_PARAMS.indicator_remote_refresh_concurrency
+DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
+TIMEFRAME_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
 KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
     "1m": 120,
     "5m": 120,
@@ -66,7 +91,16 @@ class DataService:
         self._headlines_cache: dict[str, list[str]] = {}
         self._news_items_cache: dict[str, list[dict[str, Any]]] = {}
         self._kline_cache: dict[str, pd.DataFrame] = {}  # symbol:tf -> DataFrame
+        self._indicator_snapshot_cache: dict[str, dict[str, Any]] = {}
+        self._indicator_snapshot_tasks: dict[str, asyncio.Task] = {}
+        self._indicator_remote_refresh_semaphore = asyncio.Semaphore(
+            max(1, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY))
+        )
+        self._kline_fetch_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._kline_refresh_scheduled_at: dict[tuple[str, str], datetime] = {}
         self._derivatives_cache: dict[str, dict[str, Any]] = {}
+        self._derivatives_refresh_tasks: dict[str, asyncio.Task] = {}
         self._last_sentiment_update: datetime | None = None
         self._sentiment_update_interval = 300  # seconds
         self._derivatives_update_interval = 20  # seconds
@@ -516,9 +550,37 @@ class DataService:
         """Build a complete FeatureVector for a symbol from all available data."""
         await self._ensure_sentiment_for_analysis(symbol)
 
-        ticker_task = asyncio.create_task(self._get_ticker_snapshot(symbol))
-        indicators_task = asyncio.create_task(self._get_indicator_snapshot(symbol))
-        derivatives_task = asyncio.create_task(self._get_derivatives_snapshot(symbol))
+        async def bounded_snapshot(name: str, coro) -> dict[str, Any]:
+            timeout = max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5)
+            try:
+                result = await asyncio.wait_for(coro, timeout=timeout)
+                return result if isinstance(result, dict) else {}
+            except TimeoutError:
+                logger.warning(
+                    "feature snapshot source timed out",
+                    symbol=symbol,
+                    source=name,
+                    timeout_seconds=timeout,
+                )
+                return {}
+            except Exception as exc:
+                logger.debug(
+                    "feature snapshot source failed",
+                    symbol=symbol,
+                    source=name,
+                    error=safe_error_text(exc),
+                )
+                return {}
+
+        ticker_task = asyncio.create_task(
+            bounded_snapshot("ticker", self._get_ticker_snapshot(symbol))
+        )
+        indicators_task = asyncio.create_task(
+            bounded_snapshot("indicators", self._get_indicator_snapshot(symbol))
+        )
+        derivatives_task = asyncio.create_task(
+            bounded_snapshot("derivatives", self._get_derivatives_snapshot(symbol))
+        )
         gather_results: tuple[Any, Any, Any] = await asyncio.gather(
             ticker_task,
             indicators_task,
@@ -618,30 +680,253 @@ class DataService:
             logger.debug("failed to fetch ticker", symbol=symbol, error=safe_error_text(e))
             return {}
 
-    async def _get_indicator_snapshot(self, symbol: str) -> dict[str, float]:
+    async def _get_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
+        normalized = self._normalize_symbols([symbol])[0]
+        cache = self._indicator_snapshot_cache_map()
+        cached = cache.get(normalized)
+        if self._is_fresh_indicator_cache(cached):
+            self._schedule_kline_background_refresh(normalized)
+            return dict(cached.get("data") or {})
+
+        tasks = self._indicator_snapshot_task_map()
+        existing_task = tasks.get(normalized)
+        if existing_task and not existing_task.done():
+            result = await existing_task
+            return dict(result or {})
+
+        task = asyncio.create_task(self._build_indicator_snapshot(normalized))
+        tasks[normalized] = task
         try:
-            kline_results = await asyncio.gather(
+            result = await task
+            return dict(result or {})
+        finally:
+            if tasks.get(normalized) is task:
+                tasks.pop(normalized, None)
+
+    def _indicator_snapshot_cache_map(self) -> dict[str, dict[str, Any]]:
+        cache = getattr(self, "_indicator_snapshot_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._indicator_snapshot_cache = cache
+        return cache
+
+    def _indicator_snapshot_task_map(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_indicator_snapshot_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._indicator_snapshot_tasks = tasks
+        return tasks
+
+    def _indicator_remote_refresh_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_indicator_remote_refresh_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(max(1, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)))
+            self._indicator_remote_refresh_semaphore = gate
+        return gate
+
+    def _kline_fetch_task_map(self) -> dict[tuple[str, str], asyncio.Task]:
+        tasks = getattr(self, "_kline_fetch_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._kline_fetch_tasks = tasks
+        return tasks
+
+    def _kline_refresh_schedule_map(self) -> dict[tuple[str, str], datetime]:
+        scheduled = getattr(self, "_kline_refresh_scheduled_at", None)
+        if not isinstance(scheduled, dict):
+            scheduled = {}
+            self._kline_refresh_scheduled_at = scheduled
+        return scheduled
+
+    def _kline_background_refresh_task_map(self) -> dict[tuple[str, str], asyncio.Task]:
+        tasks = getattr(self, "_kline_background_refresh_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._kline_background_refresh_tasks = tasks
+        return tasks
+
+    def _derivatives_refresh_task_map(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_derivatives_refresh_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._derivatives_refresh_tasks = tasks
+        return tasks
+
+    def _is_fresh_indicator_cache(self, cached: Any) -> bool:
+        if not isinstance(cached, dict):
+            return False
+        updated_at = cached.get("updated_at")
+        if not isinstance(updated_at, datetime):
+            return False
+        return (
+            datetime.now(UTC) - updated_at
+        ).total_seconds() <= INDICATOR_SNAPSHOT_CACHE_TTL_SECONDS
+
+    def _store_indicator_snapshot_cache(self, symbol: str, data: dict[str, Any]) -> None:
+        if not data:
+            return
+        normalized = self._normalize_symbols([symbol])[0]
+        self._indicator_snapshot_cache_map()[normalized] = {
+            "updated_at": datetime.now(UTC),
+            "data": dict(data),
+        }
+
+    def _schedule_kline_background_refresh(self, symbol: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        normalized = self._normalize_symbols([symbol])[0]
+        scheduled = self._kline_refresh_schedule_map()
+        background_tasks = self._kline_background_refresh_task_map()
+        now = datetime.now(UTC)
+        for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items():
+            key = (normalized, timeframe)
+            existing = background_tasks.get(key)
+            if existing and not existing.done():
+                continue
+            last_scheduled = scheduled.get(key)
+            if (
+                last_scheduled
+                and (now - last_scheduled).total_seconds()
+                < KLINE_BACKGROUND_REFRESH_MIN_INTERVAL_SECONDS
+            ):
+                continue
+            scheduled[key] = now
+            task = loop.create_task(
+                self._refresh_klines_in_background(normalized, timeframe, limit)
+            )
+            background_tasks[key] = task
+
+            def cleanup(_task: asyncio.Task, refresh_key: tuple[str, str] = key) -> None:
+                if background_tasks.get(refresh_key) is _task:
+                    background_tasks.pop(refresh_key, None)
+
+            task.add_done_callback(cleanup)
+
+    async def _refresh_klines_in_background(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> None:
+        try:
+            await self._fetch_and_persist_klines_uncached(symbol, timeframe, limit)
+        except Exception as exc:
+            logger.debug(
+                "background kline refresh failed",
+                symbol=symbol,
+                timeframe=timeframe,
+                error=safe_error_text(exc),
+            )
+
+    async def _build_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
+        try:
+            cached_results = await asyncio.gather(
                 *(
-                    self._fetch_and_persist_klines(symbol, timeframe, limit)
+                    self._load_recent_cached_klines(symbol, timeframe, limit)
                     for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
+                ),
+                return_exceptions=True,
+            )
+            cached_klines_by_timeframe = {
+                timeframe: rows
+                for (timeframe, _limit), rows in zip(
+                    KLINE_PERSIST_TIMEFRAME_LIMITS.items(),
+                    cached_results,
+                    strict=False,
                 )
-            )
-            klines_by_timeframe = {timeframe: rows for timeframe, rows in kline_results if rows}
-            klines = klines_by_timeframe.get(INDICATOR_FEATURE_TIMEFRAME) or []
-            if not klines:
-                return {}
-            df = pd.DataFrame(
-                klines,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = compute_all_indicators(df)
-            features = extract_latest_features(df)
-            features.update(self._kline_anomaly_snapshot(df))
+                if isinstance(rows, list) and rows
+            }
+            cached_features = self._indicator_features_from_timeframes(cached_klines_by_timeframe)
+            if cached_features:
+                self._store_indicator_snapshot_cache(symbol, cached_features)
+                self._schedule_kline_background_refresh(symbol)
+                return cached_features
+
+            gate = self._indicator_remote_refresh_gate()
+            async with gate:
+                kline_results = await asyncio.gather(
+                    *(
+                        self._fetch_and_persist_klines(symbol, timeframe, limit)
+                        for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
+                    ),
+                    return_exceptions=True,
+                )
+            klines_by_timeframe = {
+                timeframe: rows
+                for item in kline_results
+                if isinstance(item, tuple)
+                for timeframe, rows in (item,)
+                if rows
+            }
+            features = self._indicator_features_from_timeframes(klines_by_timeframe)
+            if features:
+                self._store_indicator_snapshot_cache(symbol, features)
             return features
         except Exception as e:
             logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))
             return {}
+
+    def _indicator_features_from_timeframes(
+        self,
+        klines_by_timeframe: dict[str, list],
+    ) -> dict[str, Any]:
+        if not klines_by_timeframe:
+            return {}
+
+        trend_timeframe, trend_features, trend_df = self._select_indicator_features(
+            klines_by_timeframe,
+            TREND_FEATURE_TIMEFRAME_PRIORITY,
+        )
+        short_timeframe, short_features, short_df = self._select_indicator_features(
+            klines_by_timeframe,
+            SHORT_RETURN_FEATURE_TIMEFRAME_PRIORITY,
+        )
+        if not trend_features and not short_features:
+            return {}
+
+        features: dict[str, Any] = dict(trend_features or short_features)
+        if short_features:
+            for key in SHORT_RETURN_FEATURE_KEYS:
+                if key in short_features:
+                    features[key] = short_features[key]
+            for key in ("close", "volume"):
+                if key in short_features:
+                    features[key] = short_features[key]
+            features["short_returns_timeframe"] = short_timeframe
+        if trend_features:
+            features["technical_indicator_timeframe"] = trend_timeframe
+        anomaly_df = trend_df if not trend_df.empty else short_df
+        features.update(self._kline_anomaly_snapshot(anomaly_df))
+        return features
+
+    def _select_indicator_features(
+        self,
+        klines_by_timeframe: dict[str, list],
+        priority: tuple[str, ...],
+    ) -> tuple[str, dict[str, Any], pd.DataFrame]:
+        for timeframe in priority:
+            klines = klines_by_timeframe.get(timeframe) or []
+            features, df = self._features_from_klines(klines)
+            if features:
+                return timeframe, features, df
+        return "", {}, pd.DataFrame()
+
+    def _features_from_klines(self, klines: list) -> tuple[dict[str, Any], pd.DataFrame]:
+        if len(klines) < MIN_INDICATOR_ROWS:
+            return {}, pd.DataFrame()
+        df = pd.DataFrame(
+            klines,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.dropna(subset=["timestamp", "close"]).drop_duplicates("timestamp")
+        df = df.sort_values("timestamp").tail(max(len(klines), MIN_INDICATOR_ROWS))
+        if len(df) < MIN_INDICATOR_ROWS:
+            return {}, df
+        computed = compute_all_indicators(df)
+        return extract_latest_features(computed), computed
 
     async def _fetch_and_persist_klines(
         self,
@@ -650,15 +935,46 @@ class DataService:
         limit: int,
     ) -> tuple[str, list]:
         """Fetch one timeframe and persist it for local model training."""
+        normalized = self._normalize_symbols([symbol])[0]
+        key = (normalized, timeframe)
+        tasks = self._kline_fetch_task_map()
+        existing_task = tasks.get(key)
+        if existing_task and not existing_task.done():
+            rows = await existing_task
+            return timeframe, rows if isinstance(rows, list) else []
+
+        task = asyncio.create_task(
+            self._fetch_and_persist_klines_uncached(normalized, timeframe, limit)
+        )
+        tasks[key] = task
         try:
-            klines = await self.rest_client.fetch_ohlcv(
-                symbol,
-                timeframe=timeframe,
-                limit=limit,
+            rows = await task
+            return timeframe, rows if isinstance(rows, list) else []
+        finally:
+            if tasks.get(key) is task:
+                tasks.pop(key, None)
+
+    async def _fetch_and_persist_klines_uncached(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> list:
+        try:
+            timeout = max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 0.5)
+            klines = await asyncio.wait_for(
+                self.rest_client.fetch_ohlcv(
+                    symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                ),
+                timeout=timeout,
             )
             if klines:
                 await self._persist_klines(symbol, timeframe, klines)
-            return timeframe, klines or []
+                return klines
+            cached = await self._load_recent_cached_klines(symbol, timeframe, limit)
+            return cached
         except Exception as exc:
             logger.debug(
                 "failed to fetch kline timeframe",
@@ -666,7 +982,50 @@ class DataService:
                 timeframe=timeframe,
                 error=safe_error_text(exc),
             )
-            return timeframe, []
+            cached = await self._load_recent_cached_klines(symbol, timeframe, limit)
+            return cached
+
+    async def _load_recent_cached_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> list[list[float]]:
+        try:
+            normalized = self._normalize_symbols([symbol])[0]
+            async with get_session_ctx() as session:
+                repo = MarketRepository(session)
+                rows = await repo.get_klines(normalized, timeframe, limit)
+            if not rows:
+                return []
+            latest = rows[-1].open_time
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=UTC)
+            max_age_seconds = max(
+                TIMEFRAME_SECONDS.get(timeframe, 60) * KLINE_CACHE_MAX_AGE_MULTIPLIER,
+                KLINE_CACHE_MIN_MAX_AGE_SECONDS,
+            )
+            if (datetime.now(UTC) - latest).total_seconds() > max_age_seconds:
+                return []
+            return [
+                [
+                    row.open_time.timestamp() * 1000.0,
+                    row.open,
+                    row.high,
+                    row.low,
+                    row.close,
+                    row.volume,
+                ]
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.debug(
+                "load cached klines failed",
+                symbol=symbol,
+                timeframe=timeframe,
+                error=safe_error_text(exc),
+            )
+            return []
 
     def _kline_anomaly_snapshot(self, df: pd.DataFrame) -> dict[str, float]:
         """Detect repeat extreme wicks that can make stop losses fill far away."""
@@ -748,7 +1107,12 @@ class DataService:
 
     async def _get_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
         now = datetime.now(UTC)
-        cached = self._derivatives_cache.get(symbol)
+        normalized = self._normalize_symbols([symbol])[0]
+        cache = getattr(self, "_derivatives_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._derivatives_cache = cache
+        cached = cache.get(normalized)
         if cached:
             updated_at = cached.get("updated_at")
             if (
@@ -756,18 +1120,69 @@ class DataService:
                 and (now - updated_at).total_seconds() < self._derivatives_update_interval
             ):
                 return dict(cached.get("data") or {})
+            if (
+                isinstance(updated_at, datetime)
+                and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
+            ):
+                self._schedule_derivatives_background_refresh(normalized)
+                return dict(cached.get("data") or {})
 
+        tasks = self._derivatives_refresh_task_map()
+        existing_task = tasks.get(normalized)
+        if existing_task and not existing_task.done():
+            result = await existing_task
+            return dict(result or {})
+        task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
+        tasks[normalized] = task
         try:
-            data = await self.rest_client.fetch_derivatives_snapshot(symbol)
+            result = await task
+            return dict(result or {})
+        finally:
+            if tasks.get(normalized) is task:
+                tasks.pop(normalized, None)
+
+    def _schedule_derivatives_background_refresh(self, symbol: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        normalized = self._normalize_symbols([symbol])[0]
+        tasks = self._derivatives_refresh_task_map()
+        existing_task = tasks.get(normalized)
+        if existing_task and not existing_task.done():
+            return
+        task = loop.create_task(self._refresh_derivatives_snapshot(normalized))
+        tasks[normalized] = task
+
+        def cleanup(_task: asyncio.Task) -> None:
+            if tasks.get(normalized) is _task:
+                tasks.pop(normalized, None)
+
+        task.add_done_callback(cleanup)
+
+    async def _refresh_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
+        normalized = self._normalize_symbols([symbol])[0]
+        now = datetime.now(UTC)
+        tasks = self._derivatives_refresh_task_map()
+        current_task = asyncio.current_task()
+        existing_task = tasks.get(normalized)
+        if existing_task and existing_task is not current_task and not existing_task.done():
+            result = await existing_task
+            return dict(result or {})
+        try:
+            data = await asyncio.wait_for(
+                self.rest_client.fetch_derivatives_snapshot(normalized),
+                timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+            )
         except Exception as e:
             logger.debug(
                 "failed to fetch derivatives snapshot",
-                symbol=symbol,
+                symbol=normalized,
                 error=safe_error_text(e),
             )
             data = {}
 
-        self._derivatives_cache[symbol] = {
+        self._derivatives_cache[normalized] = {
             "updated_at": now,
             "data": dict(data or {}),
         }

@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
-from config.settings import settings
 from services.entry_evidence import build_entry_evidence_score
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_signal_extraction import (
@@ -26,27 +25,33 @@ from services.entry_signal_extraction import (
 )
 from services.entry_stop_loss_budget import ENTRY_MAX_STOP_LOSS_NORMAL_USDT
 from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
-from services.trading_params import ESTIMATED_TAKER_FEE_PCT
+from services.execution_cost_model import execution_cost_estimate
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
-ML_EXPECTED_RETURN_SCORE_CAP_PCT = 3.0
-ENTRY_NET_WEIGHT_AI = 0.25
-ENTRY_NET_WEIGHT_LOCAL_ML = 0.40
-ENTRY_NET_WEIGHT_SERVER_PROFIT = 0.08
-ENTRY_NET_WEIGHT_TIMESERIES = 0.22
-ENTRY_SMALL_WIN_BIG_LOSS_PENALTY_CAP = 0.90
-ENTRY_REALIZED_EDGE_BONUS_CAP = 0.85
-ENTRY_REALIZED_EDGE_PENALTY_CAP = 1.15
-ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = 1.50
-ENTRY_WEAK_HISTORY_MIN_PROFIT_QUALITY_RATIO = 2.00
-ENTRY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = 0.85
-ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = 1.05
-ENTRY_WEAK_HISTORY_MIN_SCORE = 3.20
-DYNAMIC_ENTRY_SCORE_ML_ALIGNED_STRONG = 0.75
-DYNAMIC_ENTRY_SCORE_ML_ALIGNED = 0.85
-DYNAMIC_ENTRY_SCORE_EXPERT_ALIGNED = 0.90
-QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = 0.18
-QUANT_PROFIT_PROBE_MIN_SCORE = 0.35
-ABNORMAL_WICK_TAIL_RISK_MAX_PCT = 60.0
+_SCORING_PARAMS = DEFAULT_TRADING_PARAMS.entry_opportunity_scoring
+ML_EXPECTED_RETURN_SCORE_CAP_PCT = _SCORING_PARAMS.ml_expected_return_score_cap_pct
+ENTRY_NET_WEIGHT_AI = _SCORING_PARAMS.ai_expected_return_weight
+ENTRY_NET_WEIGHT_LOCAL_ML = _SCORING_PARAMS.local_ml_expected_return_weight
+ENTRY_NET_WEIGHT_SERVER_PROFIT = _SCORING_PARAMS.server_profit_expected_return_weight
+ENTRY_NET_WEIGHT_TIMESERIES = _SCORING_PARAMS.timeseries_expected_return_weight
+ENTRY_SMALL_WIN_BIG_LOSS_PENALTY_CAP = _SCORING_PARAMS.small_win_big_loss_penalty_cap
+ENTRY_REALIZED_EDGE_BONUS_CAP = _SCORING_PARAMS.realized_edge_bonus_cap
+ENTRY_REALIZED_EDGE_PENALTY_CAP = _SCORING_PARAMS.realized_edge_penalty_cap
+ENTRY_MIN_NET_PROFIT_QUALITY_RATIO = _SCORING_PARAMS.min_net_profit_quality_ratio
+ENTRY_WEAK_HISTORY_MIN_PROFIT_QUALITY_RATIO = _SCORING_PARAMS.weak_history_min_profit_quality_ratio
+ENTRY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = (
+    _SCORING_PARAMS.strong_aligned_min_profit_quality_ratio
+)
+ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MIN_PROFIT_QUALITY_RATIO = (
+    _SCORING_PARAMS.weak_history_strong_aligned_min_profit_quality_ratio
+)
+ENTRY_WEAK_HISTORY_MIN_SCORE = _SCORING_PARAMS.weak_history_min_score
+DYNAMIC_ENTRY_SCORE_ML_ALIGNED_STRONG = _SCORING_PARAMS.dynamic_entry_score_ml_aligned_strong
+DYNAMIC_ENTRY_SCORE_ML_ALIGNED = _SCORING_PARAMS.dynamic_entry_score_ml_aligned
+DYNAMIC_ENTRY_SCORE_EXPERT_ALIGNED = _SCORING_PARAMS.dynamic_entry_score_expert_aligned
+QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = _SCORING_PARAMS.quant_profit_probe_min_expected_pct
+QUANT_PROFIT_PROBE_MIN_SCORE = _SCORING_PARAMS.quant_profit_probe_min_score
+ABNORMAL_WICK_TAIL_RISK_MAX_PCT = _SCORING_PARAMS.abnormal_wick_tail_risk_max_pct
 
 NormalizeSymbol = Callable[[Any], str | None]
 ContributionAdjuster = Callable[[list[str], dict[str, Any]], dict[str, Any]]
@@ -193,6 +198,60 @@ class EntryOpportunityScoringPolicy:
             "reason": "no memory habit adjustment",
         }
 
+    def _vector_memory_adjustment(self, raw: dict[str, Any], *, side: str) -> dict[str, Any]:
+        feedback = self._safe_dict(raw.get("memory_feedback"))
+        vector = self._safe_dict(feedback.get("vector_memory"))
+        hits = self._safe_list(vector.get("hits"))
+        if not vector or not hits:
+            return {
+                "applied": False,
+                "score_adjustment": 0.0,
+                "level": "neutral",
+                "matched_count": int(vector.get("matched_count") or 0) if vector else 0,
+                "is_hard_gate": False,
+                "reason": "相似历史没有足够命中，不调整评分。",
+            }
+        same_side_loss_count = 0
+        same_side_profit_count = 0
+        weighted = 0.0
+        weight_total = 0.0
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            score = max(self._safe_float(hit.get("score"), 0.0), 0.0)
+            action = str(hit.get("action") or "").lower()
+            pnl = self._safe_float(hit.get("pnl_pct"), 0.0)
+            same_side = action == side
+            if same_side and pnl < 0:
+                same_side_loss_count += 1
+            elif same_side and pnl > 0:
+                same_side_profit_count += 1
+            direction = 1.0 if pnl > 0 else -1.0 if pnl < 0 else 0.0
+            multiplier = 1.20 if same_side else 0.60
+            weighted += direction * score * multiplier
+            weight_total += score * multiplier
+        ratio = weighted / weight_total if weight_total > 0 else 0.0
+        score_adjustment = max(min(ratio * 0.18, 0.18), -0.18)
+        if same_side_loss_count >= 2:
+            score_adjustment = min(score_adjustment, -0.12)
+        if same_side_profit_count >= 2:
+            score_adjustment = max(score_adjustment, 0.08)
+        level = (
+            "negative"
+            if score_adjustment < -0.05
+            else "positive" if score_adjustment > 0.05 else "neutral"
+        )
+        return {
+            "applied": True,
+            "score_adjustment": round(score_adjustment, 6),
+            "level": level,
+            "matched_count": len(hits),
+            "same_side_loss_count": same_side_loss_count,
+            "same_side_profit_count": same_side_profit_count,
+            "is_hard_gate": False,
+            "reason": "zvec/向量相似历史只做软调分和解释，不作为开仓硬拦截。",
+        }
+
     def _side_quality_adjustment(
         self,
         strategy: dict[str, Any],
@@ -297,8 +356,12 @@ class EntryOpportunityScoringPolicy:
             confidence * take_profit_pct - loss_probability * stop_loss_pct
         ) * 100
 
-        fee_pct = ESTIMATED_TAKER_FEE_PCT * 2 * 100
-        slippage_pct = max(float(settings.max_slippage_pct or 0.0), 0.0) * 100
+        feature_snapshot = (
+            decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
+        )
+        execution_cost = execution_cost_estimate(feature_snapshot)
+        fee_pct = execution_cost.fee_pct
+        slippage_pct = execution_cost.slippage_pct
         confidence_bonus = max(confidence - 0.55, 0.0) * 0.45
         rr_bonus = max(min(reward_risk_ratio - 1.0, 2.0), 0.0) * 0.16
         risk_penalty = max(0.58 - confidence, 0.0) * 0.85
@@ -480,9 +543,6 @@ class EntryOpportunityScoringPolicy:
                 contribution_adjustment["original_position_size"] = round(original_size, 6)
                 contribution_adjustment["adjusted_position_size"] = round(size, 6)
                 contribution_adjustment["size_applied"] = True
-        feature_snapshot = (
-            decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
-        )
         volatility = self._safe_float(feature_snapshot.get("volatility_20"), 0.0)
         day_change = abs(self._safe_float(feature_snapshot.get("change_24h_pct"), 0.0))
         abnormal_volatility = volatility >= 0.08 or day_change >= 18.0
@@ -697,10 +757,29 @@ class EntryOpportunityScoringPolicy:
             historical_adjustment = historical_adjustment_cap
         historical_adjustment += symbol_tier_score_adjustment
 
+        ml_effective_weight = ENTRY_NET_WEIGHT_LOCAL_ML if side_influence_enabled else 0.0
+        ml_contribution = expected_pct * ml_effective_weight
+        server_profit_health_multiplier = 1.0
+        if (
+            local_available
+            and local_expected < 0
+            and not (local_aligned or ts_aligned or ml_aligned)
+        ):
+            server_profit_health_multiplier = 0.35
+        elif local_available and local_expected < 0 and (ts_aligned or ml_aligned):
+            server_profit_health_multiplier = 0.55
+        elif not local_available:
+            server_profit_health_multiplier = 0.0
+        server_profit_effective_weight = (
+            ENTRY_NET_WEIGHT_SERVER_PROFIT * server_profit_health_multiplier
+        )
+        server_profit_contribution = local_expected * server_profit_effective_weight
+        timeseries_contribution = ts_expected * ENTRY_NET_WEIGHT_TIMESERIES
+
         model_expected_net_return_pct = (
-            expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML
-            + local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT
-            + ts_expected * ENTRY_NET_WEIGHT_TIMESERIES
+            ml_contribution
+            + server_profit_contribution
+            + timeseries_contribution
             - fee_pct
             - slippage_pct
         )
@@ -709,9 +788,9 @@ class EntryOpportunityScoringPolicy:
             ai_only_profit_bias = min(ai_only_profit_bias, 0.15)
         expected_net_return_pct = (
             ai_only_profit_bias
-            + expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML
-            + local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT
-            + ts_expected * ENTRY_NET_WEIGHT_TIMESERIES
+            + ml_contribution
+            + server_profit_contribution
+            + timeseries_contribution
             - fee_pct
             - slippage_pct
         )
@@ -739,8 +818,9 @@ class EntryOpportunityScoringPolicy:
                     "available": side_influence_enabled and bool(primary),
                     "side": side,
                     "raw_return_pct": round(expected_pct, 6),
-                    "weight": ENTRY_NET_WEIGHT_LOCAL_ML,
-                    "contribution_pct": round(expected_pct * ENTRY_NET_WEIGHT_LOCAL_ML, 6),
+                    "weight": ml_effective_weight,
+                    "configured_weight": ENTRY_NET_WEIGHT_LOCAL_ML,
+                    "contribution_pct": round(ml_contribution, 6),
                     "note": (
                         "ML 达标并参与收益公式。"
                         if side_influence_enabled
@@ -767,7 +847,7 @@ class EntryOpportunityScoringPolicy:
                     "side": ts_best_side or "unknown",
                     "raw_return_pct": round(ts_expected, 6),
                     "weight": ENTRY_NET_WEIGHT_TIMESERIES,
-                    "contribution_pct": round(ts_expected * ENTRY_NET_WEIGHT_TIMESERIES, 6),
+                    "contribution_pct": round(timeseries_contribution, 6),
                     "note": "同向参与收益公式。" if ts_aligned else "未形成同向正期望。",
                 },
                 {
@@ -788,9 +868,19 @@ class EntryOpportunityScoringPolicy:
                     "raw_return_pct": round(slippage_pct, 6),
                     "weight": -1.0,
                     "contribution_pct": round(-slippage_pct, 6),
-                    "note": "按配置最大滑点扣除。",
+                    "note": (
+                        "按盘口点差、深度和订单簿失衡动态估算；系统配置的最大滑点只作为上限，"
+                        "不再当作每笔固定扣费。"
+                    ),
+                    "source": execution_cost.slippage_source,
+                    "configured_max_slippage_pct": execution_cost.configured_max_slippage_pct,
+                    "spread_pct": execution_cost.spread_pct,
+                    "spread_source": execution_cost.spread_source,
+                    "liquidity_penalty_pct": execution_cost.liquidity_penalty_pct,
+                    "imbalance_penalty_pct": execution_cost.imbalance_penalty_pct,
                 },
             ],
+            "execution_cost": execution_cost.to_dict(),
             "observed_not_in_formula": [
                 {
                     "key": "sentiment",
@@ -906,6 +996,10 @@ class EntryOpportunityScoringPolicy:
             decision.position_size_pct = size
             memory_habit_adjustment["original_position_size"] = round(original_size, 6)
             memory_habit_adjustment["adjusted_position_size"] = round(size, 6)
+        vector_memory_adjustment = self._vector_memory_adjustment(raw, side=side)
+        vector_memory_score_adjustment = self._safe_float(
+            vector_memory_adjustment.get("score_adjustment"), 0.0
+        )
         side_quality_adjustment = self._side_quality_adjustment(
             strategy,
             side=side,
@@ -951,6 +1045,7 @@ class EntryOpportunityScoringPolicy:
             + historical_adjustment
             + contribution_score_adjustment
             + habit_score_adjustment
+            + vector_memory_score_adjustment
             + side_quality_score_adjustment
         )
         if historical_block:
@@ -989,8 +1084,11 @@ class EntryOpportunityScoringPolicy:
             "expected_net_weights": {
                 "ai_expected_return": ENTRY_NET_WEIGHT_AI,
                 "ai_expected_return_cap_without_quant": 0.15,
-                "local_ml_expected_return": ENTRY_NET_WEIGHT_LOCAL_ML,
-                "server_profit_expected_return": ENTRY_NET_WEIGHT_SERVER_PROFIT,
+                "local_ml_expected_return": ml_effective_weight,
+                "local_ml_configured_weight": ENTRY_NET_WEIGHT_LOCAL_ML,
+                "server_profit_expected_return": server_profit_effective_weight,
+                "server_profit_configured_weight": ENTRY_NET_WEIGHT_SERVER_PROFIT,
+                "server_profit_health_multiplier": server_profit_health_multiplier,
                 "timeseries_expected_return": ENTRY_NET_WEIGHT_TIMESERIES,
             },
             "downside_asymmetry_penalty": round(downside_asymmetry_penalty, 6),
@@ -1015,6 +1113,7 @@ class EntryOpportunityScoringPolicy:
             "size_x_leverage": round(size * leverage, 6),
             "fee_pct": round(fee_pct, 6),
             "slippage_pct": round(slippage_pct, 6),
+            "execution_cost": execution_cost.to_dict(),
             "risk_penalty": round(risk_penalty, 6),
             "weak_rr_penalty": round(weak_rr_penalty, 6),
             "exposure_penalty": round(exposure_penalty, 6),
@@ -1040,6 +1139,7 @@ class EntryOpportunityScoringPolicy:
             "model_contribution_sources": contribution_sources,
             "model_contribution_score_adjustment": round(contribution_score_adjustment, 6),
             "memory_habit_adjustment": memory_habit_adjustment,
+            "vector_memory_adjustment": vector_memory_adjustment,
             "side_quality_adjustment": side_quality_adjustment,
             "portfolio_roster": portfolio_roster,
             "historical_adjustment_cap": round(historical_adjustment_cap, 6),

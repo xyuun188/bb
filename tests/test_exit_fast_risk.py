@@ -232,3 +232,41 @@ def test_fast_adverse_fresh_loser_requires_hard_evidence_even_with_predictive_sc
     assert plan["fraction"] == 0.0
     assert plan["fresh_review_window"] is True
     assert plan["fresh_exit_strong_evidence_required"] is True
+
+
+def test_fast_adverse_predictive_score_alone_does_not_full_close_loser() -> None:
+    plan = _policy().fast_adverse_exit_plan(
+        side="long",
+        entry_price=100.0,
+        current_price=98.6,
+        stop_loss=92.0,
+        returns_1=-0.004,
+        returns_5=-0.006,
+        hold_minutes=20.0,
+        volume_ratio=1.0,
+        current_unrealized_pnl=-1.4,
+        predictive_reversal_score=90.0,
+    )
+
+    assert plan["should_exit"] is False
+    assert plan["fraction"] == 0.0
+    assert plan["adverse_pct"] < 0.018
+
+
+def test_fast_adverse_predictive_full_exit_requires_loss_and_stop_progress() -> None:
+    plan = _policy().fast_adverse_exit_plan(
+        side="long",
+        entry_price=100.0,
+        current_price=95.0,
+        stop_loss=90.0,
+        returns_1=-0.004,
+        returns_5=-0.006,
+        hold_minutes=20.0,
+        volume_ratio=1.0,
+        current_unrealized_pnl=-5.0,
+        predictive_reversal_score=90.0,
+    )
+
+    assert plan["should_exit"] is True
+    assert plan["fraction"] == 1.0
+    assert plan["predictive_full_exit_confirmed"] is True

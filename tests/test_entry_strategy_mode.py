@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
+import services.trading_service as trading_service
 from services.entry_strategy_mode import EntryStrategyModeContextPolicy
 from services.entry_symbol_universe import EntrySymbolUniversePolicy
 from services.trading_service import TradingService
@@ -183,6 +186,7 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     assert result["symbol_side_performance"] == {"BTC/USDT|long": {"pnl": 1.0}}
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 1.0}}
     assert result["portfolio_roster"]["market_symbol_min"] == 12
+    assert result["portfolio_roster"]["market_symbol_min_is_batch_size"] is False
 
 
 @pytest.mark.asyncio
@@ -236,3 +240,142 @@ async def test_trading_service_strategy_mode_context_refreshes_empty_positions()
 
     assert result["position_exposure"]["count"] == 1
     assert result["portfolio_roster"]["current_position_groups"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategy_mode_context_does_not_block_on_slow_strategy_learning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+    service._current_capacity_context = {}
+    service.dynamic_capacity = None
+    service.position_quality_scorer = None
+
+    class Daily:
+        async def state(self, _mode: str) -> dict[str, Any]:
+            return {}
+
+    class Exposure:
+        def context(self, open_positions):
+            return {"count": len(open_positions), "dominant_side": "neutral"}
+
+    class SlowLearning:
+        async def apply_to_strategy_context(self, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(60)
+            return {"strategy_profile_id": "slow-profile"}
+
+    async def empty_perf(_mode: str) -> dict[str, Any]:
+        return {}
+
+    async def balance(_mode: str) -> float:
+        return 1000.0
+
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "_write_runtime_heartbeat",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_context_timeout_seconds",
+        lambda _self: 0.01,
+    )
+    service.daily_performance_service = Daily()
+    service._today_side_performance = empty_perf
+    service._multiday_side_performance = empty_perf
+    service._recent_symbol_side_performance = empty_perf
+    service._recent_model_contribution_performance = empty_perf
+    service.entry_position_exposure = Exposure()
+    service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
+    service.allocated_order_balance = balance
+    service.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
+    service.strategy_learning_service = SlowLearning()
+    service._strategy_learning_context_cache = {}
+    service._strategy_learning_context_refresh_tasks = {}
+
+    started_at = asyncio.get_running_loop().time()
+    result = await service._strategy_mode_context(
+        "paper",
+        {"mode": "range", "confidence": 0.4},
+        open_positions=[],
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert elapsed < 0.5
+    assert result["strategy_learning_cache_status"] == "baseline_timeout"
+    assert "dynamic_position_capacity" in result
+    tasks = service._strategy_learning_context_refresh_tasks
+    assert tasks["paper"].done() is False
+    tasks["paper"].cancel()
+
+
+@pytest.mark.asyncio
+async def test_strategy_mode_context_uses_cached_learning_context_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+    service._current_capacity_context = {}
+    service.dynamic_capacity = None
+    service.position_quality_scorer = None
+
+    class Daily:
+        async def state(self, _mode: str) -> dict[str, Any]:
+            return {}
+
+    class Exposure:
+        def context(self, open_positions):
+            return {"count": len(open_positions), "dominant_side": "neutral"}
+
+    class SlowLearning:
+        async def apply_to_strategy_context(self, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(60)
+            return {"strategy_profile_id": "slow-profile"}
+
+    async def empty_perf(_mode: str) -> dict[str, Any]:
+        return {}
+
+    async def balance(_mode: str) -> float:
+        return 1000.0
+
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "_write_runtime_heartbeat",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_context_timeout_seconds",
+        lambda _self: 0.01,
+    )
+    service.daily_performance_service = Daily()
+    service._today_side_performance = empty_perf
+    service._multiday_side_performance = empty_perf
+    service._recent_symbol_side_performance = empty_perf
+    service._recent_model_contribution_performance = empty_perf
+    service.entry_position_exposure = Exposure()
+    service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
+    service.allocated_order_balance = balance
+    service.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
+    service.strategy_learning_service = SlowLearning()
+    service._strategy_learning_context_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC),
+            "context": {
+                "strategy_profile_id": "cached-profile",
+                "min_opportunity_score": 0.42,
+            },
+        }
+    }
+    service._strategy_learning_context_refresh_tasks = {}
+
+    result = await service._strategy_mode_context(
+        "paper",
+        {"mode": "range", "confidence": 0.4},
+        open_positions=[],
+    )
+
+    assert result["strategy_profile_id"] == "cached-profile"
+    assert result["strategy_learning_cache_status"] == "stale_timeout"
+    tasks = service._strategy_learning_context_refresh_tasks
+    assert tasks["paper"].done() is False
+    tasks["paper"].cancel()

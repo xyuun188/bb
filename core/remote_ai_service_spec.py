@@ -345,7 +345,8 @@ class RemoteVllmServiceSpec:
                   echo "modelscope cli not found; falling back to huggingface_hub"
                 fi
                 """).rstrip()
-            python_modelscope_fallback = textwrap.dedent(f"""\
+            python_modelscope_fallback = textwrap.indent(
+                textwrap.dedent(f"""\
                     try:
                         subprocess.check_call([
                             "modelscope",
@@ -359,84 +360,91 @@ class RemoteVllmServiceSpec:
                         ])
                     except Exception as exc:
                         print("modelscope download failed, falling back to huggingface_hub:", exc)
-                """).rstrip()
+                    """).rstrip(),
+                "    ",
+            )
         else:
             modelscope_prefetch = 'echo "skipping modelscope for HuggingFace-only model repo"'
             python_modelscope_fallback = (
                 '    print("skipping modelscope Python fallback for HuggingFace-only model repo")'
             )
-        return textwrap.dedent(f"""\
-            #!/usr/bin/env bash
-            set -euo pipefail
-            export HF_HOME={shell_quote(self.hf_cache_dir)}
-            export HF_HUB_CACHE={shell_quote(self.hf_cache_dir)}/hub
-            export TRANSFORMERS_CACHE={shell_quote(self.hf_cache_dir)}/transformers
-            export HF_ENDPOINT=https://hf-mirror.com
-            export HF_HUB_DOWNLOAD_TIMEOUT=60
-            source ~/anaconda3/etc/profile.d/conda.sh
-            conda activate {shell_quote(self.conda_env)}
-            {modelscope_prefetch}
-            python - <<'PY'
-            import json
-            import shutil
-            import subprocess
-            from pathlib import Path
-
-            target = Path({model_dir_literal})
-
-            def model_complete(path: Path) -> bool:
-                if not (path / "config.json").exists():
-                    return False
-                index_path = path / "model.safetensors.index.json"
-                if index_path.exists():
-                    try:
-                        index = json.loads(index_path.read_text(encoding="utf-8"))
-                    except Exception:
-                        return False
-                    required = set((index.get("weight_map") or {{}}).values())
-                    if required:
-                        return all(
-                            (path / name).exists() and (path / name).stat().st_size > 0
-                            for name in required
-                        )
-                shards = list(path.glob("*.safetensors"))
-                return bool(shards) and all(shard.stat().st_size > 0 for shard in shards)
-
-            if model_complete(target):
-                print("model already present:", target)
-            else:
-                if target.exists():
-                    shutil.rmtree(target)
-                target.mkdir(parents=True, exist_ok=True)
-            {python_modelscope_fallback}
-                try:
-                    from huggingface_hub import snapshot_download
-                except Exception:
-                    import subprocess, sys
-                    subprocess.check_call([
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "-q",
-                        "huggingface_hub",
-                    ])
-                    from huggingface_hub import snapshot_download
-                import os
-                if not model_complete(target):
-                    snapshot_download(
-                        repo_id={model_repo_literal},
-                        local_dir=str(target),
-                        local_dir_use_symlinks=False,
-                        resume_download=True,
-                        max_workers={self.download_max_workers},
-                        endpoint=os.environ.get("HF_ENDPOINT"),
-                    )
-                if not model_complete(target):
-                    raise RuntimeError(f"incomplete model download: {{target}}")
-                print("model downloaded:", target)
-            PY
-            """)
+        python_download_body = "\n".join(
+            [
+                "import json",
+                "import shutil",
+                "import subprocess",
+                "from pathlib import Path",
+                "",
+                f"target = Path({model_dir_literal})",
+                "",
+                "def model_complete(path: Path) -> bool:",
+                '    if not (path / "config.json").exists():',
+                "        return False",
+                '    index_path = path / "model.safetensors.index.json"',
+                "    if index_path.exists():",
+                "        try:",
+                '            index = json.loads(index_path.read_text(encoding="utf-8"))',
+                "        except Exception:",
+                "            return False",
+                '        required = set((index.get("weight_map") or {}).values())',
+                "        if required:",
+                "            return all(",
+                "                (path / name).exists() and (path / name).stat().st_size > 0",
+                "                for name in required",
+                "            )",
+                '    shards = list(path.glob("*.safetensors"))',
+                "    return bool(shards) and all(shard.stat().st_size > 0 for shard in shards)",
+                "",
+                "if model_complete(target):",
+                '    print("model already present:", target)',
+                "else:",
+                "    if target.exists():",
+                "        shutil.rmtree(target)",
+                "    target.mkdir(parents=True, exist_ok=True)",
+                python_modelscope_fallback,
+                "    try:",
+                "        from huggingface_hub import snapshot_download",
+                "    except Exception:",
+                "        import subprocess, sys",
+                "        subprocess.check_call([",
+                "            sys.executable,",
+                '            "-m",',
+                '            "pip",',
+                '            "install",',
+                '            "-q",',
+                '            "huggingface_hub",',
+                "        ])",
+                "        from huggingface_hub import snapshot_download",
+                "    import os",
+                "    if not model_complete(target):",
+                "        snapshot_download(",
+                f"            repo_id={model_repo_literal},",
+                "            local_dir=str(target),",
+                "            local_dir_use_symlinks=False,",
+                "            resume_download=True,",
+                f"            max_workers={self.download_max_workers},",
+                '            endpoint=os.environ.get("HF_ENDPOINT"),',
+                "        )",
+                "    if not model_complete(target):",
+                '        raise RuntimeError(f"incomplete model download: {target}")',
+                '    print("model downloaded:", target)',
+            ]
+        )
+        return (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"export HF_HOME={shell_quote(self.hf_cache_dir)}\n"
+            f"export HF_HUB_CACHE={shell_quote(self.hf_cache_dir)}/hub\n"
+            f"export TRANSFORMERS_CACHE={shell_quote(self.hf_cache_dir)}/transformers\n"
+            "export HF_ENDPOINT=https://hf-mirror.com\n"
+            "export HF_HUB_DOWNLOAD_TIMEOUT=60\n"
+            "source ~/anaconda3/etc/profile.d/conda.sh\n"
+            f"conda activate {shell_quote(self.conda_env)}\n"
+            f"{modelscope_prefetch}\n"
+            "python - <<'PY'\n"
+            f"{python_download_body}\n"
+            "PY\n"
+        )
 
 
 QWEN3_32B_MAIN_SERVICE = RemoteVllmServiceSpec(
@@ -465,7 +473,7 @@ QWEN3_14B_TRADE_SERVICE = RemoteVllmServiceSpec(
     port=8000,
     max_model_len=8192,
     gpu_memory_utilization=0.34,
-    max_num_seqs=4,
+    max_num_seqs=2,
     max_num_batched_tokens=8192,
 )
 
@@ -483,6 +491,7 @@ DEEPSEEK_R1_14B_RISK_SERVICE = RemoteVllmServiceSpec(
     max_model_len=4096,
     gpu_memory_utilization=0.62,
     quantization="awq_marlin",
+    enforce_eager=True,
     max_num_seqs=2,
     max_num_batched_tokens=4096,
     use_modelscope=False,

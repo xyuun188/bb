@@ -256,15 +256,33 @@ class EntryQuantProfitProbePolicy:
             max(0.60 + min(side_expected, 1.2) * 0.11 + min(edge, 2.0) * 0.05, 0.60),
             0.80,
         )
-        stop_loss_pct = 0.012
-        min_reward_risk = 3.60 if strong_probe else 2.80
-        take_profit_cap = 0.085 if strong_probe else 0.065
+        stop_loss_pct = self.params.stop_loss_pct
+        min_reward_risk = (
+            self.params.strong_min_reward_risk
+            if strong_probe
+            else self.params.normal_min_reward_risk
+        )
+        take_profit_cap = (
+            self.params.strong_take_profit_cap_pct
+            if strong_probe
+            else self.params.normal_take_profit_cap_pct
+        )
         take_profit_pct = max(
             stop_loss_pct * min_reward_risk,
             min(take_profit_cap, stop_loss_pct * min_reward_risk + side_expected / 100.0 * 0.70),
         )
-        probe_size = 0.060 if strong_probe else (0.020 if roster_fill_probe else 0.025)
-        probe_leverage = 5.0 if strong_probe else 3.0
+        probe_size = (
+            self.params.strong_probe_size_pct
+            if strong_probe
+            else (
+                self.params.roster_fill_probe_size_pct
+                if roster_fill_probe
+                else self.params.normal_probe_size_pct
+            )
+        )
+        probe_leverage = (
+            self.params.strong_probe_leverage if strong_probe else self.params.normal_probe_leverage
+        )
         raw_response = original.raw_response if isinstance(original.raw_response, dict) else {}
         raw_response = dict(raw_response)
         raw_response.update(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,8 +30,10 @@ POSITION_REVIEW_URGENT_EXIT_MARKERS = (
 )
 MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS = 2
 MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS = 1
-MARKET_ANALYSIS_MEDIUM_RISK_CAP = MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS * 2
-MARKET_ANALYSIS_HIGH_RISK_CAP = MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS * 2
+MARKET_ANALYSIS_NO_POSITION_CAP = 6
+MARKET_ANALYSIS_LOW_RISK_OPEN_POSITION_CAP = 3
+MARKET_ANALYSIS_MEDIUM_RISK_CAP = 2
+MARKET_ANALYSIS_HIGH_RISK_CAP = 1
 
 NormalizeSymbol = Callable[[Any], str]
 OpenPositionGroupCounter = Callable[[list[dict[str, Any]] | None], int]
@@ -68,6 +71,8 @@ class AnalysisBudgetConfig:
     market_high_risk_min_exploration_symbols: int = (
         MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS
     )
+    market_no_position_cap: int = MARKET_ANALYSIS_NO_POSITION_CAP
+    market_low_risk_open_position_cap: int = MARKET_ANALYSIS_LOW_RISK_OPEN_POSITION_CAP
     market_medium_risk_cap: int = MARKET_ANALYSIS_MEDIUM_RISK_CAP
     market_high_risk_cap: int = MARKET_ANALYSIS_HIGH_RISK_CAP
     target_position_groups: int = PORTFOLIO_MIN_POSITION_GROUPS_TARGET
@@ -87,6 +92,8 @@ class AnalysisBudgetRuntime:
     position_high_load_max_groups_per_round: int
     market_min_exploration_symbols: int
     market_high_risk_min_exploration_symbols: int
+    market_no_position_cap: int
+    market_low_risk_open_position_cap: int
     market_medium_risk_cap: int
     market_high_risk_cap: int
     target_position_groups: int
@@ -148,14 +155,20 @@ class AnalysisBudgetPolicy:
         position_group_count = self.open_position_group_counter(open_positions)
         roster_underfilled = position_group_count < runtime.target_position_groups
 
-        if not run_position_analysis or not open_positions:
-            market_limit = base_market_limit if run_market_analysis else 0
-            if run_market_analysis and roster_underfilled:
-                market_limit = max(market_limit, runtime.roster_fill_market_symbol_min)
+        if not open_positions:
+            market_limit, market_limit_policy = self._market_limit_without_positions(
+                base_market_limit=base_market_limit,
+                run_market_analysis=run_market_analysis,
+                runtime=runtime,
+                roster_underfilled=roster_underfilled,
+                new_pair_pause_reason=new_pair_pause_reason,
+            )
             return self._result(
                 runtime=runtime,
                 risk_level="none",
                 market_symbol_limit=market_limit,
+                configured_market_symbol_limit=base_market_limit,
+                market_limit_policy=market_limit_policy,
                 position_max_groups=runtime.position_max_groups_per_round,
                 forced_exit_count=0,
                 urgent_exit_count=0,
@@ -165,11 +178,44 @@ class AnalysisBudgetPolicy:
                 roster_underfilled=roster_underfilled,
                 position_group_count=position_group_count,
                 reason=(
-                    "No position-review risk needs scheduling; market analysis uses the "
-                    "roster-fill candidate budget."
+                    (
+                        "当前没有持仓需要复盘，市场分析使用动态候选预算；"
+                        "该预算只控制本轮送入大模型的候选数量，不是开仓门槛。"
+                    )
                     if roster_underfilled
-                    else "No position-review risk needs scheduling; market analysis uses the "
-                    "base candidate budget."
+                    else (
+                        "当前没有持仓需要复盘，市场分析使用基础动态候选预算；"
+                        "该预算不是开仓门槛。"
+                    )
+                ),
+            )
+
+        if not run_position_analysis:
+            market_limit, market_limit_policy = self._market_limit_with_positions(
+                base_market_limit=base_market_limit,
+                run_market_analysis=run_market_analysis,
+                runtime=runtime,
+                risk_level="low",
+                roster_underfilled=roster_underfilled,
+                new_pair_pause_reason=new_pair_pause_reason,
+            )
+            return self._result(
+                runtime=runtime,
+                risk_level="low",
+                market_symbol_limit=market_limit,
+                configured_market_symbol_limit=base_market_limit,
+                market_limit_policy=market_limit_policy,
+                position_max_groups=runtime.position_max_groups_per_round,
+                forced_exit_count=0,
+                urgent_exit_count=0,
+                high_exit_count=0,
+                priority_count=0,
+                total_position_groups=position_group_count,
+                roster_underfilled=roster_underfilled,
+                position_group_count=position_group_count,
+                reason=(
+                    "当前存在持仓，持仓复盘由独立 position loop 并行负责；"
+                    "市场分析只使用剩余小批量候选，避免抢占大模型资源。"
                 ),
             )
 
@@ -200,7 +246,6 @@ class AnalysisBudgetPolicy:
 
         risk_level = "low"
         position_max_groups = dynamic_position_max_groups
-        market_limit = base_market_limit if run_market_analysis else 0
         if high_exit or len(forced_exit) >= 3:
             risk_level = "high"
             position_max_groups = max(
@@ -216,43 +261,28 @@ class AnalysisBudgetPolicy:
                     ),
                 ),
             )
-            market_limit = min(
-                base_market_limit,
-                max(
-                    runtime.market_high_risk_min_exploration_symbols,
-                    runtime.market_high_risk_cap,
-                ),
-            )
         elif forced_exit or len(priority) >= 3:
             risk_level = "medium"
             position_max_groups = max(
                 dynamic_position_max_groups,
                 min(len(priority) + 2, runtime.position_high_risk_max_groups_per_round),
             )
-            market_limit = min(
-                base_market_limit,
-                max(
-                    runtime.market_min_exploration_symbols,
-                    runtime.market_medium_risk_cap,
-                ),
-            )
 
-        if new_pair_pause_reason:
-            market_limit = 0
-        elif run_market_analysis and base_market_limit > 0 and market_limit <= 0:
-            market_limit = runtime.market_high_risk_min_exploration_symbols
-        if (
-            roster_underfilled
-            and run_market_analysis
-            and not new_pair_pause_reason
-            and risk_level != "high"
-        ):
-            market_limit = max(market_limit, runtime.roster_fill_market_symbol_min)
+        market_limit, market_limit_policy = self._market_limit_with_positions(
+            base_market_limit=base_market_limit,
+            run_market_analysis=run_market_analysis,
+            runtime=runtime,
+            risk_level=risk_level,
+            roster_underfilled=roster_underfilled,
+            new_pair_pause_reason=new_pair_pause_reason,
+        )
 
         return self._result(
             runtime=runtime,
             risk_level=risk_level,
             market_symbol_limit=market_limit,
+            configured_market_symbol_limit=base_market_limit,
+            market_limit_policy=market_limit_policy,
             position_max_groups=position_max_groups,
             forced_exit_count=len(forced_exit),
             urgent_exit_count=len(urgent_exit),
@@ -262,20 +292,86 @@ class AnalysisBudgetPolicy:
             roster_underfilled=roster_underfilled,
             position_group_count=position_group_count,
             reason=(
-                f"Position-review risk level {risk_level}: forced exits {len(forced_exit)}, "
-                f"urgent exits {len(urgent_exit)}, high-risk exits {len(high_exit)}, "
-                f"priority reviews {len(priority)}; this round reviews up to "
-                f"{int(position_max_groups)} position groups and keeps "
-                f"{max(0, int(market_limit))} entry-scan candidates."
+                f"持仓优先调度：风险级别 {risk_level}，强制退出 {len(forced_exit)} 组，"
+                f"紧急退出 {len(urgent_exit)} 组，高风险退出 {len(high_exit)} 组，"
+                f"优先复盘 {len(priority)} 组；本轮最多复盘 "
+                f"{int(position_max_groups)} 组持仓，市场新开仓候选只保留 "
+                f"{max(0, int(market_limit))} 个。该数量只限制大模型调度负载，"
+                "不是开仓门槛。"
                 + (
-                    f" Grouped positions are {position_group_count}/"
-                    f"{runtime.target_position_groups}; roster-fill mode raises "
-                    "entry exploration budget."
+                    f" 当前持仓组 {position_group_count}/"
+                    f"{runtime.target_position_groups}，组合仍未补齐，但市场扫描仍受持仓优先预算约束。"
                     if roster_underfilled and risk_level != "high"
                     else ""
                 )
             ),
         )
+
+    def _market_limit_without_positions(
+        self,
+        *,
+        base_market_limit: int,
+        run_market_analysis: bool,
+        runtime: AnalysisBudgetRuntime,
+        roster_underfilled: bool,
+        new_pair_pause_reason: str | None,
+    ) -> tuple[int, str]:
+        if not run_market_analysis:
+            return 0, "market_disabled"
+        if new_pair_pause_reason:
+            return 0, "new_pair_pause"
+        if base_market_limit <= 0:
+            return 0, "no_market_budget"
+        dynamic_cap = max(
+            runtime.market_min_exploration_symbols,
+            min(
+                runtime.market_no_position_cap,
+                max(1, math.ceil(math.sqrt(base_market_limit))),
+            ),
+        )
+        if roster_underfilled:
+            dynamic_cap = max(
+                dynamic_cap,
+                min(runtime.roster_fill_market_symbol_min, runtime.market_no_position_cap),
+            )
+        return min(base_market_limit, dynamic_cap), "no_position_dynamic_market_budget"
+
+    def _market_limit_with_positions(
+        self,
+        *,
+        base_market_limit: int,
+        run_market_analysis: bool,
+        runtime: AnalysisBudgetRuntime,
+        risk_level: str,
+        roster_underfilled: bool,
+        new_pair_pause_reason: str | None,
+    ) -> tuple[int, str]:
+        if not run_market_analysis:
+            return 0, "market_disabled"
+        if new_pair_pause_reason:
+            return 0, "new_pair_pause"
+        if base_market_limit <= 0:
+            return 0, "no_market_budget"
+        if risk_level == "high":
+            cap = max(
+                runtime.market_high_risk_min_exploration_symbols,
+                runtime.market_high_risk_cap,
+            )
+            return min(base_market_limit, cap), "position_first_high_risk"
+        if risk_level == "medium":
+            cap = max(runtime.market_min_exploration_symbols, runtime.market_medium_risk_cap)
+            return min(base_market_limit, cap), "position_first_medium_risk"
+
+        cap = max(
+            runtime.market_min_exploration_symbols,
+            min(runtime.market_low_risk_open_position_cap, math.ceil(base_market_limit * 0.15)),
+        )
+        policy = (
+            "position_first_low_risk_underfilled"
+            if roster_underfilled
+            else "position_first_low_risk"
+        )
+        return min(base_market_limit, cap), policy
 
     def _group_positions(
         self, open_positions: list[dict[str, Any]]
@@ -425,6 +521,18 @@ class AnalysisBudgetPolicy:
                 default=self.config.market_high_risk_min_exploration_symbols,
                 upper=10_000,
             ),
+            market_no_position_cap=self._runtime_int(
+                budget.get("market_no_position_cap"),
+                runtime.get("market_no_position_cap"),
+                default=self.config.market_no_position_cap,
+                upper=10_000,
+            ),
+            market_low_risk_open_position_cap=self._runtime_int(
+                budget.get("market_low_risk_open_position_cap"),
+                runtime.get("market_low_risk_open_position_cap"),
+                default=self.config.market_low_risk_open_position_cap,
+                upper=10_000,
+            ),
             market_medium_risk_cap=self._runtime_int(
                 budget.get("market_medium_risk_cap"),
                 runtime.get("market_medium_risk_cap"),
@@ -479,6 +587,8 @@ class AnalysisBudgetPolicy:
         runtime: AnalysisBudgetRuntime,
         risk_level: str,
         market_symbol_limit: int,
+        configured_market_symbol_limit: int,
+        market_limit_policy: str,
         position_max_groups: int,
         forced_exit_count: int,
         urgent_exit_count: int,
@@ -492,6 +602,10 @@ class AnalysisBudgetPolicy:
         return {
             "risk_level": risk_level,
             "market_symbol_limit": max(0, int(market_symbol_limit)),
+            "configured_market_symbol_limit": max(0, int(configured_market_symbol_limit)),
+            "market_limit_policy": market_limit_policy,
+            "market_symbol_limit_is_entry_gate": False,
+            "position_first_scheduling": True,
             "position_max_groups": max(1, int(position_max_groups)),
             "forced_exit_groups": forced_exit_count,
             "urgent_exit_groups": urgent_exit_count,

@@ -144,6 +144,13 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
     memory_feedback = {
         "enabled": True,
         "preferred_side_by_memory": "long",
+        "vector_memory": {
+            "enabled": True,
+            "status": "ok",
+            "matched_count": 1,
+            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+            "hits": [{"score": 0.72, "action": "long", "outcome": "loss", "pnl_pct": -0.8}],
+        },
         "decision_habit": {
             "posture": "selective_probe",
             "preferred_side": "long",
@@ -193,6 +200,9 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
 
     assert evidence["preferred_side_by_evidence"] == "long"
     assert evidence["memory_feedback"]["preferred_side_by_memory"] == "long"
+    assert evidence["memory_feedback"]["vector_memory"]["status"] == "ok"
+    assert evidence["memory_feedback"]["vector_memory"]["matched_count"] == 1
+    assert evidence["memory_feedback"]["vector_memory"]["hits"][0]["pnl_pct"] == -0.8
     assert evidence["memory_feedback"]["decision_habit"]["posture"] == "selective_probe"
     assert evidence["memory_feedback"]["decision_habit"]["long"]["stance"] == "probe_when_ev_ok"
     assert evidence["memory_feedback"]["decision_habit"]["long"]["probe_budget_pct"] == 0.015

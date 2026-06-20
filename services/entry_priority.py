@@ -14,8 +14,10 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 from services.entry_direction_metrics import selected_entry_metrics
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
-MIN_ENTRY_OPPORTUNITY_SCORE = 0.95
+_PRIORITY_PARAMS = DEFAULT_TRADING_PARAMS.entry_execution_priority
+MIN_ENTRY_OPPORTUNITY_SCORE = _PRIORITY_PARAMS.min_entry_opportunity_score
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -86,54 +88,72 @@ class EntryExecutionPriorityPolicy:
             return None
 
         exceptional = (
-            score >= max(min_score + 2.0, 4.20)
-            and confidence >= 0.86
-            and expected_net >= 1.20
-            and profit_quality >= 1.50
+            score
+            >= max(
+                min_score + _PRIORITY_PARAMS.exceptional_score_delta,
+                _PRIORITY_PARAMS.exceptional_score_floor,
+            )
+            and confidence >= _PRIORITY_PARAMS.exceptional_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.exceptional_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.exceptional_min_profit_quality
         )
         strong_aligned = (
-            score >= max(min_score + 1.00, 2.80)
-            and confidence >= 0.88
-            and expected_net >= 0.80
-            and profit_quality >= 1.20
-            and (aligned or entry_votes >= 2)
+            score
+            >= max(
+                min_score + _PRIORITY_PARAMS.strong_score_delta,
+                _PRIORITY_PARAMS.strong_score_floor,
+            )
+            and confidence >= _PRIORITY_PARAMS.strong_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.strong_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.strong_min_profit_quality
+            and (aligned or entry_votes >= _PRIORITY_PARAMS.strong_min_entry_votes)
         )
         strong_quant = (
             strong_quant_probe
-            and score >= max(min_score + 1.00, 2.80)
-            and confidence >= 0.78
-            and expected_net >= 0.75
-            and profit_quality >= 0.85
-            and quant_loss_probability <= 0.42
+            and score
+            >= max(
+                min_score + _PRIORITY_PARAMS.strong_score_delta,
+                _PRIORITY_PARAMS.strong_score_floor,
+            )
+            and confidence >= _PRIORITY_PARAMS.strong_quant_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.strong_quant_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.strong_quant_min_profit_quality
+            and quant_loss_probability <= _PRIORITY_PARAMS.strong_quant_max_loss_probability
         )
         medium_quant = (
             quant_probe_triggered
             and not strong_quant_probe
-            and score >= max(min_score, 0.35)
-            and confidence >= 0.66
-            and expected_net >= 0.25
-            and profit_quality >= 0.20
-            and quant_loss_probability <= 0.52
-            and float(decision.position_size_pct or 0.0) <= 0.03
+            and score >= max(min_score, _PRIORITY_PARAMS.medium_quant_score_floor)
+            and confidence >= _PRIORITY_PARAMS.medium_quant_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.medium_quant_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.medium_quant_min_profit_quality
+            and quant_loss_probability <= _PRIORITY_PARAMS.medium_quant_max_loss_probability
+            and float(decision.position_size_pct or 0.0)
+            <= _PRIORITY_PARAMS.medium_quant_max_position_size
         )
         positive_expectancy = (
-            score >= max(min_score - 0.15, 0.55)
-            and confidence >= 0.68
-            and expected_net >= 0.35
-            and profit_quality >= 0.30
-            and quant_loss_probability <= 0.58
-            and tail_risk_score < 0.88
+            score
+            >= max(
+                min_score + _PRIORITY_PARAMS.positive_expectancy_score_delta,
+                _PRIORITY_PARAMS.positive_expectancy_score_floor,
+            )
+            and confidence >= _PRIORITY_PARAMS.positive_expectancy_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.positive_expectancy_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.positive_expectancy_min_profit_quality
+            and quant_loss_probability <= _PRIORITY_PARAMS.positive_expectancy_max_loss_probability
+            and tail_risk_score < _PRIORITY_PARAMS.positive_expectancy_max_tail_risk
             and (aligned or entry_votes >= 1 or quant_probe_triggered)
         )
         roster_fill_quant = (
             roster_underfilled
             and roster_fill_probe
-            and score >= max(min_score, 0.25)
-            and confidence >= 0.66
-            and expected_net >= 0.30
-            and profit_quality >= 0.30
-            and quant_loss_probability <= 0.62
-            and float(decision.position_size_pct or 0.0) <= 0.025
+            and score >= max(min_score, _PRIORITY_PARAMS.roster_fill_score_floor)
+            and confidence >= _PRIORITY_PARAMS.roster_fill_min_confidence
+            and expected_net >= _PRIORITY_PARAMS.roster_fill_min_expected_net
+            and profit_quality >= _PRIORITY_PARAMS.roster_fill_min_profit_quality
+            and quant_loss_probability <= _PRIORITY_PARAMS.roster_fill_max_loss_probability
+            and float(decision.position_size_pct or 0.0)
+            <= _PRIORITY_PARAMS.roster_fill_max_position_size
         )
         if not (
             exceptional

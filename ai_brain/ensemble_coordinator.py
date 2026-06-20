@@ -26,11 +26,16 @@ from config.settings import (
 from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
     enrich_signal_payload,
-    expected_return_pct as signal_expected_return_pct,
-    payload_side as signal_payload_side,
     signal_available,
     unwrap_tool_payload,
 )
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
+)
+from services.entry_signal_extraction import (
+    payload_side as signal_payload_side,
+)
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -53,16 +58,28 @@ MAX_ENTRY_DISAGREEMENT = 0.50
 MIN_EXECUTABLE_ENTRY_CONFIDENCE = 0.58
 DAILY_RECOVERY_ENTRY_SCORE_BONUS = 0.10
 DAILY_RECOVERY_MIN_ENTRY_CONFIDENCE = 0.74
+ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
+
 DAILY_RECOVERY_MAX_ENTRY_SIZE = 0.04
 DAILY_RECOVERY_MAX_LEVERAGE = 5.0
-PROFIT_QUALITY_EXPAND_MIN_ENTRY_SIZE = 0.055
-PROFIT_QUALITY_EXPAND_RECOVERY_MAX_SIZE = 0.090
-PROFIT_QUALITY_EXPAND_SELECTIVE_MAX_SIZE = 0.075
-PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE = 0.110
-PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE = 0.070
-MAX_NORMAL_ENTRY_SIZE = 0.12
-MAX_PROBE_ENTRY_SIZE = 0.03
-ML_SOFT_CAUTION_MAX_ENTRY_SIZE = 0.025
+PROFIT_QUALITY_EXPAND_MIN_ENTRY_SIZE = (
+    ENTRY_RISK_SIZING_PARAMS.ensemble_profit_expand_min_entry_size
+)
+PROFIT_QUALITY_EXPAND_RECOVERY_MAX_SIZE = (
+    ENTRY_RISK_SIZING_PARAMS.ensemble_profit_expand_recovery_max_size
+)
+PROFIT_QUALITY_EXPAND_SELECTIVE_MAX_SIZE = (
+    ENTRY_RISK_SIZING_PARAMS.ensemble_profit_expand_selective_max_size
+)
+PROFIT_QUALITY_EXPAND_NORMAL_MAX_SIZE = (
+    ENTRY_RISK_SIZING_PARAMS.ensemble_profit_expand_normal_max_size
+)
+PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE = (
+    ENTRY_RISK_SIZING_PARAMS.ensemble_profit_expand_crowded_max_size
+)
+MAX_NORMAL_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_max_normal_entry_size
+MAX_PROBE_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_max_probe_entry_size
+ML_SOFT_CAUTION_MAX_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_ml_soft_caution_max_entry_size
 MARKET_DIRECTION_EXCLUDED_EXPERTS = {"position_expert", "risk_expert"}
 ENTRY_DIRECTION_SUPPORT_EXPERTS = {"trend_expert", "sentiment_expert"}
 ENTRY_PROFIT_QUALITY_EXPERTS = {"momentum_expert"}
@@ -161,9 +178,9 @@ ML_QUANT_ONLY_MAX_LOSS_PROBABILITY = 0.60
 ML_PROFIT_FIRST_LOW_WIN_RATE_SIZE_MULTIPLIER = 0.60
 LOCAL_TOOLS_MAX_LOSS_PROBABILITY = 0.62
 PROFIT_FIRST_PROBE_CONFIDENCE = 0.72
-PROFIT_FIRST_PROBE_SIZE = 0.025
+PROFIT_FIRST_PROBE_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_profit_first_probe_size
 QUANT_VALIDATION_PROBE_CONFIDENCE = 0.70
-QUANT_VALIDATION_PROBE_SIZE = 0.04
+QUANT_VALIDATION_PROBE_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_quant_validation_probe_size
 QUANT_VALIDATION_MAX_LOSS_PROBABILITY = 0.58
 QUANT_VALIDATION_MIN_LOCAL_EXPECTED_RETURN_PCT = 0.03
 QUANT_VALIDATION_MIN_PROFIT_QUALITY_SCORE = 0.20
@@ -2439,7 +2456,7 @@ class EnsembleCoordinator:
         if profit_first_probe:
             size = min(size, PROFIT_FIRST_PROBE_SIZE)
         if recovery_probe_entry:
-            size = min(size, 0.018)
+            size = min(size, ENTRY_RISK_SIZING_PARAMS.ensemble_recovery_probe_size_cap)
         leverage_cap = self._entry_leverage_cap(confidence, quality_points)
         min_leverage = self._entry_min_leverage(confidence, quality_points)
         leverage = min(max(leverage, min_leverage), leverage_cap, settings.max_leverage)
@@ -2493,7 +2510,7 @@ class EnsembleCoordinator:
         )
         crowded_side_size_cap = None
         if isinstance(exposure, dict) and exposure.get("dominant_side") == action_side:
-            crowded_cap = 0.025
+            crowded_cap = ENTRY_RISK_SIZING_PARAMS.ensemble_crowded_side_size_cap
             crowded_reason = "同方向敞口已经偏高，普通信号只允许小仓，避免单边堆仓。"
             if profit_quality_expand.get("allow"):
                 crowded_cap = min(
@@ -2510,7 +2527,7 @@ class EnsembleCoordinator:
             size = min(size, crowded_cap)
             crowded_side_size_cap = {
                 "applied": True,
-                "max_position_size": 0.025,
+                "max_position_size": round(crowded_cap, 6),
                 "dominant_side": action_side,
                 "profit_quality_expand_allowed": bool(profit_quality_expand.get("allow")),
                 "readable_reason": crowded_reason,
@@ -3844,9 +3861,10 @@ class EnsembleCoordinator:
         expected = self._local_expected_return(profit, reverse_side)
         blocked_side = "long" if blocked_action == Action.LONG else "short"
         blocked_expected = self._local_expected_return(profit, blocked_side)
-        best_side = signal_payload_side(profit) or str(
-            profit.get("best_side") or local_gate.get("best_side") or ""
-        ).lower()
+        best_side = (
+            signal_payload_side(profit)
+            or str(profit.get("best_side") or local_gate.get("best_side") or "").lower()
+        )
         loss_probability = self._safe_float(profit.get(f"{reverse_side}_loss_probability"), 0.0)
         profit_quality_score = self._safe_float(profit.get("profit_quality_score"), 0.0)
         result.update(
@@ -4483,9 +4501,7 @@ class EnsembleCoordinator:
             profit.get(f"{current_side}_loss_probability"), 0.50
         )
         local_best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
-        local_available = (
-            isinstance(profit, dict) and bool(profit) and signal_available(profit)
-        )
+        local_available = isinstance(profit, dict) and bool(profit) and signal_available(profit)
 
         ts_prediction = self._local_timeseries_signal(context)
         ts_best_side = signal_payload_side(ts_prediction)
@@ -5791,9 +5807,7 @@ class EnsembleCoordinator:
                     row.get("duration_kind"),
                     row.get("duration_sec"),
                 )
-                shared_batch_durations[key] = max(
-                    shared_batch_durations.get(key, 0.0), duration
-                )
+                shared_batch_durations[key] = max(shared_batch_durations.get(key, 0.0), duration)
             else:
                 non_shared_model_duration += duration
         shared_batch_total = sum(shared_batch_durations.values())

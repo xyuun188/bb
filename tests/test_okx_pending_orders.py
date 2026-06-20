@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.exceptions import ExchangeAPIError
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 
@@ -106,6 +107,12 @@ class FakeCcxt:
 
     async def fetch_order(self, _order_id, _symbol):
         return dict(self.confirmed_order)
+
+
+class RejectingCreateOrderCcxt(FakeCcxt):
+    async def create_order(self, symbol, order_type, side, quantity, price, params):
+        self.create_calls.append((symbol, order_type, side, quantity, price, params))
+        raise ExchangeAPIError("51008 Insufficient USDT margin")
 
 
 def _executor(fake_ccxt: FakeCcxt) -> OKXExecutor:
@@ -271,6 +278,28 @@ async def test_entry_size_rejects_before_okx_when_min_contracts_unaffordable():
     assert rules["amount_min_contracts"] == pytest.approx(10.0)
     assert rules["affordable_notional_usdt"] == pytest.approx(1.0)
     assert rules["min_notional_usdt"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_exchange_rejection_is_structured_not_raised():
+    fake_ccxt = RejectingCreateOrderCcxt(amount_min=1.0, contract_size=1.0)
+    executor = _executor(fake_ccxt)
+
+    result = await executor.place_order(
+        _entry_decision(),
+        account_id="ensemble_trader",
+        override_balance=10.0,
+    )
+
+    assert fake_ccxt.create_calls
+    assert result.status == OrderStatus.REJECTED
+    assert result.order_id == "okx_rejected"
+    assert result.raw_response is not None
+    assert result.raw_response["okx_rejection"] is True
+    assert result.raw_response["system_pre_submit_rejection"] is False
+    assert result.raw_response["execution_blocker"] == "okx_exchange_rejection"
+    assert "51008" in result.raw_response["raw_error"]
+    assert result.raw_response["okx_order_rules"]["pre_submit_valid"] is True
 
 
 @pytest.mark.asyncio

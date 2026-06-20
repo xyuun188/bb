@@ -26,9 +26,12 @@ class _FakeOKXExecutor:
     error_text = ""
     raise_on_balance = False
     raise_on_initialize = False
+    created_kwargs: list[dict[str, Any]] = []
 
-    def __init__(self, mode: str = "paper") -> None:
+    def __init__(self, mode: str = "paper", **kwargs: Any) -> None:
         self.mode = mode
+        self.kwargs = kwargs
+        self.created_kwargs.append(kwargs)
 
     async def initialize(self) -> None:
         if self.raise_on_initialize:
@@ -422,6 +425,7 @@ async def test_dashboard_okx_connection_error_is_redacted(
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     _FakeOKXExecutor.error_text = f"Authorization: Bearer {leaked_value} is invalid"
     _FakeOKXExecutor.raise_on_balance = False
+    _FakeOKXExecutor.created_kwargs.clear()
     settings_api_module._OKX_BALANCE_CACHE.clear()
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
@@ -439,6 +443,7 @@ async def test_dashboard_okx_connection_error_is_redacted(
     assert body["success"] is False
     assert leaked_value not in body["error"]
     assert "Authorization: ***" in body["error"]
+    assert _FakeOKXExecutor.created_kwargs[-1]["load_markets_on_initialize"] is False
 
 
 @pytest.mark.asyncio
@@ -450,6 +455,7 @@ async def test_dashboard_okx_update_logs_redacted_executor_init_failure(
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     warning_events: list[dict[str, Any]] = []
     trading_service = _FakeTradingService()
+    _FakeOKXExecutor.created_kwargs.clear()
 
     class FakeLogger:
         def warning(self, event: str, **fields: Any) -> None:
@@ -474,6 +480,7 @@ async def test_dashboard_okx_update_logs_redacted_executor_init_failure(
 
     assert response["status"] == "ok"
     assert trading_service._okx_paper is None
+    assert _FakeOKXExecutor.created_kwargs[-1]["load_markets_on_initialize"] is False
     assert warning_events == [
         {
             "event": "failed to initialize OKX executor after credential update",
@@ -493,6 +500,7 @@ async def test_dashboard_okx_balance_error_is_redacted(
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     _FakeOKXExecutor.error_text = f"Authorization: Bearer {leaked_value} is invalid"
     _FakeOKXExecutor.raise_on_balance = True
+    _FakeOKXExecutor.created_kwargs.clear()
     settings_api_module._OKX_BALANCE_CACHE.clear()
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")

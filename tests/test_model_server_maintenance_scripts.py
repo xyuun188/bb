@@ -65,6 +65,8 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
     assert "http://127.0.0.1:18001" in source
     assert "http://127.0.0.1:18002/v1" in source
     assert "values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'" in source
+    assert "values['LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT'] = '0.12'" in source
+    assert "values['LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT'] = '0.18'" in source
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" in source
     assert "qwen3-14b-trade" in source
     assert "deepseek-r1-14b-risk" in source
@@ -89,3 +91,24 @@ def test_model_server_bridge_reads_only_local_ai_tools_key_payload() -> None:
     assert "'/data/trade_ai/local_ai_tools.env'" in source
     assert "values.get('LOCAL_AI_TOOLS_API_KEY', '')" in source
     assert "safe_error_text" in source
+
+
+def test_model_server_status_scripts_use_dual_14b_contract() -> None:
+    check_source = (ROOT / "scripts" / "check_server_model_status.py").read_text(encoding="utf-8")
+    inspect_source = (ROOT / "scripts" / "inspect_server_ai_services.py").read_text(
+        encoding="utf-8"
+    )
+
+    for source in (check_source, inspect_source):
+        assert "qwen3-14b-trade.service" in source
+        assert "deepseek-r1-14b-risk.service" in source
+        assert "local-ai-tools.service" in source
+        assert "qwen3-32b-main.service" in source
+        assert "deprecated service" in source.lower()
+
+    assert '("qwen3-14b-trade.service", "qwen3-14b-trade", 8000)' in check_source
+    assert '("deepseek-r1-14b-risk.service", "deepseek-r1-14b-risk", 8002)' in check_source
+    assert "http://127.0.0.1:{port}/v1/models" in check_source
+    assert "Qwen3-32B" not in check_source
+    assert "qwen3_32b_main.log" not in check_source
+    assert "start_qwen3_32b_main.sh" not in inspect_source

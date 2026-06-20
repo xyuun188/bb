@@ -144,6 +144,35 @@ def test_entry_opportunity_scoring_turns_memory_habit_into_probe_cap() -> None:
     assert decision.position_size_pct == 0.015
 
 
+def test_entry_opportunity_scoring_uses_vector_memory_as_soft_adjustment() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    baseline = _decision()
+    decision = _decision()
+    decision.raw_response["memory_feedback"] = {
+        "vector_memory": {
+            "enabled": True,
+            "status": "ok",
+            "matched_count": 2,
+            "hits": [
+                {"score": 0.72, "action": "long", "pnl_pct": -0.8},
+                {"score": 0.61, "action": "long", "pnl_pct": -0.3},
+            ],
+            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+        }
+    }
+
+    policy = _policy(now)
+    baseline_score = policy.score_candidate(baseline, {"min_opportunity_score": 0.95})
+    score = policy.score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    adjustment = decision.raw_response["opportunity_score"]["vector_memory_adjustment"]
+    assert adjustment["applied"] is True
+    assert adjustment["level"] == "negative"
+    assert adjustment["score_adjustment"] < 0
+    assert adjustment["is_hard_gate"] is False
+    assert score < baseline_score
+
+
 def test_entry_opportunity_scoring_tightens_degraded_side_quality() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     decision = _decision()
@@ -244,4 +273,31 @@ def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned
     assert components["local_ml"]["available"] is False
     assert components["server_profit"]["raw_return_pct"] == -0.28
     assert components["fee"]["contribution_pct"] < 0
+    assert components["slippage"]["source"] == "dynamic_microstructure"
+    assert components["slippage"]["raw_return_pct"] < 0.5
     assert breakdown["observed_not_in_formula"][0]["key"] == "sentiment"
+
+
+def test_entry_opportunity_scoring_does_not_use_max_slippage_as_fixed_cost(monkeypatch) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "max_slippage_pct", 0.005)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.feature_snapshot.update(
+        {
+            "spread_pct": 0.012,
+            "orderbook_bid_depth": 150_000.0,
+            "orderbook_ask_depth": 150_000.0,
+            "orderbook_imbalance": 0.0,
+        }
+    )
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    execution_cost = opportunity["execution_cost"]
+    assert execution_cost["configured_max_slippage_pct"] == 0.5
+    assert opportunity["slippage_pct"] == 0.05
+    assert opportunity["slippage_pct"] < execution_cost["configured_max_slippage_pct"]
+    assert execution_cost["slippage_source"] == "dynamic_microstructure"
