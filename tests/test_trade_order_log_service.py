@@ -81,3 +81,54 @@ async def test_trade_order_log_service_persists_order_payload() -> None:
             "filled_at": filled_at,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_trade_order_log_service_skips_zero_quantity_tracking_order() -> None:
+    repo = FakeTradeRepo()
+    result = ExecutionResult(
+        order_id="exit_tracking",
+        exchange_order_id="okx-exit-1",
+        symbol="PROS/USDT",
+        side="sell",
+        order_type="market",
+        quantity=0.0,
+        price=0.5666,
+        status=OrderStatus.OPEN,
+        raw_response={"exit_tracking": True, "existing_exit_order": True},
+    )
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda model_name: f"mode:{model_name}",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", _decision(), decision_id=78)
+
+    assert repo.orders == []
+
+
+@pytest.mark.asyncio
+async def test_trade_order_log_service_keeps_rejected_zero_quantity_diagnostics() -> None:
+    repo = FakeTradeRepo()
+    result = ExecutionResult(
+        order_id="rejected",
+        symbol="PROS/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.0,
+        price=0.5666,
+        status=OrderStatus.REJECTED,
+        raw_response={"error": "pre-submit rejected"},
+    )
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda model_name: f"mode:{model_name}",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", _decision(), decision_id=79)
+
+    assert len(repo.orders) == 1
+    assert repo.orders[0]["status"] == "rejected"
+    assert repo.orders[0]["quantity"] == 0.0

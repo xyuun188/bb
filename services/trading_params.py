@@ -253,6 +253,8 @@ class TrainingDataQualityParams:
     max_horizon_minutes: int = 1440
     invalid_horizon_penalty: float = 0.35
     invalid_price_penalty: float = 0.25
+    abnormal_indicator_price_gap_pct: float = 20.0
+    training_price_24h_range_tolerance_pct: float = 0.03
     abnormal_spread_pct: float = 2.0
     wide_spread_pct: float = 0.50
     wide_spread_penalty: float = 0.20
@@ -282,6 +284,8 @@ class LocalMLTrainingParams:
     auto_train_min_new_samples: int = 500
     auto_train_learning_only_interval_seconds: int = 2 * 60 * 60
     auto_train_learning_only_min_new_samples: int = 120
+    auto_quarantine_batch_size: int = 1000
+    auto_quarantine_max_batches: int = 5
     min_training_samples: int = 200
     training_shadow_sample_limit: int = 20_000
     training_trade_sample_limit: int = 8_000

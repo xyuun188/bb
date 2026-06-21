@@ -12,6 +12,7 @@ from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from executor.base_executor import OrderStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -41,6 +42,8 @@ class TradeOrderLogService:
         decision: DecisionOutput,
         decision_id: int | None = None,
     ) -> None:
+        if self._should_skip_order_log(result):
+            return
         try:
             async with self._session_context_factory() as session:
                 repo = self._trade_repo_factory(session)
@@ -62,3 +65,35 @@ class TradeOrderLogService:
                 )
         except Exception as exc:
             logger.error("failed to log trade", error=safe_error_text(exc))
+
+    @staticmethod
+    def _should_skip_order_log(result: Any) -> bool:
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        if raw.get("do_not_persist_order"):
+            return True
+
+        status = getattr(result, "status", None)
+        status_value = getattr(status, "value", status)
+        status_text = str(status_value or "").lower()
+        quantity = TradeOrderLogService._safe_float(getattr(result, "quantity", 0.0), 0.0)
+        price = TradeOrderLogService._safe_float(getattr(result, "price", 0.0), 0.0)
+        active_or_filled = {
+            OrderStatus.PENDING.value,
+            OrderStatus.OPEN.value,
+            OrderStatus.PARTIAL.value,
+            OrderStatus.FILLED.value,
+        }
+        tracking_only = bool(raw.get("entry_tracking") or raw.get("exit_tracking"))
+        if tracking_only and quantity <= 0:
+            return True
+        if quantity <= 0 and status_text in active_or_filled:
+            return True
+        return price <= 0 and status_text in active_or_filled
+
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default

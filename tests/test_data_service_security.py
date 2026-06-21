@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -320,6 +321,80 @@ def test_feature_vector_keeps_market_feature_source_timeframes() -> None:
     assert vector.technical_indicator_timeframe == "1h"
     assert "short_returns=1m" in vector.to_llm_context()
     assert "trend=1h" in vector.to_llm_context()
+
+
+def test_feature_vector_keeps_fresh_ticker_when_indicator_close_diverges() -> None:
+    from data_feed.feature_vector import build_feature_vector
+
+    vector = build_feature_vector(
+        "PROS/USDT",
+        ticker={
+            "last_price": 0.5666,
+            "bid": 0.5665,
+            "ask": 0.5667,
+            "high_24h": 0.569,
+            "low_24h": 0.5491,
+            "source": "rest",
+        },
+        indicators={"close": 0.3902, "returns_1": 0.01},
+    )
+
+    assert vector.current_price == pytest.approx(0.5666)
+    assert vector.close == pytest.approx(0.5666)
+    assert vector.indicator_close_price == pytest.approx(0.3902)
+    assert vector.indicator_price_gap_pct > 20
+    assert vector.price_reconciliation_warning == (
+        "ticker_current_price_kept_indicator_close_diverged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ticker_snapshot_refreshes_stale_ws_cache_from_swap_rest() -> None:
+    service = _service()
+    stale_timestamp_ms = int(
+        (time.time() - data_service_module.TICKER_CACHE_MAX_AGE_SECONDS - 60) * 1000
+    )
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "timestamp": stale_timestamp_ms,
+            }
+        }
+
+    class FakeRestClient:
+        def __init__(self) -> None:
+            self.symbols: list[str] = []
+
+        async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            self.symbols.append(symbol)
+            return {
+                "last": 0.5666,
+                "bid": 0.5665,
+                "ask": 0.5667,
+                "high": 0.569,
+                "low": 0.5491,
+                "baseVolume": 1234,
+                "percentage": 1.2,
+                "timestamp": int(time.time() * 1000),
+                "info": {"instId": "PROS-USDT-SWAP"},
+            }
+
+    service.ws_client = FakeWsClient()
+    rest_client = FakeRestClient()
+    service.rest_client = rest_client
+
+    snapshot = await service._get_ticker_snapshot("PROS/USDT")
+
+    assert rest_client.symbols == ["PROS/USDT"]
+    assert snapshot["last_price"] == pytest.approx(0.5666)
+    assert snapshot["source"] == "rest"
+    assert snapshot["inst_type"] == "SWAP"
+    assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5666)
 
 
 def test_news_item_summary_keeps_safe_external_url() -> None:

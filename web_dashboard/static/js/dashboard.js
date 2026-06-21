@@ -4079,9 +4079,20 @@ function memoryActionLabel(action) {
 
 async function fetchMLSignalDashboard() {
     const [status, localToolsStatus, recordsData, contributionData] = await Promise.all([
-        fetchJSON('/api/ml-signal/status'),
-        fetchJSON('/api/local-ai-tools/status').catch(() => null),
-        fetchJSON(`/api/analysis-records?limit=120&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`),
+        fetchJSON('/api/ml-signal/status').catch(err => ({
+            available: false,
+            status: 'request_error',
+            error: err?.message || '本地 ML 状态接口请求失败',
+            message: '本地 ML 状态接口请求失败，页面已保留其它诊断数据。',
+        })),
+        fetchJSON('/api/local-ai-tools/status').catch(err => ({
+            available: false,
+            service_available: false,
+            status: 'request_error',
+            error: err?.message || '本地量化工具状态接口请求失败',
+            message: '本地量化工具状态接口请求失败，请检查 18001 或后端日志。',
+        })),
+        fetchJSON(`/api/analysis-records?limit=120&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
         fetchJSON(`/api/model-contribution/stats?mode=${state.mode === 'live' ? 'live' : 'paper'}&days=7`).catch(() => null),
     ]);
     state.mlSignalStatus = status || null;
@@ -4385,7 +4396,12 @@ function changeMLSignalPage(page) {
 async function fetchDataCollectionStatus(options = {}) {
     const updated = document.getElementById('data-collection-updated');
     if (updated && !options.silent) updated.textContent = '读取中...';
-    const data = await fetchJSON('/api/data-collection/status');
+    let data = null;
+    try {
+        data = await fetchJSON('/api/data-collection/status');
+    } catch (err) {
+        data = { status: 'error', detail: err?.message || '数据采集状态接口请求失败' };
+    }
     if (!data) {
         if (updated) {
             updated.textContent = state.dataCollectionStatus?.checked_at
@@ -4492,8 +4508,19 @@ function renderDataCollectionDashboard(options = {}) {
     const stats = data.stats || {};
     const training = data.training || {};
     const updated = document.getElementById('data-collection-updated');
+    const hasError = data.status === 'error' || data.detail || data.error;
+    const errorText = data.detail || data.error || '数据采集状态读取失败，请检查 Dashboard API 或登录状态。';
     if (updated && !options.failedRefresh) {
         updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '未返回时间';
+    }
+    if (hasError) {
+        const overview = document.getElementById('data-collection-overview');
+        if (overview) {
+            overview.innerHTML = `<div class="analysis-empty">${escHtml(errorText)}</div>`;
+        }
+        if (!data.config && !data.sources && !data.stats && !data.training) {
+            return;
+        }
     }
     if (!Object.keys(data).length) {
         setText('data-collection-updated', '读取失败');
@@ -7742,6 +7769,7 @@ function renderMLSignalOverview() {
     const ready = status.available === true;
     const influenceEnabled = status.influence_enabled === true && status.status === 'ready';
     const mode = status.mode || latestSignal?.mode || 'learning_only';
+    const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
     const latestText = latestRecord
@@ -7755,7 +7783,7 @@ function renderMLSignalOverview() {
     if (updatedEl) {
         updatedEl.textContent = ready
             ? `累计完成 ${samples.completedMl} 条，训练窗口 ${samples.trainingMl} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
-            : '模型不可用';
+            : `模型不可用 · ${unavailableReason}`;
     }
 
     container.innerHTML = `
@@ -7778,7 +7806,7 @@ function renderMLSignalOverview() {
             </div>
         </div>
         <div class="ml-overview-grid">
-            ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易', ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
+            ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
             ${mlMetricCard('累计完成样本', String(samples.completedMl), '数据库里已完成的影子复盘总数', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
             ${mlMetricCard('新增待消化样本', String(samples.newCount), '达到自动训练条件后会进入下一轮训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
@@ -8032,7 +8060,13 @@ function pctFmt(value) {
 async function fetchOpeningFunnel() {
     const hoursEl = document.getElementById('opening-funnel-hours');
     const hours = hoursEl ? Number(hoursEl.value || 24) : 24;
-    const data = await fetchJSON(`/api/opening-funnel?mode=${state.mode || 'paper'}&hours=${hours}&limit=500`);
+    let data = null;
+    try {
+        data = await fetchJSON(`/api/opening-funnel?mode=${state.mode || 'paper'}&hours=${hours}&limit=500`);
+    } catch (err) {
+        renderOpeningFunnelUnavailable({ detail: err?.message || '开仓漏斗接口请求失败' });
+        return;
+    }
     if (!data || !data.stages) {
         renderOpeningFunnelUnavailable(data);
         return;

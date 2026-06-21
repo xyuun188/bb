@@ -2577,10 +2577,27 @@ async def get_status(mode: str | None = None):
 
 @router.get("/ml-signal/status")
 async def get_ml_signal_status():
-    ml_signal_service = _dashboard_ml_signal_service()
+    try:
+        ml_signal_service = _dashboard_ml_signal_service()
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "client_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "本地 ML 状态客户端初始化失败。", 
+        }
     if not ml_signal_service:
         return {"available": False, "status": "service_not_ready"}
-    status = ml_signal_service.status()
+    try:
+        status = ml_signal_service.status()
+    except Exception as exc:
+        _log_dashboard_fallback("ml signal status fallback", exc)
+        return {
+            "available": False,
+            "status": "status_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "本地 ML 状态读取失败；请检查模型文件、训练元数据和服务日志。", 
+        }
     if not isinstance(status, dict):
         return status
 
@@ -2620,10 +2637,27 @@ async def get_ml_signal_status():
 
 @router.get("/local-ai-tools/status")
 async def get_local_ai_tools_status():
-    local_ai_tools = _dashboard_local_ai_tools_client()
+    try:
+        local_ai_tools = _dashboard_local_ai_tools_client()
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "client_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "本地量化工具客户端初始化失败。", 
+        }
     if not local_ai_tools:
         return {"available": False, "status": "service_not_ready"}
-    status = await local_ai_tools.status()
+    try:
+        status = await local_ai_tools.status()
+    except Exception as exc:
+        _log_dashboard_fallback("local ai tools status fallback", exc)
+        return {
+            "available": False,
+            "status": "status_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "本地量化工具状态读取失败；请检查 18001 隧道、API Key 和服务健康接口。", 
+        }
     if isinstance(status, dict):
         try:
             completed_total = await _completed_local_ai_shadow_backtest_total()
@@ -3385,6 +3419,63 @@ def _opening_funnel_is_repair_cleanup(decision) -> bool:
 
 @router.get("/opening-funnel")
 async def get_opening_funnel(
+    mode: str | None = None,
+    hours: int = 24,
+    limit: int = 500,
+):
+    try:
+        return await _build_opening_funnel_payload(mode=mode, hours=hours, limit=limit)
+    except Exception as exc:
+        _log_dashboard_fallback("opening funnel fallback", exc)
+        selected_mode = "live" if mode == "live" else "paper"
+        capped_hours = max(1, min(int(hours or 24), 24 * 30))
+        capped_limit = max(50, min(int(limit or 500), 2000))
+        return sanitize_payload(
+            {
+                "mode": selected_mode,
+                "window_hours": capped_hours,
+                "sample_limit": capped_limit,
+                "sampled_decisions": 0,
+                "repair_cleanup_rows": 0,
+                "market_scans": 0,
+                "average_confidence": 0.0,
+                "stages": {
+                    "market_scans": 0,
+                    "ai_entry_signals": 0,
+                    "orders_created": 0,
+                    "executed_entries": 0,
+                },
+                "rates": {
+                    "signal_rate": 0.0,
+                    "order_rate": 0.0,
+                    "execution_rate": 0.0,
+                    "overall_open_rate": 0.0,
+                },
+                "action_counts": {"hold": 0, "long": 0, "short": 0, "other": 0},
+                "reason_buckets": {
+                    "profit_expectancy": 0,
+                    "evidence_gate": 0,
+                    "risk_or_precheck": 0,
+                    "waiting_queue": 0,
+                    "execution_or_exchange": 0,
+                    "ai_budget": 0,
+                    "other": 0,
+                    "unknown": 0,
+                },
+                "hold_count": 0,
+                "no_order_after_signal": 0,
+                "bottleneck": "api_error",
+                "bottleneck_label": "漏斗接口异常，已返回诊断占位",
+                "top_symbols": [],
+                "recent_blocked": [],
+                "generated_at": datetime.now(UTC).isoformat(),
+                "status": "error",
+                "detail": safe_error_text(exc, limit=180),
+            }
+        )
+
+
+async def _build_opening_funnel_payload(
     mode: str | None = None,
     hours: int = 24,
     limit: int = 500,

@@ -19,6 +19,7 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
+from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
 
 async def _main() -> None:
@@ -30,7 +31,18 @@ async def _main() -> None:
         help="Max completed shadow samples to load",
     )
     parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
+    parser.add_argument("--skip-quarantine", action="store_true")
     args = parser.parse_args()
+
+    quarantine_result = {
+        "skipped": True,
+        "reason": "skip_quarantine flag enabled",
+    }
+    if not args.skip_quarantine:
+        quarantine_result = await quarantine_dirty_shadow_samples(
+            batch_size=min(args.limit, 1000),
+            max_batches=max((int(args.limit) + 999) // 1000, 1),
+        )
 
     rows = await load_shadow_training_rows(limit=args.limit)
     quality_state = shadow_training_quality_report(rows)
@@ -43,6 +55,7 @@ async def _main() -> None:
         training_quality_report=quality_state["quality_report"],
     )
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
+    print(json.dumps({"training_quarantine": quarantine_result}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

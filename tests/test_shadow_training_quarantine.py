@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from scripts.quarantine_dirty_shadow_training_samples import (
+    QUARANTINE_STATUS,
+    _note_with_quarantine_reason,
+    _quality_sample,
+)
+from services.training_data_quality import assess_shadow_sample
+from services.shadow_training_quarantine import quarantine_completed_shadow_row
+
+
+def _row(**overrides):
+    row = SimpleNamespace(
+        symbol="PROS/USDT",
+        analysis_type="market",
+        decision_action="long",
+        decision_confidence=0.72,
+        horizon_minutes=30,
+        feature_snapshot={
+            "symbol": "PROS/USDT",
+            "current_price": 0.3902,
+            "low_24h": 0.5491,
+            "high_24h": 0.5707,
+            "spread_pct": 0.03,
+        },
+        long_return_pct=0.4,
+        short_return_pct=-0.4,
+        best_action="long",
+        missed_opportunity=False,
+        status="completed",
+        note="",
+    )
+    for key, value in overrides.items():
+        setattr(row, key, value)
+    return row
+
+
+def test_quality_sample_marks_out_of_range_shadow_sample_for_quarantine() -> None:
+    assessment = assess_shadow_sample(_quality_sample(_row()))
+
+    assert assessment.exclude_from_training is True
+    assert assessment.status == "excluded"
+    assert "price_outside_24h_range" in assessment.reasons
+
+
+def test_note_with_quarantine_reason_is_idempotent() -> None:
+    note = _note_with_quarantine_reason("old note", ("price_outside_24h_range",))
+    second = _note_with_quarantine_reason(note, ("price_outside_24h_range",))
+
+    assert "[training_quarantine] price_outside_24h_range" in note
+    assert second == note
+
+
+def test_quarantine_status_constant_is_not_completed() -> None:
+    assert QUARANTINE_STATUS == "quarantined"
+    assert QUARANTINE_STATUS != "completed"
+
+
+def test_quarantine_completed_shadow_row_updates_status_and_note() -> None:
+    row = _row()
+
+    result = quarantine_completed_shadow_row(row)
+
+    assert result["applied"] is True
+    assert row.status == QUARANTINE_STATUS
+    assert "price_outside_24h_range" in row.note
+
+
+def test_clean_shadow_row_is_not_quarantined() -> None:
+    row = _row(
+        feature_snapshot={
+            "symbol": "PROS/USDT",
+            "current_price": 0.5600,
+            "low_24h": 0.5491,
+            "high_24h": 0.5707,
+            "spread_pct": 0.03,
+        },
+    )
+
+    result = quarantine_completed_shadow_row(row)
+
+    assert result["applied"] is False
+    assert row.status == "completed"

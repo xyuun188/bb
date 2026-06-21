@@ -116,6 +116,33 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if not features:
         return _final_assessment(0.0, ["missing_features"], exclude=True)
 
+    price_warning = _safe_str(features.get("price_reconciliation_warning"))
+    indicator_gap = abs(_safe_float(features.get("indicator_price_gap_pct"), 0.0) or 0.0)
+    if price_warning or indicator_gap >= _QUALITY_PARAMS.abnormal_indicator_price_gap_pct:
+        return _final_assessment(
+            0.0,
+            ["price_reconciliation:" f"{price_warning or 'indicator_close_diverged'}"],
+            exclude=True,
+        )
+
+    if bool(features.get("stale")) or bool(features.get("ticker_stale")):
+        return _final_assessment(0.0, ["stale_ticker_snapshot"], exclude=True)
+
+    current_price = _safe_float(features.get("current_price") or features.get("close"), None)
+    low_24h = _safe_float(features.get("low_24h"), None)
+    high_24h = _safe_float(features.get("high_24h"), None)
+    if current_price is not None and low_24h is not None and high_24h is not None:
+        if current_price > 0 and high_24h > 0 and low_24h > 0 and high_24h >= low_24h:
+            tolerance = _QUALITY_PARAMS.training_price_24h_range_tolerance_pct
+            lower_bound = low_24h * (1.0 - tolerance)
+            upper_bound = high_24h * (1.0 + tolerance)
+            if current_price < lower_bound or current_price > upper_bound:
+                return _final_assessment(
+                    0.0,
+                    ["price_outside_24h_range"],
+                    exclude=True,
+                )
+
     long_return = _safe_float(sample.get("long_return_pct"), None)
     short_return = _safe_float(sample.get("short_return_pct"), None)
     if long_return is None or short_return is None:
@@ -146,7 +173,6 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         score -= _QUALITY_PARAMS.invalid_horizon_penalty
         reasons.append("invalid_horizon_minutes")
 
-    current_price = _safe_float(features.get("current_price") or features.get("close"), None)
     if current_price is None or current_price <= 0:
         score -= _QUALITY_PARAMS.invalid_price_penalty
         reasons.append("missing_or_invalid_price_feature")

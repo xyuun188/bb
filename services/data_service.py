@@ -67,6 +67,10 @@ KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
     "1h": 100,
 }
 TICKER_PERSIST_THROTTLE_SECONDS = 30.0
+TICKER_CACHE_MAX_AGE_SECONDS = max(
+    10.0,
+    float(_MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds),
+)
 
 
 class DataService:
@@ -143,6 +147,8 @@ class DataService:
     async def _persist_ticker_snapshot(self, symbol: str, data: dict[str, Any]) -> None:
         try:
             normalized = self._normalize_symbols([symbol])[0]
+            source = str(data.get("source") or "websocket")
+            timestamp = data.get("timestamp")
             payload = {
                 "last_price": self._safe_float(data.get("last_price"), 0.0),
                 "bid": self._safe_float(data.get("bid"), 0.0),
@@ -154,7 +160,9 @@ class DataService:
                 "raw_data": json.dumps(
                     {
                         "symbol": normalized,
-                        "timestamp": data.get("timestamp"),
+                        "timestamp": timestamp,
+                        "source": source,
+                        "inst_type": data.get("inst_type") or "SWAP",
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -651,22 +659,35 @@ class DataService:
         self._sentiment_refresh_task = asyncio.create_task(self.refresh_sentiment(symbols))
 
     async def _get_ticker_snapshot(self, symbol: str) -> dict[str, Any]:
-        ticker = dict(self.ws_client.latest_tickers.get(symbol, {}) or {})
-        if ticker:
+        normalized = self._normalize_symbols([symbol])[0]
+        ticker = dict(
+            self.ws_client.latest_tickers.get(symbol, {})
+            or self.ws_client.latest_tickers.get(normalized, {})
+            or {}
+        )
+        if ticker and self._is_fresh_ticker_snapshot(ticker):
             bid = self._safe_float(ticker.get("bid"), 0.0)
             ask = self._safe_float(ticker.get("ask"), 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
             if mid and "spread_pct" not in ticker:
                 ticker["spread_pct"] = (ask - bid) / mid * 100 if ask >= bid else 0.0
+            ticker["source"] = ticker.get("source") or "websocket"
+            ticker["inst_type"] = ticker.get("inst_type") or "SWAP"
             return ticker
+        if ticker:
+            logger.info(
+                "ticker cache stale; refreshing from OKX REST",
+                symbol=normalized,
+                age_seconds=self._ticker_snapshot_age_seconds(ticker),
+            )
         try:
-            raw_ticker = await self.rest_client.fetch_ticker(symbol)
+            raw_ticker = await self.rest_client.fetch_ticker(normalized)
             ticker_info = raw_ticker.get("info") or {}
             bid = self._safe_float(raw_ticker.get("bid") or ticker_info.get("bidPx"), 0.0)
             ask = self._safe_float(raw_ticker.get("ask") or ticker_info.get("askPx"), 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
-            return {
-                "symbol": symbol,
+            snapshot = {
+                "symbol": normalized,
                 "last_price": raw_ticker.get("last", 0),
                 "bid": bid,
                 "ask": ask,
@@ -675,10 +696,49 @@ class DataService:
                 "volume_24h": raw_ticker.get("baseVolume", 0),
                 "change_24h_pct": raw_ticker.get("percentage", 0),
                 "spread_pct": ((ask - bid) / mid * 100) if mid and ask and bid else 0,
+                "timestamp": self._ticker_timestamp_from_raw(raw_ticker),
+                "source": "rest",
+                "inst_type": "SWAP",
             }
+            self.ws_client.latest_tickers[normalized] = dict(snapshot)
+            self._on_ticker_update(normalized, snapshot)
+            return snapshot
         except Exception as e:
             logger.debug("failed to fetch ticker", symbol=symbol, error=safe_error_text(e))
+            if ticker:
+                ticker["source"] = ticker.get("source") or "stale_websocket"
+                ticker["stale"] = True
+                ticker["age_seconds"] = self._ticker_snapshot_age_seconds(ticker)
+                return ticker
             return {}
+
+    @staticmethod
+    def _ticker_timestamp_from_raw(raw_ticker: dict[str, Any]) -> int:
+        info = raw_ticker.get("info") if isinstance(raw_ticker, dict) else {}
+        value = raw_ticker.get("timestamp") or (info or {}).get("ts")
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _ticker_snapshot_age_seconds(self, ticker: dict[str, Any]) -> float | None:
+        timestamp = ticker.get("timestamp") if isinstance(ticker, dict) else None
+        try:
+            ts = float(timestamp or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        return max(datetime.now(UTC).timestamp() - ts, 0.0)
+
+    def _is_fresh_ticker_snapshot(self, ticker: dict[str, Any]) -> bool:
+        price = self._safe_float(ticker.get("last_price"), 0.0)
+        if price <= 0:
+            return False
+        age = self._ticker_snapshot_age_seconds(ticker)
+        return age is not None and age <= TICKER_CACHE_MAX_AGE_SECONDS
 
     async def _get_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]

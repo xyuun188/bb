@@ -11,6 +11,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result
+
+
 @dataclass
 class FeatureVector:
     """Unified feature snapshot for a symbol at a point in time.
@@ -32,6 +40,10 @@ class FeatureVector:
     volume: float = 0.0
     change_24h_pct: float = 0.0
     spread_pct: float = 0.0
+    price_source: str = ""
+    indicator_close_price: float = 0.0
+    indicator_price_gap_pct: float = 0.0
+    price_reconciliation_warning: str = ""
 
     # --- Technical indicators (from latest candle) ---
     rsi_14: float = 50.0
@@ -189,34 +201,36 @@ def build_feature_vector(
 
     # Ticker data
     if ticker:
-        fv.current_price = ticker.get("last_price", 0)
+        fv.current_price = _safe_float(ticker.get("last_price"), 0.0)
         fv.close = fv.current_price
-        fv.bid = ticker.get("bid", 0)
-        fv.ask = ticker.get("ask", 0)
-        fv.high_24h = ticker.get("high_24h", 0)
-        fv.low_24h = ticker.get("low_24h", 0)
-        fv.volume_24h = ticker.get("volume_24h", 0)
-        fv.change_24h_pct = ticker.get("change_24h_pct", 0)
-        fv.spread_pct = ticker.get("spread_pct", 0)
+        fv.price_source = str(ticker.get("source") or "ticker")
+        fv.bid = _safe_float(ticker.get("bid"), 0.0)
+        fv.ask = _safe_float(ticker.get("ask"), 0.0)
+        fv.high_24h = _safe_float(ticker.get("high_24h"), 0.0)
+        fv.low_24h = _safe_float(ticker.get("low_24h"), 0.0)
+        fv.volume_24h = _safe_float(ticker.get("volume_24h"), 0.0)
+        fv.change_24h_pct = _safe_float(ticker.get("change_24h_pct"), 0.0)
+        fv.spread_pct = _safe_float(ticker.get("spread_pct"), 0.0)
 
     # Technical indicators
     if indicators:
         for key, value in indicators.items():
             if hasattr(fv, key):
                 setattr(fv, key, value)
+        fv.indicator_close_price = _safe_float(indicators.get("close"), 0.0)
         if fv.current_price <= 0 and fv.close > 0:
             fv.current_price = fv.close
+            fv.price_source = fv.price_source or "indicator_close_fallback"
         if fv.close <= 0 and fv.current_price > 0:
             fv.close = fv.current_price
         if fv.current_price > 0 and fv.close > 0:
             price_gap = abs(fv.current_price - fv.close) / max(fv.close, 1e-12)
             if price_gap > 0.20:
-                fv.current_price = fv.close
-                if fv.bid <= 0 or abs(fv.bid - fv.close) / max(fv.close, 1e-12) > 0.20:
-                    fv.bid = fv.close
-                if fv.ask <= 0 or abs(fv.ask - fv.close) / max(fv.close, 1e-12) > 0.20:
-                    fv.ask = fv.close
-                fv.spread_pct = 0.0
+                fv.indicator_price_gap_pct = price_gap * 100
+                fv.price_reconciliation_warning = (
+                    "ticker_current_price_kept_indicator_close_diverged"
+                )
+                fv.close = fv.current_price
         if fv.bid <= 0 and fv.current_price > 0:
             fv.bid = fv.current_price
         if fv.ask <= 0 and fv.current_price > 0:

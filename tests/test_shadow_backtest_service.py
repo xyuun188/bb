@@ -105,6 +105,8 @@ async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
         decision_action="hold",
         entry_price=100.0,
         horizon_minutes=10,
+        status="pending",
+        note="",
         feature_snapshot={
             "adx_14": 28.0,
             "volume_ratio": 1.4,
@@ -135,6 +137,41 @@ async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
     }
     assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
     assert repo.memories[0]["extra"]["actual_price"] == 101.0
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_service_quarantines_dirty_completed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=8,
+        decision_id=124,
+        model_name="ensemble_trader",
+        symbol="PROS/USDT",
+        decision_action="long",
+        entry_price=0.3902,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={
+            "current_price": 0.3902,
+            "low_24h": 0.5491,
+            "high_24h": 0.5707,
+            "spread_pct": 0.03,
+        },
+    )
+    repo.due_rows = [row]
+
+    await _service(repo, latest_price=0.3910).update_due()
+
+    assert row.status == "quarantined"
+    assert "[training_quarantine] price_outside_24h_range" in row.note
+    assert repo.memories == []
+    assert repo.completed[0]["actual_price"] == pytest.approx(0.3910)
 
 
 def test_shadow_backtest_side_label() -> None:

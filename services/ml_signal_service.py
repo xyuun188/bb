@@ -36,6 +36,7 @@ from services.training_data_quality import (
     governance_report,
     quality_report,
 )
+from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
 logger = structlog.get_logger(__name__)
 
@@ -716,6 +717,26 @@ class MLSignalService:
 
                 self._training = True
                 self._last_train_started_at = datetime.now(UTC).isoformat()
+                quarantine_result = await self._quarantine_dirty_training_samples()
+                completed_count = await self._completed_shadow_sample_count()
+                new_samples = max(completed_count - last_completed_count, 0)
+                if completed_count < MIN_TRAINING_SAMPLES:
+                    result = {
+                        "trained": False,
+                        "reason": "not_enough_clean_samples",
+                        "completed_sample_count": completed_count,
+                        "last_trained_sample_count": last_sample_count,
+                        "last_trained_completed_sample_count": last_completed_count,
+                        "new_sample_count": new_samples,
+                        "training_policy": training_policy,
+                        "training_quarantine": quarantine_result,
+                        "message": (
+                            f"自动隔离脏样本后，干净影子复盘样本不足："
+                            f"{completed_count} < {MIN_TRAINING_SAMPLES}。继续累计可训练样本。"
+                        ),
+                    }
+                    self._last_train_result = result
+                    return result
                 rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
                 quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
@@ -740,6 +761,7 @@ class MLSignalService:
                         trained_metadata.get("last_trained_completed_shadow_sample_count")
                         or completed_count
                     ),
+                    "training_quarantine": quarantine_result,
                     "training_policy": training_policy,
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": "本地 ML 盈亏质量模型已自动完成训练并热加载。",
@@ -925,6 +947,17 @@ class MLSignalService:
         """Return completed shadow samples through a public dashboard boundary."""
 
         return await self._completed_shadow_sample_count()
+
+    async def _quarantine_dirty_training_samples(
+        self,
+        *,
+        only_newer_than_id: int | None = None,
+    ) -> dict[str, Any]:
+        return await quarantine_dirty_shadow_samples(
+            batch_size=_LOCAL_ML_PARAMS.auto_quarantine_batch_size,
+            max_batches=_LOCAL_ML_PARAMS.auto_quarantine_max_batches,
+            only_newer_than_id=only_newer_than_id,
+        )
 
     def _parse_datetime(self, value: Any) -> datetime | None:
         if not value:

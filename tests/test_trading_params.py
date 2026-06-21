@@ -43,6 +43,8 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["entry_feature_ranker"]["tradable_max_day_change_pct"] == 22.0
     assert snapshot["training_data_quality"]["hold_observation_penalty"] == 0.55
     assert snapshot["training_data_quality"]["fast_loss_exit_minutes"] == 3.0
+    assert snapshot["training_data_quality"]["abnormal_indicator_price_gap_pct"] == 20.0
+    assert snapshot["training_data_quality"]["training_price_24h_range_tolerance_pct"] == 0.03
     assert snapshot["training_data_quality"]["allowed_sequence_timeframes"] == (
         "1m",
         "5m",
@@ -50,6 +52,8 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
         "1h",
     )
     assert snapshot["local_ml_training"]["training_shadow_sample_limit"] == 20000
+    assert snapshot["local_ml_training"]["auto_quarantine_batch_size"] == 1000
+    assert snapshot["local_ml_training"]["auto_quarantine_max_batches"] == 5
     assert snapshot["local_ml_training"]["training_trade_sample_limit"] == 8000
     assert snapshot["local_ml_training"]["training_sequence_sample_limit"] == 12000
     assert snapshot["local_ml_training"]["local_tools_min_new_trade_samples"] == 50

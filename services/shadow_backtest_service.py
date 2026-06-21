@@ -14,6 +14,7 @@ from config.settings import FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
+from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)
 
@@ -155,6 +156,15 @@ class ShadowBacktestService:
                         missed_opportunity=missed,
                         note=note,
                     )
+                    quarantine_result = quarantine_completed_shadow_row(row)
+                    if quarantine_result.get("applied"):
+                        logger.info(
+                            "shadow backtest quarantined from training",
+                            shadow_backtest_id=getattr(row, "id", None),
+                            symbol=getattr(row, "symbol", None),
+                            reasons=quarantine_result.get("reasons"),
+                        )
+                        continue
                     if settings.shadow_memory_enabled:
                         await self._record_memory_in_session(
                             repo,

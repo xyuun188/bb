@@ -43,6 +43,42 @@ EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 
+def _status_error_payload(section: str, exc: BaseException) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "section": section,
+        "error": safe_error_text(exc, limit=180),
+    }
+
+
+def _safe_status_section(
+    result: Any,
+    *,
+    section: str,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(result, BaseException):
+        logger.warning(
+            "data collection status section failed",
+            section=section,
+            error=safe_error_text(result),
+        )
+        payload = dict(fallback)
+        payload.update(_status_error_payload(section, result))
+        return payload
+    if isinstance(result, dict):
+        return result
+    payload = dict(fallback)
+    payload.update(
+        {
+            "status": "error",
+            "section": section,
+            "error": f"{section} returned non-object status",
+        }
+    )
+    return payload
+
+
 def _visible_local_ai_training_status(
     raw_status: str,
     *,
@@ -403,6 +439,10 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             "local_ml_signal": ml_quality["governance_report"],
             "local_ml_quality_report": ml_quality["quality_report"],
             "local_ml_trainable_shadow_sample_count": int(len(ml_frame)),
+            "training_quarantine": {
+                "status": "not_run",
+                "message": "状态读取接口只读；点击清洗刷新或等待自动训练时执行隔离。",
+            },
             "cleanup_effective": True,
             "artifact_refresh_targets": [
                 "local_ml_signal",
@@ -588,11 +628,32 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 
 @router.get("/data-collection/status")
 async def get_data_collection_status() -> dict[str, Any]:
-    source_stats, quality, local_ai_status, governance = await asyncio.gather(
+    source_stats_result, quality_result, local_ai_status_result, governance_result = await asyncio.gather(
         _source_breakdown(),
         _training_sample_quality(),
         _local_ai_training_status(),
         _training_governance_snapshot(),
+        return_exceptions=True,
+    )
+    source_stats = _safe_status_section(
+        source_stats_result,
+        section="source_breakdown",
+        fallback={"news": {}, "social": {}, "market": {}},
+    )
+    quality = _safe_status_section(
+        quality_result,
+        section="training_sample_quality",
+        fallback={"sampled": 0, "included": 0, "top_sources": [], "top_reasons": []},
+    )
+    local_ai_status = _safe_status_section(
+        local_ai_status_result,
+        section="local_ai_training_status",
+        fallback={"available": False, "status": "error"},
+    )
+    governance = _safe_status_section(
+        governance_result,
+        section="training_governance",
+        fallback={"cleanup_effective": False},
     )
     scrapling_installed = _scrapling_installed()
     configured_source_cards = _configured_source_cards()
@@ -664,6 +725,17 @@ async def get_data_collection_status() -> dict[str, Any]:
 async def refresh_training_governance(
     _access: None = Depends(require_dashboard_write_access),
 ) -> dict[str, Any]:
+    quarantine_result: dict[str, Any]
+    try:
+        from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
+
+        quarantine_result = await quarantine_dirty_shadow_samples(
+            batch_size=_LOCAL_ML_TRAINING_PARAMS.auto_quarantine_batch_size,
+            max_batches=_LOCAL_ML_TRAINING_PARAMS.auto_quarantine_max_batches,
+        )
+    except Exception as exc:
+        quarantine_result = _status_error_payload("training_quarantine", exc)
+
     ml_signal_service = _dash._dashboard_ml_signal_service()
     local_ai_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
     ml_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
@@ -691,6 +763,7 @@ async def refresh_training_governance(
     payload["status"] = "ok"
     payload["message"] = "训练数据治理刷新已执行：按清洗视图重训本地模型并刷新向量索引。"
     payload["refresh_result"] = {
+        "training_quarantine": quarantine_result,
         "local_ml_signal": ml_result,
         "local_ai_tools": local_ai_result,
         "vector_memory": vector_result,

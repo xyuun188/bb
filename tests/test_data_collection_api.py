@@ -285,6 +285,15 @@ async def test_training_governance_refresh_triggers_clean_artifact_refresh(
     )
     monkeypatch.setattr(data_collection_module, "get_data_collection_status", fake_status)
 
+    async def fake_quarantine(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append("quarantine")
+        return {"status": "clean", "quarantined_count": 0}
+
+    monkeypatch.setattr(
+        "services.shadow_training_quarantine.quarantine_dirty_shadow_samples",
+        fake_quarantine,
+    )
+
     app = create_app()
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -293,7 +302,8 @@ async def test_training_governance_refresh_triggers_clean_artifact_refresh(
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert calls == ["ml:True", "local_ai:True", "vector"]
+    assert calls == ["quarantine", "ml:True", "local_ai:True", "vector"]
+    assert body["refresh_result"]["training_quarantine"]["status"] == "clean"
     assert body["refresh_result"]["vector_memory"]["indexed"] == 2
 
 
@@ -365,6 +375,103 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert result["trained"] is True
     assert captured["kwargs"]["source"] == "dashboard_training_governance_refresh"
     assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_is_read_only_for_training_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    quarantine_calls: list[str] = []
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    async def fake_quarantine(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        quarantine_calls.append("called")
+        return {"status": "clean"}
+
+    monkeypatch.setattr(
+        "services.shadow_training_quarantine.quarantine_dirty_shadow_samples",
+        fake_quarantine,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_shadow_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_trade_reflection_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_closed_position_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_sequence_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._load_text_sentiment_samples",
+        lambda _limit: _async_value([]),
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_shadow_training_rows",
+        lambda *, limit: _async_value([]),
+    )
+
+    try:
+        app = create_app()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get("/api/data-collection/status")
+    finally:
+        await close_db()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert quarantine_calls == []
+    assert body["training"]["governance"]["training_quarantine"]["status"] == "not_run"
+    assert "external_event_scraper_interval_seconds" in body["config"]
+    assert "external_event_scraper_sources" in body["config"]
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_keeps_config_when_governance_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", True)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    async def failing_governance() -> dict[str, Any]:
+        raise RuntimeError("governance exploded")
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "_training_governance_snapshot",
+        failing_governance,
+    )
+
+    try:
+        app = create_app()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get("/api/data-collection/status")
+    finally:
+        await close_db()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["config"]["external_event_scraper_enabled"] is True
+    assert "api_channels" in body["config"]
+    assert "cryptopanic" in body["config"]["api_channels"]
+    assert "configured" in body["config"]["api_channels"]["cryptopanic"]
+    assert body["training"]["governance"]["status"] == "error"
+    assert "governance exploded" in body["training"]["governance"]["error"]
 
 
 async def _async_value(value: Any) -> Any:

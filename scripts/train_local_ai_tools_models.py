@@ -25,6 +25,7 @@ from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
+from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import annotate_training_payload
 
@@ -470,7 +471,18 @@ async def _main() -> None:
         default=_LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
     )
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--skip-quarantine", action="store_true")
     args = parser.parse_args()
+
+    quarantine_result = {
+        "skipped": True,
+        "reason": "skip_quarantine flag enabled",
+    }
+    if not args.skip_quarantine:
+        quarantine_result = await quarantine_dirty_shadow_samples(
+            batch_size=min(args.shadow_limit, 1000),
+            max_batches=max((int(args.shadow_limit) + 999) // 1000, 1),
+        )
 
     shadow_samples = await _load_shadow_samples(args.shadow_limit)
     trade_reflection_samples = await _load_trade_reflection_samples(args.trade_limit)
@@ -495,6 +507,7 @@ async def _main() -> None:
         "text_sentiment_samples": training_payload["text_sentiment_samples"],
         "completed_shadow_sample_count": completed_shadow_count,
         "completed_trade_sample_count": completed_trade_count,
+        "training_quarantine": quarantine_result,
         "quality_report": training_payload["quality_report"],
         "governance_report": training_payload["governance_report"],
     }

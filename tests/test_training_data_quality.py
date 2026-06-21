@@ -138,6 +138,49 @@ def test_shadow_market_data_quality_issue_is_excluded_from_training() -> None:
     assert "market_data_quality:price_source_split" in assessment.reasons
 
 
+def test_shadow_price_reconciliation_warning_is_excluded_from_training() -> None:
+    assessment = assess_shadow_sample(
+        _shadow_sample(
+            features={
+                "symbol": "PROS/USDT",
+                "current_price": 0.5666,
+                "close": 0.5666,
+                "indicator_close_price": 0.3902,
+                "indicator_price_gap_pct": 45.18,
+                "price_reconciliation_warning": (
+                    "ticker_current_price_kept_indicator_close_diverged"
+                ),
+                "spread_pct": 0.03,
+            }
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert assessment.weight == 0.0
+    assert (
+        "price_reconciliation:ticker_current_price_kept_indicator_close_diverged"
+        in assessment.reasons
+    )
+
+
+def test_shadow_price_outside_24h_range_is_excluded_from_training() -> None:
+    assessment = assess_shadow_sample(
+        _shadow_sample(
+            features={
+                "symbol": "PROS/USDT",
+                "current_price": 0.3902,
+                "low_24h": 0.5491,
+                "high_24h": 0.5707,
+                "spread_pct": 0.03,
+            }
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert assessment.weight == 0.0
+    assert "price_outside_24h_range" in assessment.reasons
+
+
 def test_training_governance_report_preserves_raw_records_and_targets_refresh() -> None:
     report = governance_report(
         {

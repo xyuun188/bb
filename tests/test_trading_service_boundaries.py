@@ -2622,6 +2622,65 @@ async def test_ml_signal_auto_train_uses_completed_cursor_for_new_samples() -> N
 
 
 @pytest.mark.asyncio
+async def test_ml_signal_auto_train_quarantines_before_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MLSignalService()
+    counts = [320, 318]
+    calls: list[str] = []
+
+    async def completed_shadow_sample_count() -> int:
+        return counts.pop(0) if counts else 318
+
+    async def quarantine_dirty_training_samples(**_kwargs: Any) -> dict[str, Any]:
+        calls.append("quarantine")
+        return {"scanned": 320, "quarantined": 2}
+
+    def current_metadata() -> dict[str, Any]:
+        return {"sample_count": 200, "last_trained_completed_shadow_sample_count": 200}
+
+    async def load_rows(limit: int) -> list[Any]:
+        assert limit > 0
+        calls.append("load_rows")
+        return [object()]
+
+    def quality_report(_rows: list[Any]) -> dict[str, Any]:
+        calls.append("quality_report")
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[Any]) -> list[Any]:
+        calls.append("build_frame")
+        return [object()]
+
+    def train_frame(_frame: list[Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append("train_frame")
+        assert kwargs["completed_sample_count"] == 318
+        return {
+            "sample_count": 318,
+            "last_trained_completed_shadow_sample_count": 318,
+            "trained_at": datetime.now(UTC).isoformat(),
+        }
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = current_metadata  # type: ignore[method-assign]
+    service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
+    service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    monkeypatch.setattr(trading_service, "datetime", datetime)
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
+    monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
+    monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+
+    result = await service.maybe_auto_train(force=True)
+
+    assert result["trained"] is True
+    assert result["completed_sample_count"] == 318
+    assert result["training_quarantine"]["quarantined"] == 2
+    assert calls[:4] == ["quarantine", "load_rows", "quality_report", "build_frame"]
+    assert "train_frame" in calls
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_uses_injected_high_risk_review_gate_boundary():
     calls: list[tuple[str, str, int]] = []
 

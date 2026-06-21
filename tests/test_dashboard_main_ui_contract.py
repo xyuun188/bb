@@ -530,6 +530,35 @@ def test_dashboard_market_uses_open_position_snapshot_contract() -> None:
     assert "buildTickersFromPositions(marketPositions)" in script
 
 
+def test_opening_funnel_request_failure_uses_unavailable_fallback() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    fetch_block = script[script.index("async function fetchOpeningFunnel"):script.index("function renderOpeningFunnelUnavailable")]
+
+    assert "try {" in fetch_block
+    assert "renderOpeningFunnelUnavailable({ detail: err?.message || '开仓漏斗接口请求失败' })" in fetch_block
+
+
+def test_local_ml_dashboard_request_failure_degrades_per_endpoint() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    fetch_block = script[script.index("async function fetchMLSignalDashboard"):script.index("function renderMLSignalDashboard")]
+
+    assert "fetchJSON('/api/ml-signal/status').catch(err => ({" in fetch_block
+    assert "status: 'request_error'" in fetch_block
+    assert "fetchJSON('/api/local-ai-tools/status').catch(err => ({" in fetch_block
+    assert "本地 ML 状态接口请求失败" in fetch_block
+    assert "本地量化工具状态接口请求失败" in fetch_block
+
+
+def test_data_collection_request_failure_still_renders_error_fallback() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    fetch_block = script[script.index("async function fetchDataCollectionStatus"):script.index("function collectionStatusTone")]
+
+    assert "try {" in fetch_block
+    assert "数据采集状态接口请求失败" in fetch_block
+    assert "state.dataCollectionStatus = data || null;" in script
+    assert "renderDataCollectionDashboard()" in script
+
+
 @pytest.mark.asyncio
 async def test_dashboard_tickers_do_not_fallback_to_watchlist(
     monkeypatch: pytest.MonkeyPatch,
