@@ -3328,14 +3328,18 @@ class StrategyLearningEngine:
         result["probe_fraction"] = _safe_float(runtime.get("probe_fraction"), 0.0)
         result["max_probe_size_pct"] = _safe_float(runtime.get("max_probe_size_pct"), 0.0)
         entry_filters = _safe_dict(runtime.get("entry_filters"))
+        default_filters = default_entry_filters(reason="strategy_learning_context_default")
         result["entry_filters"] = entry_filters
         result["min_entry_volume_ratio"] = _safe_float(
             entry_filters.get("min_entry_volume_ratio"),
-            _safe_float(runtime.get("min_entry_volume_ratio"), settings.min_entry_volume_ratio),
+            _safe_float(
+                runtime.get("min_entry_volume_ratio"),
+                default_filters.min_entry_volume_ratio,
+            ),
         )
         result["min_entry_adx"] = _safe_float(
             entry_filters.get("min_entry_adx"),
-            _safe_float(runtime.get("min_entry_adx"), settings.min_entry_adx),
+            _safe_float(runtime.get("min_entry_adx"), default_filters.min_entry_adx),
         )
         result["entry_filters_are_hard_gate"] = False
         result["strategy_learning_sizing"] = {

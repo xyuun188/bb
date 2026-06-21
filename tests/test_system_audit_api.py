@@ -64,22 +64,39 @@ async def test_system_audit_status_aggregates_root_causes(
         "_model_training_audit",
         _async_card("model_training", "warning", "模型未就绪", title="模型与训练"),
     )
+    monkeypatch.setattr(
+        system_audit,
+        "_strategy_gate_contract_audit",
+        lambda: system_audit._audit_card(
+            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
+        ),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_source_visible_text_audit",
+        lambda: system_audit._audit_card(
+            "visible_text_encoding", "中文显示与乱码回归", "ok", "无裸乱码"
+        ),
+    )
 
     payload = await system_audit.system_audit_status()
 
     assert payload["status"] == "critical"
     assert payload["status_label"] == "异常"
     assert payload["summary"] == {
-        "cards": 6,
+        "cards": 8,
         "critical": 1,
         "warning": 2,
-        "ok": 3,
+        "ok": 5,
         "findings": 3,
+        "nodes": 11,
     }
     assert [card["status"] for card in payload["cards"]] == [
         "critical",
         "warning",
         "warning",
+        "ok",
+        "ok",
         "ok",
         "ok",
         "ok",
@@ -89,6 +106,12 @@ async def test_system_audit_status_aggregates_root_causes(
         "market_data",
         "model_training",
     ]
+    node_keys = {node["key"] for node in payload["nodes"]}
+    assert "strategy_gate_contract" in node_keys
+    assert "visible_text_encoding" in node_keys
+    card_keys = {card["key"] for card in payload["cards"]}
+    assert "strategy_gate_contract" in card_keys
+    assert "visible_text_encoding" in card_keys
     assert "只读巡检" in payload["safety_note"]
     assert "人工确认" in payload["safety_note"]
 
@@ -125,6 +148,20 @@ async def test_system_audit_status_wraps_failed_section(
         system_audit,
         "_model_training_audit",
         _async_card("model_training", "ok", "模型正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_strategy_gate_contract_audit",
+        lambda: system_audit._audit_card(
+            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
+        ),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_source_visible_text_audit",
+        lambda: system_audit._audit_card(
+            "visible_text_encoding", "中文显示与乱码回归", "ok", "无裸乱码"
+        ),
     )
 
     payload = await system_audit.system_audit_status()

@@ -411,10 +411,16 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "fetchJSON('/api/system-audit/status')" in script
     assert "function renderSystemAudit" in script
     assert "function renderSystemAuditCards" in script
+    assert "function renderSystemAuditNodes" in script
     assert "function renderSystemAuditRootCauses" in script
+    assert "renderSystemAuditNodes(data.nodes)" in script
+    assert "system-audit-node-flow" in script
+    assert "system-audit-node-checks" in script
     assert "系统巡检接口请求失败" in script
     assert "补历史仓位、重启服务、批量训练等动作必须人工确认" in script
     assert ".system-audit-layout" in style
+    assert ".system-audit-node-grid" in style
+    assert ".system-audit-node" in style
     assert ".system-audit-card" in style
     assert ".system-audit-root-cause" in style
     assert ".system-audit-health-strip" in style

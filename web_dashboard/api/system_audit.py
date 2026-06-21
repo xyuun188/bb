@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from collections import Counter
@@ -39,6 +40,54 @@ STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
+
+
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
+SOURCE_MOJIBAKE_SCAN_TARGETS = (
+    ("ai_brain", "*.py"),
+    ("config", "*.py"),
+    ("core", "*.py"),
+    ("db", "*.py"),
+    ("models", "*.py"),
+    ("services", "*.py"),
+    ("web_dashboard/api", "*.py"),
+    ("web_dashboard/static/js", "*.js"),
+    ("web_dashboard/static/css", "*.css"),
+    ("web_dashboard/static", "*.html"),
+    ("scripts", "*.py"),
+)
+SOURCE_MOJIBAKE_MARKERS = (
+    _u("\\u951f"),
+    _u("\\u951b"),
+    _u("\\u9286"),
+    _u("\\u95ab"),
+    _u("\\u95b8"),
+    _u("\\u95b9"),
+    _u("\\u9227"),
+    _u("\\u9225"),
+    _u("\\u93c8"),
+    _u("\\u93c3"),
+    _u("\\u7487"),
+    _u("\\u9352"),
+    _u("\\u9359"),
+    _u("\\u7459"),
+    _u("\\u93b4"),
+    _u("\\u93c1"),
+    _u("\\u7edb"),
+    _u("\\u6d5c\\u5fd4\\u5d2f"),
+    _u("\\u9429"),
+    _u("\\u7ee0\\u20ac"),
+    _u("\\ufffd"),
+)
+STRATEGY_GATE_FORBIDDEN_PATTERNS = (
+    "settings.min_entry_volume_ratio",
+    "settings.min_entry_adx",
+    "if False and",
+)
+STRATEGY_GATE_ALLOWED_PATHS = {"services/runtime_entry_filters.py"}
 
 
 def _now() -> datetime:
@@ -284,7 +333,9 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             okx_price = _safe_float(valuation.get("current_price"))
             local_pnl = _safe_float(position.unrealized_pnl)
             okx_pnl = _safe_float(valuation.get("unrealized_pnl"))
-            price_gap = _relative_gap(local_price, okx_price) if local_price > 0 and okx_price > 0 else 0.0
+            price_gap = (
+                _relative_gap(local_price, okx_price) if local_price > 0 and okx_price > 0 else 0.0
+            )
             pnl_gap = abs(local_pnl - okx_pnl)
             if price_gap < POSITION_PRICE_SPLIT_WARN_PCT and pnl_gap < POSITION_PNL_SPLIT_WARN_USDT:
                 continue
@@ -333,8 +384,8 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             {"label": "OKX持仓", "value": exchange_open_count},
         ],
         next_actions=[
-            "若出现分裂，先运行 OKX 同步并复查持仓页；不要基于分裂数据调整策略参数。" ,
-            "若同一币种反复分裂，检查 OKX 字段解析、合约面值 ctVal、行情缓存和持仓同步任务。" ,
+            "若出现分裂，先运行 OKX 同步并复查持仓页；不要基于分裂数据调整策略参数。",
+            "若同一币种反复分裂，检查 OKX 字段解析、合约面值 ctVal、行情缓存和持仓同步任务。",
         ],
     )
 
@@ -582,6 +633,131 @@ async def _model_training_audit() -> dict[str, Any]:
     )
 
 
+def _source_scan_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _iter_source_scan_files() -> list[Path]:
+    root = _source_scan_root()
+    files: list[Path] = []
+    for dirname, pattern in SOURCE_MOJIBAKE_SCAN_TARGETS:
+        base = root / dirname
+        if not base.exists():
+            continue
+        files.extend(path for path in base.rglob(pattern) if path.is_file())
+    return sorted(set(files), key=lambda item: item.as_posix())
+
+
+def _relative_source_path(path: Path) -> str:
+    try:
+        return path.relative_to(_source_scan_root()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _source_visible_text_audit() -> dict[str, Any]:
+    offenders: list[dict[str, Any]] = []
+    scanned = 0
+    for path in _iter_source_scan_files():
+        scanned += 1
+        text = path.read_text(encoding="utf-8", errors="replace")
+        hits = sorted({marker for marker in SOURCE_MOJIBAKE_MARKERS if marker in text})
+        if hits:
+            offenders.append(
+                {
+                    "path": _relative_source_path(path),
+                    "markers": [
+                        marker.encode("unicode_escape").decode("ascii") for marker in hits[:8]
+                    ],
+                }
+            )
+    status = "critical" if offenders else "ok"
+    return _audit_card(
+        "visible_text_encoding",
+        "中文显示与乱码回归",
+        status,
+        (
+            "源码和前端静态资源未发现裸乱码。"
+            if not offenders
+            else "发现源码/前端静态资源重新出现裸乱码。"
+        ),
+        details={
+            "scanned_files": scanned,
+            "offender_count": len(offenders),
+            "offenders": offenders[:20],
+            "scope": [f"{dirname}/{pattern}" for dirname, pattern in SOURCE_MOJIBAKE_SCAN_TARGETS],
+        },
+        evidence=[
+            {"label": "扫描文件", "value": scanned},
+            {"label": "乱码文件", "value": len(offenders)},
+        ],
+        next_actions=[
+            "若乱码文件不为 0，先定位来源是源码文案、模型返回还是历史数据，不要只在前端替换显示。",
+            "历史数据修复样本必须使用 Unicode 转义，不允许裸乱码写入源码。",
+        ],
+    )
+
+
+def _strategy_gate_contract_audit() -> dict[str, Any]:
+    root = _source_scan_root()
+    scan_paths = (
+        root / "ai_brain",
+        root / "services",
+        root / "risk_manager",
+        root / "web_dashboard/api/dashboard.py",
+    )
+    files: list[Path] = []
+    for path in scan_paths:
+        if path.is_file():
+            files.append(path)
+        elif path.exists():
+            files.extend(candidate for candidate in path.rglob("*.py") if candidate.is_file())
+    offenders: list[dict[str, Any]] = []
+    for path in sorted(set(files), key=lambda item: item.as_posix()):
+        rel_path = _relative_source_path(path)
+        if rel_path in STRATEGY_GATE_ALLOWED_PATHS:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        hits = [pattern for pattern in STRATEGY_GATE_FORBIDDEN_PATTERNS if pattern in text]
+        if hits:
+            offenders.append({"path": rel_path, "patterns": hits})
+    try:
+        runtime_source = ast.parse(
+            (root / "services/runtime_entry_filters.py").read_text(encoding="utf-8")
+        )
+        runtime_contract_available = any(
+            isinstance(node, ast.ClassDef) and node.name == "RuntimeEntryFilters"
+            for node in ast.walk(runtime_source)
+        )
+    except Exception:
+        runtime_contract_available = False
+    status = "critical" if offenders or not runtime_contract_available else "ok"
+    return _audit_card(
+        "strategy_gate_contract",
+        "策略门槛契约",
+        status,
+        (
+            "策略运行时门槛保持解释/排序/仓位参考，不是固定硬开仓门槛。"
+            if status == "ok"
+            else "发现固定门槛或死分支残留，可能重新把策略卡死。"
+        ),
+        details={
+            "runtime_contract_available": runtime_contract_available,
+            "forbidden_patterns": list(STRATEGY_GATE_FORBIDDEN_PATTERNS),
+            "offender_count": len(offenders),
+            "offenders": offenders[:20],
+        },
+        evidence=[
+            {"label": "固定门槛残留", "value": len(offenders)},
+            {"label": "运行时契约", "value": "存在" if runtime_contract_available else "缺失"},
+        ],
+        next_actions=[
+            "如发现 settings.min_entry_* 直接参与运行链路，必须改为 RuntimeEntryFilters 动态参考。",
+            "低量比、ADX、置信度只能影响排序、仓位、杠杆和解释；不能作为硬开仓门槛。",
+        ],
+    )
+
+
 def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for card in cards:
@@ -635,7 +811,7 @@ def _node_from_cards(
         "title": title,
         "layer": layer,
         "status": status,
-        "summary": "；".join(summaries[:2]) or "节点暂无异常。", 
+        "summary": "；".join(summaries[:2]) or "节点暂无异常。",
         "impact": impact,
         "upstream": upstream or [],
         "downstream": downstream or [],
@@ -650,65 +826,122 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cards_by_key = _card_map(cards)
     return [
         _node_from_cards(
-            "runtime_loop", "调度与心跳", "运行层", cards_by_key, ["trade_loop"],
-            impact="决定系统是否持续分析、是否卡在某个阶段。", 
+            "runtime_loop",
+            "调度与心跳",
+            "运行层",
+            cards_by_key,
+            ["trade_loop"],
+            impact="决定系统是否持续分析、是否卡在某个阶段。",
             downstream=["market_data", "position_sync", "strategy_decision"],
             checks=["最近10分钟分析", "最近2小时订单", "当前持仓数量"],
         ),
         _node_from_cards(
-            "market_data", "行情与K线", "数据层", cards_by_key, ["market_data"],
-            impact="影响开仓候选、预期收益、止盈止损和训练特征。", 
+            "market_data",
+            "行情与K线",
+            "数据层",
+            cards_by_key,
+            ["market_data"],
+            impact="影响开仓候选、预期收益、止盈止损和训练特征。",
             upstream=["runtime_loop"],
             downstream=["strategy_decision", "risk_guard", "training_data"],
             checks=["Ticker新鲜度", "1m/5m/15m/1h K线覆盖", "币种覆盖"],
         ),
         _node_from_cards(
-            "model_training", "模型与训练数据", "模型层", cards_by_key, ["model_training"],
-            impact="影响盈利预测、时序预测、情绪预测、本地ML过滤和样本学习。", 
+            "model_training",
+            "模型与训练数据",
+            "模型层",
+            cards_by_key,
+            ["model_training"],
+            impact="影响盈利预测、时序预测、情绪预测、本地ML过滤和样本学习。",
             upstream=["market_data"],
             downstream=["strategy_decision", "training_data"],
             checks=["本地量化工具", "影子样本", "交易样本", "外部采集源"],
         ),
         _node_from_cards(
-            "strategy_decision", "策略决策质量", "策略层", cards_by_key, ["strategy_quality"],
-            impact="影响是否开仓、仓位大小、重复亏损复开和快进快出。", 
+            "strategy_decision",
+            "策略决策质量",
+            "策略层",
+            cards_by_key,
+            ["strategy_quality"],
+            impact="影响是否开仓、仓位大小、重复亏损复开和快进快出。",
             upstream=["market_data", "model_training", "position_sync"],
             downstream=["risk_guard", "okx_execution"],
             checks=["负净收益候选", "零净收益候选", "快亏平样本", "拦截原因"],
         ),
         _node_from_cards(
-            "risk_guard", "风控与守门", "风控层", cards_by_key, ["strategy_quality", "position_price_integrity"],
-            impact="影响动态证据、低质量释放、快速平仓和下单前校验。", 
+            "strategy_gate_contract",
+            "策略门槛契约",
+            "策略层",
+            cards_by_key,
+            ["strategy_gate_contract"],
+            impact="防止旧固定阈值、死分支、伪硬门槛重新卡住开仓。",
+            upstream=["model_training", "strategy_decision"],
+            downstream=["risk_guard", "okx_execution"],
+            checks=["RuntimeEntryFilters", "settings.min_entry_*残留", "if False死分支"],
+        ),
+        _node_from_cards(
+            "risk_guard",
+            "风控与守门",
+            "风控层",
+            cards_by_key,
+            ["strategy_quality", "position_price_integrity"],
+            impact="影响动态证据、低质量释放、快速平仓和下单前校验。",
             upstream=["strategy_decision", "position_sync"],
             downstream=["okx_execution", "position_sync"],
             checks=["持仓价一致性", "快亏平", "风险证据", "执行原因"],
         ),
         _node_from_cards(
-            "okx_execution", "OKX执行与历史对账", "执行层", cards_by_key, ["okx_reconciliation", "position_price_integrity"],
-            impact="影响下单、平仓、历史仓位、账户余额和盈亏记录。", 
+            "okx_execution",
+            "OKX执行与历史对账",
+            "执行层",
+            cards_by_key,
+            ["okx_reconciliation", "position_price_integrity"],
+            impact="影响下单、平仓、历史仓位、账户余额和盈亏记录。",
             upstream=["risk_guard"],
             downstream=["position_sync", "training_data"],
             checks=["缺失历史仓", "OKX持仓快照", "价格/PnL对齐"],
         ),
         _node_from_cards(
-            "position_sync", "持仓同步与PnL", "同步层", cards_by_key, ["position_price_integrity", "okx_reconciliation"],
-            impact="影响主面板余额、持仓分析、平仓判断和训练标签。", 
+            "position_sync",
+            "持仓同步与PnL",
+            "同步层",
+            cards_by_key,
+            ["position_price_integrity", "okx_reconciliation"],
+            impact="影响主面板余额、持仓分析、平仓判断和训练标签。",
             upstream=["okx_execution"],
             downstream=["strategy_decision", "training_data", "dashboard_observability"],
             checks=["平台价 vs OKX标记价", "平台浮盈 vs OKX upl", "合约面值ctVal"],
         ),
         _node_from_cards(
-            "training_data", "训练标签与样本治理", "学习层", cards_by_key, ["model_training", "strategy_quality", "position_price_integrity"],
-            impact="影响模型是否越学越聪明，避免错误价格/错误盈亏污染训练。", 
+            "training_data",
+            "训练标签与样本治理",
+            "学习层",
+            cards_by_key,
+            ["model_training", "strategy_quality", "position_price_integrity"],
+            impact="影响模型是否越学越聪明，避免错误价格/错误盈亏污染训练。",
             upstream=["market_data", "okx_execution", "position_sync"],
             downstream=["model_training", "strategy_decision"],
             checks=["样本数量", "数据源状态", "脏样本风险", "收益标签可信度"],
         ),
         _node_from_cards(
-            "dashboard_observability", "页面与可观测性", "展示层", cards_by_key, ["trade_loop", "position_price_integrity", "model_training"],
-            impact="影响你能否从页面直接定位问题，而不是只看到泛化提示。", 
+            "dashboard_observability",
+            "页面与可观测性",
+            "展示层",
+            cards_by_key,
+            ["trade_loop", "position_price_integrity", "model_training"],
+            impact="影响你能否从页面直接定位问题，而不是只看到泛化提示。",
             upstream=["position_sync", "model_training"],
             checks=["节点状态", "根因列表", "执行证据", "历史记录"],
+        ),
+        _node_from_cards(
+            "visible_text_encoding",
+            "中文显示与乱码",
+            "展示层",
+            cards_by_key,
+            ["visible_text_encoding"],
+            impact="防止源码、页面或修复脚本重新出现裸乱码，影响排查和用户判断。",
+            upstream=["dashboard_observability"],
+            checks=["源码扫描", "前端静态资源", "脚本样本转义"],
         ),
     ]
 
@@ -764,11 +997,16 @@ def _append_history_record(payload: dict[str, Any], *, source: str) -> None:
     max_records = max(50, min(int(settings.system_audit_history_max_records or 500), 5000))
     existing = list(reversed(_read_history_records(limit=max_records - 1)))
     existing.append(_history_record(payload, source=source))
-    text = "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in existing[-max_records:])
+    text = "\n".join(
+        json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        for item in existing[-max_records:]
+    )
     path.write_text(text + "\n", encoding="utf-8")
 
 
-async def collect_system_audit_status(*, record_history: bool = True, source: str = "api") -> dict[str, Any]:
+async def collect_system_audit_status(
+    *, record_history: bool = True, source: str = "api"
+) -> dict[str, Any]:
     results = await asyncio.gather(
         _trade_loop_audit(),
         _okx_reconciliation_audit(),
@@ -776,6 +1014,8 @@ async def collect_system_audit_status(*, record_history: bool = True, source: st
         _market_data_audit(),
         _strategy_quality_audit(),
         _model_training_audit(),
+        asyncio.to_thread(_strategy_gate_contract_audit),
+        asyncio.to_thread(_source_visible_text_audit),
         return_exceptions=True,
     )
     cards: list[dict[str, Any]] = []

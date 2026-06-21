@@ -11,6 +11,7 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from config.settings import FIXED_AI_MODEL_SLOTS, settings
+from services.runtime_entry_filters import default_entry_filters
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
@@ -396,13 +397,16 @@ class ShadowBacktestService:
         volume_ratio = self.float_parser(feature_snapshot.get("volume_ratio"), 0.0)
         returns_5 = self.float_parser(feature_snapshot.get("returns_5"), 0.0)
         imbalance = self.float_parser(feature_snapshot.get("orderbook_imbalance"), 0.0)
+        entry_filters = default_entry_filters(reason="shadow_backtest_bucket")
         adx_bucket = (
-            "adx_hi" if adx >= 25 else "adx_mid" if adx >= settings.min_entry_adx else "adx_low"
+            "adx_hi"
+            if adx >= 25
+            else "adx_mid" if adx >= entry_filters.min_entry_adx else "adx_low"
         )
         volume_bucket = (
             "vol_hi"
             if volume_ratio >= 1.2
-            else "vol_ok" if volume_ratio >= settings.min_entry_volume_ratio else "vol_low"
+            else "vol_ok" if volume_ratio >= entry_filters.min_entry_volume_ratio else "vol_low"
         )
         momentum_bucket = (
             "mom_up" if returns_5 > 0.002 else "mom_down" if returns_5 < -0.002 else "mom_flat"

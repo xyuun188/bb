@@ -5387,6 +5387,38 @@ function renderSystemAuditCards(cards) {
     }).join('');
 }
 
+function renderSystemAuditNodes(nodes) {
+    const container = document.getElementById('system-audit-nodes');
+    if (!container) return;
+    const rows = Array.isArray(nodes) ? nodes : [];
+    if (!rows.length) {
+        container.innerHTML = '<div class="analysis-empty">还没有节点图谱。</div>'; 
+        return;
+    }
+    container.innerHTML = rows.map(node => {
+        const tone = systemAuditTone(node.status);
+        const checks = Array.isArray(node.checks) ? node.checks.slice(0, 4) : [];
+        const upstream = Array.isArray(node.upstream) ? node.upstream : [];
+        const downstream = Array.isArray(node.downstream) ? node.downstream : [];
+        return `
+            <article class="system-audit-node system-audit-node-${tone}">
+                <div class="system-audit-node-head">
+                    <span>${escHtml(node.layer || '节点')}</span>
+                    <em>${escHtml(systemAuditStatusLabel(node.status))}</em>
+                </div>
+                <strong>${escHtml(node.title || node.key || '-')}</strong>
+                <p>${escHtml(systemAuditShortText(node.summary || node.impact || '-', 180))}</p>
+                <div class="system-audit-node-flow">
+                    <span>上游 ${escHtml(upstream.length ? upstream.join('、') : '无')}</span>
+                    <span>下游 ${escHtml(downstream.length ? downstream.join('、') : '无')}</span>
+                </div>
+                <div class="system-audit-node-checks">
+                    ${checks.map(item => `<i>${escHtml(item)}</i>`).join('') || '<i>暂无检查项</i>'}
+                </div>
+            </article>`;
+    }).join('');
+}
+
 function renderSystemAudit() {
     const data = state.systemAuditStatus || {};
     const updated = document.getElementById('system-audit-updated');
@@ -5396,11 +5428,13 @@ function renderSystemAudit() {
     if (!Object.keys(data).length) {
         overview.innerHTML = '<div class="analysis-empty">等待系统巡检结果...</div>'; 
         renderSystemAuditCards([]);
+        renderSystemAuditNodes([]);
         renderSystemAuditRootCauses([]);
         return;
     }
     overview.innerHTML = systemAuditOverviewHtml(data);
     renderSystemAuditCards(data.cards);
+    renderSystemAuditNodes(data.nodes);
     renderSystemAuditRootCauses(data.root_causes);
 }
 
