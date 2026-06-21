@@ -20,6 +20,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
 from models.trade import Order, Position
+from services.exchange_position_state import parse_exchange_position_snapshot
 
 logger = structlog.get_logger(__name__)
 
@@ -561,33 +562,31 @@ class OkxSyncService:
                 for exchange_pos in exchange_positions or []:
                     if not exchange_position_is_open(exchange_pos):
                         continue
-                    symbol = normalize_symbol(exchange_pos.get("symbol"))
-                    side = str(exchange_pos.get("side") or "").lower()
-                    if not symbol or side not in {"long", "short"}:
+                    snapshot = parse_exchange_position_snapshot(
+                        exchange_pos,
+                        symbol_normalizer=normalize_symbol,
+                    )
+                    if not snapshot:
                         continue
+                    symbol = str(snapshot["symbol"])
+                    side = str(snapshot["side"])
                     key = (symbol, side)
 
                     info = exchange_pos.get("info") or {}
-                    contracts = parse_float(exchange_pos.get("contracts"), 0.0)
-                    contract_size = parse_float(exchange_pos.get("contractSize"), 1.0) or 1.0
-                    quantity = abs(contracts * contract_size)
-                    entry_price = parse_float(
-                        exchange_pos.get("entryPrice") or info.get("avgPx"),
-                        0.0,
-                    )
+                    quantity = parse_float(snapshot.get("quantity"), 0.0)
+                    entry_price = parse_float(snapshot.get("entry_price"), 0.0)
                     if quantity <= 0 or entry_price <= 0:
                         continue
 
-                    current_price = parse_float(
-                        exchange_pos.get("markPrice")
-                        or exchange_pos.get("lastPrice")
-                        or entry_price,
-                        entry_price,
+                    current_price = (
+                        parse_float(snapshot.get("mark_price"), 0.0)
+                        or parse_float(snapshot.get("last_price"), 0.0)
+                        or entry_price
                     )
                     leverage = (
                         parse_float(exchange_pos.get("leverage") or info.get("lever"), 1.0) or 1.0
                     )
-                    exchange_unrealized = parse_float(exchange_pos.get("unrealizedPnl"), 0.0)
+                    exchange_unrealized = parse_float(snapshot.get("upl"), 0.0)
                     exchange_realized = parse_float(exchange_pos.get("realizedPnl"), 0.0)
                     protection = protection_by_key.get(key, {})
                     fallback_protection = await fallback_position_protection(

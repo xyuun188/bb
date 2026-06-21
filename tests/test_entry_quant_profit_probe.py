@@ -5,6 +5,10 @@ from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
 from services.entry_quant_profit_probe import EntryQuantProfitProbePolicy
 
 
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
 def _hold_decision() -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",
@@ -107,7 +111,7 @@ def test_quant_profit_probe_rejects_after_post_score_fails() -> None:
     assert block["blocked"] is True
     assert block["expected_net_return_pct"] == -0.1
     assert "服务端盈利模型" in block["reason"]
-    assert "鏈" not in block["reason"]
+    assert _u("\\u93c8") not in block["reason"]
 
 
 def test_quant_profit_probe_reads_wrapped_profit_payload() -> None:
@@ -142,4 +146,4 @@ def test_quant_profit_probe_reads_wrapped_profit_payload() -> None:
     assert candidate is not None
     assert candidate.action == Action.LONG
     assert "服务端盈利模型" in candidate.reasoning
-    assert "鏈" not in candidate.reasoning
+    assert _u("\\u93c8") not in candidate.reasoning

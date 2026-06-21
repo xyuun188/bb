@@ -46,6 +46,7 @@ from services.entry_signal_extraction import (
     payload_side,
     signal_available,
 )
+from services.runtime_entry_filters import entry_filters_from_context, entry_filters_from_decision
 
 logger = structlog.get_logger(__name__)
 
@@ -93,11 +94,12 @@ def _trend_aligned(decision: DecisionOutput) -> bool:
 
 def _entry_filters_pass(decision: DecisionOutput) -> bool:
     snapshot = decision.feature_snapshot or {}
+    entry_filters = entry_filters_from_decision(decision)
     volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
     adx_14 = _snapshot_float(snapshot, "adx_14")
     confirmations = [
-        volume_ratio >= settings.min_entry_volume_ratio,
-        adx_14 >= settings.min_entry_adx,
+        volume_ratio >= entry_filters.min_entry_volume_ratio,
+        adx_14 >= entry_filters.min_entry_adx,
         _trend_aligned(decision),
     ]
     return sum(1 for ok in confirmations if ok) >= 2
@@ -122,6 +124,7 @@ def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]
     bb_pct = _snapshot_float(snapshot, "bb_pct", 0.5)
     adx_14 = _snapshot_float(snapshot, "adx_14")
     volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
+    entry_filters = entry_filters_from_context(snapshot)
 
     if price_vs_sma20 > 0:
         long_score += 1
@@ -180,7 +183,7 @@ def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]
         short_score += 1
         short_reasons.append("价格位于布林中下轨")
 
-    if adx_14 >= settings.min_entry_adx:
+    if adx_14 >= entry_filters.min_entry_adx:
         if long_score >= short_score:
             long_score += 1
             long_reasons.append("ADX 支持趋势交易")
@@ -188,7 +191,7 @@ def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]
             short_score += 1
             short_reasons.append("ADX 支持趋势交易")
 
-    if volume_ratio >= settings.min_entry_volume_ratio:
+    if volume_ratio >= entry_filters.min_entry_volume_ratio:
         if long_score >= short_score:
             long_score += 1
             long_reasons.append("成交量达到入场要求")
@@ -328,7 +331,12 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "time_series",
     )
     if signal_available(ts):
-        trend = payload_side(ts) or ts.get("trend") or ts.get("direction") or ts.get("forecast_direction")
+        trend = (
+            payload_side(ts)
+            or ts.get("trend")
+            or ts.get("direction")
+            or ts.get("forecast_direction")
+        )
         move = ts.get("expected_move_pct", ts.get("forecast_return_pct"))
         if move is None:
             move = signal_expected_return_pct(ts, str(trend or ""))
@@ -449,6 +457,7 @@ def _apply_aggressive_hold_policy(
         return
 
     snapshot = decision.feature_snapshot or {}
+    snapshot["entry_filters"] = entry_filters_from_decision(decision).to_dict()
     edge_action, edge, reasons = _directional_edge(snapshot)
     if edge < 2:
         return
@@ -1485,15 +1494,6 @@ class LLMAgent(AbstractAIModel):
             feature_snapshot=features.to_dict(),
         )
 
-        if False and decision.is_entry and decision.confidence < settings.confidence_threshold:
-            if decision.confidence >= 0.45 and decision.position_size_pct > 0:
-                decision.position_size_pct = min(decision.position_size_pct, 0.06)
-                decision.reasoning += " [小仓位试探：置信度低于常规阈值，已限制仓位]"
-            else:
-                decision.action = Action.HOLD
-                decision.position_size_pct = 0.0
-                decision.reasoning += " [置信度低于 0.45 或仓位为 0，改为观望]"
-
         return decision
 
     def _local_expert_fallback(
@@ -1512,6 +1512,8 @@ class LLMAgent(AbstractAIModel):
         reason = "AI 模型暂时无有效输出，使用本地保守规则兜底。"
 
         snapshot = features.to_dict()
+        entry_filters = entry_filters_from_context(context)
+        snapshot["entry_filters"] = entry_filters.to_dict()
         edge_action, edge, edge_reasons = _directional_edge(snapshot)
         volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
         adx_14 = _snapshot_float(snapshot, "adx_14")
@@ -1526,7 +1528,7 @@ class LLMAgent(AbstractAIModel):
 
         if self._role in {"technical_trend", "trend_direction"}:
             confidence = min(0.42 + edge * 0.04, 0.62)
-            if edge >= 3 and adx_14 >= settings.min_entry_adx:
+            if edge >= 3 and adx_14 >= entry_filters.min_entry_adx:
                 action = edge_action
                 size = 0.03
                 leverage = 1.0
@@ -1538,12 +1540,18 @@ class LLMAgent(AbstractAIModel):
         elif self._role in {"short_term_momentum", "profit_quality"}:
             returns_1 = _snapshot_float(snapshot, "returns_1")
             returns_5 = _snapshot_float(snapshot, "returns_5")
-            if returns_1 > 0 and returns_5 > 0 and volume_ratio >= settings.min_entry_volume_ratio:
+            if (
+                returns_1 > 0
+                and returns_5 > 0
+                and volume_ratio >= entry_filters.min_entry_volume_ratio
+            ):
                 action = Action.LONG
                 confidence = 0.52
                 size = 0.03
             elif (
-                returns_1 < 0 and returns_5 < 0 and volume_ratio >= settings.min_entry_volume_ratio
+                returns_1 < 0
+                and returns_5 < 0
+                and volume_ratio >= entry_filters.min_entry_volume_ratio
             ):
                 action = Action.SHORT
                 confidence = 0.52
@@ -1577,7 +1585,7 @@ class LLMAgent(AbstractAIModel):
             ]
             if symbol_positions:
                 side = symbol_positions[0].get("side")
-                severe_reversal = edge >= 4 and volume_ratio >= settings.min_entry_volume_ratio
+                severe_reversal = edge >= 4 and volume_ratio >= entry_filters.min_entry_volume_ratio
                 if side == "long" and edge_action == Action.SHORT and severe_reversal:
                     action = Action.CLOSE_LONG
                     confidence = 0.62
@@ -1601,9 +1609,9 @@ class LLMAgent(AbstractAIModel):
             }
         elif self._role in {"risk_guardian", "risk_anomaly"}:
             risk_flags = []
-            if volume_ratio < settings.min_entry_volume_ratio:
+            if volume_ratio < entry_filters.min_entry_volume_ratio:
                 risk_flags.append("成交量不足")
-            if adx_14 < settings.min_entry_adx:
+            if adx_14 < entry_filters.min_entry_adx:
                 risk_flags.append("趋势强度不足")
             if volatility > 0.05:
                 risk_flags.append("波动偏高")
@@ -1629,6 +1637,8 @@ class LLMAgent(AbstractAIModel):
             "provider_model": self._model_name,
             "error": error,
             "cross_check_for": cross_check_for,
+            "entry_filters": entry_filters.to_dict(),
+            "entry_filters_are_hard_gate": False,
         }
         return DecisionOutput(
             model_name=self.name,

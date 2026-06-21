@@ -46,6 +46,11 @@ async def test_system_audit_status_aggregates_root_causes(
     )
     monkeypatch.setattr(
         system_audit,
+        "_position_price_integrity_audit",
+        _async_card("position_price_integrity", "ok", "持仓价格一致", title="持仓价格一致性"),
+    )
+    monkeypatch.setattr(
+        system_audit,
         "_market_data_audit",
         _async_card("market_data", "warning", "K线过期", title="行情与 K线"),
     )
@@ -65,16 +70,17 @@ async def test_system_audit_status_aggregates_root_causes(
     assert payload["status"] == "critical"
     assert payload["status_label"] == "异常"
     assert payload["summary"] == {
-        "cards": 5,
+        "cards": 6,
         "critical": 1,
         "warning": 2,
-        "ok": 2,
+        "ok": 3,
         "findings": 3,
     }
     assert [card["status"] for card in payload["cards"]] == [
         "critical",
         "warning",
         "warning",
+        "ok",
         "ok",
         "ok",
     ]
@@ -99,6 +105,11 @@ async def test_system_audit_status_wraps_failed_section(
         system_audit,
         "_okx_reconciliation_audit",
         _async_card("okx_reconciliation", "ok", "OKX 对账正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_position_price_integrity_audit",
+        _async_card("position_price_integrity", "ok", "持仓价格一致"),
     )
     monkeypatch.setattr(
         system_audit,

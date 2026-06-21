@@ -367,6 +367,9 @@ class Settings(BaseSettings):
     dashboard_session_secret: str = ""
     dashboard_session_ttl_seconds: int = 43200
     dashboard_auth_cookie_secure: bool = False
+    system_audit_history_enabled: bool = True
+    system_audit_history_interval_seconds: int = 300
+    system_audit_history_max_records: int = 500
 
     # --- Notifications ---
     telegram_bot_token: str = ""

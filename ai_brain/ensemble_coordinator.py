@@ -35,6 +35,7 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
+from services.runtime_entry_filters import entry_filters_from_context
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 if TYPE_CHECKING:
@@ -194,12 +195,26 @@ class EnsembleCoordinator:
         self.registry = registry
         self._slot_meta = {slot["name"]: slot for slot in FIXED_AI_MODEL_SLOTS}
         self.cross_validator = CrossValidator()
+        self._current_strategy_context: dict[str, Any] = {}
+
+    def _set_runtime_entry_filters(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any] | None,
+    ) -> None:
+        self._current_strategy_context = dict(context or {})
+        entry_filters = entry_filters_from_context(self._current_strategy_context)
+        try:
+            setattr(features, "entry_filters", entry_filters.to_dict())
+        except Exception:
+            logger.debug("failed to attach runtime entry filters to features")
 
     async def decide(
         self,
         features: FeatureVector,
         context: dict[str, Any],
     ) -> tuple[DecisionOutput, dict[str, DecisionOutput]]:
+        self._set_runtime_entry_filters(features, context)
         timing_records: list[dict[str, Any]] = []
         base_expert_context = self._base_expert_context(context)
         all_attempted: list[str] = []
@@ -1588,7 +1603,8 @@ class EnsembleCoordinator:
         abnormal_wick_recent = self._safe_float(
             getattr(features, "abnormal_wick_recent_hours", 9999.0), 9999.0
         )
-        if volume_ratio > 0 and volume_ratio < max(settings.min_entry_volume_ratio, 0.30):
+        entry_filters = entry_filters_from_context(getattr(self, "_current_strategy_context", {}))
+        if volume_ratio > 0 and volume_ratio < max(entry_filters.min_entry_volume_ratio, 0.30):
             discount += 0.05
             reasons.append("low volume ratio")
         if spread_pct >= 0.003:
@@ -1722,6 +1738,7 @@ class EnsembleCoordinator:
         cross_validations: list[dict[str, Any]] | None = None,
         consultation: dict[str, Any] | None = None,
     ) -> DecisionOutput:
+        self._set_runtime_entry_filters(features, context)
         cross_validations = cross_validations or []
         valid = {name: d for name, d in opinions.items() if isinstance(d, DecisionOutput)}
         if not valid:
@@ -2411,42 +2428,6 @@ class EnsembleCoordinator:
                 hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
                 hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
                 return self._hold(features, reason, hold_raw)
-        if False and not ml_gate.get("allow", True):
-            reason = self._reason(
-                ml_gate.get("reason") or "ML 盈亏质量过滤未通过，本轮不开仓",
-                decision_score,
-                disagreement,
-                raw_opinions,
-                resolution_brief,
-            )
-            hold_raw = self._raw(
-                raw_opinions, decision_score, disagreement, cross_validations, consultation
-            )
-            hold_raw["base_weighted_score"] = round(normalized_score, 4)
-            hold_raw["entry_quality_gate"] = "ml_profit_quality_block"
-            hold_raw["ml_profit_quality_gate"] = ml_gate
-            hold_raw["ml_signal"] = context.get("ml_signal") or {}
-            hold_raw["entry_execution_gate"] = entry_gate
-            hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
-            hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            return self._hold(features, reason, hold_raw)
-        if False and confidence < min_confidence:
-            reason = self._reason(
-                "最终置信度低于执行门槛，避免低胜率小波动被手续费磨损",
-                decision_score,
-                disagreement,
-                raw_opinions,
-                resolution_brief,
-            )
-            hold_raw = self._raw(
-                raw_opinions, decision_score, disagreement, cross_validations, consultation
-            )
-            hold_raw["base_weighted_score"] = round(normalized_score, 4)
-            hold_raw["entry_quality_gate"] = "confidence_below_fee_adjusted_threshold"
-            hold_raw["entry_execution_gate"] = entry_gate
-            hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
-            hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
-            return self._hold(features, reason, hold_raw)
         size = min(max(avg_size, 0.02), 1.0)
         if confidence < settings.confidence_threshold:
             size = max(size, 0.02)
@@ -4102,6 +4083,7 @@ class EnsembleCoordinator:
 
     def _entry_quality_points(self, features: FeatureVector, action: Action) -> int:
         """Score entry quality by liquidity, trend strength, and direction alignment."""
+        entry_filters = entry_filters_from_context(getattr(self, "_current_strategy_context", {}))
         volume_ratio = self._safe_float(getattr(features, "volume_ratio", 0.0), 0.0)
         adx_14 = self._safe_float(getattr(features, "adx_14", 0.0), 0.0)
         price_vs_sma20 = self._safe_float(getattr(features, "price_vs_sma20", 0.0), 0.0)
@@ -4116,8 +4098,8 @@ class EnsembleCoordinator:
         return sum(
             1
             for passed in (
-                volume_ratio >= settings.min_entry_volume_ratio,
-                adx_14 >= settings.min_entry_adx,
+                volume_ratio >= entry_filters.min_entry_volume_ratio,
+                adx_14 >= entry_filters.min_entry_adx,
                 trend_aligned,
             )
             if passed
@@ -6175,13 +6157,14 @@ class EnsembleCoordinator:
             "爆仓",
         )
         caution_terms = ("滑点", "假突破", "追高", "诱多", "诱空", "缺乏情绪")
+        entry_filters = entry_filters_from_context(getattr(self, "_current_strategy_context", {}))
         volume_ratio = float(getattr(features, "volume_ratio", 0) or 0)
         adx_14 = float(getattr(features, "adx_14", 0) or 0)
         volatility_20 = float(getattr(features, "volatility_20", 0) or 0)
         change_24h = abs(float(getattr(features, "change_24h_pct", 0) or 0))
         healthy_market = (
-            volume_ratio >= max(settings.min_entry_volume_ratio, 0.5)
-            and adx_14 >= settings.min_entry_adx
+            volume_ratio >= max(entry_filters.min_entry_volume_ratio, 0.5)
+            and adx_14 >= entry_filters.min_entry_adx
             and volatility_20 <= 0.05
         )
         extreme_volatility = volatility_20 >= 0.12 and change_24h >= 12

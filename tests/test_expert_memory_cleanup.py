@@ -2,6 +2,10 @@ from db.repositories.memory_repo import _memory_text_usable
 from scripts.cleanup_expert_memory_text import translate_lesson, translate_market_pattern
 
 
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
 def test_expert_memory_cleanup_translates_shadow_template_to_chinese():
     lesson, usable = translate_lesson(
         (
@@ -48,4 +52,13 @@ def test_expert_memory_cleanup_translates_trade_pattern():
 def test_memory_repository_rejects_damaged_or_mojibake_memory_text():
     assert _memory_text_usable("BTC/USDT 做多机会曾被观望错过。当时选择观望。") is True
     assert _memory_text_usable("该笔历史记录的原始说明已损坏，无法准确还原。") is False
-    assert _memory_text_usable("褰撴椂閫夋嫨瑙傛湜锛屼絾 10 鍒嗛挓鍚庢敹鐩婁笉佳") is False
+    assert (
+        _memory_text_usable(
+            _u(
+                "\\u8930\\u64b4\\u6902\\u95ab\\u590b\\u5ae8\\u7459\\u509b\\u6e5c"
+                "\\u951b\\u5c7c\\u7d7e 10 \\u9352\\u55db\\u6313\\u935a\\u5ea2\\u6579"
+                "\\u9429\\u5a41\\u7b09\\u4f73"
+            )
+        )
+        is False
+    )

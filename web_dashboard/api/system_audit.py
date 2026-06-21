@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter
 from sqlalchemy import func, select
 
+from config.settings import settings
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.market_data import Kline, Ticker
 from models.trade import Order, Position
+from services.exchange_position_state import (
+    exchange_position_display_valuation,
+    parse_exchange_position_snapshot,
+)
 from scripts.repair_missing_closed_positions_from_orders import (
     collect_missing_closed_position_plans,
 )
@@ -28,6 +36,9 @@ AUDIT_WINDOWS = {"fast_minutes": 10, "trade_hours": 2, "strategy_hours": 24}
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 KLINE_STALE_LIMIT_SECONDS = {"1m": 120, "5m": 600, "15m": 1800, "1h": 7200}
 STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
+SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
+POSITION_PRICE_SPLIT_WARN_PCT = 0.03
+POSITION_PNL_SPLIT_WARN_USDT = 0.5
 
 
 def _now() -> datetime:
@@ -56,6 +67,18 @@ def _status_from_counts(*, critical: bool = False, warning: bool = False) -> str
     if warning:
         return "warning"
     return "ok"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _relative_gap(left: float, right: float) -> float:
+    denominator = max(abs(left), abs(right), 1e-12)
+    return abs(left - right) / denominator
 
 
 def _audit_card(
@@ -191,6 +214,127 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
         next_actions=[
             "只允许先 dry-run 人工核对，再按 symbol/order-id 精确 apply。",
             "如果缺失不为 0，先不要做策略收益判断，避免训练和盈亏被脏账影响。",
+        ],
+    )
+
+
+async def _position_price_integrity_audit() -> dict[str, Any]:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    split_rows: list[dict[str, Any]] = []
+    checked_modes: list[str] = []
+    unavailable_modes: list[dict[str, str]] = []
+    local_open_count = 0
+    exchange_open_count = 0
+
+    for mode in ("paper", "live"):
+        executor = dashboard_api._dashboard_okx_executor_for_mode(mode)
+        if not executor:
+            continue
+        checked_modes.append(mode)
+        try:
+            exchange_positions = await asyncio.wait_for(executor.get_positions(), timeout=1.8)
+        except Exception as exc:
+            unavailable_modes.append({"mode": mode, "error": safe_error_text(exc, limit=120)})
+            continue
+
+        exchange_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw_position in exchange_positions or []:
+            snapshot = parse_exchange_position_snapshot(
+                raw_position,
+                symbol_normalizer=normalize_trading_symbol,
+            )
+            if not snapshot:
+                continue
+            exchange_snapshots[(str(snapshot["symbol"]), str(snapshot["side"]))] = snapshot
+        exchange_open_count += len(exchange_snapshots)
+
+        async with get_session_ctx() as session:
+            local_positions = list(
+                (
+                    await session.execute(
+                        select(Position).where(
+                            Position.execution_mode == mode,
+                            Position.is_open.is_(True),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        local_open_count += len(local_positions)
+
+        for position in local_positions:
+            key = (
+                normalize_trading_symbol(position.symbol),
+                str(position.side or "").lower(),
+            )
+            snapshot = exchange_snapshots.get(key)
+            if not snapshot:
+                continue
+            valuation = exchange_position_display_valuation(
+                snapshot,
+                key[1],
+                fallback_current_price=position.current_price,
+                fallback_unrealized_pnl=position.unrealized_pnl,
+                fallback_entry_price=position.entry_price,
+                fallback_quantity=position.quantity,
+            )
+            local_price = _safe_float(position.current_price)
+            okx_price = _safe_float(valuation.get("current_price"))
+            local_pnl = _safe_float(position.unrealized_pnl)
+            okx_pnl = _safe_float(valuation.get("unrealized_pnl"))
+            price_gap = _relative_gap(local_price, okx_price) if local_price > 0 and okx_price > 0 else 0.0
+            pnl_gap = abs(local_pnl - okx_pnl)
+            if price_gap < POSITION_PRICE_SPLIT_WARN_PCT and pnl_gap < POSITION_PNL_SPLIT_WARN_USDT:
+                continue
+            split_rows.append(
+                {
+                    "mode": mode,
+                    "symbol": key[0],
+                    "side": key[1],
+                    "local_price": round(local_price, 8),
+                    "okx_price": round(okx_price, 8),
+                    "price_gap_pct": round(price_gap * 100, 4),
+                    "local_unrealized_pnl": round(local_pnl, 8),
+                    "okx_unrealized_pnl": round(okx_pnl, 8),
+                    "pnl_gap_usdt": round(pnl_gap, 8),
+                    "pnl_source": valuation.get("pnl_source"),
+                }
+            )
+
+    status = _status_from_counts(critical=bool(split_rows), warning=bool(unavailable_modes))
+    return _audit_card(
+        "position_price_integrity",
+        "持仓价格一致性",
+        status,
+        (
+            "发现平台持仓价/浮盈与 OKX 持仓快照不一致，可能影响持仓分析、平仓和训练标签。"
+            if split_rows
+            else (
+                "部分模式暂时无法读取 OKX 持仓快照。"
+                if unavailable_modes
+                else "平台持仓价格与 OKX 持仓快照一致。"
+            )
+        ),
+        details={
+            "checked_modes": checked_modes,
+            "unavailable_modes": unavailable_modes,
+            "local_open_positions": local_open_count,
+            "exchange_open_positions": exchange_open_count,
+            "split_count": len(split_rows),
+            "price_gap_warn_pct": POSITION_PRICE_SPLIT_WARN_PCT * 100,
+            "pnl_gap_warn_usdt": POSITION_PNL_SPLIT_WARN_USDT,
+            "splits": split_rows[:12],
+        },
+        evidence=[
+            {"label": "价格/浮盈分裂", "value": len(split_rows)},
+            {"label": "本地开仓", "value": local_open_count},
+            {"label": "OKX持仓", "value": exchange_open_count},
+        ],
+        next_actions=[
+            "若出现分裂，先运行 OKX 同步并复查持仓页；不要基于分裂数据调整策略参数。" ,
+            "若同一币种反复分裂，检查 OKX 字段解析、合约面值 ctVal、行情缓存和持仓同步任务。" ,
         ],
     )
 
@@ -457,11 +601,178 @@ def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda row: STATUS_RANK.get(str(row.get("severity")), 9))[:10]
 
 
-@router.get("/system-audit/status")
-async def system_audit_status() -> dict[str, Any]:
+def _worst_status(*statuses: Any) -> str:
+    normalized = [str(status or "info") for status in statuses]
+    return min(normalized or ["info"], key=lambda item: STATUS_RANK.get(item, 9))
+
+
+def _card_map(cards: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(card.get("key") or ""): card for card in cards if card.get("key")}
+
+
+def _node_from_cards(
+    key: str,
+    title: str,
+    layer: str,
+    cards_by_key: dict[str, dict[str, Any]],
+    card_keys: list[str],
+    *,
+    impact: str,
+    upstream: list[str] | None = None,
+    downstream: list[str] | None = None,
+    checks: list[str] | None = None,
+) -> dict[str, Any]:
+    related_cards = [cards_by_key[item] for item in card_keys if item in cards_by_key]
+    status = _worst_status(*(card.get("status") for card in related_cards))
+    summaries = [str(card.get("summary") or "") for card in related_cards if card.get("summary")]
+    evidence: list[dict[str, Any]] = []
+    next_actions: list[str] = []
+    for card in related_cards:
+        evidence.extend(card.get("evidence") or [])
+        next_actions.extend(card.get("next_actions") or [])
+    return {
+        "key": key,
+        "title": title,
+        "layer": layer,
+        "status": status,
+        "summary": "；".join(summaries[:2]) or "节点暂无异常。", 
+        "impact": impact,
+        "upstream": upstream or [],
+        "downstream": downstream or [],
+        "checks": checks or [],
+        "card_keys": [card.get("key") for card in related_cards],
+        "evidence": evidence[:6],
+        "next_actions": list(dict.fromkeys(next_actions))[:6],
+    }
+
+
+def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cards_by_key = _card_map(cards)
+    return [
+        _node_from_cards(
+            "runtime_loop", "调度与心跳", "运行层", cards_by_key, ["trade_loop"],
+            impact="决定系统是否持续分析、是否卡在某个阶段。", 
+            downstream=["market_data", "position_sync", "strategy_decision"],
+            checks=["最近10分钟分析", "最近2小时订单", "当前持仓数量"],
+        ),
+        _node_from_cards(
+            "market_data", "行情与K线", "数据层", cards_by_key, ["market_data"],
+            impact="影响开仓候选、预期收益、止盈止损和训练特征。", 
+            upstream=["runtime_loop"],
+            downstream=["strategy_decision", "risk_guard", "training_data"],
+            checks=["Ticker新鲜度", "1m/5m/15m/1h K线覆盖", "币种覆盖"],
+        ),
+        _node_from_cards(
+            "model_training", "模型与训练数据", "模型层", cards_by_key, ["model_training"],
+            impact="影响盈利预测、时序预测、情绪预测、本地ML过滤和样本学习。", 
+            upstream=["market_data"],
+            downstream=["strategy_decision", "training_data"],
+            checks=["本地量化工具", "影子样本", "交易样本", "外部采集源"],
+        ),
+        _node_from_cards(
+            "strategy_decision", "策略决策质量", "策略层", cards_by_key, ["strategy_quality"],
+            impact="影响是否开仓、仓位大小、重复亏损复开和快进快出。", 
+            upstream=["market_data", "model_training", "position_sync"],
+            downstream=["risk_guard", "okx_execution"],
+            checks=["负净收益候选", "零净收益候选", "快亏平样本", "拦截原因"],
+        ),
+        _node_from_cards(
+            "risk_guard", "风控与守门", "风控层", cards_by_key, ["strategy_quality", "position_price_integrity"],
+            impact="影响动态证据、低质量释放、快速平仓和下单前校验。", 
+            upstream=["strategy_decision", "position_sync"],
+            downstream=["okx_execution", "position_sync"],
+            checks=["持仓价一致性", "快亏平", "风险证据", "执行原因"],
+        ),
+        _node_from_cards(
+            "okx_execution", "OKX执行与历史对账", "执行层", cards_by_key, ["okx_reconciliation", "position_price_integrity"],
+            impact="影响下单、平仓、历史仓位、账户余额和盈亏记录。", 
+            upstream=["risk_guard"],
+            downstream=["position_sync", "training_data"],
+            checks=["缺失历史仓", "OKX持仓快照", "价格/PnL对齐"],
+        ),
+        _node_from_cards(
+            "position_sync", "持仓同步与PnL", "同步层", cards_by_key, ["position_price_integrity", "okx_reconciliation"],
+            impact="影响主面板余额、持仓分析、平仓判断和训练标签。", 
+            upstream=["okx_execution"],
+            downstream=["strategy_decision", "training_data", "dashboard_observability"],
+            checks=["平台价 vs OKX标记价", "平台浮盈 vs OKX upl", "合约面值ctVal"],
+        ),
+        _node_from_cards(
+            "training_data", "训练标签与样本治理", "学习层", cards_by_key, ["model_training", "strategy_quality", "position_price_integrity"],
+            impact="影响模型是否越学越聪明，避免错误价格/错误盈亏污染训练。", 
+            upstream=["market_data", "okx_execution", "position_sync"],
+            downstream=["model_training", "strategy_decision"],
+            checks=["样本数量", "数据源状态", "脏样本风险", "收益标签可信度"],
+        ),
+        _node_from_cards(
+            "dashboard_observability", "页面与可观测性", "展示层", cards_by_key, ["trade_loop", "position_price_integrity", "model_training"],
+            impact="影响你能否从页面直接定位问题，而不是只看到泛化提示。", 
+            upstream=["position_sync", "model_training"],
+            checks=["节点状态", "根因列表", "执行证据", "历史记录"],
+        ),
+    ]
+
+
+def _node_summary(nodes: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "nodes": len(nodes),
+        "critical": sum(1 for node in nodes if node.get("status") == "critical"),
+        "warning": sum(1 for node in nodes if node.get("status") == "warning"),
+        "ok": sum(1 for node in nodes if node.get("status") == "ok"),
+    }
+
+
+def _history_path() -> Path:
+    return settings.data_dir / SYSTEM_AUDIT_HISTORY_FILE
+
+
+def _history_record(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
+    root_causes = payload.get("root_causes") if isinstance(payload.get("root_causes"), list) else []
+    return {
+        "checked_at": payload.get("checked_at"),
+        "source": source,
+        "status": payload.get("status"),
+        "status_label": payload.get("status_label"),
+        "summary": payload.get("summary") or {},
+        "node_summary": payload.get("node_summary") or {},
+        "root_causes": root_causes[:8],
+    }
+
+
+def _read_history_records(limit: int = 50) -> list[dict[str, Any]]:
+    path = _history_path()
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records[-max(1, int(limit)) :][::-1]
+
+
+def _append_history_record(payload: dict[str, Any], *, source: str) -> None:
+    if not settings.system_audit_history_enabled:
+        return
+    path = _history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    max_records = max(50, min(int(settings.system_audit_history_max_records or 500), 5000))
+    existing = list(reversed(_read_history_records(limit=max_records - 1)))
+    existing.append(_history_record(payload, source=source))
+    text = "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in existing[-max_records:])
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+async def collect_system_audit_status(*, record_history: bool = True, source: str = "api") -> dict[str, Any]:
     results = await asyncio.gather(
         _trade_loop_audit(),
         _okx_reconciliation_audit(),
+        _position_price_integrity_audit(),
         _market_data_audit(),
         _strategy_quality_audit(),
         _model_training_audit(),
@@ -482,13 +793,14 @@ async def system_audit_status() -> dict[str, Any]:
         else:
             cards.append(result)
     cards = sorted(cards, key=lambda item: STATUS_RANK.get(str(item.get("status")), 9))
+    nodes = _build_audit_nodes(cards)
     findings = _root_cause_findings(cards)
     status = "ok"
     if any(card.get("status") == "critical" for card in cards):
         status = "critical"
     elif any(card.get("status") == "warning" for card in cards):
         status = "warning"
-    return sanitize_payload(
+    payload = sanitize_payload(
         {
             "status": status,
             "status_label": {"ok": "正常", "warning": "需关注", "critical": "异常"}.get(
@@ -502,9 +814,39 @@ async def system_audit_status() -> dict[str, Any]:
                 "warning": sum(1 for card in cards if card.get("status") == "warning"),
                 "ok": sum(1 for card in cards if card.get("status") == "ok"),
                 "findings": len(findings),
+                "nodes": len(nodes),
             },
             "root_causes": findings,
+            "nodes": nodes,
+            "node_summary": _node_summary(nodes),
             "cards": cards,
+            "history": {
+                "enabled": bool(settings.system_audit_history_enabled),
+                "interval_seconds": int(settings.system_audit_history_interval_seconds or 300),
+                "max_records": int(settings.system_audit_history_max_records or 500),
+            },
             "safety_note": "根因雷达当前只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认。",
+        }
+    )
+    if record_history:
+        _append_history_record(payload, source=source)
+    return payload
+
+
+@router.get("/system-audit/status")
+async def system_audit_status() -> dict[str, Any]:
+    return await collect_system_audit_status(record_history=True, source="api")
+
+
+@router.get("/system-audit/history")
+async def system_audit_history(limit: int = 50) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 50), 200))
+    records = _read_history_records(limit=safe_limit)
+    return sanitize_payload(
+        {
+            "enabled": bool(settings.system_audit_history_enabled),
+            "interval_seconds": int(settings.system_audit_history_interval_seconds or 300),
+            "records": records,
+            "count": len(records),
         }
     )

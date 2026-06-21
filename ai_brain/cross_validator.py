@@ -31,6 +31,7 @@ from core.model_runtime import (
 )
 from core.safe_output import safe_error_text
 from core.secret_utils import secret_fingerprint
+from services.runtime_entry_filters import entry_filters_from_context
 
 logger = structlog.get_logger(__name__)
 
@@ -324,6 +325,7 @@ class CrossValidator:
         snapshot = target.feature_snapshot or source.feature_snapshot or {}
         source_dir = ACTION_DIRECTION.get(source.action, 0)
         target_dir = ACTION_DIRECTION.get(target.action, 0)
+        entry_filters = entry_filters_from_context(snapshot)
 
         if source_dir and target_dir:
             return "supports" if source_dir == target_dir else "challenges"
@@ -344,7 +346,7 @@ class CrossValidator:
             volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
             if volume_ratio >= 1.2:
                 return "supports"
-            if volume_ratio < settings.min_entry_volume_ratio:
+            if volume_ratio < entry_filters.min_entry_volume_ratio:
                 return "challenges"
             return "neutral"
 
@@ -354,12 +356,12 @@ class CrossValidator:
             sma20 = float(snapshot.get("price_vs_sma20") or 0.0)
             sma50 = float(snapshot.get("price_vs_sma50") or 0.0)
             if source_dir > 0:
-                if adx >= settings.min_entry_adx and macd >= 0 and sma20 > 0 and sma50 > 0:
+                if adx >= entry_filters.min_entry_adx and macd >= 0 and sma20 > 0 and sma50 > 0:
                     return "supports"
                 if sma20 <= 0 or sma50 <= 0:
                     return "challenges"
             if source_dir < 0:
-                if adx >= settings.min_entry_adx and macd <= 0 and sma20 < 0 and sma50 < 0:
+                if adx >= entry_filters.min_entry_adx and macd <= 0 and sma20 < 0 and sma50 < 0:
                     return "supports"
                 if sma20 >= 0 or sma50 >= 0:
                     return "challenges"
@@ -375,7 +377,7 @@ class CrossValidator:
             abnormal_wick_max = float(snapshot.get("abnormal_wick_max_pct") or 0.0)
             abnormal_wick_recent = float(snapshot.get("abnormal_wick_recent_hours") or 9999.0)
             if (
-                volume_ratio < settings.min_entry_volume_ratio
+                volume_ratio < entry_filters.min_entry_volume_ratio
                 or volatility > 0.08
                 or day_change > 18
                 or (

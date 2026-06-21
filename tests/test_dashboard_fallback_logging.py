@@ -87,6 +87,23 @@ class FakeDataService:
     rest_client = FailingRestClient()
 
 
+class PositionExecutor:
+    def __init__(self, positions: list[dict[str, Any]]) -> None:
+        self.positions = positions
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        return self.positions
+
+
+class PositionTradingService:
+    def __init__(self, positions: list[dict[str, Any]]) -> None:
+        self.okx_paper = PositionExecutor(positions)
+        self.okx_live = None
+
+    def okx_executor_for_dashboard(self, mode: str) -> Any | None:
+        return self.okx_live if mode == "live" else self.okx_paper
+
+
 class FakePartialDataService:
     rest_client = PartiallyFailingRestClient()
 
@@ -215,6 +232,86 @@ async def test_exchange_mark_map_uses_short_timeout(
     assert waits == [1.2]
     assert dashboard_fallback_events[0]["event"] == "exchange mark map fallback"
     assert dashboard_fallback_events[0]["has_cached"] is True
+
+
+async def test_exchange_mark_map_uses_okx_info_markpx_upl_and_contract_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dashboard, "_exchange_mark_cache", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_trading_service",
+        PositionTradingService(
+            [
+                {
+                    "symbol": "PROS/USDT:USDT",
+                    "side": "long",
+                    "contracts": 0,
+                    "markPrice": 0,
+                    "entryPrice": 0,
+                    "info": {
+                        "instId": "PROS-USDT-SWAP",
+                        "pos": "46",
+                        "ctVal": "1",
+                        "avgPx": "0.4054",
+                        "markPx": "0.4059",
+                        "last": "0.5547",
+                        "upl": "-0.82",
+                    },
+                }
+            ]
+        ),
+    )
+
+    result = await dashboard._get_exchange_position_mark_map("paper")
+    snapshot = result[("PROS/USDT", "long")]
+
+    assert snapshot["mark_price"] == pytest.approx(0.4059)
+    assert snapshot["last_price"] == pytest.approx(0.5547)
+    assert snapshot["entry_price"] == pytest.approx(0.4054)
+    assert snapshot["quantity"] == pytest.approx(46.0)
+    assert snapshot["upl"] == pytest.approx(-0.82)
+    valuation = dashboard._exchange_position_display_valuation(
+        snapshot,
+        "long",
+        fallback_current_price=0.5547,
+        fallback_unrealized_pnl=6.8678,
+        fallback_entry_price=0.4054,
+        fallback_quantity=46,
+    )
+    assert valuation["current_price"] == pytest.approx(0.4059)
+    assert valuation["unrealized_pnl"] == pytest.approx(-0.82)
+    assert valuation["pnl_source"] == "okx_position_upl"
+
+
+async def test_open_position_ticker_prefers_okx_mark_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exchange_marks(mode: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+        return {
+            ("PROS/USDT", "long"): {
+                "mark_price": 0.4059,
+                "last_price": 0.5547,
+                "entry_price": 0.4054,
+                "upl": -0.82,
+                "quantity": 46.0,
+            }
+        }
+
+    async def public_tickers(symbols: set[str]) -> dict[str, dict[str, Any]]:
+        return {}
+
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", exchange_marks)
+    monkeypatch.setattr(dashboard, "_get_public_ticker_map", public_tickers)
+
+    tickers = await dashboard._build_tickers_for_open_positions(
+        {"PROS/USDT"},
+        {"PROS/USDT": {"price": 0.5547, "change_24h": 1.0}},
+        "paper",
+    )
+
+    assert tickers["PROS/USDT"]["price"] == pytest.approx(0.4059)
+    assert tickers["PROS/USDT"]["mark_price"] == pytest.approx(0.4059)
 
 
 async def test_public_ticker_fallback_logs_and_uses_stale_cache(

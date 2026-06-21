@@ -374,6 +374,15 @@ class StrategyLearningParams:
     shadow_opportunity_target_ratio: float = 0.35
     reflection_target_ratio: float = 0.50
     market_scan_target_ratio: float = 0.08
+    entry_volume_ratio_min: float = 0.05
+    entry_volume_ratio_default: float = 0.20
+    entry_volume_ratio_max: float = 0.55
+    entry_adx_min: float = 6.0
+    entry_adx_default: float = 15.0
+    entry_adx_max: float = 24.0
+    entry_filter_profit_tighten_factor: float = 0.85
+    entry_filter_loss_relax_factor: float = 0.70
+    entry_filter_release_relax_factor: float = 0.80
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,7 +736,7 @@ class TradingParameterSnapshot:
     )
     exit_cooldown: ExitCooldownParams = field(default_factory=ExitCooldownParams)
     exit_arbitration: ExitArbitrationParams = field(default_factory=ExitArbitrationParams)
-    version: str = "2026-06-21.strategy-v4-auditable"
+    version: str = "2026-06-22.strategy-v5-runtime-filters"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

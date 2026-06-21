@@ -39,6 +39,7 @@ from services.manual_close_marker import is_manual_close_order, position_has_man
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
+from services.runtime_entry_filters import RuntimeEntryFilters, default_entry_filters
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -2881,6 +2882,7 @@ class StrategyScheduler:
     def _runtime(self, profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
         params = profile.params
         roster = self._runtime_roster(profile, feedback)
+        entry_filters = self._runtime_entry_filters(profile, feedback, roster)
         return {
             "profile_id": profile.profile_id,
             "profile_version": profile.version,
@@ -2916,6 +2918,10 @@ class StrategyScheduler:
                 "position_urgent_exit_max_groups": roster["position_urgent_exit_max_groups"],
                 "roster_fill_market_symbol_min": roster["roster_fill_market_symbol_min"],
             },
+            "entry_filters": entry_filters.to_dict(),
+            "min_entry_volume_ratio": entry_filters.min_entry_volume_ratio,
+            "min_entry_adx": entry_filters.min_entry_adx,
+            "entry_filters_are_hard_gate": False,
             "training_trade_count": feedback.totals.get("training_trade_count", 0),
             "low_trade_count_penalty": bool(feedback.totals.get("low_trade_count_penalty")),
         }
@@ -2992,6 +2998,68 @@ class StrategyScheduler:
             "roster_fill_market_symbol_min": roster_fill_market_symbol_min,
             "reason": reason,
         }
+
+    @staticmethod
+    def _runtime_entry_filters(
+        profile: StrategyProfile,
+        feedback: StrategyFeedback,
+        roster: dict[str, Any],
+    ) -> RuntimeEntryFilters:
+        params = STRATEGY_LEARNING_PARAMS
+        base = default_entry_filters(reason="strategy_learning_runtime_default")
+        volume_ratio = base.min_entry_volume_ratio
+        adx = base.min_entry_adx
+        reasons: list[str] = []
+
+        net_pnl = _safe_float(feedback.totals.get("net_pnl"), 0.0)
+        win_rate = _safe_float(feedback.totals.get("win_rate"), 0.0)
+        low_trade_count = bool(feedback.totals.get("low_trade_count_penalty"))
+        risk_mode = str(_safe_dict(feedback.totals).get("risk_mode") or "")
+        open_pressure = _safe_dict(feedback.open_position_pressure)
+        problem_keys = {
+            str(item.get("key")) for item in feedback.problems if isinstance(item, dict)
+        }
+        release_pressure = (
+            roster.get("reason") == "release_low_quality_positions_with_rotation_slots"
+        )
+
+        if net_pnl > 0 and win_rate >= 0.52 and not low_trade_count:
+            factor = params.entry_filter_profit_tighten_factor
+            volume_ratio *= 1.0 + (1.0 - factor) * 0.50
+            adx *= 1.0 + (1.0 - factor) * 0.35
+            reasons.append("profitable_recent_feedback_tightens_quality_reference")
+        elif low_trade_count or "missed_opportunities" in problem_keys or net_pnl < 0:
+            factor = params.entry_filter_loss_relax_factor
+            volume_ratio *= factor
+            adx *= 0.82
+            reasons.append("low_sample_or_loss_feedback_relaxes_scan_reference")
+
+        if release_pressure:
+            volume_ratio *= params.entry_filter_release_relax_factor
+            adx *= 0.90
+            reasons.append("release_pressure_uses_advisory_filters_only")
+
+        if risk_mode in {"drawdown", "hard_recovery"}:
+            volume_ratio *= 1.08
+            adx *= 1.06
+            reasons.append("drawdown_mode_requires_clearer_reference_quality")
+
+        if _safe_float(open_pressure.get("low_quality_open_ratio"), 0.0) > 0.30:
+            volume_ratio *= 1.04
+            reasons.append("low_quality_open_pressure_biases_quality_reference")
+
+        bounded_volume = min(
+            max(volume_ratio, params.entry_volume_ratio_min),
+            params.entry_volume_ratio_max,
+        )
+        bounded_adx = min(max(adx, params.entry_adx_min), params.entry_adx_max)
+        return RuntimeEntryFilters(
+            min_entry_volume_ratio=round(bounded_volume, 4),
+            min_entry_adx=round(bounded_adx, 2),
+            source="strategy_learning_runtime",
+            is_hard_entry_gate=False,
+            reason=", ".join(reasons) or "baseline_dynamic_reference",
+        )
 
     @staticmethod
     def _rollback(
@@ -3259,6 +3327,17 @@ class StrategyLearningEngine:
         )
         result["probe_fraction"] = _safe_float(runtime.get("probe_fraction"), 0.0)
         result["max_probe_size_pct"] = _safe_float(runtime.get("max_probe_size_pct"), 0.0)
+        entry_filters = _safe_dict(runtime.get("entry_filters"))
+        result["entry_filters"] = entry_filters
+        result["min_entry_volume_ratio"] = _safe_float(
+            entry_filters.get("min_entry_volume_ratio"),
+            _safe_float(runtime.get("min_entry_volume_ratio"), settings.min_entry_volume_ratio),
+        )
+        result["min_entry_adx"] = _safe_float(
+            entry_filters.get("min_entry_adx"),
+            _safe_float(runtime.get("min_entry_adx"), settings.min_entry_adx),
+        )
+        result["entry_filters_are_hard_gate"] = False
         result["strategy_learning_sizing"] = {
             "profile_id": active_profile.get("id") or runtime.get("profile_id"),
             "position_size_multiplier": result["position_size_multiplier"],
@@ -3446,6 +3525,7 @@ class StrategyLearningEngine:
         result["strategy_learning"] = {
             "active_profile": active_profile,
             "runtime": runtime,
+            "entry_filters": entry_filters,
             "reason": schedule.get("reason", ""),
             "rollback": schedule.get("rollback", {}),
             "feedback_summary": feedback_summary,

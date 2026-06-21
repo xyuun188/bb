@@ -1,14 +1,4 @@
-"""
-Risk management engine — the central pipeline that validates all trading decisions
-before they reach the executor.
-
-Flow:
-  1. Position limits check
-  2. Stop-loss evaluation (for existing positions)
-  3. Black swan detection
-  4. Circuit breaker check
-  5. Approval/rejection of decision
-"""
+"""Risk management engine for final pre-execution validation."""
 
 from __future__ import annotations
 
@@ -23,6 +13,7 @@ from risk_manager.black_swan import BlackSwanDetector, BlackSwanResult
 from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossManager, StopLossResult
+from services.runtime_entry_filters import entry_filters_from_decision
 
 logger = structlog.get_logger(__name__)
 
@@ -36,7 +27,7 @@ class RiskAssessment:
     """Result of the full risk evaluation pipeline."""
 
     approved: bool
-    decision: DecisionOutput | None  # May be modified (e.g., reduced size)
+    decision: DecisionOutput | None
     stop_loss_result: StopLossResult | None = None
     black_swan_result: BlackSwanResult | None = None
     rejection_reason: str = ""
@@ -44,7 +35,7 @@ class RiskAssessment:
 
 
 class RiskEngine:
-    """Orchestrates all risk checks and produces a final RiskAssessment."""
+    """Validate decisions against hard safety controls and advisory risk context."""
 
     def __init__(
         self,
@@ -74,270 +65,265 @@ class RiskEngine:
         volume_ratio: float = 1.0,
         adx_14: float | None = None,
     ) -> RiskAssessment:
-        """Evaluate a trading decision against all risk controls.
+        """Evaluate a trading decision before it reaches the executor."""
 
-        Args:
-            decision: The AI model's proposed trade.
-            current_positions: Open positions (list of dicts with side, symbol, quantity, entry_price).
-            account_balance: Current account balance in quote currency.
-            headlines: Recent news headlines for black swan detection.
-            sentiment_scores: Corresponding sentiment scores.
-            price_change_1m: Recent 1-minute price change (for flash crash detection).
-            volume_ratio: Current volume / average volume.
-            adx_14: ADX trend-strength indicator for entry filtering.
-
-        Returns:
-            RiskAssessment with approval status and any modifications.
-        """
         warnings: list[str] = []
 
-        # === 0. Circuit breaker check ===
         if self.circuit_breaker.is_open and decision.is_entry:
             return RiskAssessment(
                 approved=False,
                 decision=decision,
-                rejection_reason="Circuit breaker is OPEN — no new positions allowed.",
+                rejection_reason="Circuit breaker is open; no new entries are allowed.",
             )
 
-        # === 1. Black swan check ===
-        if headlines:
-            bs_result = self.black_swan_detector.check_combined(
-                headlines or [],
-                sentiment_scores or [],
-                price_change_1m,
-                volume_ratio,
-            )
-            if bs_result.triggered and bs_result.severity == "critical":
-                matching_positions = [
-                    pos
-                    for pos in current_positions
-                    if pos.get("symbol") == decision.symbol and pos.get("is_open", True)
-                ]
-                if not matching_positions:
-                    if decision.is_entry:
-                        return RiskAssessment(
-                            approved=False,
-                            decision=decision,
-                            black_swan_result=bs_result,
-                            rejection_reason=(
-                                "风控拦截：检测到重大行情风险，当前没有可平仓仓位，"
-                                f"因此禁止追涨/追空开新仓。原因：{bs_result.reason}"
-                            ),
-                            warnings=[bs_result.reason],
-                        )
-                    return RiskAssessment(
-                        approved=True,
-                        decision=decision,
-                        black_swan_result=bs_result,
-                        warnings=[bs_result.reason],
-                    )
+        black_swan_result = self._assess_black_swan(
+            decision=decision,
+            current_positions=current_positions,
+            headlines=headlines,
+            sentiment_scores=sentiment_scores,
+            price_change_1m=price_change_1m,
+            volume_ratio=volume_ratio,
+            warnings=warnings,
+        )
+        if black_swan_result is not None:
+            return black_swan_result
 
-                target_side = str(matching_positions[0].get("side") or "long").lower()
-                close_action = Action.CLOSE_LONG if target_side == "long" else Action.CLOSE_SHORT
-                # Force-close the matching open side only when a position exists.
-                return RiskAssessment(
-                    approved=True,  # Action must be taken
-                    decision=DecisionOutput(
-                        model_name="risk_engine",
-                        symbol=decision.symbol,
-                        action=close_action,
-                        confidence=1.0,
-                        reasoning=f"BLACK SWAN CRITICAL: {bs_result.reason}",
-                        position_size_pct=1.0,
-                    ),
-                    black_swan_result=bs_result,
-                    warnings=[bs_result.reason],
-                )
-            if bs_result.severity == "warn":
-                warning_text = (
-                    "黑天鹅预警：检测到潜在异常新闻或快速下跌，但未达到重大风险级别。"
-                    "系统继续允许交易，同时把新开仓限制为小仓位、1x 杠杆。"
-                    f" 原因：{bs_result.reason}"
-                )
-                warnings.append(warning_text)
-                # Warn mode should alert and reduce risk, not freeze trading.
-                # Critical mode above is the only black-swan branch that blocks
-                # fresh entries or forces a close.
-                if False and decision.is_entry:
-                    decision.position_size_pct = min(float(decision.position_size_pct or 0.0), 0.03)
-                    decision.suggested_leverage = min(
-                        float(decision.suggested_leverage or 1.0), 1.0
-                    )
-                    decision.reasoning = (
-                        f"{decision.reasoning} [风控预警：检测到 warning 级别黑天鹅线索，"
-                        "已自动降为小仓位 1x 试单。]"
-                    )
+        stop_result = self._assess_stop_loss(decision, current_positions)
+        if stop_result is not None:
+            return stop_result
 
-        # === 2. Stop-loss evaluation for existing positions ===
-        stop_result = None
-        for pos in current_positions:
-            if pos.get("symbol") == decision.symbol and pos.get("is_open"):
-                sl_result = self.stop_loss_manager.evaluate(
-                    symbol=pos["symbol"],
-                    side=pos["side"],
-                    entry_price=pos["entry_price"],
-                    current_price=(
-                        decision.feature_snapshot.get("close", 0)
-                        if decision.feature_snapshot
-                        else 0
-                    ),
-                )
-                if sl_result.triggered:
-                    stop_result = sl_result
-                    # Override the AI decision with a forced close
-                    close_action = (
-                        Action.CLOSE_LONG if pos["side"] == "long" else Action.CLOSE_SHORT
-                    )
-                    return RiskAssessment(
-                        approved=True,
-                        decision=DecisionOutput(
-                            model_name="risk_engine",
-                            symbol=decision.symbol,
-                            action=close_action,
-                            confidence=1.0,
-                            reasoning=f"STOP LOSS ({sl_result.stop_type.value}): {sl_result.reason}",
-                            position_size_pct=1.0,
-                        ),
-                        stop_loss_result=sl_result,
-                        warnings=[sl_result.reason],
-                    )
-
-        # === 3. Position size checks (only for entries) ===
         if decision.is_entry:
-            model_open_positions = [
-                p for p in current_positions if p.get("model_name") == decision.model_name
-            ]
-            decision_side = "long" if decision.action == Action.LONG else "short"
-            same_symbol_positions = [
-                p
-                for p in model_open_positions
-                if p.get("side") == decision_side and p.get("symbol") == decision.symbol
-            ]
-            is_same_symbol_add = bool(same_symbol_positions)
-
-            capacity = self._max_open_positions_context()
-            max_open_positions = int(
-                capacity.get("entry_limit")
-                or capacity.get("effective_limit")
-                or 0
-            )
-            model_open_group_count = self._model_open_group_count(model_open_positions)
-            if (
-                not is_same_symbol_add
-                and max_open_positions > 0
-                and model_open_group_count >= max_open_positions
-            ):
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=(
-                        "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
-                        f"当前 {model_open_group_count} 组，限制 {max_open_positions} 组。"
-                        f"{self._capacity_suffix(capacity)}"
-                    ),
-                )
-
-            min_confidence = max(
-                float(settings.confidence_threshold or 0.0), MIN_ENTRY_CONFIDENCE_AFTER_FEES
-            )
-            if False and float(decision.confidence or 0.0) < min_confidence:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=(
-                        "入场信心度未达到手续费修正后的执行门槛，暂不下单。"
-                        f"当前信心度={decision.confidence:.2f}，要求>={min_confidence:.2f}。"
-                    ),
-                )
-
-            min_take_profit = max(
-                MIN_TAKE_PROFIT_AFTER_COSTS,
-                float(decision.stop_loss_pct or 0.0) * MIN_REWARD_RISK_RATIO,
-            )
-            if False and float(decision.take_profit_pct or 0.0) < min_take_profit:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=(
-                        "止盈空间不足以覆盖手续费、滑点和止损风险，暂不下单。"
-                        f"当前止盈={decision.take_profit_pct:.2%}，要求>={min_take_profit:.2%}。"
-                    ),
-                )
-
-            if False and len(same_symbol_positions) >= settings.max_same_symbol_positions_per_side:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=(
-                        f"同币种同方向持仓已达上限，暂停加仓。"
-                        f"{decision.symbol} {decision_side} 当前 {len(same_symbol_positions)} 笔，"
-                        f"限制 {settings.max_same_symbol_positions_per_side} 笔。"
-                    ),
-                )
-
-            trend_adx = self._get_adx(decision, adx_14)
-            entry_confirmations = [
-                trend_adx >= settings.min_entry_adx,
-                volume_ratio >= settings.min_entry_volume_ratio,
-                self._trend_aligned(decision),
-            ]
-            if False and sum(1 for ok in entry_confirmations if ok) < 2:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=(
-                        "入场确认不足，暂不下单。"
-                        f"当前 ADX={trend_adx:.1f}（要求 {settings.min_entry_adx:.1f}），"
-                        f"成交量倍数={volume_ratio:.2f}（要求 {settings.min_entry_volume_ratio:.2f}），"
-                        "且均线趋势需与方向配合；三项至少满足两项。"
-                    ),
-                )
-
-            size_check = self.position_checker.check_contract_entry_limits(
-                proposed_margin_pct=decision.position_size_pct,
-                proposed_leverage=decision.suggested_leverage,
-                proposed_stop_loss_pct=decision.stop_loss_pct,
+            entry_result = self._assess_entry(
+                decision=decision,
                 current_positions=current_positions,
                 account_balance=account_balance,
-                symbol=decision.symbol,
+                volume_ratio=volume_ratio,
+                adx_14=adx_14,
+                warnings=warnings,
             )
-            if not size_check.passed:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=size_check.reason,
-                )
-            if size_check.adjusted_size_pct is not None:
-                decision.position_size_pct = size_check.adjusted_size_pct
-                warnings.append(size_check.reason)
+            if entry_result is not None:
+                return entry_result
 
-            leverage_cap = self._max_allowed_leverage(decision, volume_ratio, trend_adx)
-            if False and decision.suggested_leverage > leverage_cap:
-                decision.suggested_leverage = leverage_cap
-                warnings.append(f"杠杆已按置信度和过滤条件限制为 {leverage_cap:.1f}x。")
-
-            # Leverage check
-            lev_check = self.position_checker.check_leverage(decision.suggested_leverage)
-            if lev_check.adjusted_size_pct:
-                decision.suggested_leverage = lev_check.adjusted_size_pct
-
-        # === 4. Daily loss check ===
         self.circuit_breaker.evaluate_daily_loss(account_balance)
-        if self.circuit_breaker.is_open:
-            if decision.is_entry:
-                return RiskAssessment(
-                    approved=False,
-                    decision=decision,
-                    rejection_reason=f"Daily loss limit reached: {self.circuit_breaker._state.tripped_reason}",
-                )
+        if self.circuit_breaker.is_open and decision.is_entry:
+            return RiskAssessment(
+                approved=False,
+                decision=decision,
+                rejection_reason=(
+                    f"Daily loss limit reached: {self.circuit_breaker._state.tripped_reason}"
+                ),
+            )
 
-        # === 5. Approve ===
         return RiskAssessment(
             approved=True,
             decision=decision,
-            stop_loss_result=stop_result,
+            stop_loss_result=None,
             warnings=warnings,
         )
+
+    def _assess_black_swan(
+        self,
+        *,
+        decision: DecisionOutput,
+        current_positions: list[dict],
+        headlines: list[str] | None,
+        sentiment_scores: list[float] | None,
+        price_change_1m: float,
+        volume_ratio: float,
+        warnings: list[str],
+    ) -> RiskAssessment | None:
+        if not headlines:
+            return None
+
+        result = self.black_swan_detector.check_combined(
+            headlines or [],
+            sentiment_scores or [],
+            price_change_1m,
+            volume_ratio,
+        )
+        if result.triggered and result.severity == "critical":
+            matching_positions = [
+                pos
+                for pos in current_positions
+                if pos.get("symbol") == decision.symbol and pos.get("is_open", True)
+            ]
+            if not matching_positions:
+                if decision.is_entry:
+                    return RiskAssessment(
+                        approved=False,
+                        decision=decision,
+                        black_swan_result=result,
+                        rejection_reason=(
+                            "风控硬拦截：检测到重大行情风险，当前没有可平仓位，"
+                            f"因此禁止新开仓。原因：{result.reason}"
+                        ),
+                        warnings=[result.reason],
+                    )
+                return RiskAssessment(
+                    approved=True,
+                    decision=decision,
+                    black_swan_result=result,
+                    warnings=[result.reason],
+                )
+
+            target_side = str(matching_positions[0].get("side") or "long").lower()
+            close_action = Action.CLOSE_LONG if target_side == "long" else Action.CLOSE_SHORT
+            return RiskAssessment(
+                approved=True,
+                decision=DecisionOutput(
+                    model_name="risk_engine",
+                    symbol=decision.symbol,
+                    action=close_action,
+                    confidence=1.0,
+                    reasoning=f"BLACK SWAN CRITICAL: {result.reason}",
+                    position_size_pct=1.0,
+                ),
+                black_swan_result=result,
+                warnings=[result.reason],
+            )
+
+        if result.severity == "warn":
+            warnings.append(
+                "黑天鹅预警：检测到潜在异常新闻或快速波动；当前仅记录风险提示，"
+                f"不作为固定开仓门槛。原因：{result.reason}"
+            )
+        return None
+
+    def _assess_stop_loss(
+        self,
+        decision: DecisionOutput,
+        current_positions: list[dict],
+    ) -> RiskAssessment | None:
+        for position in current_positions:
+            if position.get("symbol") != decision.symbol or not position.get("is_open"):
+                continue
+            current_price = 0.0
+            if decision.feature_snapshot:
+                current_price = float(decision.feature_snapshot.get("close", 0) or 0)
+            result = self.stop_loss_manager.evaluate(
+                symbol=position["symbol"],
+                side=position["side"],
+                entry_price=position["entry_price"],
+                current_price=current_price,
+            )
+            if not result.triggered:
+                continue
+            close_action = Action.CLOSE_LONG if position["side"] == "long" else Action.CLOSE_SHORT
+            return RiskAssessment(
+                approved=True,
+                decision=DecisionOutput(
+                    model_name="risk_engine",
+                    symbol=decision.symbol,
+                    action=close_action,
+                    confidence=1.0,
+                    reasoning=f"STOP LOSS ({result.stop_type.value}): {result.reason}",
+                    position_size_pct=1.0,
+                ),
+                stop_loss_result=result,
+                warnings=[result.reason],
+            )
+        return None
+
+    def _assess_entry(
+        self,
+        *,
+        decision: DecisionOutput,
+        current_positions: list[dict],
+        account_balance: float,
+        volume_ratio: float,
+        adx_14: float | None,
+        warnings: list[str],
+    ) -> RiskAssessment | None:
+        model_open_positions = [
+            position
+            for position in current_positions
+            if position.get("model_name") == decision.model_name
+        ]
+        decision_side = "long" if decision.action == Action.LONG else "short"
+        same_symbol_positions = [
+            position
+            for position in model_open_positions
+            if position.get("side") == decision_side and position.get("symbol") == decision.symbol
+        ]
+        is_same_symbol_add = bool(same_symbol_positions)
+
+        capacity = self._max_open_positions_context()
+        max_open_positions = int(
+            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
+        )
+        model_open_group_count = self._model_open_group_count(model_open_positions)
+        if (
+            not is_same_symbol_add
+            and max_open_positions > 0
+            and model_open_group_count >= max_open_positions
+        ):
+            return RiskAssessment(
+                approved=False,
+                decision=decision,
+                rejection_reason=(
+                    "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
+                    f"当前 {model_open_group_count} 组，限制 {max_open_positions} 组。"
+                    f"{self._capacity_suffix(capacity)}"
+                ),
+            )
+
+        entry_filters = entry_filters_from_decision(decision)
+        min_confidence = max(
+            float(settings.confidence_threshold or 0.0),
+            MIN_ENTRY_CONFIDENCE_AFTER_FEES,
+        )
+        if float(decision.confidence or 0.0) < min_confidence:
+            warnings.append(
+                "入场信心低于手续费后参考线；此项只影响排序、仓位和解释，不是硬开仓门槛。"
+            )
+
+        min_take_profit = max(
+            MIN_TAKE_PROFIT_AFTER_COSTS,
+            float(decision.stop_loss_pct or 0.0) * MIN_REWARD_RISK_RATIO,
+        )
+        if float(decision.take_profit_pct or 0.0) < min_take_profit:
+            warnings.append(
+                "止盈空间低于成本/止损参考线；此项只影响排序、仓位和解释，不是硬开仓门槛。"
+            )
+
+        trend_adx = self._get_adx(decision, adx_14)
+        entry_confirmations = [
+            trend_adx >= entry_filters.min_entry_adx,
+            volume_ratio >= entry_filters.min_entry_volume_ratio,
+            self._trend_aligned(decision),
+        ]
+        if sum(1 for passed in entry_confirmations if passed) < 2:
+            warnings.append(
+                "运行时入场参考项不足 2 项；动态策略会降低优先级或仓位，但不在风控层硬拦截。"
+            )
+
+        size_check = self.position_checker.check_contract_entry_limits(
+            proposed_margin_pct=decision.position_size_pct,
+            proposed_leverage=decision.suggested_leverage,
+            proposed_stop_loss_pct=decision.stop_loss_pct,
+            current_positions=current_positions,
+            account_balance=account_balance,
+            symbol=decision.symbol,
+        )
+        if not size_check.passed:
+            return RiskAssessment(
+                approved=False,
+                decision=decision,
+                rejection_reason=size_check.reason,
+            )
+        if size_check.adjusted_size_pct is not None:
+            decision.position_size_pct = size_check.adjusted_size_pct
+            warnings.append(size_check.reason)
+
+        leverage_cap = self._max_allowed_leverage(decision, volume_ratio, trend_adx)
+        if decision.suggested_leverage > leverage_cap:
+            decision.suggested_leverage = leverage_cap
+            warnings.append(f"杠杆已按动态运行时参考质量限制为 {leverage_cap:.1f}x。")
+
+        leverage_check = self.position_checker.check_leverage(decision.suggested_leverage)
+        if leverage_check.adjusted_size_pct:
+            decision.suggested_leverage = leverage_check.adjusted_size_pct
+        return None
 
     def _max_open_positions_context(self) -> dict[str, Any]:
         raw = self.max_open_positions_provider()
@@ -390,7 +376,7 @@ class RiskEngine:
         if isinstance(codes, list) and codes:
             labels = {
                 "strategy_rotation_slots": "策略学习已为轮换释放预留开仓槽",
-                "release_rotation_slots": "低质量持仓释放中，系统预留了小仓轮换槽",
+                "release_rotation_slots": "低质量持仓释放中，系统预留轮换槽",
                 "rotation_entry_expansion": "开仓上限已按轮换释放策略上调",
                 "low_quality_pressure": "低质量持仓压力较高，优先复盘释放旧仓",
                 "low_quality_warn": "低质量持仓偏高，降低扩仓节奏",
@@ -422,15 +408,16 @@ class RiskEngine:
         if decision.confidence < 0.58:
             return base_cap
 
+        entry_filters = entry_filters_from_decision(decision)
         filters_pass = (
             sum(
                 1
-                for ok in (
-                    volume_ratio >= settings.min_entry_volume_ratio,
-                    trend_adx >= settings.min_entry_adx,
+                for passed in (
+                    volume_ratio >= entry_filters.min_entry_volume_ratio,
+                    trend_adx >= entry_filters.min_entry_adx,
                     self._trend_aligned(decision),
                 )
-                if ok
+                if passed
             )
             >= 2
         )

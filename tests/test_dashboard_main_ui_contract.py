@@ -10,6 +10,10 @@ from web_dashboard.api import dashboard
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
 def test_main_dashboard_removes_manual_symbol_selector() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
@@ -69,18 +73,18 @@ def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
     ]
     mojibake_markers = (
         "????",
-        "鐧诲綍",
-        "瀹炵洏",
-        "鍒囨崲",
-        "宸叉湁",
-        "璐︽埛",
-        "澶辫触",
-        "棰勬湡",
-        "鏀剁泭",
-        "鑻嶉府",
-        "鐪嬫澘",
-        "绔彛",
-        "�",
+        _u("\\u9427\\u8bf2\\u7d8d"),
+        _u("\\u7039\\u70b5\\u6d0f"),
+        _u("\\u9352\\u56e8\\u5d32"),
+        _u("\\u5bb8\\u53c9\\u6e41"),
+        _u("\\u7490\\ufe3d\\u57db"),
+        _u("\\u6fb6\\u8fab\\u89e6"),
+        _u("\\u68f0\\u52ec\\u6e61"),
+        _u("\\u93c0\\u5241\\u6ced"),
+        _u("\\u947b\\u5d89\\u5e9c"),
+        _u("\\u942a\\u5b2b\\u6f98"),
+        _u("\\u7ed4\\ue21a\\u5f5b"),
+        _u("\\ufffd"),
     )
 
     for asset in assets:

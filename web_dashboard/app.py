@@ -5,6 +5,7 @@ Serves REST API + WebSocket on the configured dashboard port.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,13 +43,43 @@ PUBLIC_AUTH_PATHS = {
 ws_manager = WebSocketManager()
 
 
+async def _system_audit_history_loop() -> None:
+    from web_dashboard.api.system_audit import collect_system_audit_status
+
+    interval = max(60, int(settings.system_audit_history_interval_seconds or 300))
+    while True:
+        try:
+            await collect_system_audit_status(record_history=True, source="background")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "system audit history loop failed",
+                error=type(exc).__name__,
+            )
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
-    yield
-    await ws_manager.close_all()
+    audit_task = (
+        asyncio.create_task(_system_audit_history_loop())
+        if settings.system_audit_history_enabled
+        else None
+    )
+    try:
+        yield
+    finally:
+        if audit_task:
+            audit_task.cancel()
+            try:
+                await audit_task
+            except asyncio.CancelledError:
+                pass
+        await ws_manager.close_all()
 
 
 def create_app() -> FastAPI:

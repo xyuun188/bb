@@ -5154,6 +5154,173 @@ function systemAuditDetailsHtml(details) {
     `).join('')}</div>`;
 }
 
+function systemAuditShortText(value, maxLength = 140) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!text) return '-';
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function systemAuditMetric(label, value, subtitle = '') {
+    return `
+        <div class="system-audit-detail-chip">
+            <span>${escHtml(label)}</span>
+            <strong>${escHtml(systemAuditValueText(value))}</strong>
+            ${subtitle ? `<em>${escHtml(subtitle)}</em>` : ''}
+        </div>`;
+}
+
+function systemAuditSafeValue(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    if (typeof value === 'object') return systemAuditShortText(JSON.stringify(value), 120);
+    return systemAuditShortText(value, 120);
+}
+
+function systemAuditTable(headers, rows) {
+    const visibleRows = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    if (!visibleRows.length) return '<div class="system-audit-muted">暂无明细</div>'; 
+    return `
+        <div class="system-audit-table-wrap">
+            <table class="system-audit-table">
+                <thead><tr>${headers.map(item => `<th>${escHtml(item)}</th>`).join('')}</tr></thead>
+                <tbody>${visibleRows.map(row => `
+                    <tr>${row.map(item => `<td>${escHtml(systemAuditSafeValue(item))}</td>`).join('')}</tr>
+                `).join('')}</tbody>
+            </table>
+        </div>`;
+}
+
+function systemAuditSection(title, body) {
+    if (!body) return ''; 
+    return `<section class="system-audit-detail-section"><h4>${escHtml(title)}</h4>${body}</section>`;
+}
+
+function systemAuditCompactList(title, rows) {
+    const items = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    if (!items.length) return ''; 
+    return `
+        <div class="system-audit-compact-list">
+            <strong>${escHtml(title)}</strong>
+            ${items.map(item => `<span>${escHtml(systemAuditShortText(item, 180))}</span>`).join('')}
+        </div>`;
+}
+
+function systemAuditTradingDetails(details) {
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('10分钟分析', details.last_10m_decisions, '交易主循环心跳')}
+            ${systemAuditMetric('2小时分析', details.last_2h_decisions, '候选评估数量')}
+            ${systemAuditMetric('2小时订单', details.last_2h_orders, '执行链路产出')}
+            ${systemAuditMetric('当前持仓', details.open_positions, '用于判断容量')}
+            ${systemAuditMetric('最新分析', details.latest_decision_at ? toBeijingTime(details.latest_decision_at) : '-', '市场/持仓分析时间')}
+            ${systemAuditMetric('最新订单', details.latest_order_at ? toBeijingTime(details.latest_order_at) : '-', '下单/平仓时间')}
+        </div>`;
+}
+
+function systemAuditOkxDetails(details) {
+    const plans = Array.isArray(details.sample_plans) ? details.sample_plans : [];
+    const rows = plans.slice(0, 5).map(item => [
+        item.symbol || '-',
+        sideLabel(item.side || '-'),
+        item.quantity ?? '-',
+        item.realized_pnl ?? '-',
+        item.closed_at ? toBeijingTime(item.closed_at) : '-',
+    ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('对账窗口', `${details.window_days || 14} 天`, '只读 dry-run')}
+            ${systemAuditMetric('缺失闭仓', details.missing_closed_positions, '不为 0 会影响收益/训练')}
+        </div>
+        ${systemAuditSection('缺失闭仓样例', systemAuditTable(['交易对', '方向', '数量', '盈亏', '平仓时间'], rows))}`;
+}
+
+function systemAuditMarketDataDetails(details) {
+    const klines = Array.isArray(details.klines) ? details.klines : [];
+    const rows = klines.map(item => [
+        item.timeframe || '-',
+        item.symbols ?? 0,
+        item.rows ?? 0,
+        item.latest_at ? toBeijingTime(item.latest_at) : '-',
+        item.missing ? '缺失' : (item.stale ? '过期' : '正常'),
+    ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('Ticker 数量', details.ticker_count, details.ticker_stale ? '实时行情过期' : '实时行情正常')}
+            ${systemAuditMetric('Ticker 最新', details.ticker_latest_at ? toBeijingTime(details.ticker_latest_at) : '-', '行情新鲜度')}
+            ${systemAuditMetric('缺失周期', Array.isArray(details.missing_timeframes) ? details.missing_timeframes.join('、') || '无' : '无')}
+            ${systemAuditMetric('过期周期', Array.isArray(details.stale_timeframes) ? details.stale_timeframes.join('、') || '无' : '无')}
+        </div>
+        ${systemAuditSection('K线覆盖', systemAuditTable(['周期', '币种数', '行数', '最新时间', '状态'], rows))}`;
+}
+
+function systemAuditStrategyDetails(details) {
+    const fastLoss = Array.isArray(details.fast_loss_positions) ? details.fast_loss_positions : [];
+    const fastLossRows = fastLoss.slice(0, 6).map(item => [
+        item.symbol || '-',
+        sideLabel(item.side || '-'),
+        `${monitorNumber(item.hold_minutes || 0, 1)} 分钟`,
+        item.realized_pnl ?? '-',
+        item.closed_at ? toBeijingTime(item.closed_at) : '-',
+    ]);
+    const blockedReasons = (Array.isArray(details.top_blocked_reasons) ? details.top_blocked_reasons : [])
+        .slice(0, 5)
+        .map(item => `${item.count || 0} 次：${systemAuditShortText(item.reason || '-', 120)}`);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('24小时决策', details.decision_count, '最近样本窗口')}
+            ${systemAuditMetric('开仓候选', details.entry_decision_count, 'long/short 候选数')}
+            ${systemAuditMetric('负净收益候选', details.negative_expected_net_count, '过高需查成本/收益')}
+            ${systemAuditMetric('零净收益候选', details.zero_expected_net_count, '过高需查模型返回')}
+        </div>
+        ${systemAuditSection('快亏平样本', systemAuditTable(['交易对', '方向', '持仓时长', '盈亏', '平仓时间'], fastLossRows))}
+        ${systemAuditCompactList('主要拦截原因', blockedReasons)}`;
+}
+
+function systemAuditModelTrainingDetails(details) {
+    const localTools = details.local_ai_tools || {};
+    const sourceWarnings = Array.isArray(details.source_warnings) ? details.source_warnings : [];
+    const criticalItems = Array.isArray(details.model_critical_items) ? details.model_critical_items : [];
+    const sourceRows = sourceWarnings.slice(0, 6).map(item => [
+        item.name || item.key || '-',
+        collectionStatusLabel(item.status || '-', item.enabled !== false),
+        item.detail || item.message || '-',
+    ]);
+    const criticalRows = criticalItems.slice(0, 6).map(item => [
+        item.title || item.key || '-',
+        systemAuditStatusLabel(item.status),
+        item.message || '-',
+    ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('本地量化工具', localTools.available ? '可用' : '不可用', collectionStatusLabel(localTools.status || '-', true))}
+            ${systemAuditMetric('影子样本', localTools.shadow_sample_count ?? 0, '训练输入')}
+            ${systemAuditMetric('交易样本', localTools.trade_sample_count ?? 0, '真实复盘输入')}
+            ${systemAuditMetric('文本样本', localTools.text_sentiment_sample_count ?? 0, '新闻/情绪输入')}
+            ${systemAuditMetric('治理状态', details.governance_status || '-', '训练数据清洗')}
+        </div>
+        ${systemAuditSection('数据源告警', systemAuditTable(['来源', '状态', '说明'], sourceRows))}
+        ${systemAuditSection('模型服务异常', systemAuditTable(['项目', '状态', '说明'], criticalRows))}`;
+}
+
+function systemAuditGenericDetailsHtml(details) {
+    if (!details || typeof details !== 'object') return ''; 
+    const rows = Object.entries(details)
+        .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+        .slice(0, 8)
+        .map(([key, value]) => systemAuditMetric(key, value));
+    return rows.length ? `<div class="system-audit-detail-grid">${rows.join('')}</div>` : ''; 
+}
+
+function systemAuditCardDetailsHtml(card) {
+    const details = card.details || {};
+    const key = String(card.key || '');
+    if (key === 'trade_loop') return systemAuditTradingDetails(details);
+    if (key === 'okx_reconciliation') return systemAuditOkxDetails(details);
+    if (key === 'market_data') return systemAuditMarketDataDetails(details);
+    if (key === 'strategy_quality') return systemAuditStrategyDetails(details);
+    if (key === 'model_training') return systemAuditModelTrainingDetails(details);
+    return systemAuditGenericDetailsHtml(details);
+}
+
 function systemAuditOverviewHtml(data) {
     const status = systemAuditTone(data.status);
     const summary = data.summary || {};
@@ -5211,7 +5378,7 @@ function renderSystemAuditCards(cards) {
                     <em>${escHtml(systemAuditStatusLabel(card.status))}</em>
                 </div>
                 ${systemAuditEvidenceHtml(card.evidence)}
-                ${systemAuditDetailsHtml(card.details)}
+                ${systemAuditCardDetailsHtml(card)}
                 <div class="system-audit-card-actions">
                     <strong>建议处理</strong>
                     ${systemAuditActionsHtml(card.next_actions)}

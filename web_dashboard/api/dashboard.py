@@ -45,7 +45,15 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     signal_available as signal_payload_available,
 )
+from services.exchange_position_state import (
+    exchange_position_display_valuation as _exchange_position_display_valuation,
+    exchange_snapshot_price as _exchange_snapshot_price,
+    exchange_snapshot_quantity as _exchange_snapshot_quantity,
+    exchange_snapshot_unrealized as _exchange_snapshot_unrealized,
+    parse_exchange_position_snapshot,
+)
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
+from services.runtime_entry_filters import entry_filters_from_context
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.vector_memory import get_vector_memory_service
@@ -71,7 +79,7 @@ _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
-_exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, float]]]] = {}
+_exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, Any]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
 _dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -172,20 +180,6 @@ def _safe_float_value(value: Any, default: float = 0.0) -> float:
 
 def _dashboard_position_key(symbol: Any, side: Any) -> tuple[str, str]:
     return (_normalize_dashboard_symbol(str(symbol or "")), str(side or "").lower())
-
-
-def _exchange_snapshot_unrealized(snapshot: dict[str, Any], side: str) -> float:
-    snapshot_upl = _safe_float(snapshot.get("upl"), None)
-    if snapshot_upl is not None:
-        return snapshot_upl
-    mark_price = _safe_float(snapshot.get("mark_price"), 0.0) or 0.0
-    entry_price = _safe_float(snapshot.get("entry_price"), 0.0) or 0.0
-    quantity = _safe_float(snapshot.get("contracts"), 0.0) or 0.0
-    if mark_price <= 0 or entry_price <= 0 or quantity <= 0:
-        return 0.0
-    if side == "short":
-        return (entry_price - mark_price) * quantity
-    return (mark_price - entry_price) * quantity
 
 
 def _exchange_snapshot_margin(snapshot: dict[str, Any]) -> float:
@@ -297,9 +291,9 @@ def _group_open_dashboard_positions(
             "mode": key[1],
             "symbol": symbol,
             "side": side,
-            "quantity": _safe_float(snapshot.get("contracts"), 0.0) or 0.0,
+            "quantity": _exchange_snapshot_quantity(snapshot),
             "entry_price": _safe_float(snapshot.get("entry_price"), 0.0) or 0.0,
-            "current_price": _safe_float(snapshot.get("mark_price"), 0.0) or 0.0,
+            "current_price": _exchange_snapshot_price(snapshot),
             "change_24h": 0.0,
             "unrealized_pnl": _exchange_snapshot_unrealized(snapshot, side),
             "pnl_source": "okx_position",
@@ -333,9 +327,9 @@ def _group_open_dashboard_positions(
         local_entry = _safe_float(group.get("local_entry_price"), 0.0) or 0.0
         snapshot = exchange_mark_map.get((symbol, side))
         if snapshot:
-            exchange_qty = _safe_float(snapshot.get("contracts"), 0.0) or 0.0
+            exchange_qty = _exchange_snapshot_quantity(snapshot)
             exchange_entry = _safe_float(snapshot.get("entry_price"), 0.0) or 0.0
-            exchange_mark = _safe_float(snapshot.get("mark_price"), 0.0) or 0.0
+            exchange_mark = _exchange_snapshot_price(snapshot)
             exchange_upl = _exchange_snapshot_unrealized(snapshot, side)
             group["quantity"] = exchange_qty if exchange_qty > 0 else local_qty
             group["entry_price"] = exchange_entry if exchange_entry > 0 else local_entry
@@ -1618,6 +1612,12 @@ def _translate_pause_reason(reason: str | None) -> str | None:
 
 
 def _fallback_execution_reason(decision, order=None) -> str | None:
+    return _fallback_execution_reason_clean(decision, order)
+
+
+def _fallback_execution_reason_clean(decision, order=None) -> str | None:
+    """Build a clean, non-mojibake execution reason for dashboard details."""
+
     if decision.was_executed:
         return None
 
@@ -1629,6 +1629,10 @@ def _fallback_execution_reason(decision, order=None) -> str | None:
         return "未保存具体未执行原因。"
 
     snapshot = decision.feature_snapshot or {}
+    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+    entry_filters = entry_filters_from_context(
+        raw or {"entry_filters": snapshot.get("entry_filters")}
+    )
     confidence = float(decision.confidence or 0.0)
     volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
     adx_14 = float(snapshot.get("adx_14") or 0.0)
@@ -1637,41 +1641,33 @@ def _fallback_execution_reason(decision, order=None) -> str | None:
 
     if confidence < settings.confidence_threshold:
         return (
-            f"信心不足，未执行。当前置信度 {confidence:.2f}，"
-            f"低于入场门槛 {settings.confidence_threshold:.2f}。"
+            f"分析信心偏低：当前 {confidence:.2f}，系统会降低排序或仓位；"
+            "这不是固定开仓门槛，最终仍由收益质量、风险、OKX规则和动态调度共同决定。"
         )
 
     if action in ("long", "short"):
-        if volume_ratio < settings.min_entry_volume_ratio:
+        if volume_ratio < entry_filters.min_entry_volume_ratio:
             return (
-                f"成交量太低，未执行。当前成交量只有近 20 根K线平均成交量的 {volume_ratio:.2f} 倍，"
-                f"低于最低要求 {settings.min_entry_volume_ratio:.2f} 倍。"
+                f"量能低于本轮运行时参考：当前量能倍数 {volume_ratio:.2f}，"
+                f"动态参考 {entry_filters.min_entry_volume_ratio:.2f}。"
+                "该参考只影响排序/仓位，不是固定硬门槛。"
             )
 
-        if adx_14 < settings.min_entry_adx:
+        if adx_14 < entry_filters.min_entry_adx:
             return (
-                f"趋势强度不够，未执行。当前 ADX 为 {adx_14:.1f}，"
-                f"低于最低要求 {settings.min_entry_adx:.1f}。"
+                f"趋势强度低于本轮运行时参考：当前 ADX {adx_14:.1f}，"
+                f"动态参考 {entry_filters.min_entry_adx:.1f}。"
+                "该参考只影响排序/仓位，不是固定硬门槛。"
             )
 
-        if action == "long":
-            if price_vs_sma20 <= 0 or price_vs_sma50 <= 0:
-                return (
-                    "做多条件不够完整，未执行。当前价格还没有同时站上 SMA20 和 SMA50，"
-                    "趋势没有完全对齐。"
-                )
-        else:
-            if price_vs_sma20 >= 0 or price_vs_sma50 >= 0:
-                return (
-                    "做空条件不够完整，未执行。当前价格还没有同时跌破 SMA20 和 SMA50，"
-                    "趋势没有完全对齐。"
-                )
+        if action == "long" and (price_vs_sma20 <= 0 or price_vs_sma50 <= 0):
+            return "做多趋势未完全对齐：价格没有同时站上 SMA20 和 SMA50，本轮未提交订单。"
+        if action == "short" and (price_vs_sma20 >= 0 or price_vs_sma50 >= 0):
+            return "做空趋势未完全对齐：价格没有同时跌破 SMA20 和 SMA50，本轮未提交订单。"
 
         return (
-            "未找到对应订单记录：页面当前没有查到这条开仓裁决关联的本地订单，"
-            "不等于 OKX 已拒单。常见情况是：普通信号仍在等待本轮候选排序、排序后未通过后续检查、"
-            "下单接口没有返回执行结果，或订单回写有延迟。请优先查看本条未执行原因和同时间附近的执行记录；"
-            "强信号会显示“强信号即时执行”，普通信号会显示“等待排序”或“排序后进入执行”。"
+            "未找到关联订单记录：这通常表示信号仍在候选排序、下单前检查、"
+            "OKX规则校验或订单回写阶段被跳过；请查看本条执行步骤时间线定位具体节点。"
         )
 
     if action in ("close_long", "close_short"):
@@ -1681,18 +1677,15 @@ def _fallback_execution_reason(decision, order=None) -> str | None:
             if exchange_order_id:
                 return (
                     f"系统已向 OKX 提交平仓单，OKX 订单号 {exchange_order_id}，"
-                    f"但最终状态是「{status_label}」。如果数量为 0，说明 OKX 没有确认成交或仓位没有减少，"
-                    "本地不会把仓位标记为已平仓。"
+                    f"最终状态为 {status_label}。如果数量为 0，说明 OKX 未确认成交或仓位未减少。"
                 )
             return (
-                f"本地已生成平仓单，但没有拿到 OKX 订单号，当前本地订单状态为「{status_label}」。"
+                f"本地已生成平仓单，但未拿到 OKX 订单号，当前本地订单状态为 {status_label}。"
                 "请以同时间附近的执行记录和 OKX 订单状态为准。"
             )
         return (
-            "这条平仓裁决没有找到对应的本地平仓委托记录，所以系统没有把它视为已执行。"
-            "注意：页面或 OKX 里同币种的开仓单/持仓记录不等于本次平仓单；"
-            "close_short 需要找到买入平空单，close_long 需要找到卖出平多单。"
-            "如果同时间附近确实有平仓委托，请以 OKX 订单状态和执行记录为准。"
+            "这条平仓决策没有找到对应的本地平仓委托记录，因此系统未把它视为已执行。"
+            "请以 OKX 订单状态和执行记录为准。"
         )
 
     return "未保存具体未执行原因。"
@@ -1936,7 +1929,7 @@ async def _get_exchange_open_position_symbols(mode: str | None = None) -> set[st
 
 async def _get_exchange_position_mark_map(
     mode: str | None = None,
-) -> dict[tuple[str, str], dict[str, float]]:
+) -> dict[tuple[str, str], dict[str, Any]]:
     """Return exchange position mark-price snapshots keyed by (symbol, side)."""
     selected_mode = mode or mode_manager.mode.value
     now = datetime.now(UTC)
@@ -1962,52 +1955,17 @@ async def _get_exchange_position_mark_map(
         )
         return cached[1] if cached else {}
 
-    snapshots: dict[tuple[str, str], dict[str, float]] = {}
+    snapshots: dict[tuple[str, str], dict[str, Any]] = {}
     for position in positions or []:
-        if not _is_live_position_open(position):
-            continue
-        symbol = _normalize_dashboard_symbol(position.get("symbol"))
-        side = str(position.get("side") or "").lower()
-        if not symbol or side not in {"long", "short"}:
-            continue
-        try:
-            mark_price = float(position.get("markPrice") or 0.0)
-        except (TypeError, ValueError):
-            mark_price = 0.0
-        if mark_price <= 0:
-            continue
-        info = position.get("info") or {}
-        try:
-            last_price = float(info.get("last") or position.get("lastPrice") or 0.0)
-        except (TypeError, ValueError):
-            last_price = 0.0
-        try:
-            index_price = float(info.get("idxPx") or 0.0)
-        except (TypeError, ValueError):
-            index_price = 0.0
-        try:
-            upl = float(info.get("upl") or position.get("unrealizedPnl") or 0.0)
-        except (TypeError, ValueError):
-            upl = 0.0
-        entry_price = _safe_float(position.get("entryPrice"), 0.0) or _safe_float(
-            info.get("avgPx"), 0.0
+        snapshot = parse_exchange_position_snapshot(
+            position,
+            symbol_normalizer=_normalize_dashboard_symbol,
         )
-        contracts = _safe_float(position.get("contracts"), 0.0) or _safe_float(info.get("pos"), 0.0)
-        margin_used = (
-            _safe_float(position.get("initialMargin"), 0.0)
-            or _safe_float(position.get("margin"), 0.0)
-            or _safe_float(info.get("imr"), 0.0)
-            or _safe_float(info.get("margin"), 0.0)
-        )
-        snapshots[(symbol, side)] = {
-            "mark_price": mark_price,
-            "last_price": last_price,
-            "index_price": index_price,
-            "upl": upl,
-            "entry_price": entry_price,
-            "contracts": contracts,
-            "margin_used": margin_used,
-        }
+        if not snapshot:
+            continue
+        symbol = str(snapshot["symbol"])
+        side = str(snapshot["side"])
+        snapshots[(symbol, side)] = dict(snapshot)
     _exchange_mark_cache[selected_mode] = (now, snapshots)
     return snapshots
 
@@ -2187,7 +2145,7 @@ async def _build_tickers_for_open_positions(
         if not snapshots:
             continue
         snapshot = snapshots[0]
-        price = float(snapshot.get("last_price") or snapshot.get("mark_price") or 0.0)
+        price = _exchange_snapshot_price(snapshot)
         if price > 0:
             market_ticker = dict(market_tickers.get(symbol, {}) or {})
             public_ticker = dict(public_tickers.get(symbol, {}) or {})
@@ -2335,14 +2293,19 @@ async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[
                     market_ticker.get("change_24h") or market_ticker.get("change24h") or 0.0
                 )
                 if snapshot:
-                    latest_price = float(snapshot.get("mark_price") or 0.0)
-                    if latest_price > 0:
-                        current_price = latest_price
-                        if side == "short":
-                            unrealized_pnl = (entry_price - latest_price) * quantity
-                        else:
-                            unrealized_pnl = (latest_price - entry_price) * quantity
-                        pnl_source = "okx_mark_local_recomputed"
+                    valuation = _exchange_position_display_valuation(
+                        snapshot,
+                        side,
+                        fallback_current_price=current_price,
+                        fallback_unrealized_pnl=unrealized_pnl,
+                        fallback_entry_price=entry_price,
+                        fallback_quantity=quantity,
+                    )
+                    current_price = valuation["current_price"]
+                    unrealized_pnl = valuation["unrealized_pnl"]
+                    entry_price = valuation["entry_price"]
+                    quantity = valuation["quantity"]
+                    pnl_source = valuation["pnl_source"]
                 elif market_ticker:
                     latest_price = float(
                         market_ticker.get("price") or market_ticker.get("last_price") or 0.0
@@ -3029,15 +2992,19 @@ async def get_positions(
                     market_ticker.get("change_24h") or market_ticker.get("change24h") or 0.0
                 )
                 if snapshot:
-                    latest_price = float(snapshot.get("mark_price") or 0.0)
-                    if latest_price > 0:
-                        current_price = latest_price
-                    if latest_price > 0:
-                        if p.side == "short":
-                            unrealized_pnl = (entry_price - latest_price) * quantity
-                        else:
-                            unrealized_pnl = (latest_price - entry_price) * quantity
-                        pnl_source = "okx_mark_local_recomputed"
+                    valuation = _exchange_position_display_valuation(
+                        snapshot,
+                        str(p.side or "").lower(),
+                        fallback_current_price=current_price,
+                        fallback_unrealized_pnl=unrealized_pnl,
+                        fallback_entry_price=entry_price,
+                        fallback_quantity=quantity,
+                    )
+                    current_price = valuation["current_price"]
+                    unrealized_pnl = valuation["unrealized_pnl"]
+                    entry_price = valuation["entry_price"]
+                    quantity = valuation["quantity"]
+                    pnl_source = valuation["pnl_source"]
                 elif market_ticker:
                     latest_price = float(
                         market_ticker.get("price") or market_ticker.get("last_price") or 0.0

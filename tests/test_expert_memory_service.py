@@ -15,7 +15,19 @@ from services.expert_memory_service import (
     reflection_summary,
 )
 
-MOJIBAKE_MARKERS = ("鍋", "锛", "閳", "鐩", "浜忔崯", "鏉冮噸")
+
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
+MOJIBAKE_MARKERS = (
+    _u("\\u934b"),
+    _u("\\u951b"),
+    _u("\\u95b3"),
+    _u("\\u9429"),
+    _u("\\u6d5c\\u5fd4\\u5d2f"),
+    _u("\\u93c9\\u51ae\\u5678"),
+)
 
 
 def _assert_clean_chinese(text: str) -> None:

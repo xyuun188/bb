@@ -10,6 +10,10 @@ from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
 from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
 
 
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
 def _decision() -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",
@@ -232,7 +236,7 @@ def test_entry_opportunity_scoring_reads_wrapped_server_quant_payloads() -> None
     assert opportunity["server_profit_expected_return_pct"] == 0.82
     assert opportunity["timeseries_expected_return_pct"] == 0.37
     assert opportunity["timeseries_aligned"] is True
-    assert "鏈" not in opportunity["dynamic_score_reason"]
+    assert _u("\\u93c8") not in opportunity["dynamic_score_reason"]
 
 
 def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned() -> None:

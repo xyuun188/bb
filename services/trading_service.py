@@ -159,6 +159,7 @@ from services.position_profit_peak_context import PositionProfitPeakContextPolic
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
 from services.position_quality import PositionQualityScorer
+from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
 from services.position_release_decision import PositionReleaseDecisionPolicy
 from services.position_review_batch import PositionReviewBatchPolicy
 from services.position_review_decision_normalizer import PositionReviewDecisionNormalizer
@@ -332,6 +333,7 @@ class TradingService:
             quality_scorer=self.position_quality_scorer,
         )
         self._current_capacity_context = self.dynamic_capacity.evaluate(open_positions=[]).as_dict()
+        self._current_strategy_mode_context: dict[str, Any] = {}
         self.risk_engine = RiskEngine(max_open_positions_provider=self._dynamic_capacity_context)
         self.market_decision_risk_assessment = MarketDecisionRiskAssessmentPolicy(
             risk_engine=self.risk_engine,
@@ -597,7 +599,7 @@ class TradingService:
         )
         self.exit_partial_guard = ExitPartialGuardPolicy(self.exit_position_matcher)
         self.exit_invalidation_snapshot = ExitInvalidationSnapshotPolicy(
-            lambda: settings.min_entry_volume_ratio
+            self._runtime_min_entry_volume_ratio
         )
         self.forced_exit_policy = ForcedExitPolicy()
         self.exit_fee_churn_guard = ExitFeeChurnGuardPolicy(
@@ -687,15 +689,15 @@ class TradingService:
         self.entry_suspicious_symbol = EntrySuspiciousSymbolPolicy(self._normalize_position_symbol)
         self.entry_feature_ranker = EntryFeatureRankerPolicy(
             suspicious_symbol_reason=self.entry_suspicious_symbol.reason,
-            min_entry_volume_ratio_provider=lambda: settings.min_entry_volume_ratio,
-            min_entry_adx_provider=lambda: settings.min_entry_adx,
+            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
+            min_entry_adx_provider=self._runtime_min_entry_adx,
             major_symbols=frozenset(ALT_LONG_ALLOWED_SYMBOLS),
         )
         self.entry_market_hold_penalty = EntryMarketHoldPenaltyPolicy(
             normalize_symbol=self._normalize_position_symbol,
             feature_opportunity_score=self._feature_opportunity_score,
-            min_entry_volume_ratio_provider=lambda: settings.min_entry_volume_ratio,
-            min_entry_adx_provider=lambda: settings.min_entry_adx,
+            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
+            min_entry_adx_provider=self._runtime_min_entry_adx,
         )
         self.entry_loss_cooldown = EntryLossCooldownPolicy(self._normalize_position_symbol)
         self.entry_post_crash_rebound_guard = EntryPostCrashReboundGuardPolicy()
@@ -2305,8 +2307,8 @@ class TradingService:
         if ranker is None:
             ranker = EntryFeatureRankerPolicy(
                 suspicious_symbol_reason=self._suspicious_new_symbol_reason,
-                min_entry_volume_ratio_provider=lambda: settings.min_entry_volume_ratio,
-                min_entry_adx_provider=lambda: settings.min_entry_adx,
+                min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
+                min_entry_adx_provider=self._runtime_min_entry_adx,
                 major_symbols=frozenset(ALT_LONG_ALLOWED_SYMBOLS),
             )
         return ranker.feature_opportunity_score(fv)
@@ -2318,8 +2320,8 @@ class TradingService:
         policy = EntryMarketHoldPenaltyPolicy(
             normalize_symbol=self._normalize_position_symbol,
             feature_opportunity_score=self._feature_opportunity_score,
-            min_entry_volume_ratio_provider=lambda: settings.min_entry_volume_ratio,
-            min_entry_adx_provider=lambda: settings.min_entry_adx,
+            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
+            min_entry_adx_provider=self._runtime_min_entry_adx,
         )
         self.entry_market_hold_penalty = policy
         return policy
@@ -2383,6 +2385,18 @@ class TradingService:
             "base_limit": fallback,
         }
 
+    def _runtime_entry_filters(self) -> RuntimeEntryFilters:
+        context = getattr(self, "_current_strategy_mode_context", None)
+        if isinstance(context, dict):
+            return entry_filters_from_context(context)
+        return entry_filters_from_context(None)
+
+    def _runtime_min_entry_volume_ratio(self) -> float:
+        return self._runtime_entry_filters().min_entry_volume_ratio
+
+    def _runtime_min_entry_adx(self) -> float:
+        return self._runtime_entry_filters().min_entry_adx
+
     def _dynamic_capacity_policy(self) -> DynamicPositionCapacityPolicy:
         policy = getattr(self, "dynamic_capacity", None)
         if policy is not None:
@@ -2423,6 +2437,7 @@ class TradingService:
         strategy_context["max_open_positions_base"] = decision.get("base_limit")
         strategy_context["max_open_positions_effective"] = decision.get("effective_limit")
         strategy_context["max_open_positions_entry"] = decision.get("entry_limit")
+        self._current_strategy_mode_context = dict(strategy_context)
         return strategy_context
 
     async def _strategy_mode_context(
@@ -2649,6 +2664,10 @@ class TradingService:
                 "strategy_learning_recovery_probe_reason", ""
             ),
             "strategy_learning_sizing": strategy_mode_context.get("strategy_learning_sizing", {}),
+            "entry_filters": strategy_mode_context.get("entry_filters", {}),
+            "min_entry_volume_ratio": strategy_mode_context.get("min_entry_volume_ratio"),
+            "min_entry_adx": strategy_mode_context.get("min_entry_adx"),
+            "entry_filters_are_hard_gate": False,
             "strategy_learning_release_pressure_detail": strategy_mode_context.get(
                 "strategy_learning_release_pressure_detail", {}
             ),

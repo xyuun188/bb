@@ -9,38 +9,53 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path("data/trading.db")
+
+
+def _u(escaped: str) -> str:
+    return escaped.encode("ascii").decode("unicode_escape")
+
+
 MOJIBAKE_MARKERS = (
-    "閿",
-    "缁",
-    "閹",
-    "閸",
-    "楠",
-    "娴",
-    "鈧",
-    "鎾",
-    "閫",
-    "嫨",
-    "瑙",
-    "傛",
-    "澧",
-    "鍫",
-    "鐟",
-    "闁",
-    "锟",
-    "褰",
-    "鏃",
-    "涓",
-    "鏆",
-    "姣",
-    "锛",
-    "絾",
-    "鍒",
-    "挓",
-    "鍚",
-    "庢",
-    "敹",
-    "鐩",
-    "婁",
+    _u("\\u95bf"),
+    _u("\\u7f01"),
+    _u("\\u95b9"),
+    _u("\\u95b8"),
+    _u("\\u6960"),
+    _u("\\u5a34"),
+    _u("\\u9227"),
+    _u("\\u93be"),
+    _u("\\u95ab"),
+    _u("\\u5ae8"),
+    _u("\\u7459"),
+    _u("\\u509b"),
+    _u("\\u6fa7"),
+    _u("\\u936b"),
+    _u("\\u941f"),
+    _u("\\u95c1"),
+    _u("\\u951f"),
+    _u("\\u8930"),
+    _u("\\u93c3"),
+    _u("\\u6d93"),
+    _u("\\u93c6"),
+    _u("\\u59e3"),
+    _u("\\u951b"),
+    _u("\\u7d7e"),
+    _u("\\u9352"),
+    _u("\\u6313"),
+    _u("\\u935a"),
+    _u("\\u5ea2"),
+    _u("\\u6579"),
+    _u("\\u9429"),
+    _u("\\u5a41"),
+)
+LEGACY_MINUTE_PATTERN = "|".join(
+    re.escape(part)
+    for part in (
+        "??",
+        _u("\\u9352\\u55db\\u6313"),
+        _u("\\u941a"),
+        _u("\\u9352"),
+    )
 )
 DAMAGED_MARKERS = (
     "原始说明已损坏",
@@ -391,7 +406,8 @@ def build_shadow_memory_texts(row: sqlite3.Row | dict) -> tuple[str, str, bool]:
     horizon = int(safe_float(extra.get("horizon_minutes"), 0.0))
     if horizon <= 0:
         horizon_match = re.search(
-            r"(\d+)\s*(?:分钟|鍒嗛挓|鐚|鍒)", str(get("market_pattern") or get("lesson") or "")
+            rf"(\d+)\s*(?:{LEGACY_MINUTE_PATTERN})",
+            str(get("market_pattern") or get("lesson") or ""),
         )
         horizon = int(horizon_match.group(1)) if horizon_match else 0
     pct = shadow_return_pct(extra, side)
