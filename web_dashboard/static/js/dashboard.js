@@ -5328,7 +5328,7 @@ function systemAuditOverviewHtml(data) {
     return `
         <div class="system-audit-overview system-audit-overview-${status}">
             <div class="system-audit-hero">
-                <span>总体状态</span>
+                <span>整体健康度</span>
                 <strong>${escHtml(data.status_label || systemAuditStatusLabel(data.status))}</strong>
                 <em>${escHtml(title)}</em>
             </div>
@@ -5339,6 +5339,18 @@ function systemAuditOverviewHtml(data) {
                 ${collectionMetric('正常项', `${monitorNumber(summary.ok || 0, 0)} 项`, '已通过只读巡检', 'good')}
             </div>
         </div>`;
+}
+
+function systemAuditCardSummaryHtml(card) {
+    const evidence = Array.isArray(card.evidence) ? card.evidence.slice(0, 3) : [];
+    if (!evidence.length) return '<div class="system-audit-card-summary muted">暂无关键证据</div>'; 
+    return `<div class="system-audit-card-summary">${evidence.map(item => `
+        <span><b>${escHtml(item.label || '证据')}</b><em>${escHtml(systemAuditValueText(item.value))}</em></span>
+    `).join('')}</div>`;
+}
+
+function systemAuditCardDetailOpen(card) {
+    return systemAuditTone(card.status) !== 'ok';
 }
 
 function renderSystemAuditRootCauses(rootCauses) {
@@ -5369,21 +5381,29 @@ function renderSystemAuditCards(cards) {
         container.innerHTML = '<div class="analysis-empty">还没有巡检卡片。</div>'; 
         return;
     }
-    container.innerHTML = rows.map(card => {
+    const sortedRows = [...rows].sort((left, right) => {
+        const priority = { critical: 0, warning: 1, ok: 2 };
+        return (priority[systemAuditTone(left.status)] ?? 3) - (priority[systemAuditTone(right.status)] ?? 3);
+    });
+    container.innerHTML = sortedRows.map(card => {
         const tone = systemAuditTone(card.status);
+        const isOpen = systemAuditCardDetailOpen(card);
         return `
-            <article class="system-audit-card system-audit-card-${tone}">
-                <div class="system-audit-card-head">
+            <details class="system-audit-card system-audit-card-${tone}" ${isOpen ? 'open' : ''}>
+                <summary class="system-audit-card-head">
                     <div><strong>${escHtml(card.title || card.key || '-')}</strong><span>${escHtml(card.summary || '-')}</span></div>
                     <em>${escHtml(systemAuditStatusLabel(card.status))}</em>
+                </summary>
+                ${systemAuditCardSummaryHtml(card)}
+                <div class="system-audit-card-body">
+                    ${systemAuditEvidenceHtml(card.evidence)}
+                    ${systemAuditCardDetailsHtml(card)}
+                    <div class="system-audit-card-actions">
+                        <strong>建议处理</strong>
+                        ${systemAuditActionsHtml(card.next_actions)}
+                    </div>
                 </div>
-                ${systemAuditEvidenceHtml(card.evidence)}
-                ${systemAuditCardDetailsHtml(card)}
-                <div class="system-audit-card-actions">
-                    <strong>建议处理</strong>
-                    ${systemAuditActionsHtml(card.next_actions)}
-                </div>
-            </article>`;
+            </details>`;
     }).join('');
 }
 
@@ -5395,7 +5415,11 @@ function renderSystemAuditNodes(nodes) {
         container.innerHTML = '<div class="analysis-empty">还没有节点图谱。</div>'; 
         return;
     }
-    container.innerHTML = rows.map(node => {
+    const sortedRows = [...rows].sort((left, right) => {
+        const priority = { critical: 0, warning: 1, ok: 2 };
+        return (priority[systemAuditTone(left.status)] ?? 3) - (priority[systemAuditTone(right.status)] ?? 3);
+    });
+    container.innerHTML = sortedRows.map((node, index) => {
         const tone = systemAuditTone(node.status);
         const checks = Array.isArray(node.checks) ? node.checks.slice(0, 4) : [];
         const upstream = Array.isArray(node.upstream) ? node.upstream : [];
@@ -5406,6 +5430,7 @@ function renderSystemAuditNodes(nodes) {
                     <span>${escHtml(node.layer || '节点')}</span>
                     <em>${escHtml(systemAuditStatusLabel(node.status))}</em>
                 </div>
+                <div class="system-audit-node-index">${String(index + 1).padStart(2, '0')}</div>
                 <strong>${escHtml(node.title || node.key || '-')}</strong>
                 <p>${escHtml(systemAuditShortText(node.summary || node.impact || '-', 180))}</p>
                 <div class="system-audit-node-flow">

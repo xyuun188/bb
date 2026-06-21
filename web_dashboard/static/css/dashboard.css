@@ -1149,6 +1149,197 @@ td .ml-bar-row .ml-bar-label {
     margin: 7px 0 0;
 }
 
+.system-audit-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.system-audit-toolbar span {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.system-audit-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.65fr) minmax(320px, 0.85fr);
+    grid-template-areas:
+        "topology root"
+        "details safety";
+    gap: 14px;
+    padding: 0 14px 14px;
+}
+
+.system-audit-section {
+    min-width: 0;
+    border: 1px solid rgba(148,163,184,0.18);
+    border-radius: calc(var(--radius) + 2px);
+    background: rgba(2,6,23,0.46);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+}
+
+.system-audit-section-topology { grid-area: topology; }
+.system-audit-section-root { grid-area: root; }
+.system-audit-section-details { grid-area: details; }
+.system-audit-section-safety { grid-area: safety; }
+
+.system-audit-section-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid rgba(148,163,184,0.14);
+    background: linear-gradient(90deg, rgba(15,23,42,0.72), rgba(15,23,42,0.18));
+}
+
+.system-audit-section-head strong {
+    display: block;
+    color: var(--text);
+    font-size: 14px;
+    letter-spacing: 0.01em;
+}
+
+.system-audit-section-head span {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.system-audit-section-head em {
+    flex: 0 0 auto;
+    padding: 4px 9px;
+    border: 1px solid rgba(6,182,212,0.28);
+    border-radius: 999px;
+    color: var(--cyan);
+    font-size: 11px;
+    font-style: normal;
+    background: rgba(6,182,212,0.08);
+}
+
+.system-audit-node-grid {
+    padding: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 285px), 1fr));
+}
+
+.system-audit-node {
+    position: relative;
+    overflow: hidden;
+    padding: 14px;
+}
+
+.system-audit-node::after {
+    content: '';
+    position: absolute;
+    inset: auto 14px 0 14px;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, rgba(6,182,212,0.46), transparent);
+}
+
+.system-audit-node-index {
+    position: absolute;
+    right: 12px;
+    bottom: 10px;
+    color: rgba(148,163,184,0.18);
+    font-size: 34px;
+    font-weight: 900;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.system-audit-card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+    gap: 12px;
+    padding: 14px;
+}
+
+.system-audit-card {
+    padding: 0;
+    overflow: hidden;
+}
+
+.system-audit-card[open] {
+    grid-column: span 2;
+}
+
+.system-audit-card-head {
+    cursor: pointer;
+    padding: 13px 14px;
+    list-style: none;
+}
+
+.system-audit-card-head::-webkit-details-marker {
+    display: none;
+}
+
+.system-audit-card-head::before {
+    content: '展开';
+    flex: 0 0 auto;
+    order: 3;
+    padding: 4px 8px;
+    border: 1px solid rgba(148,163,184,0.18);
+    border-radius: 999px;
+    color: var(--text-muted);
+    font-size: 11px;
+    background: rgba(15,23,42,0.42);
+}
+
+.system-audit-card[open] .system-audit-card-head::before {
+    content: '收起';
+}
+
+.system-audit-card-body {
+    padding: 0 14px 14px;
+}
+
+.system-audit-card-summary {
+    display: none;
+}
+
+.system-audit-section-root .system-audit-list {
+    padding: 14px;
+    max-height: 720px;
+    overflow-y: auto;
+}
+
+.system-audit-section-safety .system-audit-section-head {
+    border-bottom: 0;
+}
+
+@media (max-width: 1320px) {
+    .system-audit-grid {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "topology"
+            "root"
+            "details"
+            "safety";
+    }
+    .system-audit-card[open] {
+        grid-column: span 1;
+    }
+}
+
+@media (max-width: 760px) {
+    .system-audit-toolbar {
+        justify-content: flex-start;
+    }
+    .system-audit-grid {
+        padding: 0 10px 10px;
+    }
+    .system-audit-section-head {
+        flex-direction: column;
+    }
+    .system-audit-card-head::before {
+        order: 0;
+    }
+}
+
 @media (max-width: 1280px) {
     .system-audit-health-strip {
         grid-template-columns: repeat(2, minmax(0, 1fr));
