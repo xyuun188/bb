@@ -61,6 +61,19 @@ class EntryEvidenceParams:
     positive_net_probe_min_profit_quality: float = 0.20
     positive_net_probe_max_loss_probability: float = 0.62
     positive_net_probe_max_tail_risk: float = 0.95
+    strong_positive_relief_min_expected_pct: float = 1.20
+    strong_positive_relief_min_confidence: float = 0.78
+    strong_positive_relief_min_profit_quality: float = 1.20
+    strong_positive_relief_max_loss_probability: float = 0.45
+    strong_positive_relief_max_tail_risk: float = 0.75
+    strong_positive_relief_min_opportunity_score: float = 2.80
+    strong_positive_relief_min_aligned_sources: int = 2
+    elite_positive_relief_min_expected_pct: float = 1.80
+    elite_positive_relief_min_confidence: float = 0.86
+    elite_positive_relief_min_profit_quality: float = 2.00
+    elite_positive_relief_max_loss_probability: float = 0.42
+    elite_positive_relief_max_tail_risk: float = 0.65
+    elite_positive_relief_min_opportunity_score: float = 4.20
 
 
 @dataclass(frozen=True, slots=True)

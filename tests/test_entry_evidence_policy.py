@@ -397,6 +397,60 @@ def test_positive_net_weak_conflict_probe_is_tradeable_even_without_score_lift()
     assert evidence["shadow_only"] is False
 
 
+def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
+    decision = _decision(
+        Action.SHORT,
+        {
+            "ml_signal": {"predictions": [{"best_side": "short", "best_expected_return_pct": 1.1}]},
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "expected_return_pct": 0.8,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.18,
+                },
+                "profit_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "adjusted_short_return_pct": 2.3,
+                    "short_loss_probability": 0.35,
+                    "profit_quality_score": 4.2,
+                },
+            },
+            "memory_adjustment": -0.10,
+            "memory_summary": {"used": 3, "positive_lessons": 0, "risk_lessons": 2},
+        },
+        confidence=0.92,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 9.27,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 2.58,
+            "profit_quality_ratio": 4.23,
+            "server_profit_loss_probability": 0.35,
+            "tail_risk_score": 0.55,
+            "confidence": 0.92,
+        },
+    )
+
+    assert evidence["hard_block"] is False
+    assert evidence["positive_net_probe_relief"]["applied"] is True
+    assert evidence["strong_positive_net_relief"]["applied"] is True
+    assert evidence["strong_positive_net_relief"]["tier_floor"] == "small"
+    assert evidence["tier"] == "small"
+    assert evidence["size_multiplier"] == pytest.approx(0.18)
+    assert evidence["max_size_pct"] <= 0.025
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
+
+
 def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():
     decision = _decision(
         Action.LONG,
@@ -529,6 +583,8 @@ def test_short_probe_relief_allows_tiny_short_when_quant_and_direction_align():
     assert evidence["effective_score"] == 35.0
     assert evidence["tier"] == "weak_conflict_probe"
     assert evidence["size_multiplier"] == pytest.approx(0.03)
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
 
 
 def test_entry_evidence_maps_45_to_exploration_tier():

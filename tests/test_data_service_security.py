@@ -397,6 +397,55 @@ async def test_ticker_snapshot_refreshes_stale_ws_cache_from_swap_rest() -> None
     assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5666)
 
 
+@pytest.mark.asyncio
+async def test_ticker_snapshot_refreshes_fresh_but_inconsistent_ws_cache() -> None:
+    service = _service()
+    fresh_timestamp_ms = int(time.time() * 1000)
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "high_24h": 0.569,
+                "low_24h": 0.5491,
+                "timestamp": fresh_timestamp_ms,
+                "source": "websocket",
+            }
+        }
+
+    class FakeRestClient:
+        def __init__(self) -> None:
+            self.symbols: list[str] = []
+
+        async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            self.symbols.append(symbol)
+            return {
+                "last": 0.5531,
+                "bid": 0.5530,
+                "ask": 0.5533,
+                "high": 0.578,
+                "low": 0.5491,
+                "baseVolume": 1234,
+                "percentage": 1.2,
+                "timestamp": int(time.time() * 1000),
+                "info": {"instId": "PROS-USDT-SWAP"},
+            }
+
+    service.ws_client = FakeWsClient()
+    rest_client = FakeRestClient()
+    service.rest_client = rest_client
+
+    snapshot = await service._get_ticker_snapshot("PROS/USDT")
+
+    assert rest_client.symbols == ["PROS/USDT"]
+    assert snapshot["last_price"] == pytest.approx(0.5531)
+    assert snapshot["source"] == "rest"
+    assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5531)
+
+
 def test_news_item_summary_keeps_safe_external_url() -> None:
     service = _service()
 

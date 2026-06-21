@@ -510,6 +510,9 @@ def build_entry_evidence_score(
         and safe_float(item.get("points"), 0.0) > 0
     ]
     short_probe_relief: dict[str, Any] = {"applied": False}
+    positive_net_probe_relief: dict[str, Any] = {"applied": False}
+    strong_positive_net_relief: dict[str, Any] = {"applied": False}
+    tradeable_probe = False
     if entry_side == "short" and (
         ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_EFFECTIVE_SCORE
         <= effective_score
@@ -581,8 +584,6 @@ def build_entry_evidence_score(
         hard_block_reasons.append("ML 和时序同时明确反向")
     if "ml" in strong_opposites and "shadow_memory" in major_opposites:
         hard_block_reasons.append("ML 反向且影子/交易记忆偏负")
-    positive_net_probe_relief: dict[str, Any] = {"applied": False}
-    tradeable_probe = False
     missing_key_degraded_relief: dict[str, Any] = {"applied": False}
     missing_key_degraded = bool(
         len(missing_key_sources) >= 2 and not major_opposites and not strong_opposites
@@ -638,6 +639,41 @@ def build_entry_evidence_score(
         and not {"ml", "timeseries"}.issubset(set(strong_opposites))
         and not ("ml" in strong_opposites and "timeseries" in major_opposites)
     )
+    aligned_support_count = len(set(aligned_support_sources))
+    strong_positive_relief_allowed = bool(
+        positive_net_probe_allowed
+        and expected_net_return
+        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_expected_pct
+        and confidence >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_confidence
+        and profit_quality_ratio
+        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_profit_quality
+        and loss_probability
+        <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_loss_probability
+        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_tail_risk
+        and opportunity_score
+        >= max(
+            min_score_required + 1.0,
+            _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_opportunity_score,
+        )
+        and aligned_support_count
+        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_aligned_sources
+    )
+    elite_positive_relief_allowed = bool(
+        strong_positive_relief_allowed
+        and expected_net_return
+        >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_expected_pct
+        and confidence >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_confidence
+        and profit_quality_ratio
+        >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_profit_quality
+        and loss_probability
+        <= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_max_loss_probability
+        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_max_tail_risk
+        and opportunity_score
+        >= max(
+            min_score_required + 2.0,
+            _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_opportunity_score,
+        )
+    )
     if positive_net_probe_allowed:
         original_effective_score = effective_score
         if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
@@ -656,6 +692,33 @@ def build_entry_evidence_score(
             "reason": (
                 "机会评分为正且净收益、亏损概率、尾部风险满足受控探针条件；"
                 "动态证据不足从硬归零降级为极小仓验证，反向证据仍保留在仓位和风控里。"
+            ),
+        }
+    if strong_positive_relief_allowed:
+        original_effective_score = effective_score
+        target_score = (
+            ENTRY_EVIDENCE_SCORE_SMALL
+            if elite_positive_relief_allowed
+            else ENTRY_EVIDENCE_SCORE_PROBE
+        )
+        effective_score = max(effective_score, target_score)
+        tradeable_probe = True
+        strong_positive_net_relief = {
+            "applied": True,
+            "tier_floor": "small" if elite_positive_relief_allowed else "exploration",
+            "from_effective_score": round(original_effective_score, 6),
+            "to_effective_score": round(effective_score, 6),
+            "expected_net_return_pct": round(expected_net_return, 6),
+            "opportunity_score": round(opportunity_score, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+            "confidence": round(confidence, 6),
+            "aligned_support_sources": list(aligned_support_sources),
+            "reason": (
+                "净收益、盈利质量、置信度、亏损概率和尾部风险同时达标，"
+                "且存在多源同向证据；该信号不再按弱冲突极小仓处理，"
+                "但仍保留方向冲突、最大仓位和执行前行情复核。"
             ),
         }
     if effective_score < ENTRY_EVIDENCE_SCORE_HARD_BLOCK:
@@ -736,6 +799,7 @@ def build_entry_evidence_score(
         "aligned_support_sources": aligned_support_sources,
         "missing_key_degraded_relief": missing_key_degraded_relief,
         "positive_net_probe_relief": positive_net_probe_relief,
+        "strong_positive_net_relief": strong_positive_net_relief,
         "short_probe_relief": short_probe_relief,
         "tradeable_probe": bool(tradeable_probe),
         "shadow_only": bool(

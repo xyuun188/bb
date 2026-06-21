@@ -665,7 +665,8 @@ class DataService:
             or self.ws_client.latest_tickers.get(normalized, {})
             or {}
         )
-        if ticker and self._is_fresh_ticker_snapshot(ticker):
+        ticker_consistency_issue = self._ticker_snapshot_consistency_issue(ticker)
+        if ticker and self._is_fresh_ticker_snapshot(ticker) and not ticker_consistency_issue:
             bid = self._safe_float(ticker.get("bid"), 0.0)
             ask = self._safe_float(ticker.get("ask"), 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
@@ -674,7 +675,14 @@ class DataService:
             ticker["source"] = ticker.get("source") or "websocket"
             ticker["inst_type"] = ticker.get("inst_type") or "SWAP"
             return ticker
-        if ticker:
+        if ticker and ticker_consistency_issue:
+            logger.warning(
+                "ticker cache inconsistent; refreshing from OKX REST",
+                symbol=normalized,
+                issue=ticker_consistency_issue,
+                age_seconds=self._ticker_snapshot_age_seconds(ticker),
+            )
+        elif ticker:
             logger.info(
                 "ticker cache stale; refreshing from OKX REST",
                 symbol=normalized,
@@ -709,6 +717,8 @@ class DataService:
                 ticker["source"] = ticker.get("source") or "stale_websocket"
                 ticker["stale"] = True
                 ticker["age_seconds"] = self._ticker_snapshot_age_seconds(ticker)
+                if ticker_consistency_issue:
+                    ticker["market_data_quality_issue"] = ticker_consistency_issue
                 return ticker
             return {}
 
@@ -739,6 +749,29 @@ class DataService:
             return False
         age = self._ticker_snapshot_age_seconds(ticker)
         return age is not None and age <= TICKER_CACHE_MAX_AGE_SECONDS
+
+    def _ticker_snapshot_consistency_issue(self, ticker: dict[str, Any]) -> str | None:
+        if not ticker:
+            return None
+        last_price = self._safe_float(ticker.get("last_price"), 0.0)
+        bid = self._safe_float(ticker.get("bid"), 0.0)
+        ask = self._safe_float(ticker.get("ask"), 0.0)
+        high_24h = self._safe_float(ticker.get("high_24h"), 0.0)
+        low_24h = self._safe_float(ticker.get("low_24h"), 0.0)
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            if last_price > 0:
+                last_mid_gap = abs(last_price - mid) / max(mid, 1e-12)
+                if last_mid_gap > _MARKET_DATA_PARAMS.price_field_split_block_pct:
+                    return "last_price_bid_ask_split"
+        if last_price <= 0 or high_24h <= 0 or low_24h <= 0 or high_24h < low_24h:
+            return None
+        tolerance = _MARKET_DATA_PARAMS.price_24h_range_tolerance_pct
+        floor = low_24h * (1.0 - tolerance)
+        ceiling = high_24h * (1.0 + tolerance)
+        if floor <= last_price <= ceiling:
+            return None
+        return "last_price_outside_24h_range"
 
     async def _get_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
