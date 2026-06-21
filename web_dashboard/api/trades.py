@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 
+from core.symbols import normalize_trading_symbol, symbol_query_variants
 from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
@@ -27,34 +28,120 @@ from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sa
 
 router = APIRouter()
 EXECUTION_REASON_CLASSIFIER = ExecutionResultClassifier()
+CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS = 240
 
 
 def _normalize_display_symbol(symbol: str | None) -> str:
-    text = str(symbol or "").replace("-", "/").replace("_", "/").upper()
-    if ":" in text:
-        text = text.split(":", 1)[0]
-    if text.endswith("/USDT/SWAP"):
-        text = text[: -len("/SWAP")]
-    return text
+    return normalize_trading_symbol(symbol)
 
 
 def _symbol_query_variants(symbols: set[str]) -> set[str]:
-    variants: set[str] = set()
-    for symbol in symbols:
-        normalized = _normalize_display_symbol(symbol)
-        if not normalized:
+    return symbol_query_variants(symbols)
+
+
+def _aware_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _closed_position_matches_order_side(order_side: str | None, position_side: str | None) -> bool:
+    side = str(position_side or "").lower()
+    close_side = "buy" if side == "short" else "sell" if side == "long" else ""
+    return bool(close_side and str(order_side or "").lower() == close_side)
+
+
+def _matching_closed_positions_for_order(
+    order: Any,
+    positions: list[Any],
+    *,
+    window_seconds: int = CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS,
+) -> list[Any]:
+    if getattr(order, "status", None) != "filled":
+        return []
+    filled_at = _aware_datetime(getattr(order, "filled_at", None))
+    if filled_at is None:
+        return []
+    order_symbol = _normalize_display_symbol(getattr(order, "symbol", None))
+    order_qty = _safe_float(getattr(order, "quantity", None), 0.0) or 0.0
+    candidates: list[tuple[float, float, float, Any]] = []
+    for position in positions:
+        if getattr(position, "is_open", False):
             continue
-        variants.update(
-            {
-                symbol,
-                normalized,
-                normalized.replace("/", "-"),
-                f"{normalized}:USDT",
-                f"{normalized}-SWAP",
-                f"{normalized.replace('/', '-')}-SWAP",
-            }
+        if getattr(position, "model_name", None) != getattr(order, "model_name", None):
+            continue
+        if getattr(position, "execution_mode", None) != getattr(order, "execution_mode", None):
+            continue
+        if _normalize_display_symbol(getattr(position, "symbol", None)) != order_symbol:
+            continue
+        if not _closed_position_matches_order_side(
+            getattr(order, "side", None), getattr(position, "side", None)
+        ):
+            continue
+        closed_at = _aware_datetime(getattr(position, "closed_at", None))
+        if closed_at is None:
+            continue
+        time_delta = abs((closed_at - filled_at).total_seconds())
+        if time_delta > window_seconds:
+            continue
+        position_qty = _safe_float(getattr(position, "quantity", None), 0.0) or 0.0
+        if order_qty > 0 and position_qty > order_qty * 1.05:
+            continue
+        price_delta = abs(
+            (_safe_float(getattr(order, "price", None), 0.0) or 0.0)
+            - (_safe_float(getattr(position, "current_price", None), 0.0) or 0.0)
         )
-    return variants
+        qty_delta = abs(order_qty - position_qty)
+        candidates.append((time_delta, price_delta, qty_delta, position))
+    if not candidates:
+        return []
+    ordered = [item[3] for item in sorted(candidates, key=lambda item: (item[0], item[1], item[2]))]
+    if order_qty <= 0:
+        return ordered[:1]
+    matched: list[Any] = []
+    total_qty = 0.0
+    for position in ordered:
+        matched.append(position)
+        total_qty += _safe_float(getattr(position, "quantity", None), 0.0) or 0.0
+        if total_qty >= order_qty * 0.98:
+            break
+    return matched
+
+
+def _weighted_entry_price(positions: list[Any]) -> float:
+    total_qty = sum(_safe_float(getattr(p, "quantity", None), 0.0) or 0.0 for p in positions)
+    if total_qty <= 0:
+        return 0.0
+    return (
+        sum(
+            (_safe_float(getattr(p, "entry_price", None), 0.0) or 0.0)
+            * (_safe_float(getattr(p, "quantity", None), 0.0) or 0.0)
+            for p in positions
+        )
+        / total_qty
+    )
+
+
+def _close_order_position_reason(order: Any, positions: list[Any]) -> str | None:
+    if not positions:
+        return None
+    symbol = _normalize_display_symbol(getattr(order, "symbol", None))
+    quantity = sum(_safe_float(getattr(p, "quantity", None), 0.0) or 0.0 for p in positions)
+    entry_price = _weighted_entry_price(positions)
+    close_price = _safe_float(getattr(order, "price", None), 0.0) or 0.0
+    pnl = sum(_safe_float(getattr(p, "realized_pnl", None), 0.0) or 0.0 for p in positions)
+    side = str(getattr(positions[0], "side", "") or "").lower()
+    action_label = "买入平空" if side == "short" else "卖出平多" if side == "long" else "平仓"
+    source = (
+        "OKX 平仓成交已同步" if getattr(order, "exchange_order_id", None) else "本地平仓同步记录"
+    )
+    return (
+        f"{source}：{symbol} {action_label} {quantity:g}，成交价 {close_price:g}，"
+        f"平掉本地 {len(positions)} 段仓位，开仓均价 {entry_price:g}，"
+        f"实现盈亏 {pnl:.4f} USDT。"
+    )
 
 
 def _looks_mojibake(text: str) -> bool:
@@ -436,7 +523,7 @@ async def get_trades(
                 if order.side in {"buy", "sell"} and order.side != close_side:
                     continue
                 time_delta = abs((p.closed_at - order.filled_at).total_seconds())
-                if time_delta > 10:
+                if time_delta > CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS:
                     continue
                 price_delta = abs(float(order.price or 0) - float(p.current_price or 0))
                 qty_delta = abs(float(order.quantity or 0) - float(p.quantity or 0))
@@ -751,6 +838,26 @@ async def get_trade_detail(trade_id: int):
                 select(AIDecision).where(AIDecision.id == order.decision_id)
             )
             decision = result.scalar_one_or_none()
+        closed_positions: list[Any] = []
+        if order:
+            position_stmt = select(Position).where(
+                Position.model_name == order.model_name,
+                Position.execution_mode == order.execution_mode,
+                Position.is_open.is_(False),
+                Position.symbol.in_(_symbol_query_variants({order.symbol})),
+            )
+            if order.filled_at:
+                filled_at = order.filled_at
+                if filled_at.tzinfo is None:
+                    filled_at = filled_at.replace(tzinfo=UTC)
+                position_stmt = position_stmt.where(
+                    Position.closed_at
+                    >= filled_at - timedelta(seconds=CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS),
+                    Position.closed_at
+                    <= filled_at + timedelta(seconds=CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS),
+                )
+            position_result = await session.execute(position_stmt.limit(50))
+            closed_positions = list(position_result.scalars().all())
 
     if not order:
         return {"error": "Trade not found"}
@@ -763,6 +870,10 @@ async def get_trade_detail(trade_id: int):
         exchange_order_id=order.exchange_order_id,
         status=order.status,
     )
+    matched_closed_positions = _matching_closed_positions_for_order(order, closed_positions)
+    position_reason = _close_order_position_reason(order, matched_closed_positions)
+    if position_reason:
+        fallback_reason = sanitize_text(position_reason)
     trace = build_execution_trace(
         raw_response,
         order_status=order.status,
@@ -791,6 +902,20 @@ async def get_trade_detail(trade_id: int):
             "reason": fallback_reason,
             "detail": fallback_reason,
             "display_reason": fallback_reason,
+            "matched_positions": [
+                {
+                    "id": position.id,
+                    "symbol": _normalize_display_symbol(position.symbol),
+                    "side": position.side,
+                    "quantity": position.quantity,
+                    "entry_price": position.entry_price,
+                    "close_price": position.current_price,
+                    "realized_pnl": position.realized_pnl,
+                    "opened_at": position.created_at.isoformat() if position.created_at else None,
+                    "closed_at": position.closed_at.isoformat() if position.closed_at else None,
+                }
+                for position in matched_closed_positions
+            ],
             "execution_failure_kind": failure_kind,
             "execution_status_label": execution_status_label,
             "success": order.status == "filled",

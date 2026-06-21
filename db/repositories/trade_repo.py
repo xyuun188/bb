@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
+from core.symbols import trading_symbol_variants
 from db.repositories.base import BaseRepository
 from models.trade import Order, Position
 
@@ -113,9 +114,10 @@ class TradeRepository(BaseRepository):
         side: str,
         execution_mode: str,
     ) -> list[Position]:
+        symbol_variants = trading_symbol_variants(symbol) or {symbol}
         stmt = select(Position).where(
             Position.model_name == model_name,
-            Position.symbol == symbol,
+            Position.symbol.in_(symbol_variants),
             Position.side == side,
             Position.execution_mode == execution_mode,
             Position.is_open.is_(True),

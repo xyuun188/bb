@@ -22,6 +22,7 @@ from config.settings import (
     settings,
 )
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_query_variants
 from core.trading_mode import mode_manager
 from data_feed.okx_rest_client import OKXRestClient
 from executor.okx_executor import OKXExecutor
@@ -1827,46 +1828,12 @@ def _reset_trading_decision_runtime_state() -> None:
 
 def _normalize_dashboard_symbol(symbol: str | None) -> str:
     """Normalize exchange/CCXT symbols to the dashboard ticker key format."""
-    if not symbol:
-        return ""
-    normalized = str(symbol).split(":")[0]
-    if normalized.endswith("-SWAP"):
-        normalized = normalized[:-5]
-    if "/" not in normalized and "-" in normalized:
-        parts = normalized.split("-")
-        if len(parts) >= 2:
-            normalized = f"{parts[0]}/{parts[1]}"
-    return normalized
+    return normalize_trading_symbol(symbol)
 
 
 def _dashboard_symbol_query_variants(symbols: set[str]) -> set[str]:
     """Return historical symbol spellings used across orders, decisions, and shadows."""
-    variants: set[str] = set()
-    for symbol in symbols:
-        raw = str(symbol or "").strip()
-        normalized = _normalize_dashboard_symbol(raw)
-        for value in (raw, normalized):
-            if not value:
-                continue
-            variants.add(value)
-            variants.add(value.upper())
-            if "/" in value:
-                dashed = value.replace("/", "-")
-                variants.add(dashed)
-                variants.add(f"{dashed}-SWAP")
-                variants.add(f"{value}:USDT")
-                variants.add(f"{value.upper()}:USDT")
-            elif "-" in value:
-                parts = [part for part in value.replace("-SWAP", "").split("-") if part]
-                if len(parts) >= 2:
-                    slash = f"{parts[0]}/{parts[1]}"
-                    variants.add(slash)
-                    variants.add(slash.upper())
-                    variants.add(f"{slash}:USDT")
-                    variants.add(f"{slash.upper()}:USDT")
-                    variants.add(f"{parts[0]}-{parts[1]}")
-                    variants.add(f"{parts[0]}-{parts[1]}-SWAP")
-    return {item for item in variants if item}
+    return symbol_query_variants(symbols)
 
 
 def _is_live_position_open(position: dict) -> bool:
@@ -2877,7 +2844,8 @@ async def get_positions(
                 is_open=True,
             )
         sibling_positions = list(rows) + list(open_sibling_rows)
-        close_order_status_by_position_id: dict[int, tuple[str, str, str]] = {}
+        close_order_match_by_position_id: dict[int, dict[str, Any]] = {}
+        close_order_match_window = timedelta(seconds=240)
         if closed_only and rows:
             closed_rows = [p for p in rows if not p.is_open and p.closed_at]
             close_symbols = sorted(
@@ -2895,39 +2863,30 @@ async def get_positions(
                     order_stmt = order_stmt.where(Order.execution_mode == mode)
                 if min_closed:
                     order_stmt = order_stmt.where(
-                        Order.created_at >= min_closed - timedelta(seconds=15)
+                        Order.created_at >= min_closed - close_order_match_window
                     )
                 if max_closed:
                     order_stmt = order_stmt.where(
-                        Order.created_at <= max_closed + timedelta(seconds=15)
+                        Order.created_at <= max_closed + close_order_match_window
                     )
                 order_result = await session.execute(order_stmt)
                 close_orders = list(order_result.scalars().all())
-                decision_ids = {o.decision_id for o in close_orders if o.decision_id}
-                decision_meta: dict[int, dict[str, Any]] = {}
-                if decision_ids:
-                    decision_result = await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                close_orders_by_key: dict[tuple[str, str], list[Any]] = {}
+                for order in close_orders:
+                    order_key = (
+                        _normalize_dashboard_symbol(order.symbol),
+                        str(order.side or "").lower(),
                     )
-                    for decision in decision_result.scalars().all():
-                        raw = _safe_dict(decision.raw_llm_response)
-                        decision_meta[decision.id] = {
-                            "action": decision.action,
-                            "position_size_pct": decision.position_size_pct,
-                            "raw": raw,
-                        }
+                    close_orders_by_key.setdefault(order_key, []).append(order)
+                decision_meta: dict[int, dict[str, Any]] = {}
 
                 def status_from_order_decision(order) -> tuple[str | None, str | None]:
                     if is_manual_close_order(order):
                         return "manual", MANUAL_CLOSE_LABEL
                     meta = _safe_dict(decision_meta.get(order.decision_id or -1))
-                    raw = _safe_dict(meta.get("raw"))
-                    close_evidence = _safe_dict(raw.get("close_evidence"))
                     pct = (
                         _safe_float(
-                            meta.get("position_size_pct")
-                            or close_evidence.get("position_size_pct")
-                            or raw.get("close_fraction"),
+                            meta.get("position_size_pct"),
                             0.0,
                         )
                         or 0.0
@@ -2935,11 +2894,6 @@ async def get_positions(
                     if pct > 0:
                         if pct < 0.999:
                             return "partial", "部分平仓"
-                        return "full", "全部平仓"
-                    action_plan = str(close_evidence.get("action_plan") or "").lower()
-                    if action_plan in {"reduce", "partial", "partial_close"}:
-                        return "partial", "部分平仓"
-                    if action_plan in {"full_close", "close", "all"}:
                         return "full", "全部平仓"
                     return None, None
 
@@ -2952,14 +2906,9 @@ async def get_positions(
                         else closed_at
                     )
                     candidates = []
-                    for order in close_orders:
-                        if _normalize_dashboard_symbol(order.symbol) != _normalize_dashboard_symbol(
-                            pos.symbol
-                        ):
-                            continue
-                        if str(order.side or "").lower() != close_side:
-                            continue
-                        order_time = order.created_at
+                    order_key = (_normalize_dashboard_symbol(pos.symbol), close_side)
+                    for order in close_orders_by_key.get(order_key, []):
+                        order_time = order.filled_at or order.created_at
                         order_time_cmp = (
                             order_time.replace(tzinfo=None)
                             if order_time and order_time.tzinfo
@@ -2968,27 +2917,58 @@ async def get_positions(
                         if not closed_at_cmp or not order_time_cmp:
                             continue
                         delta = abs((order_time_cmp - closed_at_cmp).total_seconds())
-                        if delta > 8:
+                        if delta > close_order_match_window.total_seconds():
+                            continue
+                        order_qty = _safe_float(order.quantity, 0.0) or 0.0
+                        position_qty = _safe_float(pos.quantity, 0.0) or 0.0
+                        if order_qty > 0 and position_qty > order_qty * 1.05:
                             continue
                         price_delta = abs(
                             (_safe_float(order.price, 0.0) or 0.0)
                             - (_safe_float(pos.current_price, 0.0) or 0.0)
                         )
-                        candidates.append((delta, price_delta, order))
+                        qty_delta = abs(order_qty - position_qty)
+                        candidates.append((delta, price_delta, qty_delta, order))
                     if not candidates:
                         continue
-                    matched_order = sorted(candidates, key=lambda item: (item[0], item[1]))[0][2]
-                    status, label = status_from_order_decision(matched_order)
-                    if status and label:
-                        close_order_status_by_position_id[pos.id] = (status, label, "order")
+                    matched_order = sorted(
+                        candidates, key=lambda item: (item[0], item[1], item[2])
+                    )[0][3]
+                    close_order_match_by_position_id[pos.id] = {
+                        "order": matched_order,
+                        "source": "order",
+                    }
+
+                matched_decision_ids = {
+                    match["order"].decision_id
+                    for match in close_order_match_by_position_id.values()
+                    if match.get("order") and match["order"].decision_id
+                }
+                if matched_decision_ids:
+                    decision_result = await session.execute(
+                        select(
+                            AIDecision.id,
+                            AIDecision.action,
+                            AIDecision.position_size_pct,
+                        ).where(AIDecision.id.in_(matched_decision_ids))
+                    )
+                    for decision in decision_result.all():
+                        decision_meta[int(decision.id)] = {
+                            "action": decision.action,
+                            "position_size_pct": decision.position_size_pct,
+                        }
+                for match in close_order_match_by_position_id.values():
+                    status, label = status_from_order_decision(match["order"])
+                    match["status"] = status or "full"
+                    match["label"] = label or "全部平仓"
 
         def close_status_for(pos) -> tuple[str, str]:
             if pos.is_open:
                 return "open", "持有中"
 
-            order_status = close_order_status_by_position_id.get(pos.id)
+            order_status = close_order_match_by_position_id.get(pos.id)
             if order_status:
-                return order_status[0], order_status[1]
+                return str(order_status["status"]), str(order_status["label"])
 
             # A system partial close is stored as a separate closed row for the
             # closed quantity, while the original older position keeps the
@@ -3034,6 +3014,8 @@ async def get_positions(
         for p in rows:
             current_price = p.current_price
             unrealized_pnl = p.unrealized_pnl
+            realized_pnl = p.realized_pnl
+            closed_at = p.closed_at
             entry_price = p.entry_price
             quantity = p.quantity
             pnl_source = "local_db"
@@ -3075,9 +3057,40 @@ async def get_positions(
             display_is_open = bool(p.is_open and exchange_synced)
             if open_only and not display_is_open:
                 continue
+            matched_close = close_order_match_by_position_id.get(p.id)
+            if closed_only and matched_close:
+                close_order = matched_close.get("order")
+                close_price = _safe_float(getattr(close_order, "price", None), 0.0) or 0.0
+                close_quantity = _safe_float(getattr(close_order, "quantity", None), 0.0) or 0.0
+                position_quantity = _safe_float(quantity, 0.0) or 0.0
+                if close_price > 0:
+                    current_price = close_price
+                closed_at = (
+                    getattr(close_order, "filled_at", None)
+                    or getattr(close_order, "created_at", None)
+                    or closed_at
+                )
+                close_fee = _safe_float(getattr(close_order, "fee", None), 0.0) or 0.0
+                allocated_close_fee = (
+                    close_fee * position_quantity / close_quantity if close_quantity > 0 else 0.0
+                )
+                if close_price > 0 and position_quantity > 0:
+                    if str(p.side or "").lower() == "short":
+                        gross_pnl = (entry_price - close_price) * position_quantity
+                    else:
+                        gross_pnl = (close_price - entry_price) * position_quantity
+                    local_pnl = _safe_float(p.realized_pnl, 0.0) or 0.0
+                    previous_price = _safe_float(p.current_price, 0.0) or close_price
+                    if str(p.side or "").lower() == "short":
+                        previous_gross = (entry_price - previous_price) * position_quantity
+                    else:
+                        previous_gross = (previous_price - entry_price) * position_quantity
+                    inferred_entry_fee = max(previous_gross - local_pnl, 0.0)
+                    realized_pnl = gross_pnl - inferred_entry_fee - allocated_close_fee
+                    pnl_source = "okx_close_order_recomputed"
             close_status, close_status_label = close_status_for(p)
             close_status_source = (
-                "order" if p.id in close_order_status_by_position_id else "position"
+                "order" if p.id in close_order_match_by_position_id else "position"
             )
 
             positions.append(
@@ -3096,7 +3109,7 @@ async def get_positions(
                     "local_quantity": p.quantity,
                     "local_entry_price": p.entry_price,
                     "local_unrealized_pnl": p.unrealized_pnl,
-                    "realized_pnl": p.realized_pnl,
+                    "realized_pnl": realized_pnl,
                     "leverage": p.leverage,
                     "stop_loss": p.stop_loss_price,
                     "take_profit": p.take_profit_price,
@@ -3108,7 +3121,7 @@ async def get_positions(
                     "close_status_source": close_status_source,
                     "position_status": close_status_label,
                     "opened_at": p.created_at.isoformat() if p.created_at else None,
-                    "closed_at": p.closed_at.isoformat() if p.closed_at else None,
+                    "closed_at": closed_at.isoformat() if closed_at else None,
                 }
             )
 
