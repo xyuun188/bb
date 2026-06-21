@@ -377,7 +377,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260621-data-sync" in html
+    assert "dashboard.js?v=20260621-system-audit" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -387,6 +387,43 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     assert "document.getElementById('server-monitor-model-panel')" not in script
     assert "刷新大模型服务器监控失败" in script
     assert "刷新系统自检失败" in script
+
+
+def test_system_audit_root_cause_radar_is_wired() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert 'data-page="system-audit"' in html
+    assert 'id="page-system-audit"' in html
+    assert "系统巡检 / 根因雷达" in html
+    assert "根因 Top 列表" in html
+    assert "只做只读巡检" in html
+    assert "fetchSystemAudit()" in html
+    assert "systemAuditStatus: null" in script
+    assert "let systemAuditRefreshInFlight = null" in script
+    assert "if (page === 'system-audit') fetchSystemAudit();" in script
+    assert "if (isPageActive('system-audit'))" in script
+    assert "fetchJSON('/api/system-audit/status')" in script
+    assert "function renderSystemAudit" in script
+    assert "function renderSystemAuditCards" in script
+    assert "function renderSystemAuditRootCauses" in script
+    assert "系统巡检接口请求失败" in script
+    assert "补历史仓位、重启服务、批量训练等动作必须人工确认" in script
+    assert ".system-audit-layout" in style
+    assert ".system-audit-card" in style
+    assert ".system-audit-root-cause" in style
+    assert ".system-audit-health-strip" in style
+    assert "overflow-wrap: anywhere;" in style
+
+
+def test_system_audit_static_assets_keep_new_version() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "dashboard.css?v=20260621-system-audit" in html
+    assert "dashboard.js?v=20260621-system-audit" in html
+    assert "dashboard.css?v=20260621-data-sync" not in html
+    assert "dashboard.js?v=20260621-data-sync" not in html
 
 
 def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
@@ -470,8 +507,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260621-data-sync" in html
-    assert "dashboard.js?v=20260621-data-sync" in html
+    assert "dashboard.css?v=20260621-system-audit" in html
+    assert "dashboard.js?v=20260621-system-audit" in html
     assert "overflow-wrap: anywhere;" in style
 
 

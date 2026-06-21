@@ -63,6 +63,7 @@ const state = {
     localAIToolsStatus: null,
     dataCollectionStatus: null,
     serverMonitorStatus: null,
+    systemAuditStatus: null,
     serverMonitorTab: 'self-check',
     systemSelfCheck: null,
     mlSignalRecords: [],
@@ -125,6 +126,7 @@ let positionsRequestToken = 0;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
 let serverMonitorRefreshInFlight = null;
+let systemAuditRefreshInFlight = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
 
 function isPageActive(page) {
@@ -175,6 +177,11 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => {
         if (isPageActive('data-collection')) {
             fetchDataCollectionStatus({ silent: true });
+        }
+    }, 60000);
+    setInterval(() => {
+        if (isPageActive('system-audit')) {
+            fetchSystemAudit({ silent: true });
         }
     }, 60000);
     fetchDashboardAccountSettings();
@@ -1623,6 +1630,7 @@ function loadPageData(page) {
     if (page === 'shadow-backtest') fetchShadowBacktests();
     if (page === 'ml-signal') fetchMLSignalDashboard();
     if (page === 'data-collection') fetchDataCollectionStatus();
+    if (page === 'system-audit') fetchSystemAudit();
     if (page === 'server-monitor') {
         refreshServerMonitorPage();
     }
@@ -5036,6 +5044,197 @@ async function searchVectorMemory() {
             <em>相似度 ${(Number(hit.score || 0) * 100).toFixed(0)}% · ${hit.action ? analysisDecisionLabel(hit.action) : '-'} · ${hit.pnl_pct !== null && hit.pnl_pct !== undefined ? signedPctValueLabel(hit.pnl_pct) : '无收益'}</em>
         </div>
     `).join('');
+}
+
+// ========== System Audit / Root Cause Radar ==========
+
+async function fetchSystemAudit(options = {}) {
+    if (systemAuditRefreshInFlight) return systemAuditRefreshInFlight;
+    const updated = document.getElementById('system-audit-updated');
+    if (updated && !options.silent) updated.textContent = '巡检中...';
+    systemAuditRefreshInFlight = (async () => {
+        try {
+            const data = await fetchJSON('/api/system-audit/status');
+            state.systemAuditStatus = data || null;
+            renderSystemAudit();
+        } catch (error) {
+            const message = error?.message || String(error || '系统巡检接口请求失败');
+            if (options.silent && state.systemAuditStatus) {
+                if (updated) updated.textContent = '刷新失败，保留上次结果';
+                return;
+            }
+            state.systemAuditStatus = {
+                status: 'critical',
+                status_label: '异常',
+                checked_at: new Date().toISOString(),
+                summary: { cards: 1, critical: 1, warning: 0, ok: 0, findings: 1 },
+                root_causes: [{
+                    key: 'system_audit_api_failed',
+                    title: '系统巡检接口',
+                    severity: 'critical',
+                    summary: message,
+                    evidence: [{ label: '接口错误', value: message }],
+                    next_actions: ['先检查 Dashboard API 日志、登录状态和 /api/system-audit/status 路由。'],
+                }],
+                cards: [{
+                    key: 'system_audit_api_failed',
+                    title: '系统巡检接口',
+                    status: 'critical',
+                    summary: message,
+                    evidence: [{ label: '接口错误', value: message }],
+                    next_actions: ['先检查 Dashboard API 日志、登录状态和 /api/system-audit/status 路由。'],
+                }],
+                safety_note: '根因雷达当前只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认。',
+            };
+            renderSystemAudit();
+            console.error('系统巡检刷新失败', error);
+        }
+    })().finally(() => {
+        systemAuditRefreshInFlight = null;
+    });
+    return systemAuditRefreshInFlight;
+}
+
+function systemAuditStatusLabel(status) {
+    const labels = { ok: '正常', warning: '需关注', critical: '异常', info: '提示' };
+    return labels[String(status || '').toLowerCase()] || String(status || '未知');
+}
+
+function systemAuditTone(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'critical') return 'critical';
+    if (value === 'warning') return 'warning';
+    if (value === 'ok') return 'ok';
+    return 'info';
+}
+
+function systemAuditValueText(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    if (typeof value === 'number') return monitorNumber(value, Number.isInteger(value) ? 0 : 3);
+    if (typeof value === 'boolean') return value ? '是' : '否';
+    if (Array.isArray(value)) {
+        if (!value.length) return '无';
+        return value.map(item => systemAuditValueText(item)).join('、');
+    }
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+}
+
+function systemAuditEvidenceHtml(evidence) {
+    const rows = Array.isArray(evidence) ? evidence : [];
+    if (!rows.length) return '<div class="system-audit-muted">暂无关键证据</div>'; 
+    return `<div class="system-audit-evidence">${rows.map(item => `
+        <span><b>${escHtml(item.label || '证据')}</b><em>${escHtml(systemAuditValueText(item.value))}</em></span>
+    `).join('')}</div>`;
+}
+
+function systemAuditActionsHtml(actions) {
+    const rows = Array.isArray(actions) ? actions.filter(Boolean) : [];
+    if (!rows.length) return '<div class="system-audit-muted">暂无建议动作</div>'; 
+    return `<div class="system-audit-actions">${rows.map(item => `<span>${escHtml(item)}</span>`).join('')}</div>`;
+}
+
+function systemAuditDetailValue(value) {
+    if (Array.isArray(value)) {
+        if (!value.length) return '无';
+        const sample = value.slice(0, 3).map(item => systemAuditValueText(item)).join('；');
+        return value.length > 3 ? `${sample}；另 ${value.length - 3} 条` : sample;
+    }
+    return systemAuditValueText(value);
+}
+
+function systemAuditDetailsHtml(details) {
+    if (!details || typeof details !== 'object') return ''; 
+    const rows = Object.entries(details)
+        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+        .slice(0, 10);
+    if (!rows.length) return ''; 
+    return `<div class="system-audit-details">${rows.map(([key, value]) => `
+        <div><span>${escHtml(key)}</span><strong>${escHtml(systemAuditDetailValue(value))}</strong></div>
+    `).join('')}</div>`;
+}
+
+function systemAuditOverviewHtml(data) {
+    const status = systemAuditTone(data.status);
+    const summary = data.summary || {};
+    const title = status === 'ok' ? '当前未发现关键根因' : (status === 'critical' ? '发现异常根因' : '发现需关注项');
+    return `
+        <div class="system-audit-overview system-audit-overview-${status}">
+            <div class="system-audit-hero">
+                <span>总体状态</span>
+                <strong>${escHtml(data.status_label || systemAuditStatusLabel(data.status))}</strong>
+                <em>${escHtml(title)}</em>
+            </div>
+            <div class="system-audit-health-strip">
+                ${collectionMetric('巡检模块', `${monitorNumber(summary.cards || 0, 0)} 个`, '交易/对账/行情/策略/模型', 'muted')}
+                ${collectionMetric('异常根因', `${monitorNumber(summary.critical || 0, 0)} 项`, '需要优先处理', summary.critical ? 'bad' : 'good')}
+                ${collectionMetric('需关注项', `${monitorNumber(summary.warning || 0, 0)} 项`, '继续观察或排查', summary.warning ? 'warn' : 'good')}
+                ${collectionMetric('正常项', `${monitorNumber(summary.ok || 0, 0)} 项`, '已通过只读巡检', 'good')}
+            </div>
+        </div>`;
+}
+
+function renderSystemAuditRootCauses(rootCauses) {
+    const container = document.getElementById('system-audit-root-causes');
+    if (!container) return;
+    const rows = Array.isArray(rootCauses) ? rootCauses : [];
+    if (!rows.length) {
+        container.innerHTML = '<div class="system-audit-empty">暂无关键根因，继续观察核心指标。</div>'; 
+        return;
+    }
+    container.innerHTML = rows.map(item => {
+        const tone = systemAuditTone(item.severity || item.status);
+        return `
+            <div class="system-audit-root-cause ${tone}">
+                <div><strong>${escHtml(item.title || item.key || '-')}</strong><span>${escHtml(systemAuditStatusLabel(tone))}</span></div>
+                <p>${escHtml(item.summary || '-')}</p>
+                ${systemAuditEvidenceHtml(item.evidence)}
+                ${systemAuditActionsHtml(item.next_actions)}
+            </div>`;
+    }).join('');
+}
+
+function renderSystemAuditCards(cards) {
+    const container = document.getElementById('system-audit-cards');
+    if (!container) return;
+    const rows = Array.isArray(cards) ? cards : [];
+    if (!rows.length) {
+        container.innerHTML = '<div class="analysis-empty">还没有巡检卡片。</div>'; 
+        return;
+    }
+    container.innerHTML = rows.map(card => {
+        const tone = systemAuditTone(card.status);
+        return `
+            <article class="system-audit-card system-audit-card-${tone}">
+                <div class="system-audit-card-head">
+                    <div><strong>${escHtml(card.title || card.key || '-')}</strong><span>${escHtml(card.summary || '-')}</span></div>
+                    <em>${escHtml(systemAuditStatusLabel(card.status))}</em>
+                </div>
+                ${systemAuditEvidenceHtml(card.evidence)}
+                ${systemAuditDetailsHtml(card.details)}
+                <div class="system-audit-card-actions">
+                    <strong>建议处理</strong>
+                    ${systemAuditActionsHtml(card.next_actions)}
+                </div>
+            </article>`;
+    }).join('');
+}
+
+function renderSystemAudit() {
+    const data = state.systemAuditStatus || {};
+    const updated = document.getElementById('system-audit-updated');
+    const overview = document.getElementById('system-audit-overview');
+    if (updated) updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '等待巡检';
+    if (!overview) return;
+    if (!Object.keys(data).length) {
+        overview.innerHTML = '<div class="analysis-empty">等待系统巡检结果...</div>'; 
+        renderSystemAuditCards([]);
+        renderSystemAuditRootCauses([]);
+        return;
+    }
+    overview.innerHTML = systemAuditOverviewHtml(data);
+    renderSystemAuditCards(data.cards);
+    renderSystemAuditRootCauses(data.root_causes);
 }
 
 // ========== Server Monitor ==========

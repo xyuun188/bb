@@ -18,7 +18,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260621-data-sync">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260621-system-audit">
     <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260616-cangxiao-ui-fix2">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -80,6 +80,9 @@
             </button>
             <button class="nav-item" data-page="server-monitor">
                 <span class="nav-icon">🖥️</span> 服务器监控
+            </button>
+            <button class="nav-item" data-page="system-audit">
+                <span class="nav-icon">🦉</span> 系统巡检 / 根因雷达
             </button>
             <button class="nav-item" data-page="settings">
                 <span class="nav-icon">⚙️</span> 系统设置
@@ -1054,6 +1057,37 @@
         </div>
 
         <!-- ═══════ PAGE: SERVER MONITOR ═══════ -->
+        <div class="page-section" id="page-system-audit">
+            <div class="card system-audit-shell">
+                <div class="card-header">
+                    <div>
+                        <span class="card-title">系统巡检 / 根因雷达</span>
+                        <span class="card-subtitle">主动检查交易闭环、OKX 对账、K线、模型训练、外部采集和关键 API</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="card-subtitle" id="system-audit-updated">等待巡检</span>
+                        <button class="btn btn-sm" onclick="fetchSystemAudit()">立即巡检</button>
+                    </div>
+                </div>
+                <div id="system-audit-overview">
+                    <div class="analysis-empty">等待系统巡检结果...</div>
+                </div>
+                <div class="system-audit-layout">
+                    <div class="system-audit-main" id="system-audit-cards"></div>
+                    <div class="system-audit-side">
+                        <div class="system-audit-panel">
+                            <strong>根因 Top 列表</strong>
+                            <div id="system-audit-root-causes" class="system-audit-list"></div>
+                        </div>
+                        <div class="system-audit-panel">
+                            <strong>安全边界</strong>
+                            <div class="system-audit-note">当前页面只做只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认后执行。</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="page-section" id="page-server-monitor">
             <div class="card server-monitor-shell">
                 <div class="card-header">
@@ -1694,7 +1728,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260621-data-sync"></script>
+    <script src="/static/js/dashboard.js?v=20260621-system-audit"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260619-llm-error-kind"></script>
 </body>
 </html>

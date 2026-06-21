@@ -11,6 +11,7 @@ from web_dashboard.api.secure_settings_api import router as secure_settings_rout
 from web_dashboard.api.settings_api import router as settings_router
 from web_dashboard.api.symbols import router as symbols_router
 from web_dashboard.api.system_health import router as system_health_router
+from web_dashboard.api.system_audit import router as system_audit_router
 from web_dashboard.api.trades import router as trades_router
 from web_dashboard.api.vector_memory import router as vector_memory_router
 
@@ -26,4 +27,5 @@ api_router.include_router(symbols_router, tags=["symbols"])
 api_router.include_router(secure_settings_router, tags=["secure-settings"])
 api_router.include_router(settings_router, tags=["settings"])
 api_router.include_router(system_health_router, tags=["system-health"])
+api_router.include_router(system_audit_router, tags=["system-audit"])
 api_router.include_router(vector_memory_router, tags=["vector-memory"])
