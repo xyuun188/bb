@@ -377,7 +377,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260620-vector-auto-index" in html
+    assert "dashboard.js?v=20260621-data-sync" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -436,6 +436,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "fetchDataCollectionStatus()" in html
     assert "saveDataCollectionSettings()" in html
     assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
+    assert "if (isPageActive('data-collection'))" in script
+    assert "fetchDataCollectionStatus({ silent: true });" in script
     assert "selected === 'external-events'" in script
     assert "selected === 'vector-memory'" in script
     assert "selected === 'models') fetchDataCollectionStatus" not in script
@@ -468,8 +470,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260620-vector-auto-index" in html
-    assert "dashboard.js?v=20260620-vector-auto-index" in html
+    assert "dashboard.css?v=20260621-data-sync" in html
+    assert "dashboard.js?v=20260621-data-sync" in html
     assert "overflow-wrap: anywhere;" in style
 
 

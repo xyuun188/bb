@@ -49,6 +49,12 @@ INDICATOR_SNAPSHOT_CACHE_TTL_SECONDS = _MARKET_DATA_PARAMS.indicator_snapshot_ca
 KLINE_BACKGROUND_REFRESH_MIN_INTERVAL_SECONDS = (
     _MARKET_DATA_PARAMS.kline_background_refresh_min_interval_seconds
 )
+KLINE_COVERAGE_REFRESH_INTERVAL_SECONDS = (
+    _MARKET_DATA_PARAMS.kline_coverage_refresh_interval_seconds
+)
+KLINE_COVERAGE_REFRESH_BATCH_SIZE = _MARKET_DATA_PARAMS.kline_coverage_refresh_batch_size
+KLINE_COVERAGE_REFRESH_SYMBOL_CAP = _MARKET_DATA_PARAMS.kline_coverage_refresh_symbol_cap
+KLINE_COVERAGE_INITIAL_DELAY_SECONDS = _MARKET_DATA_PARAMS.kline_coverage_initial_delay_seconds
 INDICATOR_REMOTE_REFRESH_CONCURRENCY = _MARKET_DATA_PARAMS.indicator_remote_refresh_concurrency
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
 TIMEFRAME_SECONDS = {
@@ -103,6 +109,9 @@ class DataService:
         self._kline_fetch_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_refresh_scheduled_at: dict[tuple[str, str], datetime] = {}
+        self._kline_coverage_refresh_task: asyncio.Task | None = None
+        self._kline_coverage_symbols: list[str] = []
+        self._kline_coverage_index = 0
         self._derivatives_cache: dict[str, dict[str, Any]] = {}
         self._derivatives_refresh_tasks: dict[str, asyncio.Task] = {}
         self._last_sentiment_update: datetime | None = None
@@ -191,6 +200,9 @@ class DataService:
             available = await self.rest_client.get_available_symbols()
             all_symbols = [s["symbol"] for s in available]
             self.ws_client._subscribe_symbols = all_symbols if all_symbols else settings.symbols
+            self._kline_coverage_symbols = self._normalize_symbols(
+                all_symbols[: max(int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP), 1)]
+            )
             logger.info(
                 "ws subscribing to all symbols", count=len(self.ws_client._subscribe_symbols)
             )
@@ -200,14 +212,17 @@ class DataService:
                 error=safe_error_text(e),
             )
             self.ws_client._subscribe_symbols = settings.symbols
+            self._kline_coverage_symbols = self._normalize_symbols(settings.symbols)
 
         await self.ws_client.connect()
         asyncio.create_task(self.ws_client.listen())
+        self._start_kline_coverage_refresh()
         await self.external_event_service.start_controller()
         logger.info("data service started")
 
     async def stop(self) -> None:
         """Stop all data feed connections."""
+        await self._stop_kline_coverage_refresh()
         await self.ws_client.close()
         await self.rest_client.close()
         await self.news_fetcher.close()
@@ -772,6 +787,62 @@ class DataService:
         if floor <= last_price <= ceiling:
             return None
         return "last_price_outside_24h_range"
+
+    def _start_kline_coverage_refresh(self) -> None:
+        if self._kline_coverage_refresh_task and not self._kline_coverage_refresh_task.done():
+            return
+        self._kline_coverage_refresh_task = asyncio.create_task(self._kline_coverage_refresh_loop())
+
+    async def _stop_kline_coverage_refresh(self) -> None:
+        task = self._kline_coverage_refresh_task
+        self._kline_coverage_refresh_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+
+    async def _kline_coverage_refresh_loop(self) -> None:
+        await asyncio.sleep(max(float(KLINE_COVERAGE_INITIAL_DELAY_SECONDS), 0.0))
+        while True:
+            try:
+                await self.refresh_kline_coverage_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("kline coverage refresh failed", error=safe_error_text(exc))
+            await asyncio.sleep(max(float(KLINE_COVERAGE_REFRESH_INTERVAL_SECONDS), 5.0))
+
+    async def refresh_kline_coverage_once(self) -> dict[str, Any]:
+        symbols = self._kline_coverage_target_symbols()
+        if not symbols:
+            return {"refreshed_symbols": [], "timeframes": []}
+        batch_size = max(int(KLINE_COVERAGE_REFRESH_BATCH_SIZE), 1)
+        start = self._kline_coverage_index % len(symbols)
+        batch = [symbols[(start + offset) % len(symbols)] for offset in range(batch_size)]
+        self._kline_coverage_index = (start + batch_size) % len(symbols)
+        tasks = [
+            self._fetch_and_persist_klines(symbol, timeframe, limit)
+            for symbol in batch
+            for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            "refreshed_symbols": batch,
+            "timeframes": list(KLINE_PERSIST_TIMEFRAME_LIMITS),
+        }
+
+    def _kline_coverage_target_symbols(self) -> list[str]:
+        configured = self._normalize_symbols(self._kline_coverage_symbols or [])
+        subscribed = self._normalize_symbols(
+            list(getattr(self.ws_client, "_subscribe_symbols", []) or [])
+        )
+        fallback = self._normalize_symbols(settings.symbols)
+        merged = list(dict.fromkeys([*configured, *subscribed, *fallback]))
+        return merged[: max(int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP), 1)]
 
     async def _get_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]

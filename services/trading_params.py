@@ -180,6 +180,10 @@ class EntryMarketDataQualityParams:
     kline_remote_fetch_timeout_seconds: float = 3.5
     indicator_snapshot_cache_ttl_seconds: float = 30.0
     kline_background_refresh_min_interval_seconds: float = 45.0
+    kline_coverage_refresh_interval_seconds: float = 60.0
+    kline_coverage_refresh_batch_size: int = 4
+    kline_coverage_refresh_symbol_cap: int = 80
+    kline_coverage_initial_delay_seconds: float = 5.0
     indicator_remote_refresh_concurrency: int = 3
     derivatives_stale_max_age_seconds: float = 180.0
     short_return_feature_timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1h")
@@ -644,6 +648,20 @@ class ExitFastRiskParams:
 
 
 @dataclass(frozen=True, slots=True)
+class ExitPositionQualityParams:
+    """Low-quality position release policy.
+
+    Fresh positions need a short observation window so ordinary adverse noise
+    cannot be mislabeled as an old low-quality position. Hard-risk exits still
+    bypass this protection when loss evidence is severe.
+    """
+
+    fresh_position_min_release_hold_hours: float = 0.10
+    fresh_position_score_floor: float = 72.0
+    fresh_position_hard_risk_loss_ratio: float = -0.05
+
+
+@dataclass(frozen=True, slots=True)
 class ExitCooldownParams:
     ordinary_seconds: float = 600.0
     volatile_seconds: float = 300.0
@@ -704,9 +722,12 @@ class TradingParameterSnapshot:
         default_factory=EntryStopLossBudgetParams
     )
     exit_fast_risk: ExitFastRiskParams = field(default_factory=ExitFastRiskParams)
+    exit_position_quality: ExitPositionQualityParams = field(
+        default_factory=ExitPositionQualityParams
+    )
     exit_cooldown: ExitCooldownParams = field(default_factory=ExitCooldownParams)
     exit_arbitration: ExitArbitrationParams = field(default_factory=ExitArbitrationParams)
-    version: str = "2026-06-20.strategy-v3-auditable"
+    version: str = "2026-06-21.strategy-v4-auditable"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.trading_params import DEFAULT_TRADING_PARAMS, ExitPositionQualityParams
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,9 +14,12 @@ class PositionReleaseDecisionPolicy:
     """Build explicit close decisions for positions marked by release triage."""
 
     min_release_exit_score: float = 90.0
+    params: ExitPositionQualityParams = DEFAULT_TRADING_PARAMS.exit_position_quality
 
     def should_release(self, scan: dict[str, Any] | None) -> bool:
         if not isinstance(scan, dict):
+            return False
+        if self._fresh_low_quality_scan_is_protected(scan):
             return False
         if bool(scan.get("force_exit_candidate")):
             return True
@@ -36,6 +40,8 @@ class PositionReleaseDecisionPolicy:
     ) -> DecisionOutput | None:
         action = self._release_action(scan, positions)
         if action is None:
+            return None
+        if self._fresh_low_quality_scan_is_protected(scan):
             return None
 
         exit_score = self._safe_float(scan.get("exit_score"), 0.0)
@@ -111,7 +117,28 @@ class PositionReleaseDecisionPolicy:
         if hold_hours is not None:
             details.append(f"持仓小时={hold_hours}")
         suffix = "；" + "，".join(details) if details else ""
-        return f"策略纪律触发低质量旧仓释放：{reason}{suffix}。"
+        return f"策略纪律触发低质量持仓释放：{reason}{suffix}。"
+
+    def _fresh_low_quality_scan_is_protected(self, scan: dict[str, Any]) -> bool:
+        quality = (
+            scan.get("position_quality") if isinstance(scan.get("position_quality"), dict) else {}
+        )
+        hold_hours = self._safe_float(quality.get("hold_hours"), 999.0)
+        pnl_ratio = self._safe_float(quality.get("pnl_ratio"), 0.0)
+        if hold_hours >= self.params.fresh_position_min_release_hold_hours:
+            return False
+        if pnl_ratio <= self.params.fresh_position_hard_risk_loss_ratio:
+            return False
+        reasons = {str(item) for item in quality.get("reasons", []) if item is not None}
+        return bool(
+            reasons
+            & {
+                "fresh_position_observation",
+                "hard_loss_pressure",
+                "loss_pressure",
+                "signal_reversal",
+            }
+        )
 
     @staticmethod
     def _feature_snapshot(feature_vector: Any | None) -> dict[str, Any]:

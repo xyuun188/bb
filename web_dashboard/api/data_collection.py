@@ -304,16 +304,34 @@ async def _source_breakdown() -> dict[str, Any]:
             "ticker_latest_at": _iso(ticker_row[1]),
             "ticker_age_minutes": _age_minutes(ticker_row[1]),
             "klines": [
-                {
-                    "timeframe": str(timeframe),
-                    "rows": int(count or 0),
-                    "symbols": int(symbols or 0),
-                    "latest_at": _iso(latest),
-                    "age_minutes": _age_minutes(latest),
-                }
-                for timeframe, count, symbols, latest in kline_rows
+                _kline_coverage_row(timeframe, kline_rows)
+                for timeframe in EXPECTED_KLINE_TIMEFRAMES
             ],
         },
+    }
+
+
+def _kline_coverage_row(
+    timeframe: str,
+    kline_rows: list[tuple[Any, Any, Any, Any]],
+) -> dict[str, Any]:
+    for row_timeframe, count, symbols, latest in kline_rows:
+        if str(row_timeframe) == timeframe:
+            return {
+                "timeframe": timeframe,
+                "rows": int(count or 0),
+                "symbols": int(symbols or 0),
+                "latest_at": _iso(latest),
+                "age_minutes": _age_minutes(latest),
+                "missing": False,
+            }
+    return {
+        "timeframe": timeframe,
+        "rows": 0,
+        "symbols": 0,
+        "latest_at": None,
+        "age_minutes": None,
+        "missing": True,
     }
 
 

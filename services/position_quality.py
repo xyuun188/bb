@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from services.position_open_time import parse_position_time, position_hold_hours
-from services.trading_params import ESTIMATED_TAKER_FEE_PCT
+from services.trading_params import (
+    DEFAULT_TRADING_PARAMS,
+    ESTIMATED_TAKER_FEE_PCT,
+    ExitPositionQualityParams,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +46,9 @@ class PositionQualityScore:
 
 class PositionQualityScorer:
     """Scores time cost, capital efficiency, fee drag, crowding, and reversal risk."""
+
+    def __init__(self, params: ExitPositionQualityParams | None = None) -> None:
+        self.params = params or DEFAULT_TRADING_PARAMS.exit_position_quality
 
     def score(
         self,
@@ -154,6 +161,10 @@ class PositionQualityScorer:
             score -= 12.0
             reasons.append("signal_reversal_watch")
 
+        if self._fresh_position_needs_observation(hold_hours, pnl_ratio):
+            score = max(score, self.params.fresh_position_score_floor)
+            reasons.append("fresh_position_observation")
+
         score = min(max(score, 0.0), 100.0)
         release_priority = min(max(100.0 - score, 0.0), 100.0)
         bucket = "high"
@@ -193,6 +204,11 @@ class PositionQualityScorer:
             score += 1 if returns_5 > 0.006 or returns_20 > 0.012 else 0
             score += 1 if macd_diff > 0 and bb_pct > 0.65 else 0
         return score
+
+    def _fresh_position_needs_observation(self, hold_hours: float, pnl_ratio: float) -> bool:
+        if hold_hours >= self.params.fresh_position_min_release_hold_hours:
+            return False
+        return self.params.fresh_position_hard_risk_loss_ratio < pnl_ratio < 0.0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

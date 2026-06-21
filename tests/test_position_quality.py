@@ -87,6 +87,48 @@ def test_position_quality_derives_unrealized_pnl_when_snapshot_is_stale_zero() -
     assert "severe_loss_pressure" in quality.reasons
 
 
+def test_position_quality_protects_fresh_position_from_low_quality_release() -> None:
+    quality = PositionQualityScorer().score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "MET/USDT",
+            "side": "short",
+            "entry_price": 0.18,
+            "current_price": 0.185,
+            "quantity": 100.0,
+            "unrealized_pnl": -0.5,
+            "created_at": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+        },
+        feature_vector={"returns_5": 0.02, "returns_20": 0.03, "macd_diff": 1.0, "bb_pct": 0.9},
+    )
+
+    assert "hard_loss_pressure" in quality.reasons
+    assert "signal_reversal" in quality.reasons
+    assert "fresh_position_observation" in quality.reasons
+    assert quality.bucket == "high"
+    assert quality.should_release is False
+
+
+def test_position_quality_allows_fresh_position_hard_risk_release() -> None:
+    quality = PositionQualityScorer().score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "MET/USDT",
+            "side": "short",
+            "entry_price": 0.18,
+            "current_price": 0.192,
+            "quantity": 100.0,
+            "unrealized_pnl": -1.2,
+            "created_at": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+        },
+        feature_vector={"returns_5": 0.02, "returns_20": 0.03, "macd_diff": 1.0, "bb_pct": 0.9},
+    )
+
+    assert "severe_loss_pressure" in quality.reasons
+    assert "fresh_position_observation" not in quality.reasons
+    assert quality.should_release is True
+
+
 def test_position_quality_uses_okx_position_timestamp_fields() -> None:
     opened_at = datetime.now(UTC) - timedelta(hours=5)
     quality = PositionQualityScorer().score(

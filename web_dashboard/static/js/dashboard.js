@@ -172,6 +172,11 @@ document.addEventListener('DOMContentLoaded', () => {
             refreshServerMonitorPage();
         }
     }, 15000);
+    setInterval(() => {
+        if (isPageActive('data-collection')) {
+            fetchDataCollectionStatus({ silent: true });
+        }
+    }, 60000);
     fetchDashboardAccountSettings();
     fetchModelServerSettings();
     fetchOKXSettings();

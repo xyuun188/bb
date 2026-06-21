@@ -5,9 +5,12 @@ from typing import Any
 
 import httpx
 import pytest
+from datetime import UTC, datetime
 
 from config.settings import settings
 from db.session import close_db, init_db
+from db.session import get_session_ctx
+from models.market_data import Kline
 from web_dashboard.api import data_collection as data_collection_module
 from web_dashboard.app import create_app
 
@@ -71,6 +74,42 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert "local_ai_tools" in body["training"]
     assert "governance" in body["training"]
     assert body["training"]["governance"]["status"] in {"ok", "error"}
+    kline_timeframes = {row["timeframe"] for row in body["stats"]["market"]["klines"]}
+    assert kline_timeframes == {"1m", "5m", "15m", "1h"}
+
+
+@pytest.mark.asyncio
+async def test_data_collection_kline_coverage_reports_missing_timeframes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    async with get_session_ctx() as session:
+        session.add(
+            Kline(
+                symbol="BTC/USDT",
+                timeframe="1m",
+                open_time=datetime(2026, 6, 21, 8, 30, tzinfo=UTC),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=123.0,
+            )
+        )
+        await session.flush()
+
+    try:
+        stats = await data_collection_module._source_breakdown()
+    finally:
+        await close_db()
+
+    rows = {row["timeframe"]: row for row in stats["market"]["klines"]}
+    assert set(rows) == {"1m", "5m", "15m", "1h"}
+    assert rows["1m"]["rows"] == 1
+    assert rows["1m"]["missing"] is False
+    assert rows["5m"]["rows"] == 0
+    assert rows["5m"]["missing"] is True
 
 
 @pytest.mark.asyncio

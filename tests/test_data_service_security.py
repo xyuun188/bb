@@ -23,6 +23,9 @@ def _service() -> DataService:
     service._kline_fetch_tasks = {}
     service._kline_background_refresh_tasks = {}
     service._kline_refresh_scheduled_at = {}
+    service._kline_coverage_refresh_task = None
+    service._kline_coverage_symbols = []
+    service._kline_coverage_index = 0
     service._derivatives_cache = {}
     service._derivatives_refresh_tasks = {}
     service._ticker_persisted_at = {}
@@ -301,6 +304,37 @@ async def test_background_kline_refresh_does_not_block_foreground_fetch(
     assert timeframe == "1m"
     assert rows == [["foreground"]]
     assert "1m" in fetch_calls
+
+
+@pytest.mark.asyncio
+async def test_kline_coverage_refresh_rotates_symbols_and_timeframes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service.ws_client = type(
+        "Ws", (), {"_subscribe_symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]}
+    )()
+    calls: list[tuple[str, str, int]] = []
+
+    async def fake_fetch(symbol: str, timeframe: str, limit: int) -> tuple[str, list[Any]]:
+        calls.append((symbol, timeframe, limit))
+        return timeframe, []
+
+    monkeypatch.setattr(data_service_module, "KLINE_COVERAGE_REFRESH_BATCH_SIZE", 2)
+    monkeypatch.setattr(data_service_module, "KLINE_COVERAGE_REFRESH_SYMBOL_CAP", 3)
+    service._fetch_and_persist_klines = fake_fetch  # type: ignore[method-assign]
+
+    first = await service.refresh_kline_coverage_once()
+    second = await service.refresh_kline_coverage_once()
+
+    assert first["refreshed_symbols"] == ["BTC/USDT", "ETH/USDT"]
+    assert second["refreshed_symbols"] == ["SOL/USDT", "BTC/USDT"]
+    assert {(symbol, timeframe) for symbol, timeframe, _limit in calls} >= {
+        ("BTC/USDT", "1m"),
+        ("BTC/USDT", "5m"),
+        ("ETH/USDT", "15m"),
+        ("SOL/USDT", "1h"),
+    }
 
 
 def test_feature_vector_keeps_market_feature_source_timeframes() -> None:

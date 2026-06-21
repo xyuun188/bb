@@ -13,6 +13,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
 
 logger = structlog.get_logger(__name__)
 
@@ -167,6 +168,37 @@ class PositionExecutionPersistenceService:
             side=side,
             execution_mode=execution_mode,
         )
+        if not positions:
+            recovered = await reconcile_missing_closed_position_for_exit(
+                session,
+                model_name=model_name,
+                execution_mode=execution_mode,
+                decision=decision,
+                result=result,
+            )
+            if recovered is not None:
+                self._position_peak_remover(model_name, result.symbol, side)
+                if result.pnl == 0.0 and recovered.plan.realized_pnl != 0.0:
+                    result.pnl = recovered.plan.realized_pnl
+                await self._record_reflection(
+                    session,
+                    recovered.position,
+                    result,
+                    recovered.plan.entry_fee_allocated,
+                    recovered.plan.close_fee_allocated,
+                    recovered.plan.gross_pnl,
+                    decision,
+                )
+                await session.flush()
+                logger.warning(
+                    "recovered missing closed position from filled order pair",
+                    symbol=recovered.plan.symbol,
+                    side=recovered.plan.side,
+                    quantity=recovered.plan.quantity,
+                    entry_order_id=recovered.plan.entry_order_id,
+                    close_order_id=recovered.plan.close_order_id,
+                )
+            return
         exchange_backed_ids = await self._exchange_backed_id_provider(session, positions)
         positions = sorted(
             positions,
