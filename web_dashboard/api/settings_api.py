@@ -44,7 +44,8 @@ from web_dashboard.api import dashboard as _dash
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 _OKX_BALANCE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_OKX_BALANCE_TTL_SECONDS = 10.0
+_OKX_BALANCE_TTL_SECONDS = 60.0
+_OKX_BALANCE_TIMEOUT_SECONDS = 8.0
 _MODEL_CONNECTION_ERROR_LIMIT = 700
 
 
@@ -168,10 +169,14 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
 
     executor = _make_okx_executor(OKXExecutor, mode)
     try:
-        await executor.initialize()
-        snapshot = await executor.get_balance_snapshot("USDT")
+        await asyncio.wait_for(executor.initialize(), timeout=_OKX_BALANCE_TIMEOUT_SECONDS)
+        snapshot = await asyncio.wait_for(
+            executor.get_balance_snapshot("USDT"),
+            timeout=_OKX_BALANCE_TIMEOUT_SECONDS,
+        )
         if snapshot.get("error"):
             result["balance_error"] = _connection_error_text(snapshot.get("error"))
+            _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
             return result
         result.update(
             {
@@ -193,6 +198,7 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
         return result
     except Exception as exc:
         result["balance_error"] = f"OKX 余额查询失败: {_connection_error_text(exc)}"
+        _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
         return result
     finally:
         try:
@@ -694,9 +700,13 @@ async def get_okx_balances():
 @router.get("/settings/execution-account")
 async def get_execution_account_settings():
     """Return unified execution-account settings and current balances."""
+    paper_status, live_status = await asyncio.gather(
+        _execution_account_status("paper"),
+        _execution_account_status("live"),
+    )
     return {
-        "paper": await _execution_account_status("paper"),
-        "live": await _execution_account_status("live"),
+        "paper": paper_status,
+        "live": live_status,
     }
 
 
@@ -732,11 +742,16 @@ async def update_execution_account_settings(req: ExecutionAccountRequest):
     if updates:
         settings.update_env_file(updates)
 
+    paper_status, live_status = await asyncio.gather(
+        _execution_account_status("paper"),
+        _execution_account_status("live"),
+    )
+
     return {
         "status": "ok",
         "message": "执行账户风控设置已保存；下单资金自动使用 OKX 当前可用余额。",
-        "paper": await _execution_account_status("paper"),
-        "live": await _execution_account_status("live"),
+        "paper": paper_status,
+        "live": live_status,
     }
 
 

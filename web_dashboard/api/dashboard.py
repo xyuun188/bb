@@ -64,15 +64,17 @@ _data_service = None
 _competition_service = None
 _local_ai_tools_status_client = None
 _ml_signal_status_service = None
-_EXCHANGE_MARK_CACHE_TTL_SECONDS = 5.0
-_EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 5.0
+_EXCHANGE_MARK_CACHE_TTL_SECONDS = 15.0
+_EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 15.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
-_DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 10.0
+_DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, float]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
-_dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
+_dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 
@@ -2044,7 +2046,7 @@ async def _get_exchange_position_mark_map(
 
 
 async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, Any] | None:
-    """Fetch the OKX balance snapshot used by dashboard summary with fallback logging."""
+    """Fetch the OKX balance snapshot used by dashboard summary with bounded retries."""
     selected_mode = "live" if selected_mode == "live" else "paper"
     now = datetime.now(UTC)
     cached = _dashboard_okx_balance_cache.get(selected_mode)
@@ -2052,6 +2054,37 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         cached_at, cached_value = cached
         if (now - cached_at).total_seconds() <= _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
             return copy.deepcopy(cached_value)
+
+    cached_error = _dashboard_okx_balance_error_cache.get(selected_mode)
+    if cached_error:
+        cached_at, cached_value = cached_error
+        if (now - cached_at).total_seconds() <= _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS:
+            stale_cached = _dashboard_okx_balance_cache.get(selected_mode)
+            if stale_cached and stale_cached[1]:
+                stale_snapshot = copy.deepcopy(stale_cached[1])
+                stale_snapshot["stale"] = True
+                stale_snapshot["stale_age_seconds"] = round(
+                    (now - stale_cached[0]).total_seconds(), 3
+                )
+                stale_snapshot["error"] = cached_value.get("error")
+                stale_snapshot["balance_error"] = cached_value.get("balance_error")
+                stale_snapshot["error_cached"] = True
+                return stale_snapshot
+            return copy.deepcopy(cached_value)
+
+    def cache_failure(exc: Exception, *, source: str) -> dict[str, Any]:
+        error = safe_error_text(exc)
+        failure = {
+            "error": error,
+            "balance_error": error,
+            "balance_source": (
+                "OKX live account" if selected_mode == "live" else "OKX paper account"
+            ),
+            "source": source,
+            "error_cached": True,
+        }
+        _dashboard_okx_balance_error_cache[selected_mode] = (datetime.now(UTC), failure)
+        return copy.deepcopy(failure)
 
     async def fetch_with_executor(executor: Any) -> dict[str, Any] | None:
         snapshot = await asyncio.wait_for(executor.get_balance_snapshot("USDT"), timeout=8.0)
@@ -2066,6 +2099,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         try:
             snapshot = await fetch_with_executor(executor)
             _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
+            _dashboard_okx_balance_error_cache.pop(selected_mode, None)
             return snapshot
         except Exception as exc:
             _log_dashboard_fallback(
@@ -2080,6 +2114,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         await asyncio.wait_for(fallback_executor.initialize(), timeout=12.0)
         snapshot = await fetch_with_executor(fallback_executor)
         _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
+        _dashboard_okx_balance_error_cache.pop(selected_mode, None)
         return snapshot
     except Exception as exc:
         _log_dashboard_fallback(
@@ -2092,13 +2127,28 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         if cached and cached[1]:
             stale_snapshot = copy.deepcopy(cached[1])
             if isinstance(stale_snapshot, dict):
+                error = safe_error_text(exc)
                 stale_snapshot["stale"] = True
                 stale_snapshot["stale_age_seconds"] = round(
-                    (datetime.now(UTC) - cached[0]).total_seconds(),
-                    3,
+                    (datetime.now(UTC) - cached[0]).total_seconds(), 3
+                )
+                stale_snapshot["error"] = error
+                stale_snapshot["balance_error"] = error
+                stale_snapshot["error_cached"] = True
+                _dashboard_okx_balance_error_cache[selected_mode] = (
+                    datetime.now(UTC),
+                    {
+                        "error": error,
+                        "balance_error": error,
+                        "balance_source": (
+                            "OKX live account" if selected_mode == "live" else "OKX paper account"
+                        ),
+                        "source": "isolated_executor",
+                        "error_cached": True,
+                    },
                 )
             return stale_snapshot
-        return None
+        return cache_failure(exc, source="isolated_executor")
     finally:
         try:
             await fallback_executor.shutdown()
@@ -2584,7 +2634,7 @@ async def get_ml_signal_status():
             "available": False,
             "status": "client_error",
             "error": safe_error_text(exc, limit=180),
-            "message": "本地 ML 状态客户端初始化失败。", 
+            "message": "本地 ML 状态客户端初始化失败。",
         }
     if not ml_signal_service:
         return {"available": False, "status": "service_not_ready"}
@@ -2596,7 +2646,7 @@ async def get_ml_signal_status():
             "available": False,
             "status": "status_error",
             "error": safe_error_text(exc, limit=180),
-            "message": "本地 ML 状态读取失败；请检查模型文件、训练元数据和服务日志。", 
+            "message": "本地 ML 状态读取失败；请检查模型文件、训练元数据和服务日志。",
         }
     if not isinstance(status, dict):
         return status
@@ -2644,7 +2694,7 @@ async def get_local_ai_tools_status():
             "available": False,
             "status": "client_error",
             "error": safe_error_text(exc, limit=180),
-            "message": "本地量化工具客户端初始化失败。", 
+            "message": "本地量化工具客户端初始化失败。",
         }
     if not local_ai_tools:
         return {"available": False, "status": "service_not_ready"}
@@ -2656,7 +2706,7 @@ async def get_local_ai_tools_status():
             "available": False,
             "status": "status_error",
             "error": safe_error_text(exc, limit=180),
-            "message": "本地量化工具状态读取失败；请检查 18001 隧道、API Key 和服务健康接口。", 
+            "message": "本地量化工具状态读取失败；请检查 18001 隧道、API Key 和服务健康接口。",
         }
     if isinstance(status, dict):
         try:

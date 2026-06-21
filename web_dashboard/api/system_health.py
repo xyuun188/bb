@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -42,6 +43,7 @@ KLINE_FRESH_SECONDS = 2 * 60 * 60
 NEWS_FRESH_SECONDS = 24 * 60 * 60
 SOCIAL_FRESH_SECONDS = 24 * 60 * 60
 ISSUE_ORDER = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
+SELF_CHECK_SECTION_TIMEOUT_SECONDS = 6.0
 
 
 def _now_iso() -> str:
@@ -968,60 +970,94 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
     return items
 
 
+async def _run_self_check_section(coro: Any) -> Any:
+    return await asyncio.wait_for(coro, timeout=SELF_CHECK_SECTION_TIMEOUT_SECONDS)
+
+
 @router.get("/system/self-check")
 async def system_self_check() -> dict[str, Any]:
-    items: list[dict[str, Any]] = [await _trading_service_running_item()]
-    items.extend([_okx_config_item("paper"), _okx_config_item("live")])
-    monitor_status: dict[str, Any] | None = None
-    try:
-        monitor_status = await get_server_monitor_status_async()
-    except Exception:
-        monitor_status = None
+    items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
+    trading_result, monitor_result, data_result, recent_result = await asyncio.gather(
+        _run_self_check_section(_trading_service_running_item()),
+        _run_self_check_section(get_server_monitor_status_async()),
+        _run_self_check_section(_data_source_items()),
+        _run_self_check_section(_recent_execution_items()),
+        return_exceptions=True,
+    )
+
+    if isinstance(trading_result, Exception):
+        items.append(
+            _check_item(
+                "trading_service",
+                "交易主循环",
+                "warning",
+                "交易心跳自检超时或失败，请查看服务日志确认交易进程状态。",
+                details={"error": safe_error_text(trading_result, limit=180)},
+            )
+        )
+    else:
+        items.append(trading_result)
+
+    monitor_status = monitor_result if isinstance(monitor_result, dict) else None
     try:
         endpoint_items = _configured_endpoint_items(monitor_status)
     except TypeError:
         endpoint_items = _configured_endpoint_items()
     items.extend(endpoint_items)
-    try:
-        items.extend(await _data_source_items())
-    except Exception as exc:
+
+    if isinstance(data_result, Exception):
         items.append(
             _check_item(
                 "training_data_sources",
                 "训练数据源覆盖",
                 "warning",
-                "训练数据源自检失败，请检查行情、K 线、新闻和社媒数据表。",
-                details={"error": safe_error_text(exc, limit=180)},
+                "训练数据源自检超时或失败，请检查行情、K 线、新闻和社媒数据表。",
+                details={"error": safe_error_text(data_result, limit=180)},
             )
         )
-    try:
-        if monitor_status is None:
-            monitor_status = await get_server_monitor_status_async()
-        items.extend(_server_monitor_items(monitor_status))
-    except Exception as exc:
+    else:
+        items.extend(data_result)
+
+    if isinstance(monitor_result, Exception) or monitor_status is None:
         items.append(
             _check_item(
                 "server_monitor",
                 "模型服务器监控",
                 "warning",
-                "模型服务器监控采集失败。",
-                details={"error": safe_error_text(exc, limit=180)},
+                "模型服务器监控采集超时或失败。",
+                details={"error": safe_error_text(monitor_result, limit=180)},
                 repairable=True,
                 repair_action="clear_monitor_cache",
             )
         )
-    try:
-        items.extend(await _recent_execution_items())
-    except Exception as exc:
+    else:
+        try:
+            items.extend(_server_monitor_items(monitor_status))
+        except Exception as exc:
+            items.append(
+                _check_item(
+                    "server_monitor",
+                    "模型服务器监控",
+                    "warning",
+                    "模型服务器监控状态解析失败。",
+                    details={"error": safe_error_text(exc, limit=180)},
+                    repairable=True,
+                    repair_action="clear_monitor_cache",
+                )
+            )
+
+    if isinstance(recent_result, Exception):
         items.append(
             _check_item(
                 "recent_execution",
                 "最近执行结果",
                 "warning",
-                "最近执行记录检查失败。",
-                details={"error": safe_error_text(exc, limit=180)},
+                "最近执行记录检查超时或失败。",
+                details={"error": safe_error_text(recent_result, limit=180)},
             )
         )
+    else:
+        items.extend(recent_result)
 
     items = sorted(
         items, key=lambda item: (ISSUE_ORDER.get(str(item.get("status")), 9), item["key"])

@@ -4163,6 +4163,7 @@ function localModelStatus(status, key) {
     const childEndpoints = status?.child_endpoints || {};
     const endpointByModel = {
         profit: 'profit_prediction',
+        loss_filter: 'profit_prediction',
         timeseries: 'time_series_prediction',
         deep_timeseries: 'time_series_prediction',
         sentiment: 'sentiment_analysis',
@@ -4171,6 +4172,7 @@ function localModelStatus(status, key) {
     };
     const modelAliases = {
         profit: ['profit', 'profit_model', 'entry_profit', 'profit_prediction'],
+        loss_filter: ['loss_filter', 'loss_model', 'loss_probability', 'risk_filter'],
         timeseries: ['timeseries', 'time_series', 'time_series_prediction'],
         deep_timeseries: ['deep_timeseries', 'timeseries', 'time_series', 'time_series_prediction'],
         sentiment: ['sentiment', 'sentiment_model', 'sentiment_analysis'],

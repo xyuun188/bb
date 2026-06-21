@@ -172,6 +172,9 @@ Keep all memories for this repository in `bb`; do not store this project's facts
 
 - Semble is available globally through the Codex MCP server. Use Semble first for semantic code discovery in this project.
 - Use mcp__semble.search with repo="F:\\bb" for broad codebase questions.
+- Codebase Memory MCP is available globally as `codebase_memory`; use repo path `F:\BB` for indexing, architecture queries, call-path tracing, code snippets, graph searches, and change detection.
+- `Codex-CodebaseMemory-AutoIndex` refreshes this project's Codebase Memory graph every 30 minutes and at logon. Already-open Codex sessions cannot hot-load native MCP tools; use the fallback script `C:\Users\Administrator\.codex\codebase-memory\invoke-codebase-memory-tool.ps1` if needed.
+- Treat Codebase Memory as structural code intelligence. Keep durable project decisions and preferences in `hindsight_bb`, not in another project's memory bank.
 - RTK is available globally from F:\SemblevsRTK\bin\rtk.exe. Prefer RTK for supported shell commands that produce large output.
 - Do not force RTK onto PowerShell-only commands such as Get-ChildItem, Get-Content, Select-String, or Test-Path.
 <!-- END CODEX SEMBLE RTK -->

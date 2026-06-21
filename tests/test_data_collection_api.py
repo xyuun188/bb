@@ -328,6 +328,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
+
     async def fake_shadow(_limit: int) -> list[dict[str, Any]]:
         return [
             {
@@ -472,6 +473,43 @@ async def test_data_collection_status_keeps_config_when_governance_fails(
     assert "configured" in body["config"]["api_channels"]["cryptopanic"]
     assert body["training"]["governance"]["status"] == "error"
     assert "governance exploded" in body["training"]["governance"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_keeps_config_when_governance_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", True)
+    monkeypatch.setattr(settings, "external_event_scraper_interval_seconds", 600)
+    monkeypatch.setattr(data_collection_module, "STATUS_SECTION_TIMEOUT_SECONDS", 0.01)
+
+    async def slow_governance() -> dict[str, Any]:
+        await asyncio.sleep(1)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "_training_governance_snapshot",
+        slow_governance,
+    )
+
+    try:
+        app = create_app()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get("/api/data-collection/status")
+    finally:
+        await close_db()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["config"]["external_event_scraper_enabled"] is True
+    assert body["config"]["external_event_scraper_interval_seconds"] == 600
+    assert body["training"]["governance"]["status"] == "error"
+    assert body["training"]["governance"]["section"] == "training_governance"
 
 
 async def _async_value(value: Any) -> Any:

@@ -532,15 +532,26 @@ def test_dashboard_market_uses_open_position_snapshot_contract() -> None:
 
 def test_opening_funnel_request_failure_uses_unavailable_fallback() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
-    fetch_block = script[script.index("async function fetchOpeningFunnel"):script.index("function renderOpeningFunnelUnavailable")]
+    fetch_block = script[
+        script.index("async function fetchOpeningFunnel") : script.index(
+            "function renderOpeningFunnelUnavailable"
+        )
+    ]
 
     assert "try {" in fetch_block
-    assert "renderOpeningFunnelUnavailable({ detail: err?.message || '开仓漏斗接口请求失败' })" in fetch_block
+    assert (
+        "renderOpeningFunnelUnavailable({ detail: err?.message || '开仓漏斗接口请求失败' })"
+        in fetch_block
+    )
 
 
 def test_local_ml_dashboard_request_failure_degrades_per_endpoint() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
-    fetch_block = script[script.index("async function fetchMLSignalDashboard"):script.index("function renderMLSignalDashboard")]
+    fetch_block = script[
+        script.index("async function fetchMLSignalDashboard") : script.index(
+            "function renderMLSignalDashboard"
+        )
+    ]
 
     assert "fetchJSON('/api/ml-signal/status').catch(err => ({" in fetch_block
     assert "status: 'request_error'" in fetch_block
@@ -549,9 +560,27 @@ def test_local_ml_dashboard_request_failure_degrades_per_endpoint() -> None:
     assert "本地量化工具状态接口请求失败" in fetch_block
 
 
+def test_local_ml_loss_filter_uses_backend_model_contract() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    status_block = script[
+        script.index("function localModelStatus") : script.index("function mlSampleCounts")
+    ]
+
+    assert "loss_filter: 'profit_prediction'" in status_block
+    assert (
+        "loss_filter: ['loss_filter', 'loss_model', 'loss_probability', 'risk_filter']"
+        in status_block
+    )
+    assert "localModelStatus(local, 'loss_filter')" in script
+
+
 def test_data_collection_request_failure_still_renders_error_fallback() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
-    fetch_block = script[script.index("async function fetchDataCollectionStatus"):script.index("function collectionStatusTone")]
+    fetch_block = script[
+        script.index("async function fetchDataCollectionStatus") : script.index(
+            "function collectionStatusTone"
+        )
+    ]
 
     assert "try {" in fetch_block
     assert "数据采集状态接口请求失败" in fetch_block

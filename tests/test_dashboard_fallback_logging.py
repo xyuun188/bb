@@ -290,6 +290,7 @@ async def test_dashboard_okx_balance_snapshot_fallback_logs(
 ) -> None:
     monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
     monkeypatch.setattr(dashboard, "OKXExecutor", SuccessfulStandaloneBalanceExecutor)
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
@@ -318,11 +319,18 @@ async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
 ) -> None:
     monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
     monkeypatch.setattr(dashboard, "OKXExecutor", FailingStandaloneBalanceExecutor)
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
-    assert result is None
+    assert result == {
+        "error": "standalone balance unavailable",
+        "balance_error": "standalone balance unavailable",
+        "balance_source": "OKX paper account",
+        "source": "isolated_executor",
+        "error_cached": True,
+    }
     assert dashboard_fallback_events == [
         {
             "event": "dashboard summary okx balance fallback",
@@ -336,4 +344,32 @@ async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
             "mode": "paper",
             "source": "isolated_executor",
         },
+    ]
+
+
+async def test_dashboard_okx_balance_failure_cache_prevents_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    dashboard_fallback_events: list[dict[str, Any]],
+) -> None:
+    class CountingFailingStandaloneBalanceExecutor(FailingStandaloneBalanceExecutor):
+        created = 0
+
+        def __init__(self, mode: str) -> None:
+            type(self).created += 1
+            super().__init__(mode)
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+    monkeypatch.setattr(dashboard, "OKXExecutor", CountingFailingStandaloneBalanceExecutor)
+
+    first = await dashboard._get_dashboard_okx_account_snapshot("paper")
+    second = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert first == second
+    assert first["error_cached"] is True
+    assert CountingFailingStandaloneBalanceExecutor.created == 1
+    assert [event["source"] for event in dashboard_fallback_events] == [
+        "trading_service_executor",
+        "isolated_executor",
     ]

@@ -27,6 +27,8 @@ from data_feed.news_fetcher import RSS_FEEDS
 from db.session import get_session_ctx
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
+from models.learning import ShadowBacktest, TradeReflection
+from models.trade import Position
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
@@ -39,6 +41,8 @@ router = APIRouter()
 logger = structlog.get_logger(__name__)
 
 TRAINING_SAMPLE_LIMIT = 240
+GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT = 500
+STATUS_SECTION_TIMEOUT_SECONDS = 6.0
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
@@ -91,6 +95,59 @@ def _visible_local_ai_training_status(
     if normalized == "unknown" and available:
         return "learning_only" if shadow_count or trade_count or text_count else "ready"
     return normalized
+
+
+def _governance_quality_report(
+    assessments: list[Any],
+    *,
+    total_trainable_count: int,
+    quarantined_count: int,
+    sample_limit: int,
+) -> dict[str, Any]:
+    """Build a bounded training-governance summary for status pages."""
+
+    sampled = len(assessments)
+    status_counts: Counter[str] = Counter(
+        str(getattr(item, "status", "unknown") or "unknown") for item in assessments
+    )
+    reason_counts: Counter[str] = Counter(
+        reason for item in assessments for reason in tuple(getattr(item, "reasons", ()) or ())
+    )
+    effective_weight = sum(float(getattr(item, "weight", 0.0) or 0.0) for item in assessments)
+    effective_ratio = effective_weight / sampled if sampled else 0.0
+    sampled_excluded_count = int(status_counts.get("excluded", 0))
+    downweighted_count = int(status_counts.get("downweighted", 0))
+    if quarantined_count:
+        status = "quarantined"
+    elif sampled_excluded_count:
+        status = "error"
+    elif downweighted_count:
+        status = "downweighted"
+    else:
+        status = "clean" if total_trainable_count else "empty"
+    return {
+        "status": status,
+        "summary": (
+            f"训练视图 {total_trainable_count} 条，抽样 {sampled} 条，"
+            f"有效权重 {effective_ratio * 100:.1f}%"
+        ),
+        "sampled_count": sampled,
+        "sample_limit": int(sample_limit),
+        "trainable_sample_count": int(total_trainable_count),
+        "included_sample_count": int(status_counts.get("included", 0)),
+        "downweighted_sample_count": downweighted_count,
+        "excluded_sample_count": sampled_excluded_count + int(quarantined_count),
+        "quarantined_sample_count": int(quarantined_count),
+        "effective_weight_ratio": round(effective_ratio, 4),
+        "top_reasons": [
+            {"reason": reason, "count": count} for reason, count in reason_counts.most_common(8)
+        ],
+        "raw_records_preserved": True,
+        "requires_artifact_refresh": bool(
+            quarantined_count or sampled_excluded_count or downweighted_count
+        ),
+        "refresh_targets": ["local_ml_signal", "local_ai_tools", "vector_memory_reindex"],
+    }
 
 
 class ExternalEventSourcePayload(BaseModel):
@@ -392,56 +449,63 @@ async def _local_ai_training_status() -> dict[str, Any]:
 
 async def _training_governance_snapshot() -> dict[str, Any]:
     try:
-        from scripts.train_local_ai_tools_models import (
-            _load_closed_position_samples,
-            _load_sequence_samples,
-            _load_shadow_samples,
-            _load_text_sentiment_samples,
-            _load_trade_reflection_samples,
-            _merge_trade_samples,
-        )
-        from services.ml_signal_service import (
-            TRAINING_SHADOW_SAMPLE_LIMIT,
-            build_training_frame,
-            load_shadow_training_rows,
-            shadow_training_quality_report,
-        )
-        from services.training_data_quality import annotate_training_payload
+        from services.shadow_training_quarantine import assess_shadow_row
 
-        shadow_samples = await _load_shadow_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
+        sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
+        async with get_session_ctx() as session:
+            completed_result = await session.execute(
+                select(func.count(ShadowBacktest.id)).where(
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                )
+            )
+            quarantined_result = await session.execute(
+                select(func.count(ShadowBacktest.id)).where(ShadowBacktest.status == "quarantined")
+            )
+            trade_reflection_result = await session.execute(select(func.count(TradeReflection.id)))
+            closed_position_result = await session.execute(
+                select(func.count(Position.id)).where(
+                    Position.is_open.is_(False),
+                    Position.closed_at.is_not(None),
+                )
+            )
+            sample_result = await session.execute(
+                select(ShadowBacktest)
+                .where(
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                )
+                .order_by(ShadowBacktest.id.desc())
+                .limit(sample_limit)
+            )
+            shadow_rows = list(sample_result.scalars().all())
+
+        completed_count = int(completed_result.scalar() or 0)
+        quarantined_count = int(quarantined_result.scalar() or 0)
+        trade_count = int(trade_reflection_result.scalar() or 0) + int(
+            closed_position_result.scalar() or 0
         )
-        trade_reflection_samples = await _load_trade_reflection_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
+        assessments = [assess_shadow_row(row) for row in shadow_rows]
+        shadow_report = _governance_quality_report(
+            assessments,
+            total_trainable_count=completed_count,
+            quarantined_count=quarantined_count,
+            sample_limit=sample_limit,
         )
-        closed_position_samples = await _load_closed_position_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-        )
-        sequence_samples = await _load_sequence_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
-        )
-        text_sentiment_samples = await _load_text_sentiment_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
-        )
-        payload = annotate_training_payload(
-            shadow_samples=shadow_samples,
-            trade_samples=_merge_trade_samples(trade_reflection_samples, closed_position_samples),
-            sequence_samples=sequence_samples,
-            text_sentiment_samples=text_sentiment_samples,
-        )
-        ml_rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
-        ml_quality = shadow_training_quality_report(ml_rows)
-        ml_frame = build_training_frame(ml_rows)
+        local_ai_report = dict(shadow_report)
+        local_ai_report["trade_sample_count"] = trade_count
         return {
             "status": "ok",
-            "local_ai_tools": payload["governance_report"],
-            "local_ai_quality_report": payload["quality_report"],
-            "local_ml_signal": ml_quality["governance_report"],
-            "local_ml_quality_report": ml_quality["quality_report"],
-            "local_ml_trainable_shadow_sample_count": int(len(ml_frame)),
+            "local_ai_tools": local_ai_report,
+            "local_ai_quality_report": shadow_report,
+            "local_ml_signal": shadow_report,
+            "local_ml_quality_report": shadow_report,
+            "local_ml_trainable_shadow_sample_count": completed_count,
             "training_quarantine": {
                 "status": "not_run",
-                "message": "状态读取接口只读；点击清洗刷新或等待自动训练时执行隔离。",
+                "message": "状态页只读取轻量治理快照；点击清洗刷新或等待自动训练时执行隔离与重训。",
             },
             "cleanup_effective": True,
             "artifact_refresh_targets": [
@@ -628,12 +692,17 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 
 @router.get("/data-collection/status")
 async def get_data_collection_status() -> dict[str, Any]:
-    source_stats_result, quality_result, local_ai_status_result, governance_result = await asyncio.gather(
-        _source_breakdown(),
-        _training_sample_quality(),
-        _local_ai_training_status(),
-        _training_governance_snapshot(),
-        return_exceptions=True,
+    source_stats_result, quality_result, local_ai_status_result, governance_result = (
+        await asyncio.gather(
+            _source_breakdown(),
+            _training_sample_quality(),
+            _local_ai_training_status(),
+            asyncio.wait_for(
+                _training_governance_snapshot(),
+                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+            ),
+            return_exceptions=True,
+        )
     )
     source_stats = _safe_status_section(
         source_stats_result,
