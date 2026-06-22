@@ -88,6 +88,22 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["entry_price_guard"]["fresh_latest_gap_floor_pct"] == 0.006
     assert snapshot["entry_account_guard"]["min_available_balance_usdt"] == 10.0
     assert snapshot["entry_account_guard"]["capacity_min_new_margin_divisor"] == 6.0
+    assert snapshot["entry_crowded_side_cap"]["hard_max_side_count"] == 14
+    assert snapshot["ensemble_entry_decision"]["normal_entry_score_threshold"] == 0.42
+    assert snapshot["ensemble_entry_decision"]["min_executable_entry_confidence"] == 0.58
+    assert snapshot["ensemble_entry_decision"]["market_direction_excluded_experts"] == (
+        "position_expert",
+        "risk_expert",
+    )
+    assert snapshot["ensemble_entry_decision"]["no_position_trend_expert_weight"] == 0.33
+    assert snapshot["ensemble_entry_decision"]["add_position_max_size"] == 0.06
+    assert snapshot["ensemble_entry_decision"]["winner_expand_score_threshold"] == 0.18
+    assert snapshot["ensemble_exit_decision"]["fast_profit_min_hold_minutes"] == 6.0
+    assert snapshot["ensemble_exit_decision"]["loss_compress_full_usdt"] == 8.0
+    assert snapshot["ensemble_exit_decision"]["profit_lock_fee_multiple"] == 4.0
+    assert snapshot["ensemble_exit_decision"]["loss_repair_reduce_support_count"] == 2
+    assert snapshot["ensemble_ml_probe"]["ml_profit_first_min_expected_return_pct"] == 0.12
+    assert snapshot["ensemble_ml_probe"]["quant_validation_min_local_expected_return_pct"] == 0.03
     assert snapshot["entry_stop_loss_budget"]["normal_budget_usdt"] == 16.0
     assert snapshot["exit_fast_risk"]["fast_risk_fresh_review_min_hold_minutes"] == 12.0
     assert snapshot["exit_cooldown"]["ordinary_seconds"] == 600.0
@@ -223,6 +239,17 @@ def test_entry_price_guard_uses_central_params() -> None:
     )
 
 
+def test_entry_crowded_side_cap_uses_central_params() -> None:
+    from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
+
+    params = DEFAULT_TRADING_PARAMS.entry_crowded_side_cap
+    policy = EntryCrowdedSideCapPolicy()
+
+    assert policy.params == params
+    assert policy.hard_max_side_count == params.hard_max_side_count
+    assert policy.strong_min_expected_net_pct == params.strong_min_expected_net_pct
+
+
 def test_strategy_learning_uses_central_params() -> None:
     from services import strategy_learning
 
@@ -243,7 +270,34 @@ def test_sizing_and_probe_modules_use_central_params() -> None:
     from services import market_decision_risk_assessment, memory_feedback
 
     risk_params = DEFAULT_TRADING_PARAMS.entry_risk_sizing
+    entry_params = DEFAULT_TRADING_PARAMS.ensemble_entry_decision
+    exit_params = DEFAULT_TRADING_PARAMS.ensemble_exit_decision
+    ml_probe_params = DEFAULT_TRADING_PARAMS.ensemble_ml_probe
 
+    assert (
+        ensemble_coordinator.NORMAL_ENTRY_SCORE_THRESHOLD
+        == entry_params.normal_entry_score_threshold
+    )
+    assert (
+        ensemble_coordinator.PROBE_ENTRY_SCORE_THRESHOLD == entry_params.probe_entry_score_threshold
+    )
+    assert ensemble_coordinator.MAX_ENTRY_DISAGREEMENT == entry_params.max_entry_disagreement
+    assert ensemble_coordinator.MARKET_DIRECTION_EXCLUDED_EXPERTS == set(
+        entry_params.market_direction_excluded_experts
+    )
+    assert (
+        ensemble_coordinator.NO_POSITION_ENTRY_BASE_WEIGHTS["trend_expert"]
+        == entry_params.no_position_trend_expert_weight
+    )
+    assert (
+        ensemble_coordinator.MIN_EXECUTABLE_ENTRY_CONFIDENCE
+        == entry_params.min_executable_entry_confidence
+    )
+    assert ensemble_coordinator.ADD_POSITION_MAX_SIZE == entry_params.add_position_max_size
+    assert (
+        ensemble_coordinator.WINNER_EXPAND_SCORE_THRESHOLD
+        == entry_params.winner_expand_score_threshold
+    )
     assert ensemble_coordinator.MAX_PROBE_ENTRY_SIZE == risk_params.ensemble_max_probe_entry_size
     assert (
         ensemble_coordinator.ML_SOFT_CAUTION_MAX_ENTRY_SIZE
@@ -258,6 +312,32 @@ def test_sizing_and_probe_modules_use_central_params() -> None:
         == risk_params.balanced_probe_max_position_size_pct
     )
     assert memory_feedback.ENTRY_RISK_SIZING_PARAMS == risk_params
+    assert (
+        ensemble_coordinator.PROFIT_PROTECT_REDUCE_PNL_RATIO
+        == exit_params.profit_protect_reduce_pnl_ratio
+    )
+    assert (
+        ensemble_coordinator.FAST_PROFIT_MIN_HOLD_MINUTES
+        == exit_params.fast_profit_min_hold_minutes
+    )
+    assert ensemble_coordinator.LOSS_COMPRESS_FULL_USDT == exit_params.loss_compress_full_usdt
+    assert ensemble_coordinator.PROFIT_LOCK_FEE_MULTIPLE == exit_params.profit_lock_fee_multiple
+    assert (
+        ensemble_coordinator.LOSS_REPAIR_REDUCE_SUPPORT_COUNT
+        == exit_params.loss_repair_reduce_support_count
+    )
+    assert (
+        ensemble_coordinator.PREDICTIVE_REVERSAL_EXIT_SCORE
+        == exit_params.predictive_reversal_exit_score
+    )
+    assert (
+        ensemble_coordinator.ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT
+        == ml_probe_params.ml_profit_first_min_expected_return_pct
+    )
+    assert (
+        ensemble_coordinator.QUANT_VALIDATION_MIN_LOCAL_EXPECTED_RETURN_PCT
+        == ml_probe_params.quant_validation_min_local_expected_return_pct
+    )
 
 
 def test_entry_opportunity_gate_uses_central_advisory_params() -> None:

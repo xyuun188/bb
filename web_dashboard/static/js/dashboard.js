@@ -2050,6 +2050,25 @@ function dynamicEvidenceBlock(score, decision = null) {
     const waitReasons = Array.isArray(evidence.advisory_wait_reasons)
         ? evidence.advisory_wait_reasons.filter(Boolean)
         : [];
+    const shortAdjustment = evidence.short_evidence_adjustment && typeof evidence.short_evidence_adjustment === 'object'
+        ? evidence.short_evidence_adjustment
+        : null;
+    const shortAdjustmentMode = String(shortAdjustment?.mode || '');
+    const shortAdjustmentOffset = Number(shortAdjustment?.score_offset);
+    const shortAdjustmentSize = Number(shortAdjustment?.size_multiplier);
+    const shortAdjustmentLabel = shortAdjustmentMode === 'strong_current_short_evidence'
+        ? '做空强证据放开'
+        : (shortAdjustmentMode === 'conservative_short_evidence' ? '做空保守修正' : '做空动态修正');
+    const shortAdjustmentReason = shortAdjustmentMode === 'strong_current_short_evidence'
+        ? '当前净收益、盈利质量、亏损概率、尾部风险和多源同向证据达标，取消默认做空扣分和缩仓。'
+        : '当前做空证据还没有达到强证据标准，系统保留做空方向的风险修正。';
+    const shortAdjustmentHtml = shortAdjustment?.applied ? `
+        <div class="decision-evidence-adjustment ${shortAdjustmentMode === 'strong_current_short_evidence' ? 'good' : 'warn'}">
+            <strong>${escHtml(shortAdjustmentLabel)}</strong>
+            <span>分数偏移 ${Number.isFinite(shortAdjustmentOffset) ? shortAdjustmentOffset.toFixed(1) : '-'} · 仓位系数 ${Number.isFinite(shortAdjustmentSize) ? shortAdjustmentSize.toFixed(2) : '-'}</span>
+            <em>${escHtml(shortAdjustmentReason)}</em>
+        </div>
+    ` : '';
     const tier = String(evidence.tier || '').toLowerCase();
     const explanation = tier === 'weak_conflict_probe'
         ? '弱证据不是单看分析信心；它表示有效证据分只够学习/观察，而且存在反向或同向来源不足。'
@@ -2066,6 +2085,7 @@ function dynamicEvidenceBlock(score, decision = null) {
                 <div><span>档位</span><strong>${escHtml(evidenceTierLabel(evidence.tier))}</strong><small>仓位系数 ${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '-'}</small></div>
             </div>
             <div class="decision-evidence-explain">${escHtml(explanation)}</div>
+            ${shortAdjustmentHtml}
             <div class="decision-evidence-lists">
                 <span>同向支持：${escHtml(evidenceListLabel(evidence.aligned_support_sources))}</span>
                 <span>明确反向：${escHtml(evidenceListLabel(evidence.major_opposites))}</span>
@@ -5264,13 +5284,35 @@ function systemAuditStrategyDetails(details) {
     const blockedReasons = (Array.isArray(details.top_blocked_reasons) ? details.top_blocked_reasons : [])
         .slice(0, 5)
         .map(item => `${item.count || 0} 次：${systemAuditShortText(item.reason || '-', 120)}`);
+    const shortConservativeRows = (Array.isArray(details.short_conservative_adjustment_samples) ? details.short_conservative_adjustment_samples : [])
+        .slice(0, 6)
+        .map(item => [
+            item.symbol || '-',
+            item.score_offset ?? '-',
+            item.size_multiplier ?? '-',
+            item.expected_net_return_pct ?? '-',
+            item.created_at ? toBeijingTime(item.created_at) : '-',
+        ]);
+    const shortReleasedRows = (Array.isArray(details.short_released_adjustment_samples) ? details.short_released_adjustment_samples : [])
+        .slice(0, 6)
+        .map(item => [
+            item.symbol || '-',
+            item.score_offset ?? '-',
+            item.size_multiplier ?? '-',
+            item.expected_net_return_pct ?? '-',
+            item.created_at ? toBeijingTime(item.created_at) : '-',
+        ]);
     return `
         <div class="system-audit-detail-grid">
             ${systemAuditMetric('24小时决策', details.decision_count, '最近样本窗口')}
             ${systemAuditMetric('开仓候选', details.entry_decision_count, 'long/short 候选数')}
             ${systemAuditMetric('负净收益候选', details.negative_expected_net_count, '过高需查成本/收益')}
             ${systemAuditMetric('零净收益候选', details.zero_expected_net_count, '过高需查模型返回')}
+            ${systemAuditMetric('做空保守修正', details.short_conservative_adjustment_count, '仍按风险折扣处理的空单候选')}
+            ${systemAuditMetric('做空强证据放开', details.short_released_adjustment_count, '取消默认做空扣分/缩仓的空单候选')}
         </div>
+        ${systemAuditSection('做空保守修正样本', systemAuditTable(['交易对', '扣分', '仓位系数', '预期净收益', '时间'], shortConservativeRows))}
+        ${systemAuditSection('做空强证据放开样本', systemAuditTable(['交易对', '扣分', '仓位系数', '预期净收益', '时间'], shortReleasedRows))}
         ${systemAuditSection('快亏平样本', systemAuditTable(['交易对', '方向', '持仓时长', '盈亏', '平仓时间'], fastLossRows))}
         ${systemAuditCompactList('主要拦截原因', blockedReasons)}`;
 }

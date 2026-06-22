@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import pytest
 
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api import system_audit
 
 AuditFactory = Callable[[], Awaitable[dict[str, Any]]]
@@ -325,6 +327,65 @@ async def test_model_training_optional_sources_are_observing_not_unresolved(
 
 
 @pytest.mark.asyncio
+async def test_strategy_quality_audit_reports_short_adjustment_samples(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from db.session import close_db, get_session_ctx, init_db
+    from models.decision import AIDecision
+
+    await close_db()
+    db_path = tmp_path / "audit.db"
+    now = datetime(2026, 6, 22, 3, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        system_audit.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{db_path.as_posix()}",
+    )
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
+
+    await init_db()
+    try:
+        raw = {
+            "opportunity_score": {
+                "expected_net_return_pct": 1.4,
+                "evidence_score": {
+                    "tier": "normal",
+                    "short_evidence_adjustment": {
+                        "mode": "strong_current_short_evidence",
+                        "score_offset": 0.0,
+                        "size_multiplier": 1.0,
+                    },
+                },
+            }
+        }
+        async with get_session_ctx() as session:
+            session.add(
+                AIDecision(
+                    model_name="test_model",
+                    symbol="BTC/USDT",
+                    action="short",
+                    reasoning="short evidence release",
+                    position_size_pct=0.04,
+                    confidence=0.9,
+                    raw_llm_response=raw,
+                    was_executed=False,
+                    created_at=now - timedelta(minutes=5),
+                )
+            )
+
+        card = await system_audit._strategy_quality_audit()
+
+        assert card["details"]["short_released_adjustment_count"] == 1
+        assert card["details"]["short_conservative_adjustment_count"] == 0
+        assert card["details"]["short_released_adjustment_samples"][0]["symbol"] == "BTC/USDT"
+        evidence = {item["label"]: item["value"] for item in card["evidence"]}
+        assert evidence["做空强证据放开"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_model_training_auth_failure_remains_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -623,6 +684,17 @@ async def test_strategy_closed_loop_audit_separates_active_runtime_window(
         assert "历史" in ledger["observing"][0]["state_label"]
     finally:
         await close_db()
+
+
+def test_strategy_gate_contract_audit_tracks_parameterized_strategy_constants() -> None:
+    card = system_audit._strategy_gate_contract_audit()
+
+    assert card["status"] == "ok"
+    assert card["details"]["trading_parameter_version"] == DEFAULT_TRADING_PARAMS.version
+    assert card["details"]["hidden_strategy_constant_count"] == 0
+    assert card["details"]["ensemble_top_level_constant_count"] > 0
+    assert "ACTION_SCORE" in card["details"]["allowed_top_level_constants"]
+    assert any(item["label"] == "策略参数版本" for item in card["evidence"])
 
 
 def test_issue_ledger_moves_strategy_quality_to_observing_when_closed_loop_is_legacy() -> None:

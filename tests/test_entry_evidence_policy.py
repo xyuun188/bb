@@ -514,6 +514,8 @@ def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
 
     assert evidence["hard_block"] is False
     assert evidence["positive_net_probe_relief"]["applied"] is True
+    assert evidence["positive_net_probe_relief"]["tradeable_probe"] is True
+    assert evidence["positive_net_probe_relief"]["shadow_only"] is False
     assert evidence["strong_positive_net_relief"]["applied"] is True
     assert evidence["strong_positive_net_relief"]["tier_floor"] == "small"
     assert evidence["tier"] == "small"
@@ -659,6 +661,57 @@ def test_short_probe_relief_stays_shadow_only_when_quant_and_direction_align():
     assert evidence["short_probe_relief"]["shadow_only"] is True
     assert evidence["tradeable_probe"] is False
     assert evidence["shadow_only"] is True
+
+
+def test_strong_aligned_short_signal_uses_dynamic_offset_and_full_size():
+    decision = _decision(
+        Action.SHORT,
+        {
+            "ml_signal": {
+                "predictions": [{"best_side": "short", "best_expected_return_pct": 1.20}]
+            },
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "short_expected_return_pct": 0.90,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "short",
+                    "expected_return_pct": 0.30,
+                },
+                "profit_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "adjusted_short_return_pct": 1.40,
+                    "short_loss_probability": 0.34,
+                },
+            },
+        },
+        confidence=0.90,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 3.80,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 1.45,
+            "profit_quality_ratio": 1.35,
+            "server_profit_loss_probability": 0.34,
+            "tail_risk_score": 0.40,
+            "confidence": 0.90,
+        },
+    )
+
+    adjustment = evidence["short_evidence_adjustment"]
+    assert evidence["side"] == "short"
+    assert evidence["tier"] == "normal"
+    assert adjustment["score_offset"] == 0.0
+    assert adjustment["size_multiplier"] == 1.0
+    assert evidence["effective_score"] == evidence["score"]
+    assert evidence["size_multiplier"] == 1.0
 
 
 def test_entry_evidence_maps_45_to_exploration_tier():

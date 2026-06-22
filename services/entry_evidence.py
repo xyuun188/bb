@@ -328,6 +328,98 @@ def _memory_component(raw: dict[str, Any], entry_side: str) -> tuple[float, dict
     }
 
 
+def _sync_shadow_relief_with_final_tier(
+    relief: dict[str, Any],
+    *,
+    final_shadow_only: bool,
+    final_tier: str,
+    final_effective_score: float,
+) -> dict[str, Any]:
+    """Keep nested relief metadata consistent with the final execution tier."""
+    if not relief.get("applied") or not relief.get("shadow_only") or final_shadow_only:
+        return relief
+    updated = dict(relief)
+    updated["tradeable_probe"] = True
+    updated["shadow_only"] = False
+    updated["final_tier"] = final_tier
+    updated["final_effective_score"] = round(final_effective_score, 6)
+    updated["state_override_reason"] = (
+        "Final evidence tier is tradeable; earlier shadow-only relief no longer blocks execution."
+    )
+    return updated
+
+
+def _short_evidence_adjustment(
+    *,
+    decision: DecisionOutput,
+    entry_side: str,
+    opportunity: dict[str, Any],
+    aligned_support_sources: list[str],
+    major_opposites: list[str],
+    strong_opposites: list[str],
+) -> dict[str, Any]:
+    if entry_side != "short":
+        return {
+            "applied": False,
+            "score_offset": 0.0,
+            "size_multiplier": 1.0,
+            "reason": "long_or_non_entry_side",
+        }
+
+    expected_net_return = safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+    profit_quality_ratio = safe_float(opportunity.get("profit_quality_ratio"), 0.0)
+    loss_probability = safe_float(opportunity.get("server_profit_loss_probability"), 1.0)
+    tail_risk_score = safe_float(opportunity.get("tail_risk_score"), 1.0)
+    confidence = max(
+        safe_float(decision.confidence, 0.0),
+        safe_float(opportunity.get("confidence"), 0.0),
+    )
+    aligned_support_count = len(set(aligned_support_sources))
+    strong_current_short_evidence = bool(
+        expected_net_return >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_expected_pct
+        and confidence >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_confidence
+        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_profit_quality
+        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_loss_probability
+        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_tail_risk
+        and aligned_support_count
+        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_aligned_sources
+        and not strong_opposites
+        and not major_opposites
+    )
+    if strong_current_short_evidence:
+        return {
+            "applied": True,
+            "mode": "strong_current_short_evidence",
+            "score_offset": 0.0,
+            "base_score_offset": round(ENTRY_EVIDENCE_SHORT_SCORE_OFFSET, 6),
+            "size_multiplier": 1.0,
+            "base_size_multiplier": round(ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER, 6),
+            "expected_net_return_pct": round(expected_net_return, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+            "confidence": round(confidence, 6),
+            "aligned_support_sources": list(aligned_support_sources),
+            "reason": "strong current short evidence cancels conservative short caps",
+        }
+
+    return {
+        "applied": True,
+        "mode": "conservative_short_evidence",
+        "score_offset": round(ENTRY_EVIDENCE_SHORT_SCORE_OFFSET, 6),
+        "base_score_offset": round(ENTRY_EVIDENCE_SHORT_SCORE_OFFSET, 6),
+        "size_multiplier": round(ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER, 6),
+        "base_size_multiplier": round(ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER, 6),
+        "expected_net_return_pct": round(expected_net_return, 6),
+        "profit_quality_ratio": round(profit_quality_ratio, 6),
+        "loss_probability": round(loss_probability, 6),
+        "tail_risk_score": round(tail_risk_score, 6),
+        "confidence": round(confidence, 6),
+        "aligned_support_sources": list(aligned_support_sources),
+        "reason": "short evidence remains conservative until profit-risk quality is strong",
+    }
+
+
 def build_entry_evidence_score(
     decision: DecisionOutput,
     opportunity: dict[str, Any],
@@ -468,7 +560,7 @@ def build_entry_evidence_score(
     )
 
     score = min(max(total, 0.0), 100.0)
-    effective_score = score - (ENTRY_EVIDENCE_SHORT_SCORE_OFFSET if entry_side == "short" else 0.0)
+    effective_score = score
     major_opposites = [
         item["source"]
         for item in components
@@ -509,6 +601,15 @@ def build_entry_evidence_score(
         and item.get("status") == "aligned"
         and safe_float(item.get("points"), 0.0) > 0
     ]
+    short_adjustment = _short_evidence_adjustment(
+        decision=decision,
+        entry_side=entry_side,
+        opportunity=opportunity,
+        aligned_support_sources=aligned_support_sources,
+        major_opposites=major_opposites,
+        strong_opposites=strong_opposites,
+    )
+    effective_score = max(score - safe_float(short_adjustment.get("score_offset"), 0.0), 0.0)
     short_probe_relief: dict[str, Any] = {"applied": False}
     positive_net_probe_relief: dict[str, Any] = {"applied": False}
     strong_positive_net_relief: dict[str, Any] = {"applied": False}
@@ -796,7 +897,7 @@ def build_entry_evidence_score(
         tier = "blocked"
         size_multiplier = 0.0
     if entry_side == "short" and size_multiplier > 0:
-        size_multiplier *= ENTRY_EVIDENCE_SHORT_SIZE_MULTIPLIER
+        size_multiplier *= safe_float(short_adjustment.get("size_multiplier"), 1.0)
 
     max_size_pct = None
     if tier == "exploration":
@@ -816,6 +917,28 @@ def build_entry_evidence_score(
             ENTRY_EVIDENCE_MAJOR_CONFLICT_SIZE_CAP,
         )
 
+    final_shadow_only = bool(
+        tier in {"weak_conflict_probe", "degraded_missing_probe"} and not tradeable_probe
+    )
+    positive_net_probe_relief = _sync_shadow_relief_with_final_tier(
+        positive_net_probe_relief,
+        final_shadow_only=final_shadow_only,
+        final_tier=tier,
+        final_effective_score=effective_score,
+    )
+    missing_key_degraded_relief = _sync_shadow_relief_with_final_tier(
+        missing_key_degraded_relief,
+        final_shadow_only=final_shadow_only,
+        final_tier=tier,
+        final_effective_score=effective_score,
+    )
+    short_probe_relief = _sync_shadow_relief_with_final_tier(
+        short_probe_relief,
+        final_shadow_only=final_shadow_only,
+        final_tier=tier,
+        final_effective_score=effective_score,
+    )
+
     return {
         "score": round(score, 6),
         "effective_score": round(effective_score, 6),
@@ -832,15 +955,14 @@ def build_entry_evidence_score(
         "strong_opposites": strong_opposites,
         "missing_key_sources": missing_key_sources,
         "aligned_support_sources": aligned_support_sources,
+        "short_evidence_adjustment": short_adjustment,
         "missing_key_degraded_relief": missing_key_degraded_relief,
         "positive_net_probe_relief": positive_net_probe_relief,
         "memory_missed_opportunity_relief": memory_missed_opportunity_relief,
         "strong_positive_net_relief": strong_positive_net_relief,
         "short_probe_relief": short_probe_relief,
         "tradeable_probe": bool(tradeable_probe),
-        "shadow_only": bool(
-            tier in {"weak_conflict_probe", "degraded_missing_probe"} and not tradeable_probe
-        ),
+        "shadow_only": final_shadow_only,
         "components": components,
         "policy": (
             "硬风控只拦严重方向冲突和交易安全风险；"

@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+# ruff: noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -108,6 +110,19 @@ def profit_quality(decision):
     return safe_float(opp.get("profit_quality_ratio"))
 
 
+def normalize_relief_for_final_contract(relief, final_shadow_only, final_tier, final_score):
+    relief = safe_dict(relief)
+    if not relief.get("applied") or not relief.get("shadow_only") or final_shadow_only:
+        return relief
+    normalized = dict(relief)
+    normalized["tradeable_probe"] = True
+    normalized["shadow_only"] = False
+    normalized["final_tier"] = final_tier
+    normalized["final_effective_score"] = roundv(final_score)
+    normalized["state_override_reason"] = "Final evidence tier is tradeable; earlier shadow-only relief no longer blocks execution."
+    return normalized
+
+
 def evidence(decision):
     opp = opportunity(decision)
     ev = safe_dict(opp.get("evidence_score"))
@@ -118,9 +133,12 @@ def evidence(decision):
         if isinstance(item, dict)
     }
     shadow_memory = safe_dict(components.get("shadow_memory"))
+    final_tier = ev.get("tier") or opp.get("evidence_tier") or ""
+    final_score = safe_float(ev.get("effective_score", opp.get("score")))
+    final_shadow_only = bool(ev.get("shadow_only"))
     return {
-        "tier": ev.get("tier") or opp.get("evidence_tier") or "",
-        "effective_score": roundv(ev.get("effective_score", opp.get("score"))),
+        "tier": final_tier,
+        "effective_score": roundv(final_score),
         "score": roundv(opp.get("score")),
         "min_score_required": roundv(opp.get("min_score_required")),
         "expected_net_return_pct": roundv(expected_net(decision)),
@@ -129,14 +147,25 @@ def evidence(decision):
         "loss_probability": roundv(opp.get("server_profit_loss_probability", opp.get("loss_probability"))),
         "tail_risk_score": roundv(opp.get("tail_risk_score")),
         "strong_positive_net_relief": safe_dict(safe_dict(opp.get("evidence_score")).get("strong_positive_net_relief")),
-        "positive_net_probe_relief": safe_dict(safe_dict(opp.get("evidence_score")).get("positive_net_probe_relief")),
+        "positive_net_probe_relief": normalize_relief_for_final_contract(
+            safe_dict(safe_dict(opp.get("evidence_score")).get("positive_net_probe_relief")),
+            final_shadow_only,
+            final_tier,
+            final_score,
+        ),
         "memory_missed_opportunity_relief": safe_dict(safe_dict(opp.get("evidence_score")).get("memory_missed_opportunity_relief")),
         "memory_habit_adjustment": safe_dict(opp.get("memory_habit_adjustment")),
+        "tradeable_probe": bool(ev.get("tradeable_probe")),
+        "shadow_only": final_shadow_only,
         "vector_memory_adjustment": safe_dict(opp.get("vector_memory_adjustment")),
         "side_quality_adjustment": safe_dict(opp.get("side_quality_adjustment")),
         "expected_net_formula": breakdown.get("formula") or "",
         "shadow_memory_component": shadow_memory,
     }
+
+
+def is_shadow_only_entry_decision(decision):
+    return bool(evidence(decision).get("shadow_only"))
 
 
 def sizing(decision):
@@ -306,7 +335,7 @@ async def main():
             contribution = safe_float(shadow_component.get("contribution_pct"), 0.0)
             if contribution > 0:
                 shadow_memory_contributions.append(contribution)
-        if ev["positive_net_probe_relief"].get("shadow_only") or safe_dict(safe_dict(opportunity(d).get("evidence_score")).get("positive_net_probe_relief")).get("shadow_only"):
+        if is_shadow_only_entry_decision(d):
             shadow_only_examples.append(d)
         raw = safe_dict(d.raw_llm_response)
         cooldown = safe_dict(raw.get("loss_cooldown_override")) or safe_dict(safe_dict(raw.get("opportunity_score")).get("loss_cooldown_override"))

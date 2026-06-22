@@ -21,6 +21,7 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
+from services.trading_params import DEFAULT_TRADING_PARAMS, EntryCrowdedSideCapParams
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -49,22 +50,14 @@ def _safe_int(value: Any, default: int = 0) -> int:
 class EntryCrowdedSideCapPolicy:
     """Hard-block ordinary same-side entries once one direction is over-concentrated."""
 
-    min_dominant_count: int = 8
-    dominant_count_share: float = 0.72
-    dominant_net_ratio: float = 0.55
-    hard_max_side_count: int = 14
-    strong_min_score_multiple: float = 1.6
-    strong_min_score_floor: float = 2.6
-    strong_min_expected_net_pct: float = 0.55
-    strong_min_profit_quality_ratio: float = 1.4
-    strong_max_loss_probability: float = 0.42
-    hard_override_score_multiple: float = 2.4
-    hard_override_score_floor: float = 4.2
-    hard_override_min_expected_net_pct: float = 0.90
-    hard_override_min_profit_quality_ratio: float = 1.8
-    hard_override_max_loss_probability: float = 0.28
-    hard_override_max_probe_fraction: float = 0.05
-    hard_override_max_size_pct: float = 0.018
+    params: EntryCrowdedSideCapParams = DEFAULT_TRADING_PARAMS.entry_crowded_side_cap
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose old field names as read-only aliases for policy users."""
+
+        if hasattr(self.params, name):
+            return getattr(self.params, name)
+        raise AttributeError(name)
 
     def block_reason(self, decision: DecisionOutput) -> str | None:
         """Return a Chinese block reason when a crowded-side entry must be rejected."""

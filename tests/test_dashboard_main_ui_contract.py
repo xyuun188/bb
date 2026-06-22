@@ -225,7 +225,12 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     assert ".modal.modal-wide .decision-score-grid" in style
     assert ".decision-score-formula-item:nth-child(4)" in style
     assert "decision-evidence-summary" in script
+    assert "short_evidence_adjustment" in script
+    assert "做空强证据放开" in script
+    assert "做空保守修正" in script
+    assert "decision-evidence-adjustment" in script
     assert ".decision-evidence-summary" in style
+    assert ".decision-evidence-adjustment" in style
     assert ".decision-evidence-components" in style
 
 
@@ -447,6 +452,9 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "renderSystemAuditNodes(data.nodes)" in script
     assert "system-audit-node-flow" in script
     assert "system-audit-node-checks" in script
+    assert "做空保守修正样本" in script
+    assert "short_conservative_adjustment_samples" in script
+    assert "short_released_adjustment_samples" in script
     assert "系统巡检接口请求失败" in script
     assert "补历史仓位、重启服务、批量训练等动作必须人工确认" in script
     assert ".system-audit-grid" in style

@@ -4246,6 +4246,34 @@ select.form-input { cursor: pointer; }
     font-size: 12px;
     line-height: 1.6;
 }
+.decision-evidence-adjustment {
+    display: grid;
+    gap: 5px;
+    margin-top: 9px;
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: 10px;
+    padding: 9px 10px;
+    background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+    min-width: 0;
+}
+.decision-evidence-adjustment.good {
+    border-color: color-mix(in srgb, var(--success) 44%, var(--border));
+}
+.decision-evidence-adjustment.warn {
+    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+}
+.decision-evidence-adjustment strong {
+    color: var(--text);
+    font-size: 12px;
+}
+.decision-evidence-adjustment span,
+.decision-evidence-adjustment em {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: normal;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
 .decision-evidence-lists, .decision-evidence-wait {
     display: flex;
     flex-wrap: wrap;

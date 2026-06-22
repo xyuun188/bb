@@ -620,6 +620,176 @@ class EntryAccountGuardParams:
 
 
 @dataclass(frozen=True, slots=True)
+class EntryCrowdedSideCapParams:
+    """Crowded-side exposure policy parameters.
+
+    These values are hard-risk guards for one-sided portfolio concentration.
+    They must stay in the auditable strategy snapshot so same-side entry
+    blocks cannot silently drift into hidden fixed thresholds.
+    """
+
+    min_dominant_count: int = 8
+    dominant_count_share: float = 0.72
+    dominant_net_ratio: float = 0.55
+    hard_max_side_count: int = 14
+    strong_min_score_multiple: float = 1.6
+    strong_min_score_floor: float = 2.6
+    strong_min_expected_net_pct: float = 0.55
+    strong_min_profit_quality_ratio: float = 1.4
+    strong_max_loss_probability: float = 0.42
+    hard_override_score_multiple: float = 2.4
+    hard_override_score_floor: float = 4.2
+    hard_override_min_expected_net_pct: float = 0.90
+    hard_override_min_profit_quality_ratio: float = 1.8
+    hard_override_max_loss_probability: float = 0.28
+    hard_override_max_probe_fraction: float = 0.05
+    hard_override_max_size_pct: float = 0.018
+
+
+@dataclass(frozen=True, slots=True)
+class EnsembleEntryDecisionParams:
+    """Ensemble entry voting thresholds.
+
+    These values translate expert/model votes into executable entry intent.
+    Keeping them in the snapshot makes no-entry and tiny-probe decisions
+    auditable instead of being hidden inside the coordinator.
+    """
+
+    normal_entry_score_threshold: float = 0.42
+    probe_entry_score_threshold: float = 0.26
+    probe_entry_enabled: bool = True
+    max_entry_disagreement: float = 0.50
+    min_executable_entry_confidence: float = 0.58
+    daily_recovery_entry_score_bonus: float = 0.10
+    daily_recovery_min_entry_confidence: float = 0.74
+    daily_recovery_max_entry_size: float = 0.04
+    daily_recovery_max_leverage: float = 5.0
+    market_direction_excluded_experts: tuple[str, ...] = (
+        "position_expert",
+        "risk_expert",
+    )
+    entry_direction_support_experts: tuple[str, ...] = (
+        "trend_expert",
+        "sentiment_expert",
+    )
+    entry_profit_quality_experts: tuple[str, ...] = ("momentum_expert",)
+    no_position_trend_expert_weight: float = 0.33
+    no_position_momentum_expert_weight: float = 0.33
+    no_position_sentiment_expert_weight: float = 0.14
+    no_position_position_expert_weight: float = 0.05
+    no_position_position_expert_weight_cap: float = 0.05
+    risk_entry_score_discount_max: float = 0.30
+    risk_entry_size_multiplier_floor: float = 0.45
+    min_review_close_support: int = 2
+    full_close_support: int = 3
+    review_close_min_confidence: float = 0.55
+    review_close_strong_confidence: float = 0.65
+    review_strong_opposite_score: float = 0.45
+    add_position_min_support: int = 2
+    add_position_min_confidence: float = 0.60
+    add_position_strong_confidence: float = 0.68
+    add_position_score_threshold: float = 0.32
+    add_position_min_profit_ratio: float = 0.002
+    add_position_max_risk_usage: float = 0.20
+    add_position_min_size: float = 0.02
+    add_position_max_size: float = 0.06
+    winner_expand_min_unrealized_usdt: float = 1.2
+    winner_expand_min_profit_ratio: float = 0.0012
+    winner_expand_score_threshold: float = 0.18
+    winner_expand_max_risk_usage: float = 0.25
+    winner_run_min_profit_ratio: float = 0.001
+
+
+@dataclass(frozen=True, slots=True)
+class EnsembleExitDecisionParams:
+    """Ensemble position-review exit thresholds.
+
+    These thresholds decide profit protection, loss compression, and
+    predictive reversal exits, so they must be visible in strategy audits.
+    """
+
+    profit_protect_reduce_pnl_ratio: float = 0.004
+    profit_protect_strong_pnl_ratio: float = 0.010
+    profit_protect_full_pnl_ratio: float = 0.018
+    profit_protect_min_lock_usdt: float = 1.50
+    profit_protect_strong_min_lock_usdt: float = 2.50
+    profit_protect_full_min_lock_usdt: float = 4.00
+    profit_protect_moderate_opposite_score: float = 0.10
+    profit_protect_reduce_size: float = 0.45
+    fast_profit_min_hold_minutes: float = 6.0
+    profit_exit_analysis_min_floor_usdt: float = 0.75
+    min_discretionary_close_hold_minutes: float = 4.0
+    early_close_min_risk_usage: float = 0.70
+    loss_reduce_min_risk_usage: float = 0.55
+    loss_full_min_risk_usage: float = 0.82
+    quick_profit_reduce_pnl_ratio: float = 0.008
+    capital_rotation_profit_pnl_ratio: float = 0.012
+    quick_profit_full_pnl_ratio: float = 0.020
+    profit_lock_fee_multiple: float = 4.0
+    profit_lock_notional_ratio: float = 0.0025
+    profit_lock_risk_ratio: float = 0.18
+    profit_lock_min_floor_usdt: float = 0.25
+    profit_lock_max_floor_usdt: float = 8.0
+    profit_lock_meaningful_reduce_usdt: float = 3.0
+    profit_lock_reduce_fee_multiple: float = 10.0
+    profit_lock_reduce_notional_ratio: float = 0.008
+    profit_lock_reduce_risk_ratio: float = 0.16
+    portfolio_focus_lock_min_usdt: float = 3.0
+    portfolio_focus_lock_min_share: float = 0.20
+    portfolio_focus_lock_reduce_size: float = 0.35
+    profit_retrace_peak_line_multiple: float = 1.15
+    profit_retrace_current_line_multiple: float = 0.25
+    profit_retrace_base_reduce_ratio: float = 0.24
+    profit_retrace_base_full_ratio: float = 0.52
+    profit_retrace_min_reduce_ratio: float = 0.16
+    profit_retrace_max_reduce_ratio: float = 0.40
+    profit_retrace_min_full_ratio: float = 0.42
+    profit_retrace_max_full_ratio: float = 0.72
+    loss_compress_reduce_usdt: float = 3.0
+    loss_compress_full_usdt: float = 8.0
+    loss_compress_reduce_ratio: float = 0.006
+    loss_compress_full_ratio: float = 0.012
+    loss_compress_reduce_risk_ratio: float = 0.35
+    loss_compress_full_risk_ratio: float = 0.65
+    loss_repair_max_loss_probability: float = 0.54
+    loss_expand_min_loss_probability: float = 0.55
+    loss_expand_full_loss_probability: float = 0.61
+    loss_repair_reduce_support_count: int = 2
+    loss_repair_full_support_count: int = 3
+    predictive_reversal_review_score: float = 38.0
+    predictive_reversal_exit_score: float = 60.0
+    predictive_reversal_full_exit_score: float = 78.0
+    predictive_reversal_reduce_size: float = 0.60
+
+
+@dataclass(frozen=True, slots=True)
+class EnsembleMLProbeParams:
+    """ML and quant-validation probe thresholds used by the coordinator."""
+
+    ml_min_expected_return_pct: float = 0.05
+    ml_min_profit_edge_pct: float = 0.02
+    ml_min_support_win_rate: float = 0.0
+    ml_strong_support_win_rate: float = 0.0
+    ml_support_confidence_bonus: float = 0.02
+    ml_low_edge_confidence_bonus: float = 0.06
+    ml_low_win_confidence_bonus: float = 0.08
+    ml_profit_first_score_relief: float = 0.08
+    ml_profit_first_min_expected_return_pct: float = 0.12
+    ml_profit_first_min_edge_pct: float = 0.08
+    ml_quant_only_min_expected_return_pct: float = 0.10
+    ml_quant_only_min_edge_pct: float = 0.18
+    ml_quant_only_max_loss_probability: float = 0.60
+    ml_profit_first_low_win_rate_size_multiplier: float = 0.60
+    local_tools_max_loss_probability: float = 0.62
+    profit_first_probe_confidence: float = 0.72
+    quant_validation_probe_confidence: float = 0.70
+    quant_validation_max_loss_probability: float = 0.58
+    quant_validation_min_local_expected_return_pct: float = 0.03
+    quant_validation_min_profit_quality_score: float = 0.20
+    quant_only_short_direction_min_gap: float = 0.08
+
+
+@dataclass(frozen=True, slots=True)
 class EntryStopLossBudgetParams:
     normal_budget_usdt: float = 16.0
     drawdown_budget_usdt: float = 8.0
@@ -731,6 +901,16 @@ class TradingParameterSnapshot:
     entry_risk_sizing: EntryRiskSizingParams = field(default_factory=EntryRiskSizingParams)
     entry_price_guard: EntryPriceGuardParams = field(default_factory=EntryPriceGuardParams)
     entry_account_guard: EntryAccountGuardParams = field(default_factory=EntryAccountGuardParams)
+    entry_crowded_side_cap: EntryCrowdedSideCapParams = field(
+        default_factory=EntryCrowdedSideCapParams
+    )
+    ensemble_entry_decision: EnsembleEntryDecisionParams = field(
+        default_factory=EnsembleEntryDecisionParams
+    )
+    ensemble_exit_decision: EnsembleExitDecisionParams = field(
+        default_factory=EnsembleExitDecisionParams
+    )
+    ensemble_ml_probe: EnsembleMLProbeParams = field(default_factory=EnsembleMLProbeParams)
     entry_stop_loss_budget: EntryStopLossBudgetParams = field(
         default_factory=EntryStopLossBudgetParams
     )
@@ -740,7 +920,7 @@ class TradingParameterSnapshot:
     )
     exit_cooldown: ExitCooldownParams = field(default_factory=ExitCooldownParams)
     exit_arbitration: ExitArbitrationParams = field(default_factory=ExitArbitrationParams)
-    version: str = "2026-06-22.strategy-v5-runtime-filters"
+    version: str = "2026-06-22.strategy-v6-auditable-caps"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

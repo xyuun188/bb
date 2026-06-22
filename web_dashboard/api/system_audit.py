@@ -22,14 +22,15 @@ from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline, Ticker
 from models.trade import Order, Position
+from scripts.repair_missing_closed_positions_from_orders import (
+    collect_missing_closed_position_plans,
+)
 from services.exchange_position_state import (
     exchange_position_display_valuation,
     parse_exchange_position_snapshot,
 )
 from services.server_monitor_status import collect_platform_runtime_status
-from scripts.repair_missing_closed_positions_from_orders import (
-    collect_missing_closed_position_plans,
-)
+from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api import data_collection as data_collection_api
 from web_dashboard.api.text_sanitize import sanitize_payload
 
@@ -95,6 +96,15 @@ STRATEGY_GATE_FORBIDDEN_PATTERNS = (
     "if False and",
 )
 STRATEGY_GATE_ALLOWED_PATHS = {"services/runtime_entry_filters.py"}
+STRATEGY_ALLOWED_TOP_LEVEL_CONSTANTS = {"ACTION_SCORE"}
+STRATEGY_PARAMETERIZED_TOKENS = (
+    "DEFAULT_TRADING_PARAMS",
+    "_PARAMS",
+    "ENSEMBLE_ENTRY_DECISION_PARAMS",
+    "ENSEMBLE_EXIT_DECISION_PARAMS",
+    "ENSEMBLE_ML_PROBE_PARAMS",
+    "ENTRY_RISK_SIZING_PARAMS",
+)
 
 
 def _now() -> datetime:
@@ -841,6 +851,8 @@ async def _strategy_quality_audit() -> dict[str, Any]:
     negative_expected = 0
     weak_shadow_executed = []
     positive_weak_shadow_executed = []
+    short_conservative_adjustments = []
+    short_released_adjustments = []
     for row in entry_decisions:
         raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
         opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
@@ -857,6 +869,23 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             evidence_score = opportunity.get("evidence_score")
             if isinstance(evidence_score, dict):
                 evidence_tier = str(evidence_score.get("tier") or "")
+                short_adjustment = evidence_score.get("short_evidence_adjustment")
+                if isinstance(short_adjustment, dict) and str(row.action or "").lower() == "short":
+                    adjustment_sample = {
+                        "decision_id": row.id,
+                        "symbol": row.symbol,
+                        "mode": short_adjustment.get("mode"),
+                        "score_offset": round(_safe_float(short_adjustment.get("score_offset")), 6),
+                        "size_multiplier": round(
+                            _safe_float(short_adjustment.get("size_multiplier"), 1.0), 6
+                        ),
+                        "expected_net_return_pct": round(_safe_float(net), 6),
+                        "created_at": _iso(row.created_at),
+                    }
+                    if short_adjustment.get("mode") == "strong_current_short_evidence":
+                        short_released_adjustments.append(adjustment_sample)
+                    elif short_adjustment.get("mode") == "conservative_short_evidence":
+                        short_conservative_adjustments.append(adjustment_sample)
                 if evidence_tier in {"weak_conflict_probe", "degraded_missing_probe"} and bool(
                     getattr(row, "was_executed", False)
                 ):
@@ -933,6 +962,13 @@ async def _strategy_quality_audit() -> dict[str, Any]:
         or weak_shadow_executed
         or (entry_decisions and negative_expected >= len(entry_decisions) * 0.7)
     )
+    short_adjustment_evidence = [
+        {"label": "做空保守修正", "value": len(short_conservative_adjustments)},
+        {"label": "做空强证据放开", "value": len(short_released_adjustments)},
+    ]
+    short_adjustment_next_actions = [
+        "做空保守修正占比高时，先看净收益、盈利质量、亏损概率、尾部风险和反向证据，不再盲目放大空单。"
+    ]
     return _audit_card(
         "strategy_quality",
         "策略质量",
@@ -952,6 +988,10 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             "weak_shadow_executed_count": len(weak_shadow_executed),
             "positive_weak_shadow_executed_count": len(positive_weak_shadow_executed),
             "weak_shadow_executed_samples": weak_shadow_executed[:10],
+            "short_conservative_adjustment_count": len(short_conservative_adjustments),
+            "short_released_adjustment_count": len(short_released_adjustments),
+            "short_conservative_adjustment_samples": short_conservative_adjustments[:10],
+            "short_released_adjustment_samples": short_released_adjustments[:10],
             "position_notional_stats": notional_stats,
             "micro_position_count": micro_position_count,
             "fast_loss_positions": fast_loss_positions[:10],
@@ -961,14 +1001,16 @@ async def _strategy_quality_audit() -> dict[str, Any]:
                 for reason, count in blocked_reasons.most_common(8)
             ],
         },
-        evidence=[
+        evidence=short_adjustment_evidence
+        + [
             {"label": "开仓候选", "value": len(entry_decisions)},
             {"label": "负净收益", "value": negative_expected},
             {"label": "弱证据已执行", "value": len(weak_shadow_executed)},
             {"label": "微小仓观测", "value": micro_position_count},
             {"label": "快亏平", "value": len(fast_loss_positions)},
         ],
-        next_actions=[
+        next_actions=short_adjustment_next_actions
+        + [
             "负净收益占比高时先查成本/滑点/点差，不直接放宽开仓。",
             "弱证据已执行不应为正；若出现，先查 entry_evidence 与执行器契约。",
             "微小仓快亏平出现时先查仓位 sizing 与新仓释放保护，不继续扩大样本污染。",
@@ -1114,6 +1156,49 @@ def _source_scan_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _ensemble_top_level_parameter_audit(root: Path) -> dict[str, Any]:
+    path = root / "ai_brain/ensemble_coordinator.py"
+    hidden_constants: list[dict[str, Any]] = []
+    top_level_constant_count = 0
+    try:
+        source = path.read_text(encoding="utf-8")
+        module = ast.parse(source)
+    except Exception as exc:
+        return {
+            "top_level_constant_count": 0,
+            "hidden_constants": [
+                {
+                    "name": "ensemble_coordinator_parse_error",
+                    "line": 0,
+                    "reason": safe_error_text(exc, limit=120),
+                }
+            ],
+        }
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Name) or not target.id.isupper():
+                continue
+            top_level_constant_count += 1
+            if target.id in STRATEGY_ALLOWED_TOP_LEVEL_CONSTANTS:
+                continue
+            expression = ast.unparse(node.value)
+            if any(token in expression for token in STRATEGY_PARAMETERIZED_TOKENS):
+                continue
+            hidden_constants.append(
+                {
+                    "name": target.id,
+                    "line": node.lineno,
+                    "expression": expression[:180],
+                }
+            )
+    return {
+        "top_level_constant_count": top_level_constant_count,
+        "hidden_constants": hidden_constants,
+    }
+
+
 def _iter_source_scan_files() -> list[Path]:
     root = _source_scan_root()
     files: list[Path] = []
@@ -1176,6 +1261,7 @@ def _source_visible_text_audit() -> dict[str, Any]:
 
 
 def _strategy_gate_contract_audit() -> dict[str, Any]:
+    parameter_audit = _ensemble_top_level_parameter_audit(_source_scan_root())
     root = _source_scan_root()
     scan_paths = (
         root / "ai_brain",
@@ -1208,7 +1294,12 @@ def _strategy_gate_contract_audit() -> dict[str, Any]:
         )
     except Exception:
         runtime_contract_available = False
-    status = "critical" if offenders or not runtime_contract_available else "ok"
+    hidden_strategy_constants = parameter_audit["hidden_constants"]
+    status = (
+        "critical"
+        if offenders or hidden_strategy_constants or not runtime_contract_available
+        else "ok"
+    )
     return _audit_card(
         "strategy_gate_contract",
         "策略门槛契约",
@@ -1219,13 +1310,20 @@ def _strategy_gate_contract_audit() -> dict[str, Any]:
             else "发现固定门槛或死分支残留，可能重新把策略卡死。"
         ),
         details={
+            "trading_parameter_version": DEFAULT_TRADING_PARAMS.version,
             "runtime_contract_available": runtime_contract_available,
             "forbidden_patterns": list(STRATEGY_GATE_FORBIDDEN_PATTERNS),
             "offender_count": len(offenders),
             "offenders": offenders[:20],
+            "ensemble_top_level_constant_count": parameter_audit["top_level_constant_count"],
+            "hidden_strategy_constant_count": len(hidden_strategy_constants),
+            "hidden_strategy_constants": hidden_strategy_constants[:20],
+            "allowed_top_level_constants": sorted(STRATEGY_ALLOWED_TOP_LEVEL_CONSTANTS),
         },
         evidence=[
+            {"label": "策略参数版本", "value": DEFAULT_TRADING_PARAMS.version},
             {"label": "固定门槛残留", "value": len(offenders)},
+            {"label": "隐藏策略常量", "value": len(hidden_strategy_constants)},
             {"label": "运行时契约", "value": "存在" if runtime_contract_available else "缺失"},
         ],
         next_actions=[
