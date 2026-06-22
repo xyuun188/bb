@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -18,17 +19,18 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from db.session import get_session_ctx
 from models.decision import AIDecision
+from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline, Ticker
 from models.trade import Order, Position
 from services.exchange_position_state import (
     exchange_position_display_valuation,
     parse_exchange_position_snapshot,
 )
+from services.server_monitor_status import collect_platform_runtime_status
 from scripts.repair_missing_closed_positions_from_orders import (
     collect_missing_closed_position_plans,
 )
 from web_dashboard.api import data_collection as data_collection_api
-from web_dashboard.api.system_health import system_self_check
 from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
@@ -40,6 +42,10 @@ STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
+OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
+MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 4.0
+
+_okx_reconciliation_cache: tuple[datetime, dict[str, Any]] | None = None
 
 
 def _u(escaped: str) -> str:
@@ -102,6 +108,24 @@ def _iso(value: Any) -> str | None:
     return value.astimezone(UTC).isoformat()
 
 
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _age_seconds(value: Any) -> float | None:
     if not isinstance(value, datetime):
         return None
@@ -130,6 +154,55 @@ def _relative_gap(left: float, right: float) -> float:
     return abs(left - right) / denominator
 
 
+def _distribution(values: list[float]) -> dict[str, Any]:
+    clean = sorted(value for value in values if isinstance(value, int | float))
+    if not clean:
+        return {"count": 0}
+
+    def percentile(ratio: float) -> float:
+        index = min(max(int((len(clean) - 1) * ratio), 0), len(clean) - 1)
+        return round(float(clean[index]), 6)
+
+    return {
+        "count": len(clean),
+        "min": round(float(clean[0]), 6),
+        "p25": percentile(0.25),
+        "median": percentile(0.5),
+        "p75": percentile(0.75),
+        "max": round(float(clean[-1]), 6),
+        "avg": round(float(sum(clean) / len(clean)), 6),
+    }
+
+
+def _decision_raw(row: AIDecision) -> dict[str, Any]:
+    return row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
+
+
+def _decision_opportunity(row: AIDecision) -> dict[str, Any]:
+    raw = _decision_raw(row)
+    opportunity = raw.get("opportunity_score")
+    return opportunity if isinstance(opportunity, dict) else {}
+
+
+def _decision_evidence(row: AIDecision) -> dict[str, Any]:
+    evidence = _decision_opportunity(row).get("evidence_score")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _decision_evidence_tier(row: AIDecision) -> str:
+    return str(_decision_evidence(row).get("tier") or "")
+
+
+def _decision_expected_net(row: AIDecision) -> float | None:
+    opportunity = _decision_opportunity(row)
+    if "expected_net_return_pct" not in opportunity:
+        return None
+    try:
+        return float(opportunity.get("expected_net_return_pct"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _audit_card(
     key: str,
     title: str,
@@ -148,6 +221,181 @@ def _audit_card(
         "details": details or {},
         "evidence": evidence or [],
         "next_actions": next_actions or [],
+    }
+
+
+def _cached_okx_reconciliation_card() -> dict[str, Any] | None:
+    cached = _okx_reconciliation_cache
+    if cached is None:
+        return None
+    cached_at, payload = cached
+    age_seconds = max((_now() - cached_at).total_seconds(), 0.0)
+    if age_seconds > OKX_RECONCILIATION_CACHE_TTL_SECONDS:
+        return None
+    data = copy.deepcopy(payload)
+    details = data.setdefault("details", {})
+    details["cache"] = {
+        "hit": True,
+        "age_seconds": round(age_seconds, 3),
+        "ttl_seconds": OKX_RECONCILIATION_CACHE_TTL_SECONDS,
+    }
+    return data
+
+
+def _store_okx_reconciliation_card(payload: dict[str, Any]) -> dict[str, Any]:
+    global _okx_reconciliation_cache
+    data = copy.deepcopy(payload)
+    details = data.setdefault("details", {})
+    details["cache"] = {
+        "hit": False,
+        "age_seconds": 0.0,
+        "ttl_seconds": OKX_RECONCILIATION_CACHE_TTL_SECONDS,
+    }
+    _okx_reconciliation_cache = (_now(), copy.deepcopy(data))
+    return data
+
+
+def _load_trading_runtime_audit_window() -> dict[str, Any]:
+    path = settings.data_dir / "trading_runtime_status.json"
+    if not path.exists():
+        return {"available": False, "started_at": None, "heartbeat_at": None}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"available": False, "started_at": None, "heartbeat_at": None}
+    if not isinstance(payload, dict):
+        return {"available": False, "started_at": None, "heartbeat_at": None}
+    started_at = _parse_utc_datetime(payload.get("started_at"))
+    heartbeat_at = _parse_utc_datetime(
+        payload.get("heartbeat_at") or payload.get("last_heartbeat_at")
+    )
+    return {
+        "available": started_at is not None,
+        "started_at": started_at,
+        "started_at_iso": _iso(started_at),
+        "heartbeat_at": heartbeat_at,
+        "heartbeat_at_iso": _iso(heartbeat_at),
+        "running": bool(payload.get("running", False)),
+        "mode": payload.get("mode"),
+        "decision_interval": payload.get("decision_interval"),
+    }
+
+
+def _summarize_strategy_window(
+    *,
+    started_at: datetime | None,
+    decisions: list[Any],
+    positions: list[Any],
+    high_quality_tiers: set[str],
+    weak_tiers: set[str],
+) -> dict[str, Any]:
+    if started_at is None:
+        return {
+            "available": False,
+            "started_at": None,
+            "decision_count": 0,
+            "entry_decision_count": 0,
+            "executed_entry_count": 0,
+            "weak_executed_count": 0,
+            "fast_loss_under_15m_count": 0,
+            "high_quality_entry_count": 0,
+            "ml_usable_rate": 0.0,
+            "historical_legacy_issues": False,
+        }
+
+    scoped_decisions = [
+        row
+        for row in decisions
+        if (created_at := _parse_utc_datetime(getattr(row, "created_at", None))) is not None
+        and created_at >= started_at
+    ]
+    scoped_positions = [
+        row
+        for row in positions
+        if (created_at := _parse_utc_datetime(getattr(row, "created_at", None))) is not None
+        and created_at >= started_at
+    ]
+    entry_decisions = [
+        row for row in scoped_decisions if str(row.action or "").lower() in {"long", "short"}
+    ]
+    executed_entries = [row for row in entry_decisions if bool(row.was_executed)]
+    high_quality_entries = [
+        row for row in entry_decisions if _decision_evidence_tier(row) in high_quality_tiers
+    ]
+    weak_executed = [row for row in executed_entries if _decision_evidence_tier(row) in weak_tiers]
+    component_stats: dict[str, Counter[str]] = {}
+    for row in entry_decisions:
+        components = _decision_evidence(row).get("components")
+        if not isinstance(components, list):
+            continue
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            component_stats.setdefault(str(component.get("source") or "unknown"), Counter())[
+                str(component.get("status") or "unknown")
+            ] += 1
+    ml_stats = dict(component_stats.get("ml", Counter()))
+    ml_usable = sum(
+        count
+        for status, count in ml_stats.items()
+        if status not in {"ignored", "missing", "unknown"}
+    )
+    ml_total = sum(ml_stats.values())
+    fast_loss_count = 0
+    for position in scoped_positions:
+        if bool(position.is_open):
+            continue
+        opened = _parse_utc_datetime(getattr(position, "created_at", None))
+        closed = _parse_utc_datetime(getattr(position, "closed_at", None))
+        if opened is None or closed is None:
+            continue
+        hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
+        if hold_minutes <= 15 and _safe_float(position.realized_pnl) < 0:
+            fast_loss_count += 1
+    return {
+        "available": True,
+        "started_at": _iso(started_at),
+        "decision_count": len(scoped_decisions),
+        "entry_decision_count": len(entry_decisions),
+        "executed_entry_count": len(executed_entries),
+        "weak_executed_count": len(weak_executed),
+        "fast_loss_under_15m_count": fast_loss_count,
+        "high_quality_entry_count": len(high_quality_entries),
+        "ml_usable_rate": round(ml_usable / ml_total, 4) if ml_total else 0.0,
+        "model_component_status_counts": {
+            key: dict(value) for key, value in sorted(component_stats.items())
+        },
+        "historical_legacy_issues": False,
+    }
+
+
+def _ml_influence_reason_from_decisions(decisions: list[Any]) -> dict[str, Any]:
+    reasons: Counter[str] = Counter()
+    influence_flags: Counter[str] = Counter()
+    for row in decisions:
+        opportunity = _decision_opportunity(row)
+        if "ml_influence_enabled" in opportunity:
+            influence_flags[str(bool(opportunity.get("ml_influence_enabled"))).lower()] += 1
+        components = _decision_evidence(row).get("components")
+        if not isinstance(components, list):
+            continue
+        for component in components:
+            if not isinstance(component, dict) or component.get("source") != "ml":
+                continue
+            reason = str(component.get("reason") or component.get("status") or "unknown")
+            reasons[reason[:160]] += 1
+    if not reasons:
+        summary = "最近开仓候选没有返回 ML 证据组件。"
+    elif reasons.most_common(1)[0][0] == "ignored":
+        summary = "ML 组件被标记为 ignored，但未写入具体原因，需要检查证据构建上下文。"
+    else:
+        summary = reasons.most_common(1)[0][0]
+    return {
+        "summary": summary,
+        "top_reasons": [
+            {"reason": reason, "count": count} for reason, count in reasons.most_common(5)
+        ],
+        "ml_influence_enabled_flags": dict(influence_flags),
     }
 
 
@@ -222,48 +470,55 @@ async def _trade_loop_audit() -> dict[str, Any]:
 
 
 async def _okx_reconciliation_audit() -> dict[str, Any]:
+    cached = _cached_okx_reconciliation_card()
+    if cached is not None:
+        return cached
     try:
         plans = await asyncio.wait_for(collect_missing_closed_position_plans(days=14), timeout=8.0)
     except Exception as exc:
-        return _audit_card(
-            "okx_reconciliation",
-            "OKX 历史对账",
-            "warning",
-            "OKX 本地订单反推历史仓位 dry-run 执行失败。",
-            details={"error": safe_error_text(exc, limit=180)},
-            next_actions=["先修复 dry-run 失败原因，不能直接补历史仓位。"],
+        return _store_okx_reconciliation_card(
+            _audit_card(
+                "okx_reconciliation",
+                "OKX 历史对账",
+                "warning",
+                "OKX 本地订单反推历史仓位 dry-run 执行失败。",
+                details={"error": safe_error_text(exc, limit=180)},
+                next_actions=["先修复 dry-run 失败原因，不能直接补历史仓位。"],
+            )
         )
     missing = len(plans)
     status = "critical" if missing else "ok"
-    return _audit_card(
-        "okx_reconciliation",
-        "OKX 历史对账",
-        status,
-        (
-            "存在可由 OKX 成交订单反推的缺失历史仓位。"
-            if missing
-            else "14 天历史仓位 dry-run 无缺失。"
-        ),
-        details={
-            "window_days": 14,
-            "missing_closed_positions": missing,
-            "sample_plans": [
-                {
-                    "symbol": plan.symbol,
-                    "side": plan.side,
-                    "quantity": plan.quantity,
-                    "realized_pnl": round(float(plan.realized_pnl), 8),
-                    "close_order_id": plan.close_order_id,
-                    "closed_at": _iso(plan.closed_at),
-                }
-                for plan in plans[:5]
+    return _store_okx_reconciliation_card(
+        _audit_card(
+            "okx_reconciliation",
+            "OKX 历史对账",
+            status,
+            (
+                "存在可由 OKX 成交订单反推的缺失历史仓位。"
+                if missing
+                else "14 天历史仓位 dry-run 无缺失。"
+            ),
+            details={
+                "window_days": 14,
+                "missing_closed_positions": missing,
+                "sample_plans": [
+                    {
+                        "symbol": plan.symbol,
+                        "side": plan.side,
+                        "quantity": plan.quantity,
+                        "realized_pnl": round(float(plan.realized_pnl), 8),
+                        "close_order_id": plan.close_order_id,
+                        "closed_at": _iso(plan.closed_at),
+                    }
+                    for plan in plans[:5]
+                ],
+            },
+            evidence=[{"label": "缺失闭仓", "value": missing}],
+            next_actions=[
+                "只允许先 dry-run 人工核对，再按 symbol/order-id 精确 apply。",
+                "如果缺失不为 0，先不要做策略收益判断，避免训练和盈亏被脏账影响。",
             ],
-        },
-        evidence=[{"label": "缺失闭仓", "value": missing}],
-        next_actions=[
-            "只允许先 dry-run 人工核对，再按 symbol/order-id 精确 apply。",
-            "如果缺失不为 0，先不要做策略收益判断，避免训练和盈亏被脏账影响。",
-        ],
+        )
     )
 
 
@@ -652,9 +907,12 @@ async def _strategy_quality_audit() -> dict[str, Any]:
 
 
 async def _model_training_audit() -> dict[str, Any]:
-    data_status, self_check = await asyncio.gather(
+    data_status, runtime_status = await asyncio.gather(
         data_collection_api.get_data_collection_status(),
-        system_self_check(),
+        asyncio.wait_for(
+            collect_platform_runtime_status(),
+            timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        ),
         return_exceptions=True,
     )
     if isinstance(data_status, Exception):
@@ -670,17 +928,62 @@ async def _model_training_audit() -> dict[str, Any]:
     governance = training.get("governance") if isinstance(training, dict) else {}
     sources = data_status.get("sources") if isinstance(data_status, dict) else []
     source_warnings = [row for row in sources or [] if row.get("status") not in {"active", "ok"}]
-    self_items = []
-    if isinstance(self_check, dict):
-        self_items = self_check.get("items") if isinstance(self_check.get("items"), list) else []
-    model_critical = [
-        row
-        for row in self_items
-        if str(row.get("key", "")).startswith("runtime_") and row.get("status") == "critical"
-    ]
+    runtime_probe: dict[str, Any] = {"status": "unknown"}
+    model_critical: list[dict[str, Any]] = []
+    if isinstance(runtime_status, Exception):
+        runtime_probe = {
+            "status": "warning",
+            "error": safe_error_text(runtime_status, limit=180),
+        }
+    elif isinstance(runtime_status, dict):
+        runtime_models = (
+            runtime_status.get("ai_models")
+            if isinstance(runtime_status.get("ai_models"), list)
+            else []
+        )
+        runtime_local_tools = (
+            runtime_status.get("local_ai_tools")
+            if isinstance(runtime_status.get("local_ai_tools"), dict)
+            else {}
+        )
+        for row in runtime_models:
+            if not isinstance(row, dict) or bool(row.get("available")):
+                continue
+            model_critical.append(
+                {
+                    "model": row.get("model") or row.get("name"),
+                    "api_base": row.get("api_base"),
+                    "endpoint_ok": bool(row.get("endpoint_ok")),
+                    "model_available": bool(row.get("model_available")),
+                    "status_code": row.get("status_code"),
+                    "latency_ms": row.get("latency_ms"),
+                    "error": row.get("error"),
+                }
+            )
+        if runtime_local_tools and not bool(runtime_local_tools.get("available")):
+            model_critical.append(
+                {
+                    "model": "local_ai_tools",
+                    "api_base": runtime_local_tools.get("api_base"),
+                    "health": runtime_local_tools.get("health"),
+                    "status": runtime_local_tools.get("status"),
+                    "child_endpoints": runtime_local_tools.get("child_endpoints"),
+                }
+            )
+        runtime_probe = {
+            "status": "critical" if model_critical else "ok",
+            "ai_model_count": len(runtime_models),
+            "local_ai_tools_configured": (
+                bool(runtime_local_tools.get("configured")) if runtime_local_tools else False
+            ),
+        }
     status = _status_from_counts(
         critical=bool(model_critical),
-        warning=bool(source_warnings) or not bool(local_tools.get("available")),
+        warning=(
+            bool(source_warnings)
+            or not bool(local_tools.get("available"))
+            or runtime_probe.get("status") == "warning"
+        ),
     )
     return _audit_card(
         "model_training",
@@ -696,6 +999,7 @@ async def _model_training_audit() -> dict[str, Any]:
                 "text_sentiment_sample_count": local_tools.get("text_sentiment_sample_count"),
             },
             "governance_status": governance.get("status") if isinstance(governance, dict) else None,
+            "runtime_probe": runtime_probe,
             "source_warnings": source_warnings[:8],
             "model_critical_items": model_critical[:8],
         },
@@ -836,6 +1140,354 @@ def _strategy_gate_contract_audit() -> dict[str, Any]:
     )
 
 
+async def _strategy_closed_loop_audit() -> dict[str, Any]:
+    since = _now() - timedelta(hours=AUDIT_WINDOWS["strategy_hours"])
+    runtime_window = _load_trading_runtime_audit_window()
+    async with get_session_ctx() as session:
+        decisions = list(
+            (
+                await session.execute(
+                    select(
+                        AIDecision.id,
+                        AIDecision.symbol,
+                        AIDecision.action,
+                        AIDecision.position_size_pct,
+                        AIDecision.raw_llm_response,
+                        AIDecision.was_executed,
+                        AIDecision.outcome_pnl_pct,
+                        AIDecision.created_at,
+                    )
+                    .where(AIDecision.created_at >= since)
+                    .order_by(AIDecision.created_at.desc())
+                    .limit(500)
+                )
+            ).all()
+        )
+        orders = list(
+            (
+                await session.execute(
+                    select(Order.decision_id, Order.status)
+                    .where(Order.created_at >= since)
+                    .order_by(Order.created_at.desc())
+                    .limit(1000)
+                )
+            ).all()
+        )
+        positions = list(
+            (
+                await session.execute(
+                    select(
+                        Position.id,
+                        Position.symbol,
+                        Position.side,
+                        Position.quantity,
+                        Position.entry_price,
+                        Position.realized_pnl,
+                        Position.is_open,
+                        Position.created_at,
+                        Position.closed_at,
+                    )
+                    .where(Position.created_at >= since)
+                    .order_by(Position.created_at.desc())
+                    .limit(800)
+                )
+            ).all()
+        )
+        trade_outcome_rows = (
+            await session.execute(
+                select(TradeReflection.outcome, func.count())
+                .where(TradeReflection.created_at >= since)
+                .group_by(TradeReflection.outcome)
+            )
+        ).all()
+        shadow_action_rows = (
+            await session.execute(
+                select(ShadowBacktest.decision_action, func.count())
+                .where(
+                    ShadowBacktest.created_at >= since,
+                    ShadowBacktest.status == "completed",
+                )
+                .group_by(ShadowBacktest.decision_action)
+            )
+        ).all()
+
+    entry_decisions = [
+        row for row in decisions if str(row.action or "").lower() in {"long", "short"}
+    ]
+    hold_decisions = [row for row in decisions if str(row.action or "").lower() == "hold"]
+    executed_entries = [row for row in entry_decisions if bool(row.was_executed)]
+    filled_orders_by_decision: dict[int, list[Order]] = {}
+    for order in orders:
+        if str(order.status or "").lower() != "filled" or order.decision_id is None:
+            continue
+        filled_orders_by_decision.setdefault(int(order.decision_id), []).append(order)
+
+    tier_counts = Counter(_decision_evidence_tier(row) or "missing" for row in entry_decisions)
+    high_quality_tiers = {"exploration", "small", "medium", "normal"}
+    weak_tiers = {"weak_conflict_probe", "degraded_missing_probe"}
+    high_quality_entries = [
+        row for row in entry_decisions if _decision_evidence_tier(row) in high_quality_tiers
+    ]
+    weak_entries = [row for row in entry_decisions if _decision_evidence_tier(row) in weak_tiers]
+    weak_executed = [row for row in executed_entries if _decision_evidence_tier(row) in weak_tiers]
+    shadow_only_executed = [
+        row
+        for row in executed_entries
+        if bool(_decision_raw(row).get("entry_evidence_shadow_only"))
+    ]
+    executed_without_order = [
+        row for row in executed_entries if not filled_orders_by_decision.get(int(row.id))
+    ]
+
+    component_stats: dict[str, Counter[str]] = {}
+    for row in entry_decisions:
+        components = _decision_evidence(row).get("components")
+        if not isinstance(components, list):
+            continue
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            source = str(component.get("source") or "unknown")
+            status = str(component.get("status") or "unknown")
+            component_stats.setdefault(source, Counter())[status] += 1
+
+    expected_net_values = [
+        value for row in entry_decisions if (value := _decision_expected_net(row)) is not None
+    ]
+    positive_net_count = sum(1 for value in expected_net_values if value > 0)
+    negative_net_count = sum(1 for value in expected_net_values if value < 0)
+    closed_positions = [row for row in positions if not bool(row.is_open)]
+    realized_values = [_safe_float(row.realized_pnl) for row in closed_positions]
+    win_count = sum(1 for value in realized_values if value > 0)
+    loss_count = sum(1 for value in realized_values if value < 0)
+    fast_loss_samples: list[dict[str, Any]] = []
+    for position in closed_positions:
+        if not isinstance(position.created_at, datetime) or not isinstance(
+            position.closed_at, datetime
+        ):
+            continue
+        opened = (
+            position.created_at.replace(tzinfo=UTC)
+            if position.created_at.tzinfo is None
+            else position.created_at
+        )
+        closed = (
+            position.closed_at.replace(tzinfo=UTC)
+            if position.closed_at.tzinfo is None
+            else position.closed_at
+        )
+        hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
+        pnl = _safe_float(position.realized_pnl)
+        if hold_minutes <= 15 and pnl < 0:
+            fast_loss_samples.append(
+                {
+                    "id": position.id,
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "hold_minutes": round(hold_minutes, 3),
+                    "realized_pnl": round(pnl, 8),
+                    "notional_usdt": round(
+                        abs(_safe_float(position.quantity) * _safe_float(position.entry_price)),
+                        6,
+                    ),
+                    "closed_at": _iso(closed),
+                }
+            )
+
+    notional_values = [
+        abs(_safe_float(row.quantity) * _safe_float(row.entry_price))
+        for row in positions
+        if abs(_safe_float(row.quantity) * _safe_float(row.entry_price)) > 0
+    ]
+    shadow_action_counts = {
+        str(action or "unknown"): int(count or 0) for action, count in shadow_action_rows
+    }
+    trade_outcome_counts = {
+        str(outcome or "unknown"): int(count or 0) for outcome, count in trade_outcome_rows
+    }
+    ml_stats = dict(component_stats.get("ml", Counter()))
+    ml_influence_reason = _ml_influence_reason_from_decisions(entry_decisions)
+    ml_usable = sum(
+        count
+        for status, count in ml_stats.items()
+        if status not in {"ignored", "missing", "unknown"}
+    )
+    ml_total = sum(ml_stats.values())
+    ml_usable_rate = round(ml_usable / ml_total, 4) if ml_total else 0.0
+    executed_with_outcome = [row for row in executed_entries if row.outcome_pnl_pct is not None]
+    high_quality_outcomes = [
+        _safe_float(row.outcome_pnl_pct)
+        for row in executed_with_outcome
+        if _decision_evidence_tier(row) in high_quality_tiers
+    ]
+    weak_outcomes = [
+        _safe_float(row.outcome_pnl_pct)
+        for row in executed_with_outcome
+        if _decision_evidence_tier(row) in weak_tiers
+    ]
+    current_window = _summarize_strategy_window(
+        started_at=runtime_window.get("started_at"),
+        decisions=decisions,
+        positions=positions,
+        high_quality_tiers=high_quality_tiers,
+        weak_tiers=weak_tiers,
+    )
+    current_window["heartbeat_at"] = runtime_window.get("heartbeat_at_iso")
+    current_window["running"] = bool(runtime_window.get("running"))
+    current_window["mode"] = runtime_window.get("mode")
+    current_window["decision_interval"] = runtime_window.get("decision_interval")
+    current_window["historical_legacy_issues"] = bool(
+        weak_executed or fast_loss_samples
+    ) and not bool(
+        current_window.get("weak_executed_count") or current_window.get("fast_loss_under_15m_count")
+    )
+    effectiveness_verdict = "样本不足，不能证明 ML/策略有效"
+    if len(high_quality_outcomes) >= 5:
+        high_avg = sum(high_quality_outcomes) / len(high_quality_outcomes)
+        weak_avg = sum(weak_outcomes) / len(weak_outcomes) if weak_outcomes else 0.0
+        if high_avg > max(weak_avg, 0.0):
+            effectiveness_verdict = "高质量信号样本暂时优于弱证据样本"
+        else:
+            effectiveness_verdict = "高质量信号未表现出收益优势，需要降权复查"
+
+    diagnostics = {
+        "current_weak_executed": bool(current_window.get("weak_executed_count")),
+        "historical_weak_executed": bool(weak_executed),
+        "shadow_only_executed": bool(shadow_only_executed),
+        "executed_without_order": bool(executed_without_order),
+        "current_no_high_quality_entries": (
+            int(current_window.get("entry_decision_count") or 0) >= 20
+            and not int(current_window.get("high_quality_entry_count") or 0)
+        ),
+        "historical_no_high_quality_entries": (
+            len(entry_decisions) >= 20 and not high_quality_entries
+        ),
+        "current_fast_loss_cluster": int(current_window.get("fast_loss_under_15m_count") or 0) >= 3,
+        "historical_fast_loss_cluster": len(fast_loss_samples) >= 3,
+        "current_ml_not_effective": (
+            int(current_window.get("entry_decision_count") or 0) >= 10
+            and float(current_window.get("ml_usable_rate") or 0.0) < 0.25
+        ),
+        "historical_ml_not_effective": ml_total >= 10 and ml_usable_rate < 0.25,
+        "insufficient_effectiveness_samples": len(executed_with_outcome) < 10,
+        "historical_legacy_issues": bool(current_window.get("historical_legacy_issues")),
+    }
+    critical = diagnostics["shadow_only_executed"] or diagnostics["executed_without_order"]
+    current_warning = any(
+        diagnostics[key]
+        for key in (
+            "current_weak_executed",
+            "current_no_high_quality_entries",
+            "current_fast_loss_cluster",
+            "current_ml_not_effective",
+        )
+    )
+    historical_warning = any(
+        diagnostics[key]
+        for key in (
+            "historical_weak_executed",
+            "historical_no_high_quality_entries",
+            "historical_fast_loss_cluster",
+            "historical_ml_not_effective",
+            "insufficient_effectiveness_samples",
+        )
+    )
+    warning = current_warning or historical_warning
+    if critical:
+        status = "critical"
+        summary = "策略闭环存在执行状态硬错误，需要先修执行契约。"
+    elif current_warning:
+        status = "warning"
+        summary = "当前运行窗口仍存在弱证据执行、高质量候选不足、ML弱参与或快亏平风险。"
+    elif warning:
+        status = "warning"
+        summary = "24小时历史窗口仍有遗留问题；当前运行窗口暂未复现硬执行错误，需继续观察新样本。"
+    else:
+        status = "ok"
+        summary = "策略闭环关键节点暂未发现硬异常。"
+
+    return _audit_card(
+        "strategy_closed_loop",
+        "策略闭环审计",
+        status,
+        summary,
+        details={
+            "window_hours": AUDIT_WINDOWS["strategy_hours"],
+            "current_runtime_window": current_window,
+            "decision_count": len(decisions),
+            "entry_decision_count": len(entry_decisions),
+            "hold_decision_count": len(hold_decisions),
+            "executed_entry_count": len(executed_entries),
+            "evidence_tier_counts": dict(tier_counts),
+            "high_quality_entry_count": len(high_quality_entries),
+            "weak_entry_count": len(weak_entries),
+            "weak_executed_count": len(weak_executed),
+            "shadow_only_executed_count": len(shadow_only_executed),
+            "executed_without_filled_order_count": len(executed_without_order),
+            "expected_net_distribution": _distribution(expected_net_values),
+            "positive_expected_net_count": positive_net_count,
+            "negative_expected_net_count": negative_net_count,
+            "model_component_status_counts": {
+                key: dict(value) for key, value in sorted(component_stats.items())
+            },
+            "ml_usable_rate": ml_usable_rate,
+            "ml_influence_reason": ml_influence_reason,
+            "position_notional_distribution": _distribution(notional_values),
+            "closed_position_count": len(closed_positions),
+            "closed_win_count": win_count,
+            "closed_loss_count": loss_count,
+            "realized_pnl_distribution": _distribution(realized_values),
+            "fast_loss_under_15m_count": len(fast_loss_samples),
+            "fast_loss_under_15m_samples": fast_loss_samples[:10],
+            "sampled_decision_limit": 500,
+            "sampled_order_limit": 1000,
+            "sampled_position_limit": 800,
+            "shadow_action_counts": shadow_action_counts,
+            "trade_reflection_outcome_counts": trade_outcome_counts,
+            "executed_outcome_sample_count": len(executed_with_outcome),
+            "high_quality_outcome_distribution": _distribution(high_quality_outcomes),
+            "weak_outcome_distribution": _distribution(weak_outcomes),
+            "effectiveness_verdict": effectiveness_verdict,
+            "diagnostics": diagnostics,
+            "weak_executed_samples": [
+                {
+                    "id": row.id,
+                    "symbol": row.symbol,
+                    "action": row.action,
+                    "tier": _decision_evidence_tier(row),
+                    "expected_net_return_pct": _decision_expected_net(row),
+                    "created_at": _iso(row.created_at),
+                }
+                for row in weak_executed[:10]
+            ],
+            "executed_without_filled_order_samples": [
+                {
+                    "id": row.id,
+                    "symbol": row.symbol,
+                    "action": row.action,
+                    "created_at": _iso(row.created_at),
+                }
+                for row in executed_without_order[:10]
+            ],
+        },
+        evidence=[
+            {"label": "当前弱证据执行", "value": current_window.get("weak_executed_count") or 0},
+            {"label": "当前快亏平", "value": current_window.get("fast_loss_under_15m_count") or 0},
+            {"label": "高质量候选", "value": len(high_quality_entries)},
+            {"label": "弱证据已执行", "value": len(weak_executed)},
+            {"label": "快亏平", "value": len(fast_loss_samples)},
+            {"label": "ML可用率", "value": ml_usable_rate},
+            {"label": "收益样本", "value": len(executed_with_outcome)},
+        ],
+        next_actions=[
+            "先确认高质量候选是否持续为 0；如果是，问题在上游模型/收益计算/证据融合，不要放开弱证据。",
+            "弱证据已执行或 shadow-only 已执行不应出现；出现时先查执行绕过路径。",
+            "ML 可用率低时先看 ml_influence_reason：如果仍是学习观察模式，要先解决训练质量/上线条件，而不是放宽开仓。",
+            "快亏平集中时先查平仓原因和持仓时间，不把亏损探针继续喂给训练。",
+        ],
+    )
+
+
 def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for card in cards:
@@ -853,6 +1505,82 @@ def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return sorted(findings, key=lambda row: STATUS_RANK.get(str(row.get("severity")), 9))[:10]
+
+
+def _strategy_closed_loop_is_historical_only(cards_by_key: dict[str, dict[str, Any]]) -> bool:
+    card = cards_by_key.get("strategy_closed_loop") or {}
+    state, _label = _issue_ledger_state(card, cards_by_key={})
+    return state == "observing"
+
+
+def _issue_ledger_state(
+    card: dict[str, Any],
+    *,
+    cards_by_key: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    status = str(card.get("status") or "info")
+    key = str(card.get("key") or "")
+    details = card.get("details") if isinstance(card.get("details"), dict) else {}
+    current_window = (
+        details.get("current_runtime_window")
+        if isinstance(details.get("current_runtime_window"), dict)
+        else {}
+    )
+    diagnostics = details.get("diagnostics") if isinstance(details.get("diagnostics"), dict) else {}
+    historical_only = bool(current_window.get("historical_legacy_issues")) and not any(
+        bool(diagnostics.get(key))
+        for key in (
+            "current_weak_executed",
+            "current_no_high_quality_entries",
+            "current_fast_loss_cluster",
+            "current_ml_not_effective",
+            "shadow_only_executed",
+            "executed_without_order",
+        )
+    )
+    if status == "ok":
+        return "fixed", "已修复 / 当前验证通过"
+    if historical_only:
+        return "observing", "历史遗留 / 当前未复现"
+    if (
+        key == "strategy_quality"
+        and status == "warning"
+        and cards_by_key
+        and _strategy_closed_loop_is_historical_only(cards_by_key)
+    ):
+        return "observing", "历史遗留 / 当前策略闭环未复现"
+    return "unresolved", "未修复 / 当前仍需处理"
+
+
+def _issue_ledger_from_cards(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[str, list[dict[str, Any]]] = {"fixed": [], "unresolved": [], "observing": []}
+    cards_by_key = {str(card.get("key") or ""): card for card in cards}
+    for card in cards:
+        state, label = _issue_ledger_state(card, cards_by_key=cards_by_key)
+        buckets[state].append(
+            {
+                "key": card.get("key"),
+                "title": card.get("title"),
+                "status": card.get("status"),
+                "state": state,
+                "state_label": label,
+                "summary": card.get("summary"),
+                "evidence": card.get("evidence") or [],
+                "next_actions": card.get("next_actions") or [],
+            }
+        )
+    priority = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
+    for rows in buckets.values():
+        rows.sort(key=lambda item: priority.get(str(item.get("status")), 9))
+    return {
+        "summary": {
+            "fixed": len(buckets["fixed"]),
+            "unresolved": len(buckets["unresolved"]),
+            "observing": len(buckets["observing"]),
+            "total": len(cards),
+        },
+        **buckets,
+    }
 
 
 def _worst_status(*statuses: Any) -> str:
@@ -947,13 +1675,24 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             checks=["负净收益候选", "零净收益候选", "快亏平样本", "拦截原因"],
         ),
         _node_from_cards(
+            "strategy_closed_loop",
+            "策略闭环有效性",
+            "策略层",
+            cards_by_key,
+            ["strategy_closed_loop"],
+            impact="把数据、模型、决策、仓位、执行、平仓、训练反馈串起来，判断问题卡在哪一层。",
+            upstream=["market_data", "model_training", "position_sync"],
+            downstream=["risk_guard", "okx_execution", "training_data"],
+            checks=["证据档位分布", "弱证据执行", "ML可用率", "快亏平", "收益样本"],
+        ),
+        _node_from_cards(
             "strategy_gate_contract",
             "策略门槛契约",
             "策略层",
             cards_by_key,
             ["strategy_gate_contract"],
             impact="防止旧固定阈值、死分支、伪硬门槛重新卡住开仓。",
-            upstream=["model_training", "strategy_decision"],
+            upstream=["model_training", "strategy_decision", "strategy_closed_loop"],
             downstream=["risk_guard", "okx_execution"],
             checks=["RuntimeEntryFilters", "settings.min_entry_*残留", "if False死分支"],
         ),
@@ -962,7 +1701,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "风控与守门",
             "风控层",
             cards_by_key,
-            ["strategy_quality", "position_price_integrity"],
+            ["strategy_quality", "strategy_closed_loop", "position_price_integrity"],
             impact="影响动态证据、低质量释放、快速平仓和下单前校验。",
             upstream=["strategy_decision", "position_sync"],
             downstream=["okx_execution", "position_sync"],
@@ -995,7 +1734,12 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "训练标签与样本治理",
             "学习层",
             cards_by_key,
-            ["model_training", "strategy_quality", "position_price_integrity"],
+            [
+                "model_training",
+                "strategy_quality",
+                "strategy_closed_loop",
+                "position_price_integrity",
+            ],
             impact="影响模型是否越学越聪明，避免错误价格/错误盈亏污染训练。",
             upstream=["market_data", "okx_execution", "position_sync"],
             downstream=["model_training", "strategy_decision"],
@@ -1091,6 +1835,7 @@ async def collect_system_audit_status(
         _position_price_integrity_audit(),
         _market_data_audit(),
         _strategy_quality_audit(),
+        _strategy_closed_loop_audit(),
         _model_training_audit(),
         asyncio.to_thread(_strategy_gate_contract_audit),
         asyncio.to_thread(_source_visible_text_audit),
@@ -1113,6 +1858,7 @@ async def collect_system_audit_status(
     cards = sorted(cards, key=lambda item: STATUS_RANK.get(str(item.get("status")), 9))
     nodes = _build_audit_nodes(cards)
     findings = _root_cause_findings(cards)
+    issue_ledger = _issue_ledger_from_cards(cards)
     status = "ok"
     if any(card.get("status") == "critical" for card in cards):
         status = "critical"
@@ -1135,6 +1881,7 @@ async def collect_system_audit_status(
                 "nodes": len(nodes),
             },
             "root_causes": findings,
+            "issue_ledger": issue_ledger,
             "nodes": nodes,
             "node_summary": _node_summary(nodes),
             "cards": cards,

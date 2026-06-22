@@ -5353,6 +5353,55 @@ function systemAuditCardDetailOpen(card) {
     return systemAuditTone(card.status) !== 'ok';
 }
 
+function systemAuditLedgerItemHtml(item) {
+    const tone = systemAuditTone(item?.status);
+    const evidence = Array.isArray(item?.evidence) ? item.evidence.slice(0, 2) : [];
+    return `
+        <article class="system-audit-ledger-item system-audit-ledger-item-${tone}">
+            <div>
+                <strong>${escHtml(item?.title || item?.key || '-')}</strong>
+                <em>${escHtml(item?.state_label || systemAuditStatusLabel(item?.status))}</em>
+            </div>
+            <p>${escHtml(systemAuditShortText(item?.summary || '-', 150))}</p>
+            ${evidence.length ? `<div class="system-audit-ledger-evidence">${evidence.map(row => `<span>${escHtml(row.label || '证据')}：${escHtml(systemAuditValueText(row.value))}</span>`).join('')}</div>` : ''}
+        </article>`;
+}
+
+function renderSystemAuditIssueLedger(ledger) {
+    const container = document.getElementById('system-audit-issue-ledger');
+    if (!container) return;
+    const data = ledger && typeof ledger === 'object' ? ledger : {};
+    const summary = data.summary || {};
+    const groups = [
+        { key: 'unresolved', title: '未修复', hint: '当前仍需处理，优先看这里', tone: 'critical' },
+        { key: 'observing', title: '历史观察', hint: '历史遗留或刚修复后观察，不重复改同一问题', tone: 'warning' },
+        { key: 'fixed', title: '已修复', hint: '本轮只读巡检验证通过', tone: 'ok' },
+    ];
+    container.innerHTML = `
+        <div class="system-audit-ledger-head">
+            <div>
+                <strong>问题台账</strong>
+                <span>把已修复、未修复、历史遗留分开，避免重复改同一个问题。</span>
+            </div>
+            <em>未修复 ${monitorNumber(summary.unresolved || 0, 0)} · 历史观察 ${monitorNumber(summary.observing || 0, 0)} · 已修复 ${monitorNumber(summary.fixed || 0, 0)}</em>
+        </div>
+        <div class="system-audit-ledger-grid">
+            ${groups.map(group => {
+                const rows = Array.isArray(data[group.key]) ? data[group.key] : [];
+                return `
+                    <section class="system-audit-ledger-column system-audit-ledger-column-${group.tone}">
+                        <div class="system-audit-ledger-column-head">
+                            <strong>${escHtml(group.title)}</strong>
+                            <span>${monitorNumber(rows.length, 0)} 项 · ${escHtml(group.hint)}</span>
+                        </div>
+                        <div class="system-audit-ledger-list">
+                            ${rows.length ? rows.map(systemAuditLedgerItemHtml).join('') : '<div class="system-audit-ledger-empty">暂无</div>'}
+                        </div>
+                    </section>`;
+            }).join('')}
+        </div>`;
+}
+
 function renderSystemAuditRootCauses(rootCauses) {
     const container = document.getElementById('system-audit-root-causes');
     if (!container) return;
@@ -5455,9 +5504,11 @@ function renderSystemAudit() {
         renderSystemAuditCards([]);
         renderSystemAuditNodes([]);
         renderSystemAuditRootCauses([]);
+        renderSystemAuditIssueLedger(null);
         return;
     }
     overview.innerHTML = systemAuditOverviewHtml(data);
+    renderSystemAuditIssueLedger(data.issue_ledger);
     renderSystemAuditCards(data.cards);
     renderSystemAuditNodes(data.nodes);
     renderSystemAuditRootCauses(data.root_causes);

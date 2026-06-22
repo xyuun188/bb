@@ -368,6 +368,22 @@ def test_server_monitor_splits_model_and_platform_panels() -> None:
     assert "'redis-server.service': 'Redis'" in script
     assert "'redis.service': 'Redis'" in script
     assert ".server-monitor-tabs" in style
+
+
+def test_system_audit_displays_issue_ledger() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert 'id="system-audit-issue-ledger"' in html
+    assert "function renderSystemAuditIssueLedger" in script
+    assert "issue_ledger" in script
+    assert "已修复" in script
+    assert "未修复" in script
+    assert "历史观察" in script
+    assert ".system-audit-ledger-grid" in style
+    assert ".system-audit-ledger-column" in style
+    assert ".system-audit-ledger-item" in style
     assert ".server-monitor-self-check-actions" in style
     assert ".server-monitor-panel.active" in style
     assert "const MODEL_PUBLIC_HOST = '103.85.84.147';" in script
@@ -418,7 +434,7 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "function renderSystemAuditNodes" in script
     assert "function renderSystemAuditRootCauses" in script
     assert "function systemAuditCardDetailOpen" in script
-    assert "<details class=\"system-audit-card" in script
+    assert '<details class="system-audit-card' in script
     assert "renderSystemAuditNodes(data.nodes)" in script
     assert "system-audit-node-flow" in script
     assert "system-audit-node-checks" in script

@@ -467,8 +467,6 @@ async def _local_ai_training_status() -> dict[str, Any]:
 
 async def _training_governance_snapshot() -> dict[str, Any]:
     try:
-        from services.shadow_training_quarantine import assess_shadow_row
-
         sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
         async with get_session_ctx() as session:
             completed_result = await session.execute(
@@ -488,30 +486,39 @@ async def _training_governance_snapshot() -> dict[str, Any]:
                     Position.closed_at.is_not(None),
                 )
             )
-            sample_result = await session.execute(
-                select(ShadowBacktest)
-                .where(
-                    ShadowBacktest.status == "completed",
-                    ShadowBacktest.long_return_pct.is_not(None),
-                    ShadowBacktest.short_return_pct.is_not(None),
-                )
-                .order_by(ShadowBacktest.id.desc())
-                .limit(sample_limit)
-            )
-            shadow_rows = list(sample_result.scalars().all())
 
         completed_count = int(completed_result.scalar() or 0)
         quarantined_count = int(quarantined_result.scalar() or 0)
         trade_count = int(trade_reflection_result.scalar() or 0) + int(
             closed_position_result.scalar() or 0
         )
-        assessments = [assess_shadow_row(row) for row in shadow_rows]
-        shadow_report = _governance_quality_report(
-            assessments,
-            total_trainable_count=completed_count,
-            quarantined_count=quarantined_count,
-            sample_limit=sample_limit,
-        )
+        if quarantined_count:
+            status = "quarantined"
+            summary = f"已隔离 {quarantined_count} 条训练样本；原始记录保留。"
+        elif completed_count:
+            status = "clean"
+            summary = "状态页使用轻量治理快照；深度样本质量评估在训练/刷新任务中执行。"
+        else:
+            status = "empty"
+            summary = "暂无可训练影子样本。"
+        shadow_report = {
+            "status": status,
+            "summary": summary,
+            "sampled": 0,
+            "sample_limit": sample_limit,
+            "total_trainable_count": completed_count,
+            "quarantined_count": quarantined_count,
+            "cleanup_mode": "quarantine_not_delete",
+            "raw_records_preserved": True,
+            "quarantine_applied": bool(quarantined_count),
+            "requires_artifact_refresh": bool(quarantined_count),
+            "refresh_targets": [
+                "local_ml_signal",
+                "local_ai_tools",
+                "vector_memory_reindex",
+            ],
+            "deep_quality_evaluation": "deferred_to_training_refresh",
+        }
         local_ai_report = dict(shadow_report)
         local_ai_report["trade_sample_count"] = trade_count
         return {
@@ -523,7 +530,7 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             "local_ml_trainable_shadow_sample_count": completed_count,
             "training_quarantine": {
                 "status": "not_run",
-                "message": "状态页只读取轻量治理快照；点击清洗刷新或等待自动训练时执行隔离与重训。",
+                "message": "状态页只读取轻量治理快照；点击清洗刷新或等待自动训练时执行深度评估、隔离与重训。",
             },
             "cleanup_effective": True,
             "artifact_refresh_targets": [

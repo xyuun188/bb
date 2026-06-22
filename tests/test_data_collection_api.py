@@ -473,8 +473,47 @@ async def test_data_collection_status_is_read_only_for_training_quarantine(
     body = response.json()
     assert quarantine_calls == []
     assert body["training"]["governance"]["training_quarantine"]["status"] == "not_run"
+    assert (
+        body["training"]["governance"]["local_ai_tools"]["deep_quality_evaluation"]
+        == "deferred_to_training_refresh"
+    )
+    assert body["training"]["governance"]["local_ai_tools"]["raw_records_preserved"] is True
     assert "external_event_scraper_interval_seconds" in body["config"]
     assert "external_event_scraper_sources" in body["config"]
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_does_not_run_deep_shadow_assessment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    def forbidden_assess_shadow_row(_row: Any) -> None:
+        raise AssertionError("status endpoint must not run deep shadow assessment")
+
+    monkeypatch.setattr(
+        "services.shadow_training_quarantine.assess_shadow_row",
+        forbidden_assess_shadow_row,
+    )
+
+    try:
+        app = create_app()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get("/api/data-collection/status")
+    finally:
+        await close_db()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (
+        body["training"]["governance"]["local_ai_tools"]["deep_quality_evaluation"]
+        == "deferred_to_training_refresh"
+    )
 
 
 @pytest.mark.asyncio

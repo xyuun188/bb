@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import pytest
@@ -47,7 +49,12 @@ async def test_system_audit_status_aggregates_root_causes(
     monkeypatch.setattr(
         system_audit,
         "_position_price_integrity_audit",
-        _async_card("position_price_integrity", "ok", "持仓价格一致", title="持仓价格一致性"),
+        _async_card(
+            "position_price_integrity",
+            "ok",
+            "持仓价格一致",
+            title="持仓价格一致性",
+        ),
     )
     monkeypatch.setattr(
         system_audit,
@@ -58,6 +65,16 @@ async def test_system_audit_status_aggregates_root_causes(
         system_audit,
         "_strategy_quality_audit",
         _async_card("strategy_quality", "ok", "策略质量正常", title="策略质量"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_strategy_closed_loop_audit",
+        _async_card(
+            "strategy_closed_loop",
+            "ok",
+            "策略闭环正常",
+            title="策略闭环审计",
+        ),
     )
     monkeypatch.setattr(
         system_audit,
@@ -75,7 +92,7 @@ async def test_system_audit_status_aggregates_root_causes(
         system_audit,
         "_source_visible_text_audit",
         lambda: system_audit._audit_card(
-            "visible_text_encoding", "中文显示与乱码回归", "ok", "无裸乱码"
+            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
         ),
     )
 
@@ -84,17 +101,18 @@ async def test_system_audit_status_aggregates_root_causes(
     assert payload["status"] == "critical"
     assert payload["status_label"] == "异常"
     assert payload["summary"] == {
-        "cards": 8,
+        "cards": 9,
         "critical": 1,
         "warning": 2,
-        "ok": 5,
+        "ok": 6,
         "findings": 3,
-        "nodes": 11,
+        "nodes": 12,
     }
     assert [card["status"] for card in payload["cards"]] == [
         "critical",
         "warning",
         "warning",
+        "ok",
         "ok",
         "ok",
         "ok",
@@ -108,10 +126,24 @@ async def test_system_audit_status_aggregates_root_causes(
     ]
     node_keys = {node["key"] for node in payload["nodes"]}
     assert "strategy_gate_contract" in node_keys
+    assert "strategy_closed_loop" in node_keys
     assert "visible_text_encoding" in node_keys
     card_keys = {card["key"] for card in payload["cards"]}
     assert "strategy_gate_contract" in card_keys
+    assert "strategy_closed_loop" in card_keys
     assert "visible_text_encoding" in card_keys
+    assert payload["issue_ledger"]["summary"] == {
+        "fixed": 6,
+        "unresolved": 3,
+        "observing": 0,
+        "total": 9,
+    }
+    assert [item["key"] for item in payload["issue_ledger"]["unresolved"]] == [
+        "trade_loop",
+        "market_data",
+        "model_training",
+    ]
+    assert "strategy_closed_loop" in {item["key"] for item in payload["issue_ledger"]["fixed"]}
     assert "只读巡检" in payload["safety_note"]
     assert "人工确认" in payload["safety_note"]
 
@@ -146,6 +178,11 @@ async def test_system_audit_status_wraps_failed_section(
     )
     monkeypatch.setattr(
         system_audit,
+        "_strategy_closed_loop_audit",
+        _async_card("strategy_closed_loop", "ok", "策略闭环正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
         "_model_training_audit",
         _async_card("model_training", "ok", "模型正常"),
     )
@@ -160,7 +197,7 @@ async def test_system_audit_status_wraps_failed_section(
         system_audit,
         "_source_visible_text_audit",
         lambda: system_audit._audit_card(
-            "visible_text_encoding", "中文显示与乱码回归", "ok", "无裸乱码"
+            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
         ),
     )
 
@@ -171,3 +208,235 @@ async def test_system_audit_status_wraps_failed_section(
     assert payload["root_causes"][0]["title"] == "巡检模块"
     assert payload["root_causes"][0]["severity"] == "warning"
     assert payload["cards"][0]["details"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_model_training_audit_does_not_run_full_self_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status() -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "ready",
+                    "shadow_sample_count": 123,
+                    "trade_sample_count": 7,
+                    "text_sentiment_sample_count": 11,
+                },
+                "governance": {"status": "clean"},
+            },
+            "sources": [],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [
+                {
+                    "model": "qwen3-14b-trade",
+                    "available": True,
+                    "endpoint_ok": True,
+                    "model_available": True,
+                    "latency_ms": 12,
+                }
+            ],
+            "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+
+    card = await system_audit._model_training_audit()
+
+    assert not hasattr(system_audit, "system_self_check")
+    assert card["status"] == "ok"
+    assert card["details"]["runtime_probe"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_okx_reconciliation_audit_reuses_short_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def fake_collect_missing_closed_position_plans(days: int) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        assert days == 14
+        return [
+            SimpleNamespace(
+                symbol="PROS/USDT",
+                side="long",
+                quantity=1.0,
+                realized_pnl=-0.82,
+                close_order_id="close-1",
+                closed_at=datetime(2026, 6, 22, tzinfo=UTC),
+            )
+        ]
+
+    monkeypatch.setattr(system_audit, "_okx_reconciliation_cache", None)
+    monkeypatch.setattr(
+        system_audit,
+        "collect_missing_closed_position_plans",
+        fake_collect_missing_closed_position_plans,
+    )
+
+    first = await system_audit._okx_reconciliation_audit()
+    second = await system_audit._okx_reconciliation_audit()
+
+    assert calls == 1
+    assert first["details"]["cache"]["hit"] is False
+    assert second["details"]["cache"]["hit"] is True
+    assert second["details"]["missing_closed_positions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategy_closed_loop_audit_separates_active_runtime_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from db.session import close_db, get_session_ctx, init_db
+    from models.decision import AIDecision
+    from models.trade import Order
+
+    await close_db()
+    db_path = tmp_path / "audit.db"
+    monkeypatch.setattr(
+        system_audit.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{db_path.as_posix()}",
+    )
+    monkeypatch.setattr(system_audit.settings, "_data_dir", tmp_path, raising=False)
+
+    await init_db()
+    try:
+        old_created_at = datetime(2026, 6, 22, 1, 0, tzinfo=UTC)
+        runtime_started_at = datetime(2026, 6, 22, 2, 0, tzinfo=UTC)
+        monkeypatch.setattr(
+            system_audit,
+            "_load_trading_runtime_audit_window",
+            lambda: {
+                "available": True,
+                "started_at": runtime_started_at,
+                "started_at_iso": runtime_started_at.isoformat(),
+                "heartbeat_at": datetime(2026, 6, 22, 2, 5, tzinfo=UTC),
+                "heartbeat_at_iso": "2026-06-22T02:05:00+00:00",
+                "running": True,
+                "mode": "paper",
+                "decision_interval": 30,
+            },
+        )
+        raw = {
+            "opportunity_score": {
+                "expected_net_return_pct": 0.7,
+                "evidence_score": {
+                    "tier": "weak_conflict_probe",
+                    "components": [
+                        {
+                            "source": "ml",
+                            "status": "ignored",
+                            "reason": "ML 学习观察模式",
+                        }
+                    ],
+                },
+            }
+        }
+        async with get_session_ctx() as session:
+            old_decision = AIDecision(
+                model_name="test_model",
+                symbol="OLD/USDT",
+                action="long",
+                reasoning="old weak entry",
+                position_size_pct=0.001,
+                confidence=0.1,
+                raw_llm_response=raw,
+                was_executed=True,
+                created_at=old_created_at,
+            )
+            new_decision = AIDecision(
+                model_name="test_model",
+                symbol="NEW/USDT",
+                action="hold",
+                reasoning="new hold",
+                position_size_pct=0.0,
+                confidence=0.1,
+                raw_llm_response={},
+                was_executed=False,
+                created_at=runtime_started_at,
+            )
+            session.add_all([old_decision, new_decision])
+            await session.flush()
+            session.add(
+                Order(
+                    model_name="test_model",
+                    execution_mode="paper",
+                    decision_id=old_decision.id,
+                    symbol="OLD/USDT",
+                    side="long",
+                    order_type="market",
+                    quantity=1,
+                    price=1,
+                    status="filled",
+                    created_at=old_created_at,
+                )
+            )
+
+        card = await system_audit._strategy_closed_loop_audit()
+
+        assert card["details"]["weak_executed_count"] == 1
+        assert card["details"]["current_runtime_window"]["started_at"] == (
+            "2026-06-22T02:00:00+00:00"
+        )
+        assert card["details"]["current_runtime_window"]["entry_decision_count"] == 0
+        assert card["details"]["current_runtime_window"]["weak_executed_count"] == 0
+        assert card["details"]["current_runtime_window"]["historical_legacy_issues"] is True
+        assert card["details"]["ml_influence_reason"]["top_reasons"][0] == {
+            "reason": "ML 学习观察模式",
+            "count": 1,
+        }
+        ledger = system_audit._issue_ledger_from_cards([card])
+        assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+        assert ledger["observing"][0]["key"] == "strategy_closed_loop"
+        assert "历史" in ledger["observing"][0]["state_label"]
+    finally:
+        await close_db()
+
+
+def test_issue_ledger_moves_strategy_quality_to_observing_when_closed_loop_is_legacy() -> None:
+    strategy_quality = system_audit._audit_card(
+        "strategy_quality",
+        "策略质量",
+        "warning",
+        "存在快亏平、弱证据误执行或多数开仓候选净收益为负。",
+    )
+    strategy_closed_loop = system_audit._audit_card(
+        "strategy_closed_loop",
+        "策略闭环审计",
+        "warning",
+        "24小时历史窗口仍有遗留问题；当前运行窗口暂未复现硬执行错误，需继续观察新样本。",
+        details={
+            "current_runtime_window": {
+                "historical_legacy_issues": True,
+                "weak_executed_count": 0,
+                "fast_loss_under_15m_count": 0,
+            },
+            "diagnostics": {
+                "current_weak_executed": False,
+                "current_no_high_quality_entries": False,
+                "current_fast_loss_cluster": False,
+                "current_ml_not_effective": False,
+            },
+        },
+    )
+
+    ledger = system_audit._issue_ledger_from_cards([strategy_quality, strategy_closed_loop])
+
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 2, "total": 2}
+    assert {item["key"] for item in ledger["observing"]} == {
+        "strategy_quality",
+        "strategy_closed_loop",
+    }
