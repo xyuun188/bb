@@ -244,16 +244,8 @@ class MarketAutoEntryProcessor:
         evidence_tier = str(evidence_score.get("tier") or "")
         if evidence_tier not in ENTRY_EVIDENCE_SHADOW_ONLY_TIERS:
             return None
-        if evidence_score.get("tradeable_probe") or not evidence_score.get("shadow_only", True):
-            raw["entry_evidence_tradeable_probe"] = {
-                "applied": True,
-                "evidence_tier": evidence_tier,
-                "evidence_score": evidence_score,
-                "position_size_pct_before_execution": float(decision.position_size_pct or 0.0),
-                "reason": "弱证据已满足正期望受控探针条件，继续进入执行检查。",
-            }
-            decision.raw_response = raw
-            return None
+        legacy_tradeable_probe = bool(evidence_score.get("tradeable_probe"))
+        legacy_shadow_only = bool(evidence_score.get("shadow_only", True))
         raw["entry_evidence_shadow_only"] = {
             "applied": True,
             "stage_status": "skipped",
@@ -261,7 +253,10 @@ class MarketAutoEntryProcessor:
             "shadow_only": True,
             "evidence_tier": evidence_tier,
             "evidence_score": evidence_score,
+            "legacy_tradeable_probe": legacy_tradeable_probe,
+            "legacy_shadow_only": legacy_shadow_only,
             "position_size_pct_before_execution": float(decision.position_size_pct or 0.0),
+            "reason": ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
         }
         decision.raw_response = raw
         return ENTRY_EVIDENCE_SHADOW_ONLY_REASON

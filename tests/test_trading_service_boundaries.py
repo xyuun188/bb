@@ -1681,7 +1681,7 @@ async def test_entry_policy_keeps_weak_evidence_shadow_only_even_with_size() -> 
 
 
 @pytest.mark.asyncio
-async def test_entry_policy_allows_positive_net_tradeable_probe() -> None:
+async def test_entry_policy_blocks_legacy_positive_net_tradeable_probe() -> None:
     calls: list[str] = []
     decision = _decision(Action.LONG)
     decision.position_size_pct = 0.018
@@ -1721,8 +1721,11 @@ async def test_entry_policy_allows_positive_net_tradeable_probe() -> None:
 
     result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
 
-    assert result.passed is True
-    assert calls == ["sizing", "gate"]
+    assert result.passed is False
+    assert result.blocker == "entry_evidence_shadow_only"
+    assert result.data["shadow_only"] is True
+    assert result.data["legacy_tradeable_probe"] is True
+    assert calls == ["sizing"]
 
 
 def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:

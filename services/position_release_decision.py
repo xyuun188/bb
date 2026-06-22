@@ -129,6 +129,8 @@ class PositionReleaseDecisionPolicy:
             return False
         if pnl_ratio <= self.params.fresh_position_hard_risk_loss_ratio:
             return False
+        if pnl_ratio < 0.0:
+            return True
         reasons = {str(item) for item in quality.get("reasons", []) if item is not None}
         return bool(
             reasons

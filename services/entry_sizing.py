@@ -94,4 +94,10 @@ def evidence_is_low_payoff_quality(evidence_score: dict[str, Any], effective_sco
 def evidence_is_tradeable_probe(evidence_score: dict[str, Any], effective_score: float) -> bool:
     """Return True when low evidence may still trade only as a controlled probe."""
 
-    return bool(evidence_score) and effective_score >= ENTRY_EVIDENCE_SCORE_WEAK_PROBE
+    if not evidence_score or effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
+        return False
+    return str(evidence_score.get("tier") or "") not in {
+        "weak_conflict_probe",
+        "degraded_missing_probe",
+        "blocked",
+    }

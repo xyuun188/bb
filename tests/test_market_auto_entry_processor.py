@@ -200,7 +200,7 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
 
 
 @pytest.mark.asyncio
-async def test_market_auto_entry_processor_executes_tradeable_weak_probe() -> None:
+async def test_market_auto_entry_processor_blocks_legacy_tradeable_weak_probe() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
     decision = _decision()
@@ -232,11 +232,12 @@ async def test_market_auto_entry_processor_executes_tradeable_weak_probe() -> No
     )
 
     assert result.handled is True
-    assert result.execution_attempted is True
-    assert result.execution_confirmed is True
-    assert decision.raw_response["entry_evidence_tradeable_probe"]["applied"] is True
-    assert not decision.raw_response.get("entry_evidence_shadow_only")
-    assert any(call[0] == "execute" for call in calls)
+    assert result.execution_attempted is False
+    assert result.reason == ENTRY_EVIDENCE_SHADOW_ONLY_REASON
+    shadow = decision.raw_response["entry_evidence_shadow_only"]
+    assert shadow["applied"] is True
+    assert shadow["legacy_tradeable_probe"] is True
+    assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
 
 
 @pytest.mark.asyncio

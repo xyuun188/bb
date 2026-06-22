@@ -43,7 +43,7 @@ def test_position_release_decision_protects_fresh_low_quality_scan() -> None:
         "position_quality": {
             "score": 72.0,
             "bucket": "high",
-            "hold_hours": 0.04,
+            "hold_hours": 0.14,
             "pnl_ratio": -0.028,
             "reasons": [
                 "hard_loss_pressure",
@@ -62,6 +62,36 @@ def test_position_release_decision_protects_fresh_low_quality_scan() -> None:
             positions=[{"side": "short"}],
             scan=scan,
             feature_vector={"current_price": 0.185},
+        )
+        is None
+    )
+
+
+def test_position_release_decision_protects_fresh_loss_even_without_reason_tags() -> None:
+    policy = PositionReleaseDecisionPolicy()
+    scan = {
+        "force_exit_candidate": True,
+        "release_action": "close_short",
+        "exit_score": 96.0,
+        "release_reason": "severe_loss_pressure; signal_reversal_watch",
+        "position_quality": {
+            "score": 22.0,
+            "bucket": "release_now",
+            "hold_hours": 0.146,
+            "pnl_ratio": -0.004,
+            "reasons": [],
+            "should_release": True,
+        },
+    }
+
+    assert policy.should_release(scan) is False
+    assert (
+        policy.build(
+            model_name="ensemble_trader",
+            symbol="HMSTR/USDT",
+            positions=[{"side": "short"}],
+            scan=scan,
+            feature_vector={"current_price": 0.0021},
         )
         is None
     )

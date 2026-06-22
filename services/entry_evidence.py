@@ -560,10 +560,10 @@ def build_entry_evidence_score(
         if short_relief_allowed:
             original_effective_score = effective_score
             effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
-            tradeable_probe = True
             short_probe_relief = {
                 "applied": True,
-                "tradeable_probe": True,
+                "tradeable_probe": False,
+                "shadow_only": True,
                 "from_effective_score": round(original_effective_score, 6),
                 "to_effective_score": round(effective_score, 6),
                 "server_expected_return_pct": round(server_expected, 6),
@@ -571,9 +571,9 @@ def build_entry_evidence_score(
                 "direction_preferred_side": direction_preferred_side,
                 "direction_gap": round(direction_gap, 6),
                 "reason": (
-                    "Short base evidence cleared the weak-probe floor and server/time-series/"
-                    "direction competition aligned, so the short offset is relaxed only to "
-                    "a tiny probe."
+                    "Short base evidence cleared the weak-probe floor, but weak-conflict "
+                    "signals remain shadow-only until they lift into exploration/small tier. "
+                    "This prevents meaningless micro orders from feeding fast-loss churn."
                 ),
             }
     hard_block_reasons: list[str] = []
@@ -598,24 +598,19 @@ def build_entry_evidence_score(
             original_effective_score = effective_score
             if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
                 effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
-            tradeable_probe = bool(
-                expected_return_pct(profit, entry_side) > 0
-                or signal_available(timeseries)
-                or safe_float(decision.confidence, 0.0)
-                >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_confidence
-            )
             missing_key_degraded_relief = {
                 "applied": True,
-                "tradeable_probe": tradeable_probe,
+                "tradeable_probe": False,
+                "shadow_only": True,
                 "missing_key_sources": list(missing_key_sources),
                 "from_effective_score": round(original_effective_score, 6),
                 "to_effective_score": round(effective_score, 6),
                 "ai_confidence": round(ai_confidence, 6),
                 "aligned_support_sources": list(aligned_support_sources),
                 "reason": (
-                    "ML/time-series services are unavailable, so missing model data is treated "
-                    "as degraded evidence and limited to a controlled tiny probe instead of "
-                    "a hard execution veto."
+                    "ML/time-series services are unavailable; missing key model data is "
+                    "recorded as shadow-only evidence until the model chain recovers or "
+                    "other evidence lifts the signal out of the weak tier."
                 ),
             }
     expected_net_return = safe_float(opportunity.get("expected_net_return_pct"), 0.0)
@@ -642,13 +637,10 @@ def build_entry_evidence_score(
     aligned_support_count = len(set(aligned_support_sources))
     strong_positive_relief_allowed = bool(
         positive_net_probe_allowed
-        and expected_net_return
-        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_expected_pct
+        and expected_net_return >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_expected_pct
         and confidence >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_confidence
-        and profit_quality_ratio
-        >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_profit_quality
-        and loss_probability
-        <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_loss_probability
+        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_min_profit_quality
+        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_loss_probability
         and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.strong_positive_relief_max_tail_risk
         and opportunity_score
         >= max(
@@ -660,13 +652,10 @@ def build_entry_evidence_score(
     )
     elite_positive_relief_allowed = bool(
         strong_positive_relief_allowed
-        and expected_net_return
-        >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_expected_pct
+        and expected_net_return >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_expected_pct
         and confidence >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_confidence
-        and profit_quality_ratio
-        >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_profit_quality
-        and loss_probability
-        <= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_max_loss_probability
+        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_profit_quality
+        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_max_loss_probability
         and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_max_tail_risk
         and opportunity_score
         >= max(
@@ -678,10 +667,10 @@ def build_entry_evidence_score(
         original_effective_score = effective_score
         if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
             effective_score = ENTRY_EVIDENCE_SCORE_WEAK_PROBE
-        tradeable_probe = True
         positive_net_probe_relief = {
             "applied": True,
-            "tradeable_probe": True,
+            "tradeable_probe": False,
+            "shadow_only": True,
             "from_effective_score": round(original_effective_score, 6),
             "to_effective_score": round(effective_score, 6),
             "expected_net_return_pct": round(expected_net_return, 6),
@@ -690,8 +679,9 @@ def build_entry_evidence_score(
             "loss_probability": round(loss_probability, 6),
             "tail_risk_score": round(tail_risk_score, 6),
             "reason": (
-                "机会评分为正且净收益、亏损概率、尾部风险满足受控探针条件；"
-                "动态证据不足从硬归零降级为极小仓验证，反向证据仍保留在仓位和风控里。"
+                "机会评分为正但仍处于弱冲突档；本轮只沉淀影子样本和复盘证据，"
+                "不再提交微小真实/模拟订单。只有净收益、盈利质量、置信度和多源同向证据"
+                "继续增强并抬升到 exploration/small 档后才允许执行。"
             ),
         }
     if strong_positive_relief_allowed:
@@ -808,7 +798,7 @@ def build_entry_evidence_score(
         "components": components,
         "policy": (
             "硬风控只拦严重方向冲突和交易安全风险；"
-            "模型服务缺失或证据不足先按观望/极小探针处理，不等同于方向错误；"
+            "模型服务缺失或证据不足先按观望/影子学习处理，不等同于方向错误；"
             "其余按 AI/ML/时序/情绪/影子记忆/server_profit/币种方向历史的动态证据分映射仓位。"
         ),
     }

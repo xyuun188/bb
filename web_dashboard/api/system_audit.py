@@ -494,6 +494,18 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             .scalars()
             .all()
         )
+        recent_positions = list(
+            (
+                await session.execute(
+                    select(Position)
+                    .where(Position.created_at >= since)
+                    .order_by(Position.created_at.desc())
+                    .limit(300)
+                )
+            )
+            .scalars()
+            .all()
+        )
     actions = Counter(str(row.action or "unknown").lower() for row in decisions)
     entry_decisions = [
         row for row in decisions if str(row.action or "").lower() in {"long", "short"}
@@ -501,6 +513,8 @@ async def _strategy_quality_audit() -> dict[str, Any]:
     blocked_reasons: Counter[str] = Counter()
     zero_expected = 0
     negative_expected = 0
+    weak_shadow_executed = []
+    positive_weak_shadow_executed = []
     for row in entry_decisions:
         raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
         opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
@@ -514,10 +528,55 @@ async def _strategy_quality_audit() -> dict[str, Any]:
                     negative_expected += 1
             except (TypeError, ValueError):
                 pass
+            evidence_score = opportunity.get("evidence_score")
+            if isinstance(evidence_score, dict):
+                evidence_tier = str(evidence_score.get("tier") or "")
+                if evidence_tier in {"weak_conflict_probe", "degraded_missing_probe"} and bool(
+                    getattr(row, "was_executed", False)
+                ):
+                    sample = {
+                        "decision_id": row.id,
+                        "symbol": row.symbol,
+                        "action": row.action,
+                        "evidence_tier": evidence_tier,
+                        "expected_net_return_pct": round(_safe_float(net), 6),
+                        "position_size_pct": round(_safe_float(row.position_size_pct), 8),
+                        "created_at": _iso(row.created_at),
+                    }
+                    weak_shadow_executed.append(sample)
+                    if _safe_float(net) > 0:
+                        positive_weak_shadow_executed.append(sample)
         reason = str(getattr(row, "execution_reason", "") or "").strip()
         if reason:
             blocked_reasons[reason[:80]] += 1
+    position_notionals = sorted(
+        abs(_safe_float(pos.quantity) * _safe_float(pos.entry_price))
+        for pos in recent_positions
+        if abs(_safe_float(pos.quantity) * _safe_float(pos.entry_price)) > 0
+    )
+    notional_stats: dict[str, Any] = {"count": len(position_notionals)}
+    micro_notional_floor = 0.0
+    micro_position_count = 0
+    if position_notionals:
+        median_index = len(position_notionals) // 2
+        median_notional = position_notionals[median_index]
+        micro_notional_floor = max(5.0, median_notional * 0.35)
+        micro_position_count = sum(
+            1 for value in position_notionals if value <= micro_notional_floor
+        )
+        notional_stats.update(
+            {
+                "min": round(position_notionals[0], 6),
+                "avg": round(sum(position_notionals) / len(position_notionals), 6),
+                "median": round(median_notional, 6),
+                "max": round(position_notionals[-1], 6),
+                "micro_observation_floor_usdt": round(micro_notional_floor, 6),
+                "micro_position_count": micro_position_count,
+                "audit_only": True,
+            }
+        )
     fast_loss_positions = []
+    fast_loss_micro_positions = []
     for pos in closed_positions:
         created = pos.created_at
         closed = pos.closed_at
@@ -530,24 +589,33 @@ async def _strategy_quality_audit() -> dict[str, Any]:
         hold_minutes = max((closed - created).total_seconds() / 60.0, 0.0)
         pnl = float(pos.realized_pnl or 0.0)
         if hold_minutes <= 10 and pnl < 0:
-            fast_loss_positions.append(
-                {
-                    "id": pos.id,
-                    "symbol": pos.symbol,
-                    "side": pos.side,
-                    "hold_minutes": round(hold_minutes, 3),
-                    "realized_pnl": round(pnl, 8),
-                    "closed_at": _iso(closed),
-                }
-            )
+            notional = abs(_safe_float(pos.quantity) * _safe_float(pos.entry_price))
+            sample = {
+                "id": pos.id,
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "hold_minutes": round(hold_minutes, 3),
+                "realized_pnl": round(pnl, 8),
+                "notional_usdt": round(notional, 6),
+                "closed_at": _iso(closed),
+            }
+            fast_loss_positions.append(sample)
+            if micro_notional_floor > 0 and notional <= micro_notional_floor:
+                fast_loss_micro_positions.append(sample)
     warning = bool(
-        fast_loss_positions or (entry_decisions and negative_expected >= len(entry_decisions) * 0.7)
+        fast_loss_positions
+        or weak_shadow_executed
+        or (entry_decisions and negative_expected >= len(entry_decisions) * 0.7)
     )
     return _audit_card(
         "strategy_quality",
         "策略质量",
         "warning" if warning else "ok",
-        "存在快亏平或多数开仓候选净收益为负。" if warning else "最近策略质量未发现硬异常。",
+        (
+            "存在快亏平、弱证据误执行或多数开仓候选净收益为负。"
+            if warning
+            else "最近策略质量未发现硬异常。"
+        ),
         details={
             "window_hours": AUDIT_WINDOWS["strategy_hours"],
             "decision_count": len(decisions),
@@ -555,7 +623,13 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             "entry_decision_count": len(entry_decisions),
             "zero_expected_net_count": zero_expected,
             "negative_expected_net_count": negative_expected,
+            "weak_shadow_executed_count": len(weak_shadow_executed),
+            "positive_weak_shadow_executed_count": len(positive_weak_shadow_executed),
+            "weak_shadow_executed_samples": weak_shadow_executed[:10],
+            "position_notional_stats": notional_stats,
+            "micro_position_count": micro_position_count,
             "fast_loss_positions": fast_loss_positions[:10],
+            "fast_loss_micro_positions": fast_loss_micro_positions[:10],
             "top_blocked_reasons": [
                 {"reason": reason, "count": count}
                 for reason, count in blocked_reasons.most_common(8)
@@ -564,10 +638,14 @@ async def _strategy_quality_audit() -> dict[str, Any]:
         evidence=[
             {"label": "开仓候选", "value": len(entry_decisions)},
             {"label": "负净收益", "value": negative_expected},
+            {"label": "弱证据已执行", "value": len(weak_shadow_executed)},
+            {"label": "微小仓观测", "value": micro_position_count},
             {"label": "快亏平", "value": len(fast_loss_positions)},
         ],
         next_actions=[
             "负净收益占比高时先查成本/滑点/点差，不直接放宽开仓。",
+            "弱证据已执行不应为正；若出现，先查 entry_evidence 与执行器契约。",
+            "微小仓快亏平出现时先查仓位 sizing 与新仓释放保护，不继续扩大样本污染。",
             "快亏平出现时先看执行详情的风控步骤和 OKX 平仓来源。",
         ],
     )

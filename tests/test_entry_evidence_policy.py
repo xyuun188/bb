@@ -7,7 +7,11 @@ from services.entry_evidence import build_entry_evidence_score
 from services.entry_opportunity_gate import EntryOpportunityGatePolicy
 from services.entry_payoff_quality import EntryLowPayoffQualityPolicy
 from services.entry_signal_extraction import directional_expected_return_pct, expected_return_pct
-from services.entry_sizing import apply_evidence_sizing_policy, evidence_is_low_payoff_quality
+from services.entry_sizing import (
+    apply_evidence_sizing_policy,
+    evidence_is_low_payoff_quality,
+    evidence_is_tradeable_probe,
+)
 from services.entry_stop_loss_budget import EntryStopLossBudgetPolicy
 from services.entry_stress_stop import EntryStressStopPolicy
 from services.profit_attribution import extract_signal_sides
@@ -239,6 +243,10 @@ def test_missing_ml_and_timeseries_degrades_to_tiny_probe():
     assert evidence["size_multiplier"] == 0.05
     assert evidence["missing_key_sources"] == ["ml", "timeseries"]
     assert evidence["missing_key_degraded_relief"]["applied"] is True
+    assert evidence["missing_key_degraded_relief"]["tradeable_probe"] is False
+    assert evidence["missing_key_degraded_relief"]["shadow_only"] is True
+    assert evidence["tradeable_probe"] is False
+    assert evidence["shadow_only"] is True
     assert "动态证据评分硬拦截" not in str(reason or "")
 
 
@@ -350,12 +358,14 @@ def test_positive_net_return_relieves_blocked_evidence_to_controlled_probe():
     assert evidence["size_multiplier"] > 0.0
     assert evidence["positive_net_probe_relief"]["applied"] is True
     assert evidence["positive_net_probe_relief"]["expected_net_return_pct"] == pytest.approx(1.60)
-    assert evidence["tradeable_probe"] is True
-    assert evidence["shadow_only"] is False
+    assert evidence["positive_net_probe_relief"]["tradeable_probe"] is False
+    assert evidence["positive_net_probe_relief"]["shadow_only"] is True
+    assert evidence["tradeable_probe"] is False
+    assert evidence["shadow_only"] is True
     assert not any("three aligned" in item for item in evidence["advisory_wait_reasons"])
 
 
-def test_positive_net_weak_conflict_probe_is_tradeable_even_without_score_lift():
+def test_positive_net_weak_conflict_probe_stays_shadow_only_without_score_lift():
     decision = _decision(
         Action.SHORT,
         {
@@ -393,8 +403,10 @@ def test_positive_net_weak_conflict_probe_is_tradeable_even_without_score_lift()
 
     assert evidence["tier"] == "weak_conflict_probe"
     assert evidence["positive_net_probe_relief"]["applied"] is True
-    assert evidence["tradeable_probe"] is True
-    assert evidence["shadow_only"] is False
+    assert evidence["positive_net_probe_relief"]["tradeable_probe"] is False
+    assert evidence["positive_net_probe_relief"]["shadow_only"] is True
+    assert evidence["tradeable_probe"] is False
+    assert evidence["shadow_only"] is True
 
 
 def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
@@ -536,7 +548,7 @@ def test_server_profit_uses_adjusted_side_return_before_raw_return():
     assert "server_profit" not in evidence["aligned_support_sources"]
 
 
-def test_short_probe_relief_allows_tiny_short_when_quant_and_direction_align():
+def test_short_probe_relief_stays_shadow_only_when_quant_and_direction_align():
     decision = _decision(
         Action.SHORT,
         {
@@ -583,8 +595,10 @@ def test_short_probe_relief_allows_tiny_short_when_quant_and_direction_align():
     assert evidence["effective_score"] == 35.0
     assert evidence["tier"] == "weak_conflict_probe"
     assert evidence["size_multiplier"] == pytest.approx(0.03)
-    assert evidence["tradeable_probe"] is True
-    assert evidence["shadow_only"] is False
+    assert evidence["short_probe_relief"]["tradeable_probe"] is False
+    assert evidence["short_probe_relief"]["shadow_only"] is True
+    assert evidence["tradeable_probe"] is False
+    assert evidence["shadow_only"] is True
 
 
 def test_entry_evidence_maps_45_to_exploration_tier():
@@ -871,6 +885,8 @@ def test_weak_conflict_probe_sizing_caps_position_and_leverage():
         )
         is True
     )
+    assert evidence_is_tradeable_probe({"tier": "weak_conflict_probe"}, 38.0) is False
+    assert evidence_is_tradeable_probe({"tier": "exploration"}, 45.0) is True
 
 
 @pytest.mark.asyncio

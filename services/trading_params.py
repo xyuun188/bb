@@ -665,7 +665,7 @@ class ExitPositionQualityParams:
     bypass this protection when loss evidence is severe.
     """
 
-    fresh_position_min_release_hold_hours: float = 0.10
+    fresh_position_min_release_hold_hours: float = 0.25
     fresh_position_score_floor: float = 72.0
     fresh_position_hard_risk_loss_ratio: float = -0.05
 
