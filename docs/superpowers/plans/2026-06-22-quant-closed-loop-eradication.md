@@ -725,6 +725,40 @@ AI 防偏要求：
 
 ---
 
+## 二十、Batch H 补充记录：巡检口径修复与线上复查（2026-06-23）
+
+触发原因：Batch H 上线观察期间，以真实服务用户视角运行系统巡检时，`trade_execution_contract` 曾因 24 小时历史旧样本返回 `critical`。进一步只读核查确认：历史窗口内仍有 5 个契约遗留 violation（4 条弱证据执行、1 条缺开仓解释），但上线后精确窗口没有新增弱证据执行、失败订单或快亏平。因此本次只修复只读巡检口径，不放宽开仓、不改杠杆、不绕过风控、不修改真实库历史数据。
+
+本次代码修复：
+- `services/trade_execution_contract.py`：`TradeExecutionContractService.report()` 增加 `since` 当前窗口过滤，`query_policy` 记录 `db_time_filter/since_utc`，用于区分历史 24 小时审计和服务重启后的当前运行窗口。
+- `web_dashboard/api/system_audit.py`：`trade_execution_contract` 巡检同时保留历史报告和当前 runtime window 报告；只有当前窗口出现硬违规时才标记 `critical`，历史遗留但当前未复现时标记为 `warning/observing`。
+- 新增回归测试覆盖：历史报告有弱证据执行、当前窗口干净时，系统巡检不能误报 current critical；`since` 过滤必须排除旧决策和旧订单。
+
+本地验证：
+- `pytest tests/test_trade_execution_contract.py tests/test_system_audit_api.py -q`：33 passed。
+- `pytest -q`（显式临时 SQLite，避免触碰线上库）：1298 passed。
+- `ruff check .`：0 issues。
+- `black --check scripts services web_dashboard/api tests ai_brain config db executor core`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+- `git diff --check`：通过。
+
+线上部署与复查：
+- `python scripts/sync_to_online_server.py --split-services` 上传 3 个变更文件并重启成功：`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 模型服务复查：`qwen3-14b-trade.service`、`deepseek-r1-14b-risk.service`、`local-ai-tools.service` active；废弃模型服务 inactive。
+- 线上系统巡检复查：整体 `warning`，`critical_cards=[]`；`trade_execution_contract` 状态降为 warning，摘要为“24h historical trade execution contract violations remain; current runtime window has not reproduced them.”
+- `trade_execution_contract` 当前窗口：runtime started_at `2026-06-22T22:56:20.865347+00:00`，`current_summary.contract_violation_count=0`、`weak_evidence_executed_count=0`、`executed_entry_count=0`、`fast_loss_without_strong_exit_count=0`；历史窗口仍保留 `contract_violation_count=5`，不得标记全绿。
+- 重启后精确窗口约 2.21 分钟：3 decisions，全部 hold；entry/orders/filled/failed_or_rejected/positions_created/positions_closed/fast_loss/weak_evidence_executed 全部 0；strategy_learning_events 3。
+- 120 分钟策略健康窗口：242 decisions，全部 hold；entry/orders/failed_orders/fast_loss_close_under_15m 均 0；open_positions 2。该窗口包含重启前样本，只用于确认没有新增执行错误，不代表收益改善。
+- `model_training` 仍为 warning，但细节显示 local AI tools 可用、runtime_probe ok、shadow_sample_count 19982、trade_sample_count 1600、text_sentiment_sample_count 8000；硬 warning 来源是 Scrapling 外部事件采集已启用但没有有效 HTTPS 公网采集源。该问题属于外部事件数据源配置风险，不得被当作放宽开仓理由。
+
+继续观察规则：
+- Batch H 仍未完成，必须继续 2h/24h/72h 或至少 20 笔已平仓订单观察。
+- 后续如果当前窗口新增 `critical`、失败订单、弱证据执行、快亏平、绕过风控、无强证据亏损复开，必须停止扩大逻辑并回到对应批次定位。
+- 当前仍是 0 开仓，不允许为了制造交易量直接放宽阈值；若持续 0 开仓且 missed opportunity 高，应诊断候选证据链、expected net、成本/滑点、模型 readiness、特征缺失和同币种同方向重复证据，而不是绕过风险门。
+- 回滚点：本次修复只涉及 `services/trade_execution_contract.py`、`web_dashboard/api/system_audit.py` 及对应测试；线上若需回滚，可回到部署前 commit `7eaa8e4` 或回滚本次提交并重启三项服务。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

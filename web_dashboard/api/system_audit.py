@@ -1439,14 +1439,85 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
     )
 
 
+def _trade_contract_violation_counts(summary: dict[str, Any]) -> tuple[int, int]:
+    hard = (
+        int(summary.get("weak_evidence_executed_count") or 0)
+        + int(summary.get("negative_expected_executed_count") or 0)
+        + int(summary.get("fast_loss_without_strong_exit_count") or 0)
+        + int(summary.get("reentry_without_strong_unlock_count") or 0)
+    )
+    soft = (
+        int(summary.get("missing_entry_explanation_count") or 0)
+        + int(summary.get("missing_sizing_explanation_count") or 0)
+        + int(summary.get("small_size_without_reason_count") or 0)
+    )
+    return hard, soft
+
+
+def _trade_contract_current_window(
+    *,
+    runtime_window: dict[str, Any],
+    current_summary: dict[str, Any],
+    current_hard_violations: int,
+    current_soft_violations: int,
+    historical_has_violations: bool,
+) -> dict[str, Any]:
+    started_at = _parse_utc_datetime(runtime_window.get("started_at"))
+    available = bool(runtime_window.get("available") and started_at is not None)
+    return {
+        "available": available,
+        "started_at": runtime_window.get("started_at_iso") or _iso(started_at),
+        "heartbeat_at": runtime_window.get("heartbeat_at_iso"),
+        "running": bool(runtime_window.get("running")),
+        "mode": runtime_window.get("mode"),
+        "decision_interval": runtime_window.get("decision_interval"),
+        "decision_count": int(current_summary.get("decision_count") or 0),
+        "executed_entry_count": int(current_summary.get("executed_entry_count") or 0),
+        "weak_evidence_executed_count": int(
+            current_summary.get("weak_evidence_executed_count") or 0
+        ),
+        "negative_expected_executed_count": int(
+            current_summary.get("negative_expected_executed_count") or 0
+        ),
+        "fast_loss_without_strong_exit_count": int(
+            current_summary.get("fast_loss_without_strong_exit_count") or 0
+        ),
+        "reentry_without_strong_unlock_count": int(
+            current_summary.get("reentry_without_strong_unlock_count") or 0
+        ),
+        "soft_violation_count": int(current_soft_violations),
+        "hard_violation_count": int(current_hard_violations),
+        "contract_violation_count": int(current_summary.get("contract_violation_count") or 0),
+        "historical_legacy_issues": bool(
+            available
+            and historical_has_violations
+            and not current_hard_violations
+            and not current_soft_violations
+            and not int(current_summary.get("contract_violation_count") or 0)
+        ),
+    }
+
+
 async def _trade_execution_contract_audit() -> dict[str, Any]:
     try:
+        service = TradeExecutionContractService()
         report = _safe_trade_execution_contract_report(
-            await TradeExecutionContractService().report(
+            await service.report(
                 hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
                 limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
             )
         )
+        runtime_window = _load_trading_runtime_audit_window()
+        runtime_started_at = _parse_utc_datetime(runtime_window.get("started_at"))
+        current_report: dict[str, Any] | None = None
+        if runtime_started_at is not None:
+            current_report = _safe_trade_execution_contract_report(
+                await service.report(
+                    hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
+                    limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+                    since=runtime_started_at,
+                )
+            )
     except Exception as exc:
         return _audit_card(
             "trade_execution_contract",
@@ -1466,28 +1537,46 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
         )
     summary = _safe_dict(report.get("summary"))
     violation_counts = _safe_dict(report.get("violation_reason_counts"))
+    current_summary = _safe_dict(current_report.get("summary")) if current_report else {}
+    current_violation_counts = (
+        _safe_dict(current_report.get("violation_reason_counts")) if current_report else {}
+    )
     weak_executed = int(summary.get("weak_evidence_executed_count") or 0)
     negative_expected = int(summary.get("negative_expected_executed_count") or 0)
     fast_loss_without_exit = int(summary.get("fast_loss_without_strong_exit_count") or 0)
     reentry_without_unlock = int(summary.get("reentry_without_strong_unlock_count") or 0)
-    missing_explanation = int(summary.get("missing_entry_explanation_count") or 0)
     missing_sizing = int(summary.get("missing_sizing_explanation_count") or 0)
-    small_size_without_reason = int(summary.get("small_size_without_reason_count") or 0)
-    hard_violations = (
-        weak_executed + negative_expected + fast_loss_without_exit + reentry_without_unlock
+    hard_violations, soft_violations = _trade_contract_violation_counts(summary)
+    current_hard_violations, current_soft_violations = _trade_contract_violation_counts(
+        current_summary
     )
-    soft_violations = missing_explanation + missing_sizing + small_size_without_reason
+    current_window = _trade_contract_current_window(
+        runtime_window=runtime_window,
+        current_summary=current_summary,
+        current_hard_violations=current_hard_violations,
+        current_soft_violations=current_soft_violations,
+        historical_has_violations=bool(hard_violations or soft_violations or violation_counts),
+    )
     status = _status_from_counts(
-        critical=bool(hard_violations),
-        warning=bool(soft_violations or violation_counts),
+        critical=bool(current_hard_violations if current_report else hard_violations),
+        warning=bool(
+            current_soft_violations
+            or current_violation_counts
+            or current_window.get("historical_legacy_issues")
+            or (not current_report and (soft_violations or violation_counts))
+        ),
     )
     summary_text = (
-        "Trade execution has hard contract violations in entry evidence, expected net, fast exits or loss re-entry."
-        if hard_violations
+        "Trade execution has current hard contract violations in entry evidence, expected net, fast exits or loss re-entry."
+        if (current_hard_violations if current_report else hard_violations)
         else (
-            "Trade execution contract is missing explanations or sizing reasons; keep observing before tuning live logic."
-            if soft_violations
-            else "Trade execution contract passed for recent executed entries and closed positions."
+            "24h historical trade execution contract violations remain; current runtime window has not reproduced them."
+            if current_window.get("historical_legacy_issues")
+            else (
+                "Trade execution contract is missing explanations or sizing reasons; keep observing before tuning live logic."
+                if (current_soft_violations if current_report else soft_violations)
+                else "Trade execution contract passed for recent executed entries and closed positions."
+            )
         )
     )
     return _audit_card(
@@ -1502,11 +1591,26 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
             "can_bypass_risk_controls": False,
             "summary": summary,
             "violation_reason_counts": violation_counts,
+            "current_summary": current_summary,
+            "current_violation_reason_counts": current_violation_counts,
+            "current_runtime_window": current_window,
             "entry_explanations": _safe_list(report.get("entry_explanations"))[:10],
             "fast_loss_samples": _safe_list(report.get("fast_loss_samples"))[:10],
             "violations": _safe_list(report.get("violations"))[:10],
+            "current_entry_explanations": (
+                _safe_list(current_report.get("entry_explanations"))[:10] if current_report else []
+            ),
+            "current_fast_loss_samples": (
+                _safe_list(current_report.get("fast_loss_samples"))[:10] if current_report else []
+            ),
+            "current_violations": (
+                _safe_list(current_report.get("violations"))[:10] if current_report else []
+            ),
             "policy": _safe_dict(report.get("policy")),
             "query_policy": _safe_dict(report.get("query_policy")),
+            "current_query_policy": (
+                _safe_dict(current_report.get("query_policy")) if current_report else {}
+            ),
         },
         evidence=[
             {"label": "执行开仓", "value": int(summary.get("executed_entry_count") or 0)},

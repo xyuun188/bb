@@ -666,6 +666,120 @@ async def test_trade_execution_contract_audit_and_endpoint_force_read_only(
 
 
 @pytest.mark.asyncio
+async def test_trade_execution_contract_audit_treats_historical_only_as_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_started_at = datetime(2026, 6, 22, 2, 0, tzinfo=UTC)
+    calls: list[tuple[int, int, datetime | None]] = []
+
+    historical_report = {
+        "audit_only": False,
+        "live_entry_mutation": True,
+        "live_exit_mutation": True,
+        "can_bypass_risk_controls": True,
+        "summary": {
+            "executed_entry_count": 4,
+            "missing_entry_explanation_count": 1,
+            "missing_sizing_explanation_count": 0,
+            "weak_evidence_executed_count": 2,
+            "negative_expected_executed_count": 0,
+            "fast_loss_count": 1,
+            "fast_loss_without_strong_exit_count": 0,
+            "reentry_without_strong_unlock_count": 0,
+            "small_size_without_reason_count": 0,
+            "contract_violation_count": 3,
+        },
+        "violation_reason_counts": {"weak_evidence_executed": 2},
+        "entry_explanations": [{"decision_id": 1, "violations": ["weak_evidence_executed"]}],
+        "fast_loss_samples": [{"id": 10, "symbol": "BTC/USDT"}],
+        "violations": [{"reason": "weak_evidence_executed"}],
+    }
+    current_report = {
+        "audit_only": False,
+        "live_entry_mutation": True,
+        "live_exit_mutation": True,
+        "can_bypass_risk_controls": True,
+        "summary": {
+            "decision_count": 12,
+            "executed_entry_count": 0,
+            "missing_entry_explanation_count": 0,
+            "missing_sizing_explanation_count": 0,
+            "weak_evidence_executed_count": 0,
+            "negative_expected_executed_count": 0,
+            "fast_loss_count": 0,
+            "fast_loss_without_strong_exit_count": 0,
+            "reentry_without_strong_unlock_count": 0,
+            "small_size_without_reason_count": 0,
+            "contract_violation_count": 0,
+        },
+        "violation_reason_counts": {},
+        "entry_explanations": [],
+        "fast_loss_samples": [],
+        "violations": [],
+        "query_policy": {"db_time_filter": True},
+    }
+
+    class FakeTradeExecutionContractService:
+        async def report(
+            self,
+            *,
+            hours: int = 24,
+            limit: int = 500,
+            since: datetime | None = None,
+        ) -> dict[str, Any]:
+            calls.append((hours, limit, since))
+            return current_report if since is not None else historical_report
+
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_audit_window",
+        lambda: {
+            "available": True,
+            "started_at": runtime_started_at,
+            "started_at_iso": runtime_started_at.isoformat(),
+            "heartbeat_at": datetime(2026, 6, 22, 2, 5, tzinfo=UTC),
+            "heartbeat_at_iso": "2026-06-22T02:05:00+00:00",
+            "running": True,
+            "mode": "paper",
+            "decision_interval": 30,
+        },
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "TradeExecutionContractService",
+        lambda: FakeTradeExecutionContractService(),
+    )
+
+    card = await system_audit._trade_execution_contract_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert calls == [(24, 500, None), (24, 500, runtime_started_at)]
+    assert card["status"] == "warning"
+    assert card["details"]["summary"]["contract_violation_count"] == 3
+    assert card["details"]["current_summary"]["contract_violation_count"] == 0
+    assert card["details"]["current_runtime_window"] == {
+        "available": True,
+        "started_at": "2026-06-22T02:00:00+00:00",
+        "heartbeat_at": "2026-06-22T02:05:00+00:00",
+        "running": True,
+        "mode": "paper",
+        "decision_interval": 30,
+        "decision_count": 12,
+        "executed_entry_count": 0,
+        "weak_evidence_executed_count": 0,
+        "negative_expected_executed_count": 0,
+        "fast_loss_without_strong_exit_count": 0,
+        "reentry_without_strong_unlock_count": 0,
+        "soft_violation_count": 0,
+        "hard_violation_count": 0,
+        "contract_violation_count": 0,
+        "historical_legacy_issues": True,
+    }
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "trade_execution_contract"
+
+
+@pytest.mark.asyncio
 async def test_crypto_feature_coverage_audit_and_endpoint_force_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -26,6 +26,7 @@ class TradeExecutionContractService:
         *,
         hours: int = DEFAULT_REPORT_WINDOW_HOURS,
         limit: int = DEFAULT_REPORT_LIMIT,
+        since: datetime | None = None,
     ) -> dict[str, Any]:
         from sqlalchemy import and_, or_, select
 
@@ -35,26 +36,63 @@ class TradeExecutionContractService:
 
         capped_hours = max(1, min(int(hours or DEFAULT_REPORT_WINDOW_HOURS), 168))
         capped_limit = max(50, min(int(limit or DEFAULT_REPORT_LIMIT), 1000))
+        since_utc = _normalize_since(since)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
             decision_result = await session.execute(
-                select(AIDecision).order_by(AIDecision.id.desc()).limit(capped_limit)
+                _apply_since_filter(
+                    select(AIDecision),
+                    AIDecision,
+                    since_utc=since_utc,
+                )
+                .order_by(AIDecision.id.desc())
+                .limit(capped_limit)
             )
             order_result = await session.execute(
-                select(Order).order_by(Order.id.desc()).limit(capped_limit)
+                _apply_since_filter(
+                    select(Order),
+                    Order,
+                    since_utc=since_utc,
+                )
+                .order_by(Order.id.desc())
+                .limit(capped_limit)
             )
             position_result = await session.execute(
-                select(Position).order_by(Position.id.desc()).limit(capped_limit)
+                _apply_position_since_filter(
+                    select(Position),
+                    Position,
+                    since_utc=since_utc,
+                    or_=or_,
+                )
+                .order_by(Position.id.desc())
+                .limit(capped_limit)
             )
-            decisions = [
-                row for row in decision_result.scalars().all() if _row_recent(row, capped_hours)
-            ]
-            orders = [row for row in order_result.scalars().all() if _row_recent(row, capped_hours)]
-            positions = [
-                row
-                for row in position_result.scalars().all()
-                if _row_recent(row, capped_hours) or _closed_recent(row, capped_hours)
-            ]
+            if since_utc is not None:
+                decisions = [
+                    row
+                    for row in decision_result.scalars().all()
+                    if _row_at_or_after(row, since_utc)
+                ]
+                orders = [
+                    row for row in order_result.scalars().all() if _row_at_or_after(row, since_utc)
+                ]
+                positions = [
+                    row
+                    for row in position_result.scalars().all()
+                    if _row_at_or_after(row, since_utc) or _closed_at_or_after(row, since_utc)
+                ]
+            else:
+                decisions = [
+                    row for row in decision_result.scalars().all() if _row_recent(row, capped_hours)
+                ]
+                orders = [
+                    row for row in order_result.scalars().all() if _row_recent(row, capped_hours)
+                ]
+                positions = [
+                    row
+                    for row in position_result.scalars().all()
+                    if _row_recent(row, capped_hours) or _closed_recent(row, capped_hours)
+                ]
             supplemental_order_decisions = await _load_supplemental_order_decisions(
                 session=session,
                 decision_model=AIDecision,
@@ -88,7 +126,7 @@ class TradeExecutionContractService:
         report["query_policy"] = {
             "online_safe": True,
             "ordered_by_primary_key": True,
-            "db_time_filter": False,
+            "db_time_filter": since_utc is not None,
             "row_limit": capped_limit,
             "supplemental_order_decision_lookup": bool(supplemental_order_decisions),
             "supplemental_order_decision_count": len(supplemental_order_decisions),
@@ -97,6 +135,8 @@ class TradeExecutionContractService:
             "supplemental_exit_decision_count": len(supplemental_exit_decisions),
             "supplemental_fast_loss_position_count": len(fast_loss_positions),
         }
+        if since_utc is not None:
+            report["query_policy"]["since_utc"] = since_utc.isoformat()
         return report
 
 
@@ -553,6 +593,42 @@ def _closed_recent(row: Any, hours: int) -> bool:
     if closed is None:
         return False
     return (_now_utc() - closed).total_seconds() <= hours * 3600
+
+
+def _normalize_since(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _row_at_or_after(row: Any, since: datetime) -> bool:
+    created = _parse_datetime(_row_get(row, "created_at"))
+    return created is not None and created >= since
+
+
+def _closed_at_or_after(row: Any, since: datetime) -> bool:
+    closed = _parse_datetime(_row_get(row, "closed_at"))
+    return closed is not None and closed >= since
+
+
+def _apply_since_filter(statement: Any, model: Any, *, since_utc: datetime | None) -> Any:
+    if since_utc is None:
+        return statement
+    return statement.where(model.created_at >= since_utc)
+
+
+def _apply_position_since_filter(
+    statement: Any,
+    model: Any,
+    *,
+    since_utc: datetime | None,
+    or_: Any,
+) -> Any:
+    if since_utc is None:
+        return statement
+    return statement.where(or_(model.created_at >= since_utc, model.closed_at >= since_utc))
 
 
 def _now_utc() -> datetime:

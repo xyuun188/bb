@@ -74,14 +74,19 @@ def _entry_decision(
     )
 
 
-def _order(decision_id: int, *, status: str = "filled") -> SimpleNamespace:
+def _order(
+    decision_id: int,
+    *,
+    status: str = "filled",
+    created_at: datetime | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=10 + decision_id,
         decision_id=decision_id,
         symbol="BTC/USDT",
         side="buy",
         status=status,
-        created_at=datetime(2026, 6, 23, 8, 1, tzinfo=UTC),
+        created_at=created_at or datetime(2026, 6, 23, 8, 1, tzinfo=UTC),
     )
 
 
@@ -350,6 +355,85 @@ async def test_report_uses_recent_primary_key_window_for_online_read_only_path()
     assert any("ORDER BY ai_decisions.id DESC" in item for item in fake_session.statements)
     assert any("ORDER BY orders.id DESC" in item for item in fake_session.statements)
     assert any("ORDER BY positions.id DESC" in item for item in fake_session.statements)
+
+
+@pytest.mark.asyncio
+async def test_report_since_filters_legacy_decisions_and_orders_from_current_window() -> None:
+    since = datetime(2026, 6, 23, 8, 0, tzinfo=UTC)
+    old_at = since - timedelta(minutes=30)
+    current_at = since + timedelta(minutes=5)
+
+    class FakeScalarResult:
+        def __init__(self, rows: list[SimpleNamespace]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[SimpleNamespace]:
+            return self._rows
+
+    class FakeResult:
+        def __init__(self, rows: list[SimpleNamespace]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeScalarResult:
+            return FakeScalarResult(self._rows)
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+            self.ai_decision_calls = 0
+
+        async def execute(self, statement: object) -> FakeResult:
+            compiled = str(statement)
+            self.statements.append(compiled)
+            if "FROM ai_decisions" in compiled:
+                self.ai_decision_calls += 1
+                if self.ai_decision_calls > 1:
+                    return FakeResult([])
+                return FakeResult(
+                    [
+                        _entry_decision(
+                            decision_id=1,
+                            evidence_tier="weak_conflict_probe",
+                            created_at=old_at,
+                        ),
+                        _entry_decision(decision_id=2, created_at=current_at),
+                    ]
+                )
+            if "FROM orders" in compiled:
+                return FakeResult(
+                    [
+                        _order(1, created_at=old_at),
+                        _order(2, created_at=current_at),
+                    ]
+                )
+            if "FROM positions" in compiled:
+                return FakeResult([])
+            return FakeResult([])
+
+    class FakeSessionContext:
+        def __init__(self, session: FakeSession) -> None:
+            self._session = session
+
+        async def __aenter__(self) -> FakeSession:
+            return self._session
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    fake_session = FakeSession()
+
+    def session_context_factory() -> FakeSessionContext:
+        return FakeSessionContext(fake_session)
+
+    report = await TradeExecutionContractService(
+        session_context_factory=session_context_factory
+    ).report(since=since)
+
+    assert report["summary"]["executed_entry_count"] == 1
+    assert report["summary"]["weak_evidence_executed_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["query_policy"]["db_time_filter"] is True
+    assert report["query_policy"]["since_utc"] == "2026-06-23T08:00:00+00:00"
 
 
 @pytest.mark.asyncio
