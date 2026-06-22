@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from datetime import UTC, datetime
 
 from config.settings import settings
-from db.session import close_db, init_db
-from db.session import get_session_ctx
+from db.session import close_db, get_session_ctx, init_db
 from models.market_data import Kline
 from web_dashboard.api import data_collection as data_collection_module
 from web_dashboard.app import create_app

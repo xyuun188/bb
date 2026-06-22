@@ -363,7 +363,6 @@ async def test_does_not_pair_order_when_decision_action_conflicts(
                 ]
             )
             await session.flush()
-            close_order_id = close_decision.id
 
         async with get_session_ctx() as session:
             order_result = await session.execute(select(Order).where(Order.side == "buy"))

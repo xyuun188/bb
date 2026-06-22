@@ -40,6 +40,15 @@ def _table_names() -> list[str]:
     return [table.name for table in Base.metadata.sorted_tables]
 
 
+def _sqlite_table_identifier(table_name: str) -> str:
+    known_tables = set(_table_names())
+    if table_name not in known_tables:
+        raise ValueError(f"Unknown SQLAlchemy table: {table_name}")
+    if not table_name.replace("_", "").isalnum():
+        raise ValueError(f"Unsafe SQLite table identifier: {table_name}")
+    return f'"{table_name}"'
+
+
 def _load_json(value: Any) -> Any:
     if value is None or isinstance(value, (dict, list)):
         return value
@@ -103,7 +112,9 @@ def _sqlite_tables(conn: sqlite3.Connection) -> set[str]:
 
 
 def _count_sqlite(conn: sqlite3.Connection, table_name: str) -> int:
-    return int(conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
+    table_identifier = _sqlite_table_identifier(table_name)
+    query = f"SELECT COUNT(*) FROM {table_identifier}"  # noqa: S608
+    return int(conn.execute(query).fetchone()[0])
 
 
 async def _count_target(table: Any) -> int:
@@ -128,17 +139,20 @@ async def _reset_postgres_sequences() -> None:
         for table in Base.metadata.sorted_tables:
             if "id" not in table.c:
                 continue
+            max_result = await conn.execute(select(func.max(table.c.id)))
+            max_id = int(max_result.scalar_one_or_none() or 0)
             await conn.execute(
                 text(
-                    "SELECT setval(pg_get_serial_sequence(:table_name, 'id'), "
-                    "COALESCE((SELECT MAX(id) FROM "
-                    + table.name
-                    + "), 1), "
-                    "COALESCE((SELECT MAX(id) FROM "
-                    + table.name
-                    + "), 0) > 0)"
+                    "SELECT setval("
+                    "pg_get_serial_sequence(:table_name, 'id'), "
+                    ":sequence_value, "
+                    ":is_called)"
                 ),
-                {"table_name": table.name},
+                {
+                    "table_name": table.name,
+                    "sequence_value": max(max_id, 1),
+                    "is_called": max_id > 0,
+                },
             )
 
 
@@ -178,11 +192,12 @@ async def migrate_sqlite_to_postgres(
             source_count = _count_sqlite(sqlite_conn, table.name)
             inserted_count = 0
             offset = 0
+            table_identifier = _sqlite_table_identifier(table.name)
             while True:
-                rows = sqlite_conn.execute(
-                    f'SELECT * FROM "{table.name}" ORDER BY id LIMIT ? OFFSET ?',
-                    (batch_size, offset),
-                ).fetchall()
+                query = (
+                    f"SELECT * FROM {table_identifier} ORDER BY id LIMIT ? OFFSET ?"  # noqa: S608
+                )
+                rows = sqlite_conn.execute(query, (batch_size, offset)).fetchall()
                 if not rows:
                     break
                 payload = [_coerce_row(table, row) for row in rows]
