@@ -178,6 +178,15 @@ def test_opportunity_score_execution_state_uses_final_status() -> None:
     assert "已进入执行队列" not in script
 
 
+def test_system_audit_model_training_distinguishes_optional_sources() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "optional_source_warnings" in script
+    assert "可选增强源" in script
+    assert "硬故障" in script
+    assert "学习观察" in script
+
+
 def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
@@ -258,6 +258,157 @@ async def test_model_training_audit_does_not_run_full_self_check(
 
 
 @pytest.mark.asyncio
+async def test_model_training_optional_sources_are_observing_not_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status() -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "learning_only",
+                    "shadow_sample_count": 19979,
+                    "trade_sample_count": 1588,
+                    "text_sentiment_sample_count": 8000,
+                },
+                "governance": {"status": "ok"},
+            },
+            "sources": [
+                {
+                    "key": "cryptopanic",
+                    "name": "CryptoPanic",
+                    "group": "api",
+                    "enabled": False,
+                    "status": "not_configured",
+                },
+                {
+                    "key": "coinmarketcal",
+                    "name": "CoinMarketCal",
+                    "group": "api",
+                    "enabled": False,
+                    "status": "not_configured",
+                },
+                {
+                    "key": "newsapi",
+                    "name": "NewsAPI",
+                    "group": "api",
+                    "enabled": False,
+                    "status": "not_configured",
+                },
+            ],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [
+                {"model": "qwen3-14b-trade", "available": True},
+                {"model": "deepseek-r1-14b-risk", "available": True},
+            ],
+            "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["hard_failure"] is False
+    assert card["details"]["optional_source_warning_count"] == 3
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "model_training"
+
+
+@pytest.mark.asyncio
+async def test_model_training_auth_failure_remains_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status() -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": False,
+                    "status": "error",
+                    "shadow_sample_count": 0,
+                    "trade_sample_count": 0,
+                    "text_sentiment_sample_count": 0,
+                },
+                "governance": {"status": "ok"},
+            },
+            "sources": [],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
+            "local_ai_tools": {
+                "available": False,
+                "api_base": "http://127.0.0.1:18001",
+                "health": {"status_category": "auth_failed"},
+            },
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "critical"
+    assert card["details"]["hard_failure"] is True
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 1, "observing": 0, "total": 1}
+    assert ledger["unresolved"][0]["key"] == "model_training"
+
+
+@pytest.mark.asyncio
+async def test_model_training_runtime_probe_timeout_is_observing_when_training_is_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status() -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "learning_only",
+                    "shadow_sample_count": 19979,
+                    "trade_sample_count": 1588,
+                    "text_sentiment_sample_count": 8000,
+                },
+                "governance": {"status": "ok"},
+            },
+            "sources": [],
+        }
+
+    async def timeout_runtime_status() -> dict[str, Any]:
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", timeout_runtime_status)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["runtime_probe"]["timeout"] is True
+    assert card["details"]["hard_failure"] is False
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "model_training"
+
+
+@pytest.mark.asyncio
 async def test_okx_reconciliation_audit_reuses_short_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -292,6 +443,74 @@ async def test_okx_reconciliation_audit_reuses_short_cache(
     assert first["details"]["cache"]["hit"] is False
     assert second["details"]["cache"]["hit"] is True
     assert second["details"]["missing_closed_positions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_reconciliation_timeout_is_observing_not_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_collect_missing_closed_position_plans(days: int) -> list[Any]:
+        raise TimeoutError()
+
+    monkeypatch.setattr(system_audit, "_okx_reconciliation_cache", None)
+    monkeypatch.setattr(
+        system_audit,
+        "collect_missing_closed_position_plans",
+        slow_collect_missing_closed_position_plans,
+    )
+
+    card = await system_audit._okx_reconciliation_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["timeout"] is True
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "okx_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_trade_loop_recent_restart_without_decisions_is_observing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from db.session import close_db, init_db
+
+    await close_db()
+    db_path = tmp_path / "audit.db"
+    now = datetime(2026, 6, 22, 4, 30, tzinfo=UTC)
+    started_at = now - timedelta(seconds=75)
+    monkeypatch.setattr(
+        system_audit.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{db_path.as_posix()}",
+    )
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_audit_window",
+        lambda: {
+            "available": True,
+            "started_at": started_at,
+            "started_at_iso": started_at.isoformat(),
+            "heartbeat_at": now - timedelta(seconds=5),
+            "heartbeat_at_iso": (now - timedelta(seconds=5)).isoformat(),
+            "running": True,
+            "mode": "paper",
+            "decision_interval": 30,
+        },
+    )
+
+    await init_db()
+    try:
+        card = await system_audit._trade_loop_audit()
+        ledger = system_audit._issue_ledger_from_cards([card])
+
+        assert card["status"] == "warning"
+        assert card["details"]["cold_start"] is True
+        assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+        assert ledger["observing"][0]["key"] == "trade_loop"
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

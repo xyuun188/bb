@@ -44,6 +44,7 @@ POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 4.0
+OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
 
 _okx_reconciliation_cache: tuple[datetime, dict[str, Any]] | None = None
 
@@ -255,6 +256,24 @@ def _store_okx_reconciliation_card(payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _split_training_source_warnings(
+    sources: list[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    optional: list[dict[str, Any]] = []
+    hard: list[dict[str, Any]] = []
+    for row in sources or []:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "").strip()
+        if status in {"active", "ok"}:
+            continue
+        if not bool(row.get("enabled")) and status in OPTIONAL_TRAINING_SOURCE_STATUSES:
+            optional.append(row)
+        else:
+            hard.append(row)
+    return optional, hard
+
+
 def _load_trading_runtime_audit_window() -> dict[str, Any]:
     path = settings.data_dir / "trading_runtime_status.json"
     if not path.exists():
@@ -403,6 +422,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
     now = _now()
     since_10m = now - timedelta(minutes=AUDIT_WINDOWS["fast_minutes"])
     since_2h = now - timedelta(hours=AUDIT_WINDOWS["trade_hours"])
+    runtime_window = _load_trading_runtime_audit_window()
     async with get_session_ctx() as session:
         recent_decisions = (
             await session.execute(
@@ -432,17 +452,38 @@ async def _trade_loop_audit() -> dict[str, Any]:
     decisions_count = int(decisions_2h[0] or 0)
     orders_count = int(orders_2h[0] or 0)
     latest_decision_age = _age_seconds(recent_decisions[1])
-    stalled = recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600)
+    runtime_age_seconds = _age_seconds(runtime_window.get("started_at"))
+    heartbeat_age_seconds = _age_seconds(runtime_window.get("heartbeat_at"))
+    try:
+        decision_interval = float(runtime_window.get("decision_interval") or 0)
+    except (TypeError, ValueError):
+        decision_interval = 0.0
+    cold_start_grace_seconds = max(decision_interval * 3.0, 0.0)
+    cold_start = bool(runtime_window.get("running")) and (
+        runtime_age_seconds is not None
+        and cold_start_grace_seconds > 0
+        and runtime_age_seconds <= cold_start_grace_seconds
+        and (heartbeat_age_seconds is None or heartbeat_age_seconds <= cold_start_grace_seconds)
+    )
+    stalled = not cold_start and (
+        recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600)
+    )
+    cold_start_no_orders = cold_start and orders_count == 0
     status = _status_from_counts(
-        critical=stalled, warning=orders_count == 0 and decisions_count > 30
+        critical=stalled,
+        warning=cold_start_no_orders or (orders_count == 0 and decisions_count > 30),
     )
     summary = (
-        "最近 10 分钟没有新增分析，交易主循环可能卡住。"
-        if stalled
+        "交易服务刚重启，当前处于冷启动观察窗口，暂不判定为不开仓异常。"
+        if cold_start_no_orders
         else (
-            "最近 2 小时有分析但没有订单，需结合开仓漏斗判断是否策略正常观望。"
-            if orders_count == 0 and decisions_count > 30
-            else "分析心跳和订单链路有活动。"
+            "最近 10 分钟没有新增分析，交易主循环可能卡住。"
+            if stalled
+            else (
+                "最近 2 小时有分析但没有订单，需结合开仓漏斗判断是否策略正常观望。"
+                if orders_count == 0 and decisions_count > 30
+                else "分析心跳和订单链路有活动。"
+            )
         )
     )
     return _audit_card(
@@ -457,13 +498,30 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "open_positions": int(open_positions or 0),
             "latest_decision_at": _iso(recent_decisions[1]),
             "latest_order_at": _iso(orders_2h[1]),
+            "cold_start": cold_start,
+            "cold_start_no_orders": cold_start_no_orders,
+            "runtime_age_seconds": (
+                round(runtime_age_seconds, 3) if runtime_age_seconds is not None else None
+            ),
+            "heartbeat_age_seconds": (
+                round(heartbeat_age_seconds, 3) if heartbeat_age_seconds is not None else None
+            ),
+            "cold_start_grace_seconds": round(cold_start_grace_seconds, 3),
+            "runtime_window": {
+                "running": bool(runtime_window.get("running")),
+                "mode": runtime_window.get("mode"),
+                "started_at": _iso(runtime_window.get("started_at")),
+                "heartbeat_at": _iso(runtime_window.get("heartbeat_at")),
+                "decision_interval": runtime_window.get("decision_interval"),
+            },
         },
         evidence=[
             {"label": "10分钟决策", "value": recent_count},
             {"label": "2小时订单", "value": orders_count},
         ],
         next_actions=[
-            "若 10 分钟决策为 0，先查交易服务心跳和当前 stage。",
+            "若处于冷启动观察窗口，先等交易服务完成至少 3 个调度周期再判定卡死。",
+            "若 10 分钟决策为 0 且不是冷启动，先查交易服务心跳和当前 stage。",
             "若有大量分析但无订单，打开开仓漏斗看收益期望/风控/OKX 规则分布。",
         ],
     )
@@ -476,14 +534,27 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
     try:
         plans = await asyncio.wait_for(collect_missing_closed_position_plans(days=14), timeout=8.0)
     except Exception as exc:
+        timeout = isinstance(exc, TimeoutError)
         return _store_okx_reconciliation_card(
             _audit_card(
                 "okx_reconciliation",
                 "OKX 历史对账",
                 "warning",
-                "OKX 本地订单反推历史仓位 dry-run 执行失败。",
-                details={"error": safe_error_text(exc, limit=180)},
-                next_actions=["先修复 dry-run 失败原因，不能直接补历史仓位。"],
+                (
+                    "OKX 历史对账 dry-run 超时；当前不能证明存在缺失仓位，先观察并重试。"
+                    if timeout
+                    else "OKX 本地订单反推历史仓位 dry-run 执行失败。"
+                ),
+                details={
+                    "error": safe_error_text(exc, limit=180),
+                    "timeout": timeout,
+                    "hard_failure": not timeout,
+                    "window_days": 14,
+                },
+                next_actions=[
+                    "dry-run 超时时先重试巡检或缩小窗口，不能直接补历史仓位。",
+                    "如果连续超时，再查数据库慢查询、订单数量和对账索引。",
+                ],
             )
         )
     missing = len(plans)
@@ -927,13 +998,15 @@ async def _model_training_audit() -> dict[str, Any]:
     local_tools = training.get("local_ai_tools") if isinstance(training, dict) else {}
     governance = training.get("governance") if isinstance(training, dict) else {}
     sources = data_status.get("sources") if isinstance(data_status, dict) else []
-    source_warnings = [row for row in sources or [] if row.get("status") not in {"active", "ok"}]
+    optional_source_warnings, hard_source_warnings = _split_training_source_warnings(sources)
     runtime_probe: dict[str, Any] = {"status": "unknown"}
     model_critical: list[dict[str, Any]] = []
     if isinstance(runtime_status, Exception):
+        timeout = isinstance(runtime_status, TimeoutError)
         runtime_probe = {
             "status": "warning",
             "error": safe_error_text(runtime_status, limit=180),
+            "timeout": timeout,
         }
     elif isinstance(runtime_status, dict):
         runtime_models = (
@@ -977,19 +1050,35 @@ async def _model_training_audit() -> dict[str, Any]:
                 bool(runtime_local_tools.get("configured")) if runtime_local_tools else False
             ),
         }
-    status = _status_from_counts(
-        critical=bool(model_critical),
-        warning=(
-            bool(source_warnings)
-            or not bool(local_tools.get("available"))
-            or runtime_probe.get("status") == "warning"
-        ),
+    runtime_probe_timeout = bool(runtime_probe.get("timeout"))
+    runtime_probe_hard_failure = runtime_probe.get("status") == "warning" and not (
+        runtime_probe_timeout and bool(local_tools.get("available"))
     )
+    hard_failure = (
+        bool(model_critical)
+        or bool(hard_source_warnings)
+        or not bool(local_tools.get("available"))
+        or runtime_probe_hard_failure
+    )
+    observing = not hard_failure and (
+        bool(optional_source_warnings)
+        or str(local_tools.get("status") or "").lower() == "learning_only"
+        or runtime_probe_timeout
+    )
+    status = _status_from_counts(
+        critical=bool(model_critical) or not bool(local_tools.get("available")),
+        warning=hard_failure or observing,
+    )
+    summary = "模型和训练数据状态正常。"
+    if hard_failure:
+        summary = "模型服务或训练数据源存在硬故障，需要处理。"
+    elif observing:
+        summary = "模型服务可用；可选增强数据源未配置、运行探针超时或模型仍在学习观察。"
     return _audit_card(
         "model_training",
         "模型与训练",
         status,
-        "模型和训练数据状态正常。" if status == "ok" else "模型服务或训练数据源需要关注。",
+        summary,
         details={
             "local_ai_tools": {
                 "available": bool(local_tools.get("available")),
@@ -1000,7 +1089,12 @@ async def _model_training_audit() -> dict[str, Any]:
             },
             "governance_status": governance.get("status") if isinstance(governance, dict) else None,
             "runtime_probe": runtime_probe,
-            "source_warnings": source_warnings[:8],
+            "hard_failure": hard_failure,
+            "observing": observing,
+            "source_warnings": hard_source_warnings[:8],
+            "optional_source_warnings": optional_source_warnings[:8],
+            "hard_source_warning_count": len(hard_source_warnings),
+            "optional_source_warning_count": len(optional_source_warnings),
             "model_critical_items": model_critical[:8],
         },
         evidence=[
@@ -1009,8 +1103,9 @@ async def _model_training_audit() -> dict[str, Any]:
             {"label": "文本样本", "value": local_tools.get("text_sentiment_sample_count") or 0},
         ],
         next_actions=[
-            "模型 critical 时优先查端口契约 18000/18001/18002。",
-            "训练数据源 warning 时先看数据采集页来源新鲜度。",
+            "模型 critical 时优先查端口契约 18000/18001/18002 和本地量化工具 API Key。",
+            "可选增强源未配置只影响新闻/事件覆盖，不应误判为模型训练硬故障。",
+            "learning_only 表示模型可用但仍需效果验证，继续看高分组收益和样本质量。",
         ],
     )
 
@@ -1542,6 +1637,17 @@ def _issue_ledger_state(
         return "fixed", "已修复 / 当前验证通过"
     if historical_only:
         return "observing", "历史遗留 / 当前未复现"
+    if (
+        key == "model_training"
+        and status == "warning"
+        and bool(details.get("observing"))
+        and not bool(details.get("hard_failure"))
+    ):
+        return "observing", "观察项 / 可选增强或学习模式"
+    if key == "okx_reconciliation" and status == "warning" and bool(details.get("timeout")):
+        return "observing", "观察项 / 对账巡检超时"
+    if key == "trade_loop" and status == "warning" and bool(details.get("cold_start")):
+        return "observing", "观察项 / 服务冷启动"
     if (
         key == "strategy_quality"
         and status == "warning"

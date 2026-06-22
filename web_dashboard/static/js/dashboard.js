@@ -5278,26 +5278,37 @@ function systemAuditStrategyDetails(details) {
 function systemAuditModelTrainingDetails(details) {
     const localTools = details.local_ai_tools || {};
     const sourceWarnings = Array.isArray(details.source_warnings) ? details.source_warnings : [];
+    const optionalSourceWarnings = Array.isArray(details.optional_source_warnings) ? details.optional_source_warnings : [];
     const criticalItems = Array.isArray(details.model_critical_items) ? details.model_critical_items : [];
     const sourceRows = sourceWarnings.slice(0, 6).map(item => [
         item.name || item.key || '-',
         collectionStatusLabel(item.status || '-', item.enabled !== false),
         item.detail || item.message || '-',
     ]);
-    const criticalRows = criticalItems.slice(0, 6).map(item => [
-        item.title || item.key || '-',
-        systemAuditStatusLabel(item.status),
-        item.message || '-',
+    const optionalRows = optionalSourceWarnings.slice(0, 6).map(item => [
+        item.name || item.key || '-',
+        collectionStatusLabel(item.status || '-', false),
+        item.detail || item.message || '未配置时只影响新闻/事件覆盖，不代表模型训练硬故障。',
     ]);
+    const criticalRows = criticalItems.slice(0, 6).map(item => [
+        item.model || item.title || item.key || '-',
+        systemAuditStatusLabel(item.status || (item.status_code ? 'critical' : '-')),
+        item.error || item.message || item.api_base || '-',
+    ]);
+    const modeText = details.hard_failure
+        ? '硬故障'
+        : (details.observing ? '学习观察' : '正常');
     return `
         <div class="system-audit-detail-grid">
+            ${systemAuditMetric('巡检判断', modeText, details.hard_failure ? '需要立即处理' : '非硬故障不进入未修复')}
             ${systemAuditMetric('本地量化工具', localTools.available ? '可用' : '不可用', collectionStatusLabel(localTools.status || '-', true))}
             ${systemAuditMetric('影子样本', localTools.shadow_sample_count ?? 0, '训练输入')}
             ${systemAuditMetric('交易样本', localTools.trade_sample_count ?? 0, '真实复盘输入')}
             ${systemAuditMetric('文本样本', localTools.text_sentiment_sample_count ?? 0, '新闻/情绪输入')}
             ${systemAuditMetric('治理状态', details.governance_status || '-', '训练数据清洗')}
         </div>
-        ${systemAuditSection('数据源告警', systemAuditTable(['来源', '状态', '说明'], sourceRows))}
+        ${systemAuditSection('硬故障数据源', systemAuditTable(['来源', '状态', '说明'], sourceRows))}
+        ${systemAuditSection('可选增强源', systemAuditTable(['来源', '状态', '说明'], optionalRows))}
         ${systemAuditSection('模型服务异常', systemAuditTable(['项目', '状态', '说明'], criticalRows))}`;
 }
 
