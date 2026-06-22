@@ -40,6 +40,16 @@ async def test_system_audit_status_aggregates_root_causes(
 ) -> None:
     monkeypatch.setattr(
         system_audit,
+        "_shadow_missed_opportunity_audit",
+        _async_card("shadow_missed_opportunity", "ok", "Shadow missed loop normal"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_trade_execution_contract_audit",
+        _async_card("trade_execution_contract", "ok", "Trade execution contract normal"),
+    )
+    monkeypatch.setattr(
+        system_audit,
         "_trade_loop_audit",
         _async_card("trade_loop", "critical", "交易主循环卡住", title="交易闭环"),
     )
@@ -85,6 +95,28 @@ async def test_system_audit_status_aggregates_root_causes(
     )
     monkeypatch.setattr(
         system_audit,
+        "_model_expert_health_audit",
+        _async_card("model_expert_health", "ok", "模型/专家体检正常", title="模型/专家体检"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_model_expert_competition_audit",
+        _async_card("model_expert_competition", "ok", "模型/专家竞赛正常", title="模型/专家竞赛"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_crypto_feature_coverage_audit",
+        _async_card(
+            "crypto_feature_coverage", "ok", "Crypto 特征覆盖正常", title="数字货币特征覆盖"
+        ),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_model_dynamic_routing_audit",
+        _async_card("model_dynamic_routing", "ok", "动态路由正常", title="模型动态路由"),
+    )
+    monkeypatch.setattr(
+        system_audit,
         "_strategy_gate_contract_audit",
         lambda: system_audit._audit_card(
             "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
@@ -97,23 +129,37 @@ async def test_system_audit_status_aggregates_root_causes(
             "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
         ),
     )
+    monkeypatch.setattr(
+        system_audit,
+        "_runtime_text_integrity_audit",
+        lambda: system_audit._audit_card(
+            "runtime_text_integrity", "运行时文本完整性", "ok", "无新增乱码"
+        ),
+    )
 
     payload = await system_audit.system_audit_status()
 
     assert payload["status"] == "critical"
     assert payload["status_label"] == "异常"
     assert payload["summary"] == {
-        "cards": 9,
+        "cards": 16,
         "critical": 1,
         "warning": 2,
-        "ok": 6,
+        "ok": 13,
         "findings": 3,
-        "nodes": 12,
+        "nodes": 18,
     }
     assert [card["status"] for card in payload["cards"]] == [
         "critical",
         "warning",
         "warning",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
         "ok",
         "ok",
         "ok",
@@ -126,19 +172,38 @@ async def test_system_audit_status_aggregates_root_causes(
         "market_data",
         "model_training",
     ]
+    assert all(item["owner_path"] for item in payload["root_causes"])
+    assert all(item["state"] in {"unresolved", "observing"} for item in payload["root_causes"])
     node_keys = {node["key"] for node in payload["nodes"]}
     assert "strategy_gate_contract" in node_keys
     assert "strategy_closed_loop" in node_keys
+    assert "model_expert_health" in node_keys
+    assert "model_expert_competition" in node_keys
+    assert "crypto_feature_coverage" in node_keys
+    assert "model_dynamic_routing" in node_keys
+    assert "shadow_missed_opportunity" in node_keys
     assert "visible_text_encoding" in node_keys
+    assert "runtime_text_integrity" in node_keys
+    assert all(node["owner_path"] for node in payload["nodes"])
+    assert all(node["state"] in {"fixed", "unresolved", "observing"} for node in payload["nodes"])
+    assert all(node["state_label"] for node in payload["nodes"])
     card_keys = {card["key"] for card in payload["cards"]}
     assert "strategy_gate_contract" in card_keys
     assert "strategy_closed_loop" in card_keys
+    assert "model_expert_health" in card_keys
+    assert "model_expert_competition" in card_keys
+    assert "crypto_feature_coverage" in card_keys
+    assert "model_dynamic_routing" in card_keys
+    assert "shadow_missed_opportunity" in card_keys
+    assert "trade_execution_contract" in card_keys
     assert "visible_text_encoding" in card_keys
+    assert "runtime_text_integrity" in card_keys
+    assert all(card["owner_path"] for card in payload["cards"])
     assert payload["issue_ledger"]["summary"] == {
-        "fixed": 6,
+        "fixed": 13,
         "unresolved": 3,
         "observing": 0,
-        "total": 9,
+        "total": 16,
     }
     assert [item["key"] for item in payload["issue_ledger"]["unresolved"]] == [
         "trade_loop",
@@ -151,9 +216,36 @@ async def test_system_audit_status_aggregates_root_causes(
 
 
 @pytest.mark.asyncio
+async def test_audit_maybe_async_times_out_slow_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_audit() -> dict[str, Any]:
+        import asyncio
+
+        await asyncio.sleep(0.05)
+        return system_audit._audit_card("slow", "slow", "ok", "late")
+
+    monkeypatch.setattr(system_audit, "SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await system_audit._audit_maybe_async(slow_audit)
+
+
+@pytest.mark.asyncio
 async def test_system_audit_status_wraps_failed_section(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        system_audit,
+        "_shadow_missed_opportunity_audit",
+        _async_card("shadow_missed_opportunity", "ok", "Shadow missed loop normal"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_trade_execution_contract_audit",
+        _async_card("trade_execution_contract", "ok", "Trade execution contract normal"),
+    )
+
     async def failed_audit() -> dict[str, Any]:
         raise RuntimeError("boom")
 
@@ -190,6 +282,26 @@ async def test_system_audit_status_wraps_failed_section(
     )
     monkeypatch.setattr(
         system_audit,
+        "_model_expert_health_audit",
+        _async_card("model_expert_health", "ok", "模型/专家体检正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_model_expert_competition_audit",
+        _async_card("model_expert_competition", "ok", "模型/专家竞赛正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_crypto_feature_coverage_audit",
+        _async_card("crypto_feature_coverage", "ok", "Crypto 特征覆盖正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_model_dynamic_routing_audit",
+        _async_card("model_dynamic_routing", "ok", "动态路由正常"),
+    )
+    monkeypatch.setattr(
+        system_audit,
         "_strategy_gate_contract_audit",
         lambda: system_audit._audit_card(
             "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
@@ -202,12 +314,21 @@ async def test_system_audit_status_wraps_failed_section(
             "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
         ),
     )
+    monkeypatch.setattr(
+        system_audit,
+        "_runtime_text_integrity_audit",
+        lambda: system_audit._audit_card(
+            "runtime_text_integrity", "运行时文本完整性", "ok", "无新增乱码"
+        ),
+    )
 
     payload = await system_audit.system_audit_status()
 
     assert payload["status"] == "warning"
     assert payload["summary"]["warning"] == 1
     assert payload["root_causes"][0]["title"] == "巡检模块"
+    assert payload["root_causes"][0]["key"] == "trade_loop"
+    assert payload["root_causes"][0]["owner_path"] == "services/trading_service.py"
     assert payload["root_causes"][0]["severity"] == "warning"
     assert payload["cards"][0]["details"]["error"]
 
@@ -257,6 +378,344 @@ async def test_model_training_audit_does_not_run_full_self_check(
     assert not hasattr(system_audit, "system_self_check")
     assert card["status"] == "ok"
     assert card["details"]["runtime_probe"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_model_expert_health_audit_reports_read_only_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModelExpertHealthService:
+        async def report(self, *, hours: int = 72, limit: int = 1000) -> dict[str, Any]:
+            return {
+                "audit_only": True,
+                "live_weight_mutation": False,
+                "summary": {
+                    "components": 3,
+                    "recommended_state_counts": {
+                        "keep": 1,
+                        "reduce": 1,
+                        "disable": 1,
+                    },
+                },
+                "components": {
+                    "trend_expert": {
+                        "recommended_state": "reduce",
+                        "state_reasons": ["negative_adopted_pnl"],
+                        "stability": {"json_error_rate": 0.0, "no_return_rate": 0.0},
+                    },
+                    "risk_expert": {
+                        "recommended_state": "disable",
+                        "state_reasons": ["json_error_rate_high"],
+                        "stability": {"json_error_rate": 0.6, "no_return_rate": 0.6},
+                    },
+                },
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ModelExpertHealthService",
+        lambda: FakeModelExpertHealthService(),
+    )
+
+    card = await system_audit._model_expert_health_audit()
+
+    assert card["key"] == "model_expert_health"
+    assert card["status"] == "warning"
+    assert card["details"]["audit_only"] is True
+    assert card["details"]["live_weight_mutation"] is False
+    assert card["details"]["recommended_state_counts"]["disable"] == 1
+    assert card["details"]["top_components"][0]["name"] == "risk_expert"
+    assert any(item["label"] == "需降权" for item in card["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_model_expert_health_status_endpoint_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModelExpertHealthService:
+        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            return {
+                "audit_only": False,
+                "live_weight_mutation": True,
+                "windows_hours": [24, 72],
+                "summary": {"components": 1},
+                "components": {"trend_expert": {"recommended_state": "keep"}},
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ModelExpertHealthService",
+        lambda: FakeModelExpertHealthService(),
+    )
+
+    report = await system_audit.model_expert_health_status(hours=24, limit=200)
+
+    assert report["audit_only"] is True
+    assert report["live_weight_mutation"] is False
+    assert report["components"]["trend_expert"]["recommended_state"] == "keep"
+
+
+@pytest.mark.asyncio
+async def test_model_expert_competition_audit_never_allows_live_weight_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModelExpertCompetitionService:
+        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            return {
+                "audit_only": True,
+                "live_weight_mutation": False,
+                "can_apply_live_weight": False,
+                "baseline": {"sample_count": 12, "net_pnl_pct": -0.3},
+                "layers": {
+                    "offline_replay": {"baseline_available": True, "sample_count": 12},
+                    "shadow_competition": {"available": True, "sample_count": 8},
+                    "sim_ab": {"available": False, "sample_count": 0},
+                },
+                "blocking_reasons": [],
+                "competitors": {
+                    "trend_expert": {
+                        "recommended_weight_action": "increase_shadow_weight",
+                        "baseline_delta": {"net_pnl_pct": 0.8},
+                        "can_apply_live_weight": True,
+                    },
+                    "risk_expert": {
+                        "recommended_weight_action": "pause_shadow",
+                        "baseline_delta": {"net_pnl_pct": -0.5},
+                        "can_apply_live_weight": False,
+                    },
+                },
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ModelExpertCompetitionService",
+        lambda: FakeModelExpertCompetitionService(),
+    )
+
+    card = await system_audit._model_expert_competition_audit()
+    endpoint_report = await system_audit.model_expert_competition_status(hours=24, limit=200)
+
+    assert card["key"] == "model_expert_competition"
+    assert card["status"] == "warning"
+    assert card["details"]["can_apply_live_weight"] is False
+    assert card["details"]["live_weight_mutation"] is False
+    assert card["details"]["recommended_weight_action_counts"]["pause_shadow"] == 1
+    assert card["details"]["top_competitors"][0]["can_apply_live_weight"] is False
+    assert endpoint_report["audit_only"] is True
+    assert endpoint_report["live_weight_mutation"] is False
+    assert endpoint_report["can_apply_live_weight"] is False
+
+
+@pytest.mark.asyncio
+async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDynamicRoutingService:
+        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            return {
+                "audit_only": False,
+                "live_route_mutation": True,
+                "can_apply_live_route": True,
+                "summary": {
+                    "route_plan_count": 3,
+                    "shadow_only_count": 2,
+                    "estimated_call_reduction": 4,
+                    "unsafe_live_mutation_attempts": 1,
+                },
+                "blocking_reason_counts": {"competition_baseline_missing": 2},
+                "safety_observations": {"weak_evidence_executed_count": 1},
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ModelDynamicRoutingService",
+        lambda: FakeDynamicRoutingService(),
+    )
+
+    card = await system_audit._model_dynamic_routing_audit()
+    endpoint_report = await system_audit.model_dynamic_routing_status(hours=24, limit=200)
+
+    assert card["key"] == "model_dynamic_routing"
+    assert card["status"] == "warning"
+    assert card["details"]["audit_only"] is True
+    assert card["details"]["live_route_mutation"] is False
+    assert card["details"]["can_apply_live_route"] is False
+    assert card["details"]["unsafe_live_mutation_attempts"] == 1
+    assert endpoint_report["audit_only"] is True
+    assert endpoint_report["live_route_mutation"] is False
+    assert endpoint_report["can_apply_live_route"] is False
+
+
+@pytest.mark.asyncio
+async def test_shadow_missed_opportunity_audit_and_endpoint_force_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class FakeShadowMissedOpportunityService:
+        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            calls.append((hours, limit))
+            return {
+                "audit_only": False,
+                "live_entry_mutation": True,
+                "can_bypass_risk_controls": True,
+                "weak_evidence_execution_allowed": True,
+                "global_missed_count_can_drive_entries": True,
+                "summary": {
+                    "missed_count": 7,
+                    "adopted_count": 1,
+                    "probe_count": 1,
+                    "blocked_count": 5,
+                    "weak_evidence_executed_count": 1,
+                },
+                "blocked_reason_counts": {"high_risk_evidence": 2},
+                "probe_candidates": [
+                    {"symbol": "BTC/USDT", "side": "long", "status": "probe_ready"}
+                ],
+                "adopted": [],
+                "blocked": [],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ShadowMissedOpportunityClosedLoopService",
+        lambda: FakeShadowMissedOpportunityService(),
+    )
+
+    card = await system_audit._shadow_missed_opportunity_audit()
+    endpoint_report = await system_audit.shadow_missed_opportunity_status(hours=24, limit=200)
+
+    assert calls == [(24, 200), (24, 200)]
+    assert card["key"] == "shadow_missed_opportunity"
+    assert card["status"] == "warning"
+    assert card["details"]["audit_only"] is True
+    assert card["details"]["live_entry_mutation"] is False
+    assert card["details"]["can_bypass_risk_controls"] is False
+    assert card["details"]["weak_evidence_execution_allowed"] is False
+    assert card["details"]["global_missed_count_can_drive_entries"] is False
+    assert card["details"]["summary"]["weak_evidence_executed_count"] == 1
+    assert endpoint_report["audit_only"] is True
+    assert endpoint_report["live_entry_mutation"] is False
+    assert endpoint_report["can_bypass_risk_controls"] is False
+    assert endpoint_report["weak_evidence_execution_allowed"] is False
+    assert endpoint_report["global_missed_count_can_drive_entries"] is False
+
+
+@pytest.mark.asyncio
+async def test_trade_execution_contract_audit_and_endpoint_force_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class FakeTradeExecutionContractService:
+        async def report(self, *, hours: int = 24, limit: int = 500) -> dict[str, Any]:
+            calls.append((hours, limit))
+            return {
+                "audit_only": False,
+                "live_entry_mutation": True,
+                "live_exit_mutation": True,
+                "can_bypass_risk_controls": True,
+                "summary": {
+                    "executed_entry_count": 4,
+                    "missing_entry_explanation_count": 1,
+                    "missing_sizing_explanation_count": 1,
+                    "weak_evidence_executed_count": 1,
+                    "negative_expected_executed_count": 1,
+                    "fast_loss_count": 2,
+                    "fast_loss_without_strong_exit_count": 1,
+                    "reentry_without_strong_unlock_count": 1,
+                    "contract_violation_count": 5,
+                },
+                "violation_reason_counts": {
+                    "weak_evidence_executed": 1,
+                    "non_positive_expected_net_executed": 1,
+                    "fast_loss_without_strong_exit": 1,
+                    "reentry_without_strong_unlock": 1,
+                },
+                "entry_explanations": [{"decision_id": 1, "violations": []}],
+                "fast_loss_samples": [{"id": 10, "symbol": "BTC/USDT"}],
+                "violations": [{"reason": "weak_evidence_executed"}],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "TradeExecutionContractService",
+        lambda: FakeTradeExecutionContractService(),
+    )
+
+    card = await system_audit._trade_execution_contract_audit()
+    endpoint_report = await system_audit.trade_execution_contract_status(hours=24, limit=200)
+
+    assert calls == [(24, 500), (24, 200)]
+    assert card["key"] == "trade_execution_contract"
+    assert card["status"] == "critical"
+    assert card["details"]["audit_only"] is True
+    assert card["details"]["live_entry_mutation"] is False
+    assert card["details"]["live_exit_mutation"] is False
+    assert card["details"]["can_bypass_risk_controls"] is False
+    assert card["details"]["summary"]["contract_violation_count"] == 5
+    evidence = {item["label"]: item["value"] for item in card["evidence"]}
+    assert evidence["弱证据执行"] == 1
+    assert evidence["负期望执行"] == 1
+    assert evidence["快亏缺强证据"] == 1
+    assert evidence["复开缺解锁"] == 1
+    assert endpoint_report["audit_only"] is True
+    assert endpoint_report["live_entry_mutation"] is False
+    assert endpoint_report["live_exit_mutation"] is False
+    assert endpoint_report["can_bypass_risk_controls"] is False
+
+
+@pytest.mark.asyncio
+async def test_crypto_feature_coverage_audit_and_endpoint_force_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCryptoFeatureCoverageService:
+        async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+            return {
+                "audit_only": False,
+                "live_signal_mutation": True,
+                "can_missing_features_drive_live_entry": True,
+                "feature_defaults_are_neutral": False,
+                "status": "warning",
+                "features": [
+                    {
+                        "key": "funding_rate",
+                        "status": "missing",
+                        "live_entry_influence": "eligible",
+                        "reasons": ["default_zero_without_presence_flag"],
+                    }
+                ],
+                "missing_features": ["funding_rate"],
+                "stale_features": [],
+                "neutralized_features": ["funding_rate"],
+                "symbols_observed": ["BTC/USDT"],
+                "feature_contribution_policy": {"missing_feature_policy": "unsafe"},
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "CryptoFeatureCoverageService",
+        lambda: FakeCryptoFeatureCoverageService(),
+    )
+
+    card = await system_audit._crypto_feature_coverage_audit()
+    endpoint_report = await system_audit.crypto_feature_coverage_status(hours=12, limit=200)
+
+    assert card["key"] == "crypto_feature_coverage"
+    assert card["status"] == "warning"
+    assert card["details"]["audit_only"] is True
+    assert card["details"]["live_signal_mutation"] is False
+    assert card["details"]["can_missing_features_drive_live_entry"] is False
+    assert card["details"]["feature_defaults_are_neutral"] is True
+    assert card["details"]["missing_features"] == ["funding_rate"]
+    assert endpoint_report["audit_only"] is True
+    assert endpoint_report["live_signal_mutation"] is False
+    assert endpoint_report["can_missing_features_drive_live_entry"] is False
+    assert endpoint_report["feature_defaults_are_neutral"] is True
+    assert (
+        endpoint_report["feature_contribution_policy"]["missing_feature_policy"]
+        == "neutral_blocked"
+    )
 
 
 @pytest.mark.asyncio
@@ -383,6 +842,47 @@ async def test_strategy_quality_audit_reports_short_adjustment_samples(
         assert evidence["做空强证据放开"] == 1
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_model_training_unconfigured_local_tools_are_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status() -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": False,
+                    "status": "disabled",
+                    "shadow_sample_count": 0,
+                    "trade_sample_count": 0,
+                    "text_sentiment_sample_count": 0,
+                },
+                "governance": {"status": "error"},
+            },
+            "sources": [],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [],
+            "local_ai_tools": {"available": False, "configured": False},
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["hard_failure"] is False
+    assert card["details"]["observing"] is True
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
 
 
 @pytest.mark.asyncio
@@ -684,6 +1184,48 @@ async def test_strategy_closed_loop_audit_separates_active_runtime_window(
         assert "历史" in ledger["observing"][0]["state_label"]
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_runtime_text_integrity_audit_reports_recent_suspects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_collect_runtime_text_integrity_report(
+        *, hours: int, limit_per_table: int, example_limit: int
+    ) -> dict[str, Any]:
+        assert hours == system_audit.AUDIT_WINDOWS["strategy_hours"]
+        assert limit_per_table > 0
+        assert example_limit > 0
+        return {
+            "status": "warning",
+            "scanned_records": 5,
+            "suspected_records": 2,
+            "suspected_fields": 3,
+            "repairable_count": 1,
+            "by_table": {"ai_decisions": {"suspected_records": 2}},
+            "examples": [{"table": "ai_decisions", "field": "execution_reason"}],
+            "policy": {"dry_run": True, "mutates_database": False},
+        }
+
+    monkeypatch.setattr(
+        system_audit,
+        "collect_runtime_text_integrity_report",
+        fake_collect_runtime_text_integrity_report,
+    )
+
+    card = await system_audit._runtime_text_integrity_audit()
+
+    assert card["key"] == "runtime_text_integrity"
+    assert card["status"] == "warning"
+    assert card["details"]["suspected_records"] == 2
+    assert card["details"]["policy"]["dry_run"] is True
+    assert {item["label"]: item["value"] for item in card["evidence"]} == {
+        "扫描记录": 5,
+        "疑似记录": 2,
+        "疑似字段": 3,
+        "可自动修复字段": 1,
+    }
+    assert "写入边界" in " ".join(card["next_actions"])
 
 
 def test_strategy_gate_contract_audit_tracks_parameterized_strategy_constants() -> None:

@@ -33,8 +33,7 @@ def _remote_quote(value: str) -> str:
 
 def _remote_script(*, remote_app_dir: str, delete: bool) -> str:
     markers_json = json.dumps(SENSITIVE_NAME_MARKERS, ensure_ascii=False)
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         import json
         import os
         from pathlib import Path
@@ -62,8 +61,7 @@ def _remote_script(*, remote_app_dir: str, delete: bool) -> str:
             if delete:
                 Path(path).unlink(missing_ok=True)
         print(json.dumps({{'count': len(matches), 'deleted': bool(delete)}}, ensure_ascii=False))
-        """
-    ).strip()
+        """).strip()
 
 
 def parse_args() -> argparse.Namespace:

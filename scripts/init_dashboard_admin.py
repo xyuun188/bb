@@ -42,7 +42,9 @@ def _write_runtime_env(path: Path, updates: dict[str, str]) -> None:
     values.update({key: value for key, value in updates.items() if value is not None})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+    tmp_path.write_text(
+        "".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8"
+    )
     os.replace(tmp_path, path)
     os.chmod(path, 0o600)
 
@@ -113,7 +115,9 @@ async def _run() -> int:
     settings.dashboard_auth_username = username
     settings.dashboard_auth_password_hash = hash_dashboard_password(password)
 
-    runtime_env_path = Path(args.runtime_env_path) if args.runtime_env_path else _default_runtime_env_path()
+    runtime_env_path = (
+        Path(args.runtime_env_path) if args.runtime_env_path else _default_runtime_env_path()
+    )
     if args.write_runtime_env and runtime_env_path is not None:
         updates = {
             "DASHBOARD_AUTH_ENABLED": "true",

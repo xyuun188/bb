@@ -111,7 +111,7 @@
                         <button class="mode-btn active" data-mode="paper">模拟盘</button>
                         <button class="mode-btn" data-mode="live">实盘</button>
                     </div>
-                    <button class="btn" onclick="togglePause()" id="pause-btn">暂停交易</button>
+                    <button class="btn" onclick="togglePause()" id="pause-btn">暂停新开仓分析</button>
                     <span style="font-size:11px;color:var(--text-muted);">
                         执行账户 <strong id="live-model-name" style="color:var(--text);">加载中</strong>
                     </span>
@@ -124,6 +124,13 @@
                         <button class="dashboard-logout-btn" type="button" onclick="logoutDashboard()">退出</button>
                     </div>
                 </div>
+            </div>
+            <div class="dashboard-pause-banner" id="dashboard-pause-banner" hidden>
+                <div>
+                    <strong>已暂停新市场分析 / 新开仓</strong>
+                    <span>已有仓位仍会继续复盘、止盈止损和平仓；OKX 同步和行情采集继续运行。</span>
+                </div>
+                <button class="btn btn-sm" type="button" onclick="togglePause()">恢复新开仓分析</button>
             </div>
 
             <!-- Stats -->
@@ -1042,6 +1049,15 @@
                 </div>
                 <div id="data-collection-sources">
                     <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待数据源统计...</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">数字货币特征覆盖</span>
+                    <span class="card-subtitle">K线、盘口、衍生品、新闻社媒与事件特征可用性</span>
+                </div>
+                <div id="data-collection-feature-coverage">
+                    <div style="color:var(--text-muted);font-size:12px;padding:16px;">等待特征覆盖报告...</div>
                 </div>
             </div>
             <div class="card">

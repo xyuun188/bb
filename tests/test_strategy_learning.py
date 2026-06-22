@@ -197,6 +197,109 @@ def _reflection(
     )
 
 
+def _missed_shadow(symbol: str, side: str, return_pct: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        status="completed",
+        missed_opportunity=True,
+        decision_action="hold",
+        symbol=symbol,
+        best_action=side,
+        long_return_pct=return_pct if side == "long" else -0.2,
+        short_return_pct=return_pct if side == "short" else -0.2,
+        feature_snapshot={
+            "market_structure": "trend_up_momentum" if side == "long" else "trend_down_momentum",
+            "loss_probability": 0.34,
+            "tail_risk_score": 0.52,
+            "volume_ratio": 1.7,
+            "adx": 31.0,
+        },
+        raw_llm_response={"ml_signal": {"best_side": side, "confidence": 0.72}},
+        horizon_minutes=10,
+    )
+
+
+def test_strategy_learning_global_missed_count_does_not_select_probe_profile(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(
+                side="long" if index % 2 == 0 else "short",
+                pnl=0.8,
+                position_id=index + 100,
+            )
+            for index in range(80)
+        ],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("hold") for _ in range(20)],
+        shadows=[_missed_shadow(f"SYM{index}/USDT", "long", 0.8) for index in range(8)],
+        memories=[],
+        max_open_positions=14,
+    )
+
+    feedback = payload["feedback"]
+    closed_loop = feedback["shadow_feedback"]["missed_opportunity_closed_loop"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+
+    assert feedback["shadow_feedback"]["missed_opportunity_count"] == 8
+    assert closed_loop["global_missed_count_can_drive_entries"] is False
+    assert closed_loop["summary"]["probe_count"] == 0
+    assert closed_loop["summary"]["adopted_count"] == 0
+    assert "missed_opportunities" not in problem_keys
+    assert payload["schedule"]["active_profile"]["id"] == "baseline_current"
+
+
+def test_strategy_learning_uses_qualified_missed_loop_for_probe_feedback(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(
+                side="long" if index % 2 == 0 else "short",
+                pnl=0.8,
+                position_id=index + 300,
+            )
+            for index in range(80)
+        ],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("hold") for _ in range(20)],
+        shadows=[
+            _missed_shadow("BTC/USDT", "long", 0.44),
+            _missed_shadow("BTC/USDT", "long", 0.52),
+            _missed_shadow("BTC/USDT", "long", 0.58),
+        ],
+        memories=[],
+        max_open_positions=14,
+    )
+
+    feedback = payload["feedback"]
+    closed_loop = feedback["shadow_feedback"]["missed_opportunity_closed_loop"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    validation_row = next(
+        row
+        for row in payload["schedule"]["shadow_validation"]["rows"]
+        if row["profile_id"] == "balanced_probe"
+    )
+
+    assert closed_loop["summary"]["probe_count"] == 1
+    assert closed_loop["usable_group_count"] == 1
+    assert "missed_opportunities" in problem_keys
+    assert validation_row["missed_opportunities_used"] == 1
+    assert validation_row["missed_opportunity_raw_count"] == 3
+    assert validation_row["missed_opportunity_closed_loop"]["usable_group_count"] == 1
+    assert payload["schedule"]["probe"]["closed_loop_probe_rules"]
+
+
 def test_strategy_learning_builds_full_feedback_and_schedules_loss_release(tmp_path) -> None:
 
     state_store = StrategyLearningStateStore(tmp_path / "state.json")
@@ -1336,13 +1439,9 @@ def test_strategy_learning_auto_schedules_valid_structured_candidate(tmp_path) -
         orders=[],
         decisions=[_decision("long", reason="expert_integrity fallback")],
         shadows=[
-            SimpleNamespace(
-                status="completed",
-                missed_opportunity=True,
-                decision_action="hold",
-                long_return_pct=0.9,
-                short_return_pct=-0.1,
-            )
+            _missed_shadow("BTC/USDT", "long", 0.70),
+            _missed_shadow("BTC/USDT", "long", 0.74),
+            _missed_shadow("BTC/USDT", "long", 0.78),
         ],
         memories=[],
         strategy_events=[

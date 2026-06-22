@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from services.okx_error_classifier import is_okx_temporary_service_error
 from services.decision_state import (
     ORDERED_STAGES,
     STAGE_LABELS,
@@ -14,6 +13,7 @@ from services.decision_state import (
     DecisionStageStatus,
     decision_state_from_raw,
 )
+from services.okx_error_classifier import is_okx_temporary_service_error
 
 PROBLEM_STATUSES = {DecisionStageStatus.BLOCKED, DecisionStageStatus.FAILED}
 SUCCESS_STATUSES = {DecisionStageStatus.PASSED, DecisionStageStatus.COMPLETED}

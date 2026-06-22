@@ -24,7 +24,7 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
-from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_text
+from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
 
 logger = structlog.get_logger(__name__)
 
@@ -77,7 +77,7 @@ class DecisionPersistenceService:
                         "symbol": display_symbol,
                         "action": decision.action.value,
                         "confidence": decision.confidence,
-                        "reasoning": sanitize_text(decision.reasoning),
+                        "reasoning": sanitize_runtime_text(decision.reasoning),
                         "position_size_pct": decision.position_size_pct,
                         "suggested_leverage": decision.suggested_leverage,
                         "stop_loss_pct": decision.stop_loss_pct,
@@ -123,15 +123,17 @@ class DecisionPersistenceService:
         if value is None or isinstance(value, (int, bool)):
             return value
         if isinstance(value, str):
-            return sanitize_text(value)
+            return sanitize_runtime_text(value)
         if isinstance(value, float):
             return value if math.isfinite(value) else None
         if isinstance(value, datetime):
             return value.isoformat()
         if isinstance(value, dict):
-            return {str(key): self.json_safe_payload(item) for key, item in value.items()}
+            payload = {str(key): self.json_safe_payload(item) for key, item in value.items()}
+            return sanitize_runtime_text(payload)
         if isinstance(value, (list, tuple, set)):
-            return [self.json_safe_payload(item) for item in value]
+            payload = [self.json_safe_payload(item) for item in value]
+            return sanitize_runtime_text(payload)
         item = getattr(value, "item", None)
         if callable(item):
             try:
@@ -143,7 +145,7 @@ class DecisionPersistenceService:
                 return value.isoformat()
             except Exception as exc:
                 logger.debug("failed to serialize isoformat payload", error=safe_error_text(exc))
-        return sanitize_text(str(value))
+        return sanitize_runtime_text(str(value))
 
     def record_stage(
         self,
@@ -162,7 +164,7 @@ class DecisionPersistenceService:
             raw,
             stage,
             status,
-            sanitize_text(reason) if reason else "",
+            str(sanitize_runtime_text(reason) or "") if reason else "",
             data=self.json_safe_payload(data or {}) if data else None,
             duration_sec=duration_sec,
         )
@@ -203,11 +205,11 @@ class DecisionPersistenceService:
         try:
             async with self._session_context_factory() as session:
                 row = await session.get(AIDecision, int(decision_id))
-                sanitized_reason = sanitize_text(reason)
+                sanitized_reason = sanitize_runtime_text(reason)
                 if self.execution_reason_is_unusable(sanitized_reason):
                     recovered = reason_recoverer(row, reason) if reason_recoverer else None
                     if recovered:
-                        sanitized_reason = sanitize_text(recovered)
+                        sanitized_reason = sanitize_runtime_text(recovered)
                 repo = self._decision_repo_factory(session)
                 await repo.mark_execution_reason(decision_id, sanitized_reason)
         except Exception as exc:
@@ -218,7 +220,7 @@ class DecisionPersistenceService:
         text = str(reason or "").strip()
         if not text:
             return False
-        if looks_mojibake(text):
+        if looks_like_mojibake(text):
             return True
         unusable_markers = (
             "原始说明已损坏",
@@ -275,7 +277,7 @@ class DecisionPersistenceService:
         try:
             async with self._session_context_factory() as session:
                 repo = self._decision_repo_factory(session)
-                await repo.update_raw_response(decision_id, raw_response)
+                await repo.update_raw_response(decision_id, self.json_safe_payload(raw_response))
         except Exception as exc:
             logger.error("failed to update decision raw response", error=safe_error_text(exc))
 
@@ -288,7 +290,7 @@ class DecisionPersistenceService:
         if not ids:
             return
         try:
-            sanitized_reason = str(sanitize_text(reason) or reason)
+            sanitized_reason = str(sanitize_runtime_text(reason) or reason)
             async with self._session_context_factory() as session:
                 repo = self._decision_repo_factory(session)
                 await repo.fill_missing_execution_reasons(ids, sanitized_reason)

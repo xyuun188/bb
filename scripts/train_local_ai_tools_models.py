@@ -172,6 +172,7 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
                 "features": features,
                 "long_return_pct": _as_float(row.long_return_pct),
                 "short_return_pct": _as_float(row.short_return_pct),
+                "label_timestamp": row.due_at.isoformat() if row.due_at else None,
                 "best_action": row.best_action,
                 "missed_opportunity": bool(row.missed_opportunity),
             }

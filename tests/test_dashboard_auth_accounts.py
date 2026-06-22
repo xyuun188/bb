@@ -26,7 +26,7 @@ async def _create_auth_client(
     monkeypatch.setattr(settings, "dashboard_auth_password_hash", hash_dashboard_password(password))
     monkeypatch.setattr(settings, "dashboard_session_secret", "unit-dashboard-session-secret")
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
-    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")  # noqa: S104
     await init_db()
     app = create_app()
     transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 12345))

@@ -1,5 +1,6 @@
-from services.memory_feedback import MemoryFeedbackPolicy
 import pytest
+
+from services.memory_feedback import MemoryFeedbackPolicy
 
 
 def test_memory_feedback_turns_missed_opportunities_into_probe_bias() -> None:

@@ -58,6 +58,9 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["local_ml_training"]["training_sequence_sample_limit"] == 12000
     assert snapshot["local_ml_training"]["local_tools_min_new_trade_samples"] == 50
     assert snapshot["local_ml_training"]["influence_min_auc"] == 0.53
+    assert snapshot["local_ml_training"]["influence_min_pr_auc"] == 0.52
+    assert snapshot["local_ml_training"]["readiness_max_dirty_sample_ratio"] == 0.08
+    assert snapshot["local_ml_training"]["readiness_max_model_age_seconds"] == 259200
     assert snapshot["auto_scan"]["rotation_pool_multiplier"] == 20
     assert snapshot["auto_scan"]["rotation_pool_min"] == 240
     assert snapshot["auto_scan"]["feature_fetch_pool_multiplier"] == 1
@@ -168,7 +171,7 @@ def test_training_data_quality_uses_central_trading_params() -> None:
     params = DEFAULT_TRADING_PARAMS.training_data_quality
 
     assert training_data_quality._QUALITY_PARAMS == params
-    assert training_data_quality.DATA_QUALITY_VERSION.endswith(".v2")
+    assert training_data_quality.DATA_QUALITY_VERSION.endswith(".v3")
 
 
 def test_local_ml_training_uses_central_trading_params() -> None:
@@ -180,6 +183,7 @@ def test_local_ml_training_uses_central_trading_params() -> None:
     assert ml_signal_service.MIN_TRAINING_SAMPLES == params.min_training_samples
     assert ml_signal_service.TRAINING_SHADOW_SAMPLE_LIMIT == params.training_shadow_sample_limit
     assert ml_signal_service.ML_INFLUENCE_MIN_AUC == params.influence_min_auc
+    assert ml_signal_service.ML_INFLUENCE_MIN_PR_AUC == params.influence_min_pr_auc
 
 
 def test_trading_service_local_tools_training_uses_central_params() -> None:

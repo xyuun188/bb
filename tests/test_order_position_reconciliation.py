@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-from db.session import close_db, get_session_ctx, init_db
 from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.order_position_reconciliation import (

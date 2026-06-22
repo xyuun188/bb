@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from services.model_expert_health import summarize_model_expert_health
+
+
+def _decision(
+    *,
+    decision_id: int,
+    action: str,
+    hours_ago: float,
+    pnl: float | None = None,
+    executed: bool = False,
+    position_size_pct: float = 0.05,
+    raw: dict | None = None,
+) -> SimpleNamespace:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        id=decision_id,
+        model_name="ensemble_trader",
+        action=action,
+        was_executed=executed,
+        outcome_pnl_pct=pnl,
+        position_size_pct=position_size_pct,
+        raw_llm_response=raw or {},
+        created_at=now - timedelta(hours=hours_ago),
+    )
+
+
+def _shadow(
+    *,
+    decision_id: int,
+    hours_ago: float,
+    best_action: str,
+    missed: bool = False,
+) -> SimpleNamespace:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        decision_id=decision_id,
+        status="completed",
+        best_action=best_action,
+        missed_opportunity=missed,
+        created_at=now - timedelta(hours=hours_ago),
+    )
+
+
+def test_model_expert_health_report_marks_detractors_without_mutating_weights() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    raw_good = {
+        "model_timings": [
+            {
+                "name": "trend_expert",
+                "status": "completed",
+                "provider_model": "qwen3-14b-trade",
+                "duration_sec": 2.0,
+                "action": "long",
+                "confidence": 0.72,
+            },
+            {
+                "name": "risk_expert",
+                "status": "completed",
+                "provider_model": "deepseek-r1-14b-risk",
+                "duration_sec": 5.0,
+                "action": "hold",
+                "confidence": 0.64,
+            },
+        ],
+        "experts": [
+            {"expert_name": "trend_expert", "action": "long", "confidence": 0.72},
+            {"expert_name": "risk_expert", "action": "hold", "confidence": 0.64},
+        ],
+    }
+    raw_bad = {
+        "model_timings": [
+            {
+                "name": "trend_expert",
+                "status": "completed",
+                "provider_model": "qwen3-14b-trade",
+                "duration_sec": 2.8,
+                "action": "short",
+                "confidence": 0.69,
+            },
+            {
+                "name": "risk_expert",
+                "status": "failed",
+                "provider_model": "deepseek-r1-14b-risk",
+                "duration_sec": 18.0,
+                "reason": "Could not extract valid JSON from response",
+            },
+        ],
+        "experts": [
+            {"expert_name": "trend_expert", "action": "short", "confidence": 0.69},
+        ],
+    }
+    decisions = [
+        _decision(decision_id=1, action="long", hours_ago=2, pnl=0.8, executed=True, raw=raw_good),
+        _decision(decision_id=2, action="short", hours_ago=3, pnl=-1.4, executed=True, raw=raw_bad),
+        _decision(decision_id=3, action="hold", hours_ago=4, executed=False, raw=raw_bad),
+    ]
+    shadows = [
+        _shadow(decision_id=1, hours_ago=1.5, best_action="long"),
+        _shadow(decision_id=2, hours_ago=2.5, best_action="long"),
+        _shadow(decision_id=3, hours_ago=3.5, best_action="long", missed=True),
+    ]
+
+    report = summarize_model_expert_health(decisions, shadows, now=now)
+
+    assert report["audit_only"] is True
+    assert report["live_weight_mutation"] is False
+    assert report["windows_hours"] == [24, 72]
+    trend = report["components"]["trend_expert"]
+    assert trend["type"] == "expert"
+    assert trend["windows"]["24h"]["participation_count"] == 3
+    assert trend["windows"]["24h"]["adopted_count"] == 2
+    assert trend["windows"]["24h"]["adopted_net_pnl_pct"] == -0.6
+    assert trend["windows"]["24h"]["wrong_recommendation_rate"] > 0
+    assert trend["recommended_state"] == "reduce"
+    assert "negative_adopted_pnl" in trend["state_reasons"]
+
+    risk = report["components"]["risk_expert"]
+    assert risk["windows"]["24h"]["json_error_count"] == 2
+    assert risk["windows"]["24h"]["no_return_count"] == 2
+    assert risk["recommended_state"] in {"shadow_only", "disable"}
+    assert risk["stability"]["json_error_rate"] > 0
+    assert report["summary"]["components"] >= 2
+
+
+def test_model_expert_health_report_observes_insufficient_samples() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    decisions = [
+        _decision(
+            decision_id=1,
+            action="long",
+            hours_ago=1,
+            pnl=0.4,
+            executed=True,
+            raw={
+                "model_timings": [
+                    {
+                        "name": "sentiment_expert",
+                        "status": "completed",
+                        "duration_sec": 1.1,
+                        "action": "long",
+                    }
+                ],
+                "experts": [
+                    {"expert_name": "sentiment_expert", "action": "long", "confidence": 0.58}
+                ],
+            },
+        )
+    ]
+
+    report = summarize_model_expert_health(decisions, [], now=now)
+
+    sentiment = report["components"]["sentiment_expert"]
+    assert sentiment["recommended_state"] == "shadow_only"
+    assert sentiment["evidence_state"] == "observing"
+    assert "insufficient_samples" in sentiment["state_reasons"]

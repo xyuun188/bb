@@ -20,9 +20,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from db.session import get_session_ctx
-from models.decision import AIDecision
-from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
+from db.session import get_session_ctx  # noqa: E402
+from models.decision import AIDecision  # noqa: E402
+from web_dashboard.api.text_sanitize import (  # noqa: E402
+    looks_mojibake,
+    sanitize_payload,
+    sanitize_text,
+)
 
 MOJIBAKE_SQL_MARKERS = (
     "\u952b",
@@ -104,9 +108,7 @@ async def repair_ai_decisions(
             stmt = stmt.where(_visible_mojibake_filter())
 
         async with get_session_ctx() as session:
-            result = await session.execute(
-                stmt.order_by(AIDecision.id.asc()).limit(current_limit)
-            )
+            result = await session.execute(stmt.order_by(AIDecision.id.asc()).limit(current_limit))
             rows = list(result.mappings().all())
             if not rows:
                 break

@@ -7,11 +7,6 @@ from typing import Any, cast
 import pytest
 
 from config.settings import Settings
-from tests.model_endpoint_fixtures import (
-    DEEPSEEK_PUBLIC_TEST_BASE,
-    PUBLIC_MODEL_TEST_HOST,
-    QWEN_PUBLIC_TEST_BASE,
-)
 from core.secret_utils import (
     is_masked_secret,
     mask_secret,
@@ -19,6 +14,11 @@ from core.secret_utils import (
     redact_text,
     secret_fingerprint,
     secret_state,
+)
+from tests.model_endpoint_fixtures import (
+    DEEPSEEK_PUBLIC_TEST_BASE,
+    PUBLIC_MODEL_TEST_HOST,
+    QWEN_PUBLIC_TEST_BASE,
 )
 
 

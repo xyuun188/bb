@@ -40,6 +40,8 @@ from services.okx_error_classifier import is_okx_temporary_service_error
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
 from services.runtime_entry_filters import RuntimeEntryFilters, default_entry_filters
+from services.shadow_missed_opportunity_closed_loop import summarize_shadow_missed_opportunities
+from services.text_integrity import sanitize_runtime_text
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -660,7 +662,7 @@ class StrategyFeedbackCompiler:
         side_performance = self._side_performance(training_positions)
         open_pressure = self._open_position_pressure(open_positions, max_open_positions)
         decision_quality = self._decision_quality(decisions)
-        shadow_feedback = self._shadow_feedback(shadows)
+        shadow_feedback = self._shadow_feedback(shadows, decisions)
         expert_memory = self._expert_memory(memories)
         event_feedback = self._event_feedback(strategy_events or [])
         reflection_feedback = self._reflection_feedback(
@@ -1119,7 +1121,9 @@ class StrategyFeedbackCompiler:
                 statuses.append(status)
         return statuses
 
-    def _shadow_feedback(self, shadows: list[Any]) -> dict[str, Any]:
+    def _shadow_feedback(
+        self, shadows: list[Any], decisions: list[Any] | None = None
+    ) -> dict[str, Any]:
         completed = [row for row in shadows if str(getattr(row, "status", "")) == "completed"]
         missed = [row for row in completed if bool(getattr(row, "missed_opportunity", False))]
         bad_signals = []
@@ -1137,6 +1141,10 @@ class StrategyFeedbackCompiler:
                 bad_signals.append(row)
             elif realized >= 0.40:
                 good_signals.append(row)
+        missed_closed_loop = summarize_shadow_missed_opportunities(
+            completed,
+            decisions=decisions or [],
+        )
         return {
             "completed_count": len(completed),
             "missed_opportunity_count": len(missed),
@@ -1144,6 +1152,7 @@ class StrategyFeedbackCompiler:
             "good_signal_count": len(good_signals),
             "missed_opportunity_rate": round(len(missed) / len(completed), 6) if completed else 0.0,
             "bad_signal_rate": round(len(bad_signals) / len(completed), 6) if completed else 0.0,
+            "missed_opportunity_closed_loop": missed_closed_loop,
         }
 
     @staticmethod
@@ -1737,7 +1746,8 @@ class StrategyFeedbackCompiler:
                 "专家 fallback 或完整性保护正在拦截开仓，需要用小仓探针而不是直接停摆",
                 decision_quality,
             )
-        if shadow_feedback.get("missed_opportunity_rate", 0.0) >= 0.08:
+        missed_loop = _safe_dict(shadow_feedback.get("missed_opportunity_closed_loop"))
+        if _safe_int(missed_loop.get("usable_group_count"), 0) > 0:
             add(
                 "missed_opportunities",
                 "medium",
@@ -2205,6 +2215,8 @@ class StrategyBacktester:
         )
         occupancy = _safe_float(feedback.open_position_pressure.get("usage_ratio"), 0.0)
         reflection = feedback.reflection_feedback
+        missed_loop = _safe_dict(feedback.shadow_feedback.get("missed_opportunity_closed_loop"))
+        missed_usable = _safe_int(missed_loop.get("usable_group_count"), 0)
         missed_opportunity_reduction = 0.0
         loss_release_speed = 0.0
         winner_avg_profit = avg_winner
@@ -2219,13 +2231,8 @@ class StrategyBacktester:
                 )
                 matched_fixes.append("expert_fallback_overblocking")
             if "missed_opportunities" in problem_keys:
-                estimated_delta += (
-                    feedback.shadow_feedback.get("missed_opportunity_count", 0) * 0.18
-                )
-                missed_opportunity_reduction = (
-                    _safe_float(feedback.shadow_feedback.get("missed_opportunity_count"), 0.0)
-                    * 0.18
-                )
+                estimated_delta += missed_usable * 0.18
+                missed_opportunity_reduction = _safe_float(missed_usable, 0.0) * 0.18
                 matched_fixes.append("missed_opportunities")
             if "trade_reflection_mistakes" in problem_keys:
                 estimated_delta += min(_safe_int(reflection.get("mistake_count"), 0), 8) * 0.12
@@ -2367,7 +2374,8 @@ class StrategyBacktester:
                 "event_fallback_blocks",
             }
         ):
-            missed = _safe_int(feedback.shadow_feedback.get("missed_opportunity_count"), 0)
+            missed_loop = _safe_dict(feedback.shadow_feedback.get("missed_opportunity_closed_loop"))
+            missed = _safe_int(missed_loop.get("usable_group_count"), 0)
             blocks = _safe_int(
                 feedback.decision_quality.get("expert_integrity_blocks"), 0
             ) + _safe_int(feedback.event_feedback.get("fallback_blocks"), 0)
@@ -3086,7 +3094,9 @@ class StrategyScheduler:
         feedback: StrategyFeedback,
     ) -> dict[str, Any]:
         rows: list[dict[str, Any]] = []
-        missed = _safe_int(feedback.shadow_feedback.get("missed_opportunity_count"), 0)
+        missed_loop = _safe_dict(feedback.shadow_feedback.get("missed_opportunity_closed_loop"))
+        missed = _safe_int(missed_loop.get("usable_group_count"), 0)
+        raw_missed = _safe_int(feedback.shadow_feedback.get("missed_opportunity_count"), 0)
         bad = _safe_int(feedback.shadow_feedback.get("bad_signal_count"), 0)
         good = _safe_int(feedback.shadow_feedback.get("good_signal_count"), 0)
         fallback_blocks = _safe_int(feedback.event_feedback.get("fallback_blocks"), 0)
@@ -3193,6 +3203,14 @@ class StrategyScheduler:
                     "trade_count_guard": trade_count_guard,
                     "probe_required": profile.profile_id != "baseline_current",
                     "missed_opportunities_used": missed,
+                    "missed_opportunity_raw_count": raw_missed,
+                    "missed_opportunity_closed_loop": {
+                        "usable_group_count": missed,
+                        "summary": _safe_dict(missed_loop.get("summary")),
+                        "blocked_reason_counts": _safe_dict(
+                            missed_loop.get("blocked_reason_counts")
+                        ),
+                    },
                     "bad_signals_used": bad,
                     "good_signals_used": good,
                     "comparison_to_baseline": round(score - baseline_score, 6),
@@ -3213,6 +3231,15 @@ class StrategyScheduler:
     @staticmethod
     def _probe(profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
         probe_fraction = _safe_float(profile.params.get("probe_fraction"), 0.0)
+        missed_loop = _safe_dict(feedback.shadow_feedback.get("missed_opportunity_closed_loop"))
+        closed_loop_probe_rules = [
+            _safe_dict(item).get("probe_rules")
+            for item in (
+                _safe_list(missed_loop.get("probe_candidates"))
+                + _safe_list(missed_loop.get("adopted"))
+            )
+            if _safe_dict(item).get("probe_rules")
+        ]
         return {
             "profile_id": profile.profile_id,
             "enabled": profile.profile_id != "baseline_current" and probe_fraction > 0,
@@ -3223,6 +3250,13 @@ class StrategyScheduler:
                 "net_pnl_must_improve": True,
                 "max_consecutive_losses": 3,
                 "fallback_rate_must_not_increase": True,
+            },
+            "closed_loop_probe_rules": closed_loop_probe_rules,
+            "missed_opportunity_closed_loop": {
+                "usable_group_count": _safe_int(missed_loop.get("usable_group_count"), 0),
+                "global_missed_count_can_drive_entries": bool(
+                    missed_loop.get("global_missed_count_can_drive_entries")
+                ),
             },
             "current_training_trades": feedback.totals.get("training_trade_count", 0),
         }
@@ -4993,39 +5027,49 @@ class StrategyLearningService:
             event_type=event_type,
             event_status=event_status,
             severity=severity,
-            reason=str(reason or "")[:2000],
+            reason=str(sanitize_runtime_text(reason or "") or "")[:2000],
             decision_id=decision_id,
             order_id=order_id,
             position_id=position_id,
             profile_id=profile_id or None,
             profile_version=profile_version or None,
-            scheduler_reason=str(context.get("scheduler_reason") or learning.get("reason") or "")[
-                :2000
-            ],
-            strategy_snapshot=_json_safe(
-                {
-                    "active_profile": active_profile,
-                    "runtime": runtime,
-                    "feedback_summary": learning.get("feedback_summary"),
-                    "rollback": learning.get("rollback"),
-                    "scheduler_mode": learning.get("scheduler_mode", "auto"),
-                    "manual_profile_id": learning.get("manual_profile_id", ""),
-                    "candidate_count": learning.get("candidate_count", 0),
-                    "dispatch_reason": learning.get("dispatch_reason") or learning.get("reason"),
-                    "disabled_profiles": learning.get("disabled_profiles", []),
-                    "shadow_validation": learning.get("shadow_validation", {}),
-                    "probe": learning.get("probe", {}),
-                    "backtest": learning.get("backtest", {}),
-                    "training_policy": learning.get("training_policy", {}),
-                    "exclude_from_training": bool(exclude_from_training),
-                }
+            scheduler_reason=str(
+                sanitize_runtime_text(
+                    context.get("scheduler_reason") or learning.get("reason") or ""
+                )
+                or ""
+            )[:2000],
+            strategy_snapshot=sanitize_runtime_text(
+                _json_safe(
+                    {
+                        "active_profile": active_profile,
+                        "runtime": runtime,
+                        "feedback_summary": learning.get("feedback_summary"),
+                        "rollback": learning.get("rollback"),
+                        "scheduler_mode": learning.get("scheduler_mode", "auto"),
+                        "manual_profile_id": learning.get("manual_profile_id", ""),
+                        "candidate_count": learning.get("candidate_count", 0),
+                        "dispatch_reason": learning.get("dispatch_reason")
+                        or learning.get("reason"),
+                        "disabled_profiles": learning.get("disabled_profiles", []),
+                        "shadow_validation": learning.get("shadow_validation", {}),
+                        "probe": learning.get("probe", {}),
+                        "backtest": learning.get("backtest", {}),
+                        "training_policy": learning.get("training_policy", {}),
+                        "exclude_from_training": bool(exclude_from_training),
+                    }
+                ),
             ),
-            market_state=_json_safe(market_state or context.get("market_regime") or {}),
-            side_weights=_json_safe(
-                runtime.get("side_weights") or _safe_dict(context.get("side_quality"))
+            market_state=sanitize_runtime_text(
+                _json_safe(market_state or context.get("market_regime") or {})
             ),
-            expert_integrity=_json_safe(self._expert_integrity_event_payload(raw, context)),
-            attribution=_json_safe(attribution or {}),
+            side_weights=sanitize_runtime_text(
+                _json_safe(runtime.get("side_weights") or _safe_dict(context.get("side_quality")))
+            ),
+            expert_integrity=sanitize_runtime_text(
+                _json_safe(self._expert_integrity_event_payload(raw, context))
+            ),
+            attribution=sanitize_runtime_text(_json_safe(attribution or {})),
             exclude_from_training=bool(exclude_from_training),
         )
         try:

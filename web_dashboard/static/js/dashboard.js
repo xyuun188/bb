@@ -624,12 +624,12 @@ function updatePositionsTable(positions, page = 1, totalPages = 1, totalItems = 
 // --- Render Functions ---
 function updateModeDisplay(mode, paused, scanMode) {
     state.mode = mode;
-    state.paused = paused;
+    state.paused = Boolean(paused);
     state.scanMode = 'auto';
 
     const badge = document.getElementById('mode-badge');
-    if (paused) {
-        badge.textContent = '已暂停';
+    if (state.paused) {
+        badge.textContent = '已暂停新开仓';
         badge.className = 'status-badge status-paused';
     } else if (mode === 'live') {
         badge.textContent = '实盘';
@@ -638,6 +638,16 @@ function updateModeDisplay(mode, paused, scanMode) {
         badge.textContent = '模拟盘';
         badge.className = 'status-badge status-paper';
     }
+    const pauseBtn = document.getElementById('pause-btn');
+    if (pauseBtn) {
+        pauseBtn.textContent = state.paused ? '恢复新开仓分析' : '暂停新开仓分析';
+        pauseBtn.className = state.paused ? 'btn pause-btn active' : 'btn pause-btn';
+        pauseBtn.title = state.paused
+            ? '当前已暂停新市场分析和新开仓；已有仓位仍继续复盘和平仓。'
+            : '暂停后不再分析新交易对或提交新开仓，已有仓位仍继续风控。';
+    }
+    const pauseBanner = document.getElementById('dashboard-pause-banner');
+    if (pauseBanner) pauseBanner.hidden = !state.paused;
 
     document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.mode === mode);
@@ -645,7 +655,11 @@ function updateModeDisplay(mode, paused, scanMode) {
     updateModeButtonAvailability();
 
     const scanLabel = document.getElementById('scan-mode-label');
-    if (scanLabel) scanLabel.textContent = '自动扫描全市场 · 智能调度';
+    if (scanLabel) {
+        scanLabel.textContent = state.paused
+            ? '已暂停新市场分析 · 持仓风控继续'
+            : '自动扫描全市场 · 智能调度';
+    }
 }
 
 function updateTickers(tickers, options = {}) {
@@ -1738,13 +1752,24 @@ function initModeButtons() {
 
 async function togglePause() {
     const endpoint = state.paused ? '/api/control/resume' : '/api/control/pause';
-    await fetchWithAuth(endpoint, dashboardWriteOptions({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-    }));
-    await fetchDashboardSummary();
     const btn = document.getElementById('pause-btn');
-    if (btn) btn.textContent = state.paused ? '恢复' : '暂停';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = state.paused ? '正在恢复...' : '正在暂停...';
+    }
+    try {
+        const response = await fetchWithAuth(endpoint, dashboardWriteOptions({
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        }));
+        const data = await response.json().catch(() => null);
+        if (data && data.state) {
+            updateModeDisplay(data.state.mode, data.state.paused, data.state.scan_mode);
+        }
+        await fetchDashboardSummary();
+    } finally {
+        if (btn) btn.disabled = false;
+    }
 }
 
 async function selectLiveModel(modelName) {
@@ -4568,6 +4593,7 @@ function renderDataCollectionDashboard(options = {}) {
     fillDataCollectionSettings(config);
     renderDataCollectionOverview(data, config, stats, training);
     renderDataCollectionSources(data, stats);
+    renderDataCollectionFeatureCoverage(data.feature_coverage || {});
     renderDataCollectionTraining(training);
 }
 
@@ -4618,6 +4644,62 @@ function renderDataCollectionOverview(data, config, stats, training) {
         <div class="data-collection-guide">
             <strong>数据采集页只看状态</strong>
             <span>Scrapling 启停和白名单源已移动到：系统设置 → 外部事件采集。</span>
+        </div>`;
+}
+
+function dataFeatureStatusTone(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'available' || value === 'ok') return 'good';
+    if (value === 'missing' || value === 'critical' || value === 'error') return 'bad';
+    if (value === 'stale' || value === 'low_confidence' || value === 'warning') return 'warn';
+    return 'muted';
+}
+
+function dataFeatureStatusLabel(status) {
+    const map = {
+        available: '可用',
+        missing: '缺失',
+        stale: '过期',
+        low_confidence: '低可信',
+        ok: '正常',
+        warning: '需关注',
+        critical: '异常',
+        error: '读取失败',
+    };
+    return map[String(status || '').toLowerCase()] || String(status || '未知');
+}
+
+function renderDataCollectionFeatureCoverage(featureCoverage) {
+    const container = document.getElementById('data-collection-feature-coverage');
+    if (!container) return;
+    const report = featureCoverage && typeof featureCoverage === 'object' ? featureCoverage : {};
+    const features = Array.isArray(report.features) ? report.features : [];
+    const missing = Array.isArray(report.missing_features) ? report.missing_features : [];
+    const stale = Array.isArray(report.stale_features) ? report.stale_features : [];
+    const neutralized = Array.isArray(report.neutralized_features) ? report.neutralized_features : [];
+    const problemFeatures = features.filter(item => {
+        const status = String(item?.status || '').toLowerCase();
+        return ['missing', 'stale', 'low_confidence'].includes(status);
+    }).slice(0, 12);
+    container.innerHTML = `
+        <div class="data-feature-coverage-grid">
+            ${collectionMetric('覆盖状态', dataFeatureStatusLabel(report.status), report.audit_only ? '只读报告' : '状态来源异常', dataFeatureStatusTone(report.status))}
+            ${collectionMetric('缺失特征', `${monitorNumber(missing.length, 0)} 类`, missing.slice(0, 4).join(' / ') || '暂无', missing.length ? 'bad' : 'good')}
+            ${collectionMetric('过期特征', `${monitorNumber(stale.length, 0)} 类`, stale.slice(0, 4).join(' / ') || '暂无', stale.length ? 'warn' : 'good')}
+            ${collectionMetric('中性阻断', `${monitorNumber(neutralized.length, 0)} 类`, '缺失/过期不驱动开仓', neutralized.length ? 'warn' : 'good')}
+        </div>
+        <div class="data-feature-policy">
+            <span>缺失特征默认中性，不能静默当作正常。</span>
+            <span>低可信事件只允许影子观察，不直接驱动真实开仓。</span>
+        </div>
+        <div class="data-feature-table">
+            ${problemFeatures.length ? problemFeatures.map(item => `
+                <div class="data-feature-row data-source-${dataFeatureStatusTone(item.status)}">
+                    <span>${escHtml(item.label || item.key || '-')}</span>
+                    <strong>${escHtml(dataFeatureStatusLabel(item.status))}</strong>
+                    <em>${escHtml((item.reasons || []).slice(0, 3).join(' / ') || item.source || '')}</em>
+                </div>
+            `).join('') : '<div class="analysis-empty compact">暂无缺失、过期或低可信特征。</div>'}
         </div>`;
 }
 
@@ -5355,6 +5437,44 @@ function systemAuditModelTrainingDetails(details) {
 }
 
 function systemAuditGenericDetailsHtml(details) {
+function systemAuditShadowMissedOpportunityDetails(details) {
+    const summary = details.summary || {};
+    const blockedCounts = details.blocked_reason_counts || {};
+    const groupRows = (items, fallbackStatus) => (Array.isArray(items) ? items : [])
+        .slice(0, 8)
+        .map(item => {
+            const probeRules = item.probe_rules || {};
+            const reasons = Array.isArray(item.adoption_reasons) && item.adoption_reasons.length
+                ? item.adoption_reasons
+                : (Array.isArray(item.blocked_reasons) ? item.blocked_reasons : []);
+            return [
+                item.symbol || '-',
+                sideLabel(item.side || '-'),
+                item.status || fallbackStatus,
+                item.missed_count ?? '-',
+                item.avg_return_pct ?? '-',
+                probeRules.max_position_size_pct ?? '-',
+                reasons.length ? reasons.join(', ') : '-'
+            ];
+        });
+    const blockedReasonRows = Object.entries(blockedCounts)
+        .slice(0, 8)
+        .map(([reason, count]) => [reason, count]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('Missed', summary.missed_count || 0, 'shadow rows')}
+            ${systemAuditMetric('Adopted', summary.adopted_count || 0, 'learning evidence')}
+            ${systemAuditMetric('Probe', summary.probe_count || 0, 'controlled only')}
+            ${systemAuditMetric('Blocked', summary.blocked_count || 0, 'reason required')}
+            ${systemAuditMetric('Weak executed', summary.weak_evidence_executed_count || 0, 'must stay 0')}
+        </div>
+        ${systemAuditSection('Adopted missed opportunities', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.adopted, 'adopted')))}
+        ${systemAuditSection('Controlled probe candidates', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.probe_candidates, 'probe')))}
+        ${systemAuditSection('Blocked missed opportunities', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.blocked_examples, 'blocked')))}
+        ${systemAuditSection('Blocked reason counts', systemAuditTable(['Reason', 'Count'], blockedReasonRows))}`;
+}
+
+
     if (!details || typeof details !== 'object') return ''; 
     const rows = Object.entries(details)
         .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
@@ -5371,6 +5491,7 @@ function systemAuditCardDetailsHtml(card) {
     if (key === 'market_data') return systemAuditMarketDataDetails(details);
     if (key === 'strategy_quality') return systemAuditStrategyDetails(details);
     if (key === 'model_training') return systemAuditModelTrainingDetails(details);
+    if (key === 'shadow_missed_opportunity') return systemAuditShadowMissedOpportunityDetails(details);
     return systemAuditGenericDetailsHtml(details);
 }
 
@@ -6429,7 +6550,9 @@ function scopedStageText(stats, scope) {
 function updateAutoStatus(stats) {
     const scanModeEl = document.getElementById('status-scan-mode');
     if (scanModeEl) {
-        scanModeEl.textContent = '\u81ea\u52a8\u626b\u63cf\u5168\u5e02\u573a (OKX)';
+        scanModeEl.textContent = state.paused
+            ? '已暂停新市场分析；已有仓位继续复盘 / 风控 / 平仓'
+            : '\u81ea\u52a8\u626b\u63cf\u5168\u5e02\u573a (OKX)';
     }
 
     const modelCountEl = document.getElementById('status-model-count');
@@ -8303,11 +8426,20 @@ function renderMLSignalOverview() {
     const latestSignal = latestRecord?.ml_signal || null;
     const latestPrediction = mlPrimaryPrediction(latestSignal);
     const ready = status.available === true;
-    const influenceEnabled = status.influence_enabled === true && status.status === 'ready';
     const mode = status.mode || latestSignal?.mode || 'learning_only';
     const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
+    const readiness = status.readiness || {};
+    const readinessMetrics = readiness.metrics || {};
+    const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
+    const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
+    const allowLivePositionInfluence = status.allow_live_position_influence === true;
+    const influenceEnabled = status.influence_enabled === true && allowLivePositionInfluence;
+    const readinessReasonText = readinessBlockers.length
+        ? readinessBlockers.slice(0, 4).map(item => item?.message || item?.code || '').filter(Boolean).join('；')
+        : '当前没有 readiness 阻塞项';
+    const prAucText = `${monitorNumber(readinessMetrics.long_pr_auc, 3)} / ${monitorNumber(readinessMetrics.short_pr_auc, 3)}`;
     const latestText = latestRecord
         ? `${toBeijingTime(latestRecord.created_at)} ${latestRecord.symbol || '-'}`
         : '暂无最近预测';
@@ -8343,12 +8475,17 @@ function renderMLSignalOverview() {
         </div>
         <div class="ml-overview-grid">
             ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
+            ${mlMetricCard('Readiness', readinessState, readinessReasonText, allowLivePositionInfluence ? 'good' : (readinessState === 'degraded' ? 'bad' : 'warn'))}
+            ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('累计完成样本', String(samples.completedMl), '数据库里已完成的影子复盘总数', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
+            ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, Number(readinessMetrics.dirty_sample_ratio || 0) > 0.08 ? 'bad' : 'good')}
+            ${mlMetricCard('PR-AUC 多/空', prAucText, '缺失时必须重训后才能进入 ready', (Number(readinessMetrics.long_pr_auc || 0) > 0 && Number(readinessMetrics.short_pr_auc || 0) > 0) ? 'good' : 'warn')}
             ${mlMetricCard('新增待消化样本', String(samples.newCount), '达到自动训练条件后会进入下一轮训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
             ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
+            ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || '-', `要求 ${readinessMetrics.required_training_data_version || '-'}`, readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
             ${mlMetricCard('显示说明', `${samples.limit} 是窗口`, '不是样本没增长，而是只拿最新窗口训练，避免老行情污染模型', 'warn')}
         </div>`;
 }

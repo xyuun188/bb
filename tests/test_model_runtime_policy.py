@@ -87,7 +87,9 @@ def test_completion_token_limit_enforces_stage_caps() -> None:
     assert completion_token_limit("decision_maker", 999, floor=180) == 320
     assert completion_token_limit("batch_expert", 999, floor=180) == 700
     assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3-14b-trade") == 700
-    assert completion_token_limit("batch_expert", 999, floor=180, model="deepseek-r1-14b-risk") == 999
+    assert (
+        completion_token_limit("batch_expert", 999, floor=180, model="deepseek-r1-14b-risk") == 999
+    )
     assert (
         completion_token_limit(
             "high_risk_review",

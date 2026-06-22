@@ -1105,6 +1105,7 @@ class ExecutionService:
                 record_trade_notional(execution_result.price * execution_result.quantity)
             if decision_db_id is not None and exchange_confirmed:
                 await mark_decision_executed(decision_db_id, execution_result.price)
+                await mark_decision_reason(decision_db_id, confirm_reason)
                 attach_execution_parameters("exchange_confirmed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
                 if decision.is_entry:

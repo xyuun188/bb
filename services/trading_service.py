@@ -160,7 +160,6 @@ from services.position_profit_peak_context import PositionProfitPeakContextPolic
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
 from services.position_quality import PositionQualityScorer
-from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
 from services.position_release_decision import PositionReleaseDecisionPolicy
 from services.position_review_batch import PositionReviewBatchPolicy
 from services.position_review_decision_normalizer import PositionReviewDecisionNormalizer
@@ -183,6 +182,7 @@ from services.position_review_risk_alert import PositionReviewRiskAlertPolicy
 from services.position_review_risk_assessment import PositionReviewRiskAssessmentPolicy
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
+from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_learning import StrategyLearningService
@@ -237,7 +237,10 @@ async def drain_cancelled_tasks(
     for task in done:
         try:
             task.result()
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
+            continue
+        except Exception as exc:
+            logger.debug("cancelled task cleanup raised", error=safe_error_text(exc))
             continue
     if still_pending:
         for task in still_pending:
@@ -2539,7 +2542,7 @@ class TradingService:
                 timeout=self.strategy_learning_context_timeout_seconds(),
             )
             if not done:
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             learned_context = next(iter(done)).result()
             refreshed_context = self._refresh_dynamic_capacity(
                 open_positions=open_positions or [],
@@ -2552,7 +2555,7 @@ class TradingService:
                 "context": self._json_safe_payload(refreshed_context),
             }
             return refreshed_context
-        except asyncio.TimeoutError:
+        except TimeoutError:
             cached_context = self._recent_strategy_learning_context(selected_mode)
             if cached_context:
                 cached_context.update(
@@ -3209,6 +3212,24 @@ class TradingService:
                 "当前执行账户已暂停投资：停止新开仓和新交易对分析，"
                 "已有仓位继续复盘直到触发正常平仓。"
             )
+            if analysis_scope == "market":
+                return {
+                    "status": "paused",
+                    "mode": mode_manager.mode.value,
+                    "analysis_scope": analysis_scope,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "symbols_processed": 0,
+                    "decisions": [],
+                    "executions": [],
+                    "warnings": [
+                        {
+                            "model": ENSEMBLE_TRADER_NAME,
+                            "symbol": "ALL",
+                            "warning": account_pause_reason,
+                        }
+                    ],
+                    "market_analysis_paused": True,
+                }
             run_market_analysis = False
             run_position_analysis = analysis_scope in {"full", "position"}
         new_pair_market_pause_applied = False

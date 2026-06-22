@@ -5,7 +5,11 @@ from pydantic import BaseModel
 
 from core.secret_utils import is_masked_secret
 from db.session import get_session_ctx
-from services.secure_settings import SecureSettingsError, SecureSettingsService, normalize_secure_key
+from services.secure_settings import (
+    SecureSettingsError,
+    SecureSettingsService,
+    normalize_secure_key,
+)
 
 router = APIRouter()
 

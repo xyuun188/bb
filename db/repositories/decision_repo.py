@@ -7,7 +7,7 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision
-from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
+from services.text_integrity import sanitize_runtime_text
 
 
 class DecisionRepository(BaseRepository):
@@ -71,7 +71,7 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            decision.execution_reason = sanitize_text(reason)
+            decision.execution_reason = sanitize_runtime_text(reason)
             await self.session.flush()
         return decision
 
@@ -80,7 +80,7 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            clean_response = sanitize_payload(raw_response)
+            clean_response = sanitize_runtime_text(raw_response)
             decision.raw_llm_response = clean_response
             _sync_execution_parameters(decision, clean_response)
             await self.session.flush()
@@ -104,7 +104,7 @@ class DecisionRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
-        clean_reason = sanitize_text(reason)
+        clean_reason = sanitize_runtime_text(reason)
         for decision in rows:
             decision.execution_reason = clean_reason
         if rows:
@@ -176,10 +176,10 @@ def _sanitize_decision_payload(data: dict) -> dict:
     clean = dict(data or {})
     for key in ("reasoning", "execution_reason"):
         if key in clean:
-            clean[key] = sanitize_text(clean.get(key))
+            clean[key] = sanitize_runtime_text(clean.get(key))
     for key in ("feature_snapshot", "raw_llm_response"):
         if key in clean:
-            clean[key] = sanitize_payload(clean.get(key))
+            clean[key] = sanitize_runtime_text(clean.get(key))
     return clean
 
 

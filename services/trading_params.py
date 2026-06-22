@@ -320,7 +320,10 @@ class LocalMLTrainingParams:
     influence_min_sample_count: int = 1_000
     influence_min_test_count: int = 200
     influence_min_auc: float = 0.53
+    influence_min_pr_auc: float = 0.52
     influence_min_accuracy: float = 0.52
+    readiness_max_dirty_sample_ratio: float = 0.08
+    readiness_max_model_age_seconds: int = 3 * 24 * 60 * 60
     train_split_ratio: float = 0.75
     min_test_rows: int = 40
 

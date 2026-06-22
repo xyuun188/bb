@@ -455,6 +455,10 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "做空保守修正样本" in script
     assert "short_conservative_adjustment_samples" in script
     assert "short_released_adjustment_samples" in script
+    assert "function systemAuditShadowMissedOpportunityDetails" in script
+    assert "shadow_missed_opportunity" in script
+    assert "Adopted missed opportunities" in script
+    assert "Blocked reason counts" in script
     assert "系统巡检接口请求失败" in script
     assert "补历史仓位、重启服务、批量训练等动作必须人工确认" in script
     assert ".system-audit-grid" in style
@@ -539,6 +543,13 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "cryptopanic_api_key" in script
     assert "groupDataCollectionSources" in script
     assert "fetchJSON('/api/data-collection/status')" in script
+    assert 'id="data-collection-feature-coverage"' in html
+    assert "renderDataCollectionFeatureCoverage" in script
+    assert "feature_coverage" in script
+    assert "缺失特征" in script
+    assert "中性阻断" in script
+    assert ".data-feature-coverage-grid" in style
+    assert ".data-feature-row" in style
     assert "postJSON('/api/data-collection/settings', body)" in script
     assert "fetchJSON('/api/vector-memory/status')" in script
     assert "postJSON('/api/vector-memory/reindex', {})" in script
@@ -662,6 +673,23 @@ def test_local_ml_loss_filter_uses_backend_model_contract() -> None:
         in status_block
     )
     assert "localModelStatus(local, 'loss_filter')" in script
+
+
+def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    overview_block = script[
+        script.index("function renderMLSignalOverview") : script.index(
+            "function renderLocalAIToolsStatus"
+        )
+    ]
+
+    assert "status.readiness || {}" in overview_block
+    assert "readiness.blocking_reasons" in overview_block
+    assert "allow_live_position_influence" in overview_block
+    assert "readiness.metrics" in overview_block
+    assert "dirty_sample_ratio" in overview_block
+    assert "long_pr_auc" in overview_block
+    assert "short_pr_auc" in overview_block
 
 
 def test_data_collection_request_failure_still_renders_error_fallback() -> None:

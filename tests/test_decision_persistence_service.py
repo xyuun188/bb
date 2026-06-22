@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import services.decision_persistence_service as decision_persistence_module
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_persistence_service import DecisionPersistenceService
 from services.decision_state import DecisionStage, DecisionStageStatus
@@ -95,6 +96,55 @@ def _service(session: FakeSession, repo: FakeDecisionRepo) -> DecisionPersistenc
         session_context_factory=lambda: FakeSessionContext(session),
         decision_repo_factory=lambda _session: repo,
     )
+
+
+@pytest.mark.asyncio
+async def test_decision_persistence_uses_unified_runtime_text_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+
+    def fake_sanitize(value: Any) -> Any:
+        calls.append(value)
+        if isinstance(value, str):
+            return f"unified:{value}"
+        if isinstance(value, dict):
+            return {"unified": value}
+        return value
+
+    monkeypatch.setattr(
+        decision_persistence_module,
+        "sanitize_runtime_text",
+        fake_sanitize,
+        raising=False,
+    )
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision()
+    decision.reasoning = "raw decision reason"
+    decision.raw_response = {"analysis_type": "market_scan", "note": "raw llm"}
+    decision.feature_snapshot = {"note": "raw feature"}
+
+    await service.log_decision(decision, is_paper=True)
+    await service.record_and_persist_stage(
+        decision_id=9,
+        decision=decision,
+        stage=DecisionStage.RISK_CHECK,
+        status=DecisionStageStatus.BLOCKED,
+        reason="raw stage reason",
+        data={"note": "raw stage data"},
+    )
+    await service.mark_reason(9, "raw final reason")
+    await service.fill_missing_reasons([9], "raw missing reason")
+
+    assert repo.logged[0]["reasoning"] == "unified:raw decision reason"
+    assert repo.logged[0]["feature_snapshot"]["unified"]["note"] == "unified:raw feature"
+    assert repo.logged[0]["raw_llm_response"]["unified"]["note"] == "unified:raw llm"
+    assert "decision_state_machine" in repo.logged[0]["raw_llm_response"]["unified"]
+    assert repo.raw_updates[-1][1]["unified"]["note"] == "unified:raw llm"
+    assert repo.reasons == [(9, "unified:raw final reason")]
+    assert repo.fill_missing == [([9], "unified:raw missing reason")]
+    assert "raw decision reason" in calls
 
 
 @pytest.mark.asyncio

@@ -47,9 +47,17 @@ from services.entry_signal_extraction import (
 )
 from services.exchange_position_state import (
     exchange_position_display_valuation as _exchange_position_display_valuation,
+)
+from services.exchange_position_state import (
     exchange_snapshot_price as _exchange_snapshot_price,
+)
+from services.exchange_position_state import (
     exchange_snapshot_quantity as _exchange_snapshot_quantity,
+)
+from services.exchange_position_state import (
     exchange_snapshot_unrealized as _exchange_snapshot_unrealized,
+)
+from services.exchange_position_state import (
     parse_exchange_position_snapshot,
 )
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
@@ -886,7 +894,7 @@ async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any
         "running": running,
         "mode": runtime_status.get("mode")
         or ("live" if mode == "live" else mode_manager.mode.value),
-        "paused": bool(runtime_status.get("paused", mode_manager.is_paused)),
+        "paused": mode_manager.is_paused,
         "uptime_source": "split_process_heartbeat",
         "uptime_seconds": uptime_seconds,
         "started_at": runtime_status.get("started_at"),
@@ -2546,12 +2554,12 @@ async def get_status(mode: str | None = None):
 
     return {
         "status": "running" if bool(trading_stats.get("running")) else "stopped",
+        "timestamp": datetime.now(UTC).isoformat(),
+        **trading_stats,
         "mode": mode_manager.mode.value,
         "paused": mode_manager.is_paused,
         "scan_mode": mode_manager.scan_mode,
         "live_model": mode_manager.live_model_name,
-        "timestamp": datetime.now(UTC).isoformat(),
-        **trading_stats,
     }
 
 
@@ -2730,15 +2738,15 @@ async def get_dashboard_summary():
 
     return {
         "timestamp": datetime.now(UTC).isoformat(),
-        "mode": mode_manager.mode.value,
-        "paused": mode_manager.is_paused,
-        "scan_mode": mode_manager.scan_mode,
         "market": market_state,
         "model_rankings": [],
         "execution_account": execution_account,
         "accounts": account_summaries,
         "okx_account": okx_account,
         **trading_stats,
+        "mode": mode_manager.mode.value,
+        "paused": mode_manager.is_paused,
+        "scan_mode": mode_manager.scan_mode,
         "today_decisions_total": today_decisions_total,
         "today_decisions_timezone": "Asia/Shanghai",
     }

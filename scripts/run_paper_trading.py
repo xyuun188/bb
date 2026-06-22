@@ -45,7 +45,9 @@ LOCK_FILE = Path(__file__).resolve().parent.parent / "data" / "paper_trading.loc
 _lock_handle: TextIO | None = None
 
 
-async def _send_dashboard_message(redis: Any | None, inline_dashboard: bool, message: dict[str, Any]) -> None:
+async def _send_dashboard_message(
+    redis: Any | None, inline_dashboard: bool, message: dict[str, Any]
+) -> None:
     if inline_dashboard:
         await ws_manager.broadcast(message)
         return
@@ -209,7 +211,7 @@ async def main():
                     {
                         "type": "ticker_update",
                         "symbols": tickers,
-                    }
+                    },
                 )
                 await _send_dashboard_message(
                     redis,
@@ -219,7 +221,7 @@ async def main():
                         "decisions": stats.get("recent_decisions", []),
                         "executions": stats.get("recent_executions", []),
                         "stats": stats,
-                    }
+                    },
                 )
             except Exception as e:
                 ws_log.error("ws push failed", error=safe_error_text(e))

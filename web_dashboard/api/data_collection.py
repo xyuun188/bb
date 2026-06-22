@@ -25,10 +25,11 @@ from data_feed.external_event_scraper import (
 )
 from data_feed.news_fetcher import RSS_FEEDS
 from db.session import get_session_ctx
+from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
-from models.learning import ShadowBacktest, TradeReflection
 from models.trade import Position
+from services.crypto_feature_coverage import CryptoFeatureCoverageService
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
@@ -80,6 +81,43 @@ def _safe_status_section(
             "error": f"{section} returned non-object status",
         }
     )
+    return payload
+
+
+def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
+    if isinstance(result, BaseException):
+        logger.warning(
+            "crypto feature coverage status failed",
+            error=safe_error_text(result),
+        )
+        payload = _status_error_payload("crypto_feature_coverage", result)
+    elif isinstance(result, dict):
+        payload = dict(result)
+    else:
+        payload = {
+            "status": "error",
+            "section": "crypto_feature_coverage",
+            "error": "crypto_feature_coverage returned non-object status",
+        }
+    payload["audit_only"] = True
+    payload["live_signal_mutation"] = False
+    payload["can_missing_features_drive_live_entry"] = False
+    payload["feature_defaults_are_neutral"] = True
+    policy = payload.get("feature_contribution_policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    policy["missing_feature_policy"] = "neutral_blocked"
+    policy["stale_feature_policy"] = "neutral_blocked"
+    policy["low_confidence_event_policy"] = "shadow_only"
+    payload["feature_contribution_policy"] = policy
+    features = payload.get("features") if isinstance(payload.get("features"), list) else []
+    for feature in features:
+        if isinstance(feature, dict) and str(feature.get("status") or "") in {
+            "missing",
+            "stale",
+            "low_confidence",
+        }:
+            feature["live_entry_influence"] = "blocked"
     return payload
 
 
@@ -479,6 +517,49 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             quarantined_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(ShadowBacktest.status == "quarantined")
             )
+            shadow_window_filter = (
+                ShadowBacktest.status.in_(("completed", "quarantined")),
+                ShadowBacktest.long_return_pct.is_not(None),
+                ShadowBacktest.short_return_pct.is_not(None),
+            )
+            shadow_span_result = await session.execute(
+                select(
+                    func.count(ShadowBacktest.id),
+                    func.min(ShadowBacktest.due_at),
+                    func.max(ShadowBacktest.due_at),
+                ).where(*shadow_window_filter)
+            )
+            shadow_action_rows = list(
+                (
+                    await session.execute(
+                        select(ShadowBacktest.decision_action, func.count(ShadowBacktest.id))
+                        .where(*shadow_window_filter)
+                        .group_by(ShadowBacktest.decision_action)
+                    )
+                ).all()
+            )
+            trainable_action_rows = list(
+                (
+                    await session.execute(
+                        select(ShadowBacktest.decision_action, func.count(ShadowBacktest.id))
+                        .where(
+                            ShadowBacktest.status == "completed",
+                            ShadowBacktest.long_return_pct.is_not(None),
+                            ShadowBacktest.short_return_pct.is_not(None),
+                        )
+                        .group_by(ShadowBacktest.decision_action)
+                    )
+                ).all()
+            )
+            shadow_symbol_rows = list(
+                (
+                    await session.execute(
+                        select(ShadowBacktest.symbol, func.count(ShadowBacktest.id))
+                        .where(*shadow_window_filter)
+                        .group_by(ShadowBacktest.symbol)
+                    )
+                ).all()
+            )
             trade_reflection_result = await session.execute(select(func.count(TradeReflection.id)))
             closed_position_result = await session.execute(
                 select(func.count(Position.id)).where(
@@ -489,6 +570,19 @@ async def _training_governance_snapshot() -> dict[str, Any]:
 
         completed_count = int(completed_result.scalar() or 0)
         quarantined_count = int(quarantined_result.scalar() or 0)
+        sample_total_count, oldest_sample_at, latest_sample_at = shadow_span_result.one()
+        sample_total_count = int(sample_total_count or 0)
+        action_counts = {
+            str(action or "unknown").lower(): int(count or 0)
+            for action, count in shadow_action_rows
+        }
+        trainable_action_counts = {
+            str(action or "unknown").lower(): int(count or 0)
+            for action, count in trainable_action_rows
+        }
+        symbol_counts = {
+            str(symbol or "unknown"): int(count or 0) for symbol, count in shadow_symbol_rows
+        }
         trade_count = int(trade_reflection_result.scalar() or 0) + int(
             closed_position_result.scalar() or 0
         )
@@ -506,8 +600,21 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             "summary": summary,
             "sampled": 0,
             "sample_limit": sample_limit,
+            "sample_total_count": sample_total_count,
+            "trainable_sample_count": completed_count,
+            "quarantined_sample_count": quarantined_count,
             "total_trainable_count": completed_count,
             "quarantined_count": quarantined_count,
+            "action_counts": action_counts,
+            "trainable_action_counts": trainable_action_counts,
+            "symbol_count": len(symbol_counts),
+            "symbol_counts": symbol_counts,
+            "time_span": {
+                "oldest_sample_at": _iso(oldest_sample_at),
+                "latest_sample_at": _iso(latest_sample_at),
+            },
+            "latest_sample_at": _iso(latest_sample_at),
+            "data_freshness_minutes": _age_minutes(latest_sample_at),
             "cleanup_mode": "quarantine_not_delete",
             "raw_records_preserved": True,
             "quarantine_applied": bool(quarantined_count),
@@ -717,17 +824,25 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 
 @router.get("/data-collection/status")
 async def get_data_collection_status() -> dict[str, Any]:
-    source_stats_result, quality_result, local_ai_status_result, governance_result = (
-        await asyncio.gather(
-            _source_breakdown(),
-            _training_sample_quality(),
-            _local_ai_training_status(),
-            asyncio.wait_for(
-                _training_governance_snapshot(),
-                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-            ),
-            return_exceptions=True,
-        )
+    (
+        source_stats_result,
+        quality_result,
+        local_ai_status_result,
+        governance_result,
+        feature_coverage_result,
+    ) = await asyncio.gather(
+        _source_breakdown(),
+        _training_sample_quality(),
+        _local_ai_training_status(),
+        asyncio.wait_for(
+            _training_governance_snapshot(),
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+        asyncio.wait_for(
+            CryptoFeatureCoverageService().report(hours=24, limit=1000),
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+        return_exceptions=True,
     )
     source_stats = _safe_status_section(
         source_stats_result,
@@ -749,6 +864,7 @@ async def get_data_collection_status() -> dict[str, Any]:
         section="training_governance",
         fallback={"cleanup_effective": False},
     )
+    feature_coverage = _safe_feature_coverage_status(feature_coverage_result)
     scrapling_installed = _scrapling_installed()
     configured_source_cards = _configured_source_cards()
     valid_scrapling_sources = [
@@ -806,6 +922,7 @@ async def get_data_collection_status() -> dict[str, Any]:
         },
         "sources": _collection_sources_summary(),
         "stats": source_stats,
+        "feature_coverage": feature_coverage,
         "training": {
             "text_sentiment_quality_sample": quality,
             "local_ai_tools": local_ai_status,

@@ -58,7 +58,9 @@ class AuthenticatedDashboardUser:
 def normalize_username(value: str) -> str:
     username = str(value or "").strip().lower()
     if not USERNAME_RE.fullmatch(username):
-        raise ValueError("username must be 3-40 characters: letters, numbers, dot, underscore, dash")
+        raise ValueError(
+            "username must be 3-40 characters: letters, numbers, dot, underscore, dash"
+        )
     return username
 
 
@@ -267,7 +269,9 @@ async def change_dashboard_user_password(
     if row is None:
         raise ValueError("dashboard user not found")
     if require_current_password:
-        if not current_password or not verify_dashboard_password(current_password, row.password_hash):
+        if not current_password or not verify_dashboard_password(
+            current_password, row.password_hash
+        ):
             raise ValueError("current password is required")
     row.password_hash = hash_dashboard_password(validate_dashboard_password(new_password))
     await session.flush()

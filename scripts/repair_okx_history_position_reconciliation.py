@@ -22,10 +22,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sqlalchemy import select  # noqa: E402
+
 from core.symbols import normalize_trading_symbol  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
-from sqlalchemy import select  # noqa: E402
 
 DEFAULT_WINDOW_SECONDS = 240
 MIN_QUANTITY_COVERAGE = 0.80

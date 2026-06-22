@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_signal_extraction import (
     expected_return_pct as signal_expected_return_pct,
+)
+from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
     signal_available,

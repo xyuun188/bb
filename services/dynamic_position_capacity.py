@@ -89,9 +89,7 @@ class DynamicPositionCapacityPolicy:
         )
         low_quality_count = sum(1 for item in quality_rows if item[1].should_release)
         low_quality_ratio = low_quality_count / max(len(quality_rows), 1)
-        release_candidate_count = sum(
-            1 for item in quality_rows if item[1].bucket == "release_now"
-        )
+        release_candidate_count = sum(1 for item in quality_rows if item[1].bucket == "release_now")
         strategy_rotation_slots = self._strategy_rotation_slots(strategy_context)
         policy_rotation_slots = self._rotation_slot_count(
             open_group_count=open_group_count,

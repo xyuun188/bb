@@ -92,9 +92,9 @@ async def get_read_session_ctx() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Create all tables. Called at application startup."""
-    import models.decision  # noqa: F401 - register decision tables in metadata
     import models.account  # noqa: F401 - register account tables in metadata
     import models.dashboard_auth  # noqa: F401 - register dashboard auth tables
+    import models.decision  # noqa: F401 - register decision tables in metadata
     import models.learning  # noqa: F401 - register learning tables in metadata
     import models.market_data  # noqa: F401 - register market tables in metadata
     import models.news  # noqa: F401 - register news/social tables in metadata

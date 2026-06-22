@@ -558,7 +558,7 @@ async def test_dashboard_public_bind_requires_login_even_from_local_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
-    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")  # noqa: S104
     app = create_app()
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
 

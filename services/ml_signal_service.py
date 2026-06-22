@@ -20,7 +20,7 @@ import structlog
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sqlalchemy import func, select
 
@@ -29,14 +29,15 @@ from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
+from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
+from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
-    assess_shadow_sample,
     annotate_samples,
+    assess_shadow_sample,
     governance_report,
     quality_report,
 )
-from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
 logger = structlog.get_logger(__name__)
 
@@ -96,7 +97,10 @@ MIN_TRAINING_SAMPLES = _LOCAL_ML_PARAMS.min_training_samples
 ML_INFLUENCE_MIN_SAMPLE_COUNT = _LOCAL_ML_PARAMS.influence_min_sample_count
 ML_INFLUENCE_MIN_TEST_COUNT = _LOCAL_ML_PARAMS.influence_min_test_count
 ML_INFLUENCE_MIN_AUC = _LOCAL_ML_PARAMS.influence_min_auc
+ML_INFLUENCE_MIN_PR_AUC = _LOCAL_ML_PARAMS.influence_min_pr_auc
 ML_INFLUENCE_MIN_ACCURACY = _LOCAL_ML_PARAMS.influence_min_accuracy
+READINESS_MAX_DIRTY_SAMPLE_RATIO = _LOCAL_ML_PARAMS.readiness_max_dirty_sample_ratio
+READINESS_MAX_MODEL_AGE_SECONDS = _LOCAL_ML_PARAMS.readiness_max_model_age_seconds
 ML_INFLUENCE_MIN_TOP_RETURN_PCT = WIN_RETURN_THRESHOLD_PCT
 
 
@@ -247,6 +251,15 @@ def _safe_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
         return None
 
 
+def _safe_pr_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
+    try:
+        if int(pd.Series(y_true).nunique()) < 2:
+            return None
+        return float(average_precision_score(y_true, y_score))
+    except (TypeError, ValueError):
+        return None
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(min(float(value), high), low)
 
@@ -287,6 +300,7 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     sample_count = int(metadata.get("sample_count") or 0)
     test_count = int(metadata.get("test_count") or 0)
     auc = _safe_float(metrics.get(f"{side}_auc"), 0.0)
+    pr_auc = _safe_float(metrics.get(f"{side}_pr_auc"), None)
     accuracy = _safe_float(metrics.get(f"{side}_accuracy"), 0.0)
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0)
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), 0.0)
@@ -301,6 +315,10 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         maturity_reasons.append(f"测试样本 {test_count} < {ML_INFLUENCE_MIN_TEST_COUNT}")
     if auc < ML_INFLUENCE_MIN_AUC:
         hard_reasons.append(f"AUC {auc:.3f} < {ML_INFLUENCE_MIN_AUC:.2f}")
+    if pr_auc is None:
+        hard_reasons.append("PR-AUC missing")
+    elif pr_auc < ML_INFLUENCE_MIN_PR_AUC:
+        hard_reasons.append(f"PR-AUC {pr_auc:.3f} < {ML_INFLUENCE_MIN_PR_AUC:.2f}")
     if accuracy < ML_INFLUENCE_MIN_ACCURACY:
         hard_reasons.append(f"准确率 {accuracy:.3f} < {ML_INFLUENCE_MIN_ACCURACY:.2f}")
     if top_return <= ML_INFLUENCE_MIN_TOP_RETURN_PCT:
@@ -322,6 +340,7 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         "status": status,
         "side": side,
         "auc": round(auc, 4),
+        "pr_auc": None if pr_auc is None else round(pr_auc, 4),
         "accuracy": round(accuracy, 4),
         "top_avg_return_pct": round(top_return, 4),
         "bottom_avg_return_pct": round(bottom_return, 4),
@@ -381,6 +400,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             "features": snapshot,
             "long_return_pct": _safe_float(raw_long_return),
             "short_return_pct": _safe_float(raw_short_return),
+            "label_timestamp": getattr(row, "due_at", None),
             "best_action": getattr(row, "best_action", ""),
             "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
         }
@@ -435,6 +455,7 @@ def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
             "features": snapshot,
             "long_return_pct": None if raw_long_return is None else _safe_float(raw_long_return),
             "short_return_pct": None if raw_short_return is None else _safe_float(raw_short_return),
+            "label_timestamp": getattr(row, "due_at", None),
             "best_action": getattr(row, "best_action", ""),
             "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
         }
@@ -525,6 +546,8 @@ def train_from_frame(
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
             "short_auc": _safe_auc(test["short_win"], short_scores),
+            "long_pr_auc": _safe_pr_auc(test["long_win"], long_scores),
+            "short_pr_auc": _safe_pr_auc(test["short_win"], short_scores),
             "long_accuracy": (
                 float(accuracy_score(test["long_win"], long_pred)) if len(test) else None
             ),
@@ -585,15 +608,27 @@ class MLSignalService:
         self._ensure_loaded()
         auto_status = self._auto_train_status()
         if not self._bundle:
+            readiness = disabled_ml_readiness(
+                "no_model",
+                "ML model artifact is not available.",
+            )
             return {
                 "available": False,
                 "status": "no_model",
+                "readiness_state": readiness["state"],
+                "readiness": readiness,
+                "allow_live_position_influence": False,
                 "model_path": str(self.model_path),
                 "message": "本地 ML 盈亏质量模型尚未训练。",
                 **auto_status,
             }
         metadata = _safe_dict(self._bundle.get("metadata"))
         influence = _influence_policy(metadata)
+        readiness = build_ml_readiness_report(metadata, influence)
+        allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
+        advisory_enabled = bool(
+            influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
+        )
         model_note = metadata.get("note")
         training_count = int(metadata.get("sample_count") or 0)
         return {
@@ -609,16 +644,29 @@ class MLSignalService:
             "training_sample_note": metadata.get("training_sample_note")
             or "sample_count is the latest training window, not the all-time total.",
             "status": (
-                "ready" if influence.get("enabled") else influence.get("status", "learning_only")
+                "ready"
+                if allow_live_position_influence
+                else str(readiness.get("state") or influence.get("status") or "learning_only")
             ),
-            "mode": influence.get("mode"),
-            "influence_enabled": bool(influence.get("enabled")),
-            "advisory_enabled": bool(influence.get("advisory_enabled")),
+            "mode": (
+                "entry_profit_filter"
+                if allow_live_position_influence
+                else (
+                    "advisory"
+                    if advisory_enabled
+                    else str(readiness.get("state") or "learning_only")
+                )
+            ),
+            "readiness_state": readiness.get("state"),
+            "readiness": readiness,
+            "allow_live_position_influence": allow_live_position_influence,
+            "influence_enabled": allow_live_position_influence,
+            "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_note": model_note,
             "note": (
                 "ML 指标达标，当前允许参与开仓过滤、加分和机会排序。"
-                if influence.get("enabled")
+                if allow_live_position_influence
                 else (
                     "ML 硬指标有效但样本成熟度不足，当前按小权重提供收益解释，不做硬否决。"
                     if influence.get("advisory_enabled")
@@ -653,7 +701,15 @@ class MLSignalService:
                     or 0
                 )
                 influence = _influence_policy(metadata) if metadata else {"enabled": False}
-                learning_only = not bool(influence.get("enabled"))
+                readiness = (
+                    build_ml_readiness_report(metadata, influence)
+                    if metadata
+                    else disabled_ml_readiness(
+                        "no_metadata",
+                        "ML model metadata is not available.",
+                    )
+                )
+                learning_only = not bool(readiness.get("allow_live_position_influence"))
                 min_interval_seconds = (
                     AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS
                     if learning_only
@@ -675,6 +731,8 @@ class MLSignalService:
                 new_samples = max(completed_count - last_completed_count, 0)
                 training_policy = {
                     "learning_only": learning_only,
+                    "readiness_state": readiness.get("state"),
+                    "readiness_blocking_reasons": readiness.get("blocking_reasons") or [],
                     "min_interval_seconds": min_interval_seconds,
                     "min_new_samples": min_new_samples,
                     "min_training_samples": MIN_TRAINING_SAMPLES,
@@ -791,13 +849,25 @@ class MLSignalService:
     def predict(self, features: Any, *, horizons: tuple[int, ...] = (10, 30)) -> dict[str, Any]:
         self._ensure_loaded()
         if not self._bundle:
+            readiness = disabled_ml_readiness(
+                "no_model",
+                "ML model artifact is not available.",
+            )
             return {
                 "available": False,
                 "status": "no_model",
+                "readiness_state": readiness["state"],
+                "readiness": readiness,
+                "allow_live_position_influence": False,
                 "message": "本地 ML 盈亏质量模型尚未训练，当前分析不使用 ML 辅助信号。",
             }
         metadata = _safe_dict(self._bundle.get("metadata"))
         influence = _influence_policy(metadata)
+        readiness = build_ml_readiness_report(metadata, influence)
+        allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
+        advisory_enabled = bool(
+            influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
+        )
 
         predictions = []
         for horizon in horizons:
@@ -830,7 +900,7 @@ class MLSignalService:
                     "profit_edge_pct": round(profit_edge, 4),
                     "profit_quality_score": round(profit_quality, 4),
                     "profit_signal": bool(
-                        influence.get("enabled")
+                        allow_live_position_influence
                         and side_influence.get("enabled")
                         and best_expected > WIN_RETURN_THRESHOLD_PCT
                         and profit_edge >= MIN_PROFIT_EDGE_PCT
@@ -838,7 +908,7 @@ class MLSignalService:
                     ),
                     "risk_score": round(risk_score, 4),
                     "ml_influence_enabled": bool(
-                        influence.get("enabled") and side_influence.get("enabled")
+                        allow_live_position_influence and side_influence.get("enabled")
                     ),
                 }
             )
@@ -848,16 +918,27 @@ class MLSignalService:
             "available": True,
             "status": (
                 "entry_profit_filter"
-                if influence.get("enabled")
-                else "advisory" if influence.get("advisory_enabled") else "learning_only"
+                if allow_live_position_influence
+                else (
+                    "advisory"
+                    if advisory_enabled
+                    else str(readiness.get("state") or "learning_only")
+                )
             ),
             "mode": (
                 "entry_profit_filter"
-                if influence.get("enabled")
-                else "advisory" if influence.get("advisory_enabled") else "learning_only"
+                if allow_live_position_influence
+                else (
+                    "advisory"
+                    if advisory_enabled
+                    else str(readiness.get("state") or "learning_only")
+                )
             ),
-            "influence_enabled": bool(influence.get("enabled")),
-            "advisory_enabled": bool(influence.get("advisory_enabled")),
+            "readiness_state": readiness.get("state"),
+            "readiness": readiness,
+            "allow_live_position_influence": allow_live_position_influence,
+            "influence_enabled": allow_live_position_influence,
+            "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_version": metadata.get("version"),
             "trained_sample_count": int(metadata.get("sample_count") or 0),

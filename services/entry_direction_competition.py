@@ -7,10 +7,12 @@ from typing import Any
 
 from services.entry_signal_extraction import (
     directional_expected_return_pct,
-    expected_return_pct as signal_expected_return_pct,
     first_tool_payload,
     payload_side,
     signal_available,
+)
+from services.entry_signal_extraction import (
+    expected_return_pct as signal_expected_return_pct,
 )
 
 

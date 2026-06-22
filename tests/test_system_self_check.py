@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-import json
 import pytest
 
 from config.settings import settings
@@ -383,6 +383,38 @@ async def test_dashboard_summary_uses_split_process_runtime_heartbeat(
     assert stats["uptime_source"] == "split_process_heartbeat"
     assert stats["round_active"] is True
     assert stats["round_running_seconds"] >= 40
+
+
+@pytest.mark.asyncio
+async def test_split_process_stats_use_shared_pause_state_over_stale_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "trading_runtime_status.json").write_text(
+        json.dumps(
+            {
+                "running": True,
+                "mode": "paper",
+                "paused": False,
+                "heartbeat_at": datetime.now(UTC).isoformat(),
+                "decision_interval": 30,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    await dashboard.mode_manager.pause()
+
+    async def recent_activity(_hours: int = 6) -> dict[str, Any]:
+        return {"decision_count": 0, "order_count": 0, "heartbeat_age_seconds": 5.0}
+
+    monkeypatch.setattr(dashboard, "_recent_trading_activity_stats", recent_activity)
+
+    stats = await dashboard._split_process_trading_stats("paper")
+
+    assert stats["paused"] is True
 
 
 @pytest.mark.asyncio

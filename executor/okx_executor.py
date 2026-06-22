@@ -2386,16 +2386,22 @@ class OKXExecutor(AbstractExecutor):
             if markets_before is None:
                 try:
                     ccxt.markets = {}
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "failed to set temporary OKX markets cache",
+                        error=safe_error_text(exc),
+                    )
             try:
                 return await self._with_retry(ccxt.fetch_balance)
             finally:
                 if markets_before is None:
                     try:
                         ccxt.markets = markets_before
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "failed to restore OKX markets cache",
+                            error=safe_error_text(exc),
+                        )
         raise ExchangeAPIError("OKX balance API is unavailable on this client")
 
     def _balance_response_to_ccxt_shape(

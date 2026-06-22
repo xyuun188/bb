@@ -174,9 +174,9 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
 def test_server_monitor_probe_reports_each_vllm_endpoint_as_service() -> None:
     script = render_server_monitor_probe("qwen3-14b-trade", "Qwen3-14B-Instruct")
 
-    assert "for item in runtime.get(\"vllm_endpoints\", [])" in script
+    assert 'for item in runtime.get("vllm_endpoints", [])' in script
     assert "vllm_model_service_status(item)" in script
-    assert "runtime.get(\"vllm\", {}).get(\"models\")" not in script
+    assert 'runtime.get("vllm", {}).get("models")' not in script
     assert '"provider_model": provider_model' in script
     assert "DeepSeek R1 14B" in script
     assert "deepseek-r1-14b-risk" in script

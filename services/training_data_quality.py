@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
+from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-06-20.v2"
+DATA_QUALITY_VERSION = "2026-06-23.v3"
 QualityStatus = Literal["included", "downweighted", "excluded"]
 SampleKind = Literal["shadow", "trade", "sequence", "text_sentiment"]
 _RETRAIN_TARGETS = (
@@ -63,6 +65,85 @@ def _features(sample: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _iter_text_values(value: Any) -> Any:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_text_values(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_text_values(item)
+
+
+def _has_mojibake_text(*values: Any) -> bool:
+    return any(looks_like_mojibake(text) for value in values for text in _iter_text_values(value))
+
+
+def _sample_guard_reasons(sample: dict[str, Any], *text_values: Any) -> list[str]:
+    reasons: list[str] = []
+    if _has_mojibake_text(sample, *text_values):
+        reasons.append("mojibake_text")
+    if _is_duplicate_sample(sample):
+        reasons.append("duplicate_sample")
+    if _has_future_leakage(sample, *text_values):
+        reasons.append("future_leakage")
+    return reasons
+
+
+def _is_duplicate_sample(sample: dict[str, Any]) -> bool:
+    duplicate_count = _safe_float(sample.get("duplicate_count"), 0.0) or 0.0
+    return bool(sample.get("is_duplicate") or sample.get("duplicate_of") or duplicate_count > 1)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _iter_dict_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _iter_dict_values(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_dict_values(item)
+
+
+def _first_timestamp(values: tuple[Any, ...], keys: tuple[str, ...]) -> datetime | None:
+    for value in values:
+        for container in _iter_dict_values(value):
+            for key in keys:
+                parsed = _parse_datetime(container.get(key))
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+def _has_future_leakage(sample: dict[str, Any], *containers: Any) -> bool:
+    values = (sample, *containers)
+    feature_at = _first_timestamp(
+        values,
+        ("feature_timestamp", "feature_at", "observed_at"),
+    )
+    label_at = _first_timestamp(
+        values,
+        ("label_timestamp", "label_at", "outcome_at"),
+    )
+    return bool(feature_at and label_at and feature_at > label_at)
+
+
 def _market_data_quality_issue(sample: dict[str, Any], features: dict[str, Any]) -> str:
     for container in (sample, features):
         if not isinstance(container, dict):
@@ -104,6 +185,10 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     reasons: list[str] = []
     score = 1.0
     exclude = False
+
+    guard_reasons = _sample_guard_reasons(sample, features)
+    if guard_reasons:
+        return _final_assessment(0.0, guard_reasons, exclude=True)
 
     quality_issue = _market_data_quality_issue(sample, features)
     if quality_issue:
@@ -193,10 +278,39 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     score = 1.0
     exclude = False
 
+    guard_reasons = _sample_guard_reasons(sample)
+    if guard_reasons:
+        return _final_assessment(0.0, guard_reasons, exclude=True)
+
     source = _safe_str(sample.get("source")).lower()
     model_name = _safe_str(sample.get("model_name")).lower()
     if source in set(_QUALITY_PARAMS.manual_trade_sources) or "manual" in model_name:
         return _final_assessment(0.0, ["manual_or_test_trade"], exclude=True)
+
+    execution_mode = _safe_str(sample.get("execution_mode")).lower()
+    if execution_mode and execution_mode not in {"paper", "live", "sim", "simulation"}:
+        return _final_assessment(0.0, ["execution_mode_mismatch"], exclude=True)
+
+    close_status = _safe_str(sample.get("close_status") or sample.get("status")).lower()
+    if close_status in {"failed", "rejected", "cancelled", "canceled", "error"}:
+        return _final_assessment(0.0, ["failed_close_status"], exclude=True)
+
+    position_size_pct = _safe_float(sample.get("position_size_pct"), None)
+    evidence_text = " ".join(
+        _safe_str(sample.get(field)).lower() for field in ("evidence_tier", "quality_tier")
+    )
+    if (
+        position_size_pct is not None
+        and position_size_pct <= 0.001
+        and any(token in evidence_text for token in ("weak", "probe", "degraded"))
+    ):
+        return _final_assessment(0.0, ["weak_evidence_micro_probe"], exclude=True)
+
+    fee_source = sample.get("fee_estimate")
+    if fee_source is None:
+        fee_source = sample.get("fee")
+    if fee_source is None:
+        return _final_assessment(0.0, ["missing_fee_estimate"], exclude=True)
 
     side = _safe_str(sample.get("side")).lower()
     if side not in {"long", "short"}:
@@ -214,7 +328,7 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
 
     hold_minutes = _safe_float(sample.get("hold_minutes"), 0.0) or 0.0
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
-    fee = abs(_safe_float(sample.get("fee_estimate"), 0.0) or 0.0)
+    fee = abs(_safe_float(fee_source, 0.0) or 0.0)
     if hold_minutes < _QUALITY_PARAMS.fast_loss_exit_minutes and pnl < 0:
         score -= _QUALITY_PARAMS.fast_loss_exit_penalty
         reasons.append("fast_loss_exit_requires_review")
@@ -237,6 +351,10 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
 def assess_sequence_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     reasons: list[str] = []
     score = 1.0
+    guard_reasons = _sample_guard_reasons(sample, sample.get("close_sequence"))
+    if guard_reasons:
+        return _final_assessment(0.0, guard_reasons, exclude=True)
+
     closes = sample.get("close_sequence") or []
     if not isinstance(closes, list) or len(closes) < _QUALITY_PARAMS.min_sequence_length:
         return _final_assessment(0.0, ["short_price_sequence"], exclude=True)
@@ -257,6 +375,9 @@ def assess_sequence_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
 
 def assess_text_sentiment_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     text = _safe_str(sample.get("text"))
+    guard_reasons = _sample_guard_reasons(sample, text)
+    if guard_reasons:
+        return _final_assessment(0.0, guard_reasons, exclude=True)
     if len(text) < _QUALITY_PARAMS.min_text_length:
         return _final_assessment(0.0, ["empty_or_too_short_text"], exclude=True)
     score = 1.0

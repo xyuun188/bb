@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sqlalchemy import select  # noqa: E402
+
 from core.symbols import normalize_trading_symbol, trading_symbol_variants  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from models.learning import TradeReflection  # noqa: E402
@@ -23,7 +25,6 @@ from services.order_position_reconciliation import (  # noqa: E402
     apply_missing_closed_position_plan,
     plan_missing_closed_position,
 )
-from sqlalchemy import select  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)

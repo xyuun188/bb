@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import inspect
 import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -22,14 +23,23 @@ from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline, Ticker
 from models.trade import Order, Position
+from scripts.audit_runtime_text_integrity import collect_runtime_text_integrity_report
 from scripts.repair_missing_closed_positions_from_orders import (
     collect_missing_closed_position_plans,
 )
+from services.crypto_feature_coverage import CryptoFeatureCoverageService
 from services.exchange_position_state import (
     exchange_position_display_valuation,
     parse_exchange_position_snapshot,
 )
+from services.model_dynamic_routing import ModelDynamicRoutingService
+from services.model_expert_competition import ModelExpertCompetitionService
+from services.model_expert_health import ModelExpertHealthService
 from services.server_monitor_status import collect_platform_runtime_status
+from services.shadow_missed_opportunity_closed_loop import (
+    ShadowMissedOpportunityClosedLoopService,
+)
+from services.trade_execution_contract import TradeExecutionContractService
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api import data_collection as data_collection_api
 from web_dashboard.api.text_sanitize import sanitize_payload
@@ -45,7 +55,50 @@ POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 4.0
+SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
+SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS = 24
+SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT = 200
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
+TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
+TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
+CARD_OWNER_PATHS = {
+    "trade_loop": "services/trading_service.py",
+    "okx_reconciliation": "scripts/repair_missing_closed_positions_from_orders.py",
+    "position_price_integrity": "web_dashboard/api/system_audit.py",
+    "market_data": "models/market_data.py",
+    "strategy_quality": "web_dashboard/api/system_audit.py",
+    "strategy_closed_loop": "web_dashboard/api/system_audit.py",
+    "strategy_gate_contract": "services/runtime_entry_filters.py",
+    "model_training": "web_dashboard/api/data_collection.py",
+    "model_expert_health": "services/model_expert_health.py",
+    "model_expert_competition": "services/model_expert_competition.py",
+    "model_dynamic_routing": "services/model_dynamic_routing.py",
+    "crypto_feature_coverage": "services/crypto_feature_coverage.py",
+    "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
+    "trade_execution_contract": "services/trade_execution_contract.py",
+    "visible_text_encoding": "web_dashboard/api/system_audit.py",
+    "runtime_text_integrity": "scripts/audit_runtime_text_integrity.py",
+}
+NODE_OWNER_PATHS = {
+    "runtime_loop": "services/trading_service.py",
+    "market_data": "models/market_data.py",
+    "crypto_feature_coverage": "services/crypto_feature_coverage.py",
+    "model_training": "web_dashboard/api/data_collection.py",
+    "model_expert_health": "services/model_expert_health.py",
+    "model_expert_competition": "services/model_expert_competition.py",
+    "model_dynamic_routing": "services/model_dynamic_routing.py",
+    "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
+    "strategy_decision": "services/trading_policies.py",
+    "strategy_closed_loop": "web_dashboard/api/system_audit.py",
+    "strategy_gate_contract": "services/runtime_entry_filters.py",
+    "risk_guard": "services/trading_policies.py",
+    "okx_execution": "services/execution_service.py",
+    "position_sync": "services/position_sync_service.py",
+    "training_data": "services/training_data_quality.py",
+    "dashboard_observability": "web_dashboard/static/js/dashboard.js",
+    "visible_text_encoding": "web_dashboard/api/system_audit.py",
+    "runtime_text_integrity": "scripts/audit_runtime_text_integrity.py",
+}
 
 _okx_reconciliation_cache: tuple[datetime, dict[str, Any]] | None = None
 
@@ -153,11 +206,95 @@ def _status_from_counts(*, critical: bool = False, warning: bool = False) -> str
     return "ok"
 
 
+def _owner_path_for_card(key: str) -> str:
+    return CARD_OWNER_PATHS.get(str(key or ""), "web_dashboard/api/system_audit.py")
+
+
+def _owner_path_for_node(key: str, related_cards: list[dict[str, Any]]) -> str:
+    node_owner = NODE_OWNER_PATHS.get(str(key or ""))
+    if node_owner:
+        return node_owner
+    for card in related_cards:
+        owner_path = str(card.get("owner_path") or "")
+        if owner_path:
+            return owner_path
+    return "web_dashboard/api/system_audit.py"
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _safe_crypto_feature_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["audit_only"] = True
+    safe["live_signal_mutation"] = False
+    safe["can_missing_features_drive_live_entry"] = False
+    safe["feature_defaults_are_neutral"] = True
+    policy = _safe_dict(safe.get("feature_contribution_policy"))
+    policy["missing_feature_policy"] = "neutral_blocked"
+    policy["stale_feature_policy"] = "neutral_blocked"
+    policy["low_confidence_event_policy"] = "shadow_only"
+    safe["feature_contribution_policy"] = policy
+    features = safe.get("features") if isinstance(safe.get("features"), list) else []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        if str(feature.get("status") or "") in {"missing", "stale", "low_confidence"}:
+            feature["live_entry_influence"] = "blocked"
+    return safe
+
+
+def _safe_dynamic_routing_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["audit_only"] = True
+    safe["live_route_mutation"] = False
+    safe["can_apply_live_route"] = False
+    return safe
+
+
+def _safe_shadow_missed_opportunity_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["audit_only"] = True
+    safe["live_entry_mutation"] = False
+    safe["can_bypass_risk_controls"] = False
+    safe["weak_evidence_execution_allowed"] = False
+    safe["global_missed_count_can_drive_entries"] = False
+    for key in ("adopted", "probe_candidates", "blocked", "observe_only"):
+        rows = safe.get(key) if isinstance(safe.get(key), list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row["can_force_open"] = False
+            row["can_bypass_risk_controls"] = False
+    return safe
+
+
+def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["audit_only"] = True
+    safe["live_entry_mutation"] = False
+    safe["live_exit_mutation"] = False
+    safe["can_bypass_risk_controls"] = False
+    policy = _safe_dict(safe.get("policy"))
+    policy["entry_requires_positive_expected_net"] = True
+    policy["entry_requires_structured_evidence"] = True
+    policy["position_size_requires_profit_risk_sizing"] = True
+    policy["fast_loss_exit_requires_strong_exit_evidence"] = True
+    policy["recent_loss_reentry_requires_strong_unlock"] = True
+    safe["policy"] = policy
+    return safe
 
 
 def _relative_gap(left: float, right: float) -> float:
@@ -223,16 +360,28 @@ def _audit_card(
     details: dict[str, Any] | None = None,
     evidence: list[dict[str, Any]] | None = None,
     next_actions: list[str] | None = None,
+    owner_path: str | None = None,
 ) -> dict[str, Any]:
     return {
         "key": key,
         "title": title,
         "status": status,
         "summary": summary,
+        "owner_path": owner_path or _owner_path_for_card(key),
         "details": details or {},
         "evidence": evidence or [],
         "next_actions": next_actions or [],
     }
+
+
+async def _audit_maybe_async(factory: Any) -> dict[str, Any]:
+    result = factory()
+    if inspect.isawaitable(result):
+        result = await asyncio.wait_for(
+            result,
+            timeout=max(float(SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS or 20.0), 0.001),
+        )
+    return result
 
 
 def _cached_okx_reconciliation_card() -> dict[str, Any] | None:
@@ -1019,6 +1168,441 @@ async def _strategy_quality_audit() -> dict[str, Any]:
     )
 
 
+async def _model_expert_health_audit() -> dict[str, Any]:
+    try:
+        report = await ModelExpertHealthService().report(hours=72, limit=1200)
+    except Exception as exc:
+        return _audit_card(
+            "model_expert_health",
+            "模型/专家体检",
+            "warning",
+            "模型/专家体检报告读取失败。",
+            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
+            next_actions=[
+                "先检查 ai_decisions.raw_llm_response.model_timings 与专家返回结构是否正常写入。"
+            ],
+        )
+    summary = _safe_dict(report.get("summary"))
+    counts = _safe_dict(summary.get("recommended_state_counts"))
+    components = _safe_dict(report.get("components"))
+    concerning_states = {"reduce", "shadow_only", "disable", "replace"}
+    concerning_count = sum(int(counts.get(state) or 0) for state in concerning_states)
+    critical_count = int(counts.get("disable") or 0) + int(counts.get("replace") or 0)
+    priority = {"disable": 0, "replace": 1, "reduce": 2, "shadow_only": 3}
+    top_components = sorted(
+        (
+            {
+                "name": name,
+                "recommended_state": _safe_dict(component).get("recommended_state"),
+                "state_reasons": _safe_dict(component).get("state_reasons") or [],
+                "stability": _safe_dict(component).get("stability"),
+            }
+            for name, component in components.items()
+            if _safe_dict(component).get("recommended_state") in concerning_states
+        ),
+        key=lambda item: (
+            priority.get(str(item.get("recommended_state")), 9),
+            str(item.get("name") or ""),
+        ),
+    )[:8]
+    status = _status_from_counts(warning=bool(concerning_count))
+    summary_text = (
+        f"发现 {concerning_count} 个模型/专家需要降权、影子观察或禁用复核。"
+        if concerning_count
+        else "模型/专家体检暂未发现拖累项。"
+    )
+    return _audit_card(
+        "model_expert_health",
+        "模型/专家体检",
+        status,
+        summary_text,
+        details={
+            "audit_only": bool(report.get("audit_only", True)),
+            "live_weight_mutation": bool(report.get("live_weight_mutation", False)),
+            "component_count": int(summary.get("components") or len(components)),
+            "recommended_state_counts": counts,
+            "top_components": top_components,
+            "windows_hours": report.get("windows_hours") or [],
+        },
+        evidence=[
+            {"label": "组件数", "value": int(summary.get("components") or len(components))},
+            {"label": "需降权", "value": int(counts.get("reduce") or 0)},
+            {"label": "只影子", "value": int(counts.get("shadow_only") or 0)},
+            {"label": "需禁用/替换复核", "value": critical_count},
+        ],
+        next_actions=[
+            "本卡只读体检，不直接调整真实模型/专家权重。",
+            "出现 reduce/shadow_only/disable 时，先看 24/72 小时参与、采纳、收益、JSON 错误和未返回率。",
+            "样本不足的组件只能标记观察中，不因单次盈亏直接禁用或提权。",
+        ],
+    )
+
+
+async def _model_expert_competition_audit() -> dict[str, Any]:
+    try:
+        report = await ModelExpertCompetitionService().report(hours=72, limit=1200)
+    except Exception as exc:
+        return _audit_card(
+            "model_expert_competition",
+            "模型/专家竞赛",
+            "warning",
+            "模型/专家竞赛报告读取失败。",
+            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
+            next_actions=[
+                "先确认 ai_decisions outcome 与 raw_llm_response.experts/model_timings 是否可读取。"
+            ],
+        )
+    baseline = _safe_dict(report.get("baseline"))
+    layers = _safe_dict(report.get("layers"))
+    competitors = _safe_dict(report.get("competitors"))
+    action_counts = Counter(
+        str(_safe_dict(row).get("recommended_weight_action") or "unknown")
+        for row in competitors.values()
+    )
+    blockers = (
+        report.get("blocking_reasons") if isinstance(report.get("blocking_reasons"), list) else []
+    )
+    concerning = sum(
+        int(action_counts.get(action) or 0) for action in ("reduce_shadow_weight", "pause_shadow")
+    )
+    top_competitors = sorted(
+        (
+            {
+                "name": name,
+                "recommended_weight_action": _safe_dict(row).get("recommended_weight_action"),
+                "baseline_delta": _safe_dict(row).get("baseline_delta"),
+                "can_apply_live_weight": False,
+            }
+            for name, row in competitors.items()
+        ),
+        key=lambda item: abs(
+            _safe_float(_safe_dict(item.get("baseline_delta")).get("net_pnl_pct"), 0.0)
+        ),
+        reverse=True,
+    )[:8]
+    status = _status_from_counts(warning=bool(blockers or concerning))
+    summary = (
+        "竞赛缺少 baseline 样本，暂不能用于权重判断。"
+        if blockers
+        else (
+            f"竞赛发现 {concerning} 个组件相对 baseline 落后或不稳定。"
+            if concerning
+            else "模型/专家竞赛已形成 baseline 对比，暂无拖累项。"
+        )
+    )
+    return _audit_card(
+        "model_expert_competition",
+        "模型/专家竞赛",
+        status,
+        summary,
+        details={
+            "audit_only": bool(report.get("audit_only", True)),
+            "live_weight_mutation": bool(report.get("live_weight_mutation", False)),
+            "can_apply_live_weight": bool(report.get("can_apply_live_weight", False)),
+            "baseline": baseline,
+            "layers": layers,
+            "blocking_reasons": blockers,
+            "recommended_weight_action_counts": dict(action_counts),
+            "top_competitors": top_competitors,
+        },
+        evidence=[
+            {"label": "baseline样本", "value": int(baseline.get("sample_count") or 0)},
+            {"label": "竞赛组件", "value": len(competitors)},
+            {
+                "label": "可提影子权重",
+                "value": int(action_counts.get("increase_shadow_weight") or 0),
+            },
+            {"label": "需降/暂停影子", "value": concerning},
+        ],
+        next_actions=[
+            "没有 baseline 对比前不得调整真实权重。",
+            "C3 只输出 shadow/candidate 竞赛建议，不直接改主链路。",
+            "后续 C5 动态路由必须消费本报告的 shadow/sim/live 分层统计。",
+        ],
+    )
+
+
+async def _model_dynamic_routing_audit() -> dict[str, Any]:
+    try:
+        report = _safe_dynamic_routing_report(
+            await ModelDynamicRoutingService().report(hours=72, limit=1200)
+        )
+    except Exception as exc:
+        return _audit_card(
+            "model_dynamic_routing",
+            "模型动态路由",
+            "warning",
+            "模型动态路由报告读取失败；保持全量专家主链路，不启用路由变更。",
+            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
+            next_actions=[
+                "先确认 ai_decisions.raw_llm_response.dynamic_model_routing 是否正常写入。"
+            ],
+        )
+    summary = _safe_dict(report.get("summary"))
+    blockers = _safe_dict(report.get("blocking_reason_counts"))
+    observations = _safe_dict(report.get("safety_observations"))
+    unsafe_attempts = int(summary.get("unsafe_live_mutation_attempts") or 0)
+    weak_executed = int(observations.get("weak_evidence_executed_count") or 0)
+    route_count = int(summary.get("route_plan_count") or 0)
+    warning = bool(unsafe_attempts or weak_executed or blockers or route_count == 0)
+    return _audit_card(
+        "model_dynamic_routing",
+        "模型动态路由",
+        "warning" if warning else "ok",
+        (
+            "动态路由仍处于影子/观察阶段，尚不能替换主链路。"
+            if warning
+            else "动态路由影子报告正常，未发现阻塞项。"
+        ),
+        details={
+            "audit_only": True,
+            "live_route_mutation": False,
+            "can_apply_live_route": False,
+            "summary": summary,
+            "blocking_reason_counts": blockers,
+            "safety_observations": observations,
+            "unsafe_live_mutation_attempts": unsafe_attempts,
+        },
+        evidence=[
+            {"label": "路由计划", "value": route_count},
+            {"label": "影子计划", "value": int(summary.get("shadow_only_count") or 0)},
+            {"label": "理论少调用", "value": int(summary.get("estimated_call_reduction") or 0)},
+            {"label": "弱证据已执行", "value": weak_executed},
+        ],
+        next_actions=[
+            "没有 C2/C3 baseline 和线上观察前，不得把动态路由应用到真实专家调用。",
+            "不得为了降延迟跳过 risk_expert 或必要风控复核。",
+            "若弱证据执行或快亏平增加，继续保持 shadow_only 并先诊断执行质量。",
+        ],
+    )
+
+
+async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
+    try:
+        report = _safe_shadow_missed_opportunity_report(
+            await ShadowMissedOpportunityClosedLoopService().report(
+                hours=SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS,
+                limit=SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT,
+            )
+        )
+    except Exception as exc:
+        return _audit_card(
+            "shadow_missed_opportunity",
+            "Shadow missed opportunity",
+            "warning",
+            "Shadow missed opportunity report failed; keep missed-opportunity feedback observe-only.",
+            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
+            next_actions=[
+                "Check shadow_backtests completion rows and missed opportunity report inputs."
+            ],
+        )
+    summary = _safe_dict(report.get("summary"))
+    blocked_counts = _safe_dict(report.get("blocked_reason_counts"))
+    weak_executed = int(summary.get("weak_evidence_executed_count") or 0)
+    adopted = int(summary.get("adopted_count") or 0)
+    probes = int(summary.get("probe_count") or 0)
+    blocked = int(summary.get("blocked_count") or 0)
+    warning = bool(weak_executed or blocked_counts)
+    return _audit_card(
+        "shadow_missed_opportunity",
+        "Shadow missed opportunity",
+        "warning" if warning else "ok",
+        (
+            "Missed opportunity loop is still observing or blocking weak evidence."
+            if warning
+            else "Missed opportunity loop has qualified same-symbol same-side evidence."
+        ),
+        details={
+            "audit_only": True,
+            "live_entry_mutation": False,
+            "can_bypass_risk_controls": False,
+            "weak_evidence_execution_allowed": False,
+            "global_missed_count_can_drive_entries": False,
+            "summary": summary,
+            "blocked_reason_counts": blocked_counts,
+            "probe_candidates": _safe_list(report.get("probe_candidates"))[:10],
+            "adopted": _safe_list(report.get("adopted"))[:10],
+            "blocked_examples": _safe_list(report.get("blocked"))[:10],
+        },
+        evidence=[
+            {"label": "missed", "value": int(summary.get("missed_count") or 0)},
+            {"label": "adopted", "value": adopted},
+            {"label": "probe", "value": probes},
+            {"label": "blocked", "value": blocked},
+            {"label": "weak_executed", "value": weak_executed},
+        ],
+        next_actions=[
+            "Use only same-symbol same-side repeated missed opportunities as learning evidence.",
+            "Do not use global missed counts to force entries or bypass risk controls.",
+            "Weak evidence execution must stay zero before promotion beyond observation.",
+        ],
+    )
+
+
+async def _trade_execution_contract_audit() -> dict[str, Any]:
+    try:
+        report = _safe_trade_execution_contract_report(
+            await TradeExecutionContractService().report(
+                hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
+                limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+            )
+        )
+    except Exception as exc:
+        return _audit_card(
+            "trade_execution_contract",
+            "Trade execution contract",
+            "warning",
+            "Trade execution contract report failed; keep entry, sizing and exit gates unchanged.",
+            details={
+                "error": safe_error_text(exc, limit=180),
+                "audit_only": True,
+                "live_entry_mutation": False,
+                "live_exit_mutation": False,
+                "can_bypass_risk_controls": False,
+            },
+            next_actions=[
+                "Check recent ai_decisions, orders and positions before changing live trading gates."
+            ],
+        )
+    summary = _safe_dict(report.get("summary"))
+    violation_counts = _safe_dict(report.get("violation_reason_counts"))
+    weak_executed = int(summary.get("weak_evidence_executed_count") or 0)
+    negative_expected = int(summary.get("negative_expected_executed_count") or 0)
+    fast_loss_without_exit = int(summary.get("fast_loss_without_strong_exit_count") or 0)
+    reentry_without_unlock = int(summary.get("reentry_without_strong_unlock_count") or 0)
+    missing_explanation = int(summary.get("missing_entry_explanation_count") or 0)
+    missing_sizing = int(summary.get("missing_sizing_explanation_count") or 0)
+    small_size_without_reason = int(summary.get("small_size_without_reason_count") or 0)
+    hard_violations = (
+        weak_executed + negative_expected + fast_loss_without_exit + reentry_without_unlock
+    )
+    soft_violations = missing_explanation + missing_sizing + small_size_without_reason
+    status = _status_from_counts(
+        critical=bool(hard_violations),
+        warning=bool(soft_violations or violation_counts),
+    )
+    summary_text = (
+        "Trade execution has hard contract violations in entry evidence, expected net, fast exits or loss re-entry."
+        if hard_violations
+        else (
+            "Trade execution contract is missing explanations or sizing reasons; keep observing before tuning live logic."
+            if soft_violations
+            else "Trade execution contract passed for recent executed entries and closed positions."
+        )
+    )
+    return _audit_card(
+        "trade_execution_contract",
+        "Trade execution contract",
+        status,
+        summary_text,
+        details={
+            "audit_only": True,
+            "live_entry_mutation": False,
+            "live_exit_mutation": False,
+            "can_bypass_risk_controls": False,
+            "summary": summary,
+            "violation_reason_counts": violation_counts,
+            "entry_explanations": _safe_list(report.get("entry_explanations"))[:10],
+            "fast_loss_samples": _safe_list(report.get("fast_loss_samples"))[:10],
+            "violations": _safe_list(report.get("violations"))[:10],
+            "policy": _safe_dict(report.get("policy")),
+            "query_policy": _safe_dict(report.get("query_policy")),
+        },
+        evidence=[
+            {"label": "执行开仓", "value": int(summary.get("executed_entry_count") or 0)},
+            {"label": "弱证据执行", "value": weak_executed},
+            {"label": "负期望执行", "value": negative_expected},
+            {"label": "快亏缺强证据", "value": fast_loss_without_exit},
+            {"label": "复开缺解锁", "value": reentry_without_unlock},
+            {"label": "缺仓位解释", "value": missing_sizing},
+        ],
+        next_actions=[
+            "Do not loosen entry thresholds to hide weak-evidence or non-positive expected-net executions.",
+            "Fast loss exits must keep strong exit evidence before promotion beyond observation.",
+            "Same-symbol same-side re-entry after loss must require explicit high-quality unlock evidence.",
+        ],
+    )
+
+
+async def _crypto_feature_coverage_audit() -> dict[str, Any]:
+    try:
+        report = _safe_crypto_feature_report(
+            await CryptoFeatureCoverageService().report(hours=24, limit=1000)
+        )
+    except Exception as exc:
+        return _audit_card(
+            "crypto_feature_coverage",
+            "数字货币特征覆盖",
+            "warning",
+            "数字货币特征覆盖报告读取失败。反查采集状态前不得把缺失特征当作有效信号。",
+            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
+            next_actions=["先检查行情、盘口、衍生品、新闻/社媒和事件日历采集链路。"],
+        )
+    missing = (
+        report.get("missing_features") if isinstance(report.get("missing_features"), list) else []
+    )
+    stale = report.get("stale_features") if isinstance(report.get("stale_features"), list) else []
+    neutralized = (
+        report.get("neutralized_features")
+        if isinstance(report.get("neutralized_features"), list)
+        else []
+    )
+    features = report.get("features") if isinstance(report.get("features"), list) else []
+    status = str(report.get("status") or "ok")
+    if status not in {"ok", "warning", "critical"}:
+        status = _status_from_counts(critical=bool(not features), warning=bool(missing or stale))
+    summary = (
+        "核心行情或特征快照缺失，缺失特征已被中性阻断。"
+        if status == "critical"
+        else (
+            f"发现 {len(missing)} 类缺失、{len(stale)} 类过期特征；已按中性/只读处理。"
+            if missing or stale
+            else "数字货币特征覆盖未发现缺失或过期项。"
+        )
+    )
+    top_features = [
+        {
+            "key": _safe_dict(item).get("key"),
+            "status": _safe_dict(item).get("status"),
+            "source": _safe_dict(item).get("source"),
+            "confidence": _safe_dict(item).get("confidence"),
+            "live_entry_influence": _safe_dict(item).get("live_entry_influence"),
+            "reasons": _safe_dict(item).get("reasons") or [],
+        }
+        for item in features
+        if _safe_dict(item).get("status") in {"missing", "stale", "low_confidence"}
+    ][:10]
+    return _audit_card(
+        "crypto_feature_coverage",
+        "数字货币特征覆盖",
+        status,
+        summary,
+        details={
+            "audit_only": True,
+            "live_signal_mutation": False,
+            "can_missing_features_drive_live_entry": False,
+            "feature_defaults_are_neutral": True,
+            "missing_features": missing,
+            "stale_features": stale,
+            "neutralized_features": neutralized,
+            "symbols_observed": report.get("symbols_observed") or [],
+            "feature_contribution_policy": report.get("feature_contribution_policy") or {},
+            "top_feature_issues": top_features,
+        },
+        evidence=[
+            {"label": "特征项", "value": len(features)},
+            {"label": "缺失", "value": len(missing)},
+            {"label": "过期", "value": len(stale)},
+            {"label": "已中性阻断", "value": len(neutralized)},
+        ],
+        next_actions=[
+            "缺失数据源不得静默当作正常，也不得填成利于开仓的默认值。",
+            "低可信事件只允许影子观察，不得直接驱动真实开仓。",
+            "特征时间戳缺失或过期时，先修复采集链路再评估策略参数。",
+        ],
+    )
+
+
 async def _model_training_audit() -> dict[str, Any]:
     data_status, runtime_status = await asyncio.gather(
         data_collection_api.get_data_collection_status(),
@@ -1076,15 +1660,16 @@ async def _model_training_audit() -> dict[str, Any]:
                 }
             )
         if runtime_local_tools and not bool(runtime_local_tools.get("available")):
-            model_critical.append(
-                {
-                    "model": "local_ai_tools",
-                    "api_base": runtime_local_tools.get("api_base"),
-                    "health": runtime_local_tools.get("health"),
-                    "status": runtime_local_tools.get("status"),
-                    "child_endpoints": runtime_local_tools.get("child_endpoints"),
-                }
-            )
+            if bool(runtime_local_tools.get("configured", True)):
+                model_critical.append(
+                    {
+                        "model": "local_ai_tools",
+                        "api_base": runtime_local_tools.get("api_base"),
+                        "health": runtime_local_tools.get("health"),
+                        "status": runtime_local_tools.get("status"),
+                        "child_endpoints": runtime_local_tools.get("child_endpoints"),
+                    }
+                )
         runtime_probe = {
             "status": "critical" if model_critical else "ok",
             "ai_model_count": len(runtime_models),
@@ -1093,22 +1678,32 @@ async def _model_training_audit() -> dict[str, Any]:
             ),
         }
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
+    local_tools_status = str(local_tools.get("status") or "").lower()
+    local_tools_unconfigured = (
+        not bool(local_tools.get("available"))
+        and local_tools_status in OPTIONAL_TRAINING_SOURCE_STATUSES
+        and not bool(runtime_probe.get("local_ai_tools_configured"))
+    )
+    local_tools_hard_missing = (
+        not bool(local_tools.get("available")) and not local_tools_unconfigured
+    )
     runtime_probe_hard_failure = runtime_probe.get("status") == "warning" and not (
         runtime_probe_timeout and bool(local_tools.get("available"))
     )
     hard_failure = (
         bool(model_critical)
         or bool(hard_source_warnings)
-        or not bool(local_tools.get("available"))
+        or local_tools_hard_missing
         or runtime_probe_hard_failure
     )
     observing = not hard_failure and (
         bool(optional_source_warnings)
-        or str(local_tools.get("status") or "").lower() == "learning_only"
+        or local_tools_status == "learning_only"
+        or local_tools_unconfigured
         or runtime_probe_timeout
     )
     status = _status_from_counts(
-        critical=bool(model_critical) or not bool(local_tools.get("available")),
+        critical=bool(model_critical) or local_tools_hard_missing,
         warning=hard_failure or observing,
     )
     summary = "模型和训练数据状态正常。"
@@ -1256,6 +1851,56 @@ def _source_visible_text_audit() -> dict[str, Any]:
         next_actions=[
             "若乱码文件不为 0，先定位来源是源码文案、模型返回还是历史数据，不要只在前端替换显示。",
             "历史数据修复样本必须使用 Unicode 转义，不允许裸乱码写入源码。",
+        ],
+    )
+
+
+async def _runtime_text_integrity_audit() -> dict[str, Any]:
+    try:
+        report = await collect_runtime_text_integrity_report(
+            hours=AUDIT_WINDOWS["strategy_hours"],
+            limit_per_table=200,
+            example_limit=12,
+        )
+    except Exception as exc:
+        return _audit_card(
+            "runtime_text_integrity",
+            "运行时文本完整性",
+            "warning",
+            "运行时文本完整性巡检读取失败；本次未修改任何历史数据。",
+            details={"error": safe_error_text(exc, limit=180), "dry_run": True},
+            evidence=[
+                {"label": "扫描记录", "value": 0},
+                {"label": "疑似记录", "value": 0},
+            ],
+            next_actions=[
+                "先检查数据库连接和 scripts/audit_runtime_text_integrity.py --help 输出。",
+                "不要为了消除告警批量覆盖历史文本，先用 dry-run 示例定位来源。",
+            ],
+        )
+    status = str(report.get("status") or "ok")
+    suspected_records = int(report.get("suspected_records") or 0)
+    summary = (
+        "运行时写入文本未发现新增疑似乱码。"
+        if suspected_records <= 0
+        else "运行时记录中发现疑似乱码，需要定位写入边界或历史污染来源。"
+    )
+    return _audit_card(
+        "runtime_text_integrity",
+        "运行时文本完整性",
+        "warning" if status == "warning" or suspected_records else "ok",
+        summary,
+        details=report,
+        evidence=[
+            {"label": "扫描记录", "value": int(report.get("scanned_records") or 0)},
+            {"label": "疑似记录", "value": suspected_records},
+            {"label": "疑似字段", "value": int(report.get("suspected_fields") or 0)},
+            {"label": "可自动修复字段", "value": int(report.get("repairable_count") or 0)},
+        ],
+        next_actions=[
+            "若疑似记录不为 0，先用审计脚本 dry-run 示例确认来源表和字段。",
+            "优先修写入边界，禁止直接覆盖原始历史记录。",
+            "可修复字段只生成修复报告，批量修复必须另走人工确认。",
         ],
     )
 
@@ -1683,15 +2328,21 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
 
 def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    cards_by_key = {str(card.get("key") or ""): card for card in cards}
     for card in cards:
         status = str(card.get("status") or "info")
         if status == "ok":
             continue
+        state, state_label = _issue_ledger_state(card, cards_by_key=cards_by_key)
         findings.append(
             {
                 "key": card.get("key"),
                 "title": card.get("title"),
                 "severity": status,
+                "state": state,
+                "state_label": state_label,
+                "owner_path": card.get("owner_path")
+                or _owner_path_for_card(str(card.get("key") or "")),
                 "summary": card.get("summary"),
                 "evidence": card.get("evidence") or [],
                 "next_actions": card.get("next_actions") or [],
@@ -1768,6 +2419,8 @@ def _issue_ledger_from_cards(cards: list[dict[str, Any]]) -> dict[str, Any]:
                 "status": card.get("status"),
                 "state": state,
                 "state_label": label,
+                "owner_path": card.get("owner_path")
+                or _owner_path_for_card(str(card.get("key") or "")),
                 "summary": card.get("summary"),
                 "evidence": card.get("evidence") or [],
                 "next_actions": card.get("next_actions") or [],
@@ -1792,6 +2445,17 @@ def _worst_status(*statuses: Any) -> str:
     return min(normalized or ["info"], key=lambda item: STATUS_RANK.get(item, 9))
 
 
+def _node_state_from_cards(
+    related_cards: list[dict[str, Any]],
+    cards_by_key: dict[str, dict[str, Any]],
+) -> tuple[str, str]:
+    if not related_cards:
+        return "fixed", "No linked audit card."
+    state_priority = {"unresolved": 0, "observing": 1, "fixed": 2}
+    states = [_issue_ledger_state(card, cards_by_key=cards_by_key) for card in related_cards]
+    return min(states, key=lambda item: state_priority.get(item[0], 9))
+
+
 def _card_map(cards: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(card.get("key") or ""): card for card in cards if card.get("key")}
 
@@ -1810,6 +2474,7 @@ def _node_from_cards(
 ) -> dict[str, Any]:
     related_cards = [cards_by_key[item] for item in card_keys if item in cards_by_key]
     status = _worst_status(*(card.get("status") for card in related_cards))
+    state, state_label = _node_state_from_cards(related_cards, cards_by_key)
     summaries = [str(card.get("summary") or "") for card in related_cards if card.get("summary")]
     evidence: list[dict[str, Any]] = []
     next_actions: list[str] = []
@@ -1821,7 +2486,10 @@ def _node_from_cards(
         "title": title,
         "layer": layer,
         "status": status,
+        "state": state,
+        "state_label": state_label,
         "summary": "；".join(summaries[:2]) or "节点暂无异常。",
+        "owner_path": _owner_path_for_node(key, related_cards),
         "impact": impact,
         "upstream": upstream or [],
         "downstream": downstream or [],
@@ -1857,6 +2525,17 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             checks=["Ticker新鲜度", "1m/5m/15m/1h K线覆盖", "币种覆盖"],
         ),
         _node_from_cards(
+            "crypto_feature_coverage",
+            "数字货币特征覆盖",
+            "数据层",
+            cards_by_key,
+            ["crypto_feature_coverage"],
+            impact="检查 K线、ticker、盘口、滑点、资金费率、未平仓量、新闻社媒和事件日历是否真实可用。",
+            upstream=["runtime_loop", "market_data"],
+            downstream=["model_training", "strategy_decision", "risk_guard"],
+            checks=["缺失特征", "过期特征", "低可信事件", "默认值中性阻断"],
+        ),
+        _node_from_cards(
             "model_training",
             "模型与训练数据",
             "模型层",
@@ -1868,11 +2547,60 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             checks=["本地量化工具", "影子样本", "交易样本", "外部采集源"],
         ),
         _node_from_cards(
+            "model_expert_health",
+            "模型/专家体检",
+            "模型层",
+            cards_by_key,
+            ["model_expert_health"],
+            impact="评估模型/专家参与、采纳、收益、耗时、JSON 错误和未返回率，只输出体检建议。",
+            upstream=["model_training"],
+            downstream=["strategy_decision", "model_routing"],
+            checks=["24/72小时贡献", "采纳后收益", "JSON错误率", "未返回率"],
+        ),
+        _node_from_cards(
+            "model_expert_competition",
+            "模型/专家竞赛",
+            "模型层",
+            cards_by_key,
+            ["model_expert_competition"],
+            impact="对模型/专家与 baseline 的离线/影子/模拟竞赛结果做证据化比较，不直接改真实权重。",
+            upstream=["model_expert_health", "model_training"],
+            downstream=["model_routing", "strategy_decision"],
+            checks=["baseline 对比", "影子竞赛", "模拟A/B", "权重建议来源"],
+        ),
+        _node_from_cards(
+            "model_dynamic_routing",
+            "模型动态路由",
+            "模型层",
+            cards_by_key,
+            ["model_dynamic_routing"],
+            impact="根据候选质量、readiness、贡献、延迟、风险和事件状态生成影子路由计划；初期不替换主链路。",
+            upstream=["model_expert_health", "model_expert_competition", "crypto_feature_coverage"],
+            downstream=["strategy_decision", "risk_guard"],
+            checks=["影子路由计划", "理论少调用", "阻塞原因", "弱证据/快亏观察"],
+        ),
+        _node_from_cards(
+            "shadow_missed_opportunity",
+            "Shadow missed opportunity",
+            "Learning layer",
+            cards_by_key,
+            ["shadow_missed_opportunity"],
+            impact="Audits whether missed opportunities are usable only after repeated same-symbol same-side evidence.",
+            upstream=["strategy_closed_loop", "model_training"],
+            downstream=["strategy_decision", "training_data"],
+            checks=[
+                "same-symbol same-side repeats",
+                "stable positive returns",
+                "low risk evidence",
+                "weak evidence execution",
+            ],
+        ),
+        _node_from_cards(
             "strategy_decision",
             "策略决策质量",
             "策略层",
             cards_by_key,
-            ["strategy_quality"],
+            ["strategy_quality", "trade_execution_contract"],
             impact="影响是否开仓、仓位大小、重复亏损复开和快进快出。",
             upstream=["market_data", "model_training", "position_sync"],
             downstream=["risk_guard", "okx_execution"],
@@ -1905,7 +2633,12 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "风控与守门",
             "风控层",
             cards_by_key,
-            ["strategy_quality", "strategy_closed_loop", "position_price_integrity"],
+            [
+                "strategy_quality",
+                "strategy_closed_loop",
+                "trade_execution_contract",
+                "position_price_integrity",
+            ],
             impact="影响动态证据、低质量释放、快速平仓和下单前校验。",
             upstream=["strategy_decision", "position_sync"],
             downstream=["okx_execution", "position_sync"],
@@ -1954,7 +2687,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "页面与可观测性",
             "展示层",
             cards_by_key,
-            ["trade_loop", "position_price_integrity", "model_training"],
+            ["trade_loop", "position_price_integrity", "model_training", "runtime_text_integrity"],
             impact="影响你能否从页面直接定位问题，而不是只看到泛化提示。",
             upstream=["position_sync", "model_training"],
             checks=["节点状态", "根因列表", "执行证据", "历史记录"],
@@ -1964,10 +2697,21 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "中文显示与乱码",
             "展示层",
             cards_by_key,
-            ["visible_text_encoding"],
+            ["visible_text_encoding", "runtime_text_integrity"],
             impact="防止源码、页面或修复脚本重新出现裸乱码，影响排查和用户判断。",
             upstream=["dashboard_observability"],
             checks=["源码扫描", "前端静态资源", "脚本样本转义"],
+        ),
+        _node_from_cards(
+            "runtime_text_integrity",
+            "运行时文本完整性",
+            "数据层",
+            cards_by_key,
+            ["runtime_text_integrity"],
+            impact="防止模型输出、专家记忆、执行原因和策略学习事件把真乱码继续写入数据库。",
+            upstream=["model_training", "strategy_decision"],
+            downstream=["dashboard_observability", "training_data"],
+            checks=["最近新增乱码记录", "来源表和字段", "样例", "可修复性"],
         ),
     ]
 
@@ -2033,28 +2777,45 @@ def _append_history_record(payload: dict[str, Any], *, source: str) -> None:
 async def collect_system_audit_status(
     *, record_history: bool = True, source: str = "api"
 ) -> dict[str, Any]:
+    audit_specs = [
+        ("trade_loop", _trade_loop_audit),
+        ("okx_reconciliation", _okx_reconciliation_audit),
+        ("position_price_integrity", _position_price_integrity_audit),
+        ("market_data", _market_data_audit),
+        ("strategy_quality", _strategy_quality_audit),
+        ("strategy_closed_loop", _strategy_closed_loop_audit),
+        ("model_training", _model_training_audit),
+        ("model_expert_health", _model_expert_health_audit),
+        ("model_expert_competition", _model_expert_competition_audit),
+        ("model_dynamic_routing", _model_dynamic_routing_audit),
+        ("crypto_feature_coverage", _crypto_feature_coverage_audit),
+        ("shadow_missed_opportunity", _shadow_missed_opportunity_audit),
+        ("trade_execution_contract", _trade_execution_contract_audit),
+        (
+            "strategy_gate_contract",
+            lambda: asyncio.to_thread(_strategy_gate_contract_audit),
+        ),
+        ("visible_text_encoding", lambda: asyncio.to_thread(_source_visible_text_audit)),
+        ("runtime_text_integrity", _runtime_text_integrity_audit),
+    ]
     results = await asyncio.gather(
-        _trade_loop_audit(),
-        _okx_reconciliation_audit(),
-        _position_price_integrity_audit(),
-        _market_data_audit(),
-        _strategy_quality_audit(),
-        _strategy_closed_loop_audit(),
-        _model_training_audit(),
-        asyncio.to_thread(_strategy_gate_contract_audit),
-        asyncio.to_thread(_source_visible_text_audit),
+        *(_audit_maybe_async(factory) for _key, factory in audit_specs),
         return_exceptions=True,
     )
     cards: list[dict[str, Any]] = []
-    for index, result in enumerate(results):
+    for (section_key, _factory), result in zip(audit_specs, results, strict=True):
         if isinstance(result, Exception):
             cards.append(
                 _audit_card(
-                    f"audit_section_{index}",
+                    section_key,
                     "巡检模块",
                     "warning",
                     "巡检模块执行失败。",
-                    details={"error": safe_error_text(result, limit=180)},
+                    details={
+                        "section_key": section_key,
+                        "error": safe_error_text(result, limit=180),
+                    },
+                    owner_path=_owner_path_for_card(section_key),
                 )
             )
         else:
@@ -2105,6 +2866,57 @@ async def collect_system_audit_status(
 @router.get("/system-audit/status")
 async def system_audit_status() -> dict[str, Any]:
     return await collect_system_audit_status(record_history=True, source="api")
+
+
+@router.get("/model-expert-health/status")
+async def model_expert_health_status(hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+    report = await ModelExpertHealthService().report(hours=hours, limit=limit)
+    report["audit_only"] = True
+    report["live_weight_mutation"] = False
+    return sanitize_payload(report)
+
+
+@router.get("/model-expert-competition/status")
+async def model_expert_competition_status(hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+    report = await ModelExpertCompetitionService().report(hours=hours, limit=limit)
+    report["audit_only"] = True
+    report["live_weight_mutation"] = False
+    report["can_apply_live_weight"] = False
+    competitors = report.get("competitors") if isinstance(report.get("competitors"), dict) else {}
+    for row in competitors.values():
+        if isinstance(row, dict):
+            row["can_apply_live_weight"] = False
+    return sanitize_payload(report)
+
+
+@router.get("/model-dynamic-routing/status")
+async def model_dynamic_routing_status(hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+    report = await ModelDynamicRoutingService().report(hours=hours, limit=limit)
+    return sanitize_payload(_safe_dynamic_routing_report(report))
+
+
+@router.get("/shadow-missed-opportunity/status")
+async def shadow_missed_opportunity_status(
+    hours: int = SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS,
+    limit: int = SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT,
+) -> dict[str, Any]:
+    report = await ShadowMissedOpportunityClosedLoopService().report(hours=hours, limit=limit)
+    return sanitize_payload(_safe_shadow_missed_opportunity_report(report))
+
+
+@router.get("/trade-execution-contract/status")
+async def trade_execution_contract_status(
+    hours: int = TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
+    limit: int = TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+) -> dict[str, Any]:
+    report = await TradeExecutionContractService().report(hours=hours, limit=limit)
+    return sanitize_payload(_safe_trade_execution_contract_report(report))
+
+
+@router.get("/crypto-feature-coverage/status")
+async def crypto_feature_coverage_status(hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+    report = await CryptoFeatureCoverageService().report(hours=hours, limit=limit)
+    return sanitize_payload(_safe_crypto_feature_report(report))
 
 
 @router.get("/system-audit/history")

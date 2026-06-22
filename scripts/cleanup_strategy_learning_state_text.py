@@ -17,8 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import settings
-from web_dashboard.api.text_sanitize import sanitize_payload
+from config.settings import settings  # noqa: E402
+from web_dashboard.api.text_sanitize import sanitize_payload  # noqa: E402
 
 STATE_FILE_NAME = "strategy_learning_state.json"
 

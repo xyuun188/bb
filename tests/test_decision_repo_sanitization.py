@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+import db.repositories.decision_repo as decision_repo_module
 from db.repositories.decision_repo import DecisionRepository
 
 BAD_REASON = "AI 选择观望，未提交订单。?"
@@ -25,6 +26,55 @@ class FakeSession:
 
     async def get(self, _model: Any, _row_id: int) -> Any:
         return self.row
+
+
+@pytest.mark.asyncio
+async def test_decision_repo_uses_unified_runtime_text_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+
+    def fake_sanitize(value: Any) -> Any:
+        calls.append(value)
+        if isinstance(value, str):
+            return f"unified:{value}"
+        if isinstance(value, dict):
+            return {"unified": value}
+        return value
+
+    monkeypatch.setattr(
+        decision_repo_module,
+        "sanitize_runtime_text",
+        fake_sanitize,
+        raising=False,
+    )
+    session = FakeSession()
+    repo = DecisionRepository(session)  # type: ignore[arg-type]
+
+    decision = await repo.log_decision(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "BTC/USDT",
+            "action": "hold",
+            "confidence": 0.1,
+            "reasoning": "raw reason",
+            "execution_reason": "raw execution",
+            "position_size_pct": 0.0,
+            "suggested_leverage": 1.0,
+            "stop_loss_pct": 0.0,
+            "take_profit_pct": 0.0,
+            "feature_snapshot": {"note": "raw feature"},
+            "raw_llm_response": {"note": "raw llm"},
+            "analysis_type": "market",
+            "is_paper": True,
+        }
+    )
+
+    assert decision.reasoning == "unified:raw reason"
+    assert decision.execution_reason == "unified:raw execution"
+    assert decision.feature_snapshot == {"unified": {"note": "raw feature"}}
+    assert decision.raw_llm_response == {"unified": {"note": "raw llm"}}
+    assert "raw reason" in calls
 
 
 @pytest.mark.asyncio

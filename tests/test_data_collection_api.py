@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,7 @@ import pytest
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
+from models.learning import ShadowBacktest
 from models.market_data import Kline
 from web_dashboard.api import data_collection as data_collection_module
 from web_dashboard.app import create_app
@@ -31,6 +32,26 @@ async def test_data_collection_status_exposes_sources_and_training(
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
     monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    class FakeCryptoFeatureCoverageService:
+        async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+            return {
+                "audit_only": True,
+                "live_signal_mutation": False,
+                "can_missing_features_drive_live_entry": False,
+                "feature_defaults_are_neutral": True,
+                "status": "warning",
+                "missing_features": ["funding_rate"],
+                "stale_features": [],
+                "neutralized_features": ["funding_rate"],
+                "features": [{"key": "funding_rate", "status": "missing"}],
+            }
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "CryptoFeatureCoverageService",
+        lambda: FakeCryptoFeatureCoverageService(),
+    )
 
     try:
         app = create_app()
@@ -74,6 +95,10 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert "local_ai_tools" in body["training"]
     assert "governance" in body["training"]
     assert body["training"]["governance"]["status"] in {"ok", "error"}
+    assert body["feature_coverage"]["audit_only"] is True
+    assert body["feature_coverage"]["live_signal_mutation"] is False
+    assert body["feature_coverage"]["can_missing_features_drive_live_entry"] is False
+    assert body["feature_coverage"]["missing_features"] == ["funding_rate"]
     kline_timeframes = {row["timeframe"] for row in body["stats"]["market"]["klines"]}
     assert kline_timeframes == {"1m", "5m", "15m", "1h"}
 
@@ -418,6 +443,75 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
 
 
 @pytest.mark.asyncio
+async def test_training_governance_snapshot_exposes_sample_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 23, 1, 0, tzinfo=UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                ShadowBacktest(
+                    model_name="ensemble",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    decision_action="long",
+                    status="completed",
+                    due_at=base_time - timedelta(hours=2),
+                    horizon_minutes=30,
+                    long_return_pct=0.4,
+                    short_return_pct=-0.2,
+                    best_action="long",
+                ),
+                ShadowBacktest(
+                    model_name="ensemble",
+                    execution_mode="paper",
+                    symbol="ETH/USDT",
+                    decision_action="hold",
+                    status="completed",
+                    due_at=base_time - timedelta(hours=1),
+                    horizon_minutes=30,
+                    long_return_pct=0.1,
+                    short_return_pct=-0.1,
+                    best_action="hold",
+                ),
+                ShadowBacktest(
+                    model_name="ensemble",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    decision_action="short",
+                    status="quarantined",
+                    due_at=base_time,
+                    horizon_minutes=30,
+                    long_return_pct=-0.3,
+                    short_return_pct=0.2,
+                    best_action="short",
+                ),
+            ]
+        )
+        await session.flush()
+
+    try:
+        snapshot = await data_collection_module._training_governance_snapshot()
+    finally:
+        await close_db()
+
+    report = snapshot["local_ai_tools"]
+    assert snapshot["status"] == "ok"
+    assert report["sample_total_count"] == 3
+    assert report["trainable_sample_count"] == 2
+    assert report["quarantined_sample_count"] == 1
+    assert report["action_counts"] == {"hold": 1, "long": 1, "short": 1}
+    assert report["trainable_action_counts"] == {"hold": 1, "long": 1}
+    assert report["symbol_count"] == 2
+    assert report["symbol_counts"] == {"BTC/USDT": 2, "ETH/USDT": 1}
+    assert report["time_span"]["oldest_sample_at"].startswith("2026-06-22T23:00:00")
+    assert report["time_span"]["latest_sample_at"].startswith("2026-06-23T01:00:00")
+    assert report["data_freshness_minutes"] is not None
+
+
+@pytest.mark.asyncio
 async def test_data_collection_status_is_read_only_for_training_quarantine(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -521,6 +615,15 @@ async def test_data_collection_status_keeps_config_when_governance_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    class FakeCryptoFeatureCoverageService:
+        async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+            return {"status": "ok", "audit_only": True, "features": []}
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "CryptoFeatureCoverageService",
+        lambda: FakeCryptoFeatureCoverageService(),
+    )
     await _use_temp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "external_event_scraper_enabled", True)
@@ -558,6 +661,15 @@ async def test_data_collection_status_keeps_config_when_governance_times_out(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    class FakeCryptoFeatureCoverageService:
+        async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+            return {"status": "ok", "audit_only": True, "features": []}
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "CryptoFeatureCoverageService",
+        lambda: FakeCryptoFeatureCoverageService(),
+    )
     await _use_temp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "external_event_scraper_enabled", True)

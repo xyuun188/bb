@@ -11,10 +11,10 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from config.settings import FIXED_AI_MODEL_SLOTS, settings
-from services.runtime_entry_filters import default_entry_filters
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
+from services.runtime_entry_filters import default_entry_filters
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)

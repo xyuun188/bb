@@ -165,7 +165,11 @@ async def switch_mode(req: ModeSwitchRequest):
 async def pause_trading():
     """Pause all trading."""
     await mode_manager.pause()
-    return {"status": "ok", "message": "Trading paused"}
+    return {
+        "status": "ok",
+        "message": "已暂停新市场分析和新开仓；已有仓位继续复盘、风控和平仓。",
+        "state": mode_manager.get_state(),
+    }
 
 
 @router.post("/control/scan-mode")
@@ -182,7 +186,11 @@ async def switch_scan_mode(req: ScanModeRequest):
 async def resume_trading():
     """Resume trading."""
     await mode_manager.resume()
-    return {"status": "ok", "message": "Trading resumed"}
+    return {
+        "status": "ok",
+        "message": "已恢复新市场分析和新开仓调度。",
+        "state": mode_manager.get_state(),
+    }
 
 
 @router.post("/control/select-model")

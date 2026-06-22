@@ -17,8 +17,8 @@ from sqlalchemy import select
 
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
-from services.training_data_quality import SampleQualityAssessment, assess_shadow_sample
 from services.trading_params import DEFAULT_TRADING_PARAMS
+from services.training_data_quality import SampleQualityAssessment, assess_shadow_sample
 
 QUARANTINE_STATUS = "quarantined"
 TRAINING_QUARANTINE_MARKER = "[training_quarantine]"
@@ -49,6 +49,7 @@ def shadow_quality_sample(row: Any) -> dict[str, Any]:
         "features": _safe_feature_snapshot(getattr(row, "feature_snapshot", None)),
         "long_return_pct": getattr(row, "long_return_pct", None),
         "short_return_pct": getattr(row, "short_return_pct", None),
+        "label_timestamp": getattr(row, "due_at", None),
         "best_action": getattr(row, "best_action", ""),
         "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
     }

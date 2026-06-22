@@ -14,9 +14,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
+from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-from dotenv import dotenv_values
 
 from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
@@ -709,10 +709,7 @@ class Settings(BaseSettings):
     def refresh_runtime_env(self, *, force: bool = False) -> bool:
         """Refresh safe runtime knobs from .env for long-lived worker processes."""
         now = time.monotonic()
-        if (
-            not force
-            and now - self._runtime_env_last_checked < RUNTIME_ENV_REFRESH_MIN_SECONDS
-        ):
+        if not force and now - self._runtime_env_last_checked < RUNTIME_ENV_REFRESH_MIN_SECONDS:
             return False
         self._runtime_env_last_checked = now
 

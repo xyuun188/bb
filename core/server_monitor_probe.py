@@ -37,8 +37,7 @@ def render_server_monitor_probe(
     local_ai_tools_api_key: str = "",
 ) -> str:
     """Render the Python probe executed on the remote model server."""
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         import json
         import os
         import re
@@ -499,5 +498,4 @@ def render_server_monitor_probe(
             "model_runtime": runtime,
         }}
         print(json.dumps(payload, ensure_ascii=False))
-        """
-    ).strip()
+        """).strip()

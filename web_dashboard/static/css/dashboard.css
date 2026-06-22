@@ -457,6 +457,57 @@ td .ml-bar-row .ml-bar-label {
 .data-governance-panel {
     grid-column: 1 / -1;
 }
+.data-feature-coverage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    padding: 12px;
+}
+.data-feature-policy {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 12px 12px;
+}
+.data-feature-policy span {
+    padding: 8px 10px;
+    border: 1px solid rgba(245,158,11,0.22);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    background: rgba(245,158,11,0.06);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+.data-feature-table {
+    display: grid;
+    gap: 8px;
+    padding: 0 12px 12px;
+}
+.data-feature-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(64px, auto) minmax(160px, 2fr);
+    gap: 10px;
+    align-items: center;
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-panel);
+}
+.data-feature-row span,
+.data-feature-row strong,
+.data-feature-row em {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.data-feature-row strong {
+    color: var(--text);
+    font-size: 12px;
+}
+.data-feature-row em {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: normal;
+}
 .data-governance-notes {
     display: grid;
     gap: 7px;
@@ -2091,6 +2142,41 @@ body {
 .status-live { background: var(--green-dim); color: var(--green); }
 .status-paper { background: var(--accent-dim); color: var(--accent-light); }
 .status-paused { background: var(--red-dim); color: var(--red); }
+.pause-btn.active {
+    border-color: var(--red);
+    background: var(--red-dim);
+    color: var(--red);
+    font-weight: 700;
+}
+
+.dashboard-pause-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border));
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, color-mix(in srgb, var(--red-dim) 88%, transparent), color-mix(in srgb, var(--bg-card) 85%, transparent));
+    color: var(--text);
+}
+
+.dashboard-pause-banner[hidden] {
+    display: none;
+}
+
+.dashboard-pause-banner strong {
+    display: block;
+    color: var(--red);
+    font-size: 13px;
+    margin-bottom: 2px;
+}
+
+.dashboard-pause-banner span {
+    color: var(--text-muted);
+    font-size: 12px;
+}
 
 /* ── Cards ── */
 .card {

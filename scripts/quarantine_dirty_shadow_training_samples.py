@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.shadow_training_quarantine import (  # noqa: E402
     QUARANTINE_STATUS as QUARANTINE_STATUS,
+)
+from services.shadow_training_quarantine import (
     note_with_quarantine_reason,
     quarantine_dirty_shadow_samples,
     shadow_quality_sample,

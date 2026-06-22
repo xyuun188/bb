@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
     annotate_training_payload,
+    assess_sequence_sample,
     assess_shadow_sample,
+    assess_text_sentiment_sample,
     assess_trade_sample,
     governance_report,
 )
@@ -39,6 +43,7 @@ def _trade_sample(**overrides):
         "quantity": 0.1,
         "realized_pnl": 1.0,
         "fee_estimate": 0.05,
+        "position_size_pct": 0.03,
         "hold_minutes": 35.0,
         "outcome": "profit",
     }
@@ -63,6 +68,25 @@ def test_shadow_missing_features_are_excluded() -> None:
     assert "missing_features" in assessment.reasons
 
 
+def test_shadow_mojibake_payload_is_excluded() -> None:
+    assessment = assess_shadow_sample(
+        _shadow_sample(
+            features={"current_price": 100.0, "spread_pct": 0.01, "note": "鏈轰細璇勫垎"}
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert assessment.weight == 0.0
+    assert "mojibake_text" in assessment.reasons
+
+
+def test_duplicate_training_sample_is_excluded() -> None:
+    assessment = assess_shadow_sample(_shadow_sample(duplicate_count=2))
+
+    assert assessment.status == "excluded"
+    assert "duplicate_sample" in assessment.reasons
+
+
 def test_trade_fast_loss_exit_is_downweighted_for_review() -> None:
     assessment = assess_trade_sample(_trade_sample(realized_pnl=-0.8, hold_minutes=1.5))
 
@@ -76,6 +100,84 @@ def test_manual_trade_samples_are_excluded() -> None:
 
     assert assessment.status == "excluded"
     assert "manual_or_test_trade" in assessment.reasons
+
+
+def test_trade_missing_fee_and_micro_probe_are_excluded() -> None:
+    no_fee = assess_trade_sample(_trade_sample(fee_estimate=None))
+    micro_probe = assess_trade_sample(
+        _trade_sample(position_size_pct=0.0003, evidence_tier="weak_conflict_probe")
+    )
+
+    assert no_fee.status == "excluded"
+    assert "missing_fee_estimate" in no_fee.reasons
+    assert micro_probe.status == "excluded"
+    assert "weak_evidence_micro_probe" in micro_probe.reasons
+
+
+def test_trade_mode_mixing_and_failed_close_are_excluded() -> None:
+    mode_mixed = assess_trade_sample(_trade_sample(execution_mode="shadow"))
+    bad_close = assess_trade_sample(_trade_sample(close_status="failed"))
+
+    assert mode_mixed.status == "excluded"
+    assert "execution_mode_mismatch" in mode_mixed.reasons
+    assert bad_close.status == "excluded"
+    assert "failed_close_status" in bad_close.reasons
+
+
+def test_sequence_future_leakage_is_excluded() -> None:
+    assessment = assess_sequence_sample(
+        {
+            "close_sequence": [100 + idx for idx in range(30)],
+            "future_return_pct": 0.3,
+            "timeframe": "1m",
+            "feature_timestamp": datetime(2026, 6, 23, 1, 10, tzinfo=UTC),
+            "label_timestamp": datetime(2026, 6, 23, 1, 0, tzinfo=UTC),
+        }
+    )
+
+    assert assessment.status == "excluded"
+    assert "future_leakage" in assessment.reasons
+
+
+def test_shadow_feature_snapshot_future_leakage_is_excluded() -> None:
+    assessment = assess_shadow_sample(
+        _shadow_sample(
+            features={
+                "current_price": 100.0,
+                "spread_pct": 0.01,
+                "feature_timestamp": datetime(2026, 6, 23, 1, 10, tzinfo=UTC).isoformat(),
+            },
+            label_timestamp=datetime(2026, 6, 23, 1, 0, tzinfo=UTC).isoformat(),
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert "future_leakage" in assessment.reasons
+
+
+def test_text_sentiment_mojibake_and_duplicate_samples_are_excluded() -> None:
+    mojibake = assess_text_sentiment_sample(
+        {
+            "source": "news",
+            "platform": "scrapling:okx",
+            "text": "閺堣桨绱扮拠鍕瀻 market event summary",
+            "sentiment_score": 0.2,
+        }
+    )
+    duplicate = assess_text_sentiment_sample(
+        {
+            "source": "news",
+            "platform": "scrapling:okx",
+            "text": "OKX listing update with enough text for training",
+            "sentiment_score": 0.2,
+            "duplicate_of": "news:1",
+        }
+    )
+
+    assert mojibake.status == "excluded"
+    assert "mojibake_text" in mojibake.reasons
+    assert duplicate.status == "excluded"
+    assert "duplicate_sample" in duplicate.reasons
 
 
 def test_training_payload_returns_trainable_samples_and_quality_report() -> None:

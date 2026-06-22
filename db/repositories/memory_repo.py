@@ -7,13 +7,14 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
-from web_dashboard.api.text_sanitize import looks_mojibake
+from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
 
 DAMAGED_MEMORY_MARKERS = (
     "\u539f\u59cb\u8bf4\u660e\u5df2\u635f\u574f",
     "\u65e0\u6cd5\u51c6\u786e\u8fd8\u539f",
     "raw note is damaged",
 )
+
 
 class MemoryRepository(BaseRepository):
     """Repository for expert long-term memories and trade reflections."""
@@ -130,6 +131,7 @@ class MemoryRepository(BaseRepository):
         return memory
 
     async def create_reflection(self, data: dict[str, Any]) -> TradeReflection | None:
+        data = _normalize_reflection_payload(dict(data or {}))
         position_id = int(data.get("position_id") or 0)
         if position_id:
             result = await self.session.execute(
@@ -144,6 +146,7 @@ class MemoryRepository(BaseRepository):
         return reflection
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
+        data = _normalize_shadow_backtest_payload(dict(data or {}))
         row = ShadowBacktest(**data)
         self.session.add(row)
         await self.session.flush()
@@ -179,7 +182,7 @@ class MemoryRepository(BaseRepository):
         row.short_return_pct = short_return_pct
         row.best_action = best_action
         row.missed_opportunity = missed_opportunity
-        row.note = note
+        row.note = str(sanitize_runtime_text(note) or "")
         row.status = "completed"
         row.updated_at = datetime.now(UTC)
         await self.session.flush()
@@ -310,11 +313,28 @@ def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
     for key in ("lesson", "market_pattern"):
         value = data.get(key)
         if value is not None:
-            data[key] = str(value)
+            data[key] = str(sanitize_runtime_text(value) or "")
+    for key in ("recommended_action", "extra"):
+        if key in data:
+            data[key] = sanitize_runtime_text(data.get(key))
     if not _memory_text_usable(data.get("lesson")) or not _memory_text_usable(
         data.get("market_pattern")
     ):
         data["is_active"] = False
+    return data
+
+
+def _normalize_reflection_payload(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("mistake_summary", "improvement_summary", "expert_lessons"):
+        if key in data:
+            data[key] = sanitize_runtime_text(data.get(key))
+    return data
+
+
+def _normalize_shadow_backtest_payload(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("feature_snapshot", "raw_llm_response"):
+        if key in data:
+            data[key] = sanitize_runtime_text(data.get(key))
     return data
 
 
@@ -331,7 +351,7 @@ def _memory_text_usable(value: Any) -> bool:
     lowered = text.lower()
     if any(marker.lower() in lowered for marker in DAMAGED_MEMORY_MARKERS):
         return False
-    return not looks_mojibake(text) and not _has_suspicious_unicode(text)
+    return not looks_like_mojibake(text) and not _has_suspicious_unicode(text)
 
 
 def _has_suspicious_unicode(text: str) -> bool:

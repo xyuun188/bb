@@ -7,9 +7,10 @@ from typing import Any
 
 import pytest
 
-import services.trading_service as trading_service
 import services.sync_service as sync_module
+import services.trading_service as trading_service
 from ai_brain.base_model import Action, DecisionOutput
+from core.trading_mode import mode_manager
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.account_accounting_service import AccountAccountingService
 from services.analysis_services import MarketAnalysisService, PositionReviewService
@@ -126,6 +127,32 @@ def test_parallel_market_position_runtime_state_is_isolated(
     assert payload["round_active"] is True
     assert payload["current_stage"] == "fetch_features"
     assert TradingService._is_policy_skipped_execution_result(None) is False
+
+
+@pytest.mark.asyncio
+async def test_paused_market_scope_does_not_start_market_round(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._last_market_round_started_at = None
+    service._analysis_runtime = {
+        "market": _AnalysisRuntimeState(),
+        "position": _AnalysisRuntimeState(),
+        "full": _AnalysisRuntimeState(),
+    }
+    state_path = tmp_path / "trading-control-state.json"
+    monkeypatch.setattr(mode_manager, "_state_path", state_path)
+    monkeypatch.setattr(mode_manager, "_last_state_mtime", 0.0)
+    await mode_manager.pause()
+
+    result = await service.run_once("market")
+
+    assert result["status"] == "paused"
+    assert result["market_analysis_paused"] is True
+    assert service._last_market_round_started_at is None
+    assert service._runtime_state("market").current_stage == "idle"
 
 
 async def _async_value(value: Any) -> Any:
@@ -3107,6 +3134,7 @@ async def test_execution_service_serializes_candidate_execution():
     assert ("increment_trade_count",) in calls
     assert ("persist_position", "ensemble_trader", "paper") in calls
     assert ("executed", 123, 100.0) in calls
+    assert ("reason", 123, "filled") in calls
     assert ("clear_symbol", "BTC/USDT") in calls
     assert ("record_trade", 200.0) in calls
     assert raw_updates[-1] is not None
@@ -3141,6 +3169,7 @@ async def test_execution_service_serializes_candidate_execution():
     assert exit_result is not None
     assert ("exit_policy", "ensemble_trader", 1, False) in calls
     assert ("exit_cooldown", "ensemble_trader", "BTC/USDT") in calls
+    assert ("reason", 124, "filled") in calls
     assert exit_results["executions"][0]["order_id"] == "order-1"
 
     calls.clear()

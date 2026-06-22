@@ -10,8 +10,8 @@ from web_dashboard.api.models import router as models_router
 from web_dashboard.api.secure_settings_api import router as secure_settings_router
 from web_dashboard.api.settings_api import router as settings_router
 from web_dashboard.api.symbols import router as symbols_router
-from web_dashboard.api.system_health import router as system_health_router
 from web_dashboard.api.system_audit import router as system_audit_router
+from web_dashboard.api.system_health import router as system_health_router
 from web_dashboard.api.trades import router as trades_router
 from web_dashboard.api.vector_memory import router as vector_memory_router
 

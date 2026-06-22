@@ -25,11 +25,11 @@ from sqlalchemy import delete, func, insert, select, text
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import models  # noqa: F401 - register all ORM tables
-import db.session as session_module
-from config.settings import settings
-from db.session import close_db, get_engine, init_db
-from models.base import Base
+import db.session as session_module  # noqa: E402
+import models  # noqa: E402, F401 - register all ORM tables
+from config.settings import settings  # noqa: E402
+from db.session import close_db, get_engine, init_db  # noqa: E402
+from models.base import Base  # noqa: E402
 
 DEFAULT_SQLITE_PATH = ROOT / "data" / "trading.db"
 JSON_COLUMN_TYPE_NAMES = {"JSON", "JSONB"}
@@ -163,7 +163,7 @@ async def migrate_sqlite_to_postgres(
     batch_size: int,
     include_tables: set[str] | None = None,
 ) -> dict[str, dict[str, int]]:
-    if not sqlite_path.exists():
+    if not await asyncio.to_thread(sqlite_path.exists):
         raise FileNotFoundError(f"SQLite database not found: {sqlite_path}")
     if "sqlite" in settings.database_url:
         raise ValueError("Target DATABASE_URL must be PostgreSQL, not SQLite.")

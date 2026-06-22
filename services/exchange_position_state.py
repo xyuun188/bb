@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-import time
 from typing import Any
 
 import structlog

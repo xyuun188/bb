@@ -56,7 +56,7 @@ class SecureSettingsCipher:
         self._master_key = master_key
 
     @classmethod
-    def from_environment(cls) -> "SecureSettingsCipher":
+    def from_environment(cls) -> SecureSettingsCipher:
         return cls(_load_master_key_from_env())
 
     def _aesgcm(self) -> AESGCM:
@@ -114,11 +114,15 @@ class SecureSettingsService:
         self.session = session
         self.cipher = cipher or SecureSettingsCipher.from_environment()
 
-    async def set_secret(self, key: str, value: str, *, actor: str = "system") -> PublicSecureSetting:
+    async def set_secret(
+        self, key: str, value: str, *, actor: str = "system"
+    ) -> PublicSecureSetting:
         normalized = normalize_secure_key(key)
         text = str(value or "")
         ciphertext, nonce, aad = self.cipher.encrypt(key=normalized, plaintext=text)
-        result = await self.session.execute(select(SecureSetting).where(SecureSetting.key == normalized))
+        result = await self.session.execute(
+            select(SecureSetting).where(SecureSetting.key == normalized)
+        )
         row = result.scalar_one_or_none()
         if row is None:
             row = SecureSetting(key=normalized)
@@ -168,10 +172,14 @@ class SecureSettingsService:
 
     async def _get_row(self, key: str) -> SecureSetting | None:
         normalized = normalize_secure_key(key)
-        result = await self.session.execute(select(SecureSetting).where(SecureSetting.key == normalized))
+        result = await self.session.execute(
+            select(SecureSetting).where(SecureSetting.key == normalized)
+        )
         return result.scalar_one_or_none()
 
-    def public_view(self, row: SecureSetting, *, plaintext: str | None = None) -> PublicSecureSetting:
+    def public_view(
+        self, row: SecureSetting, *, plaintext: str | None = None
+    ) -> PublicSecureSetting:
         if plaintext is None:
             try:
                 plaintext = self.cipher.decrypt(

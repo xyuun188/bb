@@ -50,14 +50,12 @@ def test_batch_expert_prompt_can_scope_to_provider_group() -> None:
 
 
 def test_extract_json_repairs_missing_batch_tail() -> None:
-    parsed = _extract_json(
-        """
+    parsed = _extract_json("""
         ```json
         {"experts":{"trend_expert":{"action":"hold","confidence":0.5},
         "momentum_expert":{"action":"hold","confidence":0.4},
         ```
-        """
-    )
+        """)
 
     assert parsed["experts"]["trend_expert"]["action"] == "hold"
     assert parsed["experts"]["momentum_expert"]["confidence"] == 0.4
@@ -702,7 +700,9 @@ async def test_independent_provider_retry_uses_configured_expert_timeout(
         "position_expert": 60.0,
         "risk_expert": 60.0,
     }
-    assert all(timeout >= settings.ai_expert_timeout_seconds for timeout in timeout_by_name.values())
+    assert all(
+        timeout >= settings.ai_expert_timeout_seconds for timeout in timeout_by_name.values()
+    )
 
 
 @pytest.mark.asyncio

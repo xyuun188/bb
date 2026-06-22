@@ -62,7 +62,9 @@ def _session_secret() -> bytes:
     value = str(settings.dashboard_session_secret or "").strip()
     if value:
         return value.encode("utf-8")
-    fallback = str(settings.dashboard_admin_api_key or settings.dashboard_auth_password_hash or "").strip()
+    fallback = str(
+        settings.dashboard_admin_api_key or settings.dashboard_auth_password_hash or ""
+    ).strip()
     if fallback:
         return hashlib.sha256(fallback.encode("utf-8")).digest()
     return hashlib.sha256(b"bb-dashboard-session-fallback").digest()
@@ -141,7 +143,9 @@ def verify_dashboard_password(password: str, password_hash: str) -> bool:
 def create_dashboard_session(username: str) -> str:
     now = int(datetime.now(UTC).timestamp())
     expires = now + max(int(settings.dashboard_session_ttl_seconds or 43200), 600)
-    return _encode_session(DashboardAuthContext(username=username, issued_at=now, expires_at=expires))
+    return _encode_session(
+        DashboardAuthContext(username=username, issued_at=now, expires_at=expires)
+    )
 
 
 def dashboard_session_from_token(token: str | None) -> DashboardAuthContext | None:
