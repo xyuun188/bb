@@ -56,6 +56,8 @@ POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 4.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
+MODEL_EXPERT_AUDIT_HOURS = 24
+MODEL_EXPERT_AUDIT_LIMIT = 200
 SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS = 24
 SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT = 200
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
@@ -1170,7 +1172,10 @@ async def _strategy_quality_audit() -> dict[str, Any]:
 
 async def _model_expert_health_audit() -> dict[str, Any]:
     try:
-        report = await ModelExpertHealthService().report(hours=72, limit=1200)
+        report = await ModelExpertHealthService().report(
+            hours=MODEL_EXPERT_AUDIT_HOURS,
+            limit=MODEL_EXPERT_AUDIT_LIMIT,
+        )
     except Exception as exc:
         return _audit_card(
             "model_expert_health",
@@ -1240,7 +1245,10 @@ async def _model_expert_health_audit() -> dict[str, Any]:
 
 async def _model_expert_competition_audit() -> dict[str, Any]:
     try:
-        report = await ModelExpertCompetitionService().report(hours=72, limit=1200)
+        report = await ModelExpertCompetitionService().report(
+            hours=MODEL_EXPERT_AUDIT_HOURS,
+            limit=MODEL_EXPERT_AUDIT_LIMIT,
+        )
     except Exception as exc:
         return _audit_card(
             "model_expert_competition",
@@ -1325,7 +1333,10 @@ async def _model_expert_competition_audit() -> dict[str, Any]:
 async def _model_dynamic_routing_audit() -> dict[str, Any]:
     try:
         report = _safe_dynamic_routing_report(
-            await ModelDynamicRoutingService().report(hours=72, limit=1200)
+            await ModelDynamicRoutingService().report(
+                hours=MODEL_EXPERT_AUDIT_HOURS,
+                limit=MODEL_EXPERT_AUDIT_LIMIT,
+            )
         )
     except Exception as exc:
         return _audit_card(

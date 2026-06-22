@@ -751,6 +751,16 @@ AI 防偏要求：
 - 120 分钟策略健康窗口：242 decisions，全部 hold；entry/orders/failed_orders/fast_loss_close_under_15m 均 0；open_positions 2。该窗口包含重启前样本，只用于确认没有新增执行错误，不代表收益改善。
 - `model_training` 仍为 warning，但细节显示 local AI tools 可用、runtime_probe ok、shadow_sample_count 19982、trade_sample_count 1600、text_sentiment_sample_count 8000；硬 warning 来源是 Scrapling 外部事件采集已启用但没有有效 HTTPS 公网采集源。该问题属于外部事件数据源配置风险，不得被当作放宽开仓理由。
 
+追加修复：系统总巡检模型卡片轻量化（2026-06-23）：
+- 触发原因：交易执行契约口径修复上线后，单独运行 `model_expert_health`、`model_expert_competition`、`model_dynamic_routing` 都能返回只读报告，但完整系统巡检在 20 秒 section timeout 和并行负载下偶发把模型卡片显示为“巡检模块执行失败”。该噪声会误导后续 AI 把注意力从真实交易闭环问题转向不存在的模型服务故障。
+- 本次只改系统总巡检聚合页的查询窗口：新增 `MODEL_EXPERT_AUDIT_HOURS=24`、`MODEL_EXPERT_AUDIT_LIMIT=200`，三张模型卡在总巡检内使用 24h/200 轻量窗口；独立详情接口 `/model-expert-health/status`、`/model-expert-competition/status`、`/model-dynamic-routing/status` 继续尊重调用方传入的 `hours/limit`，用于深度复盘。
+- 安全边界不变：三张模型卡仍强制 `audit_only=true`，不得改真实模型/专家权重，不得启用 live route，不得替换主链路，不得把缺失 baseline 或 shadow route 结果当作开仓放宽理由。
+- 本地 TDD 验证：先新增参数断言测试并确认红测为缺少 `MODEL_EXPERT_AUDIT_*` 常量；实现后 `pytest tests/test_system_audit_api.py::test_model_expert_health_audit_reports_read_only_state tests/test_system_audit_api.py::test_model_expert_competition_audit_never_allows_live_weight_change tests/test_system_audit_api.py::test_model_dynamic_routing_audit_and_endpoint_force_read_only -q` 为 3 passed；`pytest tests/test_system_audit_api.py -q` 为 24 passed；`ruff check web_dashboard/api/system_audit.py tests/test_system_audit_api.py` 0 issues；`black --check web_dashboard/api/system_audit.py tests/test_system_audit_api.py` 通过；`git diff --check` 通过。
+- 线上部署：`python scripts/sync_to_online_server.py --split-services` 上传 1 个变更文件并重启成功：model tunnels ok，`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 线上只读总巡检复查（`record_history=False`）：总耗时 12.585s，整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；三张模型卡均正常返回，不再是“巡检模块执行失败”。其中模型体检为 7 个组件全部只影子观察，竞赛仍缺 baseline 且 `can_apply_live_weight=false`，动态路由 121 个 route plan 全部影子观察、`can_apply_live_route=false`、弱证据执行 0。
+- 仍未清零的 warning：`trade_execution_contract` 仍为历史 24h violation 遗留、当前 runtime window 未复现；`okx_reconciliation` dry-run 本次超时但不证明缺失仓位；这些 warning 不能被 AI 当作“系统已全绿”，也不能被用来放宽开仓。
+- 最新 120 分钟策略窗口：241 decisions 全 hold；entry_decisions/executed_entries/orders/failed_orders/positions_created/positions_closed/fast_loss_close_under_15m 均 0；open_positions 2；strategy_learning_events 241；missed_opportunity_sample 369。结论是没有新增执行类事故，但仍未形成收益闭环，下一步应诊断 missed opportunity、候选证据链、expected net、成本/滑点、模型 readiness 和同币种同方向重复证据，不得直接降低风控门槛。
+
 继续观察规则：
 - Batch H 仍未完成，必须继续 2h/24h/72h 或至少 20 笔已平仓订单观察。
 - 后续如果当前窗口新增 `critical`、失败订单、弱证据执行、快亏平、绕过风控、无强证据亏损复开，必须停止扩大逻辑并回到对应批次定位。

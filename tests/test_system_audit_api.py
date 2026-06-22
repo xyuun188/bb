@@ -384,8 +384,11 @@ async def test_model_training_audit_does_not_run_full_self_check(
 async def test_model_expert_health_audit_reports_read_only_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls: list[tuple[int, int]] = []
+
     class FakeModelExpertHealthService:
         async def report(self, *, hours: int = 72, limit: int = 1000) -> dict[str, Any]:
+            calls.append((hours, limit))
             return {
                 "audit_only": True,
                 "live_weight_mutation": False,
@@ -419,6 +422,7 @@ async def test_model_expert_health_audit_reports_read_only_state(
 
     card = await system_audit._model_expert_health_audit()
 
+    assert calls == [(system_audit.MODEL_EXPERT_AUDIT_HOURS, system_audit.MODEL_EXPERT_AUDIT_LIMIT)]
     assert card["key"] == "model_expert_health"
     assert card["status"] == "warning"
     assert card["details"]["audit_only"] is True
@@ -459,8 +463,11 @@ async def test_model_expert_health_status_endpoint_is_read_only(
 async def test_model_expert_competition_audit_never_allows_live_weight_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls: list[tuple[int, int]] = []
+
     class FakeModelExpertCompetitionService:
         async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            calls.append((hours, limit))
             return {
                 "audit_only": True,
                 "live_weight_mutation": False,
@@ -495,6 +502,10 @@ async def test_model_expert_competition_audit_never_allows_live_weight_change(
     card = await system_audit._model_expert_competition_audit()
     endpoint_report = await system_audit.model_expert_competition_status(hours=24, limit=200)
 
+    assert calls == [
+        (system_audit.MODEL_EXPERT_AUDIT_HOURS, system_audit.MODEL_EXPERT_AUDIT_LIMIT),
+        (24, 200),
+    ]
     assert card["key"] == "model_expert_competition"
     assert card["status"] == "warning"
     assert card["details"]["can_apply_live_weight"] is False
@@ -510,8 +521,11 @@ async def test_model_expert_competition_audit_never_allows_live_weight_change(
 async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls: list[tuple[int, int]] = []
+
     class FakeDynamicRoutingService:
         async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
+            calls.append((hours, limit))
             return {
                 "audit_only": False,
                 "live_route_mutation": True,
@@ -535,6 +549,10 @@ async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
     card = await system_audit._model_dynamic_routing_audit()
     endpoint_report = await system_audit.model_dynamic_routing_status(hours=24, limit=200)
 
+    assert calls == [
+        (system_audit.MODEL_EXPERT_AUDIT_HOURS, system_audit.MODEL_EXPERT_AUDIT_LIMIT),
+        (24, 200),
+    ]
     assert card["key"] == "model_dynamic_routing"
     assert card["status"] == "warning"
     assert card["details"]["audit_only"] is True
