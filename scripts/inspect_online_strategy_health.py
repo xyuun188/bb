@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import secrets
 import sys
 from pathlib import Path
 
@@ -493,6 +494,10 @@ import argparse
 import sys
 from pathlib import Path
 
+parser = argparse.ArgumentParser()
+parser.add_argument("sample_path")
+args = parser.parse_args()
+
 pid = subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", "bb-dashboard.service"], text=True).strip()
 env = {}
 if pid and pid != "0":
@@ -515,7 +520,7 @@ def demote():
     os.setuid(user.pw_uid)
 
 result = subprocess.run(
-    ["/data/bb/app/.venv/bin/python", "/tmp/codex_strategy_sample.py"],
+    ["/data/bb/app/.venv/bin/python", args.sample_path],
     cwd="/data/bb/app",
     env=env,
     text=True,
@@ -530,6 +535,30 @@ sys.exit(result.returncode)
 """
 
 
+def _build_remote_command(minutes: int, *, token: str | None = None) -> str:
+    safe_minutes = max(int(minutes or 480), 1)
+    safe_token = token or secrets.token_hex(6)
+    tmp_dir = "/data/bb/app/tmp/codex-strategy-health"
+    sample_path = f"{tmp_dir}/sample_{safe_minutes}_{safe_token}.py"
+    launcher_path = f"{tmp_dir}/launcher_{safe_minutes}_{safe_token}.py"
+    remote_script = REMOTE_SCRIPT_TEMPLATE.replace("__WINDOW_MINUTES__", str(safe_minutes))
+    return f"""
+set -eo pipefail
+cd /data/bb/app
+mkdir -p {tmp_dir}
+chmod 0750 {tmp_dir}
+cat > {sample_path} <<'PY'
+{remote_script}
+PY
+cat > {launcher_path} <<'PY'
+{LAUNCHER_SCRIPT}
+PY
+chmod 0644 {sample_path} {launcher_path}
+python3 {launcher_path} {sample_path}
+rm -f {sample_path} {launcher_path}
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect online strategy health.")
     parser.add_argument(
@@ -540,19 +569,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     minutes = max(int(args.minutes or 480), 1)
-    remote_script = REMOTE_SCRIPT_TEMPLATE.replace("__WINDOW_MINUTES__", str(minutes))
-    command = f"""
-set -eo pipefail
-cd /data/bb/app
-cat > /tmp/codex_strategy_sample.py <<'PY'
-{remote_script}
-PY
-cat > /tmp/codex_strategy_launcher.py <<'PY'
-{LAUNCHER_SCRIPT}
-PY
-chmod 0644 /tmp/codex_strategy_sample.py /tmp/codex_strategy_launcher.py
-python3 /tmp/codex_strategy_launcher.py
-"""
+    command = _build_remote_command(minutes)
 
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:

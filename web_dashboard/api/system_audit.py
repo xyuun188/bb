@@ -449,6 +449,10 @@ def _load_trading_runtime_audit_window() -> dict[str, Any]:
     heartbeat_at = _parse_utc_datetime(
         payload.get("heartbeat_at") or payload.get("last_heartbeat_at")
     )
+    last_market_round_started_at = _parse_utc_datetime(payload.get("last_market_round_started_at"))
+    last_market_round_finished_at = _parse_utc_datetime(
+        payload.get("last_market_round_finished_at")
+    )
     return {
         "available": started_at is not None,
         "started_at": started_at,
@@ -456,8 +460,18 @@ def _load_trading_runtime_audit_window() -> dict[str, Any]:
         "heartbeat_at": heartbeat_at,
         "heartbeat_at_iso": _iso(heartbeat_at),
         "running": bool(payload.get("running", False)),
+        "paused": bool(payload.get("paused", False)),
         "mode": payload.get("mode"),
+        "scan_mode": payload.get("scan_mode"),
         "decision_interval": payload.get("decision_interval"),
+        "current_stage": payload.get("current_stage"),
+        "round_active": bool(payload.get("round_active", False)),
+        "market_current_stage": payload.get("market_current_stage"),
+        "market_round_active": bool(payload.get("market_round_active", False)),
+        "last_market_round_started_at": last_market_round_started_at,
+        "last_market_round_started_at_iso": _iso(last_market_round_started_at),
+        "last_market_round_finished_at": last_market_round_finished_at,
+        "last_market_round_finished_at_iso": _iso(last_market_round_finished_at),
     }
 
 
@@ -626,13 +640,26 @@ async def _trade_loop_audit() -> dict[str, Any]:
         and runtime_age_seconds <= cold_start_grace_seconds
         and (heartbeat_age_seconds is None or heartbeat_age_seconds <= cold_start_grace_seconds)
     )
-    stalled = not cold_start and (
-        recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600)
+    heartbeat_fresh_seconds = max(cold_start_grace_seconds, 600.0)
+    runtime_heartbeat_fresh = (
+        heartbeat_age_seconds is not None and heartbeat_age_seconds <= heartbeat_fresh_seconds
+    )
+    market_analysis_paused = (
+        bool(runtime_window.get("running"))
+        and bool(runtime_window.get("paused"))
+        and runtime_heartbeat_fresh
+    )
+    stalled = (
+        not market_analysis_paused
+        and not cold_start
+        and (recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600))
     )
     cold_start_no_orders = cold_start and orders_count == 0
     status = _status_from_counts(
         critical=stalled,
-        warning=cold_start_no_orders or (orders_count == 0 and decisions_count > 30),
+        warning=market_analysis_paused
+        or cold_start_no_orders
+        or (orders_count == 0 and decisions_count > 30),
     )
     summary = (
         "交易服务刚重启，当前处于冷启动观察窗口，暂不判定为不开仓异常。"
@@ -647,6 +674,11 @@ async def _trade_loop_audit() -> dict[str, Any]:
             )
         )
     )
+    if market_analysis_paused:
+        summary = (
+            "Market analysis is paused; treat zero new entries as an operator/runtime "
+            "pause before diagnosing strategy thresholds."
+        )
     return _audit_card(
         "trade_loop",
         "交易闭环",
@@ -661,6 +693,8 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "latest_order_at": _iso(orders_2h[1]),
             "cold_start": cold_start,
             "cold_start_no_orders": cold_start_no_orders,
+            "market_analysis_paused": market_analysis_paused,
+            "runtime_heartbeat_fresh": runtime_heartbeat_fresh,
             "runtime_age_seconds": (
                 round(runtime_age_seconds, 3) if runtime_age_seconds is not None else None
             ),
@@ -668,9 +702,22 @@ async def _trade_loop_audit() -> dict[str, Any]:
                 round(heartbeat_age_seconds, 3) if heartbeat_age_seconds is not None else None
             ),
             "cold_start_grace_seconds": round(cold_start_grace_seconds, 3),
+            "heartbeat_fresh_seconds": round(heartbeat_fresh_seconds, 3),
             "runtime_window": {
                 "running": bool(runtime_window.get("running")),
+                "paused": bool(runtime_window.get("paused")),
                 "mode": runtime_window.get("mode"),
+                "scan_mode": runtime_window.get("scan_mode"),
+                "current_stage": runtime_window.get("current_stage"),
+                "round_active": bool(runtime_window.get("round_active")),
+                "market_current_stage": runtime_window.get("market_current_stage"),
+                "market_round_active": bool(runtime_window.get("market_round_active")),
+                "last_market_round_started_at": _iso(
+                    runtime_window.get("last_market_round_started_at")
+                ),
+                "last_market_round_finished_at": _iso(
+                    runtime_window.get("last_market_round_finished_at")
+                ),
                 "started_at": _iso(runtime_window.get("started_at")),
                 "heartbeat_at": _iso(runtime_window.get("heartbeat_at")),
                 "decision_interval": runtime_window.get("decision_interval"),
@@ -2512,6 +2559,8 @@ def _issue_ledger_state(
         return "observing", "观察项 / 对账巡检超时"
     if key == "trade_loop" and status == "warning" and bool(details.get("cold_start")):
         return "observing", "观察项 / 服务冷启动"
+    if key == "trade_loop" and status == "warning" and bool(details.get("market_analysis_paused")):
+        return "observing", "观察项 / 新币种分析暂停"
     if (
         key == "strategy_quality"
         and status == "warning"

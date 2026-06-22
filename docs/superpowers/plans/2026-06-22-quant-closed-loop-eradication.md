@@ -769,6 +769,46 @@ AI 防偏要求：
 
 ---
 
+## 二十一、Batch H 补充记录：暂停态与观察脚本防偏（2026-06-23）
+
+触发原因：Batch H 继续观察时发现“0 开仓 + missed opportunity 高”的初步判断会被两个因素带偏：其一，线上曾经 `paused=true`，当时只有持仓复核在跑，没有新币种 market analysis；其二，`scripts/inspect_online_strategy_health.py` 使用固定远端临时文件 `/tmp/codex_strategy_sample.py`，并行跑 10m/120m 观察窗口时会互相覆盖，导致观察输出口径混淆。
+
+本次修复范围：
+- `web_dashboard/api/system_audit.py`：`_load_trading_runtime_audit_window()` 透出 `paused/scan_mode/current_stage/market_current_stage/market_round_active/last_market_round_*`；`trade_loop` 巡检在 runtime 心跳新鲜且 `paused=true` 时标记为 warning/observing，并明确 summary 为暂停态，避免把暂停误判成策略卡死或证据不足。
+- `tests/test_system_audit_api.py`：新增回归测试，先确认暂停态会被旧逻辑误判为 `critical`，再验证新逻辑把它归为观察项，并在 details 中暴露 `paused/scan_mode`。
+- `scripts/inspect_online_strategy_health.py`：远端观察脚本改用 `/data/bb/app/tmp/codex-strategy-health/sample_<minutes>_<token>.py` 和对应 launcher，避免并行窗口覆盖；观察完成后清理临时文件。
+- `tests/test_inspect_online_strategy_health.py`：新增测试锁定唯一临时文件路径、窗口替换和非 `/tmp` 固定路径契约。
+
+安全边界：
+- 不放宽开仓阈值；不改杠杆、仓位、平仓、模型权重或专家路由；不绕过风控；不写真实库历史数据。
+- 暂停态只用于解释 trade_loop 巡检状态，不能被用作“系统已经健康赚钱”的证据。
+- 修复观察脚本只为避免观察窗口互相污染，不能把更多 missed opportunity 当作强制开仓理由。
+
+本地验证：
+- `pytest tests/test_system_audit_api.py tests/test_inspect_online_strategy_health.py -q`：27 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+- `git diff --check`：通过。
+
+线上部署与复查：
+- `python scripts/sync_to_online_server.py --split-services` 两次同步均成功，最终上传 `scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- systemd 环境只读总巡检（`record_history=False`）：总耗时约 14.747s，整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 5、observing 6。
+- `trade_loop` 当前因刚重启处于冷启动观察，但 runtime details 已正确展示：`paused=false`、`mode=paper`、`scan_mode=auto`、market round active/last_market_round 时间可见；这证明当前 0 订单不是暂停造成。
+- `trade_execution_contract` 当前 runtime window 仍为 0 执行违规：`executed_entry_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`contract_violation_count=0`；历史 24h violation 仍保留为 warning，不得标记全绿。
+- 修复后的策略健康脚本串行 120m 复查：268 decisions、267 hold、1 entry candidate、0 orders、0 failed_orders、0 positions_created/closed、0 fast_loss_close_under_15m、open_positions 2。唯一 SOL/USDT short 候选为正 expected net，但 evidence tier `blocked`、score 低于 min、profit quality 约 0.469、loss probability 约 0.510、tail risk 约 0.441，最终 `risk_check:skipped`，没有绕过风控。
+
+当前结论：
+- 本轮修复解决的是观察和巡检防偏，不是收益闭环完成。
+- 当前线上没有新增弱证据执行、失败订单或快亏平，但仍未产生真实收益改善样本。
+- 后续继续 Batch H 的 2h/24h/72h 或至少 20 笔已平仓订单观察；如果持续 0 开仓，应诊断候选证据链、expected net 组成、成本/滑点、profit quality、loss probability、tail risk、模型 readiness、特征缺失、同币种同方向重复证据，而不是直接降阈值。
+
+回滚点：
+- 代码层可回滚 `web_dashboard/api/system_audit.py`、`scripts/inspect_online_strategy_health.py` 及对应测试；线上回滚后重启三项服务即可。
+- 本批无 DB 迁移、无历史覆盖、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

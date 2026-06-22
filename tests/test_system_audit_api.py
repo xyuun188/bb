@@ -1207,6 +1207,61 @@ async def test_trade_loop_recent_restart_without_decisions_is_observing(
 
 
 @pytest.mark.asyncio
+async def test_trade_loop_paused_market_analysis_is_observing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from db.session import close_db, init_db
+
+    await close_db()
+    db_path = tmp_path / "audit.db"
+    now = datetime(2026, 6, 22, 5, 30, tzinfo=UTC)
+    started_at = now - timedelta(minutes=45)
+    heartbeat_at = now - timedelta(seconds=4)
+    monkeypatch.setattr(
+        system_audit.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{db_path.as_posix()}",
+    )
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_audit_window",
+        lambda: {
+            "available": True,
+            "started_at": started_at,
+            "started_at_iso": started_at.isoformat(),
+            "heartbeat_at": heartbeat_at,
+            "heartbeat_at_iso": heartbeat_at.isoformat(),
+            "running": True,
+            "paused": True,
+            "mode": "paper",
+            "scan_mode": "auto",
+            "decision_interval": 30,
+            "current_stage": "idle",
+            "market_current_stage": "idle",
+            "market_round_active": False,
+            "last_market_round_started_at": None,
+        },
+    )
+
+    await init_db()
+    try:
+        card = await system_audit._trade_loop_audit()
+        ledger = system_audit._issue_ledger_from_cards([card])
+
+        assert card["status"] == "warning"
+        assert card["details"]["market_analysis_paused"] is True
+        assert card["details"]["runtime_window"]["paused"] is True
+        assert card["details"]["runtime_window"]["scan_mode"] == "auto"
+        assert "paused" in card["summary"].lower()
+        assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+        assert ledger["observing"][0]["key"] == "trade_loop"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_strategy_closed_loop_audit_separates_active_runtime_window(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
