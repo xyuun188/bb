@@ -100,6 +100,13 @@ class DecisionPersistenceService:
         raw_analysis_type = str(raw_response.get("analysis_type") or "").lower()
         if raw_analysis_type in {"position", "position_review", "holding", "holdings"}:
             return "position"
+        if raw_analysis_type in {
+            "entry_candidate",
+            "market_entry_candidate",
+            "probe_candidate",
+            "quant_profit_probe",
+        }:
+            return "entry_candidate"
         if raw_analysis_type in {"market", "market_scan", "symbol_scan"}:
             return "market"
         if (

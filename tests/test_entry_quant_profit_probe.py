@@ -68,6 +68,8 @@ def test_quant_profit_probe_creates_candidate_after_post_score_passes() -> None:
 
     assert candidate is not None
     assert candidate.action == Action.LONG
+    assert candidate.raw_response["analysis_type"] == "entry_candidate"
+    assert candidate.raw_response["source_analysis_type"] == "market"
     assert candidate.raw_response["quant_profit_probe"]["triggered"] is True
     assert candidate.raw_response["opportunity_score"]["expected_net_return_pct"] == 0.6
 

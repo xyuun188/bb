@@ -126,6 +126,13 @@ def test_analysis_type_detects_position_review_and_exits() -> None:
     )
     assert DecisionPersistenceService.analysis_type(hold, {"position_review": True}) == "position"
     assert DecisionPersistenceService.analysis_type(close, {}) == "position"
+    assert (
+        DecisionPersistenceService.analysis_type(
+            hold,
+            {"analysis_type": "entry_candidate"},
+        )
+        == "entry_candidate"
+    )
     assert DecisionPersistenceService.analysis_type(hold, {}) == "market"
 
 

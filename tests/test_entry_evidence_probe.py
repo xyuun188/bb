@@ -58,6 +58,8 @@ def test_entry_evidence_probe_creates_controlled_candidate() -> None:
     assert candidate.action == Action.LONG
     assert candidate.position_size_pct == 0.055
     assert candidate.suggested_leverage == 6.0
+    assert candidate.raw_response["analysis_type"] == "entry_candidate"
+    assert candidate.raw_response["source_analysis_type"] == "market"
     assert candidate.raw_response["evidence_profit_probe"]["triggered"] is True
 
 

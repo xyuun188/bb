@@ -287,7 +287,8 @@ class EntryQuantProfitProbePolicy:
         raw_response = dict(raw_response)
         raw_response.update(
             {
-                "analysis_type": "market",
+                "analysis_type": "entry_candidate",
+                "source_analysis_type": str(raw_response.get("analysis_type") or "market"),
                 "ml_signal": ml_signal_context or {},
                 "local_ai_tools": tools,
                 "direction_competition": direction_competition_context or {},

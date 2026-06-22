@@ -110,13 +110,13 @@ class EntryEvidenceProbePolicy:
             "影子复盘多次证明观望错过同方向机会，且当前正期望、盈利质量、"
             "亏损概率和尾部风险达标，生成受控记忆反哺候选。"
             if memory_supported
-            else "AI 原始观望，但入场候选证据包显示该方向为正期望且风险可控，"
-            "生成受控探针候选。"
+            else "AI 原始观望，但入场候选证据包显示该方向为正期望且风险可控，" "生成受控探针候选。"
         )
         raw_response = dict(raw)
         raw_response.update(
             {
-                "analysis_type": "market",
+                "analysis_type": "entry_candidate",
+                "source_analysis_type": str(raw.get("analysis_type") or "market"),
                 "ml_signal": ml_signal_context or raw.get("ml_signal") or {},
                 "local_ai_tools": local_ai_tools_context or raw.get("local_ai_tools") or {},
                 "direction_competition": direction_competition_context
