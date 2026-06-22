@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 from services.market_queued_entry_processor import (
     QUEUED_ENTRY_PENDING_REASON,
@@ -130,6 +131,10 @@ async def test_market_queued_entry_processor_records_claim_skip() -> None:
     assert result.execution_attempted is False
     assert results["decisions"][0]["execution_status"] == "skipped"
     assert "另一条分析流程" in results["decisions"][0]["reason"]
+    assert _decision_state_status(calls, 7) == (
+        DecisionStage.STRATEGY_ARBITRATION,
+        DecisionStageStatus.SKIPPED,
+    )
     assert ("reason", 7, results["decisions"][0]["reason"]) in calls
     assert not any(call[0] == "execute" for call in calls)
 
@@ -231,4 +236,24 @@ async def test_market_queued_entry_processor_records_execution_error() -> None:
     assert staged_counts["reserved"]["ensemble_trader"] == 0
     assert results["decisions"][0]["execution_status"] == "error"
     assert "候选进入执行流程后异常中断" in results["decisions"][0]["reason"]
+    assert _decision_state_status(calls, 9) == (
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.FAILED,
+    )
     assert any(call[0] == "reason" and call[1] == 9 for call in calls)
+
+
+def _decision_state_status(
+    calls: list[tuple[str, Any]],
+    decision_id: int,
+) -> tuple[str, str] | None:
+    for call in calls:
+        if call[0] != "raw" or call[1] != decision_id:
+            continue
+        raw = call[2]
+        if not isinstance(raw, dict):
+            continue
+        machine = raw.get("decision_state_machine")
+        if isinstance(machine, dict):
+            return str(machine.get("current_stage") or ""), str(machine.get("current_status") or "")
+    return None

@@ -19,6 +19,7 @@ MARKET_NO_OPPORTUNITY_MAX_PENALTY = 240.0
 MARKET_RECENT_HOLD_DECAY_MINUTES = 45.0
 MARKET_RECENT_HOLD_MAX_PENALTY = 42.0
 MARKET_RECENT_ANALYSIS_DECAY_MINUTES = 30.0
+MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS = 75.0
 MARKET_RECENT_ANALYSIS_MAX_PENALTY = 18.0
 MARKET_NO_OPPORTUNITY_SCORE_RESET_DELTA = 28.0
 
@@ -149,6 +150,18 @@ class EntryMarketHoldPenaltyPolicy:
             MARKET_RECENT_ANALYSIS_MAX_PENALTY
             * (1.0 - age_minutes / MARKET_RECENT_ANALYSIS_DECAY_MINUTES),
         )
+
+    def recently_analyzed(
+        self,
+        symbol: str,
+        min_interval_seconds: float = MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS,
+    ) -> bool:
+        normalized = self._normalized(symbol)
+        seen_at = self.recent_analyzed_symbols.get(normalized or "")
+        if not seen_at:
+            return False
+        age_seconds = (self.now_provider() - seen_at).total_seconds()
+        return 0.0 <= age_seconds < max(float(min_interval_seconds), 0.0)
 
     def no_opportunity_rotation_penalty(
         self,

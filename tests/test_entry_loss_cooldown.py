@@ -121,6 +121,80 @@ def test_entry_loss_cooldown_blocks_fresh_recent_loss_without_strong_override() 
     assert override["failed"]
 
 
+def test_entry_loss_cooldown_uses_fresh_loss_remaining_instead_of_profile_zero() -> None:
+    profile = {
+        "cooldown": False,
+        "pnl": -3.5,
+        "today_pnl": -3.5,
+        "loss": 3.5,
+        "today_loss": 3.5,
+        "largest_loss": -3.5,
+        "count": 1,
+        "losses": 1,
+        "wins": 0,
+        "profit_factor": 0.0,
+        "cooldown_remaining_hours": 0.0,
+        "cooldown_reason": "fresh recent loss",
+        "last_loss_age_hours": 1.95,
+    }
+    decision = _decision(
+        {
+            "score": 1.8,
+            "min_score_required": 0.95,
+            "confidence": 0.74,
+            "expected_net_return_pct": 0.5,
+            "profit_quality_ratio": 0.55,
+            "reward_risk_ratio": 0.9,
+            "server_profit_expected_return_pct": 0.2,
+            "server_profit_loss_probability": 0.55,
+            "tail_risk_score": 0.45,
+            "symbol_side_profile": profile,
+        }
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is not None
+    assert "0.0 小时" not in reason
+    assert "约 3 分钟" in reason
+    metrics = decision.raw_response["loss_cooldown_override"]["metrics"]
+    assert metrics["fresh_loss_cooldown_remaining_hours"] == 0.05
+
+
+def test_entry_loss_cooldown_describes_symbol_quarantine_without_zero_hour_eta() -> None:
+    decision = _decision(
+        {
+            "score": 1.7,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.45,
+            "profit_quality_ratio": 0.65,
+            "reward_risk_ratio": 1.05,
+            "server_profit_expected_return_pct": 0.35,
+            "server_profit_loss_probability": 0.48,
+            "tail_risk_score": 0.45,
+            "symbol_profile": {
+                **_cooldown_profile(),
+                "profile_scope": "symbol",
+                "cooldown_kind": "symbol_rolling_quarantine",
+                "cooldown_time_based": False,
+                "cooldown_remaining_hours": 0.0,
+                "last_loss_side": "long",
+                "cooldown_reason": "该币种最近滚动真实亏损过大",
+            },
+        },
+        action=Action.LONG,
+    )
+
+    reason = EntryLossCooldownPolicy().reason(decision)
+
+    assert reason is not None
+    assert "0.0 小时" not in reason
+    assert "不按固定倒计时" in reason
+    metrics = decision.raw_response["loss_cooldown_override"]["metrics"]
+    assert metrics["cooldown_time_based"] is False
+    assert metrics["cooldown_kind"] == "symbol_rolling_quarantine"
+
+
 def test_entry_loss_cooldown_allows_high_quality_fresh_loss_override() -> None:
     profile = {
         "cooldown": False,

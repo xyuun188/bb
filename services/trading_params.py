@@ -119,6 +119,10 @@ class EntryOpportunityScoringParams:
     quant_profit_probe_min_expected_pct: float = 0.18
     quant_profit_probe_min_score: float = 0.35
     abnormal_wick_tail_risk_max_pct: float = 60.0
+    shadow_memory_expected_return_max_pct: float = 0.35
+    shadow_memory_expected_return_weight: float = 1.0
+    shadow_memory_min_missed_count: int = 2
+    shadow_memory_max_risk_evidence_ratio: float = 0.60
 
 
 @dataclass(frozen=True, slots=True)

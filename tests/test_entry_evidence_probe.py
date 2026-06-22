@@ -103,3 +103,96 @@ def test_entry_evidence_probe_records_market_quality_block() -> None:
 
     assert candidate is None
     assert decision.raw_response["evidence_profit_probe_blocked"]["blocked"] is True
+
+
+def test_repeated_missed_opportunity_memory_creates_tradeable_probe() -> None:
+    decision = _hold_decision(
+        {
+            "long": {
+                "expected_net_return_pct": 0.42,
+                "profit_quality_ratio": 0.38,
+                "loss_probability": 0.50,
+                "tail_risk_score": 0.82,
+                "score": 0.24,
+                "min_score_reference": 0.95,
+                "recommendation": "memory_supported_probe_candidate",
+                "review_feedback": {
+                    "allow_probe": True,
+                    "missed_opportunity_count": 8,
+                    "positive_evidence_count": 7,
+                    "risk_evidence_count": 2,
+                    "candidate_score_bonus": 0.08,
+                    "max_probe_size_pct": 0.04,
+                },
+            }
+        }
+    )
+
+    candidate = _policy().create(decision, _fv(), {}, {"ml": True}, {"tools": True}, None)
+
+    assert candidate is not None
+    assert candidate.action == Action.LONG
+    assert candidate.position_size_pct == 0.035
+    probe = candidate.raw_response["evidence_profit_probe"]
+    assert probe["source"] == "missed_opportunity_memory"
+    assert probe["missed_opportunity_count"] == 8
+    assert probe["memory_supported"] is True
+
+
+def test_missed_opportunity_memory_does_not_override_negative_expectancy() -> None:
+    decision = _hold_decision(
+        {
+            "long": {
+                "expected_net_return_pct": -0.10,
+                "profit_quality_ratio": 0.70,
+                "loss_probability": 0.42,
+                "tail_risk_score": 0.60,
+                "score": 0.40,
+                "min_score_reference": 0.95,
+                "recommendation": "memory_supported_probe_candidate",
+                "review_feedback": {
+                    "allow_probe": True,
+                    "missed_opportunity_count": 12,
+                    "positive_evidence_count": 10,
+                    "risk_evidence_count": 1,
+                    "candidate_score_bonus": 0.12,
+                },
+            }
+        }
+    )
+
+    assert _policy().create(decision, _fv(), None, None, None, None) is None
+
+
+def test_missed_opportunity_memory_does_not_override_market_quality_block() -> None:
+    decision = _hold_decision(
+        {
+            "long": {
+                "expected_net_return_pct": 0.42,
+                "profit_quality_ratio": 0.38,
+                "loss_probability": 0.50,
+                "tail_risk_score": 0.82,
+                "score": 0.24,
+                "min_score_reference": 0.95,
+                "recommendation": "memory_supported_probe_candidate",
+                "review_feedback": {
+                    "allow_probe": True,
+                    "missed_opportunity_count": 8,
+                    "positive_evidence_count": 7,
+                    "risk_evidence_count": 2,
+                },
+            }
+        }
+    )
+
+    candidate = _policy().create(
+        decision,
+        _fv(returns_20=-0.06, price_vs_sma20=-0.2, price_vs_sma50=-0.3),
+        None,
+        None,
+        None,
+        None,
+    )
+
+    assert candidate is None
+    assert decision.raw_response["evidence_profit_probe_blocked"]["blocked"] is True

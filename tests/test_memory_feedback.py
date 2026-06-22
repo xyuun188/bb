@@ -1,4 +1,5 @@
 from services.memory_feedback import MemoryFeedbackPolicy
+import pytest
 
 
 def test_memory_feedback_turns_missed_opportunities_into_probe_bias() -> None:
@@ -68,3 +69,43 @@ def test_memory_feedback_keeps_losing_side_conservative() -> None:
     assert habit["conservative_sides"] == ["long"]
     assert habit["by_side"]["long"]["stance"] == "strict_confirm"
     assert habit["by_side"]["long"]["max_loss_probability"] < 0.5
+
+
+def test_memory_feedback_extracts_missed_shadow_returns_as_ev_hint() -> None:
+    feedback = MemoryFeedbackPolicy().build(
+        [
+            {
+                "side": "long",
+                "memory_type": "shadow_missed_opportunity",
+                "confidence_adjustment": 0.05,
+                "confidence_score": 0.70,
+                "evidence_count": 3,
+                "extra": {
+                    "best_action": "long",
+                    "horizon_minutes": 10,
+                    "long_return_pct": 0.72,
+                    "short_return_pct": -0.20,
+                },
+            },
+            {
+                "side": "long",
+                "memory_type": "shadow_missed_opportunity",
+                "confidence_adjustment": 0.04,
+                "confidence_score": 0.64,
+                "evidence_count": 2,
+                "extra": {
+                    "best_action": "long",
+                    "horizon_minutes": 30,
+                    "long_return_pct": 0.42,
+                    "short_return_pct": -0.10,
+                },
+            },
+        ]
+    )
+
+    long_side = feedback["by_side"]["long"]
+    assert long_side["missed_return_evidence_count"] == 5
+    assert long_side["missed_avg_return_pct"] == pytest.approx(0.6)
+    assert 0.0 < long_side["expected_return_hint_pct"] <= long_side["missed_avg_return_pct"]
+    habit = feedback["decision_habit"]["by_side"]["long"]
+    assert habit["expected_return_hint_pct"] == long_side["expected_return_hint_pct"]

@@ -52,6 +52,10 @@ DYNAMIC_ENTRY_SCORE_EXPERT_ALIGNED = _SCORING_PARAMS.dynamic_entry_score_expert_
 QUANT_PROFIT_PROBE_MIN_EXPECTED_PCT = _SCORING_PARAMS.quant_profit_probe_min_expected_pct
 QUANT_PROFIT_PROBE_MIN_SCORE = _SCORING_PARAMS.quant_profit_probe_min_score
 ABNORMAL_WICK_TAIL_RISK_MAX_PCT = _SCORING_PARAMS.abnormal_wick_tail_risk_max_pct
+SHADOW_MEMORY_EXPECTED_RETURN_MAX_PCT = _SCORING_PARAMS.shadow_memory_expected_return_max_pct
+SHADOW_MEMORY_EXPECTED_RETURN_WEIGHT = _SCORING_PARAMS.shadow_memory_expected_return_weight
+SHADOW_MEMORY_MIN_MISSED_COUNT = _SCORING_PARAMS.shadow_memory_min_missed_count
+SHADOW_MEMORY_MAX_RISK_EVIDENCE_RATIO = _SCORING_PARAMS.shadow_memory_max_risk_evidence_ratio
 
 NormalizeSymbol = Callable[[Any], str | None]
 ContributionAdjuster = Callable[[list[str], dict[str, Any]], dict[str, Any]]
@@ -298,6 +302,86 @@ class EntryOpportunityScoringPolicy:
             "size_multiplier": 1.0,
             "strong_current_evidence_relief": False,
             "reason": "no side-quality adjustment",
+        }
+
+    def _shadow_memory_expected_return_component(
+        self,
+        raw: dict[str, Any],
+        *,
+        side: str,
+        high_disagreement: bool,
+        abnormal_volatility: bool,
+        local_loss_probability: float,
+        tail_risk_score: float,
+    ) -> dict[str, Any]:
+        feedback = self._safe_dict(raw.get("memory_feedback"))
+        by_side = self._safe_dict(feedback.get("by_side"))
+        item = self._safe_dict(by_side.get(side))
+        habit_by_side = self._safe_dict(
+            self._safe_dict(feedback.get("decision_habit")).get("by_side")
+        )
+        side_habit = self._safe_dict(habit_by_side.get(side))
+        missed_count = int(self._safe_float(item.get("missed_opportunity_count"), 0.0))
+        risk_count = int(self._safe_float(item.get("risk_evidence_count"), 0.0))
+        hint_pct = max(
+            self._safe_float(item.get("expected_return_hint_pct"), 0.0),
+            self._safe_float(side_habit.get("expected_return_hint_pct"), 0.0),
+        )
+        missed_avg_return = self._safe_float(item.get("missed_avg_return_pct"), 0.0)
+        risk_ratio = risk_count / max(missed_count, 1)
+        strict_confirm = str(side_habit.get("stance") or "") == "strict_confirm"
+        available = bool(
+            missed_count >= SHADOW_MEMORY_MIN_MISSED_COUNT
+            and hint_pct > 0
+            and not strict_confirm
+            and risk_ratio <= SHADOW_MEMORY_MAX_RISK_EVIDENCE_RATIO
+            and local_loss_probability <= 0.62
+            and tail_risk_score < 0.98
+            and not high_disagreement
+            and not abnormal_volatility
+        )
+        contribution = 0.0
+        if available:
+            contribution = min(
+                hint_pct * SHADOW_MEMORY_EXPECTED_RETURN_WEIGHT,
+                SHADOW_MEMORY_EXPECTED_RETURN_MAX_PCT,
+            )
+        blocked_reasons: list[str] = []
+        if missed_count < SHADOW_MEMORY_MIN_MISSED_COUNT:
+            blocked_reasons.append("missed_opportunity_count_not_enough")
+        if hint_pct <= 0:
+            blocked_reasons.append("missing_expected_return_hint")
+        if risk_ratio > SHADOW_MEMORY_MAX_RISK_EVIDENCE_RATIO:
+            blocked_reasons.append("risk_evidence_dominates")
+        if high_disagreement:
+            blocked_reasons.append("expert_or_direction_disagreement")
+        if abnormal_volatility:
+            blocked_reasons.append("abnormal_volatility")
+        if local_loss_probability > 0.62:
+            blocked_reasons.append("loss_probability_too_high")
+        if tail_risk_score >= 0.98:
+            blocked_reasons.append("tail_risk_too_high")
+        if strict_confirm:
+            blocked_reasons.append("memory_stance_strict_confirm")
+        return {
+            "key": "shadow_memory",
+            "label": "影子错过机会记忆",
+            "available": available,
+            "side": side,
+            "raw_return_pct": round(hint_pct, 6),
+            "missed_avg_return_pct": round(missed_avg_return, 6),
+            "missed_opportunity_count": missed_count,
+            "risk_evidence_count": risk_count,
+            "risk_evidence_ratio": round(risk_ratio, 6),
+            "weight": SHADOW_MEMORY_EXPECTED_RETURN_WEIGHT if available else 0.0,
+            "contribution_pct": round(contribution, 6),
+            "cap_pct": SHADOW_MEMORY_EXPECTED_RETURN_MAX_PCT,
+            "blocked_reasons": blocked_reasons,
+            "note": (
+                "重复观望错过机会会作为受限收益提示进入 expected_net；不绕过风控、行情质量和交易所规则。"
+                if available
+                else "影子记忆只记录解释，本轮未满足方向一致或风险质量条件，不进入收益公式。"
+            ),
         }
 
     def score_candidate(
@@ -750,6 +834,17 @@ class EntryOpportunityScoringPolicy:
             quant_conflict_penalty += 0.55
         if local_loss_probability >= 0.64 and not local_aligned:
             quant_conflict_penalty += min((local_loss_probability - 0.60) * 1.6, 0.55)
+        shadow_memory_component = self._shadow_memory_expected_return_component(
+            raw,
+            side=side,
+            high_disagreement=high_disagreement,
+            abnormal_volatility=abnormal_volatility,
+            local_loss_probability=local_loss_probability,
+            tail_risk_score=tail_risk_score,
+        )
+        shadow_memory_contribution = self._safe_float(
+            shadow_memory_component.get("contribution_pct"), 0.0
+        )
         if isinstance(exposure, dict) and exposure.get("dominant_side") == side:
             count_share = self._safe_float(exposure.get(f"{side}_count_share"), 0.0)
             side_unrealized = self._safe_float(exposure.get(f"{side}_unrealized_pnl"), 0.0)
@@ -795,6 +890,7 @@ class EntryOpportunityScoringPolicy:
             ml_contribution
             + server_profit_contribution
             + timeseries_contribution
+            + shadow_memory_contribution
             - fee_pct
             - slippage_pct
         )
@@ -806,11 +902,12 @@ class EntryOpportunityScoringPolicy:
             + ml_contribution
             + server_profit_contribution
             + timeseries_contribution
+            + shadow_memory_contribution
             - fee_pct
             - slippage_pct
         )
         expected_net_breakdown = {
-            "formula": "ai + local_ml + server_profit + timeseries - fee - slippage",
+            "formula": "ai + local_ml + server_profit + timeseries + shadow_memory - fee - slippage",
             "unit": "pct",
             "components": [
                 {
@@ -869,6 +966,7 @@ class EntryOpportunityScoringPolicy:
                     "contribution_pct": round(timeseries_contribution, 6),
                     "note": "同向参与收益公式。" if ts_aligned else "未形成同向正期望。",
                 },
+                shadow_memory_component,
                 {
                     "key": "fee",
                     "label": "双边手续费估算",

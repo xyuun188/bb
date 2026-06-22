@@ -12,6 +12,7 @@ from services.market_auto_entry_processor import (
     MarketAutoEntryProcessor,
 )
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
+from services.decision_state import DecisionStage, DecisionStageStatus
 
 
 def _decision() -> DecisionOutput:
@@ -195,6 +196,9 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
     assert result.reason == ENTRY_EVIDENCE_SHADOW_ONLY_REASON
     assert results["decisions"][0]["execution_status"] == "skipped"
     assert decision.raw_response["entry_evidence_shadow_only"]["shadow_only"] is True
+    machine = decision.raw_response["decision_state_machine"]
+    assert machine["current_stage"] == DecisionStage.RISK_CHECK
+    assert machine["current_status"] == DecisionStageStatus.SKIPPED
     assert ("reason", 12, ENTRY_EVIDENCE_SHADOW_ONLY_REASON) in calls
     assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
 
@@ -262,6 +266,10 @@ async def test_market_auto_entry_processor_records_gate_skip() -> None:
     assert result.execution_attempted is False
     assert result.reason == "入场候选暂未满足执行条件：分数不足"
     assert results["decisions"][0]["execution_status"] == "skipped"
+    assert _decision_state_status(calls, 7) == (
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+    )
     assert ("reason", 7, "入场候选暂未满足执行条件：分数不足") in calls
     assert not any(call[0] == "execute" for call in calls)
 
@@ -313,6 +321,10 @@ async def test_market_auto_entry_processor_records_capacity_skip() -> None:
     assert result.handled is True
     assert result.reason == "强信号未即时执行：持仓已满"
     assert results["decisions"][0]["reason"] == "强信号未即时执行：持仓已满"
+    assert _decision_state_status(calls, 8) == (
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+    )
     assert not any(call[0] == "reserve" for call in calls)
 
 
@@ -395,3 +407,19 @@ async def test_market_auto_entry_processor_records_execution_error() -> None:
     assert "强信号已进入即时执行" in results["decisions"][0]["reason"]
     assert ("release", "ensemble_trader", "BTC/USDT") in calls
     assert any(call[0] == "reason" and call[1] == 10 for call in calls)
+
+
+def _decision_state_status(
+    calls: list[tuple[str, Any]],
+    decision_id: int,
+) -> tuple[str, str] | None:
+    for call in calls:
+        if call[0] != "raw" or call[1] != decision_id:
+            continue
+        raw = call[2]
+        if not isinstance(raw, dict):
+            continue
+        machine = raw.get("decision_state_machine")
+        if isinstance(machine, dict):
+            return str(machine.get("current_stage") or ""), str(machine.get("current_status") or "")
+    return None

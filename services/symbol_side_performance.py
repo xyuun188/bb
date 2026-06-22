@@ -8,6 +8,7 @@ main trading orchestrator makes the feedback loop testable and easier to tune.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -27,6 +28,14 @@ DEFAULT_SYMBOL_SIDE_PROFILE_LOOKBACK = 2000
 DEFAULT_SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS = 7.0
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CooldownState:
+    active: bool
+    reason: str = ""
+    kind: str = ""
+    time_based: bool = False
 
 
 def _ensure_utc(value: datetime | None) -> datetime | None:
@@ -177,10 +186,10 @@ class SymbolSidePerformanceService:
             today_loss = float(bucket.get("today_loss") or 0.0)
             last_loss_age_hours = self._last_loss_age_hours(bucket, now_utc)
             recent_loss_cooldown_active = (
-                last_loss_age_hours <= self._loss_cooldown_params.hard_cooldown_hours
+                last_loss_age_hours < self._loss_cooldown_params.hard_cooldown_hours
             )
             is_symbol_profile = key.endswith("|all")
-            cooldown, cooldown_reason = self._cooldown_state(
+            cooldown_state = self._cooldown_state(
                 is_symbol_profile=is_symbol_profile,
                 recent_loss_cooldown_active=recent_loss_cooldown_active,
                 pnl=pnl,
@@ -195,7 +204,7 @@ class SymbolSidePerformanceService:
                     self._loss_cooldown_params.hard_cooldown_hours - last_loss_age_hours,
                     0.0,
                 )
-                if cooldown and not is_symbol_profile
+                if cooldown_state.active and cooldown_state.time_based and not is_symbol_profile
                 else 0.0
             )
             bucket.update(
@@ -205,8 +214,11 @@ class SymbolSidePerformanceService:
                     "profit_factor": (
                         round(profit / loss, 6) if loss > 0 else (999.0 if profit > 0 else 0.0)
                     ),
-                    "cooldown": cooldown,
-                    "cooldown_reason": cooldown_reason,
+                    "cooldown": cooldown_state.active,
+                    "cooldown_reason": cooldown_state.reason,
+                    "cooldown_kind": cooldown_state.kind,
+                    "cooldown_time_based": cooldown_state.time_based,
+                    "profile_scope": "symbol" if is_symbol_profile else "symbol_side",
                     "last_loss_age_hours": round(last_loss_age_hours, 6),
                     "cooldown_remaining_hours": round(cooldown_remaining_hours, 6),
                     "lookback_days": self._lookback_days,
@@ -241,19 +253,29 @@ class SymbolSidePerformanceService:
         losses: int,
         today_pnl: float,
         today_loss: float,
-    ) -> tuple[bool, str]:
+    ) -> CooldownState:
         params = self._loss_cooldown_params
         if (
             is_symbol_profile
             and losses >= params.quarantine_min_losses
             and pnl <= -params.quarantine_loss_usdt
         ):
-            return True, "该币种最近滚动真实亏损过大"
+            return CooldownState(
+                True,
+                "该币种最近滚动真实亏损过大",
+                "symbol_rolling_quarantine",
+                False,
+            )
         if is_symbol_profile and (
             today_loss >= params.total_cooldown_loss_usdt
             or today_pnl <= -params.total_cooldown_loss_usdt
         ):
-            return True, "该币种今天累计真实亏损超过限制"
+            return CooldownState(
+                True,
+                "该币种今天累计真实亏损超过限制",
+                "symbol_daily_loss_quarantine",
+                False,
+            )
         if (
             not is_symbol_profile
             and recent_loss_cooldown_active
@@ -264,7 +286,12 @@ class SymbolSidePerformanceService:
                 or today_pnl <= -params.side_cooldown_loss_usdt
             )
         ):
-            return True, "该币种这个方向的真实亏损已经超过限制"
+            return CooldownState(
+                True,
+                "该币种这个方向的真实亏损已经超过限制",
+                "side_loss_cooldown",
+                True,
+            )
         if (
             not is_symbol_profile
             and recent_loss_cooldown_active
@@ -273,5 +300,10 @@ class SymbolSidePerformanceService:
                 or (losses >= 2 and pnl < 0 and loss > profit * 1.2)
             )
         ):
-            return True, "该币种这个方向近期真实盈亏表现偏弱"
-        return False, ""
+            return CooldownState(
+                True,
+                "该币种这个方向近期真实盈亏表现偏弱",
+                "side_weak_recent_performance",
+                True,
+            )
+        return CooldownState(False)

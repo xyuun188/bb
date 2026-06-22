@@ -87,6 +87,27 @@ async def test_symbol_side_performance_loads_and_builds_recent_profiles() -> Non
     assert profiles["BTC/USDT|all"]["pnl"] == pytest.approx(-24.0)
 
 
+def test_symbol_side_performance_expires_time_based_cooldown_at_boundary() -> None:
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    service = SymbolSidePerformanceService(clock=lambda: now, lookback_days=7.0)
+
+    profiles = service.build_profiles(
+        [
+            SimpleNamespace(
+                symbol="BTC-USDT",
+                side="long",
+                realized_pnl=-30.0,
+                closed_at=now - timedelta(hours=6),
+            )
+        ]
+    )
+
+    long_profile = profiles["BTC-USDT|long"]
+    assert long_profile["cooldown"] is False
+    assert long_profile["cooldown_time_based"] is False
+    assert long_profile["cooldown_remaining_hours"] == 0.0
+
+
 def test_symbol_side_performance_build_profiles_ignores_stale_or_empty_rows() -> None:
     now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
     service = SymbolSidePerformanceService(clock=lambda: now, lookback_days=1.0)

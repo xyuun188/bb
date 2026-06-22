@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from services.entry_market_hold_penalty import (
     MARKET_NO_OPPORTUNITY_MAX_PENALTY,
+    MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS,
     MARKET_RECENT_ANALYSIS_MAX_PENALTY,
     MARKET_RECENT_HOLD_MAX_PENALTY,
     EntryMarketHoldPenaltyPolicy,
@@ -69,6 +70,17 @@ def test_recent_analysis_penalty_is_capped_and_decays() -> None:
     penalty = policy.recent_analysis_penalty("BTC/USDT")
 
     assert 0 < penalty < MARKET_RECENT_ANALYSIS_MAX_PENALTY
+
+
+def test_recently_analyzed_blocks_same_symbol_inside_short_window() -> None:
+    clock = Clock(datetime(2026, 6, 10, 10, 0, tzinfo=UTC))
+    policy = _policy(clock)
+    policy.remember_analyzed_symbol("BTC/USDT")
+
+    assert policy.recently_analyzed("btc/usdt") is True
+
+    clock.now += timedelta(seconds=MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS + 1)
+    assert policy.recently_analyzed("BTC/USDT") is False
 
 
 def test_no_opportunity_penalty_accumulates_after_repeated_holds() -> None:

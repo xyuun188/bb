@@ -10,6 +10,11 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+)
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 logger = structlog.get_logger(__name__)
@@ -90,6 +95,14 @@ class MarketQueuedEntryProcessor:
                     symbol=symbol,
                 )
                 if decision_db_id is not None:
+                    decision.raw_response = append_decision_stage(
+                        decision.raw_response if isinstance(decision.raw_response, dict) else {},
+                        DecisionStage.STRATEGY_ARBITRATION,
+                        DecisionStageStatus.SKIPPED,
+                        reason,
+                        {"skip_kind": "analysis_symbol_claimed"},
+                    )
+                    await self.mark_decision_raw_response(decision_db_id, decision.raw_response)
                     await self.mark_decision_reason(decision_db_id, reason)
                 self.result_recorder.append_result(
                     results=results,
@@ -162,6 +175,14 @@ class MarketQueuedEntryProcessor:
                 error=error_text,
             )
             if decision_db_id is not None:
+                decision.raw_response = append_decision_stage(
+                    decision.raw_response if isinstance(decision.raw_response, dict) else {},
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    reason,
+                    {"skip_kind": "queued_entry_execution_error", "error": error_text},
+                )
+                await self.mark_decision_raw_response(decision_db_id, decision.raw_response)
                 await self.mark_decision_reason(decision_db_id, reason)
             self.result_recorder.append_result(
                 results=results,

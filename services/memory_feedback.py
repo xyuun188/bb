@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,18 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _safe_extra(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
 
@@ -58,6 +71,8 @@ class MemoryFeedbackPolicy:
 
     max_candidate_bonus: float = 0.24
     max_candidate_penalty: float = -0.32
+    max_expected_return_hint_pct: float = 0.35
+    expected_return_hint_weight: float = 0.55
 
     def build(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
         side_rows = {side: [] for side in SIDES}
@@ -93,6 +108,8 @@ class MemoryFeedbackPolicy:
         shadow = 0
         trade = 0
         contribution = 0.0
+        missed_return_total = 0.0
+        missed_return_evidence = 0
         top_reasons: list[str] = []
 
         for memory in memories:
@@ -112,6 +129,13 @@ class MemoryFeedbackPolicy:
                 missed += evidence
                 positive += evidence
                 contribution += max(adjustment, 0.035) * weight * 1.20
+                extra = _safe_extra(memory.get("extra"))
+                best_action = str(extra.get("best_action") or memory.get("side") or "").lower()
+                if best_action == side:
+                    return_pct = _safe_float(extra.get(f"{side}_return_pct"), 0.0)
+                    if 0.0 < return_pct <= 20.0:
+                        missed_return_total += return_pct * evidence
+                        missed_return_evidence += evidence
             elif memory_type in POSITIVE_MEMORY_TYPES:
                 positive += evidence
                 contribution += max(adjustment, 0.020) * weight
@@ -131,9 +155,20 @@ class MemoryFeedbackPolicy:
                     top_reasons.append(lesson[:96])
 
         net_evidence = positive - risk
-        score_adjustment = _clamp(contribution, -0.25, 0.18)
+        repeated_missed_boost = 0.0
+        if missed >= 2 and positive >= max(risk, 1):
+            repeated_missed_boost = min(max(missed - 1, 0) * 0.014, 0.12)
+        score_adjustment = _clamp(contribution + repeated_missed_boost, -0.25, 0.18)
         candidate_bonus = _clamp(
             score_adjustment * 1.35, self.max_candidate_penalty, self.max_candidate_bonus
+        )
+        missed_avg_return = (
+            missed_return_total / missed_return_evidence if missed_return_evidence > 0 else 0.0
+        )
+        expected_return_hint = _clamp(
+            missed_avg_return * self.expected_return_hint_weight,
+            0.0,
+            self.max_expected_return_hint_pct,
         )
         allow_probe = bool(missed >= 2 and positive >= max(risk, 1) and score_adjustment >= 0.035)
         risk_dominant = bool(risk >= positive + 2 and score_adjustment < 0)
@@ -163,6 +198,9 @@ class MemoryFeedbackPolicy:
             "positive_evidence_count": positive,
             "risk_evidence_count": risk,
             "net_evidence_count": net_evidence,
+            "missed_return_evidence_count": missed_return_evidence,
+            "missed_avg_return_pct": round(missed_avg_return, 6),
+            "expected_return_hint_pct": round(expected_return_hint, 6),
             "score_adjustment": round(score_adjustment, 6),
             "candidate_score_bonus": round(candidate_bonus, 6),
             "allow_probe": allow_probe,
@@ -212,11 +250,13 @@ class MemoryFeedbackPolicy:
         score_adjustment = _safe_float(item.get("score_adjustment"), 0.0)
         candidate_bonus = _safe_float(item.get("candidate_score_bonus"), 0.0)
         max_probe_size = _safe_float(item.get("max_probe_size_pct"), 0.0)
+        expected_return_hint = _safe_float(item.get("expected_return_hint_pct"), 0.0)
         if risk >= positive + 2 and score_adjustment < 0:
             return {
                 "stance": "strict_confirm",
                 "proactive_level": 0.0,
                 "probe_budget_pct": 0.0,
+                "expected_return_hint_pct": 0.0,
                 "min_expected_net_pct": 0.35,
                 "max_loss_probability": 0.42,
                 "max_tail_risk": 0.82,
@@ -229,6 +269,7 @@ class MemoryFeedbackPolicy:
                 "stance": "probe_when_ev_ok",
                 "proactive_level": round(proactive_level, 6),
                 "probe_budget_pct": round(max(max_probe_size, 0.012), 6),
+                "expected_return_hint_pct": round(expected_return_hint, 6),
                 "min_expected_net_pct": 0.12,
                 "max_loss_probability": 0.58,
                 "max_tail_risk": 0.98,
@@ -240,6 +281,7 @@ class MemoryFeedbackPolicy:
                 "stance": "slightly_support",
                 "proactive_level": round(_clamp(score_adjustment * 2.5, 0.05, 0.30), 6),
                 "probe_budget_pct": round(max_probe_size, 6),
+                "expected_return_hint_pct": round(expected_return_hint, 6),
                 "min_expected_net_pct": 0.20,
                 "max_loss_probability": 0.54,
                 "max_tail_risk": 0.92,
@@ -250,6 +292,7 @@ class MemoryFeedbackPolicy:
             "stance": "neutral",
             "proactive_level": 0.0,
             "probe_budget_pct": 0.0,
+            "expected_return_hint_pct": round(expected_return_hint, 6),
             "min_expected_net_pct": 0.25,
             "max_loss_probability": 0.50,
             "max_tail_risk": 0.90,

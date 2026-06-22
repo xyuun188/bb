@@ -512,6 +512,7 @@ def build_entry_evidence_score(
     short_probe_relief: dict[str, Any] = {"applied": False}
     positive_net_probe_relief: dict[str, Any] = {"applied": False}
     strong_positive_net_relief: dict[str, Any] = {"applied": False}
+    memory_missed_opportunity_relief: dict[str, Any] = {"applied": False}
     tradeable_probe = False
     if entry_side == "short" and (
         ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_EFFECTIVE_SCORE
@@ -663,6 +664,29 @@ def build_entry_evidence_score(
             _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_opportunity_score,
         )
     )
+    memory_component = next(
+        (item for item in components if item.get("source") == "shadow_memory"),
+        {},
+    )
+    memory_review = (
+        memory_component.get("review_feedback")
+        if isinstance(memory_component.get("review_feedback"), dict)
+        else {}
+    )
+    memory_missed_count = int(safe_float(memory_review.get("missed_opportunity_count"), 0.0))
+    memory_score_adjustment = safe_float(memory_review.get("score_adjustment"), 0.0)
+    memory_relief_allowed = bool(
+        positive_net_probe_allowed
+        and bool(memory_review.get("allow_probe"))
+        and memory_missed_count >= 6
+        and memory_score_adjustment >= 0.12
+        and expected_net_return >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct
+        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
+        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
+        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
+        and "shadow_memory" not in major_opposites
+        and not strong_opposites
+    )
     if positive_net_probe_allowed:
         original_effective_score = effective_score
         if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
@@ -682,6 +706,27 @@ def build_entry_evidence_score(
                 "机会评分为正但仍处于弱冲突档；本轮只沉淀影子样本和复盘证据，"
                 "不再提交微小真实/模拟订单。只有净收益、盈利质量、置信度和多源同向证据"
                 "继续增强并抬升到 exploration/small 档后才允许执行。"
+            ),
+        }
+    if memory_relief_allowed:
+        original_effective_score = effective_score
+        effective_score = max(effective_score, ENTRY_EVIDENCE_SCORE_PROBE)
+        tradeable_probe = True
+        memory_missed_opportunity_relief = {
+            "applied": True,
+            "tradeable_probe": True,
+            "shadow_only": False,
+            "from_effective_score": round(original_effective_score, 6),
+            "to_effective_score": round(effective_score, 6),
+            "missed_opportunity_count": memory_missed_count,
+            "memory_score_adjustment": round(memory_score_adjustment, 6),
+            "expected_net_return_pct": round(expected_net_return, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+            "reason": (
+                "影子复盘多次证明观望错过同方向机会，且当前预期净收益、盈利质量、"
+                "亏损概率和尾部风险达标；允许受控小仓质量试单，但不绕过硬风控。"
             ),
         }
     if strong_positive_relief_allowed:
@@ -789,6 +834,7 @@ def build_entry_evidence_score(
         "aligned_support_sources": aligned_support_sources,
         "missing_key_degraded_relief": missing_key_degraded_relief,
         "positive_net_probe_relief": positive_net_probe_relief,
+        "memory_missed_opportunity_relief": memory_missed_opportunity_relief,
         "strong_positive_net_relief": strong_positive_net_relief,
         "short_probe_relief": short_probe_relief,
         "tradeable_probe": bool(tradeable_probe),

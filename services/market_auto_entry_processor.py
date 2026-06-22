@@ -10,6 +10,11 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+)
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
@@ -258,6 +263,17 @@ class MarketAutoEntryProcessor:
             "position_size_pct_before_execution": float(decision.position_size_pct or 0.0),
             "reason": ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
         }
+        raw = append_decision_stage(
+            raw,
+            DecisionStage.RISK_CHECK,
+            DecisionStageStatus.SKIPPED,
+            ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
+            {
+                "skip_kind": "entry_evidence_shadow_only",
+                "shadow_only": True,
+                "evidence_tier": evidence_tier,
+            },
+        )
         decision.raw_response = raw
         return ENTRY_EVIDENCE_SHADOW_ONLY_REASON
 
@@ -300,6 +316,14 @@ class MarketAutoEntryProcessor:
             selected=False,
             reason=reason,
         )
+        raw_response = append_decision_stage(
+            raw_response,
+            DecisionStage.RISK_CHECK,
+            DecisionStageStatus.SKIPPED,
+            reason,
+            {"skip_kind": "entry_pre_execution_skip"},
+        )
+        decision.raw_response = raw_response
         if decision_db_id is not None:
             await self.mark_decision_raw_response(decision_db_id, raw_response)
             await self.mark_decision_reason(decision_db_id, reason)

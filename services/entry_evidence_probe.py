@@ -9,8 +9,11 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 MaxLeverageProvider = Callable[[], float]
+
+_ENTRY_EVIDENCE_PARAMS = DEFAULT_TRADING_PARAMS.entry_evidence
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -63,7 +66,22 @@ class EntryEvidenceProbePolicy:
         min_ref = _safe_float(item.get("min_score_reference"), MIN_ENTRY_OPPORTUNITY_SCORE)
         recommendation = str(item.get("recommendation") or "")
         high_profit = bool(item.get("high_profit_potential"))
-        if expected_net < 0.30 or quality < 0.25 or loss_probability > 0.56 or tail_risk > 0.92:
+        review_feedback = _safe_dict(item.get("review_feedback"))
+        missed_count = int(_safe_float(review_feedback.get("missed_opportunity_count"), 0.0))
+        positive_count = int(_safe_float(review_feedback.get("positive_evidence_count"), 0.0))
+        risk_count = int(_safe_float(review_feedback.get("risk_evidence_count"), 0.0))
+        memory_supported = bool(
+            recommendation == "memory_supported_probe_candidate"
+            and review_feedback.get("allow_probe")
+            and missed_count >= 6
+            and positive_count >= max(risk_count + 1, 2)
+        )
+        if (
+            expected_net < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct
+            or quality < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
+            or loss_probability > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
+            or tail_risk > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
+        ):
             return None
 
         market_quality_block = self.market_quality.block_reason(feature_vector, side)
@@ -77,12 +95,24 @@ class EntryEvidenceProbePolicy:
             }
             original.raw_response = raw
             return None
-        if score < max(min_ref - 0.65, 0.20) and "high_profit" not in recommendation:
+        if (
+            score < max(min_ref - 0.65, 0.20)
+            and "high_profit" not in recommendation
+            and not memory_supported
+        ):
             return None
         if recommendation == "hold_or_tiny_probe_only" and not high_profit:
             return None
 
         sizing = self._sizing(expected_net, quality, loss_probability, tail_risk, high_profit)
+        source = "missed_opportunity_memory" if memory_supported else "entry_candidate_evidence"
+        reason = (
+            "影子复盘多次证明观望错过同方向机会，且当前正期望、盈利质量、"
+            "亏损概率和尾部风险达标，生成受控记忆反哺候选。"
+            if memory_supported
+            else "AI 原始观望，但入场候选证据包显示该方向为正期望且风险可控，"
+            "生成受控探针候选。"
+        )
         raw_response = dict(raw)
         raw_response.update(
             {
@@ -94,7 +124,7 @@ class EntryEvidenceProbePolicy:
                 or {},
                 "evidence_profit_probe": {
                     "triggered": True,
-                    "source": "entry_candidate_evidence",
+                    "source": source,
                     "ai_original_action": original.action.value,
                     "side": side,
                     "expected_net_return_pct": round(expected_net, 6),
@@ -104,12 +134,14 @@ class EntryEvidenceProbePolicy:
                     "score": round(score, 6),
                     "min_score_reference": round(min_ref, 6),
                     "high_profit_potential": high_profit,
+                    "memory_supported": memory_supported,
+                    "missed_opportunity_count": missed_count,
+                    "positive_evidence_count": positive_count,
+                    "risk_evidence_count": risk_count,
+                    "review_feedback": review_feedback,
                     "position_size_pct": round(sizing["size"], 6),
                     "suggested_leverage": round(sizing["leverage"], 6),
-                    "reason": (
-                        "AI 原始观望，但入场候选证据包显示该方向为正期望且风险可控，"
-                        "生成受控探针候选。"
-                    ),
+                    "reason": reason,
                 },
             }
         )
@@ -120,7 +152,8 @@ class EntryEvidenceProbePolicy:
             action=Action.LONG if side == "long" else Action.SHORT,
             confidence=sizing["confidence"],
             reasoning=(
-                f"AI 原始观望；证据包显示{side_label}正期望 {expected_net:.2f}%，"
+                f"AI 原始观望；{('影子复盘反哺' if memory_supported else '证据包')}显示"
+                f"{side_label}正期望 {expected_net:.2f}%，"
                 f"盈亏质量 {quality:.2f}，亏损概率 {loss_probability:.0%}，"
                 "转为受控开仓候选。"
             ),

@@ -377,4 +377,11 @@ class EntryCandidateEvidencePolicy:
             "lookback_days": profile.get("lookback_days"),
             "cooldown": bool(profile.get("cooldown")),
             "cooldown_reason": str(profile.get("cooldown_reason") or "")[:120],
+            "cooldown_kind": str(profile.get("cooldown_kind") or "")[:80],
+            "cooldown_time_based": bool(profile.get("cooldown_time_based")),
+            "cooldown_remaining_hours": round(
+                _safe_float(profile.get("cooldown_remaining_hours"), 0.0),
+                6,
+            ),
+            "profile_scope": str(profile.get("profile_scope") or "")[:40],
         }

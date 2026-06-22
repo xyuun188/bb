@@ -150,6 +150,120 @@ def test_entry_opportunity_scoring_turns_memory_habit_into_probe_cap() -> None:
     assert decision.position_size_pct == 0.015
 
 
+def test_entry_opportunity_scoring_adds_limited_shadow_memory_return_hint() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.confidence = 0.58
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.03
+    decision.raw_response["ml_signal"] = {
+        "influence_enabled": False,
+        "advisory_enabled": True,
+        "influence_policy": {
+            "advisory_enabled": True,
+            "long": {
+                "enabled": False,
+                "advisory_enabled": True,
+                "influence_weight": 0.20,
+            },
+        },
+        "predictions": [
+            {
+                "long_expected_return_pct": 0.04,
+                "short_expected_return_pct": -0.02,
+                "long_win_rate": 0.54,
+                "profit_quality_score": 0.2,
+            }
+        ],
+    }
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": {
+            "available": True,
+            "best_side": "long",
+            "adjusted_long_return_pct": -0.05,
+            "long_loss_probability": 0.50,
+            "profit_quality_score": 0.05,
+        },
+        "time_series_prediction": {
+            "available": True,
+            "best_side": "long",
+            "expected_return_pct": 0.03,
+        },
+    }
+    decision.raw_response["memory_feedback"] = {
+        "decision_habit": {
+            "by_side": {
+                "long": {
+                    "stance": "probe_when_ev_ok",
+                    "proactive_level": 0.72,
+                    "probe_budget_pct": 0.018,
+                    "expected_return_hint_pct": 0.30,
+                    "min_expected_net_pct": 0.12,
+                    "max_loss_probability": 0.58,
+                    "max_tail_risk": 0.98,
+                }
+            }
+        },
+        "by_side": {
+            "long": {
+                "missed_opportunity_count": 7,
+                "risk_evidence_count": 1,
+                "missed_avg_return_pct": 0.62,
+                "expected_return_hint_pct": 0.30,
+            }
+        },
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    breakdown = opportunity["expected_net_breakdown"]
+    components = {row["key"]: row for row in breakdown["components"]}
+
+    assert "shadow_memory" in components
+    assert components["shadow_memory"]["available"] is True
+    assert components["shadow_memory"]["contribution_pct"] > 0
+    assert components["shadow_memory"]["contribution_pct"] <= 0.30
+    assert opportunity["expected_net_return_pct"] == breakdown["net_pct"]
+    assert opportunity["expected_net_return_pct"] > 0
+    assert "shadow_memory" in breakdown["formula"]
+
+
+def test_entry_opportunity_scoring_ignores_shadow_memory_hint_when_risk_dominates() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.raw_response["memory_feedback"] = {
+        "decision_habit": {
+            "by_side": {
+                "long": {
+                    "stance": "strict_confirm",
+                    "expected_return_hint_pct": 0.30,
+                }
+            }
+        },
+        "by_side": {
+            "long": {
+                "missed_opportunity_count": 7,
+                "risk_evidence_count": 9,
+                "missed_avg_return_pct": 0.62,
+                "expected_return_hint_pct": 0.30,
+            }
+        },
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    components = {
+        row["key"]: row
+        for row in decision.raw_response["opportunity_score"]["expected_net_breakdown"][
+            "components"
+        ]
+    }
+    assert "shadow_memory" in components
+    assert components["shadow_memory"]["available"] is False
+    assert components["shadow_memory"]["contribution_pct"] == 0.0
+
+
 def test_entry_opportunity_scoring_uses_vector_memory_as_soft_adjustment() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     baseline = _decision()
@@ -272,10 +386,15 @@ def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned
     assert opportunity["timeseries_expected_return_pct"] == 0.05
     assert opportunity["expected_net_return_pct"] < 0.05
     breakdown = opportunity["expected_net_breakdown"]
-    assert breakdown["formula"] == "ai + local_ml + server_profit + timeseries - fee - slippage"
+    assert (
+        breakdown["formula"]
+        == "ai + local_ml + server_profit + timeseries + shadow_memory - fee - slippage"
+    )
     assert breakdown["net_pct"] == opportunity["expected_net_return_pct"]
     components = {row["key"]: row for row in breakdown["components"]}
     assert components["ai"]["contribution_pct"] == 0.15
+    assert components["shadow_memory"]["available"] is False
+    assert components["shadow_memory"]["contribution_pct"] == 0.0
     assert components["local_ml"]["available"] is False
     assert components["server_profit"]["raw_return_pct"] == -0.28
     assert components["fee"]["contribution_pct"] < 0

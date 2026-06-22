@@ -191,6 +191,19 @@ class EntryLossCooldownPolicy:
                 self.params.fresh_loss_reentry_min_aligned_sources if fresh_loss else None
             ),
             "strong_server_support": strong_server_support,
+            "cooldown_kind": str(profile.get("cooldown_kind") or ""),
+            "cooldown_time_based": self._cooldown_is_time_based(
+                profile,
+                fresh_loss=fresh_loss,
+            ),
+            "cooldown_remaining_hours": round(
+                self._cooldown_remaining_hours(profile, fresh_loss=fresh_loss),
+                6,
+            ),
+            "fresh_loss_cooldown_remaining_hours": round(
+                self._fresh_loss_remaining_hours(profile),
+                6,
+            ),
             "profile_pnl": round(_safe_float(profile.get("pnl"), 0.0), 6),
             "profile_today_pnl": round(_safe_float(profile.get("today_pnl"), 0.0), 6),
             "profile_loss": round(_safe_float(profile.get("loss"), 0.0), 6),
@@ -248,7 +261,6 @@ class EntryLossCooldownPolicy:
         loss = _safe_float(profile.get("loss"), 0.0)
         today_loss = _safe_float(profile.get("today_loss"), 0.0)
         largest_loss = _safe_float(profile.get("largest_loss"), 0.0)
-        cooldown_remaining_hours = _safe_float(profile.get("cooldown_remaining_hours"), 0.0)
         count = int(profile.get("count") or 0)
         losses = int(profile.get("losses") or 0)
         wins = int(profile.get("wins") or 0)
@@ -259,6 +271,7 @@ class EntryLossCooldownPolicy:
         side_label = self._side_label(side)
         symbol_key = self._normalized_symbol(decision.symbol)
         failed_text = self._failed_text(_safe_list(override.get("failed")))
+        cooldown_eta = self._cooldown_eta_sentence(profile, fresh_loss=fresh_loss_active)
 
         if fresh_loss_active:
             return (
@@ -275,7 +288,7 @@ class EntryLossCooldownPolicy:
                 f"{self._metric(metrics, 'server_profit_expected_return_pct'):.2f}% ，亏损概率 "
                 f"{self._metric(metrics, 'server_profit_loss_probability', 1.0):.0%}。"
                 f"为避免在 {symbol_key} 上刚亏完又同向复入，本次禁止{side_label}新开仓；"
-                f"预计还需冷却约 {cooldown_remaining_hours:.1f} 小时，之后再按最新行情重新评估。"
+                f"{cooldown_eta}"
             )
 
         return (
@@ -292,7 +305,7 @@ class EntryLossCooldownPolicy:
             f"{self._metric(metrics, 'server_profit_expected_return_pct'):.2f}% ，亏损概率 "
             f"{self._metric(metrics, 'server_profit_loss_probability', 1.0):.0%}。"
             f"为避免在 {symbol_key} 上连续同向复亏，本次禁止{side_label}新开仓；"
-            f"预计还需冷却约 {cooldown_remaining_hours:.1f} 小时，之后再按最新行情重新评估。"
+            f"{cooldown_eta}"
         )
 
     def _fresh_loss_reentry_active(self, profile: dict[str, Any]) -> bool:
@@ -305,9 +318,57 @@ class EntryLossCooldownPolicy:
         pnl = _safe_float(profile.get("pnl"), 0.0)
         if losses <= 0:
             return False
-        if last_loss_age_hours > self.params.fresh_loss_reentry_cooldown_hours:
+        if last_loss_age_hours >= self.params.fresh_loss_reentry_cooldown_hours:
             return False
         return today_pnl < 0 or pnl < 0
+
+    def _fresh_loss_remaining_hours(self, profile: dict[str, Any]) -> float:
+        last_loss_age_hours = _safe_float(profile.get("last_loss_age_hours"), 9999.0)
+        return max(self.params.fresh_loss_reentry_cooldown_hours - last_loss_age_hours, 0.0)
+
+    def _cooldown_remaining_hours(
+        self,
+        profile: dict[str, Any],
+        *,
+        fresh_loss: bool,
+    ) -> float:
+        if fresh_loss:
+            return self._fresh_loss_remaining_hours(profile)
+        return max(_safe_float(profile.get("cooldown_remaining_hours"), 0.0), 0.0)
+
+    def _cooldown_is_time_based(
+        self,
+        profile: dict[str, Any],
+        *,
+        fresh_loss: bool,
+    ) -> bool:
+        if fresh_loss:
+            return self._fresh_loss_remaining_hours(profile) > 0.0
+        return bool(profile.get("cooldown_time_based")) or (
+            _safe_float(profile.get("cooldown_remaining_hours"), 0.0) > 0.0
+        )
+
+    def _cooldown_eta_sentence(
+        self,
+        profile: dict[str, Any],
+        *,
+        fresh_loss: bool,
+    ) -> str:
+        remaining_hours = self._cooldown_remaining_hours(profile, fresh_loss=fresh_loss)
+        if self._cooldown_is_time_based(profile, fresh_loss=fresh_loss) and remaining_hours > 0:
+            if remaining_hours >= 1.0:
+                return f"预计还需冷却约 {remaining_hours:.1f} 小时，之后再按最新行情重新评估。"
+            remaining_minutes = max(int(math.ceil((remaining_hours * 60.0) - 1e-9)), 1)
+            return f"预计还需冷却约 {remaining_minutes} 分钟，之后再按最新行情重新评估。"
+        if fresh_loss:
+            return (
+                "短周期冷却时间已到或接近到期，但高质量解锁条件仍未达标；"
+                "下一轮会按最新行情、模型同向支持和真实盈亏重新评估。"
+            )
+        return (
+            "该拦截不按固定倒计时解除，而是亏损质量隔离；"
+            "需要后续真实收益、预期净收益和模型同向支持改善后才会解除。"
+        )
 
     def _normalized_symbol(self, symbol: str) -> str:
         if self.normalize_symbol is None:

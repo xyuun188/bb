@@ -52,6 +52,7 @@ from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
 from services.decision_freshness import DecisionFreshnessPolicy
 from services.decision_persistence_service import DecisionPersistenceService
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
@@ -3569,6 +3570,27 @@ class TradingService:
                         for s, fv in market_feature_vectors.items()
                         if self._normalize_position_symbol(s) in allowed_keys
                     }
+                dedupe_policy = self._entry_market_hold_penalty_policy()
+                recently_analyzed_symbols = [
+                    symbol
+                    for symbol in market_feature_vectors
+                    if dedupe_policy.recently_analyzed(symbol)
+                ]
+                if recently_analyzed_symbols:
+                    market_feature_vectors = {
+                        symbol: fv
+                        for symbol, fv in market_feature_vectors.items()
+                        if symbol not in recently_analyzed_symbols
+                    }
+                    analysis_budget_context["recent_market_analysis_dedupe"] = {
+                        "skipped_symbols": recently_analyzed_symbols[:20],
+                        "skipped_count": len(recently_analyzed_symbols),
+                        "is_entry_gate": False,
+                        "reason": (
+                            "同一交易对刚完成市场分析，本轮跳过以避免同一分钟重复消耗模型资源；"
+                            "持仓复盘不受该去重影响。"
+                        ),
+                    }
             results["analysis_budget"] = analysis_budget_context
             logger.info(
                 "analysis budget selected",
@@ -4147,7 +4169,19 @@ class TradingService:
                     reason=ranked.wait_reason,
                 )
                 if decision_db_id is not None:
-                    await self._mark_decision_raw_response(decision_db_id, raw_response)
+                    raw_response = await self._record_and_persist_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.STRATEGY_ARBITRATION,
+                        DecisionStageStatus.PENDING,
+                        ranked.wait_reason,
+                        {
+                            "rank": ranked.rank,
+                            "candidate_count": ranked.candidate_count,
+                            "score": round(float(ranked.score), 6),
+                            "selected_for_execution": False,
+                        },
+                    )
                     await self._mark_decision_reason(decision_db_id, ranked.wait_reason)
 
             filtered_entry_candidates = self._entry_candidate_filter_policy().filter(
@@ -4168,6 +4202,23 @@ class TradingService:
                     if decision_db_id is not None:
                         await self._mark_decision_raw_response(decision_db_id, raw_response)
                 if decision_db_id is not None:
+                    status = (
+                        DecisionStageStatus.BLOCKED
+                        if rejected.blocker == "entry_gate"
+                        else DecisionStageStatus.SKIPPED
+                    )
+                    await self._record_and_persist_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.RISK_CHECK,
+                        status,
+                        rejected.reason,
+                        {
+                            "blocker": rejected.blocker,
+                            "skip_kind": rejected.blocker,
+                            "selected_for_execution": False,
+                        },
+                    )
                     await self._mark_decision_reason(decision_db_id, rejected.reason)
                 self.market_decision_result_recorder.append_result(
                     results=results,

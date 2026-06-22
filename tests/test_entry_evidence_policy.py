@@ -409,6 +409,66 @@ def test_positive_net_weak_conflict_probe_stays_shadow_only_without_score_lift()
     assert evidence["shadow_only"] is True
 
 
+def test_repeated_missed_opportunity_memory_lifts_positive_weak_probe_to_tradeable():
+    decision = _decision(
+        Action.LONG,
+        {
+            "memory_feedback": {
+                "by_side": {
+                    "long": {
+                        "score_adjustment": 0.18,
+                        "candidate_score_bonus": 0.24,
+                        "allow_probe": True,
+                        "action_bias": "prefer_small_probe_when_current_ev_positive",
+                        "max_probe_size_pct": 0.025,
+                        "missed_opportunity_count": 12,
+                        "risk_evidence_count": 0,
+                    }
+                },
+                "decision_habit": {
+                    "by_side": {
+                        "long": {
+                            "stance": "probe_when_ev_ok",
+                            "proactive_level": 0.85,
+                            "probe_budget_pct": 0.025,
+                        }
+                    }
+                },
+            },
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.2,
+                }
+            },
+        },
+        confidence=0.74,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 1.05,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.72,
+            "profit_quality_ratio": 0.65,
+            "server_profit_loss_probability": 0.50,
+            "tail_risk_score": 0.60,
+            "confidence": 0.74,
+        },
+    )
+
+    relief = evidence["memory_missed_opportunity_relief"]
+    assert relief["applied"] is True
+    assert relief["missed_opportunity_count"] == 12
+    assert relief["tradeable_probe"] is True
+    assert evidence["tier"] == "exploration"
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
+    assert evidence["max_size_pct"] <= 0.015
+
+
 def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
     decision = _decision(
         Action.SHORT,
