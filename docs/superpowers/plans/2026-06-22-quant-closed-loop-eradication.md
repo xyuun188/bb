@@ -797,6 +797,8 @@ AI 防偏要求：
 - `trade_loop` 当前因刚重启处于冷启动观察，但 runtime details 已正确展示：`paused=false`、`mode=paper`、`scan_mode=auto`、market round active/last_market_round 时间可见；这证明当前 0 订单不是暂停造成。
 - `trade_execution_contract` 当前 runtime window 仍为 0 执行违规：`executed_entry_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`contract_violation_count=0`；历史 24h violation 仍保留为 warning，不得标记全绿。
 - 修复后的策略健康脚本串行 120m 复查：268 decisions、267 hold、1 entry candidate、0 orders、0 failed_orders、0 positions_created/closed、0 fast_loss_close_under_15m、open_positions 2。唯一 SOL/USDT short 候选为正 expected net，但 evidence tier `blocked`、score 低于 min、profit quality 约 0.469、loss probability 约 0.510、tail risk 约 0.441，最终 `risk_check:skipped`，没有绕过风控。
+- 追加观察口径修复：`scripts/inspect_online_strategy_health.py` 增加 `analysis_type_counts`、`analysis_type_action_counts`、`entry_candidate_evidence_by_type`、`market_decisions`、`position_review_decisions`、`market_entry_decisions`，避免把持仓复核数量误当成新币种 market 扫描数量。
+- 修复后 120m 线上只读复查：272 decisions 中 `market_decisions=49`、`position_review_decisions=223`；`analysis_type_action_counts` 为 `position_review:hold=223`、`market:hold=45`、`market:short=4`；`entry_candidate_evidence_by_type.market=49`；orders/failed_orders/fast_loss_close_under_15m 仍为 0，4 个 market short 候选均为 `risk_check:skipped`。
 
 当前结论：
 - 本轮修复解决的是观察和巡检防偏，不是收益闭环完成。

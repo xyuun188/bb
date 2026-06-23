@@ -79,6 +79,16 @@ def selected_side(decision):
     return str(opp.get("side") or "").lower()
 
 
+def analysis_type(decision):
+    raw = safe_dict(decision.raw_llm_response)
+    value = str(getattr(decision, "analysis_type", "") or raw.get("analysis_type") or "unknown").lower().strip()
+    if value in {"position", "holding", "holdings"}:
+        return "position_review"
+    if value in {"market_scan", "symbol_scan"}:
+        return "market"
+    return value or "unknown"
+
+
 def selected_side_evidence(raw, side):
     evidence = safe_dict(raw.get("entry_candidate_evidence"))
     side_evidence = safe_dict(evidence.get(side))
@@ -290,6 +300,11 @@ async def main():
 
     entry_decisions = [d for d in decisions if str(d.action or "").lower() in {"long", "short"}]
     hold_decisions = [d for d in decisions if str(d.action or "").lower() == "hold"]
+    market_decisions = [d for d in decisions if analysis_type(d) == "market"]
+    position_review_decisions = [
+        d for d in decisions if analysis_type(d) == "position_review"
+    ]
+    market_entry_decisions = [d for d in entry_decisions if analysis_type(d) == "market"]
     executed_entries = [d for d in entry_decisions if bool(d.was_executed)]
     order_by_decision = {}
     for order in orders:
@@ -310,6 +325,15 @@ async def main():
     examples = []
     cooldown_examples = []
     shadow_only_examples = []
+    analysis_type_counts = Counter(analysis_type(d) for d in decisions)
+    analysis_type_action_counts = Counter(
+        f"{analysis_type(d)}:{str(d.action or 'unknown').lower()}" for d in decisions
+    )
+    entry_candidate_evidence_by_type = Counter()
+    for d in decisions:
+        raw = safe_dict(d.raw_llm_response)
+        if isinstance(raw.get("entry_candidate_evidence"), dict):
+            entry_candidate_evidence_by_type[analysis_type(d)] += 1
 
     for d in entry_decisions:
         st = state(d)
@@ -359,6 +383,7 @@ async def main():
                 "time": aware(d.created_at).isoformat() if aware(d.created_at) else "",
                 "symbol": d.symbol,
                 "action": d.action,
+                "analysis_type": analysis_type(d),
                 "executed": bool(d.was_executed),
                 "reason": short_text(reason, 280),
                 "state": st,
@@ -442,8 +467,11 @@ async def main():
         "generated_at": now.isoformat(),
         "counts": {
             "decisions": len(decisions),
+            "market_decisions": len(market_decisions),
+            "position_review_decisions": len(position_review_decisions),
             "hold_decisions": len(hold_decisions),
             "entry_decisions": len(entry_decisions),
+            "market_entry_decisions": len(market_entry_decisions),
             "executed_entries": len(executed_entries),
             "orders": len(orders),
             "filled_orders": len(filled_orders),
@@ -459,6 +487,11 @@ async def main():
             "strategy_learning_events": len(events),
         },
         "action_counts": dict(Counter(str(d.action or "unknown").lower() for d in decisions)),
+        "analysis_type_counts": dict(analysis_type_counts.most_common(20)),
+        "analysis_type_action_counts": dict(analysis_type_action_counts.most_common(40)),
+        "entry_candidate_evidence_by_type": dict(
+            entry_candidate_evidence_by_type.most_common(20)
+        ),
         "entry_state_counts": dict(state_counts.most_common(20)),
         "entry_reason_counts": [{"reason_prefix": k, "count": v} for k, v in reason_counts.most_common(20)],
         "expected_net_stats": stats(expected_values),

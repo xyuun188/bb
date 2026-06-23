@@ -13,6 +13,22 @@ def test_strategy_health_remote_command_uses_unique_temp_files() -> None:
     assert "__WINDOW_MINUTES__" not in command
 
 
+def test_strategy_health_report_splits_market_and_position_review_decisions() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "def analysis_type(decision):" in template
+    assert '"analysis_type_counts": dict(analysis_type_counts.most_common(20))' in template
+    assert (
+        '"analysis_type_action_counts": dict(analysis_type_action_counts.most_common(40))'
+        in template
+    )
+    assert '"entry_candidate_evidence_by_type": dict(' in template
+    assert "entry_candidate_evidence_by_type.most_common(20)" in template
+    assert '"market_decisions": len(market_decisions)' in template
+    assert '"market_entry_decisions": len(market_entry_decisions)' in template
+    assert '"analysis_type": analysis_type(d)' in template
+
+
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 
