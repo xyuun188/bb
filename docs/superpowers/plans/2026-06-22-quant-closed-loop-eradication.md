@@ -856,6 +856,50 @@ AI 防偏要求：
 
 ---
 
+## 二十三、Batch H 补充记录：local ML readiness 直连观察（2026-06-23）
+
+触发原因：前一轮已经证明 `local_ml=0` 是 ML readiness 保护，而不是 expected net 字段映射错误；但策略健康脚本本身没有直接输出 ML readiness、阻塞原因和训练质量摘要，后续 AI 仍可能把 `local_ml=0` 误读成“少接了一个功能”，进而走偏到硬改 `ready` 或放宽 readiness。因此本次只把 ML readiness 只读摘要接入策略健康脚本输出。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：新增 `local_ml_readiness_summary()`，调用 `MLSignalService().status()`，输出 `status/readiness_state/allow_live_position_influence/advisory_enabled/blocking_reason_codes/metrics/quality_totals/quality_top_reasons`。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，锁定 `local_ml_readiness`、`allow_live_position_influence`、`blocking_reason_codes` 和质量原因字段，防止后续观察脚本退化。
+
+安全边界：
+- 本批只增加只读诊断字段，不改变开仓阈值、杠杆、仓位、平仓、模型权重、专家路由或风控门。
+- `local_ml_readiness.status=degraded` 与 `allow_live_position_influence=false` 必须被视为保护性阻断，不得硬改 `ready`，不得隐藏 blocking reasons，不得让未达标 ML 参与真实仓位放大。
+- 影子错过机会、AI 正贡献或 expected net 为正，仍不能绕过 score gap、profit quality、loss probability、tail risk、server_profit 和交易执行契约。
+
+本地验证：
+- `pytest tests/test_inspect_online_strategy_health.py -q`：6 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+- `git diff --check`：通过。
+
+线上只读复查：
+- 10 分钟窗口（`2026-06-23T00:57:39Z`）：23 decisions，其中 `market_decisions=9`、`position_review_decisions=14`、`market_entry_decisions=2`；2 个 market 候选全部为 `risk_check:skipped`，`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`。
+- 120 分钟窗口（`2026-06-23T00:57:39Z`）：290 decisions，其中 `market_decisions=98`、`position_review_decisions=192`、`market_entry_decisions=11`；11 个 market 候选全部为 `risk_check:skipped`，`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 120 分钟候选证据链：`expected_net_return_pct` 全部为正（min 0.280506、median 0.314058、max 0.337874），但 `position_size_pct` 全部为 0；`score_gap` 全部为负（min -2.578678、median -1.989693、max -0.753132），`profit_quality_ratio` median 0.419975，`loss_probability` median 0.5436，`tail_risk_score` median 0.399856。当前仍是候选质量与风险门未过，不是下单链路丢单。
+- expected net 组件拆解：`ai` 固定正贡献 0.15，`shadow_memory` 约 0.35 且为正，`local_ml` 全部 0，`server_profit` 全部负贡献（约 -0.017 到 -0.028），`fee/slippage` 为负，`timeseries` 仅小幅贡献。
+- `local_ml_readiness` 直连结果：`available=true`、`status=degraded`、`readiness_state=degraded`、`allow_live_position_influence=false`、`advisory_enabled=false`；阻塞项为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。
+- ML 指标：`sample_count=19982`、`test_count=4996`、`dirty_sample_ratio=0.8979`、`long_pr_auc=0.372210098695988`、`short_pr_auc=0.38521014983148383`、`top_long_avg_return_pct=0.10222611240077366`、`top_short_avg_return_pct=-0.10458550472034482`、`training_data_version=2026-06-23.v3`。质量汇总为 total 20000、included 2042、downweighted 17940、excluded 18；主要原因仍是 `shadow:very_low_decision_confidence`、`shadow:hold_observation_downweighted`、`shadow:hold_missed_opportunity_downweighted`。
+
+同步后复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 部署后 10 分钟窗口（`2026-06-23T01:01:22Z`）：21 decisions，其中 `market_decisions=9`、`position_review_decisions=12`、`market_entry_decisions=1`；该候选为 `risk_check:skipped`，`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`。
+- 部署后 120 分钟窗口（`2026-06-23T01:01:22Z`）：291 decisions，其中 `market_decisions=101`、`position_review_decisions=190`、`market_entry_decisions=11`；11 个 market 候选全部 `risk_check:skipped`，`orders=0`、`failed_orders=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。`local_ml_readiness` 仍为 degraded 且 `allow_live_position_influence=false`。
+- 稳定口径系统巡检（`record_history=False`，Python/dotenv 加载 `/data/bb/app/.env` 与 `/etc/bb/bb-runtime.env` 后以 OS 用户 `bb` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 7、observing 4。`trade_loop` 最近 2 小时有分析但 0 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh；`trade_execution_contract.current_summary.contract_violation_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`，历史 24h violation 仍保留为 warning。`runtime_text_integrity` 为 ok，扫描 815 条、疑似记录 0。
+
+当前结论：
+- 策略健康脚本现在能在同一份观察报告里解释 `local_ml=0` 的原因，降低后续 AI 把保护状态误读成缺功能的风险。
+- 当前没有触发新增失败订单、弱证据执行、快亏平或风控绕过等停止规则；但也没有形成盈利闭环，Batch H 仍未完成。
+- 下一步仍应继续观察，并定位高 missed opportunity 与低候选质量之间的断点：训练样本质量、候选评分、server_profit 负贡献、profit quality、loss probability、tail risk、成本/滑点和同币种同方向重复证据，而不是降低阈值或硬改 ML readiness。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务行为变更、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

@@ -53,6 +53,17 @@ def test_strategy_health_report_exposes_market_entry_evidence_chain_stats() -> N
     assert '"market_entry_expected_net_component_stats": {' in template
 
 
+def test_strategy_health_report_exposes_local_ml_readiness_summary() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "from services.ml_signal_service import MLSignalService" in template
+    assert "def local_ml_readiness_summary():" in template
+    assert '"local_ml_readiness": local_ml_readiness_summary()' in template
+    assert '"allow_live_position_influence"' in template
+    assert '"blocking_reason_codes"' in template
+    assert '"quality_top_reasons"' in template
+
+
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 

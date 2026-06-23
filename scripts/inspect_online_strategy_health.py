@@ -30,6 +30,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from models.learning import ShadowBacktest, ExpertMemory, StrategyLearningEvent
 from services.decision_state import decision_state_from_raw
+from services.ml_signal_service import MLSignalService
 
 WINDOW_MINUTES = __WINDOW_MINUTES__
 FAST_CLOSE_MINUTES = 15
@@ -185,6 +186,47 @@ def expected_net_components(decision):
         key = str(item.get("key") or "unknown")
         result[key] = safe_float(item.get("contribution_pct"))
     return result
+
+
+def local_ml_readiness_summary():
+    try:
+        status = MLSignalService().status()
+    except Exception as exc:
+        return {"available": False, "status": "error", "error": str(exc)[:180]}
+    readiness = safe_dict(status.get("readiness"))
+    quality = safe_dict(status.get("quality_report"))
+    metrics = safe_dict(readiness.get("metrics"))
+    blocking = safe_list(readiness.get("blocking_reasons"))
+    return {
+        "available": bool(status.get("available")),
+        "status": status.get("status"),
+        "readiness_state": status.get("readiness_state") or readiness.get("state"),
+        "allow_live_position_influence": bool(
+            status.get("allow_live_position_influence")
+            or readiness.get("allow_live_position_influence")
+        ),
+        "advisory_enabled": bool(status.get("advisory_enabled")),
+        "blocking_reason_codes": [
+            item.get("code") for item in blocking if isinstance(item, dict)
+        ],
+        "metrics": {
+            key: metrics.get(key)
+            for key in (
+                "sample_count",
+                "test_count",
+                "dirty_sample_ratio",
+                "long_pr_auc",
+                "short_pr_auc",
+                "top_long_avg_return_pct",
+                "top_short_avg_return_pct",
+                "model_age_seconds",
+                "training_data_version",
+                "required_training_data_version",
+            )
+        },
+        "quality_totals": safe_dict(quality.get("totals")),
+        "quality_top_reasons": safe_list(quality.get("top_reasons"))[:8],
+    }
 
 
 def is_shadow_only_entry_decision(decision):
@@ -538,6 +580,7 @@ async def main():
             key: stats(values)
             for key, values in sorted(market_entry_component_contributions.items())
         },
+        "local_ml_readiness": local_ml_readiness_summary(),
         "shadow_only_positive_net_count": len(shadow_only_examples),
         "notional_floor_blocked_counts": dict(notional_floor_blocked.most_common(12)),
         "shadow_completed_best_action_counts": dict(shadow_by_best.most_common(10)),
