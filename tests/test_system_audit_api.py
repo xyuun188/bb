@@ -232,6 +232,81 @@ async def test_audit_maybe_async_times_out_slow_sections(
 
 
 @pytest.mark.asyncio
+async def test_system_audit_runs_trade_contract_before_slow_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    lock = asyncio.Lock()
+
+    async def slow_model_training() -> dict[str, Any]:
+        async with lock:
+            await asyncio.sleep(0.05)
+        return system_audit._audit_card("model_training", "模型与训练", "warning", "慢诊断完成")
+
+    async def trade_contract() -> dict[str, Any]:
+        async with lock:
+            return system_audit._audit_card(
+                "trade_execution_contract",
+                "Trade execution contract",
+                "ok",
+                "交易执行契约正常",
+            )
+
+    async_names = {
+        "_trade_loop_audit": _async_card("trade_loop", "ok", "交易闭环正常"),
+        "_okx_reconciliation_audit": _async_card("okx_reconciliation", "ok", "OKX 对账正常"),
+        "_position_price_integrity_audit": _async_card(
+            "position_price_integrity", "ok", "持仓价格正常"
+        ),
+        "_market_data_audit": _async_card("market_data", "ok", "行情正常"),
+        "_strategy_quality_audit": _async_card("strategy_quality", "ok", "策略质量正常"),
+        "_strategy_closed_loop_audit": _async_card("strategy_closed_loop", "ok", "策略闭环正常"),
+        "_model_expert_health_audit": _async_card("model_expert_health", "ok", "模型体检正常"),
+        "_model_expert_competition_audit": _async_card(
+            "model_expert_competition", "ok", "模型竞赛正常"
+        ),
+        "_model_dynamic_routing_audit": _async_card("model_dynamic_routing", "ok", "动态路由正常"),
+        "_crypto_feature_coverage_audit": _async_card(
+            "crypto_feature_coverage", "ok", "特征覆盖正常"
+        ),
+        "_shadow_missed_opportunity_audit": _async_card(
+            "shadow_missed_opportunity", "ok", "影子闭环正常"
+        ),
+        "_runtime_text_integrity_audit": _async_card(
+            "runtime_text_integrity", "ok", "运行文本正常"
+        ),
+    }
+    for name, factory in async_names.items():
+        monkeypatch.setattr(system_audit, name, factory)
+
+    monkeypatch.setattr(system_audit, "_model_training_audit", slow_model_training)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_audit", trade_contract)
+    monkeypatch.setattr(
+        system_audit,
+        "_strategy_gate_contract_audit",
+        lambda: system_audit._audit_card(
+            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
+        ),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_source_visible_text_audit",
+        lambda: system_audit._audit_card(
+            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
+        ),
+    )
+    monkeypatch.setattr(system_audit, "SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS", 0.02)
+
+    payload = await system_audit.collect_system_audit_status(record_history=False, source="test")
+    cards = {card["key"]: card for card in payload["cards"]}
+
+    assert cards["trade_execution_contract"]["status"] == "ok"
+    assert cards["model_training"]["status"] == "warning"
+    assert cards["model_training"]["details"]["error"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
 async def test_system_audit_status_wraps_failed_section(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1278,6 +1353,8 @@ async def test_strategy_closed_loop_audit_separates_active_runtime_window(
         f"sqlite+aiosqlite:///{db_path.as_posix()}",
     )
     monkeypatch.setattr(system_audit.settings, "_data_dir", tmp_path, raising=False)
+    now = datetime(2026, 6, 22, 3, 0, tzinfo=UTC)
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
 
     await init_db()
     try:

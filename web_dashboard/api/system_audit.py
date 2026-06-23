@@ -63,6 +63,7 @@ SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT = 200
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
 TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
+PRIORITY_AUDIT_KEYS = ("trade_execution_contract",)
 CARD_OWNER_PATHS = {
     "trade_loop": "services/trading_service.py",
     "okx_reconciliation": "scripts/repair_missing_closed_positions_from_orders.py",
@@ -2963,11 +2964,42 @@ async def collect_system_audit_status(
         ("runtime_text_integrity", _runtime_text_integrity_audit),
     ]
     results = await asyncio.gather(
-        *(_audit_maybe_async(factory) for _key, factory in audit_specs),
+        *(
+            _audit_maybe_async(factory)
+            for _key, factory in audit_specs
+            if _key in PRIORITY_AUDIT_KEYS
+        ),
         return_exceptions=True,
     )
+    remaining_results = await asyncio.gather(
+        *(
+            _audit_maybe_async(factory)
+            for _key, factory in audit_specs
+            if _key not in PRIORITY_AUDIT_KEYS
+        ),
+        return_exceptions=True,
+    )
+    result_by_key = {
+        key: result
+        for key, result in zip(
+            [key for key, _factory in audit_specs if key in PRIORITY_AUDIT_KEYS],
+            results,
+            strict=True,
+        )
+    }
+    result_by_key.update(
+        {
+            key: result
+            for key, result in zip(
+                [key for key, _factory in audit_specs if key not in PRIORITY_AUDIT_KEYS],
+                remaining_results,
+                strict=True,
+            )
+        }
+    )
     cards: list[dict[str, Any]] = []
-    for (section_key, _factory), result in zip(audit_specs, results, strict=True):
+    for section_key, _factory in audit_specs:
+        result = result_by_key[section_key]
         if isinstance(result, Exception):
             cards.append(
                 _audit_card(

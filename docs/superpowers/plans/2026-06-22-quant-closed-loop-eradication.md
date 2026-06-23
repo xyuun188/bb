@@ -1000,6 +1000,49 @@ AI 防偏要求：
 
 ---
 
+## 二十六、Batch H 补充记录：系统巡检交易契约卡片优先调度（2026-06-23）
+
+触发原因：Batch H 继续观察时发现，完整系统巡检偶发把 `trade_execution_contract` 包装成 warning，错误详情为 `TimeoutError`。直接调用 `TradeExecutionContractService().report()` 并不慢，24h 报告约 1.766s、runtime 报告约 0.334s，且契约违规计数均为 0。因此根因不是交易执行契约本身异常，而是完整系统巡检同时跑 16 个 section 时，慢诊断段可能与契约卡片争用异步调度/资源，使关键交易契约卡片在统一 section timeout 下被误判为超时。
+
+本次修复范围：
+- `web_dashboard/api/system_audit.py`：新增 `PRIORITY_AUDIT_KEYS=("trade_execution_contract",)`，让交易执行契约卡片先于其它慢诊断段完成，再并发执行剩余巡检 section。
+- `web_dashboard/api/system_audit.py`：把优先 section 与剩余 section 的结果按 `section_key` 合并回 `result_by_key`，后续仍走原有卡片构建、异常包装和状态排序逻辑，避免因优先调度改变巡检卡片语义。
+- `tests/test_system_audit_api.py`：新增 `test_system_audit_runs_trade_contract_before_slow_diagnostics`，模拟慢 `model_training` 持有锁、`trade_execution_contract` 等同一把锁的场景；修复前交易契约卡片会被统一 timeout 包成 warning，修复后交易契约为 ok，慢诊断段仍按原规则被包装为 warning。
+- `tests/test_system_audit_api.py`：固定 `test_strategy_closed_loop_audit_separates_active_runtime_window` 的当前时间，避免测试样本随真实日期漂移后离开 24h 窗口。
+
+安全边界：
+- 本批只改系统巡检调度可靠性，不改变开仓阈值、证据 tier、probe 条件、杠杆、仓位、平仓、模型权重、专家路由或风控 veto。
+- `trade_execution_contract` 被优先调度不代表忽略其它巡检问题；慢 section 仍会按原 timeout 规则返回 warning，并继续进入整体 warning/critical 聚合。
+- 线上 `strategy_closed_loop` 仍因历史亏损样本、样本不足和 ML 不可用保持 warning；本批不能被解释为策略盈利闭环已证明。
+- 若未来 `trade_execution_contract` 自身真实超时或返回违规计数，仍必须按停止规则处理，不得因为它是 priority key 就压低严重性。
+
+本地验证：
+- TDD 红灯：`pytest tests/test_system_audit_api.py::test_system_audit_runs_trade_contract_before_slow_diagnostics -q` 在修复前失败，表现为 `trade_execution_contract` status 为 warning 而不是 ok。
+- TDD 绿灯：同一测试在修复后通过。
+- `pytest tests/test_system_audit_api.py -q`：26 passed。
+- `ruff check web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：0 issues。
+- `black --check web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：通过。
+- `git diff --check`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+
+线上复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步 `web_dashboard/api/system_audit.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
+- 部署后完整系统巡检（`2026-06-23T03:10:54Z`，`record_history=False`）：整体 `warning`，`critical_cards=[]`，cards 16，其中 warning 9、ok 7。
+- `trade_loop` 为 ok，`trade_execution_contract` 为 ok，`runtime_text_integrity` 为 ok；此前的 `trade_execution_contract TimeoutError` 未再出现。
+- `trade_execution_contract` 全窗口 summary：decision_count `517`、executed_entry_count `9`、weak_evidence_executed_count `0`、negative_expected_executed_count `0`、fast_loss_count `5`、fast_loss_without_strong_exit_count `0`、reentry_without_strong_unlock_count `0`、contract_violation_count `0`。
+- 当前 runtime window 刚随服务重启从 `2026-06-23T03:10:16.958104Z` 起算，current_summary 当时为冷启动零样本；该零样本只能说明重启后尚无新增执行样本，不能证明策略盈利。
+- `strategy_closed_loop` 仍为 warning：历史已平仓 9 笔、0 wins、9 losses、fast_loss_under_15m_count 5，ML usable rate 0.0；结论仍是样本不足且不能证明 ML/策略有效。
+
+当前结论：
+- 本轮解决的是系统巡检观测可靠性问题：关键交易契约卡片不再被慢诊断段并发拖成误报 timeout。
+- 停止规则当前从巡检关键口径看未被新的 critical 或交易契约违规触发，但 Batch H 仍是观察阶段，不是盈利闭环完成。
+- 后续继续推进时，必须优先看 `trade_execution_contract.current_summary`、新增拒单、弱证据执行、快亏无强退出、loss re-entry 和 `strategy_closed_loop` 的真实收益样本，而不是只看系统巡检 overall 是否从 warning 变少。
+
+回滚点：
+- 代码层可回滚 `web_dashboard/api/system_audit.py` 与 `tests/test_system_audit_api.py`；本批无 DB 迁移、无历史覆盖、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。
