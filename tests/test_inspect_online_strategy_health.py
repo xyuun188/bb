@@ -4,6 +4,9 @@ from scripts import inspect_online_strategy_health
 def test_strategy_health_remote_template_is_valid_python() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE.replace(
         "__WINDOW_MINUTES__", "120"
+    ).replace(
+        "__SUMMARY_ONLY__",
+        "False",
     )
 
     compile(template, "<inspect_online_strategy_health_remote_template>", "exec")
@@ -19,6 +22,17 @@ def test_strategy_health_remote_command_uses_unique_temp_files() -> None:
     assert "codex_strategy_sample.py" not in command
     assert "codex_strategy_launcher.py" not in command
     assert "__WINDOW_MINUTES__" not in command
+
+
+def test_strategy_health_remote_command_can_emit_summary_only() -> None:
+    command = inspect_online_strategy_health._build_remote_command(
+        120, token="abc123", summary=True
+    )
+
+    assert "SUMMARY_ONLY = True" in command
+    assert "__SUMMARY_ONLY__" not in command
+    assert "output = summary_report(report) if SUMMARY_ONLY else report" in command
+    assert "json.loads(out)" not in command
 
 
 def test_strategy_health_report_splits_market_and_position_review_decisions() -> None:
@@ -130,6 +144,88 @@ def test_strategy_health_report_exposes_local_ml_readiness_summary() -> None:
     assert '"quality_by_kind"' in template
     assert '"quality_top_actions"' in template
     assert '"quality_top_timeframes"' in template
+
+
+def test_strategy_health_report_exposes_trade_execution_contract_summary() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "from services.trade_execution_contract import TradeExecutionContractService" in template
+    assert "async def trade_execution_contract_summary():" in template
+    assert "TradeExecutionContractService().report(" in template
+    assert "since=since" in template
+    assert "trade_contract = await trade_execution_contract_summary()" in template
+    assert '"trade_execution_contract": trade_contract' in template
+    assert '"can_bypass_risk_controls"' in template
+    assert '"contract_violation_count"' in template
+    assert '"weak_evidence_executed_count"' in template
+    assert '"negative_expected_executed_count"' in template
+    assert '"fast_loss_without_strong_exit_count"' in template
+    assert '"reentry_without_strong_unlock_count"' in template
+
+
+def test_strategy_health_contract_samples_are_json_safe() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "def json_safe(value):" in template
+    assert '"violations": json_safe(safe_list(report.get("violations"))[:10])' in template
+    assert (
+        '"fast_loss_samples": json_safe(safe_list(report.get("fast_loss_samples"))[:10])'
+        in template
+    )
+
+
+def test_strategy_health_summary_keeps_stop_signal_fields() -> None:
+    report = {
+        "window_minutes": 120,
+        "generated_at": "2026-06-23T08:11:45+00:00",
+        "counts": {
+            "decisions": 400,
+            "orders": 6,
+            "filled_orders": 5,
+            "failed_orders": 1,
+            "rejected_orders": 1,
+            "fast_loss_close_under_15m": 1,
+            "open_positions": 6,
+        },
+        "order_status_counts": {"filled": 5, "rejected": 1},
+        "local_ml_readiness": {
+            "status": "degraded",
+            "readiness_state": "degraded",
+            "allow_live_position_influence": False,
+            "blocking_reason_codes": ["dirty_sample_ratio_high"],
+            "metrics": {"dirty_sample_ratio": 0.75},
+        },
+        "trade_execution_contract": {
+            "status": "ok",
+            "audit_only": True,
+            "can_bypass_risk_controls": False,
+            "summary": {
+                "decision_count": 401,
+                "executed_entry_count": 4,
+                "contract_violation_count": 0,
+                "weak_evidence_executed_count": 0,
+                "negative_expected_executed_count": 0,
+                "fast_loss_count": 1,
+                "fast_loss_without_strong_exit_count": 0,
+                "reentry_without_strong_unlock_count": 0,
+            },
+            "violation_reason_counts": {},
+        },
+        "rejected_order_examples": [{"order_id": 1, "symbol": "BTC/USDT"}],
+        "fast_loss_positions": [{"id": 2, "symbol": "ETH/USDT"}],
+    }
+
+    summary = inspect_online_strategy_health._summarize_report(report)
+
+    assert summary["counts"]["rejected_orders"] == 1
+    assert summary["counts"]["fast_loss_close_under_15m"] == 1
+    assert (
+        summary["trade_execution_contract"]["summary"]["fast_loss_without_strong_exit_count"] == 0
+    )
+    assert summary["trade_execution_contract"]["can_bypass_risk_controls"] is False
+    assert summary["rejected_order_examples"] == [{"order_id": 1, "symbol": "BTC/USDT"}]
+    assert summary["fast_loss_positions"] == [{"id": 2, "symbol": "ETH/USDT"}]
+    assert summary["local_ml_readiness"]["allow_live_position_influence"] is False
 
 
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:

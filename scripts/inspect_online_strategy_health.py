@@ -31,6 +31,7 @@ from models.trade import Order, Position
 from models.learning import ShadowBacktest, ExpertMemory, StrategyLearningEvent
 from services.decision_state import decision_state_from_raw
 from services.ml_signal_service import MLSignalService
+from services.trade_execution_contract import TradeExecutionContractService
 from services.entry_evidence import (
     ENTRY_EVIDENCE_SCORE_MEDIUM,
     ENTRY_EVIDENCE_SCORE_NORMAL,
@@ -40,6 +41,7 @@ from services.entry_evidence import (
 )
 
 WINDOW_MINUTES = __WINDOW_MINUTES__
+SUMMARY_ONLY = __SUMMARY_ONLY__
 FAST_CLOSE_MINUTES = 15
 now = datetime.now(UTC)
 since = now - timedelta(minutes=WINDOW_MINUTES)
@@ -59,6 +61,18 @@ def safe_dict(value):
 
 def safe_list(value):
     return value if isinstance(value, list) else []
+
+
+def json_safe(value):
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return str(value)
 
 
 def safe_float(value, default=0.0):
@@ -318,6 +332,40 @@ def local_ml_readiness_summary():
     }
 
 
+async def trade_execution_contract_summary():
+    try:
+        report = await TradeExecutionContractService().report(since=since, limit=600)
+    except Exception as exc:
+        return {"status": "error", "error": short_text(str(exc), 300)}
+    summary = safe_dict(report.get("summary"))
+    violation_count = int(safe_float(summary.get("contract_violation_count"), 0))
+    return {
+        "status": "ok" if violation_count == 0 else "violation",
+        "audit_only": bool(report.get("audit_only")),
+        "can_bypass_risk_controls": bool(report.get("can_bypass_risk_controls")),
+        "summary": {
+            "decision_count": summary.get("decision_count"),
+            "executed_entry_count": summary.get("executed_entry_count"),
+            "contract_violation_count": summary.get("contract_violation_count"),
+            "weak_evidence_executed_count": summary.get("weak_evidence_executed_count"),
+            "negative_expected_executed_count": summary.get(
+                "negative_expected_executed_count"
+            ),
+            "fast_loss_count": summary.get("fast_loss_count"),
+            "fast_loss_without_strong_exit_count": summary.get(
+                "fast_loss_without_strong_exit_count"
+            ),
+            "reentry_without_strong_unlock_count": summary.get(
+                "reentry_without_strong_unlock_count"
+            ),
+        },
+        "violation_reason_counts": safe_dict(report.get("violation_reason_counts")),
+        "query_policy": safe_dict(report.get("query_policy")),
+        "violations": json_safe(safe_list(report.get("violations"))[:10]),
+        "fast_loss_samples": json_safe(safe_list(report.get("fast_loss_samples"))[:10]),
+    }
+
+
 def is_shadow_only_entry_decision(decision):
     return bool(evidence(decision).get("shadow_only"))
 
@@ -418,6 +466,58 @@ def stats(vals):
     }
 
 
+def pick(mapping, keys):
+    mapping = safe_dict(mapping)
+    return {key: mapping.get(key) for key in keys}
+
+
+def summary_report(report):
+    local_ml = safe_dict(report.get("local_ml_readiness"))
+    contract = safe_dict(report.get("trade_execution_contract"))
+    return {
+        "window_minutes": report.get("window_minutes"),
+        "generated_at": report.get("generated_at"),
+        "counts": pick(
+            report.get("counts"),
+            (
+                "decisions",
+                "orders",
+                "filled_orders",
+                "failed_orders",
+                "rejected_orders",
+                "pending_or_open_orders",
+                "positions_created",
+                "positions_closed",
+                "open_positions",
+                "fast_loss_close_under_15m",
+            ),
+        ),
+        "order_status_counts": safe_dict(report.get("order_status_counts")),
+        "trade_execution_contract": {
+            "status": contract.get("status"),
+            "audit_only": contract.get("audit_only"),
+            "can_bypass_risk_controls": contract.get("can_bypass_risk_controls"),
+            "summary": safe_dict(contract.get("summary")),
+            "violation_reason_counts": safe_dict(
+                contract.get("violation_reason_counts")
+            ),
+            "fast_loss_samples": safe_list(contract.get("fast_loss_samples")),
+            "violations": safe_list(contract.get("violations")),
+        },
+        "local_ml_readiness": {
+            "status": local_ml.get("status"),
+            "readiness_state": local_ml.get("readiness_state"),
+            "allow_live_position_influence": local_ml.get(
+                "allow_live_position_influence"
+            ),
+            "blocking_reason_codes": safe_list(local_ml.get("blocking_reason_codes")),
+            "metrics": safe_dict(local_ml.get("metrics")),
+        },
+        "rejected_order_examples": safe_list(report.get("rejected_order_examples")),
+        "fast_loss_positions": safe_list(report.get("fast_loss_positions")),
+    }
+
+
 async def main():
     async with get_session_ctx() as session:
         decisions = list((await session.execute(
@@ -488,6 +588,7 @@ async def main():
     for order in orders:
         if order.decision_id and order.decision_id not in order_by_decision:
             order_by_decision[order.decision_id] = order
+    trade_contract = await trade_execution_contract_summary()
 
     reason_counts = Counter()
     state_counts = Counter()
@@ -840,6 +941,7 @@ async def main():
             for key, values in sorted(market_entry_component_contributions.items())
         },
         "local_ml_readiness": local_ml_readiness_summary(),
+        "trade_execution_contract": trade_contract,
         "shadow_only_positive_net_count": len(shadow_only_examples),
         "notional_floor_blocked_counts": dict(notional_floor_blocked.most_common(12)),
         "shadow_completed_best_action_counts": dict(shadow_by_best.most_common(10)),
@@ -853,7 +955,8 @@ async def main():
         "fast_loss_positions": fast_loss[:40],
         "current_open_positions": current_open,
     }
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    output = summary_report(report) if SUMMARY_ONLY else report
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 asyncio.run(main())
 """
@@ -907,13 +1010,15 @@ sys.exit(result.returncode)
 """
 
 
-def _build_remote_command(minutes: int, *, token: str | None = None) -> str:
+def _build_remote_command(minutes: int, *, token: str | None = None, summary: bool = False) -> str:
     safe_minutes = max(int(minutes or 480), 1)
     safe_token = token or secrets.token_hex(6)
     tmp_dir = "/data/bb/app/tmp/codex-strategy-health"
     sample_path = f"{tmp_dir}/sample_{safe_minutes}_{safe_token}.py"
     launcher_path = f"{tmp_dir}/launcher_{safe_minutes}_{safe_token}.py"
-    remote_script = REMOTE_SCRIPT_TEMPLATE.replace("__WINDOW_MINUTES__", str(safe_minutes))
+    remote_script = REMOTE_SCRIPT_TEMPLATE.replace("__WINDOW_MINUTES__", str(safe_minutes)).replace(
+        "__SUMMARY_ONLY__", "True" if summary else "False"
+    )
     return f"""
 set -eo pipefail
 cd /data/bb/app
@@ -931,6 +1036,62 @@ rm -f {sample_path} {launcher_path}
 """
 
 
+def _pick(mapping: dict, keys: tuple[str, ...]) -> dict:
+    return {key: mapping.get(key) for key in keys}
+
+
+def _summarize_report(report: dict) -> dict:
+    counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+    local_ml = (
+        report.get("local_ml_readiness")
+        if isinstance(report.get("local_ml_readiness"), dict)
+        else {}
+    )
+    contract = (
+        report.get("trade_execution_contract")
+        if isinstance(report.get("trade_execution_contract"), dict)
+        else {}
+    )
+    return {
+        "window_minutes": report.get("window_minutes"),
+        "generated_at": report.get("generated_at"),
+        "counts": _pick(
+            counts,
+            (
+                "decisions",
+                "orders",
+                "filled_orders",
+                "failed_orders",
+                "rejected_orders",
+                "pending_or_open_orders",
+                "positions_created",
+                "positions_closed",
+                "open_positions",
+                "fast_loss_close_under_15m",
+            ),
+        ),
+        "order_status_counts": report.get("order_status_counts", {}),
+        "trade_execution_contract": {
+            "status": contract.get("status"),
+            "audit_only": contract.get("audit_only"),
+            "can_bypass_risk_controls": contract.get("can_bypass_risk_controls"),
+            "summary": contract.get("summary", {}),
+            "violation_reason_counts": contract.get("violation_reason_counts", {}),
+            "fast_loss_samples": contract.get("fast_loss_samples", []),
+            "violations": contract.get("violations", []),
+        },
+        "local_ml_readiness": {
+            "status": local_ml.get("status"),
+            "readiness_state": local_ml.get("readiness_state"),
+            "allow_live_position_influence": local_ml.get("allow_live_position_influence"),
+            "blocking_reason_codes": local_ml.get("blocking_reason_codes", []),
+            "metrics": local_ml.get("metrics", {}),
+        },
+        "rejected_order_examples": report.get("rejected_order_examples", []),
+        "fast_loss_positions": report.get("fast_loss_positions", []),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect online strategy health.")
     parser.add_argument(
@@ -939,9 +1100,14 @@ def main() -> None:
         default=480,
         help="Lookback window in minutes. Default: 480 (8 hours).",
     )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print only stop-signal and contract summary fields.",
+    )
     args = parser.parse_args()
     minutes = max(int(args.minutes or 480), 1)
-    command = _build_remote_command(minutes)
+    command = _build_remote_command(minutes, summary=args.summary)
 
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:

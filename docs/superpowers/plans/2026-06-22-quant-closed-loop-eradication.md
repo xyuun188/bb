@@ -1266,3 +1266,47 @@ AI 防偏要求：
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。
+
+---
+
+## 三十二、Batch H 补充记录：策略健康硬停口径防偏与精简摘要（2026-06-23）
+
+触发原因：继续执行 Batch H 观察时，策略健康脚本原先只直接输出 `fast_loss_close_under_15m`、拒单数量和样本列表，没有把同一窗口的 `trade_execution_contract` 硬停摘要并列展示。后续 AI 容易走两种歪路：看到快亏就过度停止必要止损，或看到契约巡检 ok 就忽略拒单/快亏观察风险。因此本轮只做只读诊断口径补强，不改任何交易行为。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：接入 `TradeExecutionContractService().report(since=since, limit=600)`，在同一份健康报告里输出 `trade_execution_contract`，包含 `contract_violation_count`、`weak_evidence_executed_count`、`negative_expected_executed_count`、`fast_loss_without_strong_exit_count`、`reentry_without_strong_unlock_count`、`can_bypass_risk_controls`、`violations` 和 `fast_loss_samples`。
+- `scripts/inspect_online_strategy_health.py`：新增 `json_safe()`，把契约服务返回的嵌套 `datetime` 转为 ISO 字符串，避免 120m 窗口有快亏样本时 `json.dumps()` 因 `datetime` 失败。
+- `scripts/inspect_online_strategy_health.py`：新增 `--summary` 模式，并把摘要裁剪下沉到远端模板内执行，只输出停止信号、交易契约、ML readiness、拒单样本和快亏样本，避免完整报告过长被 SSH 输出上限截断后本地 JSON 解析失败。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约和摘要契约测试，先确认缺字段、非 JSON 安全样本、缺少 summary-only 远端模式时测试失败，再实现后通过。
+
+安全边界：
+- 本批只改只读观察脚本和测试，不修改开仓阈值、证据 tier、仓位、杠杆、平仓、模型权重、专家路由、ML readiness、风控 veto 或真实交易执行逻辑。
+- `fast_loss_close_under_15m` 是观察风险；真正的硬停口径必须同时看 `fast_loss_without_strong_exit_count`。如果后者大于 0，必须停止推进并回到 Batch E/平仓证据链定位。
+- `rejected_orders` 或 `failed_orders` 仍是停止观察信号；即使 `trade_execution_contract.status=ok`，也不能把拒单窗口误读为全绿，更不能据此放大开仓。
+- `trade_execution_contract.status=ok` 只说明本窗口未发现弱证据执行、负预期执行、无强退出快亏、亏损后无强解锁复开或风控绕过；不等于策略盈利闭环完成。
+
+本地验证：
+- TDD 红灯：新增 `test_strategy_health_report_exposes_trade_execution_contract_summary` 后，旧模板缺少 `TradeExecutionContractService` 导入和 `trade_execution_contract` 输出，测试失败。
+- TDD 红灯：线上 120m 验证发现 `TypeError: Object of type datetime is not JSON serializable` 后，新增 `test_strategy_health_contract_samples_are_json_safe`，旧模板缺少 `json_safe()`，测试失败。
+- TDD 红灯：`--summary` 首版在本地解析完整远端 JSON，遇到 SSH 输出截断后失败；新增 `test_strategy_health_remote_command_can_emit_summary_only`，旧 `_build_remote_command()` 缺少 `summary` 参数，测试失败。
+- TDD 绿灯：上述测试在实现后通过。
+- `pytest tests/test_inspect_online_strategy_health.py -q`：15 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：no issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `git diff --check`：通过。
+
+线上只读复查：
+- `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
+- `python scripts/inspect_online_strategy_health.py --minutes 15 --summary`（`2026-06-23T08:44:31Z`）：50 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`local_ml_readiness.status=degraded` 且 `allow_live_position_influence=false`。
+- `python scripts/inspect_online_strategy_health.py --minutes 120 --summary`（`2026-06-23T08:44:31Z`）：408 decisions、2 orders、1 filled、1 rejected、positions_created 0、positions_closed 1、open_positions 6、`fast_loss_close_under_15m=1`。
+- 120m 拒单样本为 order `2561`、decision `118360`、`TSLA/USDT`、buy、`status=rejected`、`quantity=0`、`exchange_order_id=null`；OKX raw error 为 `sCode=51155`，原因是本地合规限制导致该 pair 不可交易。该样本没有成交，不得计入收益样本。
+- 120m 快亏样本为 position `1614`、`WLFI/USDT` short，持仓约 `13.844` 分钟，realized_pnl `-0.0642124`，notional `18.5896`；同窗口 `trade_execution_contract.summary.fast_loss_without_strong_exit_count=0`，因此它是快亏观察风险，不是“无强退出证据快亏”的硬停违规。
+- 120m `trade_execution_contract.status=ok`，`can_bypass_risk_controls=false`，summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_count=1`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`，`violations=[]`。
+
+当前结论：
+- 本轮解决的是策略健康观察口径防偏和输出可靠性问题，不是收益闭环完成。
+- 当前 15m 窗口干净；120m 窗口仍包含 1 条 TSLA/USDT 拒单和 1 条 WLFI/USDT 快亏观察样本。拒单/快亏观察风险仍要求继续监控，不能据此推进仓位放大、阈值放宽或 ML live influence。
+- 后续 AI 执行总控时必须优先看 `--summary` 输出中的 `rejected_orders`、`failed_orders`、`trade_execution_contract.summary`、`violations`、`fast_loss_samples`、`local_ml_readiness.allow_live_position_influence`，再决定是否继续下一步；不能只看完整报告里的某一个计数。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务重启、无模型 artifact 替换、无真实交易参数放宽。
