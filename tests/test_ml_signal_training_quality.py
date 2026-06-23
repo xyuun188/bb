@@ -16,6 +16,7 @@ from services import ml_signal_service as ml_signal_module
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
+    build_training_frame,
     load_shadow_training_rows,
     select_shadow_training_rows,
     shadow_training_quality_report,
@@ -146,6 +147,65 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["training_run_mode"] == "dry_run"
     assert not model_path.exists()
     assert not metadata_path.exists()
+
+
+def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
+    frame = _training_frame(120)
+    frame["decision_action"] = ["hold", "long", "short"] * 40
+    frame["best_action"] = ["short", "hold", "long"] * 40
+    frame["horizon_minutes"] = [10, 30, 60] * 40
+    frame["data_quality_status"] = ["included", "downweighted", "included"] * 40
+    frame["sample_weight"] = [1.0, 0.35, 0.8] * 40
+    frame["quality_reasons"] = [
+        [],
+        ["hold_observation_downweighted"],
+        ["wide_spread_feature"],
+    ] * 40
+
+    metadata = train_from_frame(
+        frame,
+        min_samples=10,
+        completed_sample_count=120,
+        persist_artifact=False,
+    )
+
+    diagnostics = metadata["score_bucket_diagnostics"]
+    for side in ("long", "short"):
+        assert set(diagnostics[side]) == {"top", "bottom"}
+        for bucket in ("top", "bottom"):
+            summary = diagnostics[side][bucket]
+            assert summary["count"] > 0
+            assert "avg_return_pct" in summary
+            assert "win_rate" in summary
+            assert "avg_sample_weight" in summary
+            assert summary["action_counts"]
+            assert summary["best_action_counts"]
+            assert summary["horizon_counts"]
+            assert summary["data_quality_status_counts"]
+            assert isinstance(summary["top_quality_reasons"], list)
+
+
+def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
+    row = SimpleNamespace(
+        id=7,
+        symbol="BTC/USDT",
+        analysis_type="market",
+        decision_action="short",
+        decision_confidence=0.72,
+        horizon_minutes=30,
+        feature_snapshot={"current_price": 100.0, "spread_pct": 0.01},
+        long_return_pct=-0.12,
+        short_return_pct=0.18,
+        best_action="short",
+        missed_opportunity=False,
+        due_at=datetime(2026, 6, 23, 1, 0, tzinfo=UTC),
+    )
+
+    frame = build_training_frame([row])
+
+    assert frame.loc[0, "decision_action"] == "short"
+    assert frame.loc[0, "best_action"] == "short"
+    assert bool(frame.loc[0, "missed_opportunity"]) is False
 
 
 @pytest.mark.asyncio

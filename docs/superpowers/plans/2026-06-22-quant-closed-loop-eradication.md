@@ -1209,6 +1209,60 @@ AI 防偏要求：
 
 ---
 
+## 三十一、Batch H 补充记录：ML score bucket 诊断补强（2026-06-23）
+
+触发原因：上一轮 dry-run 已证明新训练窗口仍未达到 ML 实盘影响条件，尤其 `short top return` 仍为负，PR-AUC 仍偏低。但只看总指标会让后续 AI 容易走偏：可能误以为继续平衡样本、硬调 readiness、降低阈值或直接替换 artifact 就能解决。为避免这种误判，本轮只在训练元数据中增加高/低分桶诊断，用真实 test bucket 解释哪些样本段拖累收益排序。
+
+本次修复范围：
+- `services/ml_signal_service.py`：`build_training_frame()` 保留只读诊断上下文字段 `decision_action`、`best_action`、`missed_opportunity`，不把它们加入 `FEATURE_KEYS`，不作为模型训练特征。
+- `services/ml_signal_service.py`：训练 metadata 新增 `score_bucket_diagnostics`，分别输出 long/short 的 top/bottom 分桶摘要，包括 count、avg_model_score、avg_return_pct、win_rate、avg_sample_weight、decision_action counts、best_action counts、horizon counts、data_quality_status counts 和 top_quality_reasons。
+- `tests/test_ml_signal_training_quality.py`：新增分桶诊断契约测试，以及 `build_training_frame()` 必须保留诊断上下文的红绿测试，防止后续 AI 只保留空结构或让线上诊断退化成 `unknown`。
+
+安全边界：
+- 本批只增加只读/offline 诊断；不改变 `FEATURE_KEYS`，不改变模型选择器、训练行选择、收益标签、样本权重、quarantine、readiness 阈值或 live trading 行为。
+- 本批不硬改 `ready`，不降低 PR-AUC 门槛，不放宽 dirty ratio，不放宽开仓阈值，不改变仓位/杠杆/平仓/风控 veto/专家路由/模型权重。
+- 分桶诊断只能用于解释为什么指标不达标，不能被当作启用 ML live influence、替换 artifact 或放大交易的理由。
+- 如果分桶诊断显示高分组仍被 hold/低置信/降权样本主导，后续应定位样本结构、候选生成、标签、特征和成本/滑点，而不是把观察样本强行解释为可交易信号。
+
+本地验证：
+- TDD 红灯：新增 `test_build_training_frame_preserves_diagnostic_sample_context` 后，旧 frame 缺少 `decision_action`，测试因 `KeyError: 'decision_action'` 失败。
+- TDD 绿灯：补充 frame 诊断上下文字段后，同一测试通过；`test_train_from_frame_reports_score_bucket_diagnostic_segments` 也通过。
+- `python -m pytest tests/test_ml_signal_training_quality.py -q`：10 passed。
+- `python -m pytest tests/test_trading_service_boundaries.py -q`：119 passed。
+- `ruff check services/ml_signal_service.py scripts/train_ml_signal_model.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：0 issues。
+- `black --check services/ml_signal_service.py scripts/train_ml_signal_model.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：通过。
+- `git diff --check`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：scanned 514 files OK。
+
+线上只读 dry-run 评估：
+- `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `services/ml_signal_service.py`，未重启交易服务；用于只读 dry-run 探针。
+- 远端探针以 `bb-dashboard.service` 环境启动，叠加 `/data/bb/app/.env` 与 `/etc/bb/bb-runtime.env`，降权为 OS 用户 `bb` 执行 `/data/bb/app/.venv/bin/python scripts/train_ml_signal_model.py --dry-run --skip-quarantine --limit 20000`。
+- dry-run 前后 artifact 完全一致：`data/ml_signal/winrate_model.joblib` size `10652409`、mtime_ns `1782192227930000000`；`data/ml_signal/winrate_model_metadata.json` size `6838`、mtime_ns `1782192227958000000`；`artifact_stats.unchanged=true`。
+- dry-run 输出仍明确为 `training_run_mode=dry_run`、`artifact_persisted=false`、`training_quarantine.reason=dry_run_no_quarantine_writes`；`loaded_row_count=20000`、`frame_sample_count=19971`、`completed_shadow_sample_count=138498`。
+- 样本质量仍显示 total 20,000、included 4,859、downweighted 15,112、excluded 29、effective_weight_ratio 0.6048；`decision_action` 为 hold 15,000、short 3,050、long 1,950。主要降权原因仍是 `shadow:very_low_decision_confidence=15000`、`shadow:hold_missed_opportunity_downweighted=10000`、`shadow:hold_observation_downweighted=5000`。
+- dry-run 总指标仍不达标：`long_pr_auc=0.3486757989761258`、`short_pr_auc=0.379175314541324`；`top_long_avg_return_pct=0.1379226009542219`、`bottom_long_avg_return_pct=-0.18529265356726526`；`top_short_avg_return_pct=-0.0562176316920748`、`bottom_short_avg_return_pct=-0.34500060718564035`。
+- 新增分桶诊断显示：long top 桶 998 条，`avg_return_pct=0.1379226009542219`、`win_rate=0.3517034068136273`、`avg_sample_weight=0.4359819639278556`，其中 `action_counts` 为 hold 888、short 81、long 29，`data_quality_status_counts.downweighted=888`，主要原因是 `very_low_decision_confidence=888`、`hold_observation_downweighted=559`、`hold_missed_opportunity_downweighted=329`。
+- short top 桶 998 条，`avg_return_pct=-0.0562176316920748`、`win_rate=0.36472945891783565`、`avg_sample_weight=0.43544088176352697`，其中 `action_counts` 为 hold 944、long 39、short 15，`data_quality_status_counts.downweighted=944`，主要原因是 `very_low_decision_confidence=944`、`hold_observation_downweighted=502`、`hold_missed_opportunity_downweighted=442`。这说明 short 高分组收益为负并不是展示误报，而是 test bucket 仍被低置信 hold/降权样本主导且收益排序没有达到可交易条件。
+
+线上同步与复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步总控文档并重启 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service`；三项服务均 active，Dashboard 返回 `302`。
+- 重启后 15m 健康摘要（`2026-06-23T07:00:53Z`）：36 decisions、10 market decisions、2 entry decisions、1 market_entry_decision、1 order、0 failed/rejected orders、1 fast_loss_close_under_15m、open_positions 6；该快亏样本为 `WLFI/USDT` short，持仓约 13.84 分钟，realized_pnl `-0.064212`，notional 约 `18.5896`。
+- 重启后 120m 健康摘要（`2026-06-23T07:01:08Z`）：346 decisions、116 market decisions、15 entry decisions、12 market_entry_decisions、5 orders，全部 filled，0 failed/rejected orders、1 fast_loss_close_under_15m、open_positions 6。
+- 重启后 `local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`；当前线上 artifact 的 readiness metrics 仍显示 `dirty_sample_ratio=0.7571`、`long_pr_auc=0.34560508478282215`、`short_pr_auc=0.3761940221638387`、`top_short_avg_return_pct=-0.037152709390829576`。
+- 重启后系统巡检（`record_history=False`，`2026-06-23T06:59:42Z`）：overall `warning`，但 `critical_cards=[]`，cards 16、warning 9、ok 7；`trade_execution_contract` 为 `ok`，24h summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。
+- 当前运行窗口契约摘要：`decision_count=36`、`executed_entry_count=0`、`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_count=1`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。因此当前存在快亏观察风险，但没有触发“快亏且无强退出证据”的硬停规则；后续如果快亏形成簇、出现无强退出快亏、失败/拒绝订单、弱证据执行或风控绕过，必须先停止推进并定位。
+- `runtime_text_integrity` 为 `ok`，扫描 809 条，suspected_records 0、suspected_fields 0；`model_training` 仍为 warning，主要来自可选增强数据源未配置与 runtime probe timeout，不是本批新增交易执行风险。
+
+当前结论：
+- 本轮解决的是“dry-run 为什么差”的可解释性问题，不是 ML ready 问题。
+- 线上真实数据表明，模型分桶已经能区分部分 long 收益排序，但 short top bucket 仍为负，且 long/short top 桶都被低置信 hold/降权样本大量主导；因此当前仍不能启用 ML live influence，不能替换 artifact，不能把样本平衡当作放宽交易的证据。
+- 后续更优先的根治方向是：定位为什么可交易候选样本不足、为什么高分 short bucket 被 hold/低置信样本主导、收益标签是否与成本/滑点/方向一致、现有特征是否能区分 short 盈利场景，以及是否需要在离线评估中加入更清晰的 side-aware 候选质量诊断。
+
+回滚点：
+- 代码层可回滚 `services/ml_signal_service.py` 与 `tests/test_ml_signal_training_quality.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启服务以刷新 Python 进程导入。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

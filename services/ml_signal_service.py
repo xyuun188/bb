@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -531,6 +532,9 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             {
                 "id": int(getattr(row, "id", 0) or 0),
                 "symbol": str(getattr(row, "symbol", "") or ""),
+                "decision_action": str(getattr(row, "decision_action", "") or ""),
+                "best_action": str(getattr(row, "best_action", "") or ""),
+                "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
                 "raw_long_return_pct": _safe_float(raw_long_return),
                 "raw_short_return_pct": _safe_float(raw_short_return),
                 "long_return_pct": long_return,
@@ -683,6 +687,11 @@ def train_from_frame(
             "top_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=True),
             "bottom_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=False),
         },
+        "score_bucket_diagnostics": _score_bucket_diagnostics(
+            test,
+            long_expected_scores=long_expected_scores,
+            short_expected_scores=short_expected_scores,
+        ),
         "feature_keys": FEATURE_KEYS,
         "mode": "entry_profit_filter",
         "training_run_mode": "persist" if persist_artifact else "dry_run",
@@ -1260,3 +1269,90 @@ async def count_shadow_training_rows() -> int:
             )
         )
         return int(result.scalar() or 0)
+
+
+def _top_counts(values: list[Any], *, limit: int = 8) -> dict[str, int]:
+    normalized = []
+    for value in values:
+        text = str(value or "unknown").strip().lower() or "unknown"
+        normalized.append(text)
+    return dict(Counter(normalized).most_common(limit))
+
+
+def _flatten_quality_reasons(values: list[Any]) -> list[str]:
+    reasons: list[str] = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            reasons.extend(str(item) for item in value if str(item or "").strip())
+        elif str(value or "").strip():
+            reasons.append(str(value))
+    return reasons
+
+
+def _bucket_indices(scores: np.ndarray, *, top: bool) -> np.ndarray:
+    if len(scores) == 0:
+        return np.array([], dtype=int)
+    count = max(int(len(scores) * 0.20), 1)
+    order = np.argsort(scores)
+    return order[-count:] if top else order[:count]
+
+
+def _bucket_segment_summary(
+    test: pd.DataFrame,
+    scores: np.ndarray,
+    *,
+    side: str,
+    top: bool,
+) -> dict[str, Any]:
+    idx = _bucket_indices(scores, top=top)
+    bucket = test.iloc[idx].copy() if len(idx) else test.iloc[:0].copy()
+    score_values = pd.Series(scores).iloc[idx] if len(idx) else pd.Series([], dtype=float)
+    return_col = f"{side}_return_pct"
+    win_col = f"{side}_win"
+    reasons = _flatten_quality_reasons(
+        bucket.get("quality_reasons", pd.Series([], dtype=object)).tolist()
+    )
+    return {
+        "count": int(len(bucket)),
+        "avg_model_score": None if bucket.empty else float(score_values.mean()),
+        "avg_return_pct": None if bucket.empty else float(bucket[return_col].mean()),
+        "win_rate": None if bucket.empty else float(bucket[win_col].mean()),
+        "avg_sample_weight": (
+            None
+            if bucket.empty
+            else float(bucket.get("sample_weight", pd.Series([1.0] * len(bucket))).mean())
+        ),
+        "action_counts": _top_counts(
+            bucket.get("decision_action", pd.Series(["unknown"] * len(bucket))).tolist()
+        ),
+        "best_action_counts": _top_counts(
+            bucket.get("best_action", pd.Series(["unknown"] * len(bucket))).tolist()
+        ),
+        "horizon_counts": _top_counts(
+            bucket.get("horizon_minutes", pd.Series(["unknown"] * len(bucket))).tolist()
+        ),
+        "data_quality_status_counts": _top_counts(
+            bucket.get("data_quality_status", pd.Series(["unknown"] * len(bucket))).tolist()
+        ),
+        "top_quality_reasons": [
+            {"reason": reason, "count": count} for reason, count in Counter(reasons).most_common(8)
+        ],
+    }
+
+
+def _score_bucket_diagnostics(
+    test: pd.DataFrame,
+    *,
+    long_expected_scores: np.ndarray,
+    short_expected_scores: np.ndarray,
+) -> dict[str, Any]:
+    return {
+        "long": {
+            "top": _bucket_segment_summary(test, long_expected_scores, side="long", top=True),
+            "bottom": _bucket_segment_summary(test, long_expected_scores, side="long", top=False),
+        },
+        "short": {
+            "top": _bucket_segment_summary(test, short_expected_scores, side="short", top=True),
+            "bottom": _bucket_segment_summary(test, short_expected_scores, side="short", top=False),
+        },
+    }
