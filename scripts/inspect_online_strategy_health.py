@@ -312,6 +312,9 @@ def local_ml_readiness_summary():
         },
         "quality_totals": safe_dict(quality.get("totals")),
         "quality_top_reasons": safe_list(quality.get("top_reasons"))[:8],
+        "quality_by_kind": safe_dict(quality.get("by_kind")),
+        "quality_top_actions": safe_list(quality.get("top_actions"))[:8],
+        "quality_top_timeframes": safe_list(quality.get("top_timeframes"))[:8],
     }
 
 

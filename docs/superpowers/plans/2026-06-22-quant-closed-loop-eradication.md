@@ -1081,6 +1081,44 @@ AI 防偏要求：
 
 ---
 
+## 二十八、Batch H 补充记录：ML degraded 样本组成诊断补强（2026-06-23）
+
+触发原因：Batch H 持续观察显示 `local_ml_readiness` 仍为 `degraded`，阻塞项包括 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold` 和 `dirty_sample_ratio_high`。只看这些阻塞码容易让后续 AI 误以为可以通过硬改 readiness 或放宽 dirty ratio 让 ML 介入。只读核查线上模型元数据后确认：20,000 条训练窗口中 hold 样本 17,970 条，long 678 条，short 1,352 条；低置信度/hold 观察降权占大头，同时 PR-AUC 也确实低，short 高分组收益为负。因此当前不应启用 ML 实盘影响，而应先让观察报告解释模型为什么不能用。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：`local_ml_readiness_summary()` 新增 `quality_by_kind`、`quality_top_actions`、`quality_top_timeframes`，让 15m/120m 健康摘要直接暴露训练样本由哪些 action/timeframe 主导。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约断言，先确认健康脚本缺少这些字段时红测失败，再锁定观察脚本必须输出 ML 样本组成。
+
+安全边界：
+- 本批只补只读诊断字段，不改变 ML 训练阈值、readiness 状态机、模型权重、专家路由、开仓阈值、仓位、杠杆、平仓或风控 veto。
+- `dirty_sample_ratio_high` 不能被简单理解为阈值太严；当前 PR-AUC 未达标且 short top return 为负，必须继续保持 `allow_live_position_influence=false`。
+- hold 样本主导说明训练数据结构仍不利于实盘收益判断；后续如果要修训练链路，必须先做 TDD 与离线验证，不能直接让 ML 参与真实仓位。
+
+本地验证：
+- TDD 红灯：`pytest tests/test_inspect_online_strategy_health.py::test_strategy_health_report_exposes_local_ml_readiness_summary -q` 在修复前失败，缺少 `quality_by_kind`。
+- TDD 绿灯：同一测试修复后通过。
+- `pytest tests/test_inspect_online_strategy_health.py -q`：11 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `git diff --check`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+
+线上复查：
+- `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
+- 同步后 15m 观察窗口（`2026-06-23T03:48:18Z`）：44 decisions、0 entry_decisions、0 orders、0 rejected_orders、0 fast_loss_close_under_15m、open_positions 2。
+- `local_ml_readiness` 仍为 `degraded`，`allow_live_position_influence=false`；metrics 为 sample_count 19,982、test_count 4,996、dirty_sample_ratio 0.8988、long_pr_auc 0.3972、short_pr_auc 0.3765、top_short_avg_return_pct -0.0312。
+- 新增诊断字段显示 `quality_top_actions` 为 `shadow:hold=17970`、`shadow:short=1352`、`shadow:long=678`；`quality_top_reasons` 为 `shadow:very_low_decision_confidence=17970`、`shadow:hold_observation_downweighted=10603`、`shadow:hold_missed_opportunity_downweighted=7367`。
+
+当前结论：
+- 当前 ML degraded 是真实模型/训练样本结构问题，不是 dashboard 或 readiness 口径误报。
+- 这轮补强让后续 AI 能看到 ML 为什么不能用：hold/低置信度样本主导且收益排序指标未达标。
+- 后续若要根治 ML，需要回到训练样本构成、候选样本平衡、收益标签和离线评估，而不是硬改 ready、降低 PR-AUC 门槛或让 degraded ML 放大仓位。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务重启、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

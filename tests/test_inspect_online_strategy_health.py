@@ -127,6 +127,9 @@ def test_strategy_health_report_exposes_local_ml_readiness_summary() -> None:
     assert '"allow_live_position_influence"' in template
     assert '"blocking_reason_codes"' in template
     assert '"quality_top_reasons"' in template
+    assert '"quality_by_kind"' in template
+    assert '"quality_top_actions"' in template
+    assert '"quality_top_timeframes"' in template
 
 
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:
