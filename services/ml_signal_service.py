@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,7 @@ from sqlalchemy import func, select
 
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 from core.safe_output import safe_error_text
-from db.repositories.memory_repo import MemoryRepository
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx
 from models.learning import ShadowBacktest
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
@@ -53,6 +53,11 @@ AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = (
 )
 AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_learning_only_min_new_samples
 TRAINING_SHADOW_SAMPLE_LIMIT = _LOCAL_ML_PARAMS.training_shadow_sample_limit
+TRAINING_BALANCED_RECENT_CANDIDATE_SHARE = 0.60
+TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE = 0.35
+TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE = 0.60
+TRAINING_MIN_NON_HOLD_SHARE = 0.25
+TRAINING_MIN_BEST_TRADE_SHARE = 0.50
 
 FEATURE_KEYS = [
     "change_24h_pct",
@@ -379,6 +384,112 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
             "只按小权重参与 expected_net 和证据解释，不作为硬否决；硬指标不达标时继续学习观察。"
         ),
     }
+
+
+@dataclass(frozen=True)
+class ShadowTrainingRow:
+    id: int
+    created_at: datetime | None
+    symbol: str
+    analysis_type: str
+    decision_action: str
+    decision_confidence: float
+    feature_snapshot: Any
+    due_at: datetime | None
+    horizon_minutes: int
+    long_return_pct: float | None
+    short_return_pct: float | None
+    best_action: str | None
+    missed_opportunity: bool
+
+
+def _shadow_training_columns() -> tuple[Any, ...]:
+    return (
+        ShadowBacktest.id,
+        ShadowBacktest.created_at,
+        ShadowBacktest.symbol,
+        ShadowBacktest.analysis_type,
+        ShadowBacktest.decision_action,
+        ShadowBacktest.decision_confidence,
+        ShadowBacktest.feature_snapshot,
+        ShadowBacktest.due_at,
+        ShadowBacktest.horizon_minutes,
+        ShadowBacktest.long_return_pct,
+        ShadowBacktest.short_return_pct,
+        ShadowBacktest.best_action,
+        ShadowBacktest.missed_opportunity,
+    )
+
+
+def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
+    return ShadowTrainingRow(
+        id=int(mapping.get("id") or 0),
+        created_at=mapping.get("created_at"),
+        symbol=str(mapping.get("symbol") or ""),
+        analysis_type=str(mapping.get("analysis_type") or ""),
+        decision_action=str(mapping.get("decision_action") or ""),
+        decision_confidence=_safe_float(mapping.get("decision_confidence"), 0.0),
+        feature_snapshot=mapping.get("feature_snapshot"),
+        due_at=mapping.get("due_at"),
+        horizon_minutes=int(mapping.get("horizon_minutes") or 10),
+        long_return_pct=mapping.get("long_return_pct"),
+        short_return_pct=mapping.get("short_return_pct"),
+        best_action=mapping.get("best_action"),
+        missed_opportunity=bool(mapping.get("missed_opportunity")),
+    )
+
+
+def _shadow_row_id(row: Any) -> Any:
+    return getattr(row, "id", id(row))
+
+
+def _shadow_sort_key(row: Any) -> tuple[datetime, int]:
+    created_at = getattr(row, "created_at", None)
+    if not isinstance(created_at, datetime):
+        created_at = datetime.fromtimestamp(0, UTC)
+    elif created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return created_at.astimezone(UTC), int(getattr(row, "id", 0) or 0)
+
+
+def _shadow_action(row: Any, field: str) -> str:
+    return str(getattr(row, field, "") or "").lower().strip()
+
+
+def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
+    """Select a recent but not hold-dominated shadow training window."""
+
+    capped_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
+    deduped: dict[Any, Any] = {}
+    for row in rows:
+        deduped.setdefault(_shadow_row_id(row), row)
+    recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
+    if len(recent) <= capped_limit:
+        return recent
+
+    selected: list[Any] = []
+    selected_ids: set[Any] = set()
+
+    def add_from(candidates: list[Any], target_count: int) -> None:
+        for candidate in candidates:
+            if len(selected) >= capped_limit or len(selected) >= target_count:
+                return
+            candidate_id = _shadow_row_id(candidate)
+            if candidate_id in selected_ids:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate_id)
+
+    non_hold_target = int(capped_limit * TRAINING_MIN_NON_HOLD_SHARE)
+    best_trade_target = int(capped_limit * TRAINING_MIN_BEST_TRADE_SHARE)
+    non_hold = [
+        row for row in recent if _shadow_action(row, "decision_action") in {"long", "short"}
+    ]
+    best_trade = [row for row in recent if _shadow_action(row, "best_action") in {"long", "short"}]
+    add_from(non_hold, min(non_hold_target, len(non_hold)))
+    add_from(best_trade, min(best_trade_target, len(best_trade)) + len(selected))
+    add_from(recent, capped_limit)
+    return sorted(selected[:capped_limit], key=_shadow_sort_key, reverse=True)
 
 
 def build_training_frame(rows: list[Any]) -> pd.DataFrame:
@@ -1080,14 +1191,60 @@ class MLSignalService:
 
 
 async def load_shadow_training_rows(limit: int = TRAINING_SHADOW_SAMPLE_LIMIT) -> list[Any]:
-    async with get_session_ctx() as session:
-        repo = MemoryRepository(session)
-        rows = await repo.list_shadow_backtests(status="completed", limit=limit, offset=0)
-        return rows
+    async with get_read_session_ctx() as session:
+        safe_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
+        recent_limit = max(int(safe_limit * TRAINING_BALANCED_RECENT_CANDIDATE_SHARE), 1)
+        non_hold_limit = max(
+            int(safe_limit * TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE),
+            int(safe_limit * TRAINING_MIN_NON_HOLD_SHARE),
+        )
+        best_trade_limit = max(
+            int(safe_limit * TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE),
+            int(safe_limit * TRAINING_MIN_BEST_TRADE_SHARE),
+        )
+        base_filters = (
+            ShadowBacktest.status == "completed",
+            ShadowBacktest.long_return_pct.is_not(None),
+            ShadowBacktest.short_return_pct.is_not(None),
+        )
+        order_by = (ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+        columns = _shadow_training_columns()
+
+        async def load_rows(stmt: Any) -> list[ShadowTrainingRow]:
+            return [
+                _shadow_training_row_from_mapping(row)
+                for row in (await session.execute(stmt)).mappings().all()
+            ]
+
+        recent_rows = await load_rows(
+            select(*columns).where(*base_filters).order_by(*order_by).limit(recent_limit)
+        )
+        non_hold_rows = await load_rows(
+            select(*columns)
+            .where(
+                *base_filters,
+                ShadowBacktest.decision_action.in_(["long", "short"]),
+            )
+            .order_by(*order_by)
+            .limit(non_hold_limit)
+        )
+        best_trade_rows = await load_rows(
+            select(*columns)
+            .where(
+                *base_filters,
+                ShadowBacktest.best_action.in_(["long", "short"]),
+            )
+            .order_by(*order_by)
+            .limit(best_trade_limit)
+        )
+        return select_shadow_training_rows(
+            [*recent_rows, *non_hold_rows, *best_trade_rows],
+            limit=safe_limit,
+        )
 
 
 async def count_shadow_training_rows() -> int:
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
                 ShadowBacktest.status == "completed",

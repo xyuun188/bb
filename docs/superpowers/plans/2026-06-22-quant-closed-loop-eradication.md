@@ -1119,6 +1119,48 @@ AI 防偏要求：
 
 ---
 
+## 二十九、Batch H 补充记录：ML 训练样本选择与加载性能修正（2026-06-23）
+
+触发原因：Batch H 继续观察后确认，`local_ml_readiness` degraded 不是页面误报，而是训练窗口真实被 hold/低置信观察样本主导。只读分布显示最新 20,000 条 completed shadow 样本中 `decision_action` 为 hold 17,981、short 1,353、long 666；但历史 completed 样本里 `best_action` 为 long/short 的交易结果并不少。若继续只取最近 20,000 条完整 ORM 样本，训练会长期偏向“观察 hold”，同时线上装载 20,000 个完整 `ShadowBacktest` ORM 对象耗时约 150.907 秒，存在自动训练卡住风险。
+
+本次修复范围：
+- `services/ml_signal_service.py`：新增 `select_shadow_training_rows()`，在保持最近样本基础上，优先保留 `decision_action in {long, short}` 与 `best_action in {long, short}` 的训练样本；当前 20,000 窗口目标至少保留 25% 原始非 hold 决策样本，并保留 best-action 交易样本。
+- `services/ml_signal_service.py`：`load_shadow_training_rows()` 改为只读会话，并只查询训练需要的列，返回轻量 `ShadowTrainingRow`，避免装载完整 ORM 实体、无关 raw 字段和大对象。
+- `tests/test_ml_signal_training_quality.py`：新增选择器契约与临时 SQLite DB 入口测试，锁定训练入口必须同时包含 recent、decision trade 与 best-action trade 样本，并且返回轻量训练 row 而不是 `ShadowBacktest` ORM 实体。
+
+安全边界：
+- 本批不改变 ML readiness 阈值、不硬改 `ready`、不改变模型权重、不改变专家路由、不改变开仓/仓位/杠杆/平仓/风控 veto。
+- 本批没有重训模型、没有替换现有模型文件、没有让 degraded ML 参与真实仓位放大；未来训练后仍必须由 PR-AUC、收益分层、dirty ratio、样本数和模型年龄共同决定 readiness。
+- 本批不删除、不覆盖、不修历史 shadow 样本，只改变未来训练读取窗口和读取方式。
+- 如果后续重训后指标仍不达标，ML 必须继续保持 `degraded/learning_only`，不得把样本平衡本身解释为模型已可用于实盘。
+
+本地验证：
+- 红灯契约：新增 DB 入口与轻量 row 断言后，旧 loader 路径无法通过，暴露训练入口仍停在旧会话/ORM 装载思路；修复后同一测试通过。
+- `pytest tests/test_ml_signal_training_quality.py -q`：6 passed。
+- `pytest tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_quarantines_before_training tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_uses_completed_cursor_for_new_samples -q`：2 passed。
+- `ruff check services/ml_signal_service.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：0 issues。
+- `black --check services/ml_signal_service.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：通过。
+
+线上只读验证：
+- 同步前性能探针显示：`COUNT` completed+returns 138,182 条约 0.275s；最新 20,000 条 `decision_action` 聚合约 0.312s；轻量 recent 20,000 列装载约 0.282s；只查询训练必需列 recent 20,000 约 2.679s；完整 ORM 装载 recent 20,000 约 150.907s。根因是完整 ORM/大对象装载，而不是数据库计数或聚合慢。
+- `python scripts/sync_to_online_server.py --split-services --skip-restart` 已先同步 `services/ml_signal_service.py`，未重启交易服务，用于正式 loader dry-run。
+- 线上正式 `load_shadow_training_rows(limit=20000)` 只读 dry-run 耗时约 5.117s，返回 row type 为 `ShadowTrainingRow`；样本组成变为 `decision_action`: hold 15,000、long 1,950、short 3,050，非 hold 决策样本 5,000；`best_action`: hold 7,986、long 5,875、short 6,139，best-action 交易样本 12,014。
+- dry-run 未重训、未写 DB、未改模型 artifact、未改变线上交易参数。
+- 正式同步重启：`python scripts/sync_to_online_server.py --split-services` 后 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302`；由于代码文件已在 dry-run 前同步，本次正式同步只上传总控文档并重启服务，让新 loader 进入长期服务进程。
+- 重启后 15m 健康窗口：32 decisions，全部 hold；entry/orders/rejected/fast_loss 均为 0，open_positions 3；`local_ml_readiness` 仍为 degraded，`allow_live_position_influence=false`。
+- 重启后 120m 健康窗口：316 decisions，9 entry decisions，1 filled order，0 failed/rejected，0 fast_loss_close_under_15m，open_positions 3；该 1 笔成交发生在本批正式同步前，不能作为本批新执行样本。
+- 重启后系统巡检（`record_history=False`）：overall `warning`，`critical_cards=[]`，cards 16；`trade_execution_contract` 为 ok，current_summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`runtime_text_integrity` 为 ok。`model_training` 仍为 warning，但详情是学习观察、可选外部事件源未配置和运行探针超时，不是本批引入的交易执行风险。
+
+当前结论：
+- 这轮解决的是 ML 训练入口的样本窗口偏斜和加载性能问题：未来训练不会再被最近 hold 样本完全淹没，也不会因完整 ORM 装载 20,000 条而接近或超过超时。
+- 这不等于 ML 已经 ready。当前模型是否能参与真实仓位，仍必须看下一次训练后的 readiness 报告和线上观察指标。
+- 后续继续推进时，优先观察下一次训练的 `quality_top_actions`、PR-AUC、top/bottom return、dirty ratio、`allow_live_position_influence`，不得把样本平衡当成放宽开仓或放大仓位的理由。
+
+回滚点：
+- 代码层可回滚 `services/ml_signal_service.py` 与 `tests/test_ml_signal_training_quality.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

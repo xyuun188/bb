@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from services.ml_signal_service import MLSignalService, shadow_training_quality_report
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.learning import ShadowBacktest
+from services.ml_signal_service import (
+    MLSignalService,
+    load_shadow_training_rows,
+    select_shadow_training_rows,
+    shadow_training_quality_report,
+)
 from services.training_data_quality import DATA_QUALITY_VERSION
 
 
@@ -14,6 +24,45 @@ def _service_with_metadata(metadata: dict) -> MLSignalService:
     service._bundle = {"metadata": metadata}
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
     return service
+
+
+async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    await close_db()
+    db_path = tmp_path / "ml-signal-training.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
+
+
+def _db_shadow_row(
+    row_id: int,
+    created_at: datetime,
+    *,
+    action: str = "hold",
+    best_action: str = "hold",
+    status: str = "completed",
+    long_return_pct: float | None = 0.1,
+    short_return_pct: float | None = -0.1,
+) -> ShadowBacktest:
+    return ShadowBacktest(
+        id=row_id,
+        model_name="ensemble",
+        execution_mode="paper",
+        symbol=f"TEST{row_id}/USDT",
+        analysis_type="market",
+        decision_action=action,
+        decision_confidence=0.7,
+        entry_price=100.0,
+        feature_snapshot={"current_price": 100.0},
+        status=status,
+        due_at=created_at + timedelta(minutes=30),
+        horizon_minutes=30,
+        actual_price=101.0,
+        long_return_pct=long_return_pct,
+        short_return_pct=short_return_pct,
+        best_action=best_action,
+        missed_opportunity=best_action in {"long", "short"},
+        created_at=created_at,
+    )
 
 
 class _Classifier:
@@ -32,6 +81,95 @@ class _Regressor:
 
     def predict(self, values: object) -> np.ndarray:
         return np.array([self.prediction])
+
+
+def _shadow_row(
+    row_id: int,
+    *,
+    action: str = "hold",
+    best_action: str = "hold",
+    missed: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row_id,
+        created_at=datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC),
+        decision_action=action,
+        best_action=best_action,
+        missed_opportunity=missed,
+    )
+
+
+def test_shadow_training_selection_preserves_trade_and_best_action_samples() -> None:
+    recent_hold_rows = [_shadow_row(10_000 - idx) for idx in range(20)]
+    trade_rows = [
+        _shadow_row(1_000 - idx, action="long" if idx % 2 == 0 else "short") for idx in range(8)
+    ]
+    missed_rows = [
+        _shadow_row(500 - idx, best_action="long" if idx % 2 == 0 else "short", missed=True)
+        for idx in range(10)
+    ]
+
+    selected = select_shadow_training_rows(
+        [*recent_hold_rows, *trade_rows, *missed_rows],
+        limit=20,
+    )
+
+    selected_ids = [row.id for row in selected]
+    non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
+    best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
+    assert len(selected) == 20
+    assert len(set(selected_ids)) == len(selected_ids)
+    assert non_hold_count >= 5
+    assert best_trade_count >= 10
+    assert any(row.id in {item.id for item in recent_hold_rows} for row in selected)
+
+
+@pytest.mark.asyncio
+async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 23, 3, 0, tzinfo=UTC)
+    recent_holds = [
+        _db_shadow_row(10_000 + idx, base_time - timedelta(minutes=idx)) for idx in range(40)
+    ]
+    decision_trade_rows = [
+        _db_shadow_row(
+            1_000 + idx,
+            base_time - timedelta(hours=2, minutes=idx),
+            action="long" if idx % 2 == 0 else "short",
+        )
+        for idx in range(8)
+    ]
+    best_trade_rows = [
+        _db_shadow_row(
+            500 + idx,
+            base_time - timedelta(hours=3, minutes=idx),
+            best_action="long" if idx % 2 == 0 else "short",
+        )
+        for idx in range(14)
+    ]
+    excluded_rows = [
+        _db_shadow_row(90, base_time, action="long", status="pending"),
+        _db_shadow_row(91, base_time, best_action="short", short_return_pct=None),
+    ]
+    async with get_session_ctx() as session:
+        session.add_all([*recent_holds, *decision_trade_rows, *best_trade_rows, *excluded_rows])
+
+    try:
+        selected = await load_shadow_training_rows(limit=20)
+    finally:
+        await close_db()
+
+    selected_ids = {row.id for row in selected}
+    assert len(selected) == 20
+    assert all(not isinstance(row, ShadowBacktest) for row in selected)
+    assert 90 not in selected_ids
+    assert 91 not in selected_ids
+    assert sum(row.decision_action in {"long", "short"} for row in selected) >= 5
+    assert sum(row.best_action in {"long", "short"} for row in selected) >= 10
+    assert any(row.id >= 10_000 for row in selected)
 
 
 def test_ml_signal_quality_report_excludes_shadow_future_leakage() -> None:
