@@ -1043,6 +1043,44 @@ AI 防偏要求：
 
 ---
 
+## 二十七、Batch H 补充记录：线上观察脚本执行结果分类修正（2026-06-23）
+
+触发原因：继续观察 15m/120m 线上窗口时，`scripts/inspect_online_strategy_health.py` 的 `market_entry_final_skip_kind_counts` 出现 `unknown=2`。只读定位确认这两条不是未知原因：一条是 ZETA 已成交并完成本地同步，另一条是此前已核查的 SAHARA 交易所未确认/拒单。旧脚本只读取 skip_kind，缺少对非跳过执行结果的最终分类，容易让后续 AI 把“成交/拒单路径”误读为“原因不透明”。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：`entry_skip_kind(decision)` 保留原有 `entry_evidence_shadow_only.skip_kind` 与 state machine stage `skip_kind` 优先级；若无 skip_kind 且 `was_executed=true` 或 `decision_state_machine.summary` 为 `local_sync/completed`，返回 `executed`；若最终为 `local_sync/skipped` 或 `local_sync/failed`，返回 `exchange_not_confirmed`。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，先确认已执行样本仍会被旧口径归成 `unknown`，再锁定观察脚本必须输出 `executed` 与 `exchange_not_confirmed` 分类。
+
+安全边界：
+- 本批只修正只读观察脚本的分类字段，不改变开仓、仓位、平仓、杠杆、模型权重、专家路由、证据 tier 或风控 veto。
+- `executed` 分类只是说明该候选已经进入执行并成交，不代表交易策略有效；仍必须结合 PnL、快亏强退出、弱证据执行和后续平仓样本判断。
+- `exchange_not_confirmed` 分类只是说明本地未确认成交或交易所拒绝，不得计入已开仓收益样本，也不得被拿来证明策略盈利或亏损。
+
+本地验证：
+- TDD 红灯：`pytest tests/test_inspect_online_strategy_health.py::test_strategy_health_classifies_market_entry_execution_outcomes -q` 在修复前失败，表现为已执行样本返回 `unknown` 而不是 `executed`。
+- TDD 绿灯：同一测试修复后通过。
+- `pytest tests/test_inspect_online_strategy_health.py -q`：11 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `git diff --check`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+
+线上复查：
+- `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
+- 同步后 120m 观察窗口（`2026-06-23T03:41:22Z`）：346 decisions、12 entry_decisions、11 market_entry_decisions、orders 2、filled_orders 2、rejected_orders 0、positions_created 1、positions_closed 1、fast_loss_close_under_15m 1、open_positions 2。SAHARA 拒单已滚出 120m，ZETA 快亏仍在窗口内。
+- 同步后 `market_entry_final_skip_kind_counts` 为 `entry_evidence_shadow_only=5`、`entry_evidence_wait=5`、`executed=1`，不再出现 `unknown`。
+- 同步后 `market_entry_evidence_tier_counts` 为 `blocked=5`、`weak_conflict_probe=5`、`exploration=1`；`tradeable_probe_count=1`、`shadow_only_count=5`、`hard_block_count=0`。ML 仍为 `degraded`，`allow_live_position_influence=false`。
+
+当前结论：
+- 这轮修复降低了观察误读风险：已执行/交易所未确认路径不会再被归为 `unknown`。
+- 当前窗口没有新增拒单；仍有 ZETA 快亏旧样本，因此继续遵守 Batch H 观察规则，重点看未来 `fast_loss_without_strong_exit_count`、弱证据执行、loss re-entry 和真实手续费后收益。
+- 不能因为 `unknown` 消失就认为策略闭环完成；这只是诊断口径更清楚。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务重启、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

@@ -79,6 +79,17 @@ def test_strategy_health_report_exposes_entry_execution_blocking_contract() -> N
     )
 
 
+def test_strategy_health_classifies_market_entry_execution_outcomes() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+    assert 'bool(getattr(decision, "was_executed", False))' in template
+    assert 'final_stage == "local_sync" and final_status == "completed"' in template
+    assert 'return "executed"' in template
+    assert 'final_status in {"skipped", "failed"}' in template
+    assert 'return "exchange_not_confirmed"' in template
+    assert 'if data.get("skip_kind")' in template
+    assert 'return str(data.get("skip_kind"))' in template
+
+
 def test_strategy_health_report_exposes_entry_score_breakdown_and_relief_diagnostics() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 

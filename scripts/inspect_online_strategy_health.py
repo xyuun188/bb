@@ -262,6 +262,15 @@ def entry_skip_kind(decision):
         data = safe_dict(event.get("data"))
         if data.get("skip_kind"):
             return str(data.get("skip_kind"))
+    summary = safe_dict(machine.get("summary"))
+    final_stage = str(summary.get("final_stage") or "").lower()
+    final_status = str(summary.get("final_status") or "").lower()
+    if bool(getattr(decision, "was_executed", False)) or (
+        final_stage == "local_sync" and final_status == "completed"
+    ):
+        return "executed"
+    if final_stage == "local_sync" and final_status in {"skipped", "failed"}:
+        return "exchange_not_confirmed"
     return "unknown"
 
 
