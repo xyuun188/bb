@@ -692,6 +692,26 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
     assert "short_pr_auc" in overview_block
 
 
+def test_ml_signal_dashboard_renders_controlled_degraded_as_observing() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    overview_block = script[
+        script.index("function renderMLSignalOverview") : script.index(
+            "function renderLocalAIToolsStatus"
+        )
+    ]
+
+    assert "controlledReadinessDegrade" in overview_block
+    assert (
+        "const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;"
+        in overview_block
+    )
+    assert (
+        "const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');"
+        in overview_block
+    )
+    assert "readinessState === 'degraded' ? 'bad' : 'warn'" not in overview_block
+
+
 def test_data_collection_request_failure_still_renders_error_fallback() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     fetch_block = script[

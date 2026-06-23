@@ -54,7 +54,7 @@ SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
-MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 4.0
+MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
 MODEL_EXPERT_AUDIT_HOURS = 24
 MODEL_EXPERT_AUDIT_LIMIT = 200
@@ -1768,7 +1768,7 @@ async def _crypto_feature_coverage_audit() -> dict[str, Any]:
 
 async def _model_training_audit() -> dict[str, Any]:
     data_status, runtime_status = await asyncio.gather(
-        data_collection_api.get_data_collection_status(),
+        data_collection_api.get_data_collection_status(include_feature_coverage=False),
         asyncio.wait_for(
             collect_platform_runtime_status(),
             timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS,

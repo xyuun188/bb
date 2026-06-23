@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -28,6 +29,9 @@ STATIC_SECRET_KEYS: dict[str, str] = {
     "data_collection.coinmarketcal_api_key": "coinmarketcal_api_key",
     "data_collection.newsapi_api_key": "newsapi_api_key",
 }
+ENV_PROTECTED_SECRET_KEYS: dict[str, str] = {
+    "local_ai_tools.api_key": "LOCAL_AI_TOOLS_API_KEY",
+}
 
 _MODEL_KEY_RE = re.compile(r"[^a-z0-9_.:-]+")
 
@@ -51,6 +55,10 @@ async def load_secure_settings_into_runtime() -> dict[str, Any]:
         async with get_session_ctx() as session:
             service = SecureSettingsService(session)
             for key, attr in STATIC_SECRET_KEYS.items():
+                env_key = ENV_PROTECTED_SECRET_KEYS.get(key)
+                if env_key and str(os.environ.get(env_key) or "").strip():
+                    loaded["skipped"].append(key)
+                    continue
                 value = await service.get_secret(key)
                 if value:
                     setattr(settings, attr, value)

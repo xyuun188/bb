@@ -113,6 +113,58 @@ def test_server_monitor_items_keep_runtime_models_when_remote_monitor_unavailabl
     assert by_key["runtime_local_ai_tools"]["status"] == "ok"
 
 
+def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "ai_models",
+        [
+            {
+                "name": "trend_expert",
+                "api_base": "http://127.0.0.1:18000/v1",
+                "api_key": "unit-key",
+                "model": "qwen3-14b-trade",
+                "enabled": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(settings, "high_risk_review_model", "deepseek-r1-14b-risk")
+
+    items = system_health._server_monitor_items(
+        {
+            "available": True,
+            "remote_monitor_available": False,
+            "status": "model_server_config_error",
+            "platform_runtime": {
+                "ai_models": [
+                    {
+                        "model": "deepseek-v4-pro",
+                        "api_base": "https://api.deepseek.com/v1",
+                        "available": False,
+                        "endpoint_ok": False,
+                        "model_available": False,
+                    },
+                    {
+                        "model": "qwen3-14b-trade",
+                        "api_base": "http://127.0.0.1:18000/v1",
+                        "available": False,
+                        "endpoint_ok": False,
+                        "model_available": False,
+                    },
+                ],
+                "local_ai_tools": {"configured": True, "available": True},
+            },
+        }
+    )
+
+    by_key = {item["key"]: item for item in items}
+    assert by_key["runtime_model_deepseek-v4-pro"]["status"] == "info"
+    assert by_key["runtime_model_deepseek-v4-pro"]["details"]["required"] is False
+    assert by_key["runtime_model_qwen3-14b-trade"]["status"] == "critical"
+    assert by_key["runtime_model_qwen3-14b-trade"]["details"]["required"] is True
+
+
 @pytest.mark.asyncio
 async def test_self_check_repair_only_resets_low_risk_caches(
     monkeypatch: pytest.MonkeyPatch,
@@ -987,3 +1039,233 @@ async def test_recent_failed_orders_become_info_after_new_successful_execution(
     assert by_key["recent_failed_orders"]["details"]["has_unresolved_order"] is False
     assert by_key["recent_failed_orders"]["details"]["sample_order_ids"] == [2346]
     assert by_key["recent_execution"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_recent_failed_orders_known_untradable_reject_is_info_without_later_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(
+                    [
+                        SimpleNamespace(
+                            id=2561,
+                            status="rejected",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                23,
+                                7,
+                                45,
+                                tzinfo=system_health.UTC,
+                            ),
+                            decision_id=77,
+                            exchange_order_id="rejected",
+                        )
+                    ]
+                )
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=77,
+                        action="long",
+                        created_at=system_health.datetime(
+                            2026,
+                            6,
+                            23,
+                            7,
+                            44,
+                            tzinfo=system_health.UTC,
+                        ),
+                        execution_reason=(
+                            "OKX 提示该交易对当前不可交易，可能受账户地区/合规限制影响；"
+                            "系统已暂时跳过该交易对，避免重复分析和下单。51155"
+                        ),
+                        reasoning="entry rejected by exchange",
+                        raw_llm_response={
+                            "opportunity_score": {"score": 2.0},
+                            "decision_state_machine": {"stages": [{"status": "failed"}]},
+                        },
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_failed_orders"]["status"] == "info"
+    assert by_key["recent_failed_orders"]["details"]["has_unresolved_order"] is False
+    assert by_key["recent_failed_orders"]["details"]["handled_terminal_failure_count"] == 1
+    assert by_key["recent_failed_orders"]["details"]["unhandled_terminal_failure_count"] == 0
+    assert by_key["recent_failed_orders"]["details"]["sample_handled_order_ids"] == [2561]
+
+
+@pytest.mark.asyncio
+async def test_recent_failed_orders_loads_linked_decision_outside_recent_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(
+                    [
+                        SimpleNamespace(
+                            id=2561,
+                            status="rejected",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                23,
+                                7,
+                                45,
+                                tzinfo=system_health.UTC,
+                            ),
+                            decision_id=177,
+                            exchange_order_id="rejected",
+                        )
+                    ]
+                )
+            if self.calls == 2:
+                return FakeResult([])
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=177,
+                        action="long",
+                        created_at=system_health.datetime(
+                            2026,
+                            6,
+                            23,
+                            1,
+                            0,
+                            tzinfo=system_health.UTC,
+                        ),
+                        execution_reason="OKX 51155 local compliance restrictions",
+                        raw_llm_response={},
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_failed_orders"]["status"] == "info"
+    assert by_key["recent_failed_orders"]["details"]["handled_terminal_failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_failed_orders_unknown_terminal_reject_stays_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(
+                    [
+                        SimpleNamespace(
+                            id=2601,
+                            status="rejected",
+                            created_at=system_health.datetime(
+                                2026,
+                                6,
+                                23,
+                                8,
+                                0,
+                                tzinfo=system_health.UTC,
+                            ),
+                            decision_id=88,
+                            exchange_order_id="rejected",
+                        )
+                    ]
+                )
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=88,
+                        action="short",
+                        created_at=system_health.datetime(
+                            2026,
+                            6,
+                            23,
+                            7,
+                            59,
+                            tzinfo=system_health.UTC,
+                        ),
+                        execution_reason="Failed to place order",
+                        raw_llm_response={
+                            "opportunity_score": {"score": 2.0},
+                            "decision_state_machine": {"stages": [{"status": "failed"}]},
+                        },
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["recent_failed_orders"]["status"] == "warning"
+    assert by_key["recent_failed_orders"]["details"]["has_unresolved_order"] is False
+    assert by_key["recent_failed_orders"]["details"]["handled_terminal_failure_count"] == 0
+    assert by_key["recent_failed_orders"]["details"]["unhandled_terminal_failure_count"] == 1

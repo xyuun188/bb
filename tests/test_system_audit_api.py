@@ -412,7 +412,9 @@ async def test_system_audit_status_wraps_failed_section(
 async def test_model_training_audit_does_not_run_full_self_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_data_collection_status() -> dict[str, Any]:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
         return {
             "training": {
                 "local_ai_tools": {
@@ -453,6 +455,49 @@ async def test_model_training_audit_does_not_run_full_self_check(
     assert not hasattr(system_audit, "system_self_check")
     assert card["status"] == "ok"
     assert card["details"]["runtime_probe"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_model_training_audit_skips_duplicate_feature_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
+        calls.append(include_feature_coverage)
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "ready",
+                    "shadow_sample_count": 123,
+                    "trade_sample_count": 7,
+                    "text_sentiment_sample_count": 11,
+                },
+                "governance": {"status": "clean"},
+            },
+            "sources": [],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [],
+            "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+
+    card = await system_audit._model_training_audit()
+
+    assert calls == [False]
+    assert card["status"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -929,7 +974,9 @@ async def test_crypto_feature_coverage_audit_and_endpoint_force_read_only(
 async def test_model_training_optional_sources_are_observing_not_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_data_collection_status() -> dict[str, Any]:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
         return {
             "training": {
                 "local_ai_tools": {
@@ -1055,7 +1102,9 @@ async def test_strategy_quality_audit_reports_short_adjustment_samples(
 async def test_model_training_unconfigured_local_tools_are_observing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_data_collection_status() -> dict[str, Any]:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
         return {
             "training": {
                 "local_ai_tools": {
@@ -1096,7 +1145,9 @@ async def test_model_training_unconfigured_local_tools_are_observing(
 async def test_model_training_auth_failure_remains_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_data_collection_status() -> dict[str, Any]:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
         return {
             "training": {
                 "local_ai_tools": {
@@ -1141,7 +1192,9 @@ async def test_model_training_auth_failure_remains_unresolved(
 async def test_model_training_runtime_probe_timeout_is_observing_when_training_is_usable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_data_collection_status() -> dict[str, Any]:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
         return {
             "training": {
                 "local_ai_tools": {

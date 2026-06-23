@@ -1351,3 +1351,57 @@ AI 防偏要求：
 
 回滚点：
 - 代码层可回滚 `services/entry_opportunity_gate.py`、`services/trading_service.py` 与 `tests/test_trading_service_boundaries.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启服务以刷新 Python 进程导入。
+
+---
+
+## 三十四、Batch H 补充记录：Dashboard 健康面异常收口与防偏（2026-06-23）
+
+触发原因：用户指出系统巡检页、数据采集页、本地 ML 页、服务器监控/系统自检页仍有异常或需关注项。复查确认，之前 Batch H 重心偏向交易闭环和拒单拦截，漏掉了用户直接看到的 Dashboard 健康面收口。本轮按“真实故障、真实降级、误报/旧告警”拆分处理：不能把真实缺失特征和 ML degraded 洗成 ok，也不能让已处理旧拒单、重复重探和旧 secure key 覆盖继续把页面打红。
+
+本次修复范围：
+- `services/crypto_feature_coverage.py`：特征覆盖报告从加载完整 `AIDecision` ORM 对象改为轻量投影 `id/symbol/created_at/feature_snapshot`，避免数据采集页和系统巡检因大字段加载超时。
+- `web_dashboard/api/data_collection.py`：`get_data_collection_status(include_feature_coverage=True)` 支持调用方跳过重复特征覆盖重探；跳过时返回只读 `skipped_by_caller` 契约，不改变任何交易信号。
+- `web_dashboard/api/system_audit.py`：`model_training` 巡检不再重复跑完整 `feature_coverage`，并把模型运行探针超时窗口从 4s 提高到 8s；真实模型不可用仍会进入 hard failure，学习观察态仍为 warning。
+- `services/secure_runtime_config.py`：当 systemd runtime env 已注入 `LOCAL_AI_TOOLS_API_KEY` 时，启动加载 secure settings 不再用旧的 `local_ai_tools.api_key` 密文覆盖它；修复 18001 本地量化工具明明 runtime key 正确、Dashboard 启动后却被旧 key 覆盖成 401 的问题。
+- `web_dashboard/api/system_health.py`：系统自检的 `recent_failed_orders` 补查订单关联 `decision_id`，并将明确归因为 OKX 51155、合规限制、不可交易 symbol 等已处理终态拒单降为 `info`；未知拒单、未决单、未归因终态失败仍保持 warning。
+- `web_dashboard/api/system_health.py`：运行时模型自检只把当前固定专家槽和高风险复核模型视为必需模型；额外/旧配置模型如 `deepseek-v4-pro` 探测失败只作为环境观察项，不再拖红当前系统。
+- `web_dashboard/static/js/dashboard.js`：Local ML `degraded/learning_only` 且 `allow_live_position_influence=false` 时展示为“学习观察” warning，不再渲染成红色异常；模型接口不可用时仍然是 bad。
+
+安全边界：
+- 本批不修改开仓阈值、证据 tier、仓位、杠杆、平仓、模型权重、专家路由、ML readiness 门槛、风控 veto 或真实交易执行逻辑。
+- `crypto_feature_coverage.status=warning` 仍是真实数据质量 warning：当前缺失 `liquidation_risk`、`btc_eth_anchor`、`sector_correlation`、`abnormal_wick`、`event_calendar`，缺失特征继续按 `neutral_blocked` 处理，不能改成 ok。
+- 本地 ML `readiness_state=degraded` 且 `allow_live_position_influence=false` 是真实受控降级，不允许后续 AI 为了页面全绿而强行 ready、降低 PR-AUC/样本质量门槛或允许实盘仓位影响。
+- `recent_failed_orders` 只对“终态 + 明确已处理归因”的拒单降级；未知失败单、pending/open/partial 订单、没有执行原因的拒单仍必须保留 warning。
+- runtime env 保护只针对 `LOCAL_AI_TOOLS_API_KEY`，不改变 OKX、AI provider、高风险复核和数据源密钥的 secure settings 加载规则。
+
+本地验证：
+- `pytest tests/test_crypto_feature_coverage.py tests/test_data_collection_api.py::test_data_collection_status_exposes_sources_and_training tests/test_system_audit_api.py tests/test_system_self_check.py tests/test_dashboard_main_ui_contract.py tests/test_dashboard_error_safety.py tests/test_secure_runtime_config.py -q`：118 passed。
+- `ruff check web_dashboard/api/data_collection.py web_dashboard/api/system_audit.py web_dashboard/api/system_health.py services/crypto_feature_coverage.py services/secure_runtime_config.py tests/test_crypto_feature_coverage.py tests/test_system_audit_api.py tests/test_system_self_check.py tests/test_dashboard_main_ui_contract.py tests/test_secure_runtime_config.py`：no issues。
+- `black --check web_dashboard/api/data_collection.py web_dashboard/api/system_audit.py web_dashboard/api/system_health.py services/crypto_feature_coverage.py services/secure_runtime_config.py tests/test_crypto_feature_coverage.py tests/test_system_audit_api.py tests/test_system_self_check.py tests/test_dashboard_main_ui_contract.py tests/test_secure_runtime_config.py`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：source safety scan ok，扫描 514 files。
+- `git diff --check`：通过。
+
+线上同步与复查：
+- 首次全量同步在 SFTP 遍历阶段连接中断，未当作完成；随后按同一 SSH/重启逻辑聚焦同步本批相关文件并重启 split services。
+- 最终同步后 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
+- 复查以 Dashboard 主进程真实环境执行，避免 `.env` 旧值污染：`high_risk_model=deepseek-r1-14b-risk`，`secure_skipped=["local_ai_tools.api_key"]`，`secure_error=""`。
+- 数据采集页后端：`duration_sec=1.383`、`error=null`、`feature_status=warning`、`feature_error=null`、`local_ai_status=learning_only`、`local_ai_available=true`。
+- 系统巡检页：overall `warning`，但 `critical=0`；cards 16、warning 10、ok 6；`model_training` 为 warning，`hard_failure=false`、`observing=true`、`runtime_probe.status=ok`、`ai_model_count=2`；`crypto_feature_coverage` 为 warning 且 `error=null`。
+- 系统自检页：overall `ok`；critical 0、warning 0、ok 15、info 2；`recent_failed_orders` 已降为 info，order `2561` 为已处理终态拒单，`handled_terminal_failure_count=1`、`unhandled_terminal_failure_count=0`、`has_unresolved_order=false`。
+- 服务器监控页：`status=ok`、`available=true`、`remote_monitor_available=true`；`qwen3-14b-trade` 与 `deepseek-r1-14b-risk` 均 `available=true`；`local_ai_tools_available=true`、`local_ai_tools_status_ok=true`。
+- 本地 ML 页后端：`ml_signal_status.available=true`、`status=degraded`、`readiness_state=degraded`、`allow_live_position_influence=false`、`influence_enabled=false`；`local_ai_tools_status.available=true`、`service_available=true`。
+
+当前结论：
+- 本轮已处理用户可见 Dashboard 健康面的“异常/误报/密钥覆盖/旧拒单”问题：数据采集不再抛特征覆盖 TimeoutError，Local AI tools 不再因旧 secure key 被 401，服务器监控恢复 ok，系统自检不再把已处理 TSLA 拒单当成新故障。
+- 系统巡检整体仍为 warning 是正确的：还有真实只读观察项和缺失特征，不代表本轮失败，也不能为了页面全绿隐藏。
+- 本地 ML 仍是 degraded 且禁止实盘影响，这说明 ML 训练质量问题仍需后续从样本、标签、特征和离线评估根治，不能在 Dashboard 层硬改状态。
+
+后续 AI 防偏要求：
+- 后续 AI 看到 Dashboard warning 时必须先分清 `error`、`hard_failure`、`observing`、`info`、真实数据质量 warning，不能把 warning 一律当作代码异常，也不能把 warning 一律改成 ok。
+- 复核 Dashboard 必须使用 Dashboard 主进程同等环境，或者明确加载 `/data/bb/app/.env` 与 `/etc/bb/bb-runtime.env` 并调用 `load_secure_settings_into_runtime()`；不能用裸 `.venv/bin/python` 直接导入后拿 `.env` 旧配置下结论。
+- 如果后续再次出现 Local AI tools 401，优先检查 `/etc/bb/bb-runtime.env`、模型服务器 `/data/trade_ai/local_ai_tools.env`、secure settings 覆盖顺序和 Dashboard 进程环境，不要先改前端。
+- 如果后续再次出现 `deepseek-v4-pro` 类旧模型 critical，先确认它是否属于当前固定专家槽或高风险复核模型；非必需旧配置不能拖红系统自检。
+- 如果后续再次出现拒单，必须区分“已处理旧拒单滚动窗口残留”和“新增未知拒单”；新增拒单才回到 entry candidate 到 execution submit 调用链定位。
+
+回滚点：
+- 代码层可回滚 `services/crypto_feature_coverage.py`、`services/secure_runtime_config.py`、`web_dashboard/api/data_collection.py`、`web_dashboard/api/system_audit.py`、`web_dashboard/api/system_health.py`、`web_dashboard/static/js/dashboard.js` 与对应测试；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启三项服务。

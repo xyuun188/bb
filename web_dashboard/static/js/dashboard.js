@@ -8436,6 +8436,9 @@ function renderMLSignalOverview() {
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
     const allowLivePositionInfluence = status.allow_live_position_influence === true;
     const influenceEnabled = status.influence_enabled === true && allowLivePositionInfluence;
+    const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
+    const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;
+    const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
         ? readinessBlockers.slice(0, 4).map(item => item?.message || item?.code || '').filter(Boolean).join('；')
         : '当前没有 readiness 阻塞项';
@@ -8475,7 +8478,7 @@ function renderMLSignalOverview() {
         </div>
         <div class="ml-overview-grid">
             ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
-            ${mlMetricCard('Readiness', readinessState, readinessReasonText, allowLivePositionInfluence ? 'good' : (readinessState === 'degraded' ? 'bad' : 'warn'))}
+            ${mlMetricCard('Readiness', readinessDisplayState, readinessReasonText, readinessTone)}
             ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('累计完成样本', String(samples.completedMl), '数据库里已完成的影子复盘总数', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}

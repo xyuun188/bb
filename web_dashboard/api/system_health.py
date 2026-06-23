@@ -18,6 +18,7 @@ from models.decision import AIDecision
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Order
+from services.entry_symbol_blocklist import UNTRADABLE_EXCHANGE_ERROR_MARKERS
 from services.server_monitor_status import (
     clear_server_monitor_cache,
     get_server_monitor_status_async,
@@ -44,6 +45,27 @@ NEWS_FRESH_SECONDS = 24 * 60 * 60
 SOCIAL_FRESH_SECONDS = 24 * 60 * 60
 ISSUE_ORDER = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SELF_CHECK_SECTION_TIMEOUT_SECONDS = 6.0
+UNRESOLVED_ORDER_STATUSES = {"open", "pending", "partial", "partially_filled"}
+TERMINAL_FAILED_ORDER_STATUSES = {
+    "rejected",
+    "cancelled",
+    "canceled",
+    "failed",
+    "error",
+    "expired",
+}
+HANDLED_TERMINAL_FAILURE_MARKERS = tuple(
+    str(marker).lower()
+    for marker in (
+        *UNTRADABLE_EXCHANGE_ERROR_MARKERS,
+        "已暂时跳过该交易对",
+        "系统已暂时跳过该交易对",
+        "避免重复分析和下单",
+        "entry_symbol_blocklist",
+        "untradable_symbol",
+        "known_untradable_symbol",
+    )
+)
 
 
 def _now_iso() -> str:
@@ -84,6 +106,69 @@ def _check_item(
         "repairable": repairable,
         "repair_action": repair_action,
     }
+
+
+def _order_status(row: Any) -> str:
+    return str(getattr(row, "status", "") or "").lower()
+
+
+def _recent_order_reason_text(row: Any, decisions_by_id: dict[int, Any]) -> str:
+    pieces: list[Any] = [
+        getattr(row, "exchange_order_id", None),
+        getattr(row, "reason", None),
+        getattr(row, "message", None),
+    ]
+    decision_id = getattr(row, "decision_id", None)
+    decision = decisions_by_id.get(decision_id) if decision_id is not None else None
+    if decision is not None:
+        pieces.extend(
+            [
+                getattr(decision, "execution_reason", None),
+                getattr(decision, "reasoning", None),
+            ]
+        )
+        raw = decision.raw_llm_response if isinstance(decision.raw_llm_response, dict) else {}
+        execution_result = raw.get("execution_result") if isinstance(raw, dict) else {}
+        if isinstance(execution_result, dict):
+            pieces.extend(
+                execution_result.get(key)
+                for key in (
+                    "error",
+                    "raw_error",
+                    "reason",
+                    "message",
+                    "status",
+                    "order_id",
+                    "exchange_order_id",
+                )
+            )
+            raw_response = execution_result.get("raw_response")
+            if isinstance(raw_response, dict):
+                pieces.extend(
+                    raw_response.get(key)
+                    for key in ("error", "raw_error", "sCode", "sMsg", "msg", "message")
+                )
+        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
+        if isinstance(opportunity, dict):
+            pieces.extend(
+                opportunity.get(key)
+                for key in (
+                    "selection_reason",
+                    "execution_final_blocker",
+                    "execution_final_state",
+                )
+            )
+    return " ".join(str(piece) for piece in pieces if piece)
+
+
+def _is_handled_terminal_failed_order(row: Any, decisions_by_id: dict[int, Any]) -> bool:
+    status = _order_status(row)
+    if status not in TERMINAL_FAILED_ORDER_STATUSES:
+        return False
+    reason_text = _recent_order_reason_text(row, decisions_by_id).lower()
+    if not reason_text:
+        return False
+    return any(marker and marker in reason_text for marker in HANDLED_TERMINAL_FAILURE_MARKERS)
 
 
 def _overall_status(items: list[dict[str, Any]]) -> str:
@@ -515,6 +600,18 @@ def _configured_endpoint_items(
     return items
 
 
+def _required_runtime_models() -> set[str]:
+    required = {
+        str(item.get("model") or "").strip()
+        for item in settings.get_fixed_ai_models(include_empty=False)
+        if isinstance(item, dict) and item.get("model")
+    }
+    high_risk_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
+    if high_risk_model:
+        required.add(high_risk_model)
+    return {model for model in required if model}
+
+
 async def _data_source_items() -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         ticker_row = (
@@ -750,16 +847,26 @@ def _server_monitor_items(status: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         model = str(row.get("model") or row.get("name") or "模型")
         ok = bool(row.get("available"))
+        required = model in _required_runtime_models()
         endpoint_ok = bool(row.get("endpoint_ok"))
         model_ok = bool(row.get("model_available"))
         items.append(
             _check_item(
                 f"runtime_model_{model}",
                 f"{model} 运行状态",
-                "ok" if ok else "critical",
-                "端点和模型名均正常。" if ok else "端点或模型名未通过运行时检查。",
+                "ok" if ok else ("critical" if required else "info"),
+                (
+                    "端点和模型名均正常。"
+                    if ok
+                    else (
+                        "必需模型端点或模型名未通过运行时检查。"
+                        if required
+                        else "非当前固定专家/高风险复核模型未通过探测；保留为环境观察项，不计入当前系统故障。"
+                    )
+                ),
                 details={
                     "api_base": row.get("api_base"),
+                    "required": required,
                     "endpoint_ok": endpoint_ok,
                     "model_available": model_ok,
                     "status_code": row.get("status_code"),
@@ -806,9 +913,24 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
             .limit(80)
         )
         decisions = list(decisions_result.scalars().all())
+        order_decision_ids = {
+            int(row.decision_id) for row in orders if getattr(row, "decision_id", None) is not None
+        }
+        loaded_decision_ids = {
+            int(decision.id) for decision in decisions if getattr(decision, "id", None) is not None
+        }
+        missing_order_decision_ids = sorted(order_decision_ids - loaded_decision_ids)
+        if missing_order_decision_ids:
+            linked_decisions_result = await session.execute(
+                select(AIDecision).where(AIDecision.id.in_(missing_order_decision_ids[:80]))
+            )
+            decisions.extend(linked_decisions_result.scalars().all())
 
     failed_orders = [row for row in orders if str(row.status or "").lower() != "filled"]
     executed_orders = [row for row in orders if str(row.status or "").lower() == "filled"]
+    decisions_by_id = {
+        decision.id: decision for decision in decisions if getattr(decision, "id", None) is not None
+    }
     hard_gate_decisions = []
     missing_opportunity_score_decisions = []
     missing_stage_decisions = 0
@@ -866,10 +988,19 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
         )
     ]
     if failed_orders:
-        unresolved_statuses = {"open", "pending", "partial", "partially_filled"}
         has_unresolved_order = any(
-            str(row.status or "").lower() in unresolved_statuses for row in failed_orders
+            _order_status(row) in UNRESOLVED_ORDER_STATUSES for row in failed_orders
         )
+        handled_terminal_failed_orders = [
+            row for row in failed_orders if _is_handled_terminal_failed_order(row, decisions_by_id)
+        ]
+        handled_terminal_row_ids = {id(row) for row in handled_terminal_failed_orders}
+        unhandled_terminal_failed_orders = [
+            row
+            for row in failed_orders
+            if _order_status(row) not in UNRESOLVED_ORDER_STATUSES
+            and id(row) not in handled_terminal_row_ids
+        ]
         latest_failed_at = max(
             (row.created_at for row in failed_orders if isinstance(row.created_at, datetime)),
             default=None,
@@ -881,12 +1012,26 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
         recovered_after_failure = bool(
             latest_executed_at and latest_failed_at and latest_executed_at >= latest_failed_at
         )
-        failed_status = "warning" if has_unresolved_order or not recovered_after_failure else "info"
-        failed_message = (
-            f"最近 6 小时有 {len(failed_orders)} 条失败或未成交订单，需要打开执行详情查看失败步骤。"
-            if failed_status == "warning"
-            else f"最近 6 小时有 {len(failed_orders)} 条历史失败订单，但之后已有更新成交，执行链路已恢复；保留详情供复盘，不计入总体异常。"
+        has_unhandled_terminal_failure = bool(unhandled_terminal_failed_orders)
+        known_handled_only = not has_unresolved_order and not has_unhandled_terminal_failure
+        failed_status = (
+            "warning"
+            if has_unresolved_order
+            or (has_unhandled_terminal_failure and not recovered_after_failure)
+            else "info"
         )
+        if failed_status == "warning":
+            failed_message = f"最近 6 小时有 {len(failed_orders)} 条失败或未成交订单，需要打开执行详情查看失败步骤。"
+        elif known_handled_only:
+            failed_message = (
+                f"最近 6 小时有 {len(failed_orders)} 条终态失败订单，但均已识别为交易所/合规/币种不可交易等已处理拦截；"
+                "保留详情供复盘，不计入总体异常。"
+            )
+        else:
+            failed_message = (
+                f"最近 6 小时有 {len(failed_orders)} 条历史失败订单，但之后已有更新成交，执行链路已恢复；"
+                "保留详情供复盘，不计入总体异常。"
+            )
         items.append(
             _check_item(
                 "recent_failed_orders",
@@ -897,6 +1042,11 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
                     "sample_order_ids": [row.id for row in failed_orders[:5]],
                     "sample_statuses": [row.status for row in failed_orders[:5]],
                     "has_unresolved_order": has_unresolved_order,
+                    "handled_terminal_failure_count": len(handled_terminal_failed_orders),
+                    "unhandled_terminal_failure_count": len(unhandled_terminal_failed_orders),
+                    "sample_handled_order_ids": [
+                        row.id for row in handled_terminal_failed_orders[:5]
+                    ],
                     "latest_failed_at": latest_failed_at.isoformat() if latest_failed_at else None,
                     "latest_executed_at": (
                         latest_executed_at.isoformat() if latest_executed_at else None

@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from services.crypto_feature_coverage import summarize_crypto_feature_coverage
+from services.crypto_feature_coverage import (
+    CryptoFeatureCoverageService,
+    summarize_crypto_feature_coverage,
+)
 
 
 def _decision(
@@ -142,3 +145,30 @@ def test_feature_coverage_accepts_available_timestamped_crypto_features() -> Non
     assert report["symbols_observed"] == ["SOL/USDT"]
     assert "event_calendar" in report["missing_features"]
     assert "funding_rate" not in report["missing_features"]
+
+
+def test_feature_coverage_service_uses_lightweight_decision_projection() -> None:
+    class FakeColumn:
+        def label(self, name: str):
+            return (self, name)
+
+        def __ge__(self, _other):
+            return (self, "gte")
+
+        def desc(self):
+            return (self, "desc")
+
+    class FakeAIDecision:
+        id = FakeColumn()
+        symbol = FakeColumn()
+        created_at = FakeColumn()
+        feature_snapshot = FakeColumn()
+
+    columns = CryptoFeatureCoverageService._decision_projection_columns(FakeAIDecision)
+
+    assert columns == (
+        FakeAIDecision.id,
+        FakeAIDecision.symbol,
+        FakeAIDecision.created_at,
+        FakeAIDecision.feature_snapshot,
+    )

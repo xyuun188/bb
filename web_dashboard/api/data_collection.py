@@ -121,6 +121,23 @@ def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
     return payload
 
 
+def _skipped_feature_coverage_status() -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "section": "crypto_feature_coverage",
+        "reason": "skipped_by_caller",
+        "audit_only": True,
+        "live_signal_mutation": False,
+        "can_missing_features_drive_live_entry": False,
+        "feature_defaults_are_neutral": True,
+        "feature_contribution_policy": {
+            "missing_feature_policy": "neutral_blocked",
+            "stale_feature_policy": "neutral_blocked",
+            "low_confidence_event_policy": "shadow_only",
+        },
+    }
+
+
 def _visible_local_ai_training_status(
     raw_status: str,
     *,
@@ -823,14 +840,10 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 
 
 @router.get("/data-collection/status")
-async def get_data_collection_status() -> dict[str, Any]:
-    (
-        source_stats_result,
-        quality_result,
-        local_ai_status_result,
-        governance_result,
-        feature_coverage_result,
-    ) = await asyncio.gather(
+async def get_data_collection_status(
+    include_feature_coverage: bool = True,
+) -> dict[str, Any]:
+    tasks: list[Any] = [
         _source_breakdown(),
         _training_sample_quality(),
         _local_ai_training_status(),
@@ -838,11 +851,25 @@ async def get_data_collection_status() -> dict[str, Any]:
             _training_governance_snapshot(),
             timeout=STATUS_SECTION_TIMEOUT_SECONDS,
         ),
-        asyncio.wait_for(
-            CryptoFeatureCoverageService().report(hours=24, limit=1000),
-            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-        ),
-        return_exceptions=True,
+    ]
+    if include_feature_coverage:
+        tasks.append(
+            asyncio.wait_for(
+                CryptoFeatureCoverageService().report(hours=24, limit=1000),
+                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+            )
+        )
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    (
+        source_stats_result,
+        quality_result,
+        local_ai_status_result,
+        governance_result,
+    ) = results[:4]
+    feature_coverage_result = (
+        results[4]
+        if include_feature_coverage and len(results) > 4
+        else _skipped_feature_coverage_status()
     )
     source_stats = _safe_status_section(
         source_stats_result,

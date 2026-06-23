@@ -131,6 +131,10 @@ class CryptoFeatureCoverageService:
     def __init__(self, session_context_factory: Any = get_read_session_ctx) -> None:
         self._session_context_factory = session_context_factory
 
+    @staticmethod
+    def _decision_projection_columns(model: Any = AIDecision) -> tuple[Any, Any, Any, Any]:
+        return (model.id, model.symbol, model.created_at, model.feature_snapshot)
+
     async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
         from sqlalchemy import func, select
 
@@ -139,7 +143,7 @@ class CryptoFeatureCoverageService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with self._session_context_factory() as session:
             decisions_result = await session.execute(
-                select(AIDecision)
+                select(*self._decision_projection_columns())
                 .where(AIDecision.created_at >= since)
                 .order_by(AIDecision.created_at.desc())
                 .limit(capped_limit)
@@ -179,10 +183,34 @@ class CryptoFeatureCoverageService:
                     select(func.count(SocialPost.id), func.max(SocialPost.posted_at))
                 )
             ).one()
+        decision_rows = [
+            SimpleDecisionProjection(
+                id=row[0],
+                symbol=row[1],
+                created_at=row[2],
+                feature_snapshot=row[3],
+            )
+            for row in decisions_result.all()
+        ]
         return summarize_crypto_feature_coverage(
-            list(decisions_result.scalars().all()),
+            decision_rows,
             _market_coverage_from_rows(kline_rows, ticker_row, news_row, social_row),
         )
+
+
+class SimpleDecisionProjection:
+    def __init__(
+        self,
+        *,
+        id: Any,
+        symbol: Any,
+        created_at: Any,
+        feature_snapshot: Any,
+    ) -> None:
+        self.id = id
+        self.symbol = symbol
+        self.created_at = created_at
+        self.feature_snapshot = feature_snapshot
 
 
 def _market_coverage_from_rows(
