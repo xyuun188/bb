@@ -585,6 +585,7 @@ def train_from_frame(
     min_samples: int = MIN_TRAINING_SAMPLES,
     completed_sample_count: int | None = None,
     training_quality_report: dict[str, Any] | None = None,
+    persist_artifact: bool = True,
 ) -> dict[str, Any]:
     if len(frame) < min_samples:
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
@@ -684,6 +685,8 @@ def train_from_frame(
         },
         "feature_keys": FEATURE_KEYS,
         "mode": "entry_profit_filter",
+        "training_run_mode": "persist" if persist_artifact else "dry_run",
+        "artifact_persisted": bool(persist_artifact),
         "note": "本地 ML 以预期盈亏和收益质量为主，胜率仅作为辅助过滤；用于开仓门槛/否决，不直接决定交易方向。",
     }
 
@@ -695,8 +698,12 @@ def train_from_frame(
         "metadata": metadata,
         "feature_keys": FEATURE_KEYS,
     }
-    dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
-    METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    if persist_artifact:
+        dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
+        METADATA_PATH.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     return metadata
 
 

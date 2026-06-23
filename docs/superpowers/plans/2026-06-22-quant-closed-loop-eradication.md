@@ -1161,6 +1161,54 @@ AI 防偏要求：
 
 ---
 
+## 三十、Batch H 补充记录：ML 安全 dry-run 训练评估闸门（2026-06-23）
+
+触发原因：上一轮已修复 ML 训练样本选择与加载性能，但如果后续 AI 直接运行正式训练脚本，仍可能把不达标模型写入 `data/ml_signal/winrate_model.joblib`，或在未明确验证前隔离训练样本。为避免“样本平衡 = 模型已 ready”的误读，本轮新增不会写模型 artifact、不会隔离样本的训练评估入口，用来先看真实指标，再决定是否进入正式模型替换流程。
+
+本次修复范围：
+- `services/ml_signal_service.py`：`train_from_frame()` 新增 `persist_artifact` 参数；默认仍保持原正式训练行为，只有显式 `persist_artifact=False` 时才只返回训练元数据，不写 `MODEL_PATH` 与 `METADATA_PATH`。
+- `services/ml_signal_service.py`：训练元数据新增 `training_run_mode` 与 `artifact_persisted`，让 dry-run 输出可被机器和人直接审计。
+- `scripts/train_ml_signal_model.py`：新增 `run_training()` 与 CLI 参数 `--dry-run`；dry-run 模式强制跳过 quarantine，返回 `dry_run_no_quarantine_writes`，并调用 `train_from_frame(..., persist_artifact=False)`。
+- `tests/test_ml_signal_training_quality.py`：新增 dry-run 契约测试，锁定 dry-run 不得写模型文件、不得写 metadata、不得调用 quarantine、必须把 `persist_artifact=False` 传入训练函数。
+
+安全边界：
+- `--dry-run` 只能用于离线评估，不代表模型被部署，也不代表 readiness 变成 ready。
+- dry-run 指标通过时，也不得自动启用 ML 实盘影响；必须另走正式训练、artifact 替换、readiness 复查、线上观察和停止规则检查。
+- dry-run 指标不通过时，必须继续保持 `degraded/learning_only` 与 `allow_live_position_influence=false`，不得硬改 ready、降低 PR-AUC 门槛、放宽 dirty ratio、强开 probe、放大仓位或绕过风控 veto。
+- 本批不改变开仓阈值、仓位、杠杆、平仓、专家路由、模型权重、风险 veto 或真实交易执行逻辑。
+
+本地验证：
+- TDD 红灯：新增 dry-run 契约测试后，旧代码因 `train_from_frame()` 不支持 `persist_artifact`、训练脚本缺少 `run_training()` 而失败。
+- TDD 绿灯：实现 `persist_artifact`、`run_training()` 与 `--dry-run` 后，同一测试通过。
+- `python -m pytest tests/test_ml_signal_training_quality.py -q`：8 passed。
+- `python -m pytest tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_quarantines_before_training tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_uses_completed_cursor_for_new_samples -q`：2 passed。
+- `ruff check services/ml_signal_service.py scripts/train_ml_signal_model.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：0 issues。
+- `black --check services/ml_signal_service.py scripts/train_ml_signal_model.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：通过。
+
+线上只读 dry-run 评估：
+- 执行方式：以 `bb-dashboard.service` 的运行环境启动，并降权为 OS 用户 `bb` 执行 `/data/bb/app/.venv/bin/python scripts/train_ml_signal_model.py --dry-run --skip-quarantine --limit 20000`。
+- 模型 artifact 前后校验一致：`data/ml_signal/winrate_model.joblib` size `10652409`、mtime_ns `1782192227930000000`；`data/ml_signal/winrate_model_metadata.json` size `6838`、mtime_ns `1782192227958000000`。dry-run 前后完全一致，证明本轮未替换线上模型 artifact。
+- dry-run 输出明确为 `training_run_mode=dry_run`、`artifact_persisted=false`、`training_quarantine.reason=dry_run_no_quarantine_writes`；`loaded_row_count=20000`、`frame_sample_count=19971`、`completed_shadow_sample_count=138382`。
+- 样本质量：total 20,000、included 4,859、downweighted 15,112、excluded 29、effective_weight_ratio 0.6048；`decision_action` 为 hold 15,000、short 3,050、long 1,950。主要降权原因仍是 `shadow:very_low_decision_confidence=15000`、`shadow:hold_missed_opportunity_downweighted=10000`、`shadow:hold_observation_downweighted=5000`。
+- dry-run 指标：train_count 14,978、test_count 4,993；`long_pr_auc=0.3570802373417013`、`short_pr_auc=0.3726301250780891`；`top_long_avg_return_pct=0.3144083738290642`、`top_short_avg_return_pct=-0.016619942578254214`；`bottom_long_avg_return_pct=-0.22171420536348094`、`bottom_short_avg_return_pct=-0.340247292118988`。
+
+线上同步与复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步总控文档；本轮代码文件此前已同步到线上，最终同步实际上传 1 个 changed file。同步后 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均为 active，Dashboard 返回 `302`。
+- 同步后 15m 健康摘要（`2026-06-23T06:09:33Z`）：39 decisions、15 market decisions、0 entry decisions、0 orders、0 rejected orders、0 fast_loss_close_under_15m、open_positions 3；没有触发新增执行风险。
+- 同步后 120m 健康摘要（`2026-06-23T06:09:34Z`）：325 decisions、11 entry decisions、9 market_entry_decisions、1 filled order、0 failed/rejected orders、0 fast_loss_close_under_15m、open_positions 3；该 1 笔 filled 属于窗口内历史样本，不证明本批 dry-run 闸门启用了 ML 或制造了新交易。
+- 同步后 `local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`；阻塞项仍为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。当前 artifact 状态仍在保护系统不让未达标 ML 影响实盘。
+- 同步后系统巡检（`record_history=False`）：overall `warning`，但 `critical_cards=[]`；`trade_execution_contract` 为 ok，current_summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`runtime_text_integrity` 为 ok，suspected_records 0、suspected_fields 0。`model_training` 仍为 warning，原因是可选增强数据源、运行探针或学习观察，不是本批新增交易执行风险。
+
+当前结论：
+- 本轮新增的是“先评估、后决定是否替换模型”的安全闸门，解决后续 AI 无法安全查看新训练窗口指标的问题。
+- 平衡窗口改善了训练组成与加载速度，但 dry-run 指标仍不能证明 ML 已可实盘影响：long/short PR-AUC 仍偏低，且 short top return 仍为负。
+- 当前不能启用 ML live influence，不能替换线上 artifact，不能把样本平衡当作开仓放宽依据。后续若要继续根治 ML，应先定位 short 高分组收益为负的原因，包括收益标签、特征有效性、样本时间分布、成本/滑点、side imbalance、低置信 hold 样本降权策略和候选生成质量。
+
+回滚点：
+- 代码层可回滚 `services/ml_signal_service.py`、`scripts/train_ml_signal_model.py` 与 `tests/test_ml_signal_training_quality.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启服务以刷新 Python 进程导入。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

@@ -5,16 +5,21 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
+from scripts import train_ml_signal_model as train_ml_signal_script
+from services import ml_signal_service as ml_signal_module
 from services.ml_signal_service import (
+    FEATURE_KEYS,
     MLSignalService,
     load_shadow_training_rows,
     select_shadow_training_rows,
     shadow_training_quality_report,
+    train_from_frame,
 )
 from services.training_data_quality import DATA_QUALITY_VERSION
 
@@ -97,6 +102,100 @@ def _shadow_row(
         best_action=best_action,
         missed_opportunity=missed,
     )
+
+
+def _training_frame(row_count: int = 80) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for idx in range(row_count):
+        row = {key: 0.0 for key in FEATURE_KEYS}
+        row.update(
+            {
+                "id": idx + 1,
+                "symbol": "BTC/USDT" if idx % 2 == 0 else "ETH/USDT",
+                "long_return_pct": 0.2 if idx % 4 == 0 else -0.05,
+                "short_return_pct": 0.18 if idx % 4 == 1 else -0.04,
+                "long_win": int(idx % 4 == 0),
+                "short_win": int(idx % 4 == 1),
+                "sample_weight": 1.0,
+                "data_quality_status": "included",
+                "data_quality_score": 1.0,
+                "quality_reasons": [],
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_train_from_frame_can_evaluate_without_persisting_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "winrate_model.joblib"
+    metadata_path = tmp_path / "winrate_model_metadata.json"
+    monkeypatch.setattr(ml_signal_module, "MODEL_PATH", model_path)
+    monkeypatch.setattr(ml_signal_module, "METADATA_PATH", metadata_path)
+
+    metadata = train_from_frame(
+        _training_frame(),
+        min_samples=10,
+        completed_sample_count=80,
+        persist_artifact=False,
+    )
+
+    assert metadata["artifact_persisted"] is False
+    assert metadata["training_run_mode"] == "dry_run"
+    assert not model_path.exists()
+    assert not metadata_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_train_ml_signal_script_dry_run_does_not_quarantine_or_persist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def forbidden_quarantine(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("dry-run must not quarantine or mutate training rows")
+
+    async def load_rows(*, limit: int) -> list[object]:
+        assert limit == 20
+        return [object()]
+
+    def quality_report(_rows: list[object]) -> dict[str, object]:
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[object]) -> pd.DataFrame:
+        return _training_frame()
+
+    async def count_rows() -> int:
+        return 80
+
+    def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"artifact_persisted": kwargs["persist_artifact"]}
+
+    monkeypatch.setattr(
+        train_ml_signal_script, "quarantine_dirty_shadow_samples", forbidden_quarantine
+    )
+    monkeypatch.setattr(train_ml_signal_script, "load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
+    monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
+    monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
+    monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
+
+    result = await train_ml_signal_script.run_training(
+        limit=20,
+        min_samples=10,
+        skip_quarantine=False,
+        dry_run=True,
+    )
+
+    assert result["training_quarantine"] == {
+        "skipped": True,
+        "reason": "dry_run_no_quarantine_writes",
+    }
+    assert calls[0]["persist_artifact"] is False
+    assert result["metadata"] == {"artifact_persisted": False}
 
 
 def test_shadow_training_selection_preserves_trade_and_best_action_samples() -> None:
