@@ -29,6 +29,23 @@ def test_strategy_health_report_splits_market_and_position_review_decisions() ->
     assert '"analysis_type": analysis_type(d)' in template
 
 
+def test_strategy_health_report_exposes_market_entry_evidence_chain_stats() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "def expected_net_components(decision):" in template
+    assert "market_entry_score_gaps.append" in template
+    assert "market_entry_component_contributions" in template
+    assert '"market_entry_score_gap_stats": stats(market_entry_score_gaps)' in template
+    assert (
+        '"market_entry_profit_quality_stats": stats(market_entry_profit_quality_values)' in template
+    )
+    assert (
+        '"market_entry_loss_probability_stats": stats(market_entry_loss_probabilities)' in template
+    )
+    assert '"market_entry_tail_risk_stats": stats(market_entry_tail_risks)' in template
+    assert '"market_entry_expected_net_component_stats": {' in template
+
+
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 

@@ -809,6 +809,43 @@ AI 防偏要求：
 - 代码层可回滚 `web_dashboard/api/system_audit.py`、`scripts/inspect_online_strategy_health.py` 及对应测试；线上回滚后重启三项服务即可。
 - 本批无 DB 迁移、无历史覆盖、无真实交易参数放宽。
 
+## 二十二、Batch H 补充记录：market 候选证据链统计（2026-06-23）
+
+触发原因：Batch H 继续观察时，线上仍然是 `orders=0`，但新增 `analysis_type` 统计已经证明当前有新币种 market analysis 和 market entry candidate，不能继续把 0 单简单归因于暂停态、脚本窗口互相覆盖或持仓复核数量混淆。因此本次只增强只读观察脚本的证据链统计，让后续定位能区分“没有候选”“候选被风控/质量挡住”“候选已执行但订单异常”。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：增加 `expected_net_breakdown.components` 解析，并输出 market 候选的 `score_gap`、`profit_quality_ratio`、`loss_probability`、`tail_risk_score` 和 expected net 组件贡献统计。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，锁定上述证据链字段，防止后续观察脚本退化成只看 orders/hold 的粗口径。
+
+安全边界：
+- 本批只增加只读诊断字段，不放宽开仓阈值，不改杠杆、仓位、平仓、模型权重或专家路由，不绕过风控，不修改真实库历史数据。
+- `expected_net_return_pct > 0` 不能单独视为可开仓；必须同时看 score gap、profit quality、loss probability、tail risk、成本/滑点、模型 readiness 和交易执行契约。
+- 观察到 missed opportunity 或 shadow memory 正贡献，只能作为受限证据输入；不能把全局错过机会、单次暴涨样本或影子记忆直接升级成强制开仓理由。
+
+本地验证：
+- `pytest tests/test_inspect_online_strategy_health.py -q`：4 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+- `git diff --check`：通过。
+
+线上只读复查：
+- 新版策略健康脚本读取 120 分钟窗口：279 decisions，其中 `market_decisions=60`、`position_review_decisions=219`；`analysis_type_action_counts` 为 `position_review:hold=219`、`market:hold=54`、`market:short=5`、`market:long=1`。
+- `python scripts/sync_to_online_server.py --split-services` 已同步本次相关的 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 该窗口有 `market_entry_decisions=6`，全部停在 `risk_check:skipped`；`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 6 个 market 候选的 `expected_net_return_pct` 全部为正：min 0.298957、median 0.332347、max 0.337874；但 `position_size_pct` 全部为 0，不能据此认为已经满足开仓质量。
+- 6 个 market 候选的 `score_gap = score - min_score_required` 全部为负：min -2.330340、median -1.989693、max -0.753132，说明当前不是下单链路丢单，而是证据评分未达开仓门槛。
+- `profit_quality_ratio`：min 0.392026、median 0.461593、max 0.469269；`loss_probability`：min 0.428200、median 0.532300、max 0.557200；`tail_risk_score`：min 0.342714、median 0.399856、max 0.441075。当前候选质量和风险结构仍偏弱。
+- expected net 组件拆解：`ai` 固定正贡献 0.15；`shadow_memory` 为正贡献且接近 cap；`local_ml` 全部 0；`server_profit` 全部负贡献；`fee` 和 `slippage` 全部负贡献；`timeseries` 仅小幅贡献。当前正 EV 主要由 AI 与影子错过机会支撑，尚不足以越过评分、质量和风险门槛。
+
+当前结论：
+- 当前 0 订单不是暂停态造成，也不是观察脚本窗口互相覆盖造成；线上确实产生了 market 候选，但全部因证据链不足被跳过。
+- 这说明前序“弱证据不得执行、不得绕过风控”的约束正在生效；同时也说明收益闭环还没有完成，不能把 0 异常订单等同于策略有效赚钱。
+- 下一步应继续 Batch H 观察，并优先定位为什么 market 候选长期 `score_gap < 0`、`profit_quality_ratio` 偏低、`loss_probability/tail_risk` 偏高、`server_profit` 负贡献和 `local_ml=0`；不得通过直接降阈值、改杠杆、放大仓位或硬改 ML readiness 来制造成交。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无服务行为改动、无 DB 迁移、无历史覆盖、无真实交易参数放宽。
+
 ---
 
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**

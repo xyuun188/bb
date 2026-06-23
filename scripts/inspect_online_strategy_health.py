@@ -175,6 +175,18 @@ def evidence(decision):
     }
 
 
+def expected_net_components(decision):
+    opp = opportunity(decision)
+    breakdown = safe_dict(opp.get("expected_net_breakdown"))
+    result = {}
+    for item in safe_list(breakdown.get("components")):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "unknown")
+        result[key] = safe_float(item.get("contribution_pct"))
+    return result
+
+
 def is_shadow_only_entry_decision(decision):
     return bool(evidence(decision).get("shadow_only"))
 
@@ -325,6 +337,11 @@ async def main():
     examples = []
     cooldown_examples = []
     shadow_only_examples = []
+    market_entry_score_gaps = []
+    market_entry_profit_quality_values = []
+    market_entry_loss_probabilities = []
+    market_entry_tail_risks = []
+    market_entry_component_contributions = {}
     analysis_type_counts = Counter(analysis_type(d) for d in decisions)
     analysis_type_action_counts = Counter(
         f"{analysis_type(d)}:{str(d.action or 'unknown').lower()}" for d in decisions
@@ -339,6 +356,17 @@ async def main():
         st = state(d)
         sz = sizing(d)
         ev = evidence(d)
+        if analysis_type(d) == "market":
+            market_entry_score_gaps.append(
+                safe_float(ev.get("score")) - safe_float(ev.get("min_score_required"))
+            )
+            market_entry_profit_quality_values.append(
+                safe_float(ev.get("profit_quality_ratio"))
+            )
+            market_entry_loss_probabilities.append(safe_float(ev.get("loss_probability")))
+            market_entry_tail_risks.append(safe_float(ev.get("tail_risk_score")))
+            for key, contribution in expected_net_components(d).items():
+                market_entry_component_contributions.setdefault(key, []).append(contribution)
         reason = st["final_reason"] or d.execution_reason or ""
         reason_counts[reason[:100] if reason else "无原因"] += 1
         state_counts[f"{st['final_stage']}:{st['final_status']}"] += 1
@@ -502,6 +530,14 @@ async def main():
         "memory_habit_applied_counts": dict(memory_applied.most_common(10)),
         "shadow_memory_component_counts": dict(shadow_memory_component_counts.most_common(10)),
         "shadow_memory_contribution_stats": stats(shadow_memory_contributions),
+        "market_entry_score_gap_stats": stats(market_entry_score_gaps),
+        "market_entry_profit_quality_stats": stats(market_entry_profit_quality_values),
+        "market_entry_loss_probability_stats": stats(market_entry_loss_probabilities),
+        "market_entry_tail_risk_stats": stats(market_entry_tail_risks),
+        "market_entry_expected_net_component_stats": {
+            key: stats(values)
+            for key, values in sorted(market_entry_component_contributions.items())
+        },
         "shadow_only_positive_net_count": len(shadow_only_examples),
         "notional_floor_blocked_counts": dict(notional_floor_blocked.most_common(12)),
         "shadow_completed_best_action_counts": dict(shadow_by_best.most_common(10)),
