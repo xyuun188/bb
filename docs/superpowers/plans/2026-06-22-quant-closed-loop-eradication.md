@@ -838,6 +838,11 @@ AI 防偏要求：
 - `profit_quality_ratio`：min 0.392026、median 0.461593、max 0.469269；`loss_probability`：min 0.428200、median 0.532300、max 0.557200；`tail_risk_score`：min 0.342714、median 0.399856、max 0.441075。当前候选质量和风险结构仍偏弱。
 - expected net 组件拆解：`ai` 固定正贡献 0.15；`shadow_memory` 为正贡献且接近 cap；`local_ml` 全部 0；`server_profit` 全部负贡献；`fee` 和 `slippage` 全部负贡献；`timeseries` 仅小幅贡献。当前正 EV 主要由 AI 与影子错过机会支撑，尚不足以越过评分、质量和风险门槛。
 
+手工系统巡检防偏口径：
+- 手工调用 `collect_system_audit_status(record_history=False)` 时，不能使用线上裸 `python3`，否则会因缺少依赖得到 `No module named 'fastapi'` 假故障；也不能直接 shell source `.env`，因为复杂列表/映射值会被 shell 误解析。
+- 正确口径是：由 root 进程用 Python/dotenv 读取 `/data/bb/app/.env` 与 `/etc/bb/bb-runtime.env`，并让 runtime env 覆盖 app env，然后以 OS 用户 `bb` 和 `/data/bb/app/.venv/bin/python` 执行巡检。否则容易出现 `Peer authentication failed for user "root"`、`Peer authentication failed for user "bb"` 或模型训练假 `critical`。
+- 按上述稳定口径复查系统巡检：整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 7、observing 4。`trade_loop` 为 warning：最近 2 小时 284 decisions、0 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh。`trade_execution_contract` 为 warning：24h 历史遗留仍在，但当前 runtime window 未复现；`can_bypass_risk_controls=false`、`live_entry_mutation=false`、`live_exit_mutation=false`。`model_expert_health/model_expert_competition/model_dynamic_routing/shadow_missed_opportunity/crypto_feature_coverage` 均仍为只读观察或阻塞态，没有 live 权重、live 路由、弱证据执行或风控绕过。
+
 当前结论：
 - 当前 0 订单不是暂停态造成，也不是观察脚本窗口互相覆盖造成；线上确实产生了 market 候选，但全部因证据链不足被跳过。
 - 这说明前序“弱证据不得执行、不得绕过风控”的约束正在生效；同时也说明收益闭环还没有完成，不能把 0 异常订单等同于策略有效赚钱。
