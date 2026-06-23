@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import secrets
@@ -82,7 +82,9 @@ def selected_side(decision):
 
 def analysis_type(decision):
     raw = safe_dict(decision.raw_llm_response)
-    value = str(getattr(decision, "analysis_type", "") or raw.get("analysis_type") or "unknown").lower().strip()
+    value = str(
+        getattr(decision, "analysis_type", "") or raw.get("analysis_type") or "unknown"
+    ).lower().strip()
     if value in {"position", "holding", "holdings"}:
         return "position_review"
     if value in {"market_scan", "symbol_scan"}:
@@ -109,7 +111,10 @@ def expected_net(decision):
     opp = opportunity(decision)
     side_ev = selected_side_evidence(raw, selected_side(decision))
     if side_ev:
-        return safe_float(side_ev.get("expected_net_return_pct"), safe_float(opp.get("expected_net_return_pct")))
+        return safe_float(
+            side_ev.get("expected_net_return_pct"),
+            safe_float(opp.get("expected_net_return_pct")),
+        )
     return safe_float(opp.get("expected_net_return_pct"))
 
 
@@ -118,7 +123,10 @@ def profit_quality(decision):
     opp = opportunity(decision)
     side_ev = selected_side_evidence(raw, selected_side(decision))
     if side_ev:
-        return safe_float(side_ev.get("profit_quality_ratio"), safe_float(opp.get("profit_quality_ratio")))
+        return safe_float(
+            side_ev.get("profit_quality_ratio"),
+            safe_float(opp.get("profit_quality_ratio")),
+        )
     return safe_float(opp.get("profit_quality_ratio"))
 
 
@@ -131,7 +139,9 @@ def normalize_relief_for_final_contract(relief, final_shadow_only, final_tier, f
     normalized["shadow_only"] = False
     normalized["final_tier"] = final_tier
     normalized["final_effective_score"] = roundv(final_score)
-    normalized["state_override_reason"] = "Final evidence tier is tradeable; earlier shadow-only relief no longer blocks execution."
+    normalized["state_override_reason"] = (
+        "Final evidence tier is tradeable; earlier shadow-only relief no longer blocks execution."
+    )
     return normalized
 
 
@@ -156,16 +166,29 @@ def evidence(decision):
         "expected_net_return_pct": roundv(expected_net(decision)),
         "aggregate_expected_net_return_pct": roundv(opp.get("expected_net_return_pct")),
         "profit_quality_ratio": roundv(profit_quality(decision)),
-        "loss_probability": roundv(opp.get("server_profit_loss_probability", opp.get("loss_probability"))),
+        "loss_probability": roundv(
+            opp.get("server_profit_loss_probability", opp.get("loss_probability"))
+        ),
         "tail_risk_score": roundv(opp.get("tail_risk_score")),
-        "strong_positive_net_relief": safe_dict(safe_dict(opp.get("evidence_score")).get("strong_positive_net_relief")),
+        "hard_block": bool(ev.get("hard_block")),
+        "hard_block_reasons": safe_list(ev.get("hard_block_reasons")),
+        "advisory_wait_reasons": safe_list(ev.get("advisory_wait_reasons")),
+        "aligned_support_sources": safe_list(ev.get("aligned_support_sources")),
+        "major_opposites": safe_list(ev.get("major_opposites")),
+        "weak_opposites": safe_list(ev.get("weak_opposites")),
+        "strong_opposites": safe_list(ev.get("strong_opposites")),
+        "strong_positive_net_relief": safe_dict(
+            safe_dict(opp.get("evidence_score")).get("strong_positive_net_relief")
+        ),
         "positive_net_probe_relief": normalize_relief_for_final_contract(
             safe_dict(safe_dict(opp.get("evidence_score")).get("positive_net_probe_relief")),
             final_shadow_only,
             final_tier,
             final_score,
         ),
-        "memory_missed_opportunity_relief": safe_dict(safe_dict(opp.get("evidence_score")).get("memory_missed_opportunity_relief")),
+        "memory_missed_opportunity_relief": safe_dict(
+            safe_dict(opp.get("evidence_score")).get("memory_missed_opportunity_relief")
+        ),
         "memory_habit_adjustment": safe_dict(opp.get("memory_habit_adjustment")),
         "tradeable_probe": bool(ev.get("tradeable_probe")),
         "shadow_only": final_shadow_only,
@@ -186,6 +209,30 @@ def expected_net_components(decision):
         key = str(item.get("key") or "unknown")
         result[key] = safe_float(item.get("contribution_pct"))
     return result
+
+
+def evidence_components(decision):
+    ev = safe_dict(opportunity(decision).get("evidence_score"))
+    result = []
+    for item in safe_list(ev.get("components")):
+        if isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+def entry_skip_kind(decision):
+    raw = safe_dict(decision.raw_llm_response)
+    shadow = safe_dict(raw.get("entry_evidence_shadow_only"))
+    if shadow.get("skip_kind"):
+        return str(shadow.get("skip_kind"))
+    machine = safe_dict(raw.get("decision_state_machine"))
+    for event in reversed(safe_list(machine.get("stages"))):
+        if not isinstance(event, dict):
+            continue
+        data = safe_dict(event.get("data"))
+        if data.get("skip_kind"):
+            return str(data.get("skip_kind"))
+    return "unknown"
 
 
 def local_ml_readiness_summary():
@@ -380,10 +427,17 @@ async def main():
     cooldown_examples = []
     shadow_only_examples = []
     market_entry_score_gaps = []
+    market_entry_evidence_effective_scores = []
     market_entry_profit_quality_values = []
     market_entry_loss_probabilities = []
     market_entry_tail_risks = []
     market_entry_component_contributions = {}
+    market_entry_evidence_tier_counts = Counter()
+    market_entry_final_skip_kind_counts = Counter()
+    market_entry_evidence_component_status_counts = Counter()
+    market_entry_shadow_only_count = 0
+    market_entry_tradeable_probe_count = 0
+    market_entry_hard_block_count = 0
     analysis_type_counts = Counter(analysis_type(d) for d in decisions)
     analysis_type_action_counts = Counter(
         f"{analysis_type(d)}:{str(d.action or 'unknown').lower()}" for d in decisions
@@ -402,6 +456,21 @@ async def main():
             market_entry_score_gaps.append(
                 safe_float(ev.get("score")) - safe_float(ev.get("min_score_required"))
             )
+            market_entry_evidence_effective_scores.append(
+                safe_float(ev.get("effective_score"))
+            )
+            market_entry_evidence_tier_counts[str(ev.get("tier") or "unknown")] += 1
+            market_entry_final_skip_kind_counts[entry_skip_kind(d)] += 1
+            if ev.get("shadow_only"):
+                market_entry_shadow_only_count += 1
+            if ev.get("tradeable_probe"):
+                market_entry_tradeable_probe_count += 1
+            if ev.get("hard_block"):
+                market_entry_hard_block_count += 1
+            for item in evidence_components(d):
+                source = str(item.get("source") or "unknown")
+                status = str(item.get("status") or "unknown")
+                market_entry_evidence_component_status_counts[f"{source}:{status}"] += 1
             market_entry_profit_quality_values.append(
                 safe_float(ev.get("profit_quality_ratio"))
             )
@@ -433,7 +502,9 @@ async def main():
         if is_shadow_only_entry_decision(d):
             shadow_only_examples.append(d)
         raw = safe_dict(d.raw_llm_response)
-        cooldown = safe_dict(raw.get("loss_cooldown_override")) or safe_dict(safe_dict(raw.get("opportunity_score")).get("loss_cooldown_override"))
+        cooldown = safe_dict(raw.get("loss_cooldown_override")) or safe_dict(
+            safe_dict(raw.get("opportunity_score")).get("loss_cooldown_override")
+        )
         if cooldown:
             cooldown_examples.append({
                 "id": d.id,
@@ -572,7 +643,23 @@ async def main():
         "memory_habit_applied_counts": dict(memory_applied.most_common(10)),
         "shadow_memory_component_counts": dict(shadow_memory_component_counts.most_common(10)),
         "shadow_memory_contribution_stats": stats(shadow_memory_contributions),
+        "market_entry_opportunity_score_gap_stats": stats(market_entry_score_gaps),
         "market_entry_score_gap_stats": stats(market_entry_score_gaps),
+        "market_entry_evidence_effective_score_stats": stats(
+            market_entry_evidence_effective_scores
+        ),
+        "market_entry_evidence_tier_counts": dict(
+            market_entry_evidence_tier_counts.most_common(20)
+        ),
+        "market_entry_final_skip_kind_counts": dict(
+            market_entry_final_skip_kind_counts.most_common(20)
+        ),
+        "market_entry_evidence_component_status_counts": dict(
+            market_entry_evidence_component_status_counts.most_common(40)
+        ),
+        "market_entry_evidence_shadow_only_count": market_entry_shadow_only_count,
+        "market_entry_evidence_tradeable_probe_count": market_entry_tradeable_probe_count,
+        "market_entry_evidence_hard_block_count": market_entry_hard_block_count,
         "market_entry_profit_quality_stats": stats(market_entry_profit_quality_values),
         "market_entry_loss_probability_stats": stats(market_entry_loss_probabilities),
         "market_entry_tail_risk_stats": stats(market_entry_tail_risks),

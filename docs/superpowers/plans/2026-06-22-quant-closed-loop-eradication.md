@@ -900,6 +900,52 @@ AI 防偏要求：
 
 ---
 
+## 二十四、Batch H 补充记录：entry evidence 阻塞口径修正（2026-06-23）
+
+触发原因：前一轮观察已经证明线上有 market 候选且全部未下单，但只看 `score_gap = opportunity_score.score - min_score_required` 容易让后续 AI 走偏，把它误当成唯一硬阻塞，再去直接降阈值制造成交。实际执行口径还必须看 `evidence_score.tier`、`effective_score`、`decision_state_machine.skip_kind`、`shadow_only`、`tradeable_probe`、`hard_block` 和最终 `position_size_pct`。
+
+本次修复范围：
+- `scripts/inspect_online_strategy_health.py`：新增 `evidence_components(decision)` 与 `entry_skip_kind(decision)`，输出 `market_entry_opportunity_score_gap_stats`、`market_entry_evidence_effective_score_stats`、`market_entry_evidence_tier_counts`、`market_entry_final_skip_kind_counts`、`market_entry_evidence_component_status_counts`、`market_entry_evidence_shadow_only_count`、`market_entry_evidence_tradeable_probe_count`、`market_entry_evidence_hard_block_count`，并在 entry examples 中补充 `hard_block`、`hard_block_reasons`、`advisory_wait_reasons`、`aligned_support_sources`、`major_opposites`、`weak_opposites`、`strong_opposites`。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，先确认缺少上述字段时测试失败，再锁定脚本必须输出最终入场阻塞口径，避免后续观察退化成只看 orders、expected net 或 score gap。
+
+安全边界：
+- 本批只增强只读诊断字段，不放宽开仓阈值，不改杠杆、仓位、平仓、模型权重、专家路由或风控门，不修改真实库历史数据。
+- `expected_net_return_pct > 0`、`shadow_memory` 正贡献、`ai` 正贡献或 `score_gap` 接近阈值，都不能单独升级为开仓理由。
+- 如果继续 0 订单，下一步必须解释证据有效分、组件状态、ML degraded、server_profit opposite、sentiment opposite、profit quality、loss probability、tail risk 和同币种同方向历史，而不是直接降低门槛或硬改 readiness。
+
+本地验证：
+- 已按 TDD 增加 `test_strategy_health_report_exposes_entry_execution_blocking_contract`，先看到缺字段失败，再实现脚本输出后通过。
+- `pytest tests/test_inspect_online_strategy_health.py -q`：7 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+
+线上只读复查（同步前，当前本地脚本远端执行，`2026-06-23T01:19:53Z`）：
+- 120 分钟窗口共 310 decisions，其中 `market_decisions=124`、`position_review_decisions=185`、`entry_decisions=12`、`market_entry_decisions=11`；`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 11 个 market entry 候选全部未执行，`entry_state_counts` 为 `risk_check:skipped=12`；market 候选 `position_size_pct` 全部为 0。
+- market 候选 `expected_net_return_pct` 全部为正，但这不是开仓结论；`market_entry_opportunity_score_gap_stats` 全部为负（min -2.578678、median -1.989693、max -0.753132）。
+- 新增最终执行口径显示：`market_entry_evidence_tier_counts.blocked=11`，`market_entry_final_skip_kind_counts.entry_evidence_wait=11`，`market_entry_evidence_effective_score_stats` 为 min 29.241435、median 31.25256、max 34.41474。
+- 当前不是 hard risk block、shadow-only 或 tradeable probe：`market_entry_evidence_hard_block_count=0`、`market_entry_evidence_shadow_only_count=0`、`market_entry_evidence_tradeable_probe_count=0`。
+- 组件状态显示：`ai:aligned=11`、`shadow_memory:aligned=11`、`ml:ignored=11`、`timeseries:aligned=10`，但 `sentiment:opposite=10`、`server_profit:opposite=9`、`server_profit:ignored_negative_expected=2`、`symbol_side_history:opposite=2`。也就是说，当前正 EV 主要由 AI 与影子记忆支撑，ML 因 degraded 被忽略，server_profit 与情绪多数反向，最终证据有效分仍低于可交易底线。
+
+同步后复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 部署后 10 分钟窗口（`2026-06-23T01:24:53Z`）：32 decisions，其中 `market_decisions=12`、`position_review_decisions=19`、`entry_decisions=2`、`market_entry_decisions=1`；`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。该 market 候选为 `blocked`，最终 `entry_pre_execution_skip`，实际下单方向费后预期净收益为 -0.071697%，系统未提交订单。
+- 部署后 120 分钟窗口（`2026-06-23T01:24:53Z`）：314 decisions，其中 `market_decisions=129`、`position_review_decisions=184`、`entry_decisions=13`、`market_entry_decisions=12`；`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 120 分钟窗口的 12 个 market 候选全部为 `market_entry_evidence_tier_counts.blocked=12`；最终 `market_entry_final_skip_kind_counts` 为 `entry_evidence_wait=11`、`entry_pre_execution_skip=1`；`market_entry_evidence_effective_score_stats` 为 min 28.76099、median 31.25256、max 34.41474；`hard_block=0`、`shadow_only=0`、`tradeable_probe=0`。
+- 120 分钟窗口组件状态：`ai:aligned=12`、`shadow_memory:aligned=12`、`ml:ignored=12`、`timeseries:aligned=11`，但 `sentiment:opposite=11`、`server_profit:opposite=9`、`server_profit:ignored_negative_expected=3`、`symbol_side_history:opposite=2`。`local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`。
+- 稳定口径系统巡检（`record_history=False`，Python/dotenv 加载 app/runtime env 后以 OS 用户 `bb` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 7、observing 4。`trade_loop` 最近 2 小时 310 decisions、0 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh；`trade_execution_contract.current_summary.contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`，历史 24h violation 仍保留为 warning；`runtime_text_integrity` 为 ok，扫描 815 条。
+
+当前结论：
+- 当前 0 订单不是暂停态、观察脚本覆盖、下单链路丢单、硬风控误杀或 shadow-only 造成；更精确地说，是入场证据状态机给出 `entry_evidence_wait`，证据 tier 仍为 `blocked`，仓位计算保持 0。
+- 这说明“弱证据不执行、风控不绕过”的约束仍在生效；同时也说明收益闭环仍未完成，不能把 0 失败订单误当成策略已经会赚钱。
+- 后续优先诊断为什么有效证据分长期停在 29-34 区间：ML readiness、server_profit 方向收益为负、sentiment opposite、profit quality 偏低、loss probability/tail risk 偏高、成本/滑点压力、同币种同方向历史不足或质量不够。不得通过降阈值、放大仓位、强开 probe、硬改 `ready` 来制造成交。
+
+回滚点：
+- 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务行为变更、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

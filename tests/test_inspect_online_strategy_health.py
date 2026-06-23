@@ -53,6 +53,24 @@ def test_strategy_health_report_exposes_market_entry_evidence_chain_stats() -> N
     assert '"market_entry_expected_net_component_stats": {' in template
 
 
+def test_strategy_health_report_exposes_entry_execution_blocking_contract() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "def evidence_components(decision):" in template
+    assert "def entry_skip_kind(decision):" in template
+    assert "market_entry_evidence_effective_scores.append" in template
+    assert "market_entry_evidence_tier_counts" in template
+    assert "market_entry_final_skip_kind_counts" in template
+    assert "market_entry_evidence_component_status_counts" in template
+    assert '"market_entry_opportunity_score_gap_stats": stats(market_entry_score_gaps)' in template
+    assert '"market_entry_evidence_effective_score_stats": stats(' in template
+    assert '"market_entry_evidence_shadow_only_count": market_entry_shadow_only_count' in template
+    assert (
+        '"market_entry_evidence_tradeable_probe_count": market_entry_tradeable_probe_count'
+        in template
+    )
+
+
 def test_strategy_health_report_exposes_local_ml_readiness_summary() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 
