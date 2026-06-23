@@ -946,6 +946,60 @@ AI 防偏要求：
 
 ---
 
+## 二十五、Batch H 补充记录：拒单与快亏止损证据持久化（2026-06-23）
+
+触发原因：Batch H 继续观察期间，线上 120 分钟窗口开始出现真实订单样本，其中包含 1 条拒单和 1 条 15 分钟内亏损平仓。按停止规则，新增失败/拒绝订单和快亏平必须先核查，不能直接进入下一批功能扩展。本次只做只读诊断和未来事件的可追溯性补强，不放宽任何交易门槛。
+
+本次修复范围：
+- `services/execution_service.py`：在交易所确认与未确认两条路径中，把 `ExecutionResult` 的压缩快照写入 `decision.raw_response["execution_result"]`，包含 `order_id/exchange_order_id/status/quantity/price/fee/pnl/exchange_confirmed/exit_progress/raw_response`。这样未来 OKX 拒单、系统预提交拒绝、规则快照、请求参数和 `raw_error` 不会只停留在临时日志里。
+- `scripts/inspect_online_strategy_health.py`：新增 `order_execution_result(decision)`、`order_status_counts`、`non_filled_orders`、`rejected_orders`、`pending_or_open_orders` 和 `rejected_order_examples`，并在 entry examples 中输出执行结果快照，避免把拒单误读成已成交或把未成交原因丢失。
+- `scripts/inspect_online_strategy_health.py` 同时补充 entry evidence 原始分、有效分、分数 offset、阈值、组件 points、relief 状态和 advisory wait reasons，用来解释为什么某些候选从 `blocked` 进入受控 `exploration/weak_conflict_probe`，而不是让后续 AI 只看 `expected_net > 0` 后去降阈值。
+- `tests/test_inspect_online_strategy_health.py` 与 `tests/test_trading_service_boundaries.py`：用模板契约测试和执行服务边界测试锁定上述字段；拒单场景先确认缺少 `execution_result` 时测试失败，再实现持久化后通过。
+
+安全边界：
+- 本批不改变开仓阈值、证据 tier、probe 条件、杠杆、仓位、平仓、模型权重、专家路由或风控 veto。
+- 不修改真实库历史数据；历史拒单只做只读核查，缺失的历史 `raw_error` 不得补猜。
+- 拒单不是成交；拒单订单不得计入已开仓收益样本，也不得被用来证明策略有效或无效，只能作为执行链路诊断样本。
+- 快亏平只有在能找到强结构化退出证据时，才可归为风控退出；否则必须触发停止规则并回到 Batch E 定位。
+- `exploration` 或 `weak_conflict_probe` 只能按已有证据状态机的小额受控路径执行，不得被 AI 扩展成普遍放宽开仓。
+
+本地验证：
+- `pytest tests/test_inspect_online_strategy_health.py -q`：10 passed。
+- `pytest tests/test_trading_service_boundaries.py -q`：119 passed。
+- `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py services/execution_service.py tests/test_trading_service_boundaries.py`：0 issues。
+- `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py services/execution_service.py tests/test_trading_service_boundaries.py`：通过。
+- `git diff --check`：通过。
+- `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
+
+线上只读核查事实（同步前，使用当前本地诊断脚本读取线上数据）：
+- 120 分钟窗口约 `2026-06-23T02:01Z`：`orders=3`、`filled_orders=2`、`rejected_orders=1`、`non_filled_orders=1`、`positions_created=1`、`positions_closed=1`、`fast_loss_close_under_15m=1`、`executed_entries=1`。
+- 拒单样本为 order `2552`、decision `117291`、`SAHARA/USDT`、`short`、`status=rejected`、`quantity=0`、`exchange_order_id=null`。该决策没有成交，也没有创建持仓；它是受控 `exploration` probe，不是弱证据强行成交。
+- 该历史拒单在现有持久化数据里没有 OKX `raw_error`，journal 中也没有可恢复的完整拒单行。因此精确 OKX 拒绝码不可从当前数据还原，不能臆造。本批代码修复的是未来拒单的持久化缺口。
+- 120 分钟窗口的 market entry evidence 阈值为 weak_probe 35、exploration 45、small 60、medium 70、normal 80；tier 统计为 `blocked=12`、`weak_conflict_probe=2`、`exploration=2`；`tradeable_probe_count=2`、`shadow_only_count=2`、`hard_block_count=0`。ML 仍为 degraded，且不允许影响真实仓位放大。
+- 快亏样本为 ZETA position `1609`：entry order `2553`、decision `117311`、`ZETA/USDT` short，成交价约 `0.03825`、数量 `500`；exit order `2554`、decision `117320`、`ZETA/USDT:USDT` close_short，成交价约 `0.03829`、数量 `500`；持仓约 `2.43` 分钟，realized PnL 约 `-0.039135 USDT`。
+- ZETA exit decision `117320` 存在强结构化退出证据：`forced_exit=true`、`exit_intent=hard_risk`、`close_evidence.forced_exit=true`、`close_evidence.exit_intent=hard_risk`、`position_release_policy.release_reason="severe_loss_pressure; signal_reversal_watch"`、`position_quality.bucket="release_now"`、score `22.0`，并且 `exit_quality.invalidation` 中 `severe/key_break/trend_reversal` 为 true。因此该快亏从当前证据看符合强退出证据要求，但部署后仍必须用系统巡检的 `trade_execution_contract.current_summary.fast_loss_without_strong_exit_count=0` 再确认。
+
+同步后复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步 3 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`、`services/execution_service.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 部署后 15 分钟窗口（`2026-06-23T02:33:44Z`）：43 decisions，其中 `market_decisions=17`、`position_review_decisions=26`；`entry_decisions=0`、`orders=0`、`rejected_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 部署后 120 分钟窗口（`2026-06-23T02:33:58Z`）：330 decisions，其中 `market_decisions=133`、`position_review_decisions=196`、`entry_decisions=14`、`market_entry_decisions=13`；`orders=3`、`filled_orders=2`、`rejected_orders=1`、`pending_or_open_orders=0`、`positions_created=1`、`positions_closed=1`、`fast_loss_close_under_15m=1`。该窗口仍包含同步前 SAHARA 拒单与 ZETA 快亏样本。
+- 120 分钟窗口中 SAHARA 拒单 example 的 `execution_result` 仍为空，证明历史拒单的 OKX raw error 未能倒推恢复；本批修复只保证未来 `exchange_not_confirmed` 路径会写入 `execution_result.raw_response`。
+- 部署后 120 分钟 market entry evidence：阈值仍为 weak_probe 35、exploration 45、small 60、medium 70、normal 80；tier 统计为 `blocked=9`、`weak_conflict_probe=2`、`exploration=2`；raw score median `41.264163`，effective score median `34.40461`，score offset median `10.0`。
+- `local_ml_readiness` 仍为 `degraded`，`allow_live_position_influence=false`；阻塞项仍包括 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`，不得硬改 ready 或让未达标 ML 放大仓位。
+- 稳定口径系统巡检（`record_history=False`，继承 dashboard 环境、以 OS 用户 `bb` 和 `/data/bb/app/.venv/bin/python` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 9、ok 7；`trade_loop` 为 ok，最近 2 小时 3 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh。
+- `trade_execution_contract` 巡检为 ok；全窗口 summary 中 `weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`、`contract_violation_count=0`。当前 runtime window 自 `2026-06-23T02:28:34Z` 起：25 decisions、0 executed entries、0 weak evidence executed、0 fast loss without strong exit、0 contract violations。
+- `runtime_text_integrity` 为 ok，扫描 810 条记录，疑似乱码记录 0；本轮没有引入新的运行时文本污染。
+
+当前结论：
+- 这轮发现的是一个未来拒单可追溯性缺口，不是交易策略需要放宽的证据。历史 SAHARA 拒单原因缺失只能如实记录为不可恢复。
+- ZETA 快亏金额很小，且当前 raw evidence 指向硬风控退出；它不应被用来禁止必要止损，也不应被用来放宽入场。真正要守住的是：未来 `fast_loss_without_strong_exit_count` 必须为 0。
+- Batch H 仍处于观察阶段，不是全绿完成。后续必须继续看 15m/120m/24h 窗口里的新增拒单、弱证据执行、快亏无强退出、loss re-entry 和收益闭环，不得只因为出现少量成交就推进仓位放大。
+
+回滚点：
+- 代码层可回滚 `services/execution_service.py`、`scripts/inspect_online_strategy_health.py` 与对应测试；本批无 DB 迁移、无历史覆盖、无真实交易参数放宽。
+
+---
+
 这版核心就是：**不再围绕现有死框架修补，而是建立一个模型/专家/策略持续竞赛、淘汰、替换、增强的系统，最终以最懂赚钱、最懂数字货币投资的组合为准。**
 
 新增防偏内容只服务一个目的：让后续 AI 按这个总控执行时，不会偷换目标、不乱放宽交易、不硬改状态、不造假指标、不跳过验证。

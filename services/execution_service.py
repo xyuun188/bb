@@ -561,6 +561,48 @@ class ExecutionService:
             }
             decision.raw_response = raw_response
 
+        def compact_execution_value(value: Any, depth: int = 0) -> Any:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if depth >= 4:
+                return safe_error_text(value, limit=300)
+            if isinstance(value, dict):
+                return {
+                    str(key): compact_execution_value(child, depth + 1)
+                    for key, child in list(value.items())[:40]
+                }
+            if isinstance(value, list):
+                return [compact_execution_value(child, depth + 1) for child in value[:25]]
+            return safe_error_text(value, limit=300)
+
+        def attach_execution_result_snapshot(
+            source: str,
+            *,
+            exchange_confirmed: bool = False,
+            exit_progress: bool = False,
+        ) -> None:
+            if execution_result is None:
+                return
+            status = getattr(execution_result, "status", None)
+            raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw_response = dict(raw_response)
+            raw_response["execution_result"] = {
+                "source": source,
+                "order_id": getattr(execution_result, "order_id", None),
+                "exchange_order_id": getattr(execution_result, "exchange_order_id", None),
+                "status": getattr(status, "value", status),
+                "quantity": float(getattr(execution_result, "quantity", 0.0) or 0.0),
+                "price": float(getattr(execution_result, "price", 0.0) or 0.0),
+                "fee": float(getattr(execution_result, "fee", 0.0) or 0.0),
+                "pnl": float(getattr(execution_result, "pnl", 0.0) or 0.0),
+                "exchange_confirmed": bool(exchange_confirmed),
+                "exit_progress": bool(exit_progress),
+                "raw_response": compact_execution_value(
+                    getattr(execution_result, "raw_response", None)
+                ),
+            }
+            decision.raw_response = raw_response
+
         async def mark_stage(
             stage: str,
             status: str,
@@ -1107,6 +1149,11 @@ class ExecutionService:
                 await mark_decision_executed(decision_db_id, execution_result.price)
                 await mark_decision_reason(decision_db_id, confirm_reason)
                 attach_execution_parameters("exchange_confirmed")
+                attach_execution_result_snapshot(
+                    "exchange_confirmed",
+                    exchange_confirmed=exchange_confirmed,
+                    exit_progress=exit_progress,
+                )
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
                 if decision.is_entry:
                     clear_market_no_opportunity_symbol(symbol)
@@ -1116,6 +1163,11 @@ class ExecutionService:
                     execution_reason_from_result(execution_result),
                 )
                 attach_execution_parameters("exchange_not_confirmed")
+                attach_execution_result_snapshot(
+                    "exchange_not_confirmed",
+                    exchange_confirmed=exchange_confirmed,
+                    exit_progress=exit_progress,
+                )
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
             if model_mode != "paper" and decision.is_exit and execution_result.pnl != 0.0:
                 await persist_account_update(model_name, decision.model_name, execution_result)

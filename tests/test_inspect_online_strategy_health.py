@@ -1,6 +1,14 @@
 from scripts import inspect_online_strategy_health
 
 
+def test_strategy_health_remote_template_is_valid_python() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE.replace(
+        "__WINDOW_MINUTES__", "120"
+    )
+
+    compile(template, "<inspect_online_strategy_health_remote_template>", "exec")
+
+
 def test_strategy_health_remote_command_uses_unique_temp_files() -> None:
     command = inspect_online_strategy_health._build_remote_command(120, token="abc123")
 
@@ -69,6 +77,34 @@ def test_strategy_health_report_exposes_entry_execution_blocking_contract() -> N
         '"market_entry_evidence_tradeable_probe_count": market_entry_tradeable_probe_count'
         in template
     )
+
+
+def test_strategy_health_report_exposes_entry_score_breakdown_and_relief_diagnostics() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "ENTRY_EVIDENCE_SCORE_WEAK_PROBE" in template
+    assert "market_entry_evidence_raw_scores" in template
+    assert "market_entry_evidence_score_offsets" in template
+    assert "market_entry_evidence_component_point_stats" in template
+    assert "market_entry_evidence_relief_applied_counts" in template
+    assert "market_entry_advisory_wait_reason_counts" in template
+    assert '"entry_evidence_thresholds": {' in template
+    assert '"market_entry_evidence_raw_score_stats": stats(' in template
+    assert '"market_entry_evidence_score_offset_stats": stats(' in template
+
+
+def test_strategy_health_report_exposes_rejected_order_diagnostics() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "def order_execution_result(decision):" in template
+    assert "order_status_counts = Counter" in template
+    assert "rejected_orders = [" in template
+    assert "non_filled_orders = [" in template
+    assert '"order_status_counts": dict(order_status_counts.most_common(20))' in template
+    assert '"non_filled_orders": len(non_filled_orders)' in template
+    assert '"rejected_orders": len(rejected_orders)' in template
+    assert '"rejected_order_examples": rejected_order_examples' in template
+    assert '"execution_result": order_execution_result(d)' in template
 
 
 def test_strategy_health_report_exposes_local_ml_readiness_summary() -> None:

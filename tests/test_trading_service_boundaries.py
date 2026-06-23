@@ -3212,6 +3212,65 @@ async def test_execution_service_serializes_candidate_execution():
     assert not any(call[0] in {"executor", "place_order"} for call in calls)
     assert ("risk_check", "skipped", blocked_reason) in stages
 
+    class RejectingExecutor:
+        async def place_order(self, decision, account_id=None, override_balance=None):
+            assert lock.locked()
+            calls.append(
+                (
+                    "place_rejected_order",
+                    account_id,
+                    decision.action.value,
+                    override_balance,
+                )
+            )
+            return ExecutionResult(
+                order_id="okx_rejected",
+                exchange_order_id=None,
+                symbol=decision.symbol,
+                side=decision.action.value,
+                order_type="market",
+                quantity=0.0,
+                price=0.01764,
+                status=OrderStatus.REJECTED,
+                raw_response={
+                    "error": "OKX rejected entry order",
+                    "raw_error": "51008 Insufficient USDT margin",
+                    "execution_blocker": "okx_exchange_rejection",
+                    "okx_rejection": True,
+                    "system_pre_submit_rejection": False,
+                    "okx_order_rules": {"final_contracts": 1.0},
+                },
+            )
+
+    async def get_rejecting_okx_executor(mode):
+        calls.append(("rejecting_executor", mode))
+        return RejectingExecutor()
+
+    calls.clear()
+    stages.clear()
+    raw_updates.clear()
+    service.entry_policy_evaluator = evaluate_entry_policy
+    service.okx_executor_provider = get_rejecting_okx_executor
+    rejected_results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+    rejected_result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _decision(Action.LONG),
+        SimpleNamespace(warnings=[]),
+        126,
+        rejected_results,
+        open_positions=[],
+    )
+
+    assert rejected_result is not None
+    assert rejected_result.status == OrderStatus.REJECTED
+    assert raw_updates[-1] is not None
+    execution_result = raw_updates[-1]["execution_result"]
+    assert execution_result["status"] == "rejected"
+    assert execution_result["exchange_confirmed"] is False
+    assert execution_result["raw_response"]["raw_error"] == "51008 Insufficient USDT margin"
+    assert execution_result["raw_response"]["execution_blocker"] == "okx_exchange_rejection"
+
 
 @pytest.mark.asyncio
 async def test_execution_service_fails_fast_without_execution_lock_dependency():

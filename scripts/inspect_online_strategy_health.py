@@ -31,6 +31,13 @@ from models.trade import Order, Position
 from models.learning import ShadowBacktest, ExpertMemory, StrategyLearningEvent
 from services.decision_state import decision_state_from_raw
 from services.ml_signal_service import MLSignalService
+from services.entry_evidence import (
+    ENTRY_EVIDENCE_SCORE_MEDIUM,
+    ENTRY_EVIDENCE_SCORE_NORMAL,
+    ENTRY_EVIDENCE_SCORE_PROBE,
+    ENTRY_EVIDENCE_SCORE_SMALL,
+    ENTRY_EVIDENCE_SCORE_WEAK_PROBE,
+)
 
 WINDOW_MINUTES = __WINDOW_MINUTES__
 FAST_CLOSE_MINUTES = 15
@@ -161,6 +168,8 @@ def evidence(decision):
     return {
         "tier": final_tier,
         "effective_score": roundv(final_score),
+        "entry_evidence_score": roundv(ev.get("score")),
+        "entry_evidence_score_offset": roundv(safe_float(ev.get("score")) - final_score),
         "score": roundv(opp.get("score")),
         "min_score_required": roundv(opp.get("min_score_required")),
         "expected_net_return_pct": roundv(expected_net(decision)),
@@ -177,17 +186,29 @@ def evidence(decision):
         "major_opposites": safe_list(ev.get("major_opposites")),
         "weak_opposites": safe_list(ev.get("weak_opposites")),
         "strong_opposites": safe_list(ev.get("strong_opposites")),
-        "strong_positive_net_relief": safe_dict(
-            safe_dict(opp.get("evidence_score")).get("strong_positive_net_relief")
+          "strong_positive_net_relief": safe_dict(
+              safe_dict(opp.get("evidence_score")).get("strong_positive_net_relief")
+          ),
+        "missing_key_degraded_relief": safe_dict(
+            safe_dict(opp.get("evidence_score")).get("missing_key_degraded_relief")
         ),
-        "positive_net_probe_relief": normalize_relief_for_final_contract(
-            safe_dict(safe_dict(opp.get("evidence_score")).get("positive_net_probe_relief")),
-            final_shadow_only,
+          "positive_net_probe_relief": normalize_relief_for_final_contract(
+              safe_dict(safe_dict(opp.get("evidence_score")).get("positive_net_probe_relief")),
+              final_shadow_only,
             final_tier,
             final_score,
         ),
         "memory_missed_opportunity_relief": safe_dict(
             safe_dict(opp.get("evidence_score")).get("memory_missed_opportunity_relief")
+        ),
+        "short_probe_relief": normalize_relief_for_final_contract(
+            safe_dict(safe_dict(opp.get("evidence_score")).get("short_probe_relief")),
+            final_shadow_only,
+            final_tier,
+            final_score,
+        ),
+        "short_evidence_adjustment": safe_dict(
+            safe_dict(opp.get("evidence_score")).get("short_evidence_adjustment")
         ),
         "memory_habit_adjustment": safe_dict(opp.get("memory_habit_adjustment")),
         "tradeable_probe": bool(ev.get("tradeable_probe")),
@@ -218,6 +239,15 @@ def evidence_components(decision):
         if isinstance(item, dict):
             result.append(item)
     return result
+
+
+ENTRY_EVIDENCE_RELIEF_KEYS = (
+    "missing_key_degraded_relief",
+    "positive_net_probe_relief",
+    "memory_missed_opportunity_relief",
+    "strong_positive_net_relief",
+    "short_probe_relief",
+)
 
 
 def entry_skip_kind(decision):
@@ -324,6 +354,40 @@ def order_notional(order):
     return safe_float(order.quantity) * safe_float(order.price)
 
 
+def order_execution_result(decision):
+    if decision is None:
+        return {}
+    raw = safe_dict(decision.raw_llm_response)
+    result = safe_dict(raw.get("execution_result"))
+    if not result:
+        return {}
+    raw_result = safe_dict(result.get("raw_response"))
+    return {
+        "source": result.get("source") or "",
+        "order_id": result.get("order_id"),
+        "exchange_order_id": result.get("exchange_order_id"),
+        "status": result.get("status") or "",
+        "quantity": roundv(result.get("quantity")),
+        "price": roundv(result.get("price")),
+        "fee": roundv(result.get("fee")),
+        "pnl": roundv(result.get("pnl")),
+        "exchange_confirmed": bool(result.get("exchange_confirmed")),
+        "exit_progress": bool(result.get("exit_progress")),
+        "error": short_text(raw_result.get("error"), 500),
+        "raw_error": short_text(raw_result.get("raw_error"), 900),
+        "execution_blocker": raw_result.get("execution_blocker") or "",
+        "okx_rejection": bool(raw_result.get("okx_rejection")),
+        "system_pre_submit_rejection": bool(
+            raw_result.get("system_pre_submit_rejection")
+        ),
+        "okx_symbol": raw_result.get("okx_symbol") or "",
+        "planned_order_contracts": roundv(raw_result.get("planned_order_contracts")),
+        "planned_base_quantity": roundv(raw_result.get("planned_base_quantity")),
+        "okx_order_rules": safe_dict(raw_result.get("okx_order_rules")),
+        "request_params": safe_dict(raw_result.get("request_params")),
+    }
+
+
 def stats(vals):
     vals = [safe_float(v) for v in vals]
     if not vals:
@@ -407,6 +471,7 @@ async def main():
     ]
     market_entry_decisions = [d for d in entry_decisions if analysis_type(d) == "market"]
     executed_entries = [d for d in entry_decisions if bool(d.was_executed)]
+    decision_by_id = {d.id: d for d in decisions}
     order_by_decision = {}
     for order in orders:
         if order.decision_id and order.decision_id not in order_by_decision:
@@ -427,14 +492,19 @@ async def main():
     cooldown_examples = []
     shadow_only_examples = []
     market_entry_score_gaps = []
+    market_entry_evidence_raw_scores = []
     market_entry_evidence_effective_scores = []
+    market_entry_evidence_score_offsets = []
     market_entry_profit_quality_values = []
     market_entry_loss_probabilities = []
     market_entry_tail_risks = []
     market_entry_component_contributions = {}
+    market_entry_evidence_component_points = {}
     market_entry_evidence_tier_counts = Counter()
     market_entry_final_skip_kind_counts = Counter()
     market_entry_evidence_component_status_counts = Counter()
+    market_entry_evidence_relief_applied_counts = Counter()
+    market_entry_advisory_wait_reason_counts = Counter()
     market_entry_shadow_only_count = 0
     market_entry_tradeable_probe_count = 0
     market_entry_hard_block_count = 0
@@ -456,8 +526,14 @@ async def main():
             market_entry_score_gaps.append(
                 safe_float(ev.get("score")) - safe_float(ev.get("min_score_required"))
             )
+            market_entry_evidence_raw_scores.append(
+                safe_float(ev.get("entry_evidence_score"))
+            )
             market_entry_evidence_effective_scores.append(
                 safe_float(ev.get("effective_score"))
+            )
+            market_entry_evidence_score_offsets.append(
+                safe_float(ev.get("entry_evidence_score_offset"))
             )
             market_entry_evidence_tier_counts[str(ev.get("tier") or "unknown")] += 1
             market_entry_final_skip_kind_counts[entry_skip_kind(d)] += 1
@@ -471,6 +547,20 @@ async def main():
                 source = str(item.get("source") or "unknown")
                 status = str(item.get("status") or "unknown")
                 market_entry_evidence_component_status_counts[f"{source}:{status}"] += 1
+                market_entry_evidence_component_points.setdefault(source, []).append(
+                    safe_float(item.get("points"))
+                )
+            for key in ENTRY_EVIDENCE_RELIEF_KEYS:
+                relief = safe_dict(ev.get(key))
+                state_key = "applied" if relief.get("applied") else "not_applied"
+                market_entry_evidence_relief_applied_counts[f"{key}:{state_key}"] += 1
+                if relief.get("tradeable_probe"):
+                    market_entry_evidence_relief_applied_counts[f"{key}:tradeable_probe"] += 1
+                if relief.get("shadow_only"):
+                    market_entry_evidence_relief_applied_counts[f"{key}:shadow_only"] += 1
+            for wait_reason in safe_list(ev.get("advisory_wait_reasons")):
+                if wait_reason:
+                    market_entry_advisory_wait_reason_counts[str(wait_reason)] += 1
             market_entry_profit_quality_values.append(
                 safe_float(ev.get("profit_quality_ratio"))
             )
@@ -530,6 +620,7 @@ async def main():
                 "state": st,
                 "evidence": ev,
                 "sizing": sz,
+                "execution_result": order_execution_result(d),
                 "order": ({
                     "status": order.status,
                     "quantity": roundv(order.quantity),
@@ -601,8 +692,50 @@ async def main():
 
     memory_counts = Counter(str(m.memory_type or "unknown") for m in memories)
     event_counts = Counter(str(e.event_type or "unknown") for e in events)
+    order_status_counts = Counter(str(o.status or "unknown").lower() for o in orders)
     filled_orders = [o for o in orders if str(o.status or "").lower() == "filled"]
-    failed_orders = [o for o in orders if str(o.status or "").lower() != "filled"]
+    non_filled_orders = [o for o in orders if str(o.status or "").lower() != "filled"]
+    rejected_orders = [
+        o
+        for o in orders
+        if str(o.status or "").lower()
+        in {"rejected", "failed", "error", "cancelled", "canceled"}
+    ]
+    pending_or_open_orders = [
+        o
+        for o in orders
+        if str(o.status or "").lower() in {"pending", "open", "partial"}
+    ]
+    failed_orders = non_filled_orders
+    rejected_order_examples = []
+    for order in rejected_orders[:30]:
+        decision = decision_by_id.get(order.decision_id)
+        rejected_order_examples.append(
+            {
+                "id": order.id,
+                "decision_id": order.decision_id,
+                "time": aware(order.created_at).isoformat() if aware(order.created_at) else "",
+                "symbol": order.symbol,
+                "side": order.side,
+                "status": order.status,
+                "quantity": roundv(order.quantity),
+                "price": roundv(order.price),
+                "notional": roundv(order_notional(order)),
+                "exchange_order_id": order.exchange_order_id,
+                "execution_reason": short_text(
+                    getattr(decision, "execution_reason", "") if decision else "",
+                    500,
+                ),
+                "execution_parameters": safe_dict(
+                    safe_dict(getattr(decision, "raw_llm_response", None)).get(
+                        "execution_parameters"
+                    )
+                    if decision
+                    else {}
+                ),
+                "execution_result": order_execution_result(decision),
+            }
+        )
     report = {
         "window_minutes": WINDOW_MINUTES,
         "generated_at": now.isoformat(),
@@ -617,6 +750,9 @@ async def main():
             "orders": len(orders),
             "filled_orders": len(filled_orders),
             "failed_orders": len(failed_orders),
+            "non_filled_orders": len(non_filled_orders),
+            "rejected_orders": len(rejected_orders),
+            "pending_or_open_orders": len(pending_or_open_orders),
             "positions_created": len(positions),
             "positions_closed": len(closed),
             "open_positions": len(open_positions),
@@ -628,6 +764,7 @@ async def main():
             "strategy_learning_events": len(events),
         },
         "action_counts": dict(Counter(str(d.action or "unknown").lower() for d in decisions)),
+        "order_status_counts": dict(order_status_counts.most_common(20)),
         "analysis_type_counts": dict(analysis_type_counts.most_common(20)),
         "analysis_type_action_counts": dict(analysis_type_action_counts.most_common(40)),
         "entry_candidate_evidence_by_type": dict(
@@ -641,25 +778,48 @@ async def main():
         "low_payoff_entry_count": low_payoff_count,
         "strategy_probe_cap_count": strategy_probe_count,
         "memory_habit_applied_counts": dict(memory_applied.most_common(10)),
-        "shadow_memory_component_counts": dict(shadow_memory_component_counts.most_common(10)),
-        "shadow_memory_contribution_stats": stats(shadow_memory_contributions),
-        "market_entry_opportunity_score_gap_stats": stats(market_entry_score_gaps),
-        "market_entry_score_gap_stats": stats(market_entry_score_gaps),
-        "market_entry_evidence_effective_score_stats": stats(
-            market_entry_evidence_effective_scores
+          "shadow_memory_component_counts": dict(shadow_memory_component_counts.most_common(10)),
+          "shadow_memory_contribution_stats": stats(shadow_memory_contributions),
+        "entry_evidence_thresholds": {
+            "weak_probe": ENTRY_EVIDENCE_SCORE_WEAK_PROBE,
+            "exploration": ENTRY_EVIDENCE_SCORE_PROBE,
+            "small": ENTRY_EVIDENCE_SCORE_SMALL,
+            "medium": ENTRY_EVIDENCE_SCORE_MEDIUM,
+            "normal": ENTRY_EVIDENCE_SCORE_NORMAL,
+        },
+          "market_entry_opportunity_score_gap_stats": stats(market_entry_score_gaps),
+          "market_entry_score_gap_stats": stats(market_entry_score_gaps),
+        "market_entry_evidence_raw_score_stats": stats(
+            market_entry_evidence_raw_scores
         ),
-        "market_entry_evidence_tier_counts": dict(
+          "market_entry_evidence_effective_score_stats": stats(
+              market_entry_evidence_effective_scores
+          ),
+        "market_entry_evidence_score_offset_stats": stats(
+            market_entry_evidence_score_offsets
+        ),
+          "market_entry_evidence_tier_counts": dict(
             market_entry_evidence_tier_counts.most_common(20)
         ),
         "market_entry_final_skip_kind_counts": dict(
             market_entry_final_skip_kind_counts.most_common(20)
         ),
-        "market_entry_evidence_component_status_counts": dict(
-            market_entry_evidence_component_status_counts.most_common(40)
+          "market_entry_evidence_component_status_counts": dict(
+              market_entry_evidence_component_status_counts.most_common(40)
+          ),
+        "market_entry_evidence_component_point_stats": {
+            key: stats(values)
+            for key, values in sorted(market_entry_evidence_component_points.items())
+        },
+        "market_entry_evidence_relief_applied_counts": dict(
+            market_entry_evidence_relief_applied_counts.most_common(30)
         ),
-        "market_entry_evidence_shadow_only_count": market_entry_shadow_only_count,
-        "market_entry_evidence_tradeable_probe_count": market_entry_tradeable_probe_count,
-        "market_entry_evidence_hard_block_count": market_entry_hard_block_count,
+        "market_entry_advisory_wait_reason_counts": dict(
+            market_entry_advisory_wait_reason_counts.most_common(20)
+        ),
+          "market_entry_evidence_shadow_only_count": market_entry_shadow_only_count,
+          "market_entry_evidence_tradeable_probe_count": market_entry_tradeable_probe_count,
+          "market_entry_evidence_hard_block_count": market_entry_hard_block_count,
         "market_entry_profit_quality_stats": stats(market_entry_profit_quality_values),
         "market_entry_loss_probability_stats": stats(market_entry_loss_probabilities),
         "market_entry_tail_risk_stats": stats(market_entry_tail_risks),
@@ -676,6 +836,7 @@ async def main():
         "strategy_event_type_counts": dict(event_counts.most_common(20)),
         "missed_samples": missed_samples,
         "entry_examples": examples,
+        "rejected_order_examples": rejected_order_examples,
         "loss_cooldown_examples": cooldown_examples[:30],
         "fast_loss_positions": fast_loss[:40],
         "current_open_positions": current_open,
