@@ -29,6 +29,13 @@ def test_strategy_health_report_splits_market_and_position_review_decisions() ->
     assert '"analysis_type": analysis_type(d)' in template
 
 
+def test_strategy_health_counts_entry_candidate_evidence_only_for_entry_decisions() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert "for d in entry_decisions:\n        raw = safe_dict(d.raw_llm_response)" in template
+    assert "for d in decisions:\n        raw = safe_dict(d.raw_llm_response)" not in template
+
+
 def test_strategy_health_report_exposes_market_entry_evidence_chain_stats() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 

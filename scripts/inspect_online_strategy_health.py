@@ -347,7 +347,7 @@ async def main():
         f"{analysis_type(d)}:{str(d.action or 'unknown').lower()}" for d in decisions
     )
     entry_candidate_evidence_by_type = Counter()
-    for d in decisions:
+    for d in entry_decisions:
         raw = safe_dict(d.raw_llm_response)
         if isinstance(raw.get("entry_candidate_evidence"), dict):
             entry_candidate_evidence_by_type[analysis_type(d)] += 1

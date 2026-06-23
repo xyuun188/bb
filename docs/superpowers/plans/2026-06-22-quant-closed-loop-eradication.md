@@ -823,7 +823,7 @@ AI 防偏要求：
 - 观察到 missed opportunity 或 shadow memory 正贡献，只能作为受限证据输入；不能把全局错过机会、单次暴涨样本或影子记忆直接升级成强制开仓理由。
 
 本地验证：
-- `pytest tests/test_inspect_online_strategy_health.py -q`：4 passed。
+- `pytest tests/test_inspect_online_strategy_health.py -q`：5 passed。
 - `ruff check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：0 issues。
 - `black --check scripts/inspect_online_strategy_health.py tests/test_inspect_online_strategy_health.py`：通过。
 - `python scripts/security_secret_scan.py --fail-on high .`：扫描 514 files OK。
@@ -832,6 +832,7 @@ AI 防偏要求：
 线上只读复查：
 - 新版策略健康脚本读取 120 分钟窗口：279 decisions，其中 `market_decisions=60`、`position_review_decisions=219`；`analysis_type_action_counts` 为 `position_review:hold=219`、`market:hold=54`、`market:short=5`、`market:long=1`。
 - `python scripts/sync_to_online_server.py --split-services` 已同步本次相关的 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
+- 追加修正：`entry_candidate_evidence_by_type` 之前按所有 decisions 统计 `entry_candidate_evidence` payload，容易把 market 扫描数误读成候选数；已改为只从 `entry_decisions` 统计，并用红绿测试锁定。修正后 30 分钟窗口 `market_entry_decisions=3` 且 `entry_candidate_evidence_by_type.market=3`；120 分钟窗口 `market_entry_decisions=8` 且 `entry_candidate_evidence_by_type.market=8`。
 - 该窗口有 `market_entry_decisions=6`，全部停在 `risk_check:skipped`；`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
 - 6 个 market 候选的 `expected_net_return_pct` 全部为正：min 0.298957、median 0.332347、max 0.337874；但 `position_size_pct` 全部为 0，不能据此认为已经满足开仓质量。
 - 6 个 market 候选的 `score_gap = score - min_score_required` 全部为负：min -2.330340、median -1.989693、max -0.753132，说明当前不是下单链路丢单，而是证据评分未达开仓门槛。
