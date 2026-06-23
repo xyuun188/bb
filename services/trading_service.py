@@ -1188,7 +1188,7 @@ class TradingService:
 
         error_text = str(reason)[:300]
         self._last_round_error = error_text
-        self._runtime_state().last_error = error_text
+        self._runtime_state(_analysis_scope_context.get()).last_error = error_text
         self._write_runtime_heartbeat()
 
     def increment_decision_count(self) -> None:
@@ -1892,6 +1892,8 @@ class TradingService:
         state = self._runtime_state(scope)
         state.last_finished_at = finished_at
         state.current_stage = "idle" if ok else "error"
+        if ok:
+            state.last_error = None
         if scope == "market":
             self._last_market_round_finished_at = finished_at
         elif scope == "position":
@@ -1912,6 +1914,12 @@ class TradingService:
         else:
             self._last_round_finished_at = finished_at
             self._current_stage = "idle" if ok else "error"
+        if ok and not any(
+            item.last_error
+            for item_scope, item in self._analysis_runtime.items()
+            if item_scope in {"market", "position", "full"}
+        ):
+            self._last_round_error = None
 
     def _set_loop_stage(
         self,

@@ -1405,3 +1405,48 @@ AI 防偏要求：
 
 回滚点：
 - 代码层可回滚 `services/crypto_feature_coverage.py`、`services/secure_runtime_config.py`、`web_dashboard/api/data_collection.py`、`web_dashboard/api/system_audit.py`、`web_dashboard/api/system_health.py`、`web_dashboard/static/js/dashboard.js` 与对应测试；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启三项服务。
+
+---
+
+## 三十五、Batch H 补充记录：系统自检交易心跳旧错误清理（2026-06-23）
+
+触发原因：继续复核 Dashboard 健康面时，系统巡检没有 critical，15m/120m 策略健康也没有拒单、弱证据执行、负预期执行、无强退出快亏或 loss re-entry；但系统自检页仍有 `trading_service` warning。只读探针显示交易进程心跳新鲜、当前轮未卡死、交易契约为 ok，warning 来源是上一轮 `exchange position reconciliation timed out during market round start; continuing with local position state` 仍残留在 runtime heartbeat 的 `last_round_error`。
+
+本次修复范围：
+- `services/trading_service.py`：`record_round_error()` 改为把错误记录到当前 `analysis_scope`，避免 market/position 的临时错误落到全局 full scope 后难以清理。
+- `services/trading_service.py`：`_finish_runtime_round(scope, ok=True)` 成功完成时清理该 scope 的 `last_error`；当 market/position/full 都没有剩余错误时，同步清理全局 `_last_round_error`。
+- `tests/test_trading_service_boundaries.py`：新增回归测试，确认可恢复的 market 对账超时会先写入 heartbeat，后续同 scope 成功完成后 `market_last_error` 与 `last_round_error` 都清空。
+
+安全边界：
+- 本批只修 runtime heartbeat 状态机的错误生命周期，不改变 OKX 对账逻辑、不改变本地持仓降级策略、不改变开仓/平仓/仓位/杠杆/风控/模型权重/ML readiness。
+- 对账超时本身仍会记录为错误；只有后续同 scope 成功完成，且其它 scope 没有未清错误时，才清理系统自检 warning。
+- 如果 market/position round 真实卡死、心跳不新鲜、运行进程停止、持续对账失败或交易契约违规，系统自检仍必须保持 warning/critical，不允许为了页面全绿清掉真实故障。
+
+本地验证：
+- `pytest tests/test_trading_service_boundaries.py::test_successful_runtime_round_clears_recovered_scope_error tests/test_trading_service_boundaries.py::test_parallel_market_position_runtime_state_is_isolated -q`：2 passed。
+- `pytest tests/test_system_self_check.py::test_self_check_uses_split_process_runtime_heartbeat tests/test_system_self_check.py::test_self_check_warns_when_split_process_round_is_stuck tests/test_system_self_check.py::test_self_check_warns_when_market_round_is_stuck tests/test_system_self_check.py::test_self_check_uses_position_watchdog_for_position_round -q`：4 passed。
+- `pytest tests/test_trading_service_boundaries.py tests/test_system_self_check.py tests/test_system_audit_api.py tests/test_dashboard_main_ui_contract.py -q`：215 passed。
+- `ruff check services/trading_service.py tests/test_trading_service_boundaries.py`：no issues。
+- `black --check services/trading_service.py tests/test_trading_service_boundaries.py`：通过。
+
+线上复查前置证据：
+- 同步前 15m 策略健康：50 decisions、0 orders、0 rejected、0 failed、0 fast_loss；交易契约 ok，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`。
+- 同步前 120m 策略健康：377 decisions、0 orders、0 rejected、0 failed、0 fast_loss；交易契约 ok，上述硬停计数均为 0。
+- Dashboard 同环境系统巡检：overall warning 但 `critical_cards=[]`；`trade_execution_contract` ok，current summary 中硬停计数均为 0；`visible_text_encoding` ok，`runtime_text_integrity` ok。
+- Dashboard 同环境系统自检：`critical_items=[]`，唯一 warning 为 `trading_service`；其 details 显示心跳新鲜、round 未卡死，warning 原因是旧 `last_round_error` 残留。
+
+同步后线上复查：
+- `python scripts/sync_to_online_server.py --split-services` 上传 `docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md` 与 `services/trading_service.py`，三项服务 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
+- 15m 策略健康：52 decisions、0 orders、0 failed、0 rejected、0 fast_loss；交易契约 ok，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。
+- 120m 策略健康：371 decisions、0 orders、0 failed、0 rejected、0 fast_loss；交易契约 ok，上述硬停计数均为 0。
+- Dashboard 同环境系统巡检：overall `warning` 但 `critical_cards=[]`；`trade_execution_contract` 为 ok；`visible_text_encoding` 为 ok，扫描 282 files、offender 0；`runtime_text_integrity` 为 ok，扫描 809 records、疑似记录 0。
+- Dashboard 同环境系统自检复跑：overall `ok`；total 17、critical 0、warning 0、ok 15、info 2。`trading_service` 已恢复 ok，旧 `last_round_error` 不再把页面打成 warning。
+- 中途一次系统自检看到 `server_monitor` warning，经复跑确认是 `server_monitor_refreshing` 并发刷新窗口，不是稳定故障；最终稳定结果为 warning 0。
+
+后续 AI 防偏要求：
+- 看到系统自检 `trading_service` warning 时，必须同时看 `heartbeat_age_seconds`、`round_stuck`、`market_round_stuck`、`position_round_stuck`、`runtime_error`、`last_round_error` 和交易契约硬停计数，不能只凭 warning 改前端。
+- `exchange position reconciliation timed out ... continuing with local position state` 属于对账降级风险，不等于开仓/平仓契约违规；若后续同 scope 成功完成且契约计数为 0，可清理观察噪声。
+- 如果该错误连续出现、导致心跳卡死、出现未解决订单/仓位不一致、或交易契约出现 violation，必须回到 OKX 对账/持仓同步链路定位，不能把它降级成 info。
+
+回滚点：
+- 代码层可回滚 `services/trading_service.py` 与 `tests/test_trading_service_boundaries.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。线上回滚后需重启 `bb-paper-trading.service`，让 runtime heartbeat 状态机重新加载。

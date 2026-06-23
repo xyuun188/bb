@@ -129,6 +129,58 @@ def test_parallel_market_position_runtime_state_is_isolated(
     assert TradingService._is_policy_skipped_execution_result(None) is False
 
 
+def test_successful_runtime_round_clears_recovered_scope_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._start_time = datetime.now(UTC) - timedelta(minutes=5)
+    service._current_stage = "idle"
+    service._last_round_started_at = None
+    service._last_round_finished_at = None
+    service._last_round_error = None
+    service._last_market_round_started_at = None
+    service._last_market_round_finished_at = None
+    service._last_position_round_started_at = None
+    service._last_position_round_finished_at = None
+    service._analysis_runtime = {
+        "market": _AnalysisRuntimeState(),
+        "position": _AnalysisRuntimeState(),
+        "full": _AnalysisRuntimeState(),
+    }
+
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    market_start = datetime.now(UTC) - timedelta(seconds=20)
+    service._start_runtime_round("market", market_start)
+    scope_token = trading_service._analysis_scope_context.set("market")
+    try:
+        service.record_round_error(
+            "exchange position reconciliation timed out during market round start; "
+            "continuing with local position state"
+        )
+    finally:
+        trading_service._analysis_scope_context.reset(scope_token)
+
+    payload = json.loads((data_dir / "trading_runtime_status.json").read_text(encoding="utf-8"))
+    assert payload["market_last_error"]
+    assert payload["last_round_error"]
+
+    service._finish_runtime_round("market", datetime.now(UTC), ok=True)
+    service._write_runtime_heartbeat()
+
+    payload = json.loads((data_dir / "trading_runtime_status.json").read_text(encoding="utf-8"))
+    assert payload["market_round_active"] is False
+    assert payload["market_current_stage"] == "idle"
+    assert payload["market_last_error"] is None
+    assert payload["last_round_error"] is None
+
+
 @pytest.mark.asyncio
 async def test_paused_market_scope_does_not_start_market_round(
     monkeypatch: pytest.MonkeyPatch,
