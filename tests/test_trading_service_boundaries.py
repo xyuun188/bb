@@ -1141,6 +1141,23 @@ def test_entry_opportunity_gate_checks_suspicious_symbol_before_legacy_evaluator
     assert calls == ["BTC/USDT"]
 
 
+def test_entry_opportunity_gate_blocks_known_untradable_symbol_before_execution():
+    calls: list[str] = []
+
+    def blocked_symbol_reason(symbol):
+        calls.append(symbol)
+        return "OKX 51155 local compliance restrictions"
+
+    policy = EntryPolicy(
+        entry_opportunity_gate=EntryOpportunityGatePolicy(
+            blocked_symbol_reason=blocked_symbol_reason,
+        ),
+    )
+
+    assert policy.gate_reason(_decision(Action.LONG)) == ("OKX 51155 local compliance restrictions")
+    assert calls == ["BTC/USDT"]
+
+
 @pytest.mark.asyncio
 async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
     calls: list[tuple[str, str, int]] = []

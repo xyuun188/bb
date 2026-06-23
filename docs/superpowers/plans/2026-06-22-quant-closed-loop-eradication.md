@@ -1310,3 +1310,44 @@ AI 防偏要求：
 
 回滚点：
 - 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务重启、无模型 artifact 替换、无真实交易参数放宽。
+
+---
+
+## 三十三、Batch H 补充记录：已知不可交易 symbol 执行前拦截（2026-06-23）
+
+触发原因：继续观察 Batch H 时，120m 摘要窗口出现 `TSLA/USDT` 拒单：order `2561`、decision `118360`、buy、`status=rejected`、`quantity=0`、`exchange_order_id=null`。OKX raw error 明确包含 `sCode=51155`，原因为本地合规限制导致该 pair 不可交易。现有 `EntrySymbolBlocklistPolicy` 已能识别 `51155`、`local compliance restrictions`、`can't trade this pair`，`ExecutionService` 也会在 entry 拒单后调用 `remember_untradable_symbol()`，`TradingService._load_untradable_symbol_blocks()` 会从近期 `AIDecision.execution_reason` 恢复不可交易 symbol；但已经生成或排队的 entry candidate 仍可能绕过 market scan 层过滤，走到交易所提交后再次拒单。因此本轮只把“已知不可交易 symbol”的记忆接入 entry execution gate，在提交交易所前拦住复发拒单。
+
+本次修复范围：
+- `services/entry_opportunity_gate.py`：`EntryOpportunityGatePolicy` 新增只读依赖 `blocked_symbol_reason`，在 suspicious symbol 检查之后、legacy evaluator 和原有 `_evaluate()` 之前返回已知不可交易原因。
+- `services/trading_service.py`：实例化 `EntryOpportunityGatePolicy` 时注入 `self.blocked_symbol_reason`，复用现有 blocklist 记忆，不新增另一套 symbol 状态源。
+- `tests/test_trading_service_boundaries.py`：新增 `test_entry_opportunity_gate_blocks_known_untradable_symbol_before_execution`，先锁定没有注入字段时的失败，再确认 gate 会把 `OKX 51155 local compliance restrictions` 作为执行前拦截原因返回。
+
+安全边界：
+- 本批只阻断“已经被交易所或历史执行结果证明不可交易”的 symbol 再次进入执行，不修改开仓阈值、证据 tier、仓位、杠杆、平仓、模型权重、专家路由、ML readiness 或风控 veto。
+- 这不是收益策略优化，也不是让候选更容易成交；它只减少同一类合规拒单反复提交到交易所的噪声和风险。
+- `blocked_symbol_reason` 必须复用 `EntrySymbolBlocklistPolicy` 的已有 TTL/归一化/错误码识别能力，不允许后续 AI 把它扩展成随意拉黑亏损 symbol 或用主观收益判断屏蔽候选。
+- 历史 `TSLA/USDT` 拒单仍会在 120m 窗口滚动期内出现；不能因为窗口里还有旧拒单就误判本轮修复无效，也不能把旧拒单计入已成交收益样本。
+
+本地验证：
+- TDD 红灯：新增边界测试后，旧 `EntryOpportunityGatePolicy` 因缺少 `blocked_symbol_reason` 参数失败。
+- TDD 绿灯：实现注入后，`pytest tests/test_trading_service_boundaries.py::test_entry_opportunity_gate_blocks_known_untradable_symbol_before_execution -q` 通过。
+- `pytest tests/test_entry_symbol_blocklist.py tests/test_execution_result_classifier.py -q`：15 passed。
+- `pytest tests/test_trading_service_boundaries.py -q`：120 passed。
+- `pytest tests/test_trading_service_boundaries.py tests/test_entry_symbol_blocklist.py tests/test_execution_result_classifier.py -q`：135 passed。
+- `ruff check services/entry_opportunity_gate.py services/trading_service.py tests/test_trading_service_boundaries.py tests/test_entry_symbol_blocklist.py tests/test_execution_result_classifier.py`：no issues。
+- `black --check services/entry_opportunity_gate.py services/trading_service.py tests/test_trading_service_boundaries.py tests/test_entry_symbol_blocklist.py tests/test_execution_result_classifier.py`：通过。
+- `git diff --check`：通过。
+
+线上同步与只读复查：
+- `python scripts/sync_to_online_server.py --split-services` 已同步 `services/entry_opportunity_gate.py` 与 `services/trading_service.py` 并重启服务；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
+- 部署后 15m 摘要（`2026-06-23T09:12:18Z`）：33 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，全部 violation counters 为 0；`local_ml_readiness.status=degraded` 且 `allow_live_position_influence=false`。
+- 部署后 120m 摘要（`2026-06-23T09:12:18Z`）：425 decisions、1 order、0 filled、1 failed/rejected、open_positions 6、0 fast_loss_close_under_15m；拒单仍是部署前旧 `TSLA/USDT` order `2561`，订单时间 `2026-06-23T07:45:10Z`，会随 120m 窗口滚出。
+- 当前没有新增弱证据执行、负预期执行、无强退出快亏、loss re-entry 或风控绕过；但 Batch H 仍未完成，不能据此推进仓位放大、阈值放宽或 ML live influence。
+
+当前结论：
+- 本轮修复的是“已知不可交易 symbol 的重复拒单复发”问题，不是盈利闭环完成。
+- 后续观察时，如果 15m/120m 出现新的拒单，必须先看是否为新 symbol、新错误码、blocklist 未识别、队列竞态或交易所瞬时问题，再决定是否扩展 blocklist 识别；不得用降阈值、放大仓位或硬改 readiness 来掩盖拒单。
+- 若 120m 旧 `TSLA/USDT` 拒单滚出后仍出现同 symbol 新拒单，说明执行前 gate 仍有遗漏路径，必须停止推进并回到 entry candidate 到 execution submit 的调用链定位。
+
+回滚点：
+- 代码层可回滚 `services/entry_opportunity_gate.py`、`services/trading_service.py` 与 `tests/test_trading_service_boundaries.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。若回滚线上运行代码，需要同步后重启服务以刷新 Python 进程导入。

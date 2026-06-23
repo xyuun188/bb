@@ -73,6 +73,7 @@ class EntryOpportunityGatePolicy:
 
     evaluator: EntryOpportunityGateEvaluator | None = None
     suspicious_symbol_policy: Any | None = None
+    blocked_symbol_reason: Callable[[str | None], str | None] | None = None
     symbol_loss_cooldown_policy: EntryLossCooldownPolicy | None = None
     crowded_side_cap_policy: EntryCrowdedSideCapPolicy | None = None
     post_crash_rebound_guard: Any | None = None
@@ -83,6 +84,9 @@ class EntryOpportunityGatePolicy:
         suspicious_reason = self._suspicious_reason(decision)
         if suspicious_reason:
             return suspicious_reason
+        blocked_reason = self._blocked_symbol_reason(decision)
+        if blocked_reason:
+            return blocked_reason
         if self.evaluator is not None:
             return self.evaluator(decision)
         return self._evaluate(decision)
@@ -91,6 +95,11 @@ class EntryOpportunityGatePolicy:
         if self.suspicious_symbol_policy is None:
             return None
         return self.suspicious_symbol_policy.reason(decision.symbol)
+
+    def _blocked_symbol_reason(self, decision: DecisionOutput) -> str | None:
+        if self.blocked_symbol_reason is None:
+            return None
+        return self.blocked_symbol_reason(decision.symbol)
 
     def _strategy_learning_entry_pause_reason(self, raw: dict[str, Any]) -> str | None:
         strategy_mode = _safe_dict(raw.get("strategy_mode"))

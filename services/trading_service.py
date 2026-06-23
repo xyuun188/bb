@@ -714,6 +714,7 @@ class TradingService:
         self.entry_crowded_side_cap = EntryCrowdedSideCapPolicy()
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
+            blocked_symbol_reason=self.blocked_symbol_reason,
             symbol_loss_cooldown_policy=self.entry_loss_cooldown,
             crowded_side_cap_policy=self.entry_crowded_side_cap,
             post_crash_rebound_guard=self.entry_post_crash_rebound_guard,
