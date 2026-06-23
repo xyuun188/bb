@@ -833,11 +833,13 @@ AI 防偏要求：
 - 新版策略健康脚本读取 120 分钟窗口：279 decisions，其中 `market_decisions=60`、`position_review_decisions=219`；`analysis_type_action_counts` 为 `position_review:hold=219`、`market:hold=54`、`market:short=5`、`market:long=1`。
 - `python scripts/sync_to_online_server.py --split-services` 已同步本次相关的 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
 - 追加修正：`entry_candidate_evidence_by_type` 之前按所有 decisions 统计 `entry_candidate_evidence` payload，容易把 market 扫描数误读成候选数；已改为只从 `entry_decisions` 统计，并用红绿测试锁定。修正后 30 分钟窗口 `market_entry_decisions=3` 且 `entry_candidate_evidence_by_type.market=3`；120 分钟窗口 `market_entry_decisions=8` 且 `entry_candidate_evidence_by_type.market=8`。
-- 该窗口有 `market_entry_decisions=6`，全部停在 `risk_check:skipped`；`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
-- 6 个 market 候选的 `expected_net_return_pct` 全部为正：min 0.298957、median 0.332347、max 0.337874；但 `position_size_pct` 全部为 0，不能据此认为已经满足开仓质量。
-- 6 个 market 候选的 `score_gap = score - min_score_required` 全部为负：min -2.330340、median -1.989693、max -0.753132，说明当前不是下单链路丢单，而是证据评分未达开仓门槛。
-- `profit_quality_ratio`：min 0.392026、median 0.461593、max 0.469269；`loss_probability`：min 0.428200、median 0.532300、max 0.557200；`tail_risk_score`：min 0.342714、median 0.399856、max 0.441075。当前候选质量和风险结构仍偏弱。
+- 修正后 120 分钟窗口有 `market_entry_decisions=8`，全部停在 `risk_check:skipped`；`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
+- 8 个 market 候选的 `expected_net_return_pct` 全部为正：min 0.281631、median 0.316030、max 0.337874；但 `position_size_pct` 全部为 0，不能据此认为已经满足开仓质量。
+- 8 个 market 候选的 `score_gap = score - min_score_required` 全部为负：min -2.558195、median -1.989693、max -0.753132，说明当前不是下单链路丢单，而是证据评分未达开仓门槛。
+- `profit_quality_ratio`：min 0.361259、median 0.423606、max 0.469269；`loss_probability`：min 0.428200、median 0.541700、max 0.560100；`tail_risk_score`：min 0.342714、median 0.408209、max 0.441075。当前候选质量和风险结构仍偏弱。
 - expected net 组件拆解：`ai` 固定正贡献 0.15；`shadow_memory` 为正贡献且接近 cap；`local_ml` 全部 0；`server_profit` 全部负贡献；`fee` 和 `slippage` 全部负贡献；`timeseries` 仅小幅贡献。当前正 EV 主要由 AI 与影子错过机会支撑，尚不足以越过评分、质量和风险门槛。
+- `local_ml=0` 是 ML readiness 保护而非缺功能：线上模型最新训练于 2026-06-22T23:56:22Z，`sample_count=19982`、`test_count=4996`，但状态为 `degraded`、`allow_live_position_influence=false`。阻塞项包括 long PR-AUC 0.3587 < 0.52、short PR-AUC 0.3912 < 0.52、short top-score bucket return -0.011 < 0.05，以及 dirty/downweighted 样本比例 0.8976 > 0.08。质量报告显示 20,000 条 shadow 样本中 hold 17,947 条，主要原因是 `very_low_decision_confidence`、`hold_observation_downweighted`、`hold_missed_opportunity_downweighted`；不得硬改 ready 或放宽 readiness。
+- `server_profit` 负贡献来自真实模型输出，不是字段映射错误：最新 market 候选中 `local-profit-trained-v2` 可用，但候选方向的 expected return 全为负，部分 best_side 只是“两边都负时较不差的一边”，因此 `local_profit_aligned=false`，expected net 组件中 server_profit 维持小幅负贡献约 -0.017 至 -0.028。不得把 best_side 文本当成正收益支持，也不得忽略负 expected return。
 
 手工系统巡检防偏口径：
 - 手工调用 `collect_system_audit_status(record_history=False)` 时，不能使用线上裸 `python3`，否则会因缺少依赖得到 `No module named 'fastapi'` 假故障；也不能直接 shell source `.env`，因为复杂列表/映射值会被 shell 误解析。
