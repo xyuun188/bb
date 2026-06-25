@@ -99,3 +99,38 @@ async def test_decision_final_state_ensurer_recovers_unusable_exit_reason() -> N
 
     assert row.execution_reason == "恢复出的平仓原因"
     assert results["decisions"][0]["execution_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_decision_final_state_ensurer_finalizes_exit_when_recovery_has_no_reason() -> None:
+    ensurer = DecisionFinalStateEnsurer(
+        execution_reason_unusable_checker=lambda _reason: False,
+        execution_reason_recoverer=lambda _row: None,
+        model_execution_mode_provider=lambda _model_name: "paper",
+    )
+    row = SimpleNamespace(
+        was_executed=False,
+        execution_reason="",
+        action="close_long",
+    )
+    results = {"decisions": []}
+    flushed = False
+
+    async def flush() -> None:
+        nonlocal flushed
+        flushed = True
+
+    await ensurer.ensure_row(
+        row,
+        order_count=0,
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        results=results,
+        flush_callback=flush,
+    )
+
+    assert flushed
+    assert "平仓裁决没有生成本地平仓委托" in row.execution_reason
+    assert results["decisions"][0]["execution_status"] == "skipped"
+    assert results["decisions"][0]["is_paper"] is True

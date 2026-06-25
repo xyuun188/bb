@@ -95,19 +95,19 @@ class DecisionFinalStateEnsurer:
             not reason or self.execution_reason_unusable_checker(reason)
         ):
             recovered = self.execution_reason_recoverer(row)
-            if recovered:
-                row.execution_reason = recovered
-                if flush_callback is not None:
-                    await flush_callback()
-                results.setdefault("decisions", []).append(
-                    self._result_item(
-                        symbol=symbol,
-                        model_name=model_name,
-                        decision=decision,
-                        execution_status="skipped",
-                        reason=recovered,
-                    )
+            final_reason = recovered or _exit_without_order_reason(symbol, str(row.action or ""))
+            row.execution_reason = final_reason
+            if flush_callback is not None:
+                await flush_callback()
+            results.setdefault("decisions", []).append(
+                self._result_item(
+                    symbol=symbol,
+                    model_name=model_name,
+                    decision=decision,
+                    execution_status="skipped",
+                    reason=final_reason,
                 )
+            )
             return
 
         if is_pending_execution_reason(reason):
@@ -144,3 +144,13 @@ class DecisionFinalStateEnsurer:
             "reason": reason,
             "is_paper": (self.model_execution_mode_provider(model_name) == "paper"),
         }
+
+
+def _exit_without_order_reason(symbol: str, action: str) -> str:
+    action_label = (
+        "平多" if action == "close_long" else "平空" if action == "close_short" else "平仓"
+    )
+    return (
+        f"{symbol} {action_label}平仓裁决没有生成本地平仓委托，也没有拿到 OKX 成功或失败回报。"
+        "系统已跳过本次旧裁决，下一轮会用最新行情和仓位重新分析。"
+    )

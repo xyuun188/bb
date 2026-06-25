@@ -945,7 +945,23 @@ async def test_position_capacity_release_audit_and_endpoint_force_read_only(
                 "old_profit_rotation_candidate_count": 1,
                 "release_decision_count": 2,
                 "executed_release_decision_count": 0,
+                "protected_release_decision_count": 1,
+                "exchange_blocked_release_decision_count": 1,
+                "execution_link_gap_release_decision_count": 1,
+                "stale_release_decision_count": 1,
                 "unclosed_release_decision_count": 2,
+                "release_execution_state_counts": {
+                    "protected_not_executed": 1,
+                    "exchange_blocked": 1,
+                    "reported_executed_without_link": 1,
+                    "stale_skipped": 1,
+                },
+                "release_execution_block_counts": {
+                    "fee_or_risk_guard": 1,
+                    "exchange_unavailable_or_cooldown": 1,
+                    "filled_report_missing_order_link": 1,
+                    "stale_signal_or_round_skip": 1,
+                },
                 "crowded_block_count": 1,
                 "old_profit_rotation_candidates": [
                     {
@@ -959,6 +975,38 @@ async def test_position_capacity_release_audit_and_endpoint_force_read_only(
                     {
                         "decision_id": 12,
                         "symbol": "BZ/USDT",
+                        "can_force_close": True,
+                        "can_close_winners": True,
+                    }
+                ],
+                "protected_release_decisions": [
+                    {
+                        "decision_id": 14,
+                        "symbol": "LINK/USDT",
+                        "can_force_close": True,
+                        "can_close_winners": True,
+                    }
+                ],
+                "exchange_blocked_release_decisions": [
+                    {
+                        "decision_id": 15,
+                        "symbol": "LAB/USDT",
+                        "can_force_close": True,
+                        "can_close_winners": True,
+                    }
+                ],
+                "execution_link_gap_release_decisions": [
+                    {
+                        "decision_id": 16,
+                        "symbol": "AI16Z/USDT",
+                        "can_force_close": True,
+                        "can_close_winners": True,
+                    }
+                ],
+                "stale_release_decisions": [
+                    {
+                        "decision_id": 17,
+                        "symbol": "LAB/USDT",
                         "can_force_close": True,
                         "can_close_winners": True,
                     }
@@ -992,13 +1040,34 @@ async def test_position_capacity_release_audit_and_endpoint_force_read_only(
     assert card["details"]["can_force_close"] is False
     assert card["details"]["can_close_winners"] is False
     assert card["details"]["can_bypass_risk_controls"] is False
+    assert card["details"]["protected_release_decision_count"] == 1
+    assert card["details"]["exchange_blocked_release_decision_count"] == 1
+    assert card["details"]["execution_link_gap_release_decision_count"] == 1
+    assert card["details"]["stale_release_decision_count"] == 1
+    assert card["details"]["release_execution_state_counts"] == {
+        "protected_not_executed": 1,
+        "exchange_blocked": 1,
+        "reported_executed_without_link": 1,
+        "stale_skipped": 1,
+    }
     assert card["details"]["old_profit_rotation_candidates"][0]["can_force_close"] is False
+    assert card["details"]["protected_release_decisions"][0]["can_force_close"] is False
+    assert card["details"]["exchange_blocked_release_decisions"][0]["can_force_close"] is False
+    assert card["details"]["execution_link_gap_release_decisions"][0]["can_force_close"] is False
+    assert card["details"]["stale_release_decisions"][0]["can_force_close"] is False
     assert endpoint_report["read_only"] is True
     assert endpoint_report["audit_only"] is True
     assert endpoint_report["live_exit_mutation"] is False
     assert endpoint_report["can_force_close"] is False
     assert endpoint_report["can_close_winners"] is False
     assert endpoint_report["old_profit_rotation_candidates"][0]["can_close_winners"] is False
+    assert endpoint_report["protected_release_decisions"][0]["can_close_winners"] is False
+    assert (
+        endpoint_report["exchange_blocked_release_decisions"][0]["can_bypass_risk_controls"]
+        is False
+    )
+    assert endpoint_report["execution_link_gap_release_decisions"][0]["can_close_winners"] is False
+    assert endpoint_report["stale_release_decisions"][0]["can_close_winners"] is False
 
 
 @pytest.mark.asyncio

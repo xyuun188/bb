@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -21,6 +20,8 @@ DEFAULT_LIMIT = 500
 OLD_PROFIT_MIN_HOLD_HOURS = 3.0
 OLD_PROFIT_MAX_PNL_RATIO = 0.008
 OLD_PROFIT_MIN_FEE_MULTIPLE = 1.0
+ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
+CROWDED_BLOCK_MODES = {"crowded_block", "hard_ceiling"}
 
 
 class PositionCapacityReleaseAuditService:
@@ -106,11 +107,28 @@ class PositionCapacityReleaseAuditService:
                 str(getattr(order, "status", "") or "").lower() == "filled"
                 for order in decision_orders
             )
+            state, category = self._release_execution_state(row)
+            row["execution_state"] = state
+            row["execution_block_category"] = category
 
         unclosed_release_decisions = [
+            row for row in release_decisions if row.get("execution_state") == "pending_unclosed"
+        ]
+        protected_release_decisions = [
             row
             for row in release_decisions
-            if not row["was_executed"] and not row["has_filled_order"]
+            if row.get("execution_state") == "protected_not_executed"
+        ]
+        exchange_blocked_release_decisions = [
+            row for row in release_decisions if row.get("execution_state") == "exchange_blocked"
+        ]
+        execution_link_gap_release_decisions = [
+            row
+            for row in release_decisions
+            if row.get("execution_state") == "reported_executed_without_link"
+        ]
+        stale_release_decisions = [
+            row for row in release_decisions if row.get("execution_state") == "stale_skipped"
         ]
         crowded_blocks = [
             self._crowded_block_row(decision)
@@ -152,10 +170,26 @@ class PositionCapacityReleaseAuditService:
             "old_profit_rotation_candidates": old_profit_candidates[:12],
             "release_decision_count": len(release_decisions),
             "executed_release_decision_count": sum(
-                1 for row in release_decisions if row["was_executed"] or row["has_filled_order"]
+                1 for row in release_decisions if row.get("execution_state") == "executed"
             ),
+            "protected_release_decision_count": len(protected_release_decisions),
+            "exchange_blocked_release_decision_count": len(exchange_blocked_release_decisions),
+            "execution_link_gap_release_decision_count": len(execution_link_gap_release_decisions),
+            "stale_release_decision_count": len(stale_release_decisions),
             "unclosed_release_decision_count": len(unclosed_release_decisions),
             "unclosed_release_decisions": unclosed_release_decisions[:12],
+            "protected_release_decisions": protected_release_decisions[:12],
+            "exchange_blocked_release_decisions": exchange_blocked_release_decisions[:12],
+            "execution_link_gap_release_decisions": execution_link_gap_release_decisions[:12],
+            "stale_release_decisions": stale_release_decisions[:12],
+            "release_execution_state_counts": dict(
+                Counter(str(row.get("execution_state") or "unknown") for row in release_decisions)
+            ),
+            "release_execution_block_counts": dict(
+                Counter(
+                    str(row.get("execution_block_category") or "none") for row in release_decisions
+                )
+            ),
             "release_decision_action_counts": dict(
                 Counter(str(row.get("action") or "unknown") for row in release_decisions)
             ),
@@ -163,8 +197,9 @@ class PositionCapacityReleaseAuditService:
             "crowded_blocks": crowded_blocks[:12],
             "diagnostic_boundary": (
                 "Read-only Phase 2 capacity-release audit. It can identify release "
-                "gaps and old profitable capacity candidates, but cannot close, "
-                "resize, force entries, or bypass risk controls."
+                "gaps, protected non-execution, exchange-blocked closes, and old "
+                "profitable capacity candidates, but cannot close, resize, force "
+                "entries, or bypass risk controls."
             ),
         }
 
@@ -251,19 +286,79 @@ class PositionCapacityReleaseAuditService:
         }
 
     @staticmethod
+    def _release_execution_state(row: dict[str, Any]) -> tuple[str, str]:
+        if bool(row.get("was_executed")) or bool(row.get("has_filled_order")):
+            return "executed", "none"
+        reason = str(row.get("execution_reason") or "").lower()
+        if _has_any(
+            reason,
+            (
+                "不可交易平仓冷却",
+                "交易对不可用",
+                "okx 明确拒绝",
+                "contract under delivery",
+                "51028",
+            ),
+        ):
+            return "exchange_blocked", "exchange_unavailable_or_cooldown"
+        if _has_any(reason, ("订单已成交", "已成交")):
+            return "reported_executed_without_link", "filled_report_missing_order_link"
+        if _has_any(
+            reason,
+            (
+                "ai信号已过有效期",
+                "信号已过有效期",
+                "本轮已经结束",
+                "没有进入下单阶段",
+                "旧信号",
+                "等待下一轮重新分析",
+            ),
+        ):
+            return "stale_skipped", "stale_signal_or_round_skip"
+        if _has_any(
+            reason,
+            (
+                "仓位轮动保护",
+                "平仓保护",
+                "扣费后预计净亏",
+                "预计净亏",
+                "尚未明显覆盖双边手续费",
+                "未触发硬止损",
+                "继续观察",
+                "继续持有",
+            ),
+        ):
+            return "protected_not_executed", "fee_or_risk_guard"
+        return "pending_unclosed", "missing_close_order_or_confirmation"
+
+    @staticmethod
     def _contains_crowded_side_cap(decision: AIDecision) -> bool:
-        raw = getattr(decision, "raw_llm_response", None)
+        raw = _safe_dict(getattr(decision, "raw_llm_response", None))
+        action = str(getattr(decision, "action", "") or "").lower()
+        if action not in ENTRY_ACTIONS:
+            return False
+        cap = _safe_dict(raw.get("crowded_side_cap"))
+        mode = str(cap.get("mode") or "").lower()
+        if mode not in CROWDED_BLOCK_MODES:
+            return False
+        if bool(getattr(decision, "was_executed", False)):
+            return False
+        gate = _safe_dict(raw.get("entry_execution_gate"))
+        gate_reason = str(gate.get("reason") or gate.get("block_reason") or "").lower()
+        gate_status = str(gate.get("status") or "").lower()
         reason = str(getattr(decision, "execution_reason", "") or "")
-        try:
-            text = json.dumps(raw, ensure_ascii=False) if isinstance(raw, dict) else str(raw or "")
-        except TypeError:
-            text = str(raw or "")
-        return "crowded_side_cap" in text or "crowded_side_cap" in reason
+        return (
+            "crowded_side_cap" in gate_reason
+            or "crowded_side_cap" in reason
+            or gate_status in {"blocked", "rejected", "skipped"}
+            or mode in CROWDED_BLOCK_MODES
+        )
 
     @staticmethod
     def _crowded_block_row(decision: AIDecision) -> dict[str, Any]:
         raw = _safe_dict(getattr(decision, "raw_llm_response", None))
         gate = _safe_dict(raw.get("entry_execution_gate"))
+        cap = _safe_dict(raw.get("crowded_side_cap"))
         evidence = _safe_dict(_safe_dict(raw.get("opportunity_score")).get("evidence_score"))
         return {
             "decision_id": int(getattr(decision, "id", 0) or 0),
@@ -271,6 +366,7 @@ class PositionCapacityReleaseAuditService:
             "action": str(getattr(decision, "action", "") or "").lower(),
             "created_at": _iso(getattr(decision, "created_at", None)),
             "execution_reason": str(getattr(decision, "execution_reason", "") or "")[:260],
+            "crowded_mode": cap.get("mode"),
             "gate_status": gate.get("status"),
             "gate_reason": gate.get("reason") or gate.get("block_reason"),
             "evidence_tier": evidence.get("tier") or raw.get("evidence_tier"),
@@ -316,6 +412,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _has_any(text: str, needles: tuple[str, ...]) -> bool:
+    return any(needle.lower() in text for needle in needles)
 
 
 def _round_optional(value: Any) -> float | None:

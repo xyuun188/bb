@@ -342,6 +342,10 @@ def _safe_position_capacity_release_report(report: dict[str, Any]) -> dict[str, 
         "current_release_candidates",
         "old_profit_rotation_candidates",
         "unclosed_release_decisions",
+        "protected_release_decisions",
+        "exchange_blocked_release_decisions",
+        "execution_link_gap_release_decisions",
+        "stale_release_decisions",
         "crowded_blocks",
     ):
         rows = safe.get(key) if isinstance(safe.get(key), list) else []
@@ -1789,6 +1793,10 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
     current_release_count = int(report.get("current_release_candidate_count") or 0)
     old_profit_count = int(report.get("old_profit_rotation_candidate_count") or 0)
     unclosed_release_count = int(report.get("unclosed_release_decision_count") or 0)
+    protected_release_count = int(report.get("protected_release_decision_count") or 0)
+    exchange_blocked_count = int(report.get("exchange_blocked_release_decision_count") or 0)
+    execution_link_gap_count = int(report.get("execution_link_gap_release_decision_count") or 0)
+    stale_release_count = int(report.get("stale_release_decision_count") or 0)
     crowded_block_count = int(report.get("crowded_block_count") or 0)
     open_group_count = int(report.get("open_group_count") or 0)
     entry_limit = int(capacity.get("entry_limit") or 0)
@@ -1797,6 +1805,8 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
         current_release_count
         or old_profit_count
         or unclosed_release_count
+        or exchange_blocked_count
+        or execution_link_gap_count
         or crowded_block_count
         or over_capacity
     )
@@ -1805,7 +1815,7 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
         "Position capacity release",
         "warning" if warning else "ok",
         (
-            "Capacity release audit is observing release gaps, old profit candidates, or crowded-side pressure."
+            "Capacity release audit is observing release gaps, exchange blocks, execution-link gaps, old profit candidates, or crowded-side pressure."
             if warning
             else "Capacity release audit sees no current release backlog or crowded-side pressure."
         ),
@@ -1831,13 +1841,33 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
             "executed_release_decision_count": int(
                 report.get("executed_release_decision_count") or 0
             ),
+            "protected_release_decision_count": protected_release_count,
+            "exchange_blocked_release_decision_count": exchange_blocked_count,
+            "execution_link_gap_release_decision_count": execution_link_gap_count,
+            "stale_release_decision_count": stale_release_count,
             "unclosed_release_decision_count": unclosed_release_count,
+            "release_execution_state_counts": _safe_dict(
+                report.get("release_execution_state_counts")
+            ),
+            "release_execution_block_counts": _safe_dict(
+                report.get("release_execution_block_counts")
+            ),
             "crowded_block_count": crowded_block_count,
             "current_release_candidates": _safe_list(report.get("current_release_candidates"))[:8],
             "old_profit_rotation_candidates": _safe_list(
                 report.get("old_profit_rotation_candidates")
             )[:8],
             "unclosed_release_decisions": _safe_list(report.get("unclosed_release_decisions"))[:8],
+            "protected_release_decisions": _safe_list(report.get("protected_release_decisions"))[
+                :8
+            ],
+            "exchange_blocked_release_decisions": _safe_list(
+                report.get("exchange_blocked_release_decisions")
+            )[:8],
+            "execution_link_gap_release_decisions": _safe_list(
+                report.get("execution_link_gap_release_decisions")
+            )[:8],
+            "stale_release_decisions": _safe_list(report.get("stale_release_decisions"))[:8],
             "crowded_blocks": _safe_list(report.get("crowded_blocks"))[:8],
             "diagnostic_boundary": report.get("diagnostic_boundary"),
         },
