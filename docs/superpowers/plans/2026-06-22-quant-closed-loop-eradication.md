@@ -3181,3 +3181,107 @@ AI 防偏要求：
 回滚点：
 - 代码层可回滚 `services/strategy_signal_root_cause_audit.py`、`web_dashboard/api/system_audit.py`、`tests/test_strategy_signal_root_cause_audit.py`、`tests/test_system_audit_api.py`。
 - 本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。
+
+---
+
+## 六十二、Batch I 二期阶段 4/5 补充记录：容量释放审计误报收口与平仓决策终态修复（2026-06-26）
+
+触发原因：
+- 线上 `position_capacity_release` 只读报告在 24 小时窗口内显示大量 `unclosed_release_decision_count` 和 `crowded_block_count`，但逐条核对后发现旧口径把三类不同事实混在一起：
+  - `LAB/USDT` 因 OKX 返回不可交易/交割合约相关拒绝后进入不可交易平仓冷却；
+  - `LINK/USDT`、`AAVE/USDT` 等低质量小仓触发释放候选，但扣费后预计净亏且无硬风险，系统按保护规则不执行；
+  - `SPK/USDT` 等已成交或强信号 override 的 entry raw 中带有 `crowded_side_cap` 元信息，却被字符串匹配误计为拥挤阻断。
+- 另有少量历史平仓决策显示 `execution_reason=订单已成交` 但没有 `decision_id -> Order` 直连，属于成交回报与订单链接缺口；还有 1 条 `LAB/USDT` 历史 close decision 留下空执行原因。
+- 以上问题会让后续 AI 误以为“平仓链路全部失败/拥挤方向一直阻断”，从而偏离真实根因。
+
+本次修复范围：
+- `services/position_capacity_release_audit.py`
+  - 将释放决策执行状态拆分为：
+    - `executed`
+    - `protected_not_executed`
+    - `exchange_blocked`
+    - `reported_executed_without_link`
+    - `stale_skipped`
+    - `pending_unclosed`
+  - 新增 `release_execution_state_counts`、`release_execution_block_counts`、`protected_release_decision_count`、`exchange_blocked_release_decision_count`、`execution_link_gap_release_decision_count`、`stale_release_decision_count`。
+  - `unclosed_release_decision_count` 只保留真正“应该有终态但没有订单/保护/过期/成交回报解释”的 `pending_unclosed`。
+  - 拥挤阻断审计改为结构化读取 `crowded_side_cap.mode`，只统计 entry 动作中 `crowded_block` 或 `hard_ceiling`，不再把 `crowded_strong_override`、已成交 entry、close decision 或历史 raw 元信息误算成阻断。
+- `web_dashboard/api/system_audit.py`
+  - Dashboard 巡检卡 details 透出上述新分类和列表；
+  - 所有新增列表继续强制 `can_force_close=false`、`can_close_winners=false`、`can_bypass_risk_controls=false`。
+- `services/decision_final_state_ensurer.py`
+  - 修复 close_long/close_short 决策在恢复器拿不到原因时直接返回的问题；
+  - 未来若平仓裁决没有生成本地平仓委托、也没有 OKX 成功/失败回报，会写入明确终态原因，不再留下空 `execution_reason`。
+- 历史数据单行校正：
+  - 仅更新线上 `AIDecision.id=131840` 的空 `execution_reason`；
+  - 更新前已备份到 `/data/bb/app/data/codex_backups/decision_131840_before_execution_reason_repair_20260625T221132Z.json`；
+  - 未修改持仓、订单、盈亏、OKX 原始数据、模型数据或交易参数。
+
+本地验证：
+- `pytest tests/test_position_capacity_release_audit.py tests/test_system_audit_api.py -q`：46 passed。
+- `pytest tests/test_decision_final_state_ensurer.py tests/test_position_capacity_release_audit.py tests/test_system_audit_api.py -q`：50 passed。
+- 全量测试：`pytest -q`：1517 passed。
+- `ruff check services/decision_final_state_ensurer.py services/position_capacity_release_audit.py web_dashboard/api/system_audit.py tests/test_decision_final_state_ensurer.py tests/test_position_capacity_release_audit.py tests/test_system_audit_api.py`：no issues。
+- `black --check services/decision_final_state_ensurer.py services/position_capacity_release_audit.py web_dashboard/api/system_audit.py tests/test_decision_final_state_ensurer.py tests/test_position_capacity_release_audit.py tests/test_system_audit_api.py`：通过。
+
+Git 与线上部署：
+- 本地提交：`dd1b942 fix: classify capacity release audit states`。
+- 第一次定向上线只上传：
+  - `services/position_capacity_release_audit.py`
+  - `web_dashboard/api/system_audit.py`
+  - 只重启 `bb-dashboard.service`。
+- 第二次完整 split-services 上线只新增上传：
+  - `services/decision_final_state_ensurer.py`
+  - 重启 `bb-paper-trading.service`、`bb-dashboard.service`、`bb-model-tunnels.service`。
+- 远端哈希复验全部与本地一致：
+  - `services/position_capacity_release_audit.py`：`44978a7057b54255fb28d0a8cdb6ba10ae3de9dc105c24b90af7f19aedc1f3d4`
+  - `web_dashboard/api/system_audit.py`：`00082214dad5a66b5af9b11a70bd335fb6adda821e45f1ed067acae35f0b7d4e`
+  - `services/decision_final_state_ensurer.py`：`17ab5663479a5abb939f41509edaa7a5a52c6fe9d1d60bc1aefce5d7ee245dba`
+- 线上服务复验：
+  - `bb-paper-trading.service=active`，`MainPID=900377`，`ActiveEnterTimestamp=Thu 2026-06-25 22:10:43 UTC`
+  - `bb-dashboard.service=active`，`MainPID=900381`，`ActiveEnterTimestamp=Thu 2026-06-25 22:10:44 UTC`
+  - `bb-model-tunnels.service=active`
+
+线上结果：
+- 修复前线上容量释放报告约为：
+  - `release_decision_count=158`
+  - `executed_release_decision_count=0`
+  - `unclosed_release_decision_count=158`
+  - `crowded_block_count=164`
+- 修复、部署和单行历史校正后：
+  - `open_position_count=5`
+  - `open_group_count=5`
+  - `quality_bucket_counts.high=4`
+  - `quality_bucket_counts.release_candidate=1`
+  - `current_release_candidate_count=1`
+  - `old_profit_rotation_candidate_count=0`
+  - `release_decision_count=143`
+  - `protected_release_decision_count=15`
+  - `exchange_blocked_release_decision_count=124`
+  - `execution_link_gap_release_decision_count=2`
+  - `stale_release_decision_count=2`
+  - `unclosed_release_decision_count=0`
+  - `crowded_block_count=0`
+- 当前唯一实时释放候选为 `AAVE/USDT` 小额 long：
+  - `position_quality.bucket=release_candidate`
+  - reason 为 `stale_probe_capital_inefficient`
+  - 最近释放决策被保护性跳过，原因是扣费后预计净亏且未触发硬止损、止盈、严重趋势失效或预测下行风险。
+
+当前结论：
+- “大量未闭环 release decision”和“拥挤方向阻断很多”已证明主要是审计误报和历史链接/终态分类不清；本批已把它们拆成可审计类别，并让真正未闭环计数清零。
+- 当前不是容量满导致不开仓：`open_group_count=5`，`entry_limit=25`。
+- 当前仍存在 1 个低质量小仓释放候选，但系统选择不为腾容量制造扣费后净亏；这是策略保护行为，不是平仓链路失败。
+- `execution_link_gap_release_decision_count=2` 说明历史成交回报与本地订单链接仍有数据台账缺口，后续若继续治理脏数据，应沿订单/决策链接修复，不应把它解释成“OKX 没平掉”。
+- 本批仍不等于“不赚钱/不开仓/小单”完成；下一阶段继续治理策略质量、ML readiness、server_profit、弱证据转高质量候选和真实手续费后 PnL。
+
+后续 AI 防偏要求：
+- 解释容量释放时必须先看 `release_execution_state_counts`，不得只看 `release_decision_count`。
+- `protected_not_executed` 表示系统避免制造扣费后净亏或无硬风险平仓；不得把它说成平仓失败。
+- `exchange_blocked` 表示 OKX/交易对状态阻断或冷却；不得通过重复提交或强行全平掩盖，应先确认交易所状态、合约生命周期、API 权限和市场列表。
+- `reported_executed_without_link` 表示成交回报与本地订单链接缺口；后续应修链接/数据台账，不得重复平仓。
+- `stale_skipped` 表示旧裁决过期或本轮未进入下单，不能当作当前可执行信号。
+- 只有 `pending_unclosed` 才是“真正未闭环”的核心告警；若它再次大于 0，必须追查生成/执行/终态写入链路。
+
+回滚点：
+- 代码层可回滚 `services/position_capacity_release_audit.py`、`web_dashboard/api/system_audit.py`、`services/decision_final_state_ensurer.py`、`tests/test_position_capacity_release_audit.py`、`tests/test_system_audit_api.py`、`tests/test_decision_final_state_ensurer.py`。
+- 历史数据仅改了 `AIDecision.id=131840.execution_reason`，可用备份 JSON 恢复；不涉及订单、持仓、盈亏或 OKX 数据。
