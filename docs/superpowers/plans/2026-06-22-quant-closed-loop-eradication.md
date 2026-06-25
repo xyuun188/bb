@@ -3285,3 +3285,82 @@ Git 与线上部署：
 回滚点：
 - 代码层可回滚 `services/position_capacity_release_audit.py`、`web_dashboard/api/system_audit.py`、`services/decision_final_state_ensurer.py`、`tests/test_position_capacity_release_audit.py`、`tests/test_system_audit_api.py`、`tests/test_decision_final_state_ensurer.py`。
 - 历史数据仅改了 `AIDecision.id=131840.execution_reason`，可用备份 JSON 恢复；不涉及订单、持仓、盈亏或 OKX 数据。
+
+---
+
+## 六十三、Batch I 二期阶段 5 补充记录：策略闭环台账历史/样本观察分层修正（2026-06-26）
+
+触发原因：
+- 线上 Dashboard 等价环境复验时，完整系统巡检已经没有新增弱证据执行、快亏平、shadow-only 执行、执行无订单等当前硬错误，但问题台账仍把 `strategy_closed_loop` 放在 `unresolved`。
+- 逐项核对后确认，`strategy_closed_loop` 的 warning 来源是 24 小时历史窗口中的 `historical_ml_not_effective=true` 与 `insufficient_effectiveness_samples=true`；当前运行窗口内：
+  - `current_weak_executed=false`
+  - `current_no_high_quality_entries=false`
+  - `current_fast_loss_cluster=false`
+  - `current_ml_not_effective=false`
+  - `shadow_only_executed=false`
+  - `executed_without_order=false`
+- 这类状态表示“收益/ML 有效性尚未被新样本证明，仍需观察”，不等同于当前执行链硬故障；若继续把它放在 `unresolved`，后续 AI 容易重复改执行链、容量释放或阈值，偏离真实根因。
+
+本次修复范围：
+- `web_dashboard/api/system_audit.py`
+  - 新增 `strategy_closed_loop` 当前诊断键与观察诊断键分组。
+  - 当前硬错误/当前质量问题仍保持 `unresolved`，包括弱证据执行、高质量候选持续为 0、当前快亏平集群、当前 ML 不参与、shadow-only 执行、执行无订单。
+  - 仅当当前诊断为干净，且 warning 只来自历史遗留、历史 ML 不参与或收益样本不足时，`strategy_closed_loop` 进入 `observing`。
+  - 保留通用 `current_runtime_window.historical_legacy_issues` 语义，避免破坏 `trade_execution_contract` 等已有“历史遗留当前未复现”台账逻辑。
+- `tests/test_system_audit_api.py`
+  - 新增“历史/样本不足 warning 进入 observing”的用例。
+  - 新增“当前窗口真实质量问题仍 unresolved”的用例。
+  - 保留并复验既有 `strategy_quality` 随 `strategy_closed_loop` 历史观察进入 observing 的用例。
+
+本地验证：
+- `pytest tests/test_system_audit_api.py -q`：41 passed。
+- 全量测试 `pytest -q`：1519 passed。
+- `ruff check web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：All checks passed。
+- `black --check web_dashboard/api/system_audit.py tests/test_system_audit_api.py`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 使用 `scripts/sync_to_online_server.py --skip-restart` 上传源码，仅上传：
+  - `/data/bb/app/web_dashboard/api/system_audit.py`
+- 远端 `py_compile web_dashboard/api/system_audit.py` 通过。
+- 本次只涉及 Dashboard 巡检/台账展示逻辑，未改交易主循环、OKX 下单、持仓同步、风控、仓位或杠杆；因此仅重启 `bb-dashboard.service`，未重启 `bb-paper-trading.service`。
+- 远端 hash 已与本地一致：
+  - `web_dashboard/api/system_audit.py`：`17ecdfc3a8f77a83017e5033af6ee578725b9be12f96ab3a11c87698973ef2fe`
+- Dashboard 服务复验：
+  - `bb-dashboard.service=active`
+  - `MainPID=923896`
+  - `ActiveEnterTimestamp=Thu 2026-06-25 22:36:53 UTC`
+  - 本机 Dashboard HTTP 返回 `302`
+- 使用 Dashboard 主进程环境并降权 OS 用户 `bb` 复验 `collect_system_audit_status(record_history=False, source="codex_verify")`：
+  - overall `status=warning`
+  - `cards=20`
+  - `critical=0`
+  - `warning=11`
+  - `ok=9`
+  - `nodes=21`
+  - `issue_ledger.fixed=9`
+  - `issue_ledger.unresolved=0`
+  - `issue_ledger.observing=11`
+  - `unresolved_keys=[]`
+  - `observing_keys` 包括 `strategy_closed_loop`、`strategy_signal_root_cause`、`model_training`、`shadow_missed_opportunity`、`strong_opportunity`、`position_capacity_release` 等。
+
+当前真实结论：
+- `strategy_closed_loop` 已从“未修复硬项”调整为“历史/样本观察项”；这修的是系统巡检台账的分层准确性，不是宣称策略已经会赚钱。
+- 当前仍未完成的是收益闭环证明：已平仓手续费后正收益样本不足、ML 仍处于学习观察/不贡献状态，`strategy_signal_root_cause` 当前根因为 `ml_not_contributing`。
+- 当前不能因为 `unresolved=0` 就放宽阈值、放大仓位、提高杠杆、硬改 ML readiness 或让 shadow missed opportunity 直接驱动实盘开仓。
+- 后续继续二期时，应优先推进：
+  1. ML readiness 与训练样本质量；
+  2. server_profit/OKX 事实口径与 selected-side 收益质量；
+  3. 弱证据向高质量候选转化；
+  4. 真实已平仓手续费后 PnL 观察；
+  5. 脏数据/乱码代码治理和本地工作区清理。
+
+后续 AI 防偏要求：
+- 看到 `strategy_closed_loop.status=warning` 但 `issue_ledger.unresolved=0` 时，必须解释为“当前硬执行错误未复现，但盈利/ML 有效性仍在观察”，不得解释为“策略闭环完成”。
+- 若 `strategy_closed_loop` 后续再次进入 `unresolved`，必须先看 `diagnostics` 中哪个 `current_*` 或 hard execution 键为 true，再决定修执行链、策略质量、ML 或数据口径；不得直接调开仓阈值。
+- 若 warning 只来自 `historical_ml_not_effective` 或 `insufficient_effectiveness_samples`，应继续观察并治理 ML/收益样本，不得重复改 OKX 平仓、容量释放或订单同步链路。
+- 任何仓位放大、阈值放宽、杠杆提高或 ML readiness live promotion，仍必须等待 2h/24h/72h 或至少 20 笔真实已平仓手续费后样本验证。
+
+回滚点：
+- 代码层可回滚 `web_dashboard/api/system_audit.py` 与 `tests/test_system_audit_api.py`。
+- 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。

@@ -2997,10 +2997,62 @@ def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda row: STATUS_RANK.get(str(row.get("severity")), 9))[:10]
 
 
+_STRATEGY_CLOSED_LOOP_CURRENT_DIAGNOSTICS = (
+    "current_weak_executed",
+    "current_no_high_quality_entries",
+    "current_fast_loss_cluster",
+    "current_ml_not_effective",
+    "shadow_only_executed",
+    "executed_without_order",
+)
+
+_STRATEGY_CLOSED_LOOP_OBSERVATION_DIAGNOSTICS = (
+    "historical_weak_executed",
+    "historical_no_high_quality_entries",
+    "historical_fast_loss_cluster",
+    "historical_ml_not_effective",
+    "insufficient_effectiveness_samples",
+    "historical_legacy_issues",
+)
+
+
+def _strategy_closed_loop_observation_only(card: dict[str, Any]) -> bool:
+    if str(card.get("key") or "") != "strategy_closed_loop":
+        return False
+    if str(card.get("status") or "info") == "ok":
+        return False
+    details = card.get("details") if isinstance(card.get("details"), dict) else {}
+    current_window = (
+        details.get("current_runtime_window")
+        if isinstance(details.get("current_runtime_window"), dict)
+        else {}
+    )
+    diagnostics = details.get("diagnostics") if isinstance(details.get("diagnostics"), dict) else {}
+    if any(bool(diagnostics.get(key)) for key in _STRATEGY_CLOSED_LOOP_CURRENT_DIAGNOSTICS):
+        return False
+    return bool(current_window.get("historical_legacy_issues")) or any(
+        bool(diagnostics.get(key)) for key in _STRATEGY_CLOSED_LOOP_OBSERVATION_DIAGNOSTICS
+    )
+
+
+def _card_historical_observation_only(card: dict[str, Any]) -> bool:
+    if str(card.get("status") or "info") == "ok":
+        return False
+    details = card.get("details") if isinstance(card.get("details"), dict) else {}
+    current_window = (
+        details.get("current_runtime_window")
+        if isinstance(details.get("current_runtime_window"), dict)
+        else {}
+    )
+    if not bool(current_window.get("historical_legacy_issues")):
+        return False
+    diagnostics = details.get("diagnostics") if isinstance(details.get("diagnostics"), dict) else {}
+    return not any(bool(diagnostics.get(key)) for key in _STRATEGY_CLOSED_LOOP_CURRENT_DIAGNOSTICS)
+
+
 def _strategy_closed_loop_is_historical_only(cards_by_key: dict[str, dict[str, Any]]) -> bool:
     card = cards_by_key.get("strategy_closed_loop") or {}
-    state, _label = _issue_ledger_state(card, cards_by_key={})
-    return state == "observing"
+    return _strategy_closed_loop_observation_only(card)
 
 
 def _issue_ledger_state(
@@ -3011,27 +3063,13 @@ def _issue_ledger_state(
     status = str(card.get("status") or "info")
     key = str(card.get("key") or "")
     details = card.get("details") if isinstance(card.get("details"), dict) else {}
-    current_window = (
-        details.get("current_runtime_window")
-        if isinstance(details.get("current_runtime_window"), dict)
-        else {}
-    )
-    diagnostics = details.get("diagnostics") if isinstance(details.get("diagnostics"), dict) else {}
-    historical_only = bool(current_window.get("historical_legacy_issues")) and not any(
-        bool(diagnostics.get(key))
-        for key in (
-            "current_weak_executed",
-            "current_no_high_quality_entries",
-            "current_fast_loss_cluster",
-            "current_ml_not_effective",
-            "shadow_only_executed",
-            "executed_without_order",
-        )
-    )
+    observation_only = _strategy_closed_loop_observation_only(
+        card
+    ) or _card_historical_observation_only(card)
     if status == "ok":
         return "fixed", "已修复 / 当前验证通过"
-    if historical_only:
-        return "observing", "历史遗留 / 当前未复现"
+    if observation_only:
+        return "observing", "历史/样本观察 / 当前未复现硬错误"
     if (
         key == "model_training"
         and status == "warning"
