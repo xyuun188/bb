@@ -6275,6 +6275,7 @@ class TradingService:
                 entry_price=entry_price,
                 unrealized_pnl=current_unrealized,
                 hold_minutes=hold_minutes,
+                quantity=self._safe_float(pos.get("quantity"), 0.0),
             )
 
             hit_sl = False

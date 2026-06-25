@@ -59,12 +59,14 @@ class PositionProfitPeakTracker:
         entry_price: float,
         unrealized_pnl: float,
         hold_minutes: float | None,
+        quantity: float | None = None,
     ) -> dict[str, Any]:
         key = self.key(model_name, symbol, side)
         now = datetime.now(UTC).isoformat()
         entry_price = self.float_parser(entry_price, 0.0)
         current_price = self.float_parser(current_price, 0.0)
         unrealized_pnl = self.float_parser(unrealized_pnl, 0.0)
+        quantity_value = abs(self.float_parser(quantity, 0.0))
         hold_minutes = float(hold_minutes or 0.0)
         if entry_price <= 0 or current_price <= 0:
             return {}
@@ -74,7 +76,19 @@ class PositionProfitPeakTracker:
         else:
             pnl_ratio = max((current_price - entry_price) / entry_price, 0.0)
 
-        state = self.peaks.get(key) or {
+        position_notional = abs(
+            (current_price if current_price > 0 else entry_price) * quantity_value
+        )
+        state = self.peaks.get(key) or {}
+        if state and not self._state_matches_position(
+            state,
+            entry_price=entry_price,
+            quantity=quantity_value,
+            position_notional=position_notional,
+            hold_minutes=hold_minutes,
+        ):
+            state = {}
+        state = state or {
             "peak_unrealized_pnl": unrealized_pnl,
             "peak_pnl_ratio": pnl_ratio,
             "last_unrealized_pnl": unrealized_pnl,
@@ -94,9 +108,47 @@ class PositionProfitPeakTracker:
         state["last_pnl_ratio"] = pnl_ratio
         state["updated_at"] = now
         state["hold_minutes"] = hold_minutes
+        state["entry_price"] = entry_price
+        state["quantity"] = quantity_value
+        state["position_notional"] = position_notional
         self.peaks[key] = state
         self.save()
         return state
+
+    def _state_matches_position(
+        self,
+        state: dict[str, Any],
+        *,
+        entry_price: float,
+        quantity: float,
+        position_notional: float,
+        hold_minutes: float,
+    ) -> bool:
+        stored_hold = self.float_parser(state.get("hold_minutes"), 0.0)
+        if hold_minutes + 5.0 < stored_hold:
+            return False
+
+        stored_entry = self.float_parser(state.get("entry_price"), 0.0)
+        if stored_entry > 0 and entry_price > 0:
+            if abs(stored_entry - entry_price) / max(abs(stored_entry), 1e-9) > 0.02:
+                return False
+
+        stored_quantity = abs(self.float_parser(state.get("quantity"), 0.0))
+        if stored_quantity > 0 and quantity > 0:
+            if abs(stored_quantity - quantity) / max(stored_quantity, 1e-9) > 0.02:
+                return False
+
+        stored_notional = self.float_parser(state.get("position_notional"), 0.0)
+        if stored_notional <= 0:
+            peak = self.float_parser(state.get("peak_unrealized_pnl"), 0.0)
+            peak_ratio = self.float_parser(state.get("peak_pnl_ratio"), 0.0)
+            if peak > 0 and peak_ratio > 0:
+                stored_notional = abs(peak / peak_ratio)
+        if stored_notional > 0 and position_notional > 0:
+            ratio = position_notional / max(stored_notional, 1e-9)
+            if ratio < 0.5 or ratio > 2.0:
+                return False
+        return True
 
     def seconds_since_profit_exit(self, peak_state: dict[str, Any]) -> float:
         value = peak_state.get("last_profit_exit_at") if isinstance(peak_state, dict) else None
@@ -172,6 +224,9 @@ class PositionProfitPeakTracker:
                     "hold_minutes": float(value.get("hold_minutes") or 0.0),
                     "last_profit_exit_at": value.get("last_profit_exit_at") or "",
                     "profit_exit_count": int(value.get("profit_exit_count") or 0),
+                    "entry_price": float(value.get("entry_price") or 0.0),
+                    "quantity": float(value.get("quantity") or 0.0),
+                    "position_notional": float(value.get("position_notional") or 0.0),
                 }
             logger.info("loaded position profit peaks", count=len(loaded), path=str(self.path))
             return loaded

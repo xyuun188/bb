@@ -654,6 +654,7 @@ class OkxSyncService:
                         entry_price=float(pos.entry_price or 0.0),
                         unrealized_pnl=float(unrealized_pnl),
                         hold_minutes=position_age_minutes(pos.created_at),
+                        quantity=float(pos.quantity or 0.0),
                     )
                     pnl_by_model[pos.model_name] = pnl_by_model.get(pos.model_name, 0.0) + float(
                         unrealized_pnl

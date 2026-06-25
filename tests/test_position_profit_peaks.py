@@ -59,6 +59,35 @@ def test_position_profit_peak_tracker_handles_short_ratio(tmp_path):
     assert state["hold_minutes"] == 0.0
 
 
+def test_position_profit_peak_tracker_resets_stale_lifecycle_peak(tmp_path):
+    tracker = _tracker(tmp_path)
+    key = tracker.key("ensemble_trader", "lab/usdt", "long")
+    tracker.peaks[key] = {
+        "peak_unrealized_pnl": 14.062,
+        "peak_pnl_ratio": 0.1740496739,
+        "last_unrealized_pnl": 1.0,
+        "last_pnl_ratio": 0.06,
+        "updated_at": "2026-06-25T20:00:00+00:00",
+        "hold_minutes": 700.0,
+    }
+
+    state = tracker.update(
+        model_name="ensemble_trader",
+        symbol="lab/usdt",
+        side="long",
+        current_price=17.991,
+        entry_price=16.865555555555556,
+        unrealized_pnl=1.0129,
+        hold_minutes=701.0,
+        quantity=0.9,
+    )
+
+    assert state["peak_unrealized_pnl"] == 1.0129
+    assert state["last_unrealized_pnl"] == 1.0129
+    assert state["quantity"] == 0.9
+    assert state["position_notional"] == 16.1919
+
+
 def test_position_profit_peak_tracker_marks_recent_profit_exit(tmp_path):
     tracker = _tracker(tmp_path)
     tracker.update(
