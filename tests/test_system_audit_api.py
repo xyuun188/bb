@@ -1686,26 +1686,34 @@ async def test_okx_reconciliation_audit_reuses_short_cache(
 ) -> None:
     calls = 0
 
-    async def fake_collect_missing_closed_position_plans(days: int) -> list[Any]:
+    async def fake_collect_missing_closed_position_scan(days: int) -> Any:
         nonlocal calls
         calls += 1
         assert days == 14
-        return [
-            SimpleNamespace(
-                symbol="PROS/USDT",
-                side="long",
-                quantity=1.0,
-                realized_pnl=-0.82,
-                close_order_id="close-1",
-                closed_at=datetime(2026, 6, 22, tzinfo=UTC),
-            )
-        ]
+        return SimpleNamespace(
+            plans=[
+                SimpleNamespace(
+                    symbol="PROS/USDT",
+                    side="long",
+                    quantity=1.0,
+                    realized_pnl=-0.82,
+                    close_order_id="close-1",
+                    closed_at=datetime(2026, 6, 22, tzinfo=UTC),
+                )
+            ],
+            lookback_days=14,
+            candidate_order_count=1,
+            scanned_order_count=1,
+            truncated=False,
+            max_close_orders=None,
+            duration_seconds=0.012,
+        )
 
     monkeypatch.setattr(system_audit, "_okx_reconciliation_cache", None)
     monkeypatch.setattr(
         system_audit,
-        "collect_missing_closed_position_plans",
-        fake_collect_missing_closed_position_plans,
+        "collect_missing_closed_position_scan",
+        fake_collect_missing_closed_position_scan,
     )
 
     first = await system_audit._okx_reconciliation_audit()
@@ -1713,6 +1721,7 @@ async def test_okx_reconciliation_audit_reuses_short_cache(
 
     assert calls == 1
     assert first["details"]["cache"]["hit"] is False
+    assert first["details"]["candidate_close_order_count"] == 1
     assert second["details"]["cache"]["hit"] is True
     assert second["details"]["missing_closed_positions"] == 1
 
@@ -1721,14 +1730,14 @@ async def test_okx_reconciliation_audit_reuses_short_cache(
 async def test_okx_reconciliation_timeout_is_observing_not_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def slow_collect_missing_closed_position_plans(days: int) -> list[Any]:
+    async def slow_collect_missing_closed_position_scan(days: int) -> Any:
         raise TimeoutError()
 
     monkeypatch.setattr(system_audit, "_okx_reconciliation_cache", None)
     monkeypatch.setattr(
         system_audit,
-        "collect_missing_closed_position_plans",
-        slow_collect_missing_closed_position_plans,
+        "collect_missing_closed_position_scan",
+        slow_collect_missing_closed_position_scan,
     )
 
     card = await system_audit._okx_reconciliation_audit()

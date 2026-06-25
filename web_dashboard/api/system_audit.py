@@ -25,7 +25,7 @@ from models.market_data import Kline, Ticker
 from models.trade import Order, Position
 from scripts.audit_runtime_text_integrity import collect_runtime_text_integrity_report
 from scripts.repair_missing_closed_positions_from_orders import (
-    collect_missing_closed_position_plans,
+    collect_missing_closed_position_scan,
 )
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
 from services.exchange_position_state import (
@@ -76,7 +76,7 @@ TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
 OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
 OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
-PRIORITY_AUDIT_KEYS = ("trade_execution_contract",)
+PRIORITY_AUDIT_KEYS = ("okx_reconciliation", "trade_execution_contract")
 HEAVY_AUDIT_KEYS = (
     "model_expert_health",
     "model_expert_competition",
@@ -853,7 +853,7 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
     if cached is not None:
         return cached
     try:
-        plans = await asyncio.wait_for(collect_missing_closed_position_plans(days=14), timeout=8.0)
+        report = await asyncio.wait_for(collect_missing_closed_position_scan(days=14), timeout=8.0)
     except Exception as exc:
         timeout = isinstance(exc, TimeoutError)
         return _store_okx_reconciliation_card(
@@ -873,26 +873,37 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
                     "window_days": 14,
                 },
                 next_actions=[
-                    "dry-run 超时时先重试巡检或缩小窗口，不能直接补历史仓位。",
-                    "如果连续超时，再查数据库慢查询、订单数量和对账索引。",
+                    "dry-run 超时时不能直接补历史仓位；先确认是否仍在全量扫非平仓成交或数据库慢查询。",
+                    "如果连续超时，运行对账脚本查看 candidate_order_count/scanned_order_count，再按订单 ID 精确核对。",
                 ],
             )
         )
+    plans = report.plans
     missing = len(plans)
-    status = "critical" if missing else "ok"
+    status = "critical" if missing else "warning" if report.truncated else "ok"
+    summary = (
+        "存在可由 OKX 成交订单反推的缺失历史仓位。"
+        if missing
+        else (
+            "14 天历史仓位 dry-run 已限量扫描；需运行完整脚本确认无缺失。"
+            if report.truncated
+            else "14 天历史仓位 dry-run 无缺失。"
+        )
+    )
     return _store_okx_reconciliation_card(
         _audit_card(
             "okx_reconciliation",
             "OKX 历史对账",
             status,
-            (
-                "存在可由 OKX 成交订单反推的缺失历史仓位。"
-                if missing
-                else "14 天历史仓位 dry-run 无缺失。"
-            ),
+            summary,
             details={
-                "window_days": 14,
+                "window_days": report.lookback_days,
                 "missing_closed_positions": missing,
+                "candidate_close_order_count": report.candidate_order_count,
+                "scanned_close_order_count": report.scanned_order_count,
+                "truncated": report.truncated,
+                "max_close_orders": report.max_close_orders,
+                "duration_seconds": report.duration_seconds,
                 "sample_plans": [
                     {
                         "symbol": plan.symbol,
@@ -905,10 +916,15 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
                     for plan in plans[:5]
                 ],
             },
-            evidence=[{"label": "缺失闭仓", "value": missing}],
+            evidence=[
+                {"label": "候选平仓单", "value": report.candidate_order_count},
+                {"label": "已扫描平仓单", "value": report.scanned_order_count},
+                {"label": "缺失闭仓", "value": missing},
+            ],
             next_actions=[
                 "只允许先 dry-run 人工核对，再按 symbol/order-id 精确 apply。",
                 "如果缺失不为 0，先不要做策略收益判断，避免训练和盈亏被脏账影响。",
+                "如果 scanned_close_order_count 小于 candidate_close_order_count，先跑完整脚本或按订单 ID 分段复核。",
             ],
         )
     )

@@ -849,13 +849,13 @@ AI 防偏要求：
 
 ## 十七点六、二期未完成闭环台账与工程基线门禁
 
-本节记录截至北京时间 `2026-06-26 04:14` 复核后的二期未完成闭环。后续 AI 继续执行总控时，必须先阅读本节，再决定是否改策略、部署或清理数据。
+本节记录截至北京时间 `2026-06-26 07:35` 复核后的二期未完成闭环。后续 AI 继续执行总控时，必须先阅读本节，再决定是否改策略、部署或清理数据。
 
 当前复核口径：
 
-- 线上系统巡检为 `warning`，`critical=0`，问题台账 `fixed=9`、`unresolved=1`、`observing=10`。
-- 当前唯一 `unresolved` 为 `strategy_closed_loop`。
-- `okx_trade_fact_integrity=ok`、`position_price_integrity=ok`、`trade_execution_contract=ok`。
+- 线上系统巡检为 `warning`，`critical=0`，问题台账 `fixed=10`、`unresolved=0`、`observing=10`。
+- 当前没有 `unresolved`；`strategy_closed_loop` 仍是收益/ML 有效性观察项，不能当作盈利闭环完成。
+- `okx_reconciliation=ok`、`okx_trade_fact_integrity=ok`、`position_price_integrity=ok`、`trade_execution_contract=ok`。
 - 近窗口新增 contract violation、weak evidence executed、negative expected executed、fast_loss_without_strong_exit 均为 0。
 - 当前这些结果只能说明“没有新增硬执行事故”，不能说明“不赚钱、不开仓、小单、历史脏数据、乱码遗留、ML/server_profit 和强机会实盘化已经根治”。
 
@@ -897,12 +897,13 @@ AI 防偏要求：
 - 当前 `okx_trade_fact_integrity=ok`。
 - 当前 `position_price_integrity=ok`。
 - 当前 `trade_execution_contract=ok`。
+- 当前 `okx_reconciliation=ok`，14 天候选平仓单 `247`、实际扫描 `247`、缺失闭仓 `0`、完整巡检耗时约 `4.45s`，不再复现 dry-run 超时。
 - 近窗口没有交易对错配、弱证据执行、负期望执行、快亏无强退出。
 
 未闭环原因：
 
 - 历史执行记录、历史持仓、历史收益样本是否全部修正、隔离或标记，还不能说彻底结束。
-- `okx_reconciliation` 仍有 dry-run `TimeoutError` 观察项。
+- `okx_reconciliation` 的 dry-run `TimeoutError` 已收口；后续若再次超时，应先看 `candidate_close_order_count`、`scanned_close_order_count`、`duration_seconds` 和巡检调度分组。
 - 历史脏样本如果继续进入 server_profit、影子复盘或训练，会继续污染策略。
 
 下一步：
@@ -910,7 +911,7 @@ AI 防偏要求：
 - 对历史订单、成交、持仓、收益样本做只读审计。
 - 按订单 ID、OKX `ordId`、OKX `fillId` 优先关联，交易对 alias 只作为辅助。
 - 对无法确认的历史样本标记为隔离或不参与训练/收益模型。
-- 修复 OKX 历史对账 dry-run 超时，不把超时当正常完成。
+- 保持 OKX 历史对账 dry-run 为 ok；若再次超时，先查候选平仓单过滤、数据库慢查询和完整巡检并发调度，不把超时当正常完成。
 
 验收：
 
@@ -3463,4 +3464,75 @@ Git 与线上部署：
 
 回滚点：
 - 代码层可回滚 `services/strategy_signal_root_cause_audit.py`、`web_dashboard/api/system_audit.py`、`tests/test_strategy_signal_root_cause_audit.py`、`tests/test_system_audit_api.py`。
+- 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。
+
+---
+
+## 六十五、Batch I 二期阶段 1/工程基线补充记录：OKX 历史对账 dry-run 超时根因收口（2026-06-26）
+
+触发原因：
+- 二期未完成台账中 `okx_reconciliation` 仍有 dry-run `TimeoutError` 观察项，用户多次指出 OKX/本地口径、历史脏数据、订单关联和收益样本不能继续靠页面提示绕过去。
+- 线上单卡复核确认：单独执行 OKX 历史对账可以完成，但完整系统巡检并发执行时，OKX 对账仍可能被 8 秒内部预算打断，导致页面继续显示 dry-run 超时。
+- 根因不是 OKX API，也不是交易所仓位接口；当前历史对账脚本在巡检中扫描 14 天所有 filled OKX 订单，再逐笔进入 `plan_missing_closed_position()`，普通开仓成交也会先进入候选扫描，完整巡检并发 DB 压力下容易超时。
+
+本次修复范围：
+- `scripts/repair_missing_closed_positions_from_orders.py`
+  - 新增 `ReconciliationScanReport` 和 `collect_missing_closed_position_scan()`。
+  - SQL 入口只扫描有 `AIDecision.action in (close_long, close_short)` 且方向与平仓动作匹配的 filled OKX 平仓单。
+  - 输出 `candidate_order_count`、`scanned_order_count`、`truncated`、`max_close_orders`、`duration_seconds`，让后续排查不再只看到 `TimeoutError`。
+  - 保留原 `collect_missing_closed_position_plans()` 兼容调用方。
+- `web_dashboard/api/system_audit.py`
+  - `okx_reconciliation` 卡片改读扫描报告，展示候选平仓单、已扫描平仓单、缺失闭仓和耗时。
+  - `okx_reconciliation` 加入优先串行巡检组，先于普通并发诊断执行，避免完整巡检下被其它 DB 重任务挤超时。
+  - 若未来出现截断扫描，卡片会保持 warning，不会把“只扫了一部分”误报为完整 ok。
+- `tests/test_order_position_reconciliation.py`
+  - 新增回归：大量普通 entry filled 订单存在时，历史对账候选只包含真实 close order。
+- `tests/test_system_audit_api.py`
+  - 更新 OKX 对账缓存/超时测试，覆盖新扫描报告字段。
+
+安全边界：
+- 本批只改只读审计和 dry-run 扫描入口，不写数据库，不补历史仓位，不修改订单、持仓、盈亏、训练样本、模型 artifact、开仓阈值、仓位、杠杆、止盈止损、平仓逻辑或 OKX 下单/平仓接口。
+- `okx_reconciliation=ok` 只表示 14 天窗口没有由本地 OKX 成交订单反推出的缺失闭仓，不代表所有历史脏样本、历史执行记录和训练样本污染已经彻底清理。
+- 后续若再次看到 OKX 对账超时，必须先看 `candidate_close_order_count`、`scanned_close_order_count`、`duration_seconds` 和巡检调度分组，不得直接补历史数据或把超时当 OK。
+
+本地验证：
+- `pytest tests/test_order_position_reconciliation.py tests/test_system_audit_api.py -q`：47 passed。
+- 全量测试 `pytest -q`：1522 passed。
+- `ruff check scripts/repair_missing_closed_positions_from_orders.py web_dashboard/api/system_audit.py tests/test_order_position_reconciliation.py tests/test_system_audit_api.py`：All checks passed。
+- `black --check scripts/repair_missing_closed_positions_from_orders.py web_dashboard/api/system_audit.py tests/test_order_position_reconciliation.py tests/test_system_audit_api.py`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 已使用 `scripts/sync_to_online_server.py --skip-restart` 上传：
+  - `/data/bb/app/scripts/repair_missing_closed_positions_from_orders.py`
+  - `/data/bb/app/web_dashboard/api/system_audit.py`
+- 远端 `py_compile scripts/repair_missing_closed_positions_from_orders.py web_dashboard/api/system_audit.py` 通过。
+- 仅重启 `bb-dashboard.service`，未重启 `bb-paper-trading.service`；最终 Dashboard：
+  - `bb-dashboard.service=active`
+  - `MainPID=968920`
+  - `ActiveEnterTimestamp=Thu 2026-06-25 23:28:31 UTC`
+- 使用 Dashboard 主进程等价环境、OS 用户 `bb` 只读复验：
+  - 单卡：`okx_reconciliation.status=ok`
+  - `candidate_close_order_count=247`
+  - `scanned_close_order_count=247`
+  - `missing_closed_positions=0`
+  - `truncated=false`
+  - 单卡耗时约 `3.27s`
+  - 完整系统巡检中该卡耗时约 `4.45s`
+  - 完整系统巡检：overall `warning`、cards `20`、critical `0`、warning `10`、ok `10`
+  - issue ledger：`fixed=10`、`unresolved=0`、`observing=10`
+
+当前真实结论：
+- OKX 历史对账 dry-run 超时链路已从“泛化 TimeoutError 观察项”收口为“可解释、可计数、完整巡检可通过”的只读审计。
+- 当前 14 天窗口没有缺失闭仓；这降低了历史缺仓继续污染收益判断的风险。
+- 但二期 OKX/本地历史脏数据闭环还没有全部完成：历史执行记录、历史持仓、历史收益样本仍需继续按订单 ID、OKX `ordId`、OKX `fillId` 做隔离/清单/回滚式治理。
+- 本批不解决“不赚钱、不开仓、小单、ML top return 仍负、server_profit 反向或强机会 canary”问题；这些仍按第十七点六推荐顺序继续推进。
+
+后续 AI 防偏要求：
+- 不得因为 `okx_reconciliation=ok` 就宣称历史脏数据彻底清完；只能说“当前 14 天缺失闭仓 dry-run 为 0，且超时已收口”。
+- 不得把 OKX 对账卡变绿当作放大仓位、降低阈值、硬启 ML 或启用强机会 live sizing 的依据。
+- 继续治理历史脏数据时，优先用订单 ID / OKX `ordId` / OKX `fillId` 关联；交易对 alias 只能作为辅助。
+
+回滚点：
+- 代码层可回滚 `scripts/repair_missing_closed_positions_from_orders.py`、`web_dashboard/api/system_audit.py`、`tests/test_order_position_reconciliation.py`、`tests/test_system_audit_api.py` 与本节文档。
 - 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。

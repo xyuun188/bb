@@ -9,10 +9,128 @@ from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order, Position
+from scripts.repair_missing_closed_positions_from_orders import (
+    collect_missing_closed_position_scan,
+)
 from services.order_position_reconciliation import (
     apply_missing_closed_position_plan,
     plan_missing_closed_position,
 )
+
+
+@pytest.mark.asyncio
+async def test_missing_closed_position_scan_only_scans_close_orders(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'trading.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        opened_at = datetime.now(UTC) - timedelta(hours=2)
+        closed_at = opened_at + timedelta(minutes=12)
+        async with get_session_ctx() as session:
+            ignored_decisions = [
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol=f"NOISE{i}/USDT",
+                    action="long" if i % 2 else "short",
+                    confidence=0.7,
+                    reasoning="entry noise",
+                    is_paper=True,
+                    was_executed=True,
+                )
+                for i in range(20)
+            ]
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="PROS/USDT",
+                action="long",
+                confidence=0.88,
+                reasoning="entry",
+                position_size_pct=0.02,
+                suggested_leverage=3.0,
+                stop_loss_pct=0.02,
+                take_profit_pct=0.04,
+                is_paper=True,
+                was_executed=True,
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="PROS/USDT",
+                action="close_long",
+                confidence=0.92,
+                reasoning="close",
+                position_size_pct=1.0,
+                is_paper=True,
+                was_executed=True,
+            )
+            session.add_all([*ignored_decisions, entry_decision, close_decision])
+            await session.flush()
+            noise_orders = [
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol=decision.symbol,
+                    side="buy" if decision.action == "long" else "sell",
+                    order_type="market",
+                    quantity=1.0,
+                    price=1.0,
+                    status="filled",
+                    fee=0.0,
+                    decision_id=decision.id,
+                    exchange_order_id=f"noise-{decision.id}",
+                    filled_at=opened_at,
+                )
+                for decision in ignored_decisions
+            ]
+            session.add_all(
+                [
+                    *noise_orders,
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PROS/USDT:USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=9.0,
+                        price=0.7316,
+                        status="filled",
+                        fee=0.001,
+                        decision_id=entry_decision.id,
+                        exchange_order_id="entry-1",
+                        filled_at=opened_at,
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PROS/USDT:USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=9.0,
+                        price=0.7879,
+                        status="filled",
+                        fee=0.002,
+                        decision_id=close_decision.id,
+                        exchange_order_id="close-1",
+                        filled_at=closed_at,
+                    ),
+                ]
+            )
+            await session.flush()
+
+        report = await collect_missing_closed_position_scan(days=14)
+
+        assert report.candidate_order_count == 1
+        assert report.scanned_order_count == 1
+        assert report.truncated is False
+        assert len(report.plans) == 1
+        assert report.plans[0].close_exchange_order_id == "close-1"
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

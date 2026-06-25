@@ -9,16 +9,18 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import and_, func, or_, select  # noqa: E402
 
 from core.symbols import normalize_trading_symbol, trading_symbol_variants  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
+from models.decision import AIDecision  # noqa: E402
 from models.learning import TradeReflection  # noqa: E402
 from models.trade import Order  # noqa: E402
 from services.order_position_reconciliation import (  # noqa: E402
@@ -39,35 +41,103 @@ class ReconciliationFilters:
     max_realized_pnl: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ReconciliationScanReport:
+    """Read-only scan metadata for historical position reconciliation."""
+
+    plans: list[Any]
+    lookback_days: int
+    candidate_order_count: int
+    scanned_order_count: int
+    truncated: bool
+    max_close_orders: int | None
+    duration_seconds: float
+
+
 async def collect_missing_closed_position_plans(
     *,
     days: int | None = None,
     filters: ReconciliationFilters | None = None,
 ) -> list[Any]:
+    report = await collect_missing_closed_position_scan(days=days, filters=filters)
+    return report.plans
+
+
+async def collect_missing_closed_position_scan(
+    *,
+    days: int | None = None,
+    filters: ReconciliationFilters | None = None,
+    max_close_orders: int | None = None,
+) -> ReconciliationScanReport:
     active_filters = filters or ReconciliationFilters(days=int(days or 14))
     since = datetime.now(UTC) - timedelta(days=max(int(active_filters.days), 1))
+    max_orders = int(max_close_orders) if max_close_orders is not None else None
+    if max_orders is not None and max_orders <= 0:
+        max_orders = None
+    started = perf_counter()
     plans: list[Any] = []
     async with get_session_ctx() as session:
-        stmt = select(Order).where(
-            Order.status == "filled",
-            Order.exchange_order_id.is_not(None),
-            Order.exchange_order_id != "",
-            Order.filled_at >= since,
+        conditions = _close_order_candidate_conditions(active_filters, since)
+        candidate_count = int(
+            (
+                await session.execute(
+                    select(func.count(Order.id))
+                    .join(AIDecision, Order.decision_id == AIDecision.id)
+                    .where(*conditions)
+                )
+            ).scalar_one()
+            or 0
         )
-        if active_filters.close_order_ids:
-            stmt = stmt.where(Order.id.in_(active_filters.close_order_ids))
-        if active_filters.close_exchange_order_ids:
-            stmt = stmt.where(Order.exchange_order_id.in_(active_filters.close_exchange_order_ids))
-        if active_filters.symbols:
-            variants = _symbol_variants(active_filters.symbols)
-            stmt = stmt.where(Order.symbol.in_(variants))
-        result = await session.execute(stmt.order_by(Order.filled_at.asc(), Order.created_at.asc()))
+        stmt = (
+            select(Order)
+            .join(AIDecision, Order.decision_id == AIDecision.id)
+            .where(*conditions)
+            .order_by(Order.filled_at.asc(), Order.created_at.asc())
+        )
+        if max_orders is not None:
+            stmt = stmt.limit(max_orders)
+        result = await session.execute(stmt)
         orders = list(result.scalars().all())
         for order in orders:
             plan = await plan_missing_closed_position(session, order)
             if plan is not None and _matches_filters(plan, active_filters):
                 plans.append(plan)
-    return plans
+    return ReconciliationScanReport(
+        plans=plans,
+        lookback_days=max(int(active_filters.days), 1),
+        candidate_order_count=candidate_count,
+        scanned_order_count=len(orders),
+        truncated=max_orders is not None and candidate_count > len(orders),
+        max_close_orders=max_orders,
+        duration_seconds=round(max(perf_counter() - started, 0.0), 6),
+    )
+
+
+def _close_order_candidate_conditions(
+    filters: ReconciliationFilters,
+    since: datetime,
+) -> list[Any]:
+    close_long = and_(
+        func.lower(AIDecision.action) == "close_long", func.lower(Order.side) == "sell"
+    )
+    close_short = and_(
+        func.lower(AIDecision.action) == "close_short", func.lower(Order.side) == "buy"
+    )
+    conditions: list[Any] = [
+        func.lower(Order.status) == "filled",
+        Order.exchange_order_id.is_not(None),
+        Order.exchange_order_id != "",
+        Order.decision_id.is_not(None),
+        Order.filled_at >= since,
+        or_(close_long, close_short),
+    ]
+    if filters.close_order_ids:
+        conditions.append(Order.id.in_(filters.close_order_ids))
+    if filters.close_exchange_order_ids:
+        conditions.append(Order.exchange_order_id.in_(filters.close_exchange_order_ids))
+    if filters.symbols:
+        conditions.append(Order.symbol.in_(_symbol_variants(filters.symbols)))
+    return conditions
 
 
 async def apply_plans(
