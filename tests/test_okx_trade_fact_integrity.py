@@ -229,6 +229,135 @@ async def test_filled_close_order_without_position_is_a_warning(
 
 
 @pytest.mark.asyncio
+async def test_entry_order_matches_existing_position_lifecycle_without_false_warning(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=240)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="PROS/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="PROS-USDT-SWAP",
+                    contracts=1,
+                    contract_size=1,
+                    avg_price=0.3902,
+                ),
+                was_executed=False,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PROS/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=1.0,
+                        price=0.3902,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="pros-add-fill",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PROS/USDT",
+                        side="long",
+                        quantity=1.0,
+                        entry_price=0.3902,
+                        current_price=0.3948,
+                        realized_pnl=0.0042,
+                        leverage=3.0,
+                        is_open=False,
+                        created_at=filled_at - timedelta(days=10),
+                        closed_at=filled_at + timedelta(hours=2),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_old_open_position_is_included_for_recent_entry_order_audit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=30)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="LINK/USDT",
+                action="short",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="LINK-USDT-SWAP",
+                    contracts=2,
+                    contract_size=1,
+                    avg_price=7.22,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="LINK/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=2.0,
+                        price=7.22,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="link-add-fill",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="LINK/USDT",
+                        side="short",
+                        quantity=2.0,
+                        entry_price=7.22,
+                        current_price=7.18,
+                        leverage=3.0,
+                        is_open=True,
+                        created_at=filled_at - timedelta(days=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["checked_positions"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_split_exit_order_uses_weighted_child_fill_price(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

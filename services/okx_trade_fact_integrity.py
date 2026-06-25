@@ -113,7 +113,13 @@ class OkxTradeFactIntegrityService:
                 decisions = {int(decision.id): decision for decision in decision_rows.scalars()}
             position_rows = await session.execute(
                 select(Position)
-                .where(or_(Position.created_at >= since_naive, Position.closed_at >= since_naive))
+                .where(
+                    or_(
+                        Position.created_at >= since_naive,
+                        Position.closed_at >= since_naive,
+                        Position.is_open.is_(True),
+                    )
+                )
                 .order_by(Position.created_at.desc())
                 .limit(self.limit)
             )
@@ -441,15 +447,23 @@ def _related_positions_for_order(
             continue
         if str(position.side or "").lower() != side:
             continue
-        position_time = _position_match_time(position, entry_action=entry_action)
-        if position_time is None:
-            continue
-        time_delta = abs((position_time - order_time).total_seconds())
-        if time_delta > POSITION_MATCH_WINDOW.total_seconds():
-            continue
-
         position_symbol = normalize_trading_symbol(position.symbol)
         symbol_matches = bool(position_symbol and position_symbol in expected_symbols)
+        lifecycle_match = (
+            entry_action
+            and symbol_matches
+            and _entry_position_lifecycle_contains_order(position, order_time)
+        )
+        position_time = _position_match_time(position, entry_action=entry_action)
+        if lifecycle_match:
+            time_delta = 0.0
+        else:
+            if position_time is None:
+                continue
+            time_delta = abs((position_time - order_time).total_seconds())
+        if not lifecycle_match and time_delta > POSITION_MATCH_WINDOW.total_seconds():
+            continue
+
         price_matches = _position_price_matches_order(position, order, entry_action=entry_action)
         quantity_matches = _relative_close_enough(
             abs(_safe_float(position.quantity)),
@@ -478,6 +492,14 @@ def _position_match_time(position: Position, *, entry_action: bool) -> datetime 
     if entry_action:
         return _ensure_aware(getattr(position, "created_at", None))
     return _ensure_aware(getattr(position, "closed_at", None))
+
+
+def _entry_position_lifecycle_contains_order(position: Position, order_time: datetime) -> bool:
+    created_at = _ensure_aware(getattr(position, "created_at", None))
+    if created_at is None or created_at > order_time:
+        return False
+    closed_at = _ensure_aware(getattr(position, "closed_at", None))
+    return closed_at is None or closed_at >= order_time
 
 
 def _position_price_matches_order(position: Position, order: Order, *, entry_action: bool) -> bool:
