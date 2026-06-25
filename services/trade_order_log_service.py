@@ -14,6 +14,7 @@ from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
+from services.execution_result_classifier import is_confirmed_native_full_close_result
 
 logger = structlog.get_logger(__name__)
 
@@ -95,7 +96,10 @@ class TradeOrderLogService:
         }
         if status_text in exchange_confirmed_statuses:
             exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
-            if not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}:
+            native_full_close_confirmed = is_confirmed_native_full_close_result(result)
+            if not native_full_close_confirmed and (
+                not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}
+            ):
                 return True
         if quantity <= 0 and status_text in active_or_filled:
             return True
@@ -108,10 +112,15 @@ class TradeOrderLogService:
         status_value = getattr(status, "value", status)
         status_text = str(status_value or "").lower()
         exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
-        exchange_confirmed = (
-            status_text in {OrderStatus.PARTIAL.value, OrderStatus.FILLED.value}
-            and bool(exchange_order_id)
-            and exchange_order_id not in {"hold", "rejected", "no_position"}
+        exchange_confirmed = status_text in {
+            OrderStatus.PARTIAL.value,
+            OrderStatus.FILLED.value,
+        } and (
+            is_confirmed_native_full_close_result(result)
+            or (
+                bool(exchange_order_id)
+                and exchange_order_id not in {"hold", "rejected", "no_position"}
+            )
         )
         if not exchange_confirmed:
             return decision_symbol or normalize_trading_symbol(getattr(result, "symbol", None))

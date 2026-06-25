@@ -1251,7 +1251,10 @@ def test_strategy_health_summary_keeps_stop_signal_fields() -> None:
 def test_strategy_health_shadow_only_examples_use_final_entry_evidence_contract() -> None:
     template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
 
-    assert "def closed_position_pnl_diagnostics(closed_rows):" in template
+    assert (
+        "def closed_position_pnl_diagnostics(closed_rows, orders, decision_by_id, decisions):"
+        in template
+    )
     assert "def compact_closed_position_pnl_diagnostics(value):" in template
     assert "_compact_closed_position_pnl_diagnostics" not in template
     assert "def is_shadow_only_entry_decision(decision):" in template

@@ -163,6 +163,58 @@ async def test_trade_order_log_service_skips_unconfirmed_filled_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trade_order_log_service_persists_confirmed_native_full_close_without_order_id() -> (
+    None
+):
+    repo = FakeTradeRepo()
+    filled_at = datetime(2026, 6, 25, 20, 54, tzinfo=UTC)
+    result = ExecutionResult(
+        order_id="okx_native_full_close",
+        exchange_order_id=None,
+        symbol="AI16Z/USDT",
+        side="sell",
+        order_type="market",
+        quantity=366.0,
+        price=0.0513,
+        status=OrderStatus.FILLED,
+        timestamp=filled_at,
+        raw_response={
+            "okx_native_close_position": True,
+            "position_contracts_before": 36.6,
+            "position_contracts_after": 0.0,
+            "remaining_contracts": 0.0,
+            "filled_contracts": 36.6,
+        },
+    )
+    decision = _decision()
+    decision.symbol = "AI16Z/USDT"
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda model_name: f"mode:{model_name}",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", decision, decision_id=132611)
+
+    assert repo.orders == [
+        {
+            "model_name": "ensemble_trader",
+            "execution_mode": "mode:ensemble_trader",
+            "symbol": "AI16Z/USDT",
+            "side": "sell",
+            "order_type": "market",
+            "quantity": 366.0,
+            "price": 0.0513,
+            "status": "filled",
+            "fee": 0.0,
+            "decision_id": 132611,
+            "exchange_order_id": None,
+            "filled_at": filled_at,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_trade_order_log_service_skips_unconfirmed_partial_order() -> None:
     repo = FakeTradeRepo()
     result = ExecutionResult(

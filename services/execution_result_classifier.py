@@ -32,6 +32,27 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def is_confirmed_native_full_close_result(result: ExecutionResult | None) -> bool:
+    """OKX close-position may not return a normal order id; flat snapshot is confirmation."""
+
+    if result is None or result.status != OrderStatus.FILLED:
+        return False
+    if result.quantity <= 0 or result.price <= 0:
+        return False
+    raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+    if not raw.get("okx_native_close_position"):
+        return False
+
+    before = _safe_float(raw.get("position_contracts_before"), 0.0)
+    after = _safe_float(raw.get("position_contracts_after"), before)
+    remaining = _safe_float(raw.get("remaining_contracts"), after)
+    filled = _safe_float(raw.get("filled_contracts"), result.quantity)
+    if filled <= 0:
+        return False
+    tolerance = max(before * 0.001, 1e-8) if before > 0 else 1e-8
+    return min(after, remaining) <= tolerance
+
+
 class ExecutionResultClassifier:
     """Classify exchange execution results and normalize failure reasons."""
 
@@ -199,6 +220,8 @@ class ExecutionResultClassifier:
 
         if result is None or result.status != OrderStatus.FILLED:
             return False
+        if is_confirmed_native_full_close_result(result):
+            return True
         order_id = str(result.exchange_order_id or "").strip()
         if not order_id or order_id in {"hold", "rejected", "no_position"}:
             return False

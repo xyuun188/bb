@@ -568,7 +568,148 @@ def compact_execution_result_for_entry(decision):
     )
 
 
-def closed_position_pnl_diagnostics(closed_rows):
+def _close_action_for_position(pos):
+    side = str(getattr(pos, "side", "") or "").lower()
+    return "close_long" if side == "long" else "close_short"
+
+
+def _close_order_side_for_position(pos):
+    side = str(getattr(pos, "side", "") or "").lower()
+    return "sell" if side == "long" else "buy"
+
+
+def _decision_has_exit_context(decision):
+    raw = safe_dict(getattr(decision, "raw_llm_response", None))
+    if not raw:
+        return False
+    return bool(
+        raw.get("close_evidence")
+        or raw.get("position_release_policy")
+        or raw.get("exit_quality")
+        or raw.get("exit_intent")
+        or raw.get("fast_risk_trigger")
+        or raw.get("forced_exit")
+        or raw.get("execution_profit_protection")
+    )
+
+
+def _close_order_candidates_for_position(pos, orders):
+    symbol = str(getattr(pos, "symbol", "") or "")
+    close_side = _close_order_side_for_position(pos)
+    opened = aware(getattr(pos, "created_at", None))
+    closed = aware(getattr(pos, "closed_at", None))
+    candidates = []
+    for order in orders:
+        if str(getattr(order, "symbol", "") or "") != symbol:
+            continue
+        if str(getattr(order, "side", "") or "").lower() != close_side:
+            continue
+        if str(getattr(order, "status", "") or "").lower() != "filled":
+            continue
+        order_time = aware(getattr(order, "filled_at", None)) or aware(
+            getattr(order, "created_at", None)
+        )
+        if opened and order_time and order_time < opened - timedelta(minutes=2):
+            continue
+        if closed and order_time and order_time > closed + timedelta(minutes=5):
+            continue
+        candidates.append(order)
+    candidates.sort(
+        key=lambda order: abs(
+            (
+                (aware(getattr(order, "filled_at", None)) or aware(getattr(order, "created_at", None)) or closed or now)
+                - (closed or now)
+            ).total_seconds()
+        )
+    )
+    return candidates
+
+
+def _matching_close_decision_for_position(pos, orders, decision_by_id, decisions):
+    fallback_decision = None
+    fallback_order = None
+    for order in _close_order_candidates_for_position(pos, orders):
+        decision = decision_by_id.get(getattr(order, "decision_id", None))
+        if decision and _decision_has_exit_context(decision):
+            return decision, order, "close_order_decision"
+        if decision and fallback_decision is None:
+            fallback_decision = decision
+            fallback_order = order
+
+    symbol = str(getattr(pos, "symbol", "") or "")
+    close_action = _close_action_for_position(pos)
+    opened = aware(getattr(pos, "created_at", None))
+    closed = aware(getattr(pos, "closed_at", None))
+    nearby = []
+    for decision in decisions:
+        if str(getattr(decision, "symbol", "") or "") != symbol:
+            continue
+        if str(getattr(decision, "action", "") or "").lower() != close_action:
+            continue
+        created = aware(getattr(decision, "created_at", None))
+        if opened and created and created < opened - timedelta(minutes=2):
+            continue
+        if closed and created and created > closed + timedelta(minutes=5):
+            continue
+        nearby.append(decision)
+    nearby.sort(
+        key=lambda decision: abs(
+            ((aware(getattr(decision, "created_at", None)) or closed or now) - (closed or now)).total_seconds()
+        )
+    )
+    for decision in nearby:
+        if _decision_has_exit_context(decision):
+            return decision, fallback_order, "nearby_exit_decision"
+    if fallback_decision:
+        return fallback_decision, fallback_order, "close_order_decision_without_raw"
+    return None, fallback_order, "position_fields"
+
+
+def _exit_trigger_from_decision(decision):
+    if decision is None:
+        return "unknown"
+    raw = safe_dict(getattr(decision, "raw_llm_response", None))
+    close_evidence = safe_dict(raw.get("close_evidence"))
+    release_policy = safe_dict(raw.get("position_release_policy"))
+    fast_trigger = str(raw.get("fast_risk_trigger") or "").strip().lower()
+    if fast_trigger:
+        return f"fast_risk:{fast_trigger}"
+    release_reason = str(release_policy.get("release_reason") or "").strip()
+    release_source = str(
+        release_policy.get("source") or close_evidence.get("source") or ""
+    ).strip()
+    if release_reason:
+        return f"position_release:{release_reason}"
+    if release_source:
+        return f"position_release:{release_source}"
+    if close_evidence.get("profit_retrace_protection"):
+        return "profit_lock:retrace"
+    if (
+        close_evidence.get("profit_protection")
+        or close_evidence.get("profit_lock_ready_for_exit")
+        or close_evidence.get("portfolio_focus_profit_lock")
+        or safe_dict(raw.get("execution_profit_protection")).get("allow")
+    ):
+        return "profit_lock"
+    if raw.get("forced_exit") or close_evidence.get("hard_risk") or close_evidence.get("raw_hard_risk"):
+        return "hard_risk"
+    if (
+        close_evidence.get("predictive_exit")
+        or close_evidence.get("predictive_reversal_exit")
+        or close_evidence.get("strong_opposite_pressure")
+        or close_evidence.get("moderate_opposite_pressure")
+    ):
+        return "predictive_downside"
+    exit_intent = str(raw.get("exit_intent") or close_evidence.get("exit_intent") or "").strip()
+    if exit_intent:
+        return f"exit_intent:{exit_intent}"
+    action = str(getattr(decision, "action", "") or "").lower()
+    if action in {"close_long", "close_short"}:
+        return "system_exit"
+    return "unknown"
+
+
+def closed_position_pnl_diagnostics(closed_rows, orders, decision_by_id, decisions):
     pnl_values = []
     hold_minutes = []
     winning_pnls = []
@@ -598,12 +739,20 @@ def closed_position_pnl_diagnostics(closed_rows):
         symbol_pnl[symbol] += realized
         side_counts[side] += 1
         side_pnl[side] += realized
-        trigger = str(
+        close_decision, close_order, trigger_source = _matching_close_decision_for_position(
+            pos,
+            orders,
+            decision_by_id,
+            decisions,
+        )
+        trigger = _exit_trigger_from_decision(close_decision)
+        if trigger == "unknown":
+            trigger = str(
             getattr(pos, "close_reason", None)
             or getattr(pos, "exit_reason", None)
             or getattr(pos, "status", None)
             or "unknown"
-        )
+            )
         trigger_counts[trigger] += 1
         if realized > 0:
             winning_pnls.append(realized)
@@ -634,6 +783,9 @@ def closed_position_pnl_diagnostics(closed_rows):
                     "created_at": created.isoformat() if created else "",
                     "closed_at": closed_at.isoformat() if closed_at else "",
                     "trigger": trigger,
+                    "trigger_source": trigger_source,
+                    "close_decision_id": getattr(close_decision, "id", None),
+                    "close_order_id": getattr(close_order, "id", None),
                 }
             )
 
@@ -2717,7 +2869,12 @@ async def main():
         },
         "local_ml_readiness": local_ml_readiness_summary(),
         "trade_execution_contract": trade_contract,
-        "closed_position_pnl_diagnostics": closed_position_pnl_diagnostics(closed),
+        "closed_position_pnl_diagnostics": closed_position_pnl_diagnostics(
+            closed,
+            orders,
+            decision_by_id,
+            decisions,
+        ),
         "executed_entry_sizing_diagnostics": executed_entry_sizing_diagnostics(
             entry_decisions,
             order_by_decision,

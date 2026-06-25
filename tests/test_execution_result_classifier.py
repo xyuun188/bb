@@ -202,6 +202,44 @@ def test_execution_confirmation_requires_real_exchange_order_id() -> None:
     assert policy.is_exchange_confirmed_execution(_result(OrderStatus.PARTIAL)) is False
 
 
+def test_execution_confirmation_accepts_native_full_close_flat_snapshot() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.FILLED,
+        order_id="okx_native_full_close",
+        exchange_order_id=None,
+        quantity=366.0,
+        raw_response={
+            "okx_native_close_position": True,
+            "position_contracts_before": 36.6,
+            "position_contracts_after": 0.0,
+            "remaining_contracts": 0.0,
+            "filled_contracts": 36.6,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is True
+
+
+def test_execution_confirmation_rejects_unfinished_native_full_close_without_order_id() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.FILLED,
+        order_id="okx_native_full_close",
+        exchange_order_id=None,
+        quantity=100.0,
+        raw_response={
+            "okx_native_close_position": True,
+            "position_contracts_before": 100.0,
+            "position_contracts_after": 12.0,
+            "remaining_contracts": 12.0,
+            "filled_contracts": 88.0,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is False
+
+
 def test_exit_progress_requires_tracking_partial_and_order_id() -> None:
     policy = ExecutionResultClassifier()
 
