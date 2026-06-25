@@ -240,6 +240,56 @@ def _high_risk_decision() -> DecisionOutput:
     )
 
 
+def _local_controlled_probe_decision() -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.76,
+        reasoning="unit test",
+        position_size_pct=0.012,
+        suggested_leverage=3.0,
+        raw_response={
+            "opportunity_score": {
+                "score": 0.98,
+                "min_score_required": 1.2,
+                "expected_net_return_pct": 1.12,
+                "profit_quality_ratio": 1.45,
+                "server_profit_loss_probability": 0.46,
+                "tail_risk_score": 0.31,
+                "evidence_score": {
+                    "tier": "exploration",
+                    "effective_score": 49.5,
+                    "shadow_only": False,
+                    "hard_block": False,
+                },
+            },
+            "profit_risk_sizing": {
+                "quality_tier": "probe",
+                "low_payoff_quality": True,
+                "low_payoff_reasons": ["evidence_low_payoff_quality"],
+                "position_size_pct": 0.012,
+                "leverage": 3.0,
+            },
+            "opinions": [
+                {"action": "short"},
+                {"action": "short"},
+                {"action": "short"},
+            ],
+        },
+    )
+
+
+def _gate_with_today_loss(review_service: Any | None = None) -> EntryHighRiskReviewGatePolicy:
+    async def allocation_state(model_mode: str) -> dict[str, Any]:
+        return {"today_risk_pnl": -3.5}
+
+    return EntryHighRiskReviewGatePolicy(
+        reviewer=review_service or HighRiskReviewService(),
+        allocation_state_provider=allocation_state,
+    )
+
+
 @pytest.mark.asyncio
 async def test_high_risk_review_service_uses_short_timeout_and_token_cap(
     high_risk_settings: None,
@@ -427,6 +477,78 @@ async def test_high_risk_review_gate_delegates_to_runtime_service(
     review = _raw_response(decision)["high_risk_review"]
     assert review["status"] == "completed"
     assert review["approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_skips_online_reviewer_for_local_controlled_probe(
+    high_risk_settings: None,
+) -> None:
+    reviewer = GateReviewer()
+    gate = _gate_with_today_loss(reviewer)
+    decision = _local_controlled_probe_decision()
+
+    reason = await gate.evaluate(decision, "paper", [])
+
+    assert reason is None
+    assert reviewer.calls == []
+    review = _raw_response(decision)["high_risk_review"]
+    assert review["status"] == "skipped_local_controlled_probe"
+    assert review["approved"] is True
+    assert review["triggered"] is False
+    assert review["low_payoff_quality"] is True
+    assert "today_recovery_after_loss" in review["advisory_reasons"]
+    assert "expert_disagreement:100%" in review["advisory_reasons"]
+    assert "sizing:probe" in review["probe_sources"]
+    assert review["expected_net_return_pct"] == 1.12
+    assert review["position_size_pct"] == 0.012
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_local_probe_does_not_skip_large_or_high_leverage_entries(
+    high_risk_settings: None,
+) -> None:
+    reviewer = GateReviewer()
+    gate = _gate_with_today_loss(reviewer)
+    decision = _local_controlled_probe_decision()
+    decision.position_size_pct = 0.13
+    decision.suggested_leverage = 12.0
+
+    reason = await gate.evaluate(decision, "paper", [])
+
+    assert reason is None
+    assert len(reviewer.calls) == 1
+    review = _raw_response(decision)["high_risk_review"]
+    assert review["status"] == "completed"
+    assert review["approved"] is True
+    assert review["hard_review_required"] is True
+    assert reviewer.calls[0]["prompt"]["trigger_reasons"] == [
+        "high_leverage:12.0x",
+        "large_position:13.0%",
+        "expert_disagreement:100%",
+        "today_recovery_after_loss",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_local_probe_does_not_skip_weak_loss_profile(
+    high_risk_settings: None,
+) -> None:
+    reviewer = GateReviewer()
+    gate = _gate_with_today_loss(reviewer)
+    decision = _local_controlled_probe_decision()
+    raw = _raw_response(decision)
+    raw["opportunity_score"]["server_profit_loss_probability"] = 0.76
+    decision.raw_response = raw
+
+    reason = await gate.evaluate(decision, "paper", [])
+
+    assert reason is None
+    assert len(reviewer.calls) == 1
+    review = _raw_response(decision)["high_risk_review"]
+    assert review["status"] == "completed"
+    assert review["hard_review_required"] is True
+    assert "expert_disagreement:100%" in reviewer.calls[0]["prompt"]["trigger_reasons"]
+    assert "today_recovery_after_loss" in reviewer.calls[0]["prompt"]["trigger_reasons"]
 
 
 @pytest.mark.asyncio

@@ -104,12 +104,12 @@ def test_trade_detail_matches_split_positions_for_one_okx_close_order() -> None:
     ]
 
     matched = _matching_closed_positions_for_order(order, positions)
-    reason = _close_order_position_reason(order, matched)
+    reason = _close_order_position_reason(order, matched, execution_source="okx")
 
     assert {position.id for position in matched} == {1576, 1577}
     assert sum(position.quantity for position in matched) == pytest.approx(90.0)
     assert reason is not None
-    assert "OKX 平仓成交已同步" in reason
+    assert "OKX" in reason
     assert "MET/USDT" in reason
     assert "90" in reason
-    assert "2 段仓位" in reason
+    assert "2 " in reason

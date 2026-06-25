@@ -25,6 +25,7 @@ DECISION_MAKER_NAME = "decision_maker"
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
+DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL = 20
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -213,6 +214,59 @@ def _parse_complex_env_value(value: Any) -> Any:
     return text
 
 
+def _parse_maybe_escaped_complex_env_value(value: str) -> Any:
+    text = value.strip()
+    if '\\"' in text and text.startswith(("[", "{")):
+        unescaped = text
+        for _ in range(3):
+            unescaped = unescaped.replace('\\"', '"')
+            parsed = _parse_complex_env_value(unescaped)
+            if parsed is not unescaped:
+                return parsed
+    parsed = _parse_complex_env_value(value)
+    return parsed if parsed is not value else value
+
+
+def _wrapped_external_event_sources(value: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Recover a legacy write where the whole JSON source list was stored as one url."""
+    if set(value) - {"url"}:
+        return None
+    url_text = str(value.get("url") or "").strip()
+    if not url_text or not url_text.startswith(("[", "{")):
+        return None
+    parsed = _parse_maybe_escaped_complex_env_value(url_text)
+    if parsed is url_text:
+        return None
+    sources = parse_external_event_scraper_sources_value(parsed)
+    return sources or None
+
+
+def parse_external_event_scraper_sources_value(v: Any) -> list[dict[str, Any]]:
+    if isinstance(v, str):
+        if not v.strip():
+            return []
+        parsed = _parse_maybe_escaped_complex_env_value(v)
+        if parsed is not v:
+            return parse_external_event_scraper_sources_value(parsed)
+        return [{"url": item.strip()} for item in _split_top_level_commas(v) if item.strip()]
+    if isinstance(v, dict):
+        wrapped = _wrapped_external_event_sources(v)
+        return wrapped if wrapped is not None else [dict(v)]
+    if isinstance(v, list):
+        sources: list[dict[str, Any]] = []
+        for item in v:
+            if isinstance(item, dict):
+                wrapped = _wrapped_external_event_sources(item)
+                if wrapped is not None:
+                    sources.extend(wrapped)
+                else:
+                    sources.append(dict(item))
+            elif str(item or "").strip():
+                sources.extend(parse_external_event_scraper_sources_value(str(item).strip()))
+        return sources
+    return []
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -291,13 +345,10 @@ class Settings(BaseSettings):
     auto_scan_symbol_limit: int = 20
     market_analysis_watchdog_seconds: int = 180
     position_analysis_watchdog_seconds: int = 180
-    max_auto_trades_per_round: int = 3
-    max_open_positions_per_model: int = 20
+    max_open_positions_per_model: int = DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
     max_same_symbol_positions_per_side: int = 2
     min_entry_adx: float = 15.0
     min_entry_volume_ratio: float = 0.2
-    daily_profit_target_usdt: float = 0.0
-    daily_profit_target_cny: float = 0.0
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
     expert_memory_per_prompt: int = 4
@@ -459,26 +510,18 @@ class Settings(BaseSettings):
     @field_validator("external_event_scraper_sources", mode="before")
     @classmethod
     def parse_external_event_scraper_sources(cls, v: Any) -> list[dict[str, Any]]:
-        if isinstance(v, str):
-            if not v.strip():
-                return []
-            parsed = _parse_complex_env_value(v)
-            if isinstance(parsed, dict):
-                return [dict(parsed)]
-            if isinstance(parsed, list):
-                sources: list[dict[str, Any]] = []
-                for item in parsed:
-                    if isinstance(item, dict):
-                        sources.append(dict(item))
-                    elif str(item or "").strip():
-                        sources.append({"url": str(item).strip()})
-                return sources
-            return [{"url": item.strip()} for item in v.split(",") if item.strip()]
-        if isinstance(v, dict):
-            return [dict(v)]
-        if isinstance(v, list):
-            return [dict(item) for item in v if isinstance(item, dict)]
-        return []
+        return parse_external_event_scraper_sources_value(v)
+
+    @field_validator("max_open_positions_per_model", mode="before")
+    @classmethod
+    def normalize_max_open_positions_per_model(cls, v: Any) -> int:
+        try:
+            value = int(float(v))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
+        if value <= 0:
+            return DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
+        return value
 
     def dashboard_allowed_origins(self) -> list[str]:
         """Return explicit Dashboard CORS origins without wildcard credentials."""

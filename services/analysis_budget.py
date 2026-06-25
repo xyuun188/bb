@@ -362,7 +362,7 @@ class AnalysisBudgetPolicy:
             cap = max(runtime.market_min_exploration_symbols, runtime.market_medium_risk_cap)
             return min(base_market_limit, cap), "position_first_medium_risk"
 
-        cap = max(
+        base_cap = max(
             runtime.market_min_exploration_symbols,
             min(runtime.market_low_risk_open_position_cap, math.ceil(base_market_limit * 0.15)),
         )
@@ -371,6 +371,15 @@ class AnalysisBudgetPolicy:
             if roster_underfilled
             else "position_first_low_risk"
         )
+        if roster_underfilled:
+            # When the portfolio roster is underfilled and no position group is
+            # asking for medium/high-risk attention, spend more market-analysis
+            # budget on candidate discovery. Entry evidence, sizing, leverage,
+            # ML readiness, and risk vetoes still own trade permission.
+            roster_fill_cap = min(base_market_limit, runtime.roster_fill_market_symbol_min)
+            cap = max(base_cap, roster_fill_cap)
+        else:
+            cap = base_cap
         return min(base_market_limit, cap), policy
 
     def _group_positions(
@@ -546,11 +555,14 @@ class AnalysisBudgetPolicy:
                 upper=10_000,
             ),
             target_position_groups=max(1, min(target_position_groups, max_bound)),
-            roster_fill_market_symbol_min=self._runtime_int(
-                budget.get("roster_fill_market_symbol_min"),
-                runtime.get("roster_fill_market_symbol_min"),
-                default=self.config.roster_fill_market_symbol_min,
-                upper=10_000,
+            roster_fill_market_symbol_min=max(
+                self.config.roster_fill_market_symbol_min,
+                self._runtime_int(
+                    budget.get("roster_fill_market_symbol_min"),
+                    runtime.get("roster_fill_market_symbol_min"),
+                    default=self.config.roster_fill_market_symbol_min,
+                    upper=10_000,
+                ),
             ),
             max_position_group_bound=max_bound,
             source=source,
@@ -599,14 +611,62 @@ class AnalysisBudgetPolicy:
         position_group_count: int,
         reason: str,
     ) -> dict[str, Any]:
+        selected_market_limit = max(0, int(market_symbol_limit))
+        configured_limit = max(0, int(configured_market_symbol_limit))
+        selected_position_groups = max(1, int(position_max_groups))
+        market_limit_diagnostics = {
+            "read_only": True,
+            "is_entry_gate": False,
+            "budget_source": runtime.source,
+            "strategy_profile_id": runtime.strategy_profile_id,
+            "risk_level": risk_level,
+            "market_limit_policy": market_limit_policy,
+            "configured_market_symbol_limit": configured_limit,
+            "selected_market_symbol_limit": selected_market_limit,
+            "position_group_count": position_group_count,
+            "total_position_groups": total_position_groups,
+            "target_position_groups": runtime.target_position_groups,
+            "roster_underfilled": roster_underfilled,
+            "max_position_group_bound": runtime.max_position_group_bound,
+            "position_review_caps": {
+                "selected_position_max_groups": selected_position_groups,
+                "base_position_max_groups_per_round": runtime.position_max_groups_per_round,
+                "high_risk_max_groups_per_round": (runtime.position_high_risk_max_groups_per_round),
+                "urgent_exit_max_groups_per_round": (
+                    runtime.position_urgent_exit_max_groups_per_round
+                ),
+                "medium_load_group_threshold": runtime.position_medium_load_group_threshold,
+                "high_load_group_threshold": runtime.position_high_load_group_threshold,
+                "medium_load_max_groups_per_round": (
+                    runtime.position_medium_load_max_groups_per_round
+                ),
+                "high_load_max_groups_per_round": (runtime.position_high_load_max_groups_per_round),
+            },
+            "market_caps": {
+                "min_exploration_symbols": runtime.market_min_exploration_symbols,
+                "high_risk_min_exploration_symbols": (
+                    runtime.market_high_risk_min_exploration_symbols
+                ),
+                "no_position_cap": runtime.market_no_position_cap,
+                "low_risk_open_position_cap": runtime.market_low_risk_open_position_cap,
+                "medium_risk_cap": runtime.market_medium_risk_cap,
+                "high_risk_cap": runtime.market_high_risk_cap,
+                "roster_fill_market_symbol_min": runtime.roster_fill_market_symbol_min,
+            },
+            "diagnostic_boundary": (
+                "Read-only analysis budget diagnostics; these values explain AI analysis "
+                "load allocation and must not be treated as trade permission, leverage, "
+                "sizing, or ML-readiness overrides."
+            ),
+        }
         return {
             "risk_level": risk_level,
-            "market_symbol_limit": max(0, int(market_symbol_limit)),
-            "configured_market_symbol_limit": max(0, int(configured_market_symbol_limit)),
+            "market_symbol_limit": selected_market_limit,
+            "configured_market_symbol_limit": configured_limit,
             "market_limit_policy": market_limit_policy,
             "market_symbol_limit_is_entry_gate": False,
             "position_first_scheduling": True,
-            "position_max_groups": max(1, int(position_max_groups)),
+            "position_max_groups": selected_position_groups,
             "forced_exit_groups": forced_exit_count,
             "urgent_exit_groups": urgent_exit_count,
             "high_exit_groups": high_exit_count,
@@ -618,5 +678,6 @@ class AnalysisBudgetPolicy:
             "budget_source": runtime.source,
             "strategy_profile_id": runtime.strategy_profile_id,
             "max_position_group_bound": runtime.max_position_group_bound,
+            "market_limit_diagnostics": market_limit_diagnostics,
             "reason": reason,
         }

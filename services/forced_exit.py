@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.exit_intent import is_low_quality_release_without_hard_risk
 
 FORCED_EXIT_UPPER_TERMS = (
     "STOP LOSS",
@@ -46,6 +47,8 @@ class ForcedExitPolicy:
         raw = _safe_dict(decision.raw_response)
         close_evidence = _safe_dict(raw.get("close_evidence"))
         position_review_alert = _safe_dict(raw.get("position_review_risk_alert"))
+        if is_low_quality_release_without_hard_risk(raw):
+            return False
         return (
             bool(raw.get("fast_risk_exit") or raw.get("forced_exit"))
             or bool(close_evidence.get("hard_risk") or close_evidence.get("forced_exit"))

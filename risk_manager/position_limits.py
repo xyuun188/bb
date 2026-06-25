@@ -51,8 +51,15 @@ class PositionLimitChecker:
     """Validates that a proposed trade respects position and leverage limits."""
 
     def __init__(self) -> None:
-        self.max_position_pct = settings.max_position_pct
-        self.max_leverage = settings.max_leverage
+        pass
+
+    @property
+    def max_position_pct(self) -> float:
+        return float(settings.max_position_pct or 0.0)
+
+    @property
+    def max_leverage(self) -> float:
+        return float(settings.max_leverage or 1.0)
 
     def check_position_size(
         self, proposed_size_pct: float, current_exposure_pct: float, symbol: str

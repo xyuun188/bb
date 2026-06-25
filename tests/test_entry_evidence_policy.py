@@ -572,6 +572,71 @@ def test_probe_derived_hold_entry_does_not_get_full_ai_or_server_points():
     assert any("观望" in item or "探针" in item for item in evidence["advisory_wait_reasons"])
 
 
+def test_probe_derived_hold_entry_gets_capped_ai_points_after_independent_support():
+    decision = _decision(
+        Action.LONG,
+        {
+            "opinions": [
+                {
+                    "model_name": "trend_expert",
+                    "action": "long",
+                    "confidence": 0.72,
+                    "independent_expert_retry": True,
+                },
+                {
+                    "model_name": "momentum_expert",
+                    "action": "long",
+                    "confidence": 0.70,
+                    "independent_expert_retry": True,
+                },
+                {"model_name": "sentiment_expert", "action": "hold", "confidence": 0.52},
+            ],
+            "evidence_profit_probe": {
+                "triggered": True,
+                "ai_original_action": "hold",
+                "side": "long",
+            },
+            "ml_signal": {
+                "available": True,
+                "influence_enabled": True,
+                "predictions": [
+                    {
+                        "best_side": "long",
+                        "best_expected_return_pct": 0.55,
+                    }
+                ],
+            },
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.45,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.20,
+                },
+                "profit_prediction": {
+                    "available": True,
+                    "best_side": "long",
+                    "adjusted_long_return_pct": 0.65,
+                },
+            },
+        },
+        confidence=0.84,
+    )
+
+    evidence = build_entry_evidence_score(decision, {"ml_influence_enabled": True})
+
+    ai_component = next(item for item in evidence["components"] if item["source"] == "ai")
+    assert ai_component["status"] == "probe_derived_independent_expert_support"
+    assert ai_component["directional_support_count"] == 2
+    assert ai_component["points"] == 18.0
+    assert "ai" not in evidence["aligned_support_sources"]
+    assert evidence["tier"] in {"small", "medium", "normal"}
+
+
 def test_server_profit_uses_adjusted_side_return_before_raw_return():
     assert (
         expected_return_pct(

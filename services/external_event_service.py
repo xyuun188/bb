@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -14,7 +13,7 @@ import structlog
 from dotenv import dotenv_values
 from sqlalchemy import select
 
-from config.settings import settings
+from config.settings import parse_external_event_scraper_sources_value, settings
 from core.safe_output import safe_error_text
 from core.url_safety import normalize_external_http_url
 from data_feed.external_event_scraper import ExternalEventScraper
@@ -69,15 +68,7 @@ def _float_env(value: Any, default: float, *, minimum: float, maximum: float) ->
 
 
 def _sources_env(value: Any) -> list[dict[str, Any]]:
-    if value is None or str(value).strip() == "":
-        return []
-    try:
-        parsed = json.loads(str(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return [dict(item) for item in parsed if isinstance(item, dict)]
+    return parse_external_event_scraper_sources_value(value)
 
 
 def load_external_event_settings_from_env() -> dict[str, Any]:

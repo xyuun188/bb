@@ -20,6 +20,26 @@ from services.entry_direction_metrics import selected_entry_metrics
 from services.high_risk_review_service import HighRiskReviewService
 
 QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO = 0.12
+LOCAL_CONTROLLED_PROBE_MIN_EXPECTED_NET_RETURN_PCT = 0.70
+LOCAL_CONTROLLED_PROBE_MIN_PROFIT_QUALITY_RATIO = 0.90
+LOCAL_CONTROLLED_PROBE_MAX_LOSS_PROBABILITY = 0.58
+LOCAL_CONTROLLED_PROBE_MAX_TAIL_RISK_SCORE = 0.75
+LOCAL_CONTROLLED_PROBE_MAX_SIZE_PCT = 0.04
+LOCAL_CONTROLLED_LOW_PAYOFF_PROBE_MAX_SIZE_PCT = 0.025
+LOCAL_CONTROLLED_PROBE_MAX_LEVERAGE = 5.0
+LOCAL_CONTROLLED_PROBE_ML_CONFLICT_MIN_EXPECTED_NET_RETURN_PCT = 0.85
+LOCAL_CONTROLLED_PROBE_ML_CONFLICT_MIN_PROFIT_QUALITY_RATIO = 1.0
+LOCAL_CONTROLLED_PROBE_EVIDENCE_TIERS = {"exploration", "small", "medium", "normal"}
+LOCAL_CONTROLLED_PROBE_QUALITY_TIERS = {
+    "probe",
+    "good_probe",
+    "strong_probe",
+    "roster_fill",
+    "quality_override",
+    "high_profit",
+    "elite",
+    "winner_add",
+}
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -72,6 +92,105 @@ def ml_ai_direction_conflict(decision: DecisionOutput) -> bool:
     primary = _safe_dict(predictions[0]) if predictions else {}
     ml_side = str(primary.get("best_side") or "").lower()
     return ml_side in {"long", "short"} and ml_side != entry_side_value(decision)
+
+
+def _local_controlled_probe_sources(
+    *,
+    raw: dict[str, Any],
+    opportunity: dict[str, Any],
+    quant_probe: dict[str, Any],
+) -> list[str]:
+    sources: list[str] = []
+    if quant_probe.get("triggered"):
+        sources.append("quant_profit_probe")
+    evidence_probe = _safe_dict(raw.get("evidence_profit_probe"))
+    if evidence_probe.get("triggered"):
+        sources.append("evidence_profit_probe")
+
+    profit_sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    quality_tier = str(profit_sizing.get("quality_tier") or "").lower()
+    if quality_tier in LOCAL_CONTROLLED_PROBE_QUALITY_TIERS:
+        sources.append(f"sizing:{quality_tier}")
+
+    evidence_score = _safe_dict(opportunity.get("evidence_score"))
+    evidence_tier = str(evidence_score.get("tier") or opportunity.get("evidence_tier") or "")
+    evidence_tier = evidence_tier.lower()
+    if (
+        evidence_tier in LOCAL_CONTROLLED_PROBE_EVIDENCE_TIERS
+        and not evidence_score.get("shadow_only")
+        and not evidence_score.get("hard_block")
+    ):
+        sources.append(f"evidence:{evidence_tier}")
+    return sources
+
+
+def _local_controlled_probe_payload(
+    *,
+    raw: dict[str, Any],
+    opportunity: dict[str, Any],
+    quant_probe: dict[str, Any],
+    expected_net: float,
+    profit_quality: float,
+    loss_probability: float,
+    tail_risk: float,
+    size_pct: float,
+    leverage: float,
+    ml_conflict: bool,
+    advisory_reasons: list[str],
+) -> dict[str, Any] | None:
+    """Return metadata when a small positive probe should stay under local controls."""
+
+    sources = _local_controlled_probe_sources(
+        raw=raw,
+        opportunity=opportunity,
+        quant_probe=quant_probe,
+    )
+    if not sources:
+        return None
+    evidence_score = _safe_dict(opportunity.get("evidence_score"))
+    if evidence_score.get("shadow_only") or evidence_score.get("hard_block"):
+        return None
+    profit_sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    low_payoff_quality = bool(profit_sizing.get("low_payoff_quality"))
+    if expected_net < LOCAL_CONTROLLED_PROBE_MIN_EXPECTED_NET_RETURN_PCT:
+        return None
+    if profit_quality < LOCAL_CONTROLLED_PROBE_MIN_PROFIT_QUALITY_RATIO:
+        return None
+    if loss_probability > LOCAL_CONTROLLED_PROBE_MAX_LOSS_PROBABILITY:
+        return None
+    if tail_risk > LOCAL_CONTROLLED_PROBE_MAX_TAIL_RISK_SCORE:
+        return None
+    if leverage > LOCAL_CONTROLLED_PROBE_MAX_LEVERAGE:
+        return None
+    if size_pct > LOCAL_CONTROLLED_PROBE_MAX_SIZE_PCT:
+        return None
+    if low_payoff_quality and size_pct > LOCAL_CONTROLLED_LOW_PAYOFF_PROBE_MAX_SIZE_PCT:
+        return None
+    if ml_conflict and (
+        expected_net < LOCAL_CONTROLLED_PROBE_ML_CONFLICT_MIN_EXPECTED_NET_RETURN_PCT
+        or profit_quality < LOCAL_CONTROLLED_PROBE_ML_CONFLICT_MIN_PROFIT_QUALITY_RATIO
+    ):
+        return None
+
+    return {
+        "triggered": False,
+        "approved": True,
+        "status": "skipped_local_controlled_probe",
+        "rule": "positive small probe stays under local risk controls",
+        "probe_sources": sources,
+        "advisory_reasons": advisory_reasons,
+        "low_payoff_quality": low_payoff_quality,
+        "reason": (
+            "正期望小仓探针已通过本地收益/风险阈值，今日亏损恢复或专家分歧只作为风险提示；"
+            "本次不调用线上高风险复核，继续由本地仓位、杠杆、止损预算和执行检查控制风险。"
+        ),
+        "expected_net_return_pct": round(expected_net, 6),
+        "profit_quality_ratio": round(profit_quality, 6),
+        "loss_probability": round(loss_probability, 6),
+        "tail_risk_score": round(tail_risk, 6),
+        "position_size_pct": round(size_pct, 6),
+        "leverage": round(leverage, 4),
+    }
 
 
 def _review_opportunity_summary(opportunity: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +269,9 @@ class EntryHighRiskReviewGatePolicy:
         if selected_metrics.has_selected_side:
             expected_net = selected_metrics.expected_net_return_pct
             profit_quality = selected_metrics.profit_quality_ratio
+        tail_risk = _safe_float(opportunity.get("tail_risk_score"), 0.0)
+        if selected_metrics.has_selected_side:
+            tail_risk = selected_metrics.tail_risk_score
         loss_probability = _safe_float(
             quant_probe.get(
                 "loss_probability",
@@ -164,6 +286,7 @@ class EntryHighRiskReviewGatePolicy:
             and expected_net > 0
             and profit_quality >= self.quant_probe_min_profit_quality_ratio
             and loss_probability < 0.58
+            and tail_risk <= LOCAL_CONTROLLED_PROBE_MAX_TAIL_RISK_SCORE
             and _safe_float(decision.position_size_pct, 0.0) <= 0.04
             and _safe_float(decision.suggested_leverage, 1.0) <= 5.0
         ):
@@ -174,6 +297,7 @@ class EntryHighRiskReviewGatePolicy:
                 "expected_net_return_pct": round(expected_net, 6),
                 "profit_quality_ratio": round(profit_quality, 6),
                 "loss_probability": round(loss_probability, 6),
+                "tail_risk_score": round(tail_risk, 6),
             }
             decision.raw_response = raw
             return None
@@ -211,6 +335,24 @@ class EntryHighRiskReviewGatePolicy:
                     reasons.append("today_recovery_after_loss")
             except Exception:
                 allocation_state = {}
+
+        local_probe_review = _local_controlled_probe_payload(
+            raw=raw,
+            opportunity=opportunity,
+            quant_probe=quant_probe,
+            expected_net=expected_net,
+            profit_quality=profit_quality,
+            loss_probability=loss_probability,
+            tail_risk=tail_risk,
+            size_pct=size_pct,
+            leverage=leverage,
+            ml_conflict=ml_conflict,
+            advisory_reasons=reasons,
+        )
+        if local_probe_review is not None:
+            raw["high_risk_review"] = local_probe_review
+            decision.raw_response = raw
+            return None
 
         hard_review_required = bool(
             leverage >= 10.0

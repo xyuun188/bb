@@ -21,6 +21,7 @@ EXPERT_NAMES = (
 class _ConsensusBatchExpert(AbstractAIModel):
     batch_calls = 0
     individual_calls: list[str] = []
+    batch_hold_confidence = 0.50
 
     def __init__(self, name: str, independent_actions: dict[str, Action] | None = None) -> None:
         self.name = name
@@ -62,7 +63,7 @@ class _ConsensusBatchExpert(AbstractAIModel):
                 model_name=name,
                 symbol=features.symbol,
                 action=Action.HOLD,
-                confidence=0.50,
+                confidence=type(self).batch_hold_confidence,
                 reasoning="batch low information hold",
                 raw_response={"provider_model": self._model_name, "batch_expert": True},
                 feature_snapshot=features.to_dict(),
@@ -74,9 +75,14 @@ class _ConsensusBatchExpert(AbstractAIModel):
         return None
 
 
-def _registry(independent_actions: dict[str, Action] | None = None) -> ModelRegistry:
+def _registry(
+    independent_actions: dict[str, Action] | None = None,
+    *,
+    batch_hold_confidence: float = 0.50,
+) -> ModelRegistry:
     _ConsensusBatchExpert.batch_calls = 0
     _ConsensusBatchExpert.individual_calls = []
+    _ConsensusBatchExpert.batch_hold_confidence = batch_hold_confidence
     registry = ModelRegistry()
     for name in EXPERT_NAMES:
         registry.register(_ConsensusBatchExpert(name, independent_actions))
@@ -110,6 +116,22 @@ def _strong_ml_context() -> dict[str, Any]:
                     "short_expected_return_pct": -0.04,
                 }
             ],
+        },
+    }
+
+
+def _strong_entry_evidence_context() -> dict[str, Any]:
+    return {
+        "expert_mode": True,
+        "entry_candidate_evidence": {
+            "long": {
+                "score": 52.0,
+                "expected_net_return_pct": 1.08,
+                "profit_quality_ratio": 1.25,
+                "loss_probability": 0.46,
+                "tail_risk_score": 0.32,
+                "aligned_source_count": 3,
+            }
         },
     }
 
@@ -187,3 +209,62 @@ async def test_hard_wick_risk_explains_batch_hold_consensus_without_retry(
     policy = context["_expert_diversity_policy"]
     assert policy["should_retry"] is False
     assert policy["objective_evidence"]["hard_risk"] is True
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_batch_hold_retries_when_entry_evidence_is_strong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    registry = _registry(
+        {
+            "trend_expert": Action.LONG,
+            "momentum_expert": Action.LONG,
+            "sentiment_expert": Action.HOLD,
+        },
+        batch_hold_confidence=0.82,
+    )
+    context = _strong_entry_evidence_context()
+
+    decisions = await registry.decide_all(_features(), context)
+
+    assert _ConsensusBatchExpert.batch_calls == 1
+    assert set(_ConsensusBatchExpert.individual_calls) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+    }
+    assert decisions["trend_expert"].action == Action.LONG
+    policy = context["_expert_diversity_policy"]
+    assert policy["should_retry"] is True
+    assert policy["low_information_consensus"] is False
+    assert policy["objective_evidence"]["side"] == "long"
+    assert "strong entry-candidate evidence" in policy["reason"]
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_batch_hold_does_not_retry_weak_entry_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    registry = _registry({"trend_expert": Action.LONG}, batch_hold_confidence=0.82)
+    context = {
+        "expert_mode": True,
+        "entry_candidate_evidence": {
+            "long": {
+                "score": 44.0,
+                "expected_net_return_pct": 0.72,
+                "profit_quality_ratio": 0.82,
+                "loss_probability": 0.46,
+                "tail_risk_score": 0.32,
+                "aligned_source_count": 3,
+            }
+        },
+    }
+
+    decisions = await registry.decide_all(_features(), context)
+
+    assert _ConsensusBatchExpert.batch_calls == 1
+    assert _ConsensusBatchExpert.individual_calls == []
+    assert all(decision.action == Action.HOLD for decision in decisions.values())
+    assert context["_expert_diversity_policy"]["should_retry"] is False

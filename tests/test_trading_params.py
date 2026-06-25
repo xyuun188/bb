@@ -1,6 +1,5 @@
 from services.trading_params import (
     DEFAULT_TRADING_PARAMS,
-    ESTIMATED_TAKER_FEE_PCT,
     default_trading_parameter_snapshot,
 )
 
@@ -8,7 +7,7 @@ from services.trading_params import (
 def test_default_trading_parameter_snapshot_is_serializable() -> None:
     snapshot = default_trading_parameter_snapshot()
 
-    assert snapshot["fee"]["estimated_taker_fee_pct"] == ESTIMATED_TAKER_FEE_PCT
+    assert "fee" not in snapshot
     assert snapshot["execution_cost"]["default_max_slippage_pct"] == 0.005
     assert snapshot["execution_cost"]["default_paper_slippage_pct"] == 0.05
     assert snapshot["execution_cost"]["local_ml_round_trip_cost_pct"] == 0.12
@@ -17,7 +16,7 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["entry_tiers"]["weak_probe_min_aligned_sources"] == 3
     assert snapshot["entry_evidence"]["positive_net_probe_min_expected_pct"] == 0.35
     assert snapshot["entry_evidence"]["short_size_multiplier"] == 0.60
-    assert snapshot["entry_opportunity_gate"]["selected_side_positive_net_hard_gate"] is True
+    assert "selected_side_positive_net_hard_gate" not in snapshot["entry_opportunity_gate"]
     assert snapshot["entry_opportunity_gate"]["advisory_risk_size_cap"] == 0.020
     assert (
         snapshot["entry_opportunity_gate"]["advisory_strong_quality_min_expected_net_pct"] == 0.90
@@ -63,8 +62,9 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["local_ml_training"]["readiness_max_model_age_seconds"] == 259200
     assert snapshot["auto_scan"]["rotation_pool_multiplier"] == 20
     assert snapshot["auto_scan"]["rotation_pool_min"] == 240
-    assert snapshot["auto_scan"]["feature_fetch_pool_multiplier"] == 1
-    assert snapshot["auto_scan"]["feature_fetch_pool_min"] == 12
+    assert snapshot["auto_scan"]["feature_fetch_pool_multiplier"] == 5
+    assert snapshot["auto_scan"]["feature_fetch_pool_min"] == 48
+    assert snapshot["auto_scan"]["feature_fetch_pool_max"] == 64
     assert snapshot["auto_scan"]["feature_fetch_timeout_seconds"] == 8.0
     assert "BTC/USDT" in snapshot["auto_scan"]["major_symbols"]
     assert snapshot["strategy_learning"]["default_lookback_hours"] == 168
@@ -207,6 +207,7 @@ def test_trading_service_auto_scan_uses_central_params() -> None:
         == params.feature_fetch_pool_multiplier
     )
     assert trading_service.AUTO_SCAN_FEATURE_FETCH_POOL_MIN == params.feature_fetch_pool_min
+    assert trading_service.AUTO_SCAN_FEATURE_FETCH_POOL_MAX == params.feature_fetch_pool_max
     assert (
         trading_service.AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS
         == params.feature_fetch_timeout_seconds

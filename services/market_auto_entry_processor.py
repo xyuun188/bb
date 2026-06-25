@@ -37,6 +37,10 @@ CandidateExecutor = Callable[..., Awaitable[Any]]
 FinalStateEnsurer = Callable[[int, str, str, DecisionOutput, dict[str, Any]], Awaitable[None]]
 MarketNoOpportunityClearer = Callable[[str], None]
 CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
+CapacityReasonProvider = Callable[
+    [str, DecisionOutput, list[dict[str, Any]], dict[str, dict[Any, int]]],
+    str | None,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +71,7 @@ class MarketAutoEntryProcessor:
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
     capacity_releaser: CapacityReleaser | None = None
+    pre_execution_capacity_reason: CapacityReasonProvider | None = None
     execution_confirmed_checker: Callable[[Any], bool] | None = None
 
     async def process(
@@ -134,6 +139,32 @@ class MarketAutoEntryProcessor:
                 results=results,
                 model_mode=model_mode,
                 reason=reason,
+                skip_kind=(
+                    "entry_capacity"
+                    if immediate_plan.capacity_reason
+                    else "entry_pre_execution_skip"
+                ),
+            )
+            return MarketAutoEntryProcessResult(handled=True, reason=reason)
+
+        capacity_reason = self._pre_execution_capacity_reason(
+            model_name=model_name,
+            decision=decision,
+            open_positions=open_positions,
+            staged_entry_counts=staged_entry_counts,
+        )
+        if capacity_reason:
+            self._release_capacity(model_name, decision, staged_entry_counts)
+            reason = f"开仓信号执行前容量复核未通过：{capacity_reason}"
+            await self._record_skip(
+                symbol=symbol,
+                model_name=model_name,
+                decision=decision,
+                decision_db_id=decision_db_id,
+                results=results,
+                model_mode=model_mode,
+                reason=reason,
+                skip_kind="entry_capacity",
             )
             return MarketAutoEntryProcessResult(handled=True, reason=reason)
 
@@ -220,6 +251,19 @@ class MarketAutoEntryProcessor:
     ) -> None:
         if self.capacity_releaser is not None:
             self.capacity_releaser(model_name, decision, staged_entry_counts)
+
+    def _pre_execution_capacity_reason(
+        self,
+        *,
+        model_name: str,
+        decision: DecisionOutput,
+        open_positions: list[dict[str, Any]],
+        staged_entry_counts: dict[str, dict[Any, int]],
+    ) -> str | None:
+        provider = self.pre_execution_capacity_reason
+        if provider is None:
+            provider = self.immediate_execution.capacity_reason_provider
+        return provider(model_name, decision, open_positions, staged_entry_counts)
 
     def _execution_confirmed(self, execution_result: Any) -> bool:
         if self.execution_confirmed_checker is not None:
@@ -310,6 +354,7 @@ class MarketAutoEntryProcessor:
         results: dict[str, Any],
         model_mode: str,
         reason: str,
+        skip_kind: str = "entry_pre_execution_skip",
     ) -> None:
         raw_response = self.annotate_candidate_selection(
             decision,
@@ -321,7 +366,10 @@ class MarketAutoEntryProcessor:
             DecisionStage.RISK_CHECK,
             DecisionStageStatus.SKIPPED,
             reason,
-            {"skip_kind": "entry_pre_execution_skip"},
+            {
+                "skip_kind": skip_kind,
+                "selected_for_execution": False,
+            },
         )
         decision.raw_response = raw_response
         if decision_db_id is not None:

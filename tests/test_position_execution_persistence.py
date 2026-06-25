@@ -177,6 +177,31 @@ async def test_persist_entry_opens_position_with_protection_prices() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
+    session = FakeSession()
+    repo = FakeTradeRepo()
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.SHORT),
+        result=_result(
+            symbol="WLFI/USDT",
+            price=0.0817,
+            quantity=1176.0,
+            raw_response={
+                "symbol": "WLFI/USDT:USDT",
+                "info": {"instId": "H-USDT-SWAP"},
+                "canonical_exchange_symbol": "H/USDT",
+            },
+        ),
+        execution_mode="paper",
+    )
+
+    assert repo.opened[0]["symbol"] == "H/USDT"
+    assert repo.opened[0]["side"] == "short"
+
+
+@pytest.mark.asyncio
 async def test_persist_partial_exit_splits_closed_position_and_records_reflection() -> None:
     session = FakeSession()
     open_position = _position(quantity=5.0)

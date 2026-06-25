@@ -112,8 +112,13 @@ def _position(
     )
 
 
-def _exit_decision(*, strong: bool, created_at: datetime | None = None) -> SimpleNamespace:
-    raw = (
+def _exit_decision(
+    *,
+    strong: bool,
+    created_at: datetime | None = None,
+    raw_override: dict | None = None,
+) -> SimpleNamespace:
+    raw = raw_override or (
         {
             "exit_intent": "hard_risk",
             "fast_risk_exit": True,
@@ -235,6 +240,62 @@ def test_fast_loss_exit_requires_strong_structured_exit_evidence() -> None:
     assert weak_report["violation_reason_counts"]["fast_loss_without_strong_exit"] == 1
     assert strong_report["summary"]["fast_loss_count"] == 1
     assert strong_report["summary"]["fast_loss_without_strong_exit_count"] == 0
+
+
+def test_exchange_confirmed_close_fill_is_strong_external_exit_evidence() -> None:
+    report = summarize_trade_execution_contract(
+        decisions=[
+            _exit_decision(
+                strong=False,
+                raw_override={
+                    "system_sync": True,
+                    "source": "okx_position_reconcile",
+                    "close_fill": {
+                        "order_id": "okx-close-1",
+                        "price": 99.0,
+                        "quantity": 1.0,
+                        "pnl": -1.0,
+                        "source": "my_trades",
+                    },
+                },
+            )
+        ],
+        orders=[],
+        positions=[_position()],
+    )
+
+    assert report["summary"]["fast_loss_count"] == 1
+    assert report["summary"]["fast_loss_without_strong_exit_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 0
+
+
+def test_estimated_exchange_quantity_reduction_is_observability_not_fast_loss_violation() -> None:
+    report = summarize_trade_execution_contract(
+        decisions=[
+            _exit_decision(
+                strong=False,
+                raw_override={
+                    "system_sync": True,
+                    "source": "okx_position_reconcile",
+                    "close_fill": {
+                        "estimated": True,
+                        "partial_reduction": True,
+                        "price": 99.0,
+                        "quantity": 1.0,
+                        "remaining_quantity": 0.1,
+                        "pnl": -1.0,
+                    },
+                },
+            )
+        ],
+        orders=[],
+        positions=[_position()],
+    )
+
+    assert report["summary"]["fast_loss_count"] == 0
+    assert report["summary"]["exchange_sync_estimated_reduction_count"] == 1
+    assert report["summary"]["fast_loss_without_strong_exit_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 0
 
 
 def test_recent_loss_reentry_requires_allowed_high_quality_unlock() -> None:
@@ -488,7 +549,7 @@ async def test_report_supplements_exit_decisions_for_fast_loss_positions() -> No
 
     report = await TradeExecutionContractService(
         session_context_factory=session_context_factory
-    ).report()
+    ).report(hours=168)
 
     assert report["summary"]["fast_loss_count"] == 1
     assert report["summary"]["fast_loss_without_strong_exit_count"] == 0
@@ -549,7 +610,7 @@ async def test_report_supplements_order_decisions_for_executed_entries() -> None
 
     report = await TradeExecutionContractService(
         session_context_factory=session_context_factory
-    ).report()
+    ).report(hours=168)
 
     assert report["summary"]["executed_entry_count"] == 1
     assert report["summary"]["contract_violation_count"] == 0

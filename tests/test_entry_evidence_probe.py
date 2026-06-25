@@ -166,6 +166,38 @@ def test_missed_opportunity_memory_does_not_override_negative_expectancy() -> No
     assert _policy().create(decision, _fv(), None, None, None, None) is None
 
 
+def test_missed_opportunity_memory_records_subthreshold_expected_net_block() -> None:
+    decision = _hold_decision(
+        {
+            "long": {
+                "expected_net_return_pct": 0.34,
+                "profit_quality_ratio": 0.70,
+                "loss_probability": 0.42,
+                "tail_risk_score": 0.60,
+                "score": 0.40,
+                "min_score_reference": 0.95,
+                "recommendation": "memory_watchlist_needs_probe_threshold",
+                "review_feedback": {
+                    "allow_probe": True,
+                    "missed_opportunity_count": 90,
+                    "positive_evidence_count": 90,
+                    "risk_evidence_count": 0,
+                    "candidate_score_bonus": 0.24,
+                },
+            }
+        }
+    )
+
+    assert _policy().create(decision, _fv(), None, None, None, None) is None
+
+    block = decision.raw_response["evidence_profit_probe_blocked"]
+    assert block["blocked"] is True
+    assert block["block_kind"] == "probe_threshold_not_met"
+    assert block["block_reasons"] == ["expected_net_below_probe_threshold"]
+    assert block["expected_net_return_pct"] == 0.34
+    assert block["thresholds"]["min_expected_net_return_pct"] == 0.35
+
+
 def test_missed_opportunity_memory_does_not_override_market_quality_block() -> None:
     decision = _hold_decision(
         {

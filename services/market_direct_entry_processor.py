@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+)
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 CapacityReasonProvider = Callable[
@@ -73,6 +78,17 @@ class MarketDirectEntryProcessor:
                 selected=False,
                 reason=capacity_reason,
             )
+            raw_response = append_decision_stage(
+                raw_response,
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.SKIPPED,
+                capacity_reason,
+                {
+                    "skip_kind": "entry_capacity",
+                    "selected_for_execution": False,
+                },
+            )
+            executed.raw_response = raw_response
             if decision_db_id is not None:
                 await self.mark_decision_raw_response(decision_db_id, raw_response)
                 await self.mark_decision_reason(decision_db_id, capacity_reason)

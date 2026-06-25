@@ -411,7 +411,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260622-system-audit-layout" in html
+    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -421,6 +421,39 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     assert "document.getElementById('server-monitor-model-panel')" not in script
     assert "刷新大模型服务器监控失败" in script
     assert "刷新系统自检失败" in script
+
+
+def test_server_monitor_endpoint_labels_are_status_aware() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    label_block = script[
+        script.index("function runtimeEndpointStatusLabel") : script.index(
+            "function runtimeEndpointSummary"
+        )
+    ]
+    platform_block = script[
+        script.index("function renderPlatformRuntimeCard") : script.index(
+            "function runtimeStatusBadge"
+        )
+    ]
+    model_block = script[
+        script.index("function renderServerModelRuntime") : script.index("// --- Formatters ---")
+    ]
+
+    assert "status_category" in label_block
+    assert "category === 'auth_failed'" in label_block
+    assert "category === 'auth_forbidden'" in label_block
+    assert "category === 'network_error'" in label_block
+    assert "return '认证失败';" in label_block
+    assert "return '权限拒绝';" in label_block
+    assert "return '模型不匹配';" in label_block
+    assert "return '模型未就绪';" in label_block
+    assert "return '业务未通过';" in label_block
+    assert "runtimeEndpointStatusLabel(item, { model: true })" in platform_block
+    assert "runtimeEndpointStatusLabel(item)" in platform_block
+    assert "runtimeEndpointStatusLabel(item, { model: true })" in model_block
+    assert "runtimeEndpointStatusLabel(item)" in model_block
+    assert "item.ok ? '接口异常'" not in script
+    assert "endpoint_ok ? '模型不匹配' : '不可达'" not in script
 
 
 def test_system_audit_root_cause_radar_is_wired() -> None:
@@ -456,6 +489,18 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "short_conservative_adjustment_samples" in script
     assert "short_released_adjustment_samples" in script
     assert "function systemAuditShadowMissedOpportunityDetails" in script
+    assert (
+        script.index("function systemAuditGenericDetailsHtml")
+        < script.index("function systemAuditShadowMissedOpportunityDetails")
+        < script.index("function systemAuditCardDetailsHtml")
+    )
+    generic_body = script[
+        script.index("function systemAuditGenericDetailsHtml") : script.index(
+            "function systemAuditShadowMissedOpportunityDetails"
+        )
+    ]
+    assert "Object.entries(details)" in generic_body
+    assert "systemAuditShadowMissedOpportunityDetails" not in generic_body
     assert "shadow_missed_opportunity" in script
     assert "Adopted missed opportunities" in script
     assert "Blocked reason counts" in script
@@ -472,13 +517,89 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "overflow-wrap: anywhere;" in style
 
 
+def test_system_audit_nodes_use_state_aware_display_status() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    display_status_block = script[
+        script.index("function systemAuditDisplayStatus") : script.index(
+            "function systemAuditValueText"
+        )
+    ]
+    node_block = script[
+        script.index("function renderSystemAuditNodes") : script.index(
+            "function renderSystemAudit()"
+        )
+    ]
+    card_block = script[
+        script.index("function renderSystemAuditCards") : script.index(
+            "function renderSystemAuditNodes"
+        )
+    ]
+
+    assert "if (item.display_status) return item.display_status;" in display_status_block
+    assert "if (state === 'observing') return 'warning';" in display_status_block
+    assert "const displayStatus = systemAuditDisplayStatus(node);" in node_block
+    assert "systemAuditTone(systemAuditDisplayStatus(left))" in node_block
+    assert "systemAuditStatusLabel(displayStatus)" in node_block
+    assert "systemAuditTone(card.status)" in card_block
+    assert "systemAuditDisplayStatus(card)" not in card_block
+
+
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260622-system-audit-layout" in html
-    assert "dashboard.js?v=20260622-system-audit-layout" in html
+    assert "dashboard.css?v=20260624-threshold-governance-strip" in html
+    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
+
+
+def test_trading_settings_show_threshold_governance_catalog() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert "阈值治理与手动配置说明" in html
+    assert "手动硬风控上限" in html
+    assert 'id="cfg-max-position-pct"' in html
+    assert 'id="cfg-max-leverage"' in html
+    assert 'id="cfg-max-daily-loss-pct"' in html
+    assert 'id="cfg-hard-stop-loss-pct"' in html
+    assert 'id="cfg-max-open-positions-per-model"' in html
+    assert 'id="cfg-max-same-symbol-positions-per-side"' in html
+    assert 'id="threshold-governance-summary"' in html
+    assert 'id="threshold-governance-strip"' in html
+    assert 'id="threshold-governance-strip-text"' in html
+    assert 'id="threshold-manual-count"' in html
+    assert 'id="threshold-auto-count"' in html
+    assert 'id="threshold-hard-count"' in html
+    assert 'id="threshold-removed-count"' in html
+    assert 'id="threshold-manual-editable"' in html
+    assert 'id="threshold-service-controls"' in html
+    assert 'id="threshold-auto-tunable"' in html
+    assert 'id="threshold-manual-hard-guards"' in html
+    assert 'id="threshold-removed-deprecated"' in html
+
+    assert "function fetchThresholdCatalog" in script
+    assert "fetchJSON('/api/settings/threshold-catalog')" in script
+    assert "if (selected === 'trading') fetchTradingParams();" in script
+    assert "renderThresholdCatalogList('threshold-manual-editable'" in script
+    assert "renderThresholdCatalogList('threshold-auto-tunable'" in script
+    assert "renderThresholdCatalogList('threshold-removed-deprecated'" in script
+    assert "threshold-governance-strip-text" in script
+    assert "setCount('threshold-manual-count'" in script
+    assert "setCount('threshold-hard-count'" in script
+    assert "body.max_position_pct = pct / 100;" in script
+    assert "body.max_leverage = leverage;" in script
+    assert "body.max_daily_loss_pct = pct / 100;" in script
+    assert "body.hard_stop_loss_pct = pct / 100;" in script
+    assert "body.max_open_positions_per_model = value;" in script
+    assert "body.max_same_symbol_positions_per_side = value;" in script
+    assert "硬风险上限不会自动放松" in script
+    assert "自动调度项不放进手动输入框" in script
+
+    assert ".threshold-governance-grid" in style
+    assert ".threshold-governance-strip" in style
+    assert ".threshold-governance-impact" in style
 
 
 def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
@@ -569,8 +690,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260622-system-audit-layout" in html
-    assert "dashboard.js?v=20260622-system-audit-layout" in html
+    assert "dashboard.css?v=20260624-threshold-governance-strip" in html
+    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -659,6 +780,20 @@ def test_local_ml_dashboard_request_failure_degrades_per_endpoint() -> None:
     assert "fetchJSON('/api/local-ai-tools/status').catch(err => ({" in fetch_block
     assert "本地 ML 状态接口请求失败" in fetch_block
     assert "本地量化工具状态接口请求失败" in fetch_block
+
+
+def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    fetch_block = script[
+        script.index("async function fetchJSON") : script.index("function redirectToLogin")
+    ]
+
+    assert "const data = await res.json().catch(() => ({}));" in fetch_block
+    assert "redirectToLogin(message);" in fetch_block
+    assert "throw new Error(message);" in fetch_block
+    assert "throw new Error(apiErrorText(data, res.statusText || '请求失败'));" in fetch_block
+    assert "throw e;" in fetch_block
+    assert "return null;" not in fetch_block
 
 
 def test_local_ml_loss_filter_uses_backend_model_contract() -> None:
@@ -793,8 +928,12 @@ async def test_open_position_market_snapshot_returns_positions_and_tickers(
         assert mode == "paper"
         return {"ETH/USDT": {"price": 2500.0}}
 
-    async def open_positions(mode: str | None = None) -> list[dict[str, Any]]:
+    async def open_positions(
+        mode: str | None = None,
+        ticker_overrides: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         assert mode == "paper"
+        assert ticker_overrides == {"ETH/USDT": {"price": 2500.0}}
         return [
             {
                 "symbol": "ETH/USDT",
@@ -831,7 +970,10 @@ async def test_market_snapshot_builds_tickers_from_open_positions_when_feed_empt
     ) -> dict[str, Any]:
         return {}
 
-    async def open_positions(mode: str | None = None) -> list[dict[str, Any]]:
+    async def open_positions(
+        mode: str | None = None,
+        ticker_overrides: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "symbol": "ETH/USDT",
@@ -860,6 +1002,188 @@ async def test_market_snapshot_builds_tickers_from_open_positions_when_feed_empt
             "ask": 0.0,
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_market_snapshot_keeps_nonzero_feed_change_when_position_change_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def open_symbols(mode: str | None = None) -> set[str]:
+        return {"ETH/USDT"}
+
+    async def feed_tickers(
+        symbols: set[str],
+        market_tickers: dict[str, Any],
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ETH/USDT": {
+                "price": 2500.0,
+                "change_24h_pct": -2.4,
+                "volume_24h": 123.0,
+                "bid": 2499.0,
+                "ask": 2501.0,
+            }
+        }
+
+    async def open_positions(
+        mode: str | None = None,
+        ticker_overrides: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        assert ticker_overrides == {
+            "ETH/USDT": {
+                "price": 2500.0,
+                "change_24h_pct": -2.4,
+                "volume_24h": 123.0,
+                "bid": 2499.0,
+                "ask": 2501.0,
+            }
+        }
+        return [
+            {
+                "symbol": "ETH/USDT",
+                "side": "long",
+                "current_price": 2500.0,
+                "entry_price": 2400.0,
+                "change_24h": 0.0,
+                "is_open": True,
+            }
+        ]
+
+    monkeypatch.setattr(dashboard, "_data_service", None)
+    monkeypatch.setattr(dashboard, "_get_display_open_position_symbols", open_symbols)
+    monkeypatch.setattr(dashboard, "_build_dashboard_tickers", feed_tickers)
+    monkeypatch.setattr(dashboard, "_get_display_open_positions_snapshot", open_positions)
+
+    payload = await dashboard._build_open_position_market_snapshot("paper")
+
+    assert payload["tickers"]["ETH/USDT"]["change_24h"] == -2.4
+    assert payload["tickers"]["ETH/USDT"]["volume_24h"] == 123.0
+
+
+def test_parse_public_tickers_accepts_internal_market_state_fields() -> None:
+    parsed = dashboard._parse_public_tickers(
+        {
+            "ETH/USDT": {
+                "symbol": "ETH/USDT",
+                "last_price": 2500.0,
+                "change_24h_pct": -2.4,
+                "volume_24h": 123.0,
+                "bid": 2499.0,
+                "ask": 2501.0,
+            }
+        },
+        {"ETH/USDT"},
+    )
+
+    assert parsed["ETH/USDT"]["price"] == 2500.0
+    assert parsed["ETH/USDT"]["change_24h"] == -2.4
+
+
+def test_dashboard_js_preserves_market_change_when_position_snapshot_change_is_zero() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    position_builder = script[
+        script.index("function buildTickersFromPositions") : script.index(
+            "function buildPositionTickers"
+        )
+    ]
+    market_update = script[
+        script.index("function updateMarketData") : script.index("function decisionSizeTitle")
+    ]
+
+    assert "const positionChange =" in position_builder
+    assert "Number(positionChange) !== 0" in position_builder
+    assert "const shouldKeepMarketChange =" in market_update
+    assert "Number(tickerChange) === 0" in market_update
+    assert "change_24h: shouldKeepMarketChange ? marketChange" in market_update
+
+
+def test_position_ticker_snapshot_uses_backend_market_contract() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    snapshot_block = script[
+        script.index("async function fetchPositionTickerSnapshot") : script.index(
+            "function filterTickersToOpenPositions"
+        )
+    ]
+
+    assert "/api/dashboard/market" in snapshot_block
+    assert "updateMarketData(data, state.accounts || [])" in snapshot_block
+    assert "/api/dashboard/positions" not in snapshot_block
+    assert "enrichTickersFromOKX" not in snapshot_block
+
+
+def test_parse_public_tickers_uses_okx_open24h_baseline() -> None:
+    parsed = dashboard._parse_public_tickers(
+        {
+            "ETH/USDT": {
+                "symbol": "ETH/USDT",
+                "last": 105.0,
+                "open24h": 100.0,
+            }
+        },
+        {"ETH/USDT"},
+    )
+
+    assert parsed["ETH/USDT"]["change_24h"] == 5.0
+
+
+def test_parse_public_tickers_prefers_okx_24h_change_over_sod_utc8() -> None:
+    parsed = dashboard._parse_public_tickers(
+        {
+            "AUCTION/USDT": {
+                "symbol": "AUCTION/USDT",
+                "last": 3.53,
+                "percentage": -0.2261164499717354,
+                "info": {
+                    "instId": "AUCTION-USDT-SWAP",
+                    "last": "3.53",
+                    "open24h": "3.538",
+                    "sodUtc8": "3.53",
+                },
+            }
+        },
+        {"AUCTION/USDT"},
+    )
+
+    assert parsed["AUCTION/USDT"]["change_24h"] == pytest.approx(-0.2261164499717354)
+
+
+@pytest.mark.asyncio
+async def test_open_position_tickers_use_public_change_when_market_cache_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def public_tickers(symbols: set[str]) -> dict[str, Any]:
+        return {
+            "ETH/USDT": {
+                "price": 2500.0,
+                "change_24h": -1.7,
+                "volume_24h": 321.0,
+                "bid": 2499.0,
+                "ask": 2501.0,
+            }
+        }
+
+    async def exchange_marks(mode: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+        return {
+            ("ETH/USDT", "long"): {
+                "mark_price": 2502.0,
+                "entry_price": 2400.0,
+                "quantity": 1.0,
+            }
+        }
+
+    monkeypatch.setattr(dashboard, "_get_public_ticker_map", public_tickers)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", exchange_marks)
+
+    tickers = await dashboard._build_tickers_for_open_positions(
+        {"ETH/USDT"},
+        {},
+        "paper",
+    )
+
+    assert tickers["ETH/USDT"]["price"] == 2502.0
+    assert tickers["ETH/USDT"]["change_24h"] == -1.7
+    assert tickers["ETH/USDT"]["volume_24h"] == 321.0
 
 
 def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error() -> None:

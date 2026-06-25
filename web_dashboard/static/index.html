@@ -18,7 +18,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260622-system-audit-layout">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260624-threshold-governance-strip">
     <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260616-cangxiao-ui-fix2">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1392,6 +1392,18 @@
                     <span class="card-title">交易参数</span>
                     <span class="card-subtitle">全局决策控制</span>
                 </div>
+                <div class="threshold-governance-strip" id="threshold-governance-strip">
+                    <div>
+                        <strong>阈值治理已接入</strong>
+                        <span id="threshold-governance-strip-text">正在读取手动/自动/废弃阈值说明...</span>
+                    </div>
+                    <div class="threshold-governance-strip-metrics">
+                        <span id="threshold-manual-count">手动 --</span>
+                        <span id="threshold-auto-count">自动 --</span>
+                        <span id="threshold-hard-count">硬上限 --</span>
+                        <span id="threshold-removed-count">废弃 --</span>
+                    </div>
+                </div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
                     <div class="settings-panel">
                         <div class="settings-panel-title">决策间隔</div>
@@ -1422,6 +1434,41 @@
                         </div>
                         <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">
                             这是下单与评分的滑点安全上限，不是每笔固定扣费；系统会按实时点差、盘口深度动态估算。
+                        </div>
+                    </div>
+                    <div class="settings-panel" style="grid-column:1 / -1;">
+                        <div class="settings-panel-title">手动硬风控上限</div>
+                        <div class="settings-form-grid">
+                            <div class="form-group">
+                                <label class="form-label">单笔保证金上限 %</label>
+                                <input type="number" class="form-input" id="cfg-max-position-pct" min="0.5" max="50" step="0.1" placeholder="25">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调高会放大单笔亏损和保证金占用；调低会让单笔更小但盈利弹性下降。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">最大杠杆 x</label>
+                                <input type="number" class="form-input" id="cfg-max-leverage" min="1" max="125" step="0.5" placeholder="20">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">这是账户级杠杆天花板，运行态仍会按证据质量压到更低。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">日内最大亏损 %</label>
+                                <input type="number" class="form-input" id="cfg-max-daily-loss-pct" min="0.1" max="50" step="0.1" placeholder="5">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调低会更早停手保护本金；调高会延后停手并扩大当天风险。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">硬止损 %</label>
+                                <input type="number" class="form-input" id="cfg-hard-stop-loss-pct" min="0.1" max="50" step="0.1" placeholder="5">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调低更快止损但容易被普通波动洗出；调高会给仓位更大回撤空间。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">基础持仓组数上限</label>
+                                <input type="number" class="form-input" id="cfg-max-open-positions-per-model" min="1" max="200" step="1" placeholder="20">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">动态容量策略以此为基础，调高会扩大组合复杂度和保证金压力。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">同币同向持仓组数上限</label>
+                                <input type="number" class="form-input" id="cfg-max-same-symbol-positions-per-side" min="1" max="20" step="1" placeholder="2">
+                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">限制同一个币种同方向重复堆仓，调高会增加集中暴露。</div>
+                            </div>
                         </div>
                     </div>
                     <div class="settings-panel">
@@ -1504,6 +1551,38 @@
                 <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;">
                     <button class="btn btn-accent btn-sm" onclick="saveTradingParams()">保存参数</button>
                     <span style="font-size:11px;color:var(--text-muted);">修改后立即生效，无需重启</span>
+                </div>
+                <div class="threshold-governance-card" id="threshold-governance-card">
+                    <div class="threshold-governance-head">
+                        <div>
+                            <div class="settings-panel-title">阈值治理与手动配置说明</div>
+                            <div class="threshold-governance-summary" id="threshold-governance-summary">
+                                正在读取阈值治理规则...
+                            </div>
+                        </div>
+                    </div>
+                    <div class="threshold-governance-grid">
+                        <div class="threshold-governance-group">
+                            <div class="threshold-governance-title">本页可手动配置</div>
+                            <div id="threshold-manual-editable" class="threshold-governance-list"></div>
+                        </div>
+                        <div class="threshold-governance-group">
+                            <div class="threshold-governance-title">服务超时与熔断</div>
+                            <div id="threshold-service-controls" class="threshold-governance-list"></div>
+                        </div>
+                        <div class="threshold-governance-group">
+                            <div class="threshold-governance-title">自动调度，不手动改</div>
+                            <div id="threshold-auto-tunable" class="threshold-governance-list"></div>
+                        </div>
+                        <div class="threshold-governance-group">
+                            <div class="threshold-governance-title">必须手动确认的硬上限</div>
+                            <div id="threshold-manual-hard-guards" class="threshold-governance-list"></div>
+                        </div>
+                        <div class="threshold-governance-group threshold-governance-group-wide">
+                            <div class="threshold-governance-title">已删除或废弃的假阈值</div>
+                            <div id="threshold-removed-deprecated" class="threshold-governance-list compact"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
             </section>
@@ -1770,7 +1849,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260622-system-audit-layout"></script>
+    <script src="/static/js/dashboard.js?v=20260624-threshold-governance-strip"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260619-llm-error-kind"></script>
 </body>
 </html>

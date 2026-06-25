@@ -42,3 +42,29 @@ def test_exit_arbitrator_keeps_ordinary_exit_on_full_guard_chain() -> None:
     assert result.bypass_cooldown is False
     assert result.bypass_profit_precheck is False
     assert result.bypass_fee_churn_guard is False
+
+
+def test_exit_arbitrator_keeps_low_quality_release_on_churn_guards() -> None:
+    decision = _decision(
+        {
+            "forced_exit": True,
+            "exit_intent": "hard_risk",
+            "position_release_policy": {
+                "source": "position_quality_capacity_release",
+                "forced": True,
+            },
+            "close_evidence": {
+                "forced_exit": True,
+                "hard_risk": False,
+                "source": "low_quality_position_release",
+            },
+        }
+    )
+
+    result = ExitArbitrator().arbitrate(decision)
+
+    assert result.intent == ExitIntent.CAPITAL_ROTATION
+    assert result.bypass_partial_guard is False
+    assert result.bypass_cooldown is False
+    assert result.bypass_profit_precheck is False
+    assert result.bypass_fee_churn_guard is False

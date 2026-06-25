@@ -158,3 +158,49 @@ def test_model_expert_health_report_observes_insufficient_samples() -> None:
     assert sentiment["recommended_state"] == "shadow_only"
     assert sentiment["evidence_state"] == "observing"
     assert "insufficient_samples" in sentiment["state_reasons"]
+
+
+def test_model_expert_health_does_not_count_successful_independent_retry_as_json_error() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    timings = [
+        {
+            "name": name,
+            "status": "completed",
+            "stage": "expert_independent_provider",
+            "provider_model": "deepseek-r1-14b-risk",
+            "provider_independent_expert_mode": True,
+            "batch_expert": False,
+            "shared_batch_call": False,
+            "batch_failure_status": "batch_fallback",
+            "duration_sec": 4.2,
+            "action": "hold",
+            "confidence": 0.61,
+            "reason": 'batch expert failed: Could not extract valid JSON from: {"experts":',
+        }
+        for name in ("sentiment_expert", "position_expert", "risk_expert")
+    ]
+    decisions = [
+        _decision(
+            decision_id=index,
+            action="hold",
+            hours_ago=index,
+            executed=False,
+            raw={
+                "model_timings": timings,
+                "experts": [
+                    {"expert_name": item["name"], "action": "hold", "confidence": 0.61}
+                    for item in timings
+                ],
+            },
+        )
+        for index in range(1, 4)
+    ]
+
+    report = summarize_model_expert_health(decisions, [], now=now)
+
+    for name in ("sentiment_expert", "position_expert", "risk_expert"):
+        component = report["components"][name]
+        assert component["windows"]["24h"]["participation_count"] == 3
+        assert component["windows"]["24h"]["json_error_count"] == 0
+        assert component["windows"]["24h"]["no_return_count"] == 0
+        assert component["stability"]["json_error_rate"] == 0.0

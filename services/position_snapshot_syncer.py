@@ -4,6 +4,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+ENTRY_PRICE_SYNC_MAX_GAP_RATIO = 0.70
+
 
 def _default_float_parser(value: Any, default: float = 0.0) -> float:
     try:
@@ -52,8 +54,17 @@ class PositionSnapshotSyncer:
         )
         for position in open_positions:
             position.current_price = current_price
-            if not getattr(position, "entry_price", 0.0) and entry_price > 0:
+            local_entry = self.float_parser(getattr(position, "entry_price", 0.0), 0.0)
+            entry_gap_ratio = (
+                abs(local_entry - entry_price) / max(entry_price, 1e-12)
+                if local_entry > 0 and entry_price > 0
+                else 0.0
+            )
+            if (
+                local_entry <= 0 or entry_gap_ratio > ENTRY_PRICE_SYNC_MAX_GAP_RATIO
+            ) and entry_price > 0:
                 position.entry_price = entry_price
+                changed = True
             if leverage > 0:
                 position.leverage = leverage
             if (

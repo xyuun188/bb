@@ -92,6 +92,31 @@ def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote(
     assert "risk_expert" not in support["directional_support_experts"]
 
 
+def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:
+    context = {
+        "_expert_diversity_policy": {
+            "should_retry": True,
+            "reason": "strong entry-candidate evidence requires independent confirmation",
+            "objective_evidence": {"side": "long", "score": 3.5},
+        }
+    }
+    opinions = _strong_long_opinions()
+    opinions["trend_expert"].raw_response = {
+        "independent_expert_retry": True,
+        "provider_independent_expert_mode": True,
+    }
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    assert decision.action == Action.LONG
+    assert decision.raw_response["expert_diversity_policy"]["should_retry"] is True
+    trend = next(
+        item for item in decision.raw_response["opinions"] if item["model_name"] == "trend_expert"
+    )
+    assert trend["independent_expert_retry"] is True
+    assert trend["provider_independent_expert_mode"] is True
+
+
 def test_risk_expert_hard_veto_blocks_new_entry_even_without_direction_weight() -> None:
     opinions = _strong_long_opinions(
         risk_action=Action.HOLD,

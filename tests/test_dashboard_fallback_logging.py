@@ -377,7 +377,7 @@ async def test_public_ticker_map_works_without_data_service(
     result = await dashboard._get_public_ticker_map({"BTC/USDT"})
 
     assert result["BTC/USDT"]["price"] == 100.0
-    assert result["BTC/USDT"]["change_24h"] == pytest.approx(1.52284263959)
+    assert result["BTC/USDT"]["change_24h"] == pytest.approx(1.5)
     assert result["BTC/USDT"]["volume_24h"] == 1234.0
 
 

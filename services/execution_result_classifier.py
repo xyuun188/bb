@@ -108,6 +108,12 @@ class ExecutionResultClassifier:
                 "OKX 拒绝调整杠杆：该交易对当前挂单超过 5 条。"
                 "系统会跳过重复杠杆设置，必要时只清理旧的非保护挂单后重试。"
             )
+        if "51028" in normalized or "contract under delivery" in normalized_lower:
+            return (
+                "OKX 51028: Contract under delivery。该合约正在交割/结算，"
+                "OKX 暂时拒绝开仓、减仓和平仓操作。系统不会把本地仓位标记为已平仓，"
+                "并会暂停重复提交平仓，直到 OKX 结算完成或仓位同步确认最终状态。"
+            )
         if "tptriggerpx" in normalized_lower and "error" in normalized_lower:
             return (
                 "OKX 返回错误码 51000：保护止盈触发价 tpTriggerPx 无效，订单没有提交成功。"

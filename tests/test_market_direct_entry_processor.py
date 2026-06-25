@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 from services.market_direct_entry_processor import MarketDirectEntryProcessor
 
@@ -125,6 +126,11 @@ async def test_market_direct_entry_processor_records_capacity_skip() -> None:
     assert result.reason == "持仓已满"
     assert results["decisions"][0]["execution_status"] == "skipped"
     assert ("reason", 7, "持仓已满") in calls
+    assert _decision_state_status(calls, 7) == (
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+        "entry_capacity",
+    )
     assert not any(call[0] == "reserve" for call in calls)
     assert not staged_counts
 
@@ -182,3 +188,27 @@ async def test_market_direct_entry_processor_releases_capacity_on_unconfirmed_ex
     assert result.execution_confirmed is False
     assert staged_counts["reserved"]["ensemble_trader"] == 0
     assert ("release", "ensemble_trader", "BTC/USDT") in calls
+
+
+def _decision_state_status(
+    calls: list[tuple[str, Any]],
+    decision_id: int,
+) -> tuple[str, str, str] | None:
+    for call in calls:
+        if call[0] != "raw" or call[1] != decision_id:
+            continue
+        raw = call[2]
+        if not isinstance(raw, dict):
+            continue
+        machine = raw.get("decision_state_machine")
+        if not isinstance(machine, dict):
+            continue
+        stages = machine.get("stages")
+        event = stages[-1] if isinstance(stages, list) and stages else {}
+        data = event.get("data") if isinstance(event, dict) else {}
+        return (
+            str(machine.get("current_stage") or ""),
+            str(machine.get("current_status") or ""),
+            str(data.get("skip_kind") or "") if isinstance(data, dict) else "",
+        )
+    return None

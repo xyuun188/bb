@@ -31,6 +31,7 @@ from services.account_accounting_service import (
     balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
+from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     first_tool_payload,
@@ -94,6 +95,7 @@ _dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+_DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 
 
 def _dashboard_heavy_cache_get(
@@ -414,34 +416,13 @@ def _execution_reason_is_unusable(reason: str | None) -> bool:
             "无法准确还原",
             "鍘嗗彶璁板綍",
             "鎹熷潖",
+            "这条平仓决策没有找到对应的本地平仓委托记录",
         )
     )
 
 
 def _recover_execution_reason_from_raw_decision(decision) -> str | None:
-    raw = _safe_dict(decision.raw_llm_response)
-    action = str(getattr(decision, "action", "") or "")
-    if action not in {"close_long", "close_short"}:
-        return None
-    close_evidence = _safe_dict(raw.get("close_evidence"))
-    action_plan = str(close_evidence.get("action_plan") or "").lower()
-    plan_label = (
-        "全平" if action_plan == "full_close" else "减仓" if action_plan == "reduce" else "平仓"
-    )
-    close_reason = str(
-        close_evidence.get("reason") or getattr(decision, "reasoning", "") or ""
-    ).strip()
-    pnl = _safe_float(close_evidence.get("position_unrealized_pnl"), 0.0) or 0.0
-    if close_reason:
-        return (
-            f"平仓裁决已生成但本轮没有确认到 OKX 平仓订单结果：AI 建议{plan_label}，"
-            f"当时估算浮动盈亏 {pnl:.4f} USDT。裁决依据：{close_reason}"
-            "系统会继续以 OKX 实际仓位和执行记录为准同步；如果仓位仍存在，下一轮持仓复盘会重新评估并提交平仓。"
-        )
-    return (
-        "平仓裁决已生成但本轮没有确认到 OKX 平仓订单结果。"
-        "系统会继续以 OKX 实际仓位和执行记录为准同步；如果仓位仍存在，下一轮持仓复盘会重新评估并提交平仓。"
-    )
+    return _DECISION_REASON_RECOVERY.recover(decision)
 
 
 def _display_execution_reason(decision, order=None) -> str | None:
@@ -1623,6 +1604,13 @@ def _fallback_execution_reason(decision, order=None) -> str | None:
     return _fallback_execution_reason_clean(decision, order)
 
 
+def _decision_raw_payload(decision) -> dict[str, Any]:
+    raw = getattr(decision, "raw_llm_response", None)
+    if not isinstance(raw, dict):
+        raw = getattr(decision, "raw_response", None)
+    return raw if isinstance(raw, dict) else {}
+
+
 def _fallback_execution_reason_clean(decision, order=None) -> str | None:
     """Build a clean, non-mojibake execution reason for dashboard details."""
 
@@ -1637,7 +1625,7 @@ def _fallback_execution_reason_clean(decision, order=None) -> str | None:
         return "未保存具体未执行原因。"
 
     snapshot = decision.feature_snapshot or {}
-    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+    raw = _decision_raw_payload(decision)
     entry_filters = entry_filters_from_context(
         raw or {"entry_filters": snapshot.get("entry_filters")}
     )
@@ -1691,6 +1679,9 @@ def _fallback_execution_reason_clean(decision, order=None) -> str | None:
                 f"本地已生成平仓单，但未拿到 OKX 订单号，当前本地订单状态为 {status_label}。"
                 "请以同时间附近的执行记录和 OKX 订单状态为准。"
             )
+        recovered = _recover_execution_reason_from_raw_decision(decision)
+        if recovered:
+            return recovered
         return (
             "这条平仓决策没有找到对应的本地平仓委托记录，因此系统未把它视为已执行。"
             "请以 OKX 订单状态和执行记录为准。"
@@ -2157,16 +2148,20 @@ async def _build_tickers_for_open_positions(
         if price > 0:
             market_ticker = dict(market_tickers.get(symbol, {}) or {})
             public_ticker = dict(public_tickers.get(symbol, {}) or {})
-            raw_change = market_ticker.get("change_24h")
-            if raw_change is None:
-                raw_change = market_ticker.get("change24h")
-            if raw_change is None or _safe_float(raw_change, 0.0) == 0.0:
-                raw_change = public_ticker.get("change_24h", raw_change)
+            if not market_ticker and public_ticker:
+                market_ticker = public_ticker
+            market_change = _ticker_change_24h(market_ticker, None)
+            public_change = _ticker_change_24h(public_ticker, None)
+            change_24h = (
+                market_change
+                if market_change is not None and abs(market_change) > 1e-12
+                else public_change if public_change is not None else market_change or 0.0
+            )
             tickers[symbol] = {
                 "price": price,
                 "mark_price": snapshot.get("mark_price"),
                 "index_price": snapshot.get("index_price"),
-                "change_24h": _safe_float(raw_change, 0.0),
+                "change_24h": change_24h,
                 "volume_24h": _safe_float(market_ticker.get("volume_24h"), 0.0)
                 or _safe_float(public_ticker.get("volume_24h"), 0.0),
                 "bid": _safe_float(market_ticker.get("bid"), 0.0)
@@ -2176,9 +2171,9 @@ async def _build_tickers_for_open_positions(
             }
 
     for symbol in open_symbols - set(tickers):
-        if symbol in market_tickers:
+        if symbol in market_tickers or symbol in public_tickers:
             tickers[symbol] = _merge_market_and_public_ticker(
-                dict(market_tickers[symbol]),
+                dict(market_tickers.get(symbol, {}) or {}),
                 dict(public_tickers.get(symbol, {}) or {}),
             )
 
@@ -2189,14 +2184,16 @@ async def _build_tickers_for_open_positions(
             if price > 0:
                 market_ticker = dict(market_tickers.get(symbol, {}) or {})
                 public_ticker = dict(public_tickers.get(symbol, {}) or {})
-                raw_change = market_ticker.get("change_24h")
-                if raw_change is None:
-                    raw_change = market_ticker.get("change24h")
-                if raw_change is None or _safe_float(raw_change, 0.0) == 0.0:
-                    raw_change = public_ticker.get("change_24h", raw_change)
+                market_change = _ticker_change_24h(market_ticker, None)
+                public_change = _ticker_change_24h(public_ticker, None)
+                change_24h = (
+                    market_change
+                    if market_change is not None and abs(market_change) > 1e-12
+                    else public_change if public_change is not None else market_change or 0.0
+                )
                 tickers[symbol] = {
                     "price": price,
-                    "change_24h": _safe_float(raw_change, 0.0),
+                    "change_24h": change_24h,
                     "volume_24h": _safe_float(market_ticker.get("volume_24h"), 0.0)
                     or _safe_float(public_ticker.get("volume_24h"), 0.0),
                     "bid": _safe_float(market_ticker.get("bid"), 0.0)
@@ -2237,7 +2234,10 @@ async def _build_open_position_market_snapshot(mode: str | None = None) -> dict[
     market_tickers = market_state.get("tickers", {}) if isinstance(market_state, dict) else {}
     open_symbols = await _get_display_open_position_symbols(selected_mode)
     tickers = await _build_dashboard_tickers(open_symbols, market_tickers, selected_mode)
-    open_positions = await _get_display_open_positions_snapshot(selected_mode)
+    open_positions = await _get_display_open_positions_snapshot(
+        selected_mode,
+        ticker_overrides=tickers,
+    )
     if open_positions:
         position_tickers = _build_tickers_from_position_snapshot(
             open_positions,
@@ -2255,7 +2255,10 @@ async def _build_open_position_market_snapshot(mode: str | None = None) -> dict[
     }
 
 
-async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[dict[str, Any]]:
+async def _get_display_open_positions_snapshot(
+    mode: str | None = None,
+    ticker_overrides: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Return display-ready open positions without pagination for dashboard widgets."""
     from db.repositories.trade_repo import TradeRepository
     from db.session import get_session_ctx
@@ -2268,7 +2271,6 @@ async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[
     market_tickers: dict[str, dict[str, Any]] = {}
     if _data_service:
         market_tickers = (_data_service.get_market_state() or {}).get("tickers", {}) or {}
-
     positions: list[dict[str, Any]] = []
     try:
         async with get_session_ctx() as session:
@@ -2294,12 +2296,18 @@ async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[
                 entry_price = p.entry_price
                 quantity = p.quantity
                 pnl_source = "local_db"
-                change_24h = 0.0
                 snapshot = exchange_mark_map.get(exchange_key)
-                market_ticker = market_tickers.get(symbol, {})
-                change_24h = float(
-                    market_ticker.get("change_24h") or market_ticker.get("change24h") or 0.0
+                market_ticker = dict(market_tickers.get(symbol, {}) or {})
+                override_ticker = (
+                    dict(ticker_overrides.get(symbol, {}) or {})
+                    if isinstance(ticker_overrides, dict)
+                    else {}
                 )
+                display_ticker = _merge_market_and_public_ticker(
+                    market_ticker,
+                    override_ticker,
+                )
+                change_24h = _ticker_change_24h(display_ticker, 0.0) or 0.0
                 if snapshot:
                     valuation = _exchange_position_display_valuation(
                         snapshot,
@@ -2314,9 +2322,9 @@ async def _get_display_open_positions_snapshot(mode: str | None = None) -> list[
                     entry_price = valuation["entry_price"]
                     quantity = valuation["quantity"]
                     pnl_source = valuation["pnl_source"]
-                elif market_ticker:
+                elif display_ticker:
                     latest_price = float(
-                        market_ticker.get("price") or market_ticker.get("last_price") or 0.0
+                        display_ticker.get("price") or display_ticker.get("last_price") or 0.0
                     )
                     if latest_price > 0:
                         current_price = latest_price
@@ -2395,12 +2403,17 @@ def _build_tickers_from_position_snapshot(
         if price <= 0:
             continue
         previous = existing_tickers.get(symbol, {}) if isinstance(existing_tickers, dict) else {}
-        raw_change = position.get("change_24h")
-        if raw_change is None and isinstance(previous, dict):
-            raw_change = previous.get("change_24h", previous.get("change24h"))
+        position_change = _ticker_change_24h(position, None)
+        previous_change = _ticker_change_24h(previous, None) if isinstance(previous, dict) else None
+        if position_change is not None and abs(position_change) > 1e-12:
+            change_24h = position_change
+        elif previous_change is not None:
+            change_24h = previous_change
+        else:
+            change_24h = position_change or 0.0
         tickers[symbol] = {
             "price": price,
-            "change_24h": _safe_float(raw_change, 0.0) or 0.0,
+            "change_24h": change_24h,
             "volume_24h": _safe_float(
                 previous.get("volume_24h") if isinstance(previous, dict) else None,
                 0.0,
@@ -2416,15 +2429,30 @@ def _build_tickers_from_position_snapshot(
 
 def _merge_market_and_public_ticker(market_ticker: dict, public_ticker: dict) -> dict:
     merged = {**public_ticker, **market_ticker}
-    market_change = market_ticker.get("change_24h")
-    if market_change is None:
-        market_change = market_ticker.get("change24h")
-    if market_change is None or _safe_float(market_change, 0.0) == 0.0:
-        merged["change_24h"] = public_ticker.get("change_24h", market_change or 0.0)
+    market_change = _ticker_change_24h(market_ticker, None)
+    public_change = _ticker_change_24h(public_ticker, None)
+    merged["change_24h"] = (
+        market_change
+        if market_change is not None and abs(market_change) > 1e-12
+        else public_change if public_change is not None else market_change or 0.0
+    )
     for key in ("volume_24h", "bid", "ask"):
         if _safe_float(market_ticker.get(key), 0.0) == 0.0:
             merged[key] = public_ticker.get(key, market_ticker.get(key, 0.0))
     return merged
+
+
+def _ticker_change_24h(ticker: dict[str, Any] | None, default: float | None = 0.0) -> float | None:
+    if not isinstance(ticker, dict):
+        return default
+    for key in ("change_24h", "change24h", "change_24h_pct", "percentage"):
+        if key not in ticker:
+            continue
+        value = ticker.get(key)
+        if value is None:
+            continue
+        return _safe_float(value, 0.0)
+    return default
 
 
 async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
@@ -2515,7 +2543,12 @@ def _parse_public_tickers(
         if symbol not in requested_symbols:
             continue
         price = _safe_float(
-            ticker.get("last") or ticker.get("close") or info.get("last") or info.get("lastPx"),
+            ticker.get("price")
+            or ticker.get("last_price")
+            or ticker.get("last")
+            or ticker.get("close")
+            or info.get("last")
+            or info.get("lastPx"),
             0.0,
         )
         parsed[symbol] = {
@@ -2532,17 +2565,46 @@ def _parse_public_tickers(
 
 
 def _okx_display_change_pct(ticker: dict) -> float:
-    """Match OKX web UI's displayed day-change baseline when available."""
+    """Use OKX's real 24h change, not the UTC+8 session-open helper field."""
+    info = ticker.get("info") or {}
+    for key in ("change_24h", "change24h", "change_24h_pct", "percentage"):
+        value = ticker.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if abs(parsed) > 1e-12:
+            return parsed
     try:
-        price = float(ticker.get("last") or ticker.get("close") or 0)
-        info = ticker.get("info") or {}
-        baseline = float(info.get("sodUtc8") or ticker.get("open") or 0)
+        price = float(
+            ticker.get("price")
+            or ticker.get("last_price")
+            or ticker.get("last")
+            or ticker.get("close")
+            or info.get("last")
+            or info.get("lastPx")
+            or 0
+        )
+        baseline = float(
+            ticker.get("open")
+            or ticker.get("open24h")
+            or info.get("open24h")
+            or info.get("sodUtc8")
+            or ticker.get("sodUtc8")
+            or 0
+        )
         if price > 0 and baseline > 0:
             return (price - baseline) / baseline * 100
     except (TypeError, ValueError):
         pass
     try:
-        return float(ticker.get("percentage") or 0)
+        return float(
+            ticker.get("change_24h")
+            or ticker.get("change24h")
+            or ticker.get("change_24h_pct")
+            or ticker.get("percentage")
+            or 0
+        )
     except (TypeError, ValueError):
         return 0.0
 
@@ -2784,6 +2846,10 @@ async def get_positions(
     market_tickers: dict[str, dict[str, Any]] = {}
     if _data_service:
         market_tickers = (_data_service.get_market_state() or {}).get("tickers", {}) or {}
+    public_tickers: dict[str, dict[str, Any]] = {}
+    if open_only and not closed_only:
+        open_symbols = await _get_display_open_position_symbols(mode)
+        public_tickers = await _get_public_ticker_map(open_symbols)
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
@@ -2815,6 +2881,57 @@ async def get_positions(
                 is_open=True,
             )
         sibling_positions = list(rows) + list(open_sibling_rows)
+        closed_group_totals: dict[tuple, dict[str, Any]] = {}
+        if closed_only:
+            for sibling in sibling_positions:
+                created = getattr(sibling, "created_at", None)
+                created_second = (
+                    created.replace(microsecond=0).isoformat() if created is not None else ""
+                )
+                group_key = (
+                    getattr(sibling, "model_name", None),
+                    getattr(sibling, "execution_mode", None),
+                    _normalize_dashboard_symbol(str(getattr(sibling, "symbol", "") or "")),
+                    str(getattr(sibling, "side", "") or "").lower(),
+                    round(_safe_float(getattr(sibling, "entry_price", None), 0.0) or 0.0, 8),
+                    created_second,
+                )
+                totals = closed_group_totals.setdefault(
+                    group_key,
+                    {"closed_qty": 0.0, "open_qty": 0.0, "closed_count": 0},
+                )
+                qty = _safe_float(getattr(sibling, "quantity", None), 0.0) or 0.0
+                if getattr(sibling, "is_open", False):
+                    totals["open_qty"] += qty
+                else:
+                    totals["closed_qty"] += qty
+                    totals["closed_count"] += 1
+
+        def closed_group_key_for(pos) -> tuple:
+            created = getattr(pos, "created_at", None)
+            created_second = (
+                created.replace(microsecond=0).isoformat() if created is not None else ""
+            )
+            return (
+                getattr(pos, "model_name", None),
+                getattr(pos, "execution_mode", None),
+                _normalize_dashboard_symbol(str(getattr(pos, "symbol", "") or "")),
+                str(getattr(pos, "side", "") or "").lower(),
+                round(_safe_float(getattr(pos, "entry_price", None), 0.0) or 0.0, 8),
+                created_second,
+            )
+
+        def group_close_status_for(pos) -> tuple[str | None, str | None]:
+            if not closed_only or getattr(pos, "is_open", False):
+                return None, None
+            totals = closed_group_totals.get(closed_group_key_for(pos)) or {}
+            if (
+                _safe_float(totals.get("open_qty"), 0.0) > 1e-8
+                or int(totals.get("closed_count") or 0) > 1
+            ):
+                return "partial", "部分平仓"
+            return None, None
+
         close_order_match_by_position_id: dict[int, dict[str, Any]] = {}
         close_order_match_window = timedelta(seconds=240)
         if closed_only and rows:
@@ -2937,6 +3054,10 @@ async def get_positions(
             if pos.is_open:
                 return "open", "持有中"
 
+            group_status, group_label = group_close_status_for(pos)
+            if group_status:
+                return group_status, str(group_label)
+
             order_status = close_order_match_by_position_id.get(pos.id)
             if order_status:
                 return str(order_status["status"]), str(order_status["label"])
@@ -2995,10 +3116,14 @@ async def get_positions(
                 snapshot = exchange_mark_map.get(
                     (_normalize_dashboard_symbol(p.symbol), str(p.side or "").lower())
                 )
-                market_ticker = market_tickers.get(_normalize_dashboard_symbol(p.symbol), {})
-                change_24h = float(
-                    market_ticker.get("change_24h") or market_ticker.get("change24h") or 0.0
+                symbol_key = _normalize_dashboard_symbol(p.symbol)
+                market_ticker = dict(market_tickers.get(symbol_key, {}) or {})
+                public_ticker = dict(public_tickers.get(symbol_key, {}) or {})
+                display_ticker = _merge_market_and_public_ticker(
+                    market_ticker,
+                    public_ticker,
                 )
+                change_24h = _ticker_change_24h(display_ticker, 0.0) or 0.0
                 if snapshot:
                     valuation = _exchange_position_display_valuation(
                         snapshot,
@@ -3013,9 +3138,9 @@ async def get_positions(
                     entry_price = valuation["entry_price"]
                     quantity = valuation["quantity"]
                     pnl_source = valuation["pnl_source"]
-                elif market_ticker:
+                elif display_ticker:
                     latest_price = float(
-                        market_ticker.get("price") or market_ticker.get("last_price") or 0.0
+                        display_ticker.get("price") or display_ticker.get("last_price") or 0.0
                     )
                     if latest_price > 0:
                         current_price = latest_price
@@ -3036,7 +3161,6 @@ async def get_positions(
             if closed_only and matched_close:
                 close_order = matched_close.get("order")
                 close_price = _safe_float(getattr(close_order, "price", None), 0.0) or 0.0
-                close_quantity = _safe_float(getattr(close_order, "quantity", None), 0.0) or 0.0
                 position_quantity = _safe_float(quantity, 0.0) or 0.0
                 if close_price > 0:
                     current_price = close_price
@@ -3045,24 +3169,9 @@ async def get_positions(
                     or getattr(close_order, "created_at", None)
                     or closed_at
                 )
-                close_fee = _safe_float(getattr(close_order, "fee", None), 0.0) or 0.0
-                allocated_close_fee = (
-                    close_fee * position_quantity / close_quantity if close_quantity > 0 else 0.0
-                )
                 if close_price > 0 and position_quantity > 0:
-                    if str(p.side or "").lower() == "short":
-                        gross_pnl = (entry_price - close_price) * position_quantity
-                    else:
-                        gross_pnl = (close_price - entry_price) * position_quantity
-                    local_pnl = _safe_float(p.realized_pnl, 0.0) or 0.0
-                    previous_price = _safe_float(p.current_price, 0.0) or close_price
-                    if str(p.side or "").lower() == "short":
-                        previous_gross = (entry_price - previous_price) * position_quantity
-                    else:
-                        previous_gross = (previous_price - entry_price) * position_quantity
-                    inferred_entry_fee = max(previous_gross - local_pnl, 0.0)
-                    realized_pnl = gross_pnl - inferred_entry_fee - allocated_close_fee
-                    pnl_source = "okx_close_order_recomputed"
+                    realized_pnl = _safe_float(p.realized_pnl, 0.0) or 0.0
+                    pnl_source = "position_realized_pnl"
             close_status, close_status_label = close_status_for(p)
             close_status_source = (
                 "order" if p.id in close_order_match_by_position_id else "position"

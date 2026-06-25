@@ -488,6 +488,10 @@ def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_p
         context["target_position_groups"] == context["portfolio_roster"]["target_position_groups"]
     )
     assert context["position_review_max_groups"] >= 1
+    assert (
+        context["strategy_learning"]["runtime"]["analysis_budget"]["roster_fill_market_symbol_min"]
+        >= 6
+    )
 
 
 def test_strategy_learning_single_low_quality_open_position_does_not_global_release(
@@ -515,6 +519,46 @@ def test_strategy_learning_single_low_quality_open_position_does_not_global_rele
     assert payload["schedule"]["active_profile"]["id"] != "loss_release"
     assert context["strategy_learning_release_pressure_active"] is False
     assert context["strategy_learning_sizing"].get("release_pressure_active") is not True
+
+
+def test_strategy_learning_runtime_keeps_roster_fill_candidate_floor(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    open_positions = [
+        SimpleNamespace(
+            model_name="ensemble_trader",
+            symbol=f"OPEN{i}/USDT",
+            side="long",
+            is_open=True,
+            created_at=None,
+            opened_at=None,
+            unrealized_pnl=0.0,
+            realized_pnl=0.0,
+            quantity=1.0,
+            entry_price=1.0,
+            current_price=1.0,
+        )
+        for i in range(7)
+    ]
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=open_positions,
+        orders=[],
+        decisions=[_healthy_decision("long", executed=True)],
+        shadows=[],
+        memories=[],
+        max_open_positions=12,
+    )
+    context = engine.apply_to_context({}, payload)
+    runtime_budget = context["strategy_learning"]["runtime"]["analysis_budget"]
+
+    assert context["target_position_groups"] > 7
+    assert context["portfolio_roster"]["policy_source"] == "strategy_learning_runtime"
+    assert runtime_budget["roster_fill_market_symbol_min"] >= 6
 
 
 def test_strategy_learning_historical_capacity_blocks_do_not_trigger_release_without_current_pressure(

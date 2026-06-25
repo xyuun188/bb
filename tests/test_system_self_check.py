@@ -792,7 +792,7 @@ async def test_recent_execution_old_missing_score_downgrades_after_new_scored_en
     items = await system_health._recent_execution_items()
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["entry_opportunity_score_coverage"]["status"] == "warning"
+    assert by_key["entry_opportunity_score_coverage"]["status"] == "info"
     assert by_key["entry_opportunity_score_coverage"]["details"]["sample_decision_ids"] == [101]
 
 

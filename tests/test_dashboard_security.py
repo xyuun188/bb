@@ -139,6 +139,31 @@ async def test_dashboard_middleware_rejects_remote_read_without_login(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_auth_status_accepts_admin_key_for_read_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "unit-" + "dashboard-read-token"
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", configured)
+    monkeypatch.setattr(settings, "dashboard_auth_enabled", True)
+    monkeypatch.setattr(settings, "dashboard_auth_username", "admin")
+    monkeypatch.setattr(settings, "dashboard_host", "0.0.0.0")  # noqa: S104
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/api/auth/status",
+            headers={"X-Dashboard-Admin-Key": configured},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["authenticated"] is True
+    assert payload["auth_method"] == "admin_key"
+    assert payload["username"] == "admin"
+
+
+@pytest.mark.asyncio
 async def test_dashboard_write_middleware_rejects_remote_write_without_admin_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,6 +242,105 @@ async def test_dashboard_settings_exposes_high_risk_review_token_bounds(
     data = response.json()
     assert data["high_risk_review_token_floor"] == HIGH_RISK_REVIEW_TOKEN_FLOOR
     assert data["high_risk_review_token_cap"] == HIGH_RISK_REVIEW_TOKEN_CAP
+
+
+@pytest.mark.asyncio
+async def test_dashboard_settings_threshold_catalog_governs_manual_auto_and_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/settings/threshold-catalog")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["policy"]["hard_risk_auto_relax"] is False
+    assert data["policy"]["auto_tunable_not_rendered_as_manual_inputs"] is True
+    assert data["policy"]["removed_fake_thresholds"] is True
+
+    manual_keys = {item["key"] for item in data["manual_editable"]}
+    auto_keys = {item["key"] for item in data["auto_tunable"]}
+    hard_keys = {item["key"] for item in data["manual_hard_guards"]}
+    removed_keys = {item["key"] for item in data["removed_or_deprecated"]}
+
+    assert "decision_interval_seconds" in manual_keys
+    assert "confidence_threshold" in manual_keys
+    assert "min_entry_volume_ratio" not in manual_keys
+    assert "min_entry_volume_ratio" in auto_keys
+    assert "min_entry_adx" in auto_keys
+    assert "max_leverage" in hard_keys
+    assert "max_daily_loss_pct" in hard_keys
+    assert "max_auto_trades_per_round" in removed_keys
+    assert "daily_profit_target_usdt_cny" in removed_keys
+    assert "fee.estimated_taker_fee_pct" in removed_keys
+    assert "entry_opportunity_gate.selected_side_positive_net_hard_gate" in removed_keys
+
+    confidence_item = next(
+        item for item in data["manual_editable"] if item["key"] == "confidence_threshold"
+    )
+    assert (
+        confidence_item["effective"] >= data["risk_references"]["min_entry_confidence_after_fees"]
+    )
+    assert "不会被手动调低" in confidence_item["effect"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_settings_updates_manual_hard_risk_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_updates: list[dict[str, Any]] = []
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "max_position_pct", 0.25)
+    monkeypatch.setattr(settings, "max_leverage", 20.0)
+    monkeypatch.setattr(settings, "max_daily_loss_pct", 0.05)
+    monkeypatch.setattr(settings, "hard_stop_loss_pct", 0.05)
+    monkeypatch.setattr(settings, "max_open_positions_per_model", 20)
+    monkeypatch.setattr(settings, "max_same_symbol_positions_per_side", 2)
+
+    def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
+        captured_updates.append(updates)
+
+    monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/settings/thresholds",
+            json={
+                "max_position_pct": 0.12,
+                "max_leverage": 7.5,
+                "max_daily_loss_pct": 0.03,
+                "hard_stop_loss_pct": 0.04,
+                "max_open_positions_per_model": 12,
+                "max_same_symbol_positions_per_side": 3,
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["max_position_pct"] == 0.12
+    assert data["max_leverage"] == 7.5
+    assert data["max_daily_loss_pct"] == 0.03
+    assert data["hard_stop_loss_pct"] == 0.04
+    assert data["max_open_positions_per_model"] == 12
+    assert data["max_same_symbol_positions_per_side"] == 3
+    assert settings.max_position_pct == 0.12
+    assert settings.max_leverage == 7.5
+    assert settings.max_daily_loss_pct == 0.03
+    assert settings.hard_stop_loss_pct == 0.04
+    assert settings.max_open_positions_per_model == 12
+    assert settings.max_same_symbol_positions_per_side == 3
+    assert captured_updates
+    assert captured_updates[-1]["MAX_POSITION_PCT"] == "0.12"
+    assert captured_updates[-1]["MAX_LEVERAGE"] == "7.5"
+    assert captured_updates[-1]["MAX_DAILY_LOSS_PCT"] == "0.03"
+    assert captured_updates[-1]["HARD_STOP_LOSS_PCT"] == "0.04"
+    assert captured_updates[-1]["MAX_OPEN_POSITIONS_PER_MODEL"] == "12"
+    assert captured_updates[-1]["MAX_SAME_SYMBOL_POSITIONS_PER_SIDE"] == "3"
 
 
 @pytest.mark.asyncio

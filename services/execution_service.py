@@ -17,6 +17,7 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.strategy_arbitration import arbitrate_decision
@@ -699,6 +700,7 @@ class ExecutionService:
                     "reason": reason,
                 }
             )
+            raw_response.update(data)
             decision.raw_response = raw_response
             attach_execution_parameters("policy_blocked")
             if decision_db_id is not None:
@@ -732,6 +734,26 @@ class ExecutionService:
             result = rejected_execution_result(decision, reason)
             result.raw_response = raw_response
             return result
+
+        request_symbol = normalize_trading_symbol(symbol)
+        decision_symbol = normalize_trading_symbol(decision.symbol)
+        if request_symbol and decision_symbol and request_symbol != decision_symbol:
+            reason = (
+                "执行链交易对不一致，系统已在提交 OKX 前拦截："
+                f"流程交易对 {request_symbol}，决策交易对 {decision_symbol}。"
+            )
+            return await block_before_submit(
+                PolicyGateResult.block(
+                    "execution_symbol_mismatch",
+                    reason,
+                    {
+                        "request_symbol": symbol,
+                        "decision_symbol": decision.symbol,
+                        "normalized_request_symbol": request_symbol,
+                        "normalized_decision_symbol": decision_symbol,
+                    },
+                )
+            )
 
         arbitration = arbitrate_decision(decision)
         await mark_stage(
@@ -1033,6 +1055,11 @@ class ExecutionService:
             )
             if decision.is_entry and is_untradable_exchange_error(result_text):
                 remember_untradable_symbol(symbol, result_text)
+            elif decision.is_exit and is_untradable_exchange_error(result_text):
+                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                raw["untradable_exit_execution_error"] = {"reason": result_text[:1000]}
+                decision.raw_response = raw
+                remember_exit_cooldown(model_name, decision)
             elif transient_entry_exchange_error:
                 remember_temporary_entry_block(
                     symbol,

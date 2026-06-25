@@ -69,6 +69,25 @@ class ExchangeCloseFillFinder:
         ]
         if not candidates:
             return {}
+        return self._best_candidate(candidates, target_quantity)
+
+    @staticmethod
+    def _best_candidate(
+        candidates: list[dict[str, Any]],
+        target_quantity: float,
+    ) -> dict[str, Any]:
+        if target_quantity > 0:
+            quantity_candidates = [
+                candidate for candidate in candidates if float(candidate.get("quantity") or 0.0) > 0
+            ]
+            if quantity_candidates:
+                return sorted(
+                    quantity_candidates,
+                    key=lambda candidate: (
+                        abs(float(candidate.get("quantity") or 0.0) - target_quantity),
+                        -(candidate.get("timestamp_ms") or 0),
+                    ),
+                )[0]
         return sorted(candidates, key=lambda candidate: candidate.get("timestamp_ms") or 0)[-1]
 
     def _contract_size(self, ccxt: Any, okx_symbol: str) -> float:
@@ -119,6 +138,8 @@ class ExchangeCloseFillFinder:
             if reduce_raw in (None, ""):
                 reduce_raw = info.get("reduceOnly")
             is_reduce_only = str(reduce_raw).lower() == "true"
+            order_type = info.get("ordType") or order.get("type")
+            algo_id = info.get("algoId") or info.get("algoClOrdId")
             pnl = self.float_parser(info.get("pnl") or info.get("fillPnl"), 0.0)
             has_close_pnl = abs(pnl) > 1e-12
             if not is_reduce_only and not has_close_pnl:
@@ -147,6 +168,10 @@ class ExchangeCloseFillFinder:
                     "contract_size": contract_size,
                     "pnl": pnl,
                     "source": "closed_orders",
+                    "reduce_only": is_reduce_only,
+                    "order_type": order_type,
+                    "algo_id": algo_id,
+                    "order_info": info,
                 }
             )
         return candidates
@@ -199,8 +224,11 @@ class ExchangeCloseFillFinder:
                     "timestamp_ms": timestamp,
                     "order_id": order_id,
                     "source": "my_trades",
+                    "order_info": info,
                 },
             )
+            group.setdefault("order_type", info.get("ordType") or trade.get("type"))
+            group.setdefault("algo_id", info.get("algoId") or info.get("algoClOrdId"))
             group["price_value"] += price * quantity
             group["quantity"] += quantity
             group["contracts"] = group.get("contracts", 0.0) + contracts
@@ -225,6 +253,9 @@ class ExchangeCloseFillFinder:
                     "quantity": quantity,
                     "pnl": group.get("pnl") or 0.0,
                     "source": "my_trades",
+                    "order_type": group.get("order_type"),
+                    "algo_id": group.get("algo_id"),
+                    "order_info": group.get("order_info"),
                 }
             )
         return candidates

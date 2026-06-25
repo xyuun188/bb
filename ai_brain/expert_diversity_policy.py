@@ -39,6 +39,13 @@ LOW_INFO_CONFIDENCE_MIN = 0.42
 LOW_INFO_CONFIDENCE_MAX = 0.58
 LOW_INFO_CONFIDENCE_STDEV_MAX = 0.045
 MIN_OBJECTIVE_EVIDENCE_SCORE = 2.0
+BATCH_HOLD_ENTRY_EVIDENCE_RETRY_MIN_SCORE = 3.0
+ENTRY_EVIDENCE_RETRY_MIN_SCORE = 45.0
+ENTRY_EVIDENCE_RETRY_MIN_EXPECTED_NET_PCT = 0.75
+ENTRY_EVIDENCE_RETRY_MIN_PROFIT_QUALITY = 0.85
+ENTRY_EVIDENCE_RETRY_MAX_LOSS_PROBABILITY = 0.52
+ENTRY_EVIDENCE_RETRY_MAX_TAIL_RISK = 0.75
+ENTRY_EVIDENCE_RETRY_MIN_ALIGNED_SOURCES = 2
 HARD_WICK_MAX_PCT = 80.0
 HARD_WICK_RECENT_HOURS = 96.0
 
@@ -88,12 +95,22 @@ def review_batch_expert_consensus(
     """
 
     low_info = _is_low_information_hold_consensus(decisions)
+    batch_hold = _is_batch_hold_consensus(decisions)
     evidence = _objective_directional_evidence(features, context)
     analysis_type = "position" if context.get("review_positions") else "market"
-    if not low_info:
+    strong_entry_evidence_retry = (
+        batch_hold
+        and evidence.side is not None
+        and evidence.score >= BATCH_HOLD_ENTRY_EVIDENCE_RETRY_MIN_SCORE
+        and _strong_entry_candidate_evidence_for_retry(context, evidence.side)
+    )
+    if not low_info and not strong_entry_evidence_retry:
         return ExpertDiversityReview(
             should_retry=False,
-            reason="batch experts were not a low-information hold consensus",
+            reason=(
+                "batch experts were not a low-information hold consensus and no strong "
+                "entry-candidate evidence justified independent confirmation"
+            ),
             low_information_consensus=False,
             objective_evidence=evidence,
         )
@@ -101,25 +118,34 @@ def review_batch_expert_consensus(
         return ExpertDiversityReview(
             should_retry=False,
             reason=f"hold consensus is explained by hard risk: {evidence.hard_risk_reason}",
-            low_information_consensus=True,
+            low_information_consensus=low_info,
             objective_evidence=evidence,
         )
-    if not evidence.side or evidence.score < MIN_OBJECTIVE_EVIDENCE_SCORE:
+    min_required_score = (
+        MIN_OBJECTIVE_EVIDENCE_SCORE if low_info else BATCH_HOLD_ENTRY_EVIDENCE_RETRY_MIN_SCORE
+    )
+    if not evidence.side or evidence.score < min_required_score:
         return ExpertDiversityReview(
             should_retry=False,
             reason="objective directional evidence is too weak for independent retry",
-            low_information_consensus=True,
+            low_information_consensus=low_info,
             objective_evidence=evidence,
         )
 
     targets = POSITION_RETRY_EXPERTS if analysis_type == "position" else MARKET_RETRY_EXPERTS
+    reason = (
+        "batched experts returned low-information all-hold while objective "
+        f"evidence favors {evidence.side}"
+    )
+    if strong_entry_evidence_retry and not low_info:
+        reason = (
+            "batched experts returned all-hold while strong entry-candidate evidence "
+            f"requires independent confirmation for {evidence.side}"
+        )
     return ExpertDiversityReview(
         should_retry=True,
-        reason=(
-            "batched experts returned low-information all-hold while objective "
-            f"evidence favors {evidence.side}"
-        ),
-        low_information_consensus=True,
+        reason=reason,
+        low_information_consensus=low_info,
         objective_evidence=evidence,
         target_experts=targets,
     )
@@ -142,6 +168,22 @@ def _is_low_information_hold_consensus(decisions: dict[str, DecisionOutput]) -> 
     ):
         return False
     return pstdev(confidences) <= LOW_INFO_CONFIDENCE_STDEV_MAX
+
+
+def _is_batch_hold_consensus(decisions: dict[str, DecisionOutput]) -> bool:
+    selected = [decisions.get(name) for name in BATCH_EXPERT_NAMES]
+    if any(not isinstance(item, DecisionOutput) for item in selected):
+        return False
+    typed = [item for item in selected if isinstance(item, DecisionOutput)]
+    if any(decision.action != Action.HOLD for decision in typed):
+        return False
+    if any(decision.cross_check_for for decision in typed):
+        return False
+    for decision in typed:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        if not raw.get("batch_expert") or raw.get("batch_expert_fallback"):
+            return False
+    return True
 
 
 def _objective_directional_evidence(
@@ -271,6 +313,33 @@ def _score_entry_candidate_evidence(
                 points += 0.5
             side_scores[side] += points
             side_reasons[side].append(f"entry_evidence:{score:.1f}/{expected_net:.2f}")
+
+
+def _strong_entry_candidate_evidence_for_retry(context: dict[str, Any], side: str) -> bool:
+    evidence = context.get("entry_candidate_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    side_payload = evidence.get(side)
+    if not isinstance(side_payload, dict):
+        return False
+    score = max(
+        _float(side_payload.get("score")),
+        _float(side_payload.get("effective_score")),
+        _float(side_payload.get("dynamic_evidence_score")),
+    )
+    expected_net = _float(side_payload.get("expected_net_return_pct"))
+    profit_quality = _float(side_payload.get("profit_quality_ratio"))
+    loss_probability = _float(side_payload.get("loss_probability"), 1.0)
+    tail_risk = _float(side_payload.get("tail_risk_score"), 1.0)
+    aligned = int(_float(side_payload.get("aligned_source_count"), 0.0))
+    return bool(
+        score >= ENTRY_EVIDENCE_RETRY_MIN_SCORE
+        and expected_net >= ENTRY_EVIDENCE_RETRY_MIN_EXPECTED_NET_PCT
+        and profit_quality >= ENTRY_EVIDENCE_RETRY_MIN_PROFIT_QUALITY
+        and loss_probability <= ENTRY_EVIDENCE_RETRY_MAX_LOSS_PROBABILITY
+        and tail_risk <= ENTRY_EVIDENCE_RETRY_MAX_TAIL_RISK
+        and aligned >= ENTRY_EVIDENCE_RETRY_MIN_ALIGNED_SOURCES
+    )
 
 
 def _score_direction_competition(

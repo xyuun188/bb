@@ -7,14 +7,16 @@ import pytest
 
 import db.repositories.decision_repo as decision_repo_module
 from db.repositories.decision_repo import DecisionRepository
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 
 BAD_REASON = "AI 选择观望，未提交订单。?"
 GOOD_REASON = "AI 选择观望，未提交订单。"
 
 
 class FakeSession:
-    def __init__(self, row: Any | None = None) -> None:
+    def __init__(self, row: Any | None = None, rows: list[Any] | None = None) -> None:
         self.row = row
+        self.rows = rows or []
         self.added: Any | None = None
         self.flush_count = 0
 
@@ -26,6 +28,20 @@ class FakeSession:
 
     async def get(self, _model: Any, _row_id: int) -> Any:
         return self.row
+
+    async def execute(self, _stmt: Any) -> Any:
+        return FakeRowsResult(self.rows)
+
+
+class FakeRowsResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+
+    def scalars(self) -> FakeRowsResult:
+        return self
+
+    def all(self) -> list[Any]:
+        return self.rows
 
 
 @pytest.mark.asyncio
@@ -151,3 +167,72 @@ async def test_decision_repo_update_methods_sanitize_text_and_json() -> None:
     assert row.stop_loss_pct == 0.012
     assert row.take_profit_pct == 0.044
     assert session.flush_count == 2
+
+
+@pytest.mark.asyncio
+async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_needed() -> None:
+    unresolved = SimpleNamespace(
+        id=1,
+        was_executed=False,
+        execution_reason="",
+        raw_llm_response={"decision_state_machine": {"stages": []}},
+        position_size_pct=0.25,
+        suggested_leverage=5.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+    )
+    executed = SimpleNamespace(
+        id=2,
+        was_executed=True,
+        execution_reason="filled",
+        raw_llm_response={},
+        position_size_pct=0.25,
+        suggested_leverage=5.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+    )
+    terminal_raw = append_decision_stage(
+        {},
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+        "已有明确终态",
+    )
+    terminal = SimpleNamespace(
+        id=3,
+        was_executed=False,
+        execution_reason="已有明确终态",
+        raw_llm_response=terminal_raw,
+        position_size_pct=0.25,
+        suggested_leverage=5.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+    )
+    update_raw = append_decision_stage(
+        {"execution_parameters": {"position_size_pct": 0.004}},
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+        "轮次结束未进入下单",
+    )
+    session = FakeSession(rows=[unresolved, executed, terminal])
+    repo = DecisionRepository(session)  # type: ignore[arg-type]
+
+    updated = await repo.finalize_unresolved_decisions(
+        [
+            (1, "轮次结束未进入下单", update_raw),
+            (2, "不应覆盖已成交", update_raw),
+            (3, "不应覆盖已终态", update_raw),
+        ]
+    )
+
+    assert updated == 1
+    assert unresolved.execution_reason == "轮次结束未进入下单"
+    assert unresolved.raw_llm_response["decision_state_machine"]["summary"]["final_stage"] == (
+        DecisionStage.RISK_CHECK
+    )
+    assert unresolved.raw_llm_response["decision_state_machine"]["summary"]["final_status"] == (
+        DecisionStageStatus.SKIPPED
+    )
+    assert unresolved.position_size_pct == 0.004
+    assert executed.execution_reason == "filled"
+    assert terminal.execution_reason == "已有明确终态"
+    assert session.flush_count == 1

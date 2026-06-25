@@ -98,6 +98,7 @@ def test_server_monitor_reports_model_server_not_configured() -> None:
     result = service.collect_sync()
 
     assert result["available"] is False
+    assert result["remote_monitor_available"] is False
     assert result["status"] == "model_server_not_configured"
     assert "系统设置" in result["message"]
 

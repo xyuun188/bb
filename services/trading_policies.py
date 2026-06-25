@@ -354,6 +354,22 @@ class ExitPolicy:
             return None
         raise RuntimeError("ExitPolicy requires exit_cooldown dependency")
 
+    def recent_untradable_exit_cooldown_reason(
+        self,
+        model_name: str,
+        decision: DecisionOutput,
+    ) -> str | None:
+        if self.exit_cooldown is None:
+            return None
+        checker = getattr(
+            self.exit_cooldown,
+            "recent_untradable_exit_cooldown_reason",
+            None,
+        )
+        if checker is None:
+            return None
+        return checker(model_name, decision)
+
     def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
         if self.decision_freshness is not None:
             return self.decision_freshness.stale_decision_reason(decision)
@@ -439,6 +455,17 @@ class ExitPolicy:
                     self.no_matching_position_reason(decision),
                     gate_data(),
                 )
+
+        untradable_exit_reason = self.recent_untradable_exit_cooldown_reason(
+            model_name,
+            decision,
+        )
+        if untradable_exit_reason:
+            return PolicyGateResult.block(
+                "untradable_exit_cooldown",
+                untradable_exit_reason,
+                gate_data(),
+            )
 
         if not arbitration.bypass_partial_guard:
             loss_partial_reason = self.loss_partial_guard_reason(

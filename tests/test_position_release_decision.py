@@ -4,7 +4,7 @@ from ai_brain.base_model import Action
 from services.position_release_decision import PositionReleaseDecisionPolicy
 
 
-def test_position_release_decision_builds_forced_close_from_scan() -> None:
+def test_position_release_decision_builds_capital_rotation_close_from_scan() -> None:
     policy = PositionReleaseDecisionPolicy()
     decision = policy.build(
         model_name="ensemble_trader",
@@ -28,8 +28,11 @@ def test_position_release_decision_builds_forced_close_from_scan() -> None:
     assert decision is not None
     assert decision.action == Action.CLOSE_SHORT
     assert decision.position_size_pct == 1.0
-    assert decision.raw_response["forced_exit"] is True
-    assert decision.raw_response["close_evidence"]["forced_exit"] is True
+    assert decision.raw_response.get("forced_exit") is not True
+    assert decision.raw_response["exit_intent"] == "capital_rotation"
+    assert decision.raw_response["close_evidence"].get("forced_exit") is not True
+    assert decision.raw_response["close_evidence"]["hard_risk"] is False
+    assert decision.raw_response["close_evidence"]["exit_intent"] == "capital_rotation"
     assert "低质量持仓释放" in decision.reasoning
 
 

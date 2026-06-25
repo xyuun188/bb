@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import paramiko
 import pytest
 
 from core.safe_output import safe_error_text
@@ -16,6 +17,20 @@ from web_dashboard.api import dashboard, symbols
 
 class _FakeServerInfo:
     host = "203.0.113.17"
+    access_host = "203.0.113.17"
+    port = 22
+    username = "root"
+    source_path = "model_server_info.txt"
+
+    def redacted(self) -> dict[str, object]:
+        return {
+            "host": self.host,
+            "access_host": self.access_host,
+            "port": self.port,
+            "username": self.username,
+            "password": "***",
+            "source_path": self.source_path,
+        }
 
 
 class _FakeSSH:
@@ -114,6 +129,68 @@ def test_dashboard_fallback_logger_redacts_exception_text(
     ]
 
 
+def test_dashboard_execution_reason_uses_raw_llm_response_for_orm_decision() -> None:
+    decision = SimpleNamespace(
+        was_executed=False,
+        action="long",
+        confidence=0.9,
+        feature_snapshot={"volume_ratio": 0.01},
+        raw_llm_response={"entry_filters": {"min_entry_volume_ratio": 2.0}},
+    )
+
+    reason = dashboard._fallback_execution_reason_clean(decision)
+
+    assert reason
+
+
+def test_dashboard_exit_reason_prefers_raw_exchange_error_without_order() -> None:
+    decision = SimpleNamespace(
+        was_executed=False,
+        action="close_long",
+        confidence=0.9,
+        reasoning="AI 建议平仓",
+        feature_snapshot={},
+        raw_llm_response={
+            "execution_result": {
+                "status": "rejected",
+                "raw_response": {
+                    "error": (
+                        'okx {"code":"1","data":[{"ordId":"","sCode":"51028",'
+                        '"sMsg":"Contract under delivery."}],"msg":"All operations failed"}'
+                    )
+                },
+            }
+        },
+    )
+
+    reason = dashboard._fallback_execution_reason_clean(decision)
+
+    assert "OKX 51028" in reason
+    assert "Contract under delivery" in reason
+    assert "本地平仓委托记录" not in reason
+
+
+def test_dashboard_exit_reason_recovers_from_generic_local_order_fallback() -> None:
+    decision = SimpleNamespace(
+        was_executed=False,
+        action="close_short",
+        confidence=0.9,
+        reasoning="AI 建议平仓",
+        feature_snapshot={},
+        execution_reason=("这条平仓决策没有找到对应的本地平仓委托记录，因此系统未把它视为已执行。"),
+        raw_llm_response={
+            "untradable_exit_execution_error": {
+                "reason": "okx {'sCode': '51028', 'sMsg': 'Contract under delivery.'}"
+            }
+        },
+    )
+
+    reason = dashboard._display_execution_reason(decision)
+
+    assert "OKX 51028" in reason
+    assert "本地平仓委托记录" not in reason
+
+
 @pytest.mark.asyncio
 async def test_dashboard_account_balance_is_mode_aware(monkeypatch) -> None:
     class FakePaperExecutor:
@@ -188,6 +265,28 @@ def test_server_monitor_command_timeout_is_classified_and_redacted() -> None:
     assert result["status"] == "remote_command_timeout"
     assert leaked_value not in result["message"]
     assert "Authorization: ***" in result["message"]
+
+
+def test_server_monitor_ssh_auth_failure_is_classified_without_leaking_secret() -> None:
+    leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
+
+    def failing_connector(*_args: Any, **_kwargs: Any) -> Any:
+        raise paramiko.AuthenticationException(f"Authentication failed {leaked_value}")
+
+    service = server_monitor_status.ServerMonitorStatusService(
+        model_id_provider=lambda: "qwen3-32b-trade",
+        info_loader=lambda _root: _FakeServerInfo(),
+        ssh_connector=failing_connector,
+    )
+
+    result = service.collect_sync()
+
+    assert result["available"] is False
+    assert result["remote_monitor_available"] is False
+    assert result["status"] == "ssh_auth_failed"
+    assert leaked_value not in result["message"]
+    assert result["credential_source"]["host"] == "203.0.113.17"
+    assert result["credential_source"]["password"] == "***"
 
 
 def test_server_monitor_status_uses_short_cache() -> None:
@@ -407,6 +506,50 @@ async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
     assert tools["expected_platform_api_base"] == "http://127.0.0.1:18001"
     assert tools["tunnel_contract"]["status"] == "external_or_dev_endpoint"
     assert ("POST", "http://local-ai.test/profit/predict", "Bearer hidden-tools-key") in requests
+
+
+async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(
+    monkeypatch,
+) -> None:
+    requests: list[tuple[str, str, str]] = []
+
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [],
+        local_ai_tools_api_base="http://local-ai.test",
+        local_ai_tools_api_key="",
+        ai_api_key="",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+    monkeypatch.setenv("LOCAL_AI_TOOLS_API_KEY", "env-tools-key")
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            requests.append((method, url, str((headers or {}).get("Authorization") or "")))
+            return httpx.Response(200, json={"available": True}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+
+    assert result["local_ai_tools"]["available"] is True
+    assert ("GET", "http://local-ai.test/health", "Bearer env-tools-key") in requests
+    assert ("GET", "http://local-ai.test/models/status", "Bearer env-tools-key") in requests
+    assert ("POST", "http://local-ai.test/profit/predict", "Bearer env-tools-key") in requests
 
 
 async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_port(

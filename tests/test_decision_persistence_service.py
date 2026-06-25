@@ -66,6 +66,7 @@ class FakeDecisionRepo:
         self.reasons: list[tuple[int, str | None]] = []
         self.raw_updates: list[tuple[int, dict[str, Any] | None]] = []
         self.fill_missing: list[tuple[list[int], str]] = []
+        self.finalize_unresolved: list[list[tuple[int, str, dict[str, Any]]]] = []
         self.outcomes: list[tuple[int, str, float]] = []
 
     async def log_decision(self, data: dict[str, Any]) -> SimpleNamespace:
@@ -85,6 +86,13 @@ class FakeDecisionRepo:
 
     async def fill_missing_execution_reasons(self, ids: list[int], reason: str) -> None:
         self.fill_missing.append((ids, reason))
+
+    async def finalize_unresolved_decisions(
+        self,
+        decision_updates: list[tuple[int, str, dict[str, Any]]],
+    ) -> int:
+        self.finalize_unresolved.append(decision_updates)
+        return len(decision_updates)
 
     async def mark_outcome(self, decision_id: int, outcome: str, pnl_pct: float) -> None:
         self.outcomes.append((decision_id, outcome, pnl_pct))
@@ -237,6 +245,26 @@ async def test_mark_pending_fill_missing_and_outcome_delegate_to_repo() -> None:
     assert repo.fill_missing == [([8, 9], "仍在处理中")]
     assert repo.marked_executed == [(8, 123.4)]
     assert repo.outcomes == [(8, "profit", 0.012)]
+
+
+@pytest.mark.asyncio
+async def test_finalize_unresolved_decisions_adds_terminal_risk_skip() -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision()
+
+    count = await service.finalize_unresolved_decisions({12: decision}, "轮次结束未进入下单")
+
+    assert count == 1
+    decision_id, reason, raw = repo.finalize_unresolved[0][0]
+    assert decision_id == 12
+    assert reason == "轮次结束未进入下单"
+    machine = raw["decision_state_machine"]
+    assert machine["current_stage"] == DecisionStage.RISK_CHECK
+    assert machine["current_status"] == DecisionStageStatus.SKIPPED
+    assert machine["summary"]["final_stage"] == DecisionStage.RISK_CHECK
+    assert machine["summary"]["final_status"] == DecisionStageStatus.SKIPPED
+    assert machine["stages"][-1]["data"]["skip_kind"] == "round_unresolved_terminal_skip"
 
 
 @pytest.mark.asyncio

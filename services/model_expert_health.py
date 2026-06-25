@@ -114,6 +114,12 @@ def _shadow_best_actions(shadows: list[Any]) -> dict[int, str]:
 def _is_json_error(row: dict[str, Any]) -> bool:
     status = str(row.get("status") or "").lower().strip()
     reason = str(row.get("reason") or row.get("error") or "").lower()
+    if (
+        status == "completed"
+        and bool(row.get("provider_independent_expert_mode"))
+        and not bool(row.get("local_fallback"))
+    ):
+        return False
     return bool(
         status in {"failed", "invalid", "batch_fallback", "partial_batch_fallback"}
         or "json" in reason

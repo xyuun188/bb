@@ -403,6 +403,40 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        assert path == "/models/status"
+        return {
+            "available": True,
+            "trained_at": "2026-06-23T16:58:10+00:00",
+            "models": {"profit": "trained"},
+        }
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return {"available": True, "path": path}
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert result["available"] is True
+    assert result["model_bundle_available"] is True
+    assert result["service_available"] is True
+    assert result["status"] == "ready"
+    assert result["trained_at"] == "2026-06-23T16:58:10+00:00"
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fails(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

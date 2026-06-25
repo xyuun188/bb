@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from config.settings import settings
+from config.settings import Settings, settings
 from data_feed.external_event_scraper import (
     ExternalEventScraper,
     ExternalEventSource,
@@ -106,6 +106,63 @@ def test_external_event_runtime_settings_reload_from_env(
     assert loaded == {"enabled": True, "source_count": 1, "interval_seconds": 600}
     assert settings.external_event_scraper_enabled is True
     assert settings.external_event_scraper_sources[0]["name"] == "ethereum_blog"
+
+
+def test_external_event_sources_recover_legacy_json_wrapped_in_url() -> None:
+    legacy_value = (
+        '[{\\"name\\":\\"binance_announcements\\",'
+        '\\"url\\":\\"https://www.binance.com/en/support/announcement/c-48\\",'
+        '\\"weight\\":0.88},{\\"name\\":\\"ethereum_blog\\",'
+        '\\"url\\":\\"https://blog.ethereum.org/\\",'
+        '\\"symbols\\":[\\"ETH\\"],\\"weight\\":0.72}]'
+    )
+
+    cfg = Settings(_env_file=None, external_event_scraper_sources={"url": legacy_value})  # type: ignore[call-arg]
+
+    assert len(cfg.external_event_scraper_sources) == 2
+    assert cfg.external_event_scraper_sources[0]["name"] == "binance_announcements"
+    assert cfg.external_event_scraper_sources[0]["url"].startswith("https://www.binance.com/")
+    assert cfg.external_event_scraper_sources[1]["symbols"] == ["ETH"]
+
+
+def test_external_event_runtime_reload_recovers_legacy_json_wrapped_in_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "EXTERNAL_EVENT_SCRAPER_ENABLED=true",
+                "EXTERNAL_EVENT_SCRAPER_MAX_SOURCES=4",
+                (
+                    'EXTERNAL_EVENT_SCRAPER_SOURCES={"url":"'
+                    '[{\\"name\\":\\"binance_announcements\\",'
+                    '\\"url\\":\\"https://www.binance.com/en/support/announcement/c-48\\"},'
+                    '{\\"name\\":\\"ethereum_blog\\",'
+                    '\\"url\\":\\"https://blog.ethereum.org/\\",'
+                    '\\"symbols\\":[\\"ETH\\"]}]'
+                    '"}'
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        external_event_service_module,
+        "_project_env_path",
+        lambda: env_path,
+    )
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    loaded = load_external_event_settings_from_env()
+
+    assert loaded["enabled"] is True
+    assert loaded["source_count"] == 2
+    assert settings.external_event_scraper_sources[0]["name"] == "binance_announcements"
+    assert settings.external_event_scraper_sources[1]["url"] == "https://blog.ethereum.org/"
 
 
 def test_external_event_source_diagnostics_exposes_invalid_source(

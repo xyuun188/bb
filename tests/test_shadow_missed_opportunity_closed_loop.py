@@ -21,7 +21,7 @@ def _shadow(
     model_side: str | None = None,
     structure: str = "trend_up_momentum",
 ) -> SimpleNamespace:
-    now = datetime(2026, 6, 23, 8, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     feature_snapshot = {
         "market_structure": structure,
         "price_vs_sma20": 0.035 if "up" in structure else -0.035,

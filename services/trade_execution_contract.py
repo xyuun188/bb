@@ -246,12 +246,22 @@ def summarize_trade_execution_contract(
             violations.append(_violation(row, reason, explanation))
 
     fast_loss_rows: list[dict[str, Any]] = []
+    exchange_sync_estimated_reductions: list[dict[str, Any]] = []
     for position in positions or []:
         fast_loss = _fast_loss_summary(position)
         if fast_loss is None:
             continue
-        fast_loss_rows.append(fast_loss)
         matching_exit = _matching_exit_decision(exit_decisions, position, fast_loss["closed_at"])
+        if _is_estimated_exchange_quantity_reduction(matching_exit):
+            exchange_sync_estimated_reductions.append(
+                {
+                    **fast_loss,
+                    "decision_id": _row_get(matching_exit, "id") if matching_exit else None,
+                    "reason": "estimated_exchange_quantity_reduction",
+                }
+            )
+            continue
+        fast_loss_rows.append(fast_loss)
         if not _has_strong_exit_evidence(matching_exit):
             reason_counts["fast_loss_without_strong_exit"] += 1
             violations.append(
@@ -273,6 +283,7 @@ def summarize_trade_execution_contract(
         "weak_evidence_executed_count": reason_counts["weak_evidence_executed"],
         "negative_expected_executed_count": reason_counts["non_positive_expected_net_executed"],
         "fast_loss_count": len(fast_loss_rows),
+        "exchange_sync_estimated_reduction_count": len(exchange_sync_estimated_reductions),
         "fast_loss_without_strong_exit_count": reason_counts["fast_loss_without_strong_exit"],
         "reentry_without_strong_unlock_count": reason_counts["reentry_without_strong_unlock"],
         "contract_violation_count": sum(reason_counts.values()),
@@ -286,6 +297,7 @@ def summarize_trade_execution_contract(
         "violation_reason_counts": dict(reason_counts),
         "entry_explanations": entry_explanations[:20],
         "fast_loss_samples": fast_loss_rows[:20],
+        "exchange_sync_estimated_reductions": exchange_sync_estimated_reductions[:20],
         "violations": violations[:30],
         "policy": {
             "entry_requires_positive_expected_net": True,
@@ -519,12 +531,38 @@ def _has_strong_exit_evidence(decision: Any | None) -> bool:
         return True
     if raw.get("forced_exit") or raw.get("fast_risk_exit"):
         return True
+    if _has_exchange_confirmed_close_fill(raw):
+        return True
     return bool(
         close_evidence.get("hard_risk")
         or close_evidence.get("trend_failure")
         or close_evidence.get("predictive_reversal_exit")
         or close_evidence.get("profit_retrace_protection")
     )
+
+
+def _has_exchange_confirmed_close_fill(raw: dict[str, Any]) -> bool:
+    close_fill = _safe_dict(raw.get("close_fill"))
+    if not raw.get("system_sync") or str(raw.get("source") or "") != "okx_position_reconcile":
+        return False
+    if bool(close_fill.get("estimated")):
+        return False
+    if not str(close_fill.get("order_id") or "").strip():
+        return False
+    return bool(
+        _safe_float(close_fill.get("price"), 0.0) > 0
+        and _safe_float(close_fill.get("quantity"), 0.0) > 0
+    )
+
+
+def _is_estimated_exchange_quantity_reduction(decision: Any | None) -> bool:
+    if decision is None:
+        return False
+    raw = _safe_dict(_row_get(decision, "raw_llm_response"))
+    close_fill = _safe_dict(raw.get("close_fill"))
+    if not raw.get("system_sync") or str(raw.get("source") or "") != "okx_position_reconcile":
+        return False
+    return bool(close_fill.get("estimated") and close_fill.get("partial_reduction"))
 
 
 def _violation(row: Any, reason: str, explanation: dict[str, Any]) -> dict[str, Any]:

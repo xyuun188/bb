@@ -11,7 +11,7 @@ from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
-KLINE_STALE_LIMIT_SECONDS = {"1m": 120, "5m": 600, "15m": 1800, "1h": 7200}
+KLINE_STALE_LIMIT_SECONDS = {"1m": 180, "5m": 600, "15m": 1800, "1h": 7200}
 SNAPSHOT_STALE_LIMIT_SECONDS = 1800
 TICKER_STALE_LIMIT_SECONDS = 600
 NEWS_STALE_LIMIT_SECONDS = 86400
@@ -53,6 +53,7 @@ def summarize_crypto_feature_coverage(
     snapshots = _snapshot_rows(decisions)
     latest_snapshot = snapshots[0]["snapshot"] if snapshots else {}
     latest_snapshot_at = snapshots[0]["timestamp"] if snapshots else None
+    evidence = _feature_evidence_from_snapshots(snapshots)
     symbols = sorted(
         {
             str(row.get("symbol") or "").strip()
@@ -65,20 +66,27 @@ def summarize_crypto_feature_coverage(
     for timeframe in EXPECTED_KLINE_TIMEFRAMES:
         feature_rows.append(_kline_feature(timeframe, coverage, current))
     feature_rows.append(_ticker_feature(coverage, current))
+    anchor_evidence = evidence["btc_eth_anchor"]
+    if not anchor_evidence["snapshot"]:
+        anchor_evidence = _market_anchor_evidence(coverage)
+    event_evidence = evidence["event_calendar"]
+    if not event_evidence["snapshot"]:
+        event_evidence = _market_event_calendar_evidence(coverage)
+
     feature_rows.extend(
         [
-            _orderbook_feature(latest_snapshot, latest_snapshot_at, symbols, current),
+            _orderbook_feature(evidence["orderbook_depth"], symbols, current),
             _slippage_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _funding_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _open_interest_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _liquidation_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _anchor_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _sector_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _altcoin_volatility_feature(latest_snapshot, latest_snapshot_at, symbols, current),
-            _abnormal_wick_feature(latest_snapshot, latest_snapshot_at, symbols, current),
+            _funding_feature(evidence["funding_rate"], symbols, current),
+            _open_interest_feature(evidence["open_interest"], symbols, current),
+            _liquidation_feature(evidence["liquidation_risk"], symbols, current),
+            _anchor_feature(anchor_evidence, symbols, current),
+            _sector_feature(evidence["sector_correlation"], symbols, current),
+            _altcoin_volatility_feature(evidence["altcoin_volatility_risk"], symbols, current),
+            _abnormal_wick_feature(evidence["abnormal_wick"], symbols, current),
             _news_feature(latest_snapshot, latest_snapshot_at, symbols, coverage, current),
             _social_feature(latest_snapshot, latest_snapshot_at, symbols, coverage, current),
-            _event_calendar_feature(latest_snapshot, latest_snapshot_at, symbols, current),
+            _event_calendar_feature(event_evidence, symbols, current),
         ]
     )
 
@@ -136,7 +144,7 @@ class CryptoFeatureCoverageService:
         return (model.id, model.symbol, model.created_at, model.feature_snapshot)
 
     async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
-        from sqlalchemy import func, select
+        from sqlalchemy import func, or_, select
 
         capped_hours = max(1, min(int(hours or 24), 168))
         capped_limit = max(50, min(int(limit or 1000), 5000))
@@ -183,6 +191,47 @@ class CryptoFeatureCoverageService:
                     select(func.count(SocialPost.id), func.max(SocialPost.posted_at))
                 )
             ).one()
+            event_source_filter = or_(
+                NewsArticle.source == "coinmarketcal",
+                NewsArticle.source == "okx_announcements",
+                NewsArticle.source.like("scrapling:%"),
+            )
+            event_row = (
+                await session.execute(
+                    select(
+                        func.count(NewsArticle.id),
+                        func.max(func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)),
+                    ).where(event_source_filter)
+                )
+            ).one()
+            event_source_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            NewsArticle.source,
+                            func.count(NewsArticle.id),
+                            func.max(
+                                func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)
+                            ),
+                        )
+                        .where(event_source_filter)
+                        .group_by(NewsArticle.source)
+                        .order_by(func.count(NewsArticle.id).desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
+            anchor_ticker_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            Ticker.symbol,
+                            Ticker.change_24h_pct,
+                            func.coalesce(Ticker.updated_at, Ticker.created_at),
+                        ).where(Ticker.symbol.in_(("BTC/USDT", "ETH/USDT")))
+                    )
+                ).all()
+            )
         decision_rows = [
             SimpleDecisionProjection(
                 id=row[0],
@@ -194,7 +243,15 @@ class CryptoFeatureCoverageService:
         ]
         return summarize_crypto_feature_coverage(
             decision_rows,
-            _market_coverage_from_rows(kline_rows, ticker_row, news_row, social_row),
+            _market_coverage_from_rows(
+                kline_rows,
+                ticker_row,
+                news_row,
+                social_row,
+                anchor_ticker_rows,
+                event_row,
+                event_source_rows,
+            ),
         )
 
 
@@ -214,7 +271,13 @@ class SimpleDecisionProjection:
 
 
 def _market_coverage_from_rows(
-    kline_rows: Sequence[Any], ticker_row: Any, news_row: Any, social_row: Any
+    kline_rows: Sequence[Any],
+    ticker_row: Any,
+    news_row: Any,
+    social_row: Any,
+    anchor_ticker_rows: Sequence[Any] | None = None,
+    event_row: Any | None = None,
+    event_source_rows: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     klines: dict[str, Any] = {}
     for row in kline_rows:
@@ -224,11 +287,27 @@ def _market_coverage_from_rows(
             "symbols": int(row[2] or 0),
             "latest_at": row[3],
         }
+    anchor: dict[str, Any] = {}
+    for row in anchor_ticker_rows or ():
+        symbol = str(row[0] or "").upper()
+        if symbol.startswith("BTC/"):
+            anchor["btc"] = {"change_24h_pct": row[1], "latest_at": row[2]}
+        elif symbol.startswith("ETH/"):
+            anchor["eth"] = {"change_24h_pct": row[1], "latest_at": row[2]}
     return {
         "klines": klines,
         "ticker": {"count": int(ticker_row[0] or 0), "latest_at": ticker_row[1]},
+        "btc_eth_anchor": anchor,
         "news": {"count": int(news_row[0] or 0), "latest_at": news_row[1]},
         "social": {"count": int(social_row[0] or 0), "latest_at": social_row[1]},
+        "event_calendar": {
+            "count": int(event_row[0] or 0) if event_row is not None else 0,
+            "latest_at": event_row[1] if event_row is not None else None,
+            "sources": [
+                {"source": str(row[0] or ""), "count": int(row[1] or 0), "latest_at": row[2]}
+                for row in event_source_rows or ()
+            ],
+        },
     }
 
 
@@ -253,6 +332,116 @@ def _snapshot_rows(decisions: Sequence[Any]) -> list[dict[str, Any]]:
         key=lambda item: item.get("timestamp") or datetime.min.replace(tzinfo=UTC),
         reverse=True,
     )
+
+
+def _feature_evidence_from_snapshots(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    keys = (
+        "orderbook_depth",
+        "funding_rate",
+        "open_interest",
+        "liquidation_risk",
+        "btc_eth_anchor",
+        "sector_correlation",
+        "altcoin_volatility_risk",
+        "abnormal_wick",
+        "event_calendar",
+    )
+    evidence = {key: {"snapshot": {}, "timestamp": None} for key in keys}
+    for row in rows:
+        snapshot = _safe_dict(row.get("snapshot"))
+        timestamp = _as_utc(row.get("timestamp"))
+        if not evidence["orderbook_depth"]["snapshot"] and _has_orderbook_depth(snapshot):
+            evidence["orderbook_depth"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["funding_rate"]["snapshot"] and _has_funding_presence(snapshot):
+            evidence["funding_rate"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["open_interest"]["snapshot"] and _has_open_interest(snapshot):
+            evidence["open_interest"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["liquidation_risk"]["snapshot"] and _first_positive(
+            snapshot,
+            "liquidation_usd_1h",
+            "liquidation_usd_4h",
+            "liquidation_risk_score",
+        ):
+            evidence["liquidation_risk"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if (
+            not evidence["btc_eth_anchor"]["snapshot"]
+            and _first_present(
+                snapshot,
+                "btc_eth_anchor",
+                "btc_change_24h_pct",
+                "eth_change_24h_pct",
+            )
+            is not None
+        ):
+            evidence["btc_eth_anchor"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if (
+            not evidence["sector_correlation"]["snapshot"]
+            and _first_present(
+                snapshot,
+                "sector_correlation",
+                "sector_relative_strength",
+            )
+            is not None
+        ):
+            evidence["sector_correlation"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["altcoin_volatility_risk"]["snapshot"]:
+            value = _first_present(snapshot, "altcoin_volatility_risk", "volatility_20")
+            if value is not None and _safe_float(value, 0.0) > 0:
+                evidence["altcoin_volatility_risk"] = {
+                    "snapshot": snapshot,
+                    "timestamp": timestamp,
+                }
+        if not evidence["abnormal_wick"]["snapshot"] and _has_abnormal_wick_presence(snapshot):
+            evidence["abnormal_wick"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["event_calendar"]["snapshot"] and _has_event_calendar_presence(snapshot):
+            evidence["event_calendar"] = {"snapshot": snapshot, "timestamp": timestamp}
+    return evidence
+
+
+def _market_anchor_evidence(coverage: dict[str, Any]) -> dict[str, Any]:
+    anchor = _safe_dict(coverage.get("btc_eth_anchor"))
+    btc = _safe_dict(anchor.get("btc"))
+    eth = _safe_dict(anchor.get("eth"))
+    snapshot: dict[str, Any] = {}
+    if "change_24h_pct" in btc and btc.get("change_24h_pct") is not None:
+        snapshot["btc_change_24h_pct"] = btc.get("change_24h_pct")
+    if "change_24h_pct" in eth and eth.get("change_24h_pct") is not None:
+        snapshot["eth_change_24h_pct"] = eth.get("change_24h_pct")
+    timestamp = _latest_datetime(
+        [_parse_datetime(btc.get("latest_at")), _parse_datetime(eth.get("latest_at"))]
+    )
+    if not snapshot:
+        return {"snapshot": {}, "timestamp": None, "source": "market_tickers"}
+    return {"snapshot": snapshot, "timestamp": timestamp, "source": "market_tickers"}
+
+
+def _market_event_calendar_evidence(coverage: dict[str, Any]) -> dict[str, Any]:
+    event = _safe_dict(coverage.get("event_calendar"))
+    count = int(_safe_float(event.get("count"), 0.0))
+    latest = _parse_datetime(event.get("latest_at"))
+    source_rows = [
+        row
+        for row in _safe_list(event.get("sources"))
+        if isinstance(row, dict) and row.get("source")
+    ]
+    if count <= 0 and not source_rows:
+        return {"snapshot": {}, "timestamp": None, "source": "event_calendar_sources"}
+    items = [
+        {
+            "source": str(row.get("source") or ""),
+            "published_at": _iso(_parse_datetime(row.get("latest_at"))),
+            "source_weight": _event_source_weight(str(row.get("source") or "")),
+            "event_calendar": True,
+            "count": int(_safe_float(row.get("count"), 0.0)),
+        }
+        for row in source_rows[:12]
+    ]
+    snapshot = {
+        "event_calendar_items": items,
+        "event_calendar_source_count": len(items),
+        "event_calendar_item_count": count,
+    }
+    return {"snapshot": snapshot, "timestamp": latest, "source": "event_calendar_sources"}
 
 
 def _feature_row(
@@ -342,8 +531,10 @@ def _ticker_feature(coverage: dict[str, Any], now: datetime) -> dict[str, Any]:
 
 
 def _orderbook_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     bid_depth = _safe_float(snapshot.get("orderbook_bid_depth"), 0.0)
     ask_depth = _safe_float(snapshot.get("orderbook_ask_depth"), 0.0)
     imbalance = _safe_float(snapshot.get("orderbook_imbalance"), 0.0)
@@ -398,8 +589,10 @@ def _slippage_feature(
 
 
 def _funding_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     rate = _safe_float(snapshot.get("funding_rate"), 0.0)
     next_time = snapshot.get("next_funding_time")
     if abs(rate) <= 1e-12 and not next_time:
@@ -424,8 +617,10 @@ def _funding_feature(
 
 
 def _open_interest_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     contracts = _safe_float(snapshot.get("open_interest_contracts"), 0.0)
     value = _safe_float(snapshot.get("open_interest_value"), 0.0)
     if contracts <= 0 and value <= 0:
@@ -450,8 +645,10 @@ def _open_interest_feature(
 
 
 def _liquidation_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     value = _first_positive(
         snapshot, "liquidation_usd_1h", "liquidation_usd_4h", "liquidation_risk_score"
     )
@@ -471,25 +668,48 @@ def _liquidation_feature(
 
 
 def _anchor_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
+    source = str(evidence.get("source") or "feature_snapshot")
     value = _first_present(snapshot, "btc_eth_anchor", "btc_change_24h_pct", "eth_change_24h_pct")
     if value is None:
         return _feature_row(
             "btc_eth_anchor",
             "missing",
-            source="feature_snapshot",
+            source=source,
             timestamp=timestamp,
             age_seconds=_age_seconds(timestamp, now),
             affected_symbols=symbols,
             reasons=["btc_eth_anchor_missing"],
         )
-    return _snapshot_feature("btc_eth_anchor", timestamp, symbols, now, confidence=0.75)
+    age = _age_seconds(timestamp, now)
+    stale_limit = (
+        TICKER_STALE_LIMIT_SECONDS if source == "market_tickers" else SNAPSHOT_STALE_LIMIT_SECONDS
+    )
+    stale = age is None or age > stale_limit
+    return _feature_row(
+        "btc_eth_anchor",
+        "stale" if stale else "available",
+        source=source,
+        confidence=0.6 if stale else 0.8,
+        timestamp=timestamp,
+        age_seconds=age,
+        affected_symbols=symbols,
+        reasons=["btc_eth_anchor_stale"] if stale else [],
+        details={
+            "btc_change_24h_pct": snapshot.get("btc_change_24h_pct"),
+            "eth_change_24h_pct": snapshot.get("eth_change_24h_pct"),
+        },
+    )
 
 
 def _sector_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     value = _first_present(snapshot, "sector_correlation", "sector_relative_strength")
     if value is None:
         return _feature_row(
@@ -505,8 +725,10 @@ def _sector_feature(
 
 
 def _altcoin_volatility_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     value = _first_present(snapshot, "altcoin_volatility_risk", "volatility_20")
     if value is None or _safe_float(value, 0.0) <= 0:
         return _feature_row(
@@ -529,12 +751,14 @@ def _altcoin_volatility_feature(
 
 
 def _abnormal_wick_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     count = int(_safe_float(snapshot.get("abnormal_wick_count_72h"), 0.0))
     max_pct = _safe_float(snapshot.get("abnormal_wick_max_pct"), 0.0)
     recent_hours = _safe_float(snapshot.get("abnormal_wick_recent_hours"), 9999.0)
-    if count <= 0 and max_pct <= 0 and recent_hours >= 9999.0:
+    if not _has_abnormal_wick_presence(snapshot):
         return _feature_row(
             "abnormal_wick",
             "missing",
@@ -653,8 +877,10 @@ def _social_feature(
 
 
 def _event_calendar_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     items = [
         item for item in _safe_list(snapshot.get("event_calendar_items")) if isinstance(item, dict)
     ]
@@ -746,6 +972,17 @@ def _event_confidence(items: Sequence[dict[str, Any]]) -> float:
     return 0.5
 
 
+def _event_source_weight(source: str) -> float:
+    value = str(source or "").lower()
+    if value == "coinmarketcal":
+        return 0.8
+    if value == "okx_announcements":
+        return 0.88
+    if value.startswith("scrapling:"):
+        return 0.68
+    return 0.5
+
+
 def _latest_datetime(values: Any) -> datetime | None:
     parsed = [_as_utc(value) for value in values if _as_utc(value) is not None]
     return max(parsed) if parsed else None
@@ -764,6 +1001,49 @@ def _first_present(snapshot: dict[str, Any], *keys: str) -> Any:
         if key in snapshot and snapshot.get(key) is not None:
             return snapshot.get(key)
     return None
+
+
+def _has_orderbook_depth(snapshot: dict[str, Any]) -> bool:
+    return (
+        _safe_float(snapshot.get("orderbook_bid_depth"), 0.0) > 0
+        and _safe_float(snapshot.get("orderbook_ask_depth"), 0.0) > 0
+    )
+
+
+def _has_funding_presence(snapshot: dict[str, Any]) -> bool:
+    return abs(_safe_float(snapshot.get("funding_rate"), 0.0)) > 1e-12 or bool(
+        snapshot.get("next_funding_time")
+    )
+
+
+def _has_open_interest(snapshot: dict[str, Any]) -> bool:
+    return (
+        _safe_float(snapshot.get("open_interest_contracts"), 0.0) > 0
+        or _safe_float(snapshot.get("open_interest_value"), 0.0) > 0
+    )
+
+
+def _has_abnormal_wick_presence(snapshot: dict[str, Any]) -> bool:
+    return any(
+        key in snapshot and snapshot.get(key) is not None
+        for key in (
+            "abnormal_wick_count_72h",
+            "abnormal_wick_max_pct",
+            "abnormal_wick_recent_hours",
+        )
+    )
+
+
+def _has_event_calendar_presence(snapshot: dict[str, Any]) -> bool:
+    if _safe_list(snapshot.get("event_calendar_items")):
+        return True
+    for item in _safe_list(snapshot.get("recent_news_items")):
+        if isinstance(item, dict) and (
+            "coinmarketcal" in str(item.get("source") or "").lower()
+            or bool(item.get("event_calendar"))
+        ):
+            return True
+    return False
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:

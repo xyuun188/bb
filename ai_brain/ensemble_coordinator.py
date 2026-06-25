@@ -1899,6 +1899,14 @@ class EnsembleCoordinator:
                     "reasoning": decision.reasoning,
                     "cross_check_for": decision.cross_check_for,
                     "timeout_fallback": timeout_fallback,
+                    "independent_expert_retry": bool(
+                        isinstance(decision.raw_response, dict)
+                        and decision.raw_response.get("independent_expert_retry")
+                    ),
+                    "provider_independent_expert_mode": bool(
+                        isinstance(decision.raw_response, dict)
+                        and decision.raw_response.get("provider_independent_expert_mode")
+                    ),
                 }
             )
             raw_opinions_by_name[name] = raw_opinions[-1]
@@ -1932,6 +1940,7 @@ class EnsembleCoordinator:
             isinstance(consultation, dict) and consultation.get("should_trade") is False
         )
         raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+        self._attach_expert_diversity_policy(raw, context)
         raw["base_weighted_score"] = round(normalized_score, 4)
         raw["memory_adjustment"] = round(memory_adjustment, 4)
         raw["memory_summary"] = self._memory_summary(context, normalized_score)
@@ -2025,6 +2034,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
@@ -2316,6 +2326,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "market_regime_forecast_block"
             hold_raw["market_regime"] = context.get("market_regime") or {}
@@ -2334,6 +2345,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["memory_adjustment"] = round(memory_adjustment, 4)
             hold_raw["memory_summary"] = self._memory_summary(context, normalized_score)
@@ -2363,6 +2375,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "loss_recovery_requires_profit_first_ml"
             hold_raw["entry_execution_gate"] = entry_gate
@@ -2382,6 +2395,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "entry_execution_no_new_entry"
             hold_raw["entry_execution_gate"] = entry_gate
@@ -2433,6 +2447,7 @@ class EnsembleCoordinator:
             hold_raw = self._raw(
                 raw_opinions, decision_score, disagreement, cross_validations, consultation
             )
+            self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["base_weighted_score"] = round(normalized_score, 4)
             hold_raw["entry_quality_gate"] = "entry_quality_points_below_threshold"
             hold_raw["entry_execution_gate"] = entry_gate
@@ -2482,6 +2497,7 @@ class EnsembleCoordinator:
                 hold_raw = self._raw(
                     raw_opinions, decision_score, disagreement, cross_validations, consultation
                 )
+                self._attach_expert_diversity_policy(hold_raw, context)
                 hold_raw["base_weighted_score"] = round(normalized_score, 4)
                 hold_raw["entry_quality_gate"] = "ml_profit_quality_block"
                 hold_raw["ml_profit_quality_gate"] = ml_gate
@@ -2603,6 +2619,7 @@ class EnsembleCoordinator:
         raw_response = self._raw(
             raw_opinions, decision_score, disagreement, cross_validations, consultation
         )
+        self._attach_expert_diversity_policy(raw_response, context)
         raw_response["base_weighted_score"] = round(normalized_score, 4)
         raw_response["memory_adjustment"] = round(memory_adjustment, 4)
         raw_response["memory_size_multiplier"] = round(memory_size_multiplier, 4)
@@ -4410,10 +4427,10 @@ class EnsembleCoordinator:
             pos = symbol_positions[0] or {}
             entry_price = self._safe_float(pos.get("entry_price"), 0.0)
             current_price = self._safe_float(pos.get("current_price"), 0.0)
-            quantity = abs(self._safe_float(pos.get("quantity"), 0.0))
+            quantity = self._position_quantity(pos)
             stop_loss = self._safe_float(pos.get("stop_loss"), 0.0)
             position_unrealized_pnl = self._safe_float(pos.get("unrealized_pnl"), 0.0)
-            position_notional = abs(entry_price * quantity)
+            position_notional = self._position_notional(pos, entry_price, quantity)
             if position_notional > 0:
                 position_profit_pct = position_unrealized_pnl / position_notional
             if entry_price > 0 and current_price > 0:
@@ -4905,10 +4922,10 @@ class EnsembleCoordinator:
             pos = symbol_positions[0] or {}
             entry_price = self._safe_float(pos.get("entry_price"), 0.0)
             current_price = self._safe_float(pos.get("current_price"), 0.0)
-            quantity = abs(self._safe_float(pos.get("quantity"), 0.0))
+            quantity = self._position_quantity(pos)
             stop_loss = self._safe_float(pos.get("stop_loss"), 0.0)
             position_unrealized_pnl = self._safe_float(pos.get("unrealized_pnl"), 0.0)
-            position_notional = abs(entry_price * quantity)
+            position_notional = self._position_notional(pos, entry_price, quantity)
             opened_at = pos.get("created_at")
             if isinstance(opened_at, str):
                 try:
@@ -5588,6 +5605,54 @@ class EnsembleCoordinator:
             ),
         }
 
+    def _position_quantity(self, pos: dict[str, Any]) -> float:
+        if bool(pos.get("aggregate_position")):
+            return abs(self._safe_float(pos.get("quantity"), 0.0))
+        raw_info = pos.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        contracts = abs(
+            self._safe_float(
+                pos.get("contracts")
+                or pos.get("sz")
+                or pos.get("size")
+                or info.get("pos")
+                or info.get("qty"),
+                0.0,
+            )
+        )
+        contract_size = abs(
+            self._safe_float(
+                pos.get("contract_size") or pos.get("contractSize") or info.get("ctVal"),
+                1.0,
+            )
+        )
+        if contracts > 0:
+            return contracts * (contract_size if contract_size > 0 else 1.0)
+        return abs(self._safe_float(pos.get("quantity"), 0.0))
+
+    def _position_notional(
+        self,
+        pos: dict[str, Any],
+        entry_price: float,
+        quantity: float,
+    ) -> float:
+        raw_info = pos.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        direct_notional = abs(
+            self._safe_float(
+                pos.get("notional")
+                or pos.get("notional_usd")
+                or pos.get("notionalUsd")
+                or info.get("notionalUsd")
+                or info.get("notional")
+                or info.get("posValue"),
+                0.0,
+            )
+        )
+        if direct_notional > 0:
+            return direct_notional
+        return abs(entry_price * quantity)
+
     def _symbol_positions(self, symbol: str, context: dict[str, Any]) -> list[dict]:
         def normalize(value: Any) -> str:
             text = str(value or "").strip().upper()
@@ -5648,17 +5713,7 @@ class EnsembleCoordinator:
                     or pos.get("avgPx"),
                     entry,
                 )
-                qty = abs(
-                    self._safe_float(
-                        pos.get("quantity") or pos.get("contracts") or pos.get("sz"), 0.0
-                    )
-                )
-                contract_size = self._safe_float(
-                    pos.get("contract_size")
-                    or pos.get("contractSize")
-                    or (pos.get("info") or {}).get("ctVal"),
-                    1.0,
-                )
+                qty = self._position_quantity(pos)
                 direct_notional = abs(
                     self._safe_float(
                         pos.get("notional")
@@ -5672,11 +5727,7 @@ class EnsembleCoordinator:
                 )
                 if entry <= 0 or current <= 0:
                     continue
-                notional = (
-                    direct_notional
-                    if direct_notional > 0
-                    else qty * entry * (contract_size if contract_size > 0 else 1.0)
-                )
+                notional = direct_notional if direct_notional > 0 else qty * entry
                 if notional <= 0:
                     continue
                 synthetic_qty = notional / entry
@@ -5855,6 +5906,15 @@ class EnsembleCoordinator:
                 consultation,
             ),
         }
+
+    @staticmethod
+    def _attach_expert_diversity_policy(
+        raw: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        policy = context.get("_expert_diversity_policy")
+        if isinstance(policy, dict):
+            raw["expert_diversity_policy"] = policy
 
     def _latency_summary(
         self,

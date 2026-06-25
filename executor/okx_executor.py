@@ -24,6 +24,7 @@ from core.exceptions import (
     RateLimitError,
 )
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
 from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
 
@@ -37,6 +38,7 @@ RATE_LIMIT_TOKENS = 10  # max requests per second
 RATE_LIMIT_PERIOD = 1.0
 OKX_REST_CALL_TIMEOUT = 10.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
+OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 ATTACHED_PROTECTION_MIN_STOP_PCT = 0.012
 ATTACHED_PROTECTION_MIN_TAKE_PROFIT_PCT = 0.024
 ATTACHED_PROTECTION_MIN_TRIGGER_GAP_PCT = 0.0015
@@ -95,6 +97,7 @@ class OKXExecutor(AbstractExecutor):
         self._load_markets_on_initialize = load_markets_on_initialize
         self._markets_loaded = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
+        self._contract_delivery_locks: dict[str, tuple[float, str]] = {}
 
     @property
     def executor_mode(self) -> str:
@@ -210,6 +213,115 @@ class OKXExecutor(AbstractExecutor):
             return
         await self._load_usdt_swap_markets()
 
+    def _is_missing_market_symbol_error(self, error: Any) -> bool:
+        text = str(error or "").lower()
+        return "does not have market symbol" in text or "bad symbol" in text
+
+    def _position_matches_symbol(self, position: dict[str, Any], symbol: str) -> bool:
+        info = position.get("info") or {}
+        requested = normalize_trading_symbol(symbol)
+        actual = normalize_trading_symbol(position.get("symbol") or info.get("instId"))
+        return bool(requested and actual and requested == actual)
+
+    def _synthetic_exit_market_from_position(
+        self,
+        position: dict[str, Any],
+        okx_symbol: str,
+    ) -> dict[str, Any] | None:
+        """Build minimal market rules from an existing position for native full-close."""
+
+        from services.exchange_position_state import parse_exchange_position_snapshot
+
+        info = position.get("info") or {}
+        inst_id = str(info.get("instId") or position.get("symbol") or okx_symbol or "").strip()
+        if not inst_id:
+            return None
+        snapshot = parse_exchange_position_snapshot(
+            position,
+            symbol_normalizer=normalize_trading_symbol,
+        )
+        if not snapshot:
+            return None
+        contract_size = self._safe_float(snapshot.get("contract_size"), 0.0)
+        if contract_size <= 0:
+            contract_size = 1.0
+        min_size = self._safe_float(info.get("minSz") or info.get("lotSz"), 0.0) or 1.0
+        max_market_size = self._safe_float(info.get("maxMktSz"), 0.0)
+        market_info = {
+            **info,
+            "instId": inst_id,
+            "ctVal": str(contract_size),
+            "minSz": str(min_size),
+            "lotSz": str(min_size),
+        }
+        if max_market_size > 0:
+            market_info["maxMktSz"] = str(max_market_size)
+        return {
+            "id": inst_id,
+            "symbol": str(position.get("symbol") or inst_id),
+            "type": "swap",
+            "swap": True,
+            "linear": True,
+            "contract": True,
+            "contractSize": contract_size,
+            "precision": {"amount": min_size},
+            "limits": {"amount": {"min": min_size, "max": max_market_size or None}},
+            "info": market_info,
+            "synthetic_from_position": True,
+        }
+
+    async def _market_from_existing_position(
+        self,
+        app_symbol: str | None,
+        okx_symbol: str,
+    ) -> dict[str, Any] | None:
+        if not app_symbol:
+            return None
+        positions = await self.get_positions_strict(app_symbol)
+        for position in positions or []:
+            market = self._synthetic_exit_market_from_position(position, okx_symbol)
+            if market:
+                return market
+        return None
+
+    async def _market_for_symbol(
+        self,
+        okx_symbol: str,
+        *,
+        app_symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a market, reloading OKX instruments when a new swap is missing."""
+        ccxt = await self._get_ccxt()
+        await self._ensure_markets_loaded()
+        try:
+            return ccxt.market(okx_symbol)
+        except Exception as exc:
+            error_text = safe_error_text(exc).lower()
+            if not self._is_missing_market_symbol_error(error_text):
+                raise
+            logger.warning(
+                "OKX market missing from cache; reloading instruments",
+                symbol=okx_symbol,
+                error=safe_error_text(exc),
+            )
+            self._markets_loaded = False
+            await self._load_usdt_swap_markets()
+            try:
+                return ccxt.market(okx_symbol)
+            except Exception as retry_exc:
+                retry_error = safe_error_text(retry_exc)
+                if not self._is_missing_market_symbol_error(retry_error):
+                    raise
+                market = await self._market_from_existing_position(app_symbol, okx_symbol)
+                if market:
+                    logger.warning(
+                        "using existing OKX position snapshot as synthetic exit market",
+                        symbol=okx_symbol,
+                        app_symbol=app_symbol,
+                    )
+                    return market
+                raise
+
     async def reinitialize(self) -> None:
         """Close and re-create exchange with current settings."""
         if self._exchange:
@@ -304,8 +416,16 @@ class OKXExecutor(AbstractExecutor):
 
         ccxt = await self._get_ccxt()
 
+        side = "buy"
+        okx_symbol = self._to_swap_symbol(decision.symbol)
+        contract_size = 1.0
+        order_quantity = 0.0
+        base_quantity = 0.0
+        okx_order_rules: dict[str, Any] = {}
+        params: dict[str, Any] = {}
+
         try:
-            okx_symbol = self._to_swap_symbol(decision.symbol)
+            okx_symbol = await self._resolve_swap_symbol(decision.symbol)
             # Map action to CCXT side
             if decision.action == Action.LONG:
                 side = "buy"
@@ -328,14 +448,47 @@ class OKXExecutor(AbstractExecutor):
                     balance = await self.get_balance()
                 position_value = balance * decision.position_size_pct * decision.suggested_leverage
 
-            # Get current ticker for quantity calculation
-            ticker = await self._with_retry(ccxt.fetch_ticker, okx_symbol)
-            price = ticker.get("last", 0)
-            market = ccxt.market(okx_symbol)
+            # Get current ticker for quantity calculation. Some OKX demo/pre-quote
+            # positions are returned by fetch_positions but are absent from CCXT's
+            # market cache; exits can still use the position mark price and native
+            # close-position API in that case.
+            ticker: dict[str, Any] = {}
+            try:
+                ticker = await self._with_retry(ccxt.fetch_ticker, okx_symbol)
+            except Exception as exc:
+                if not decision.is_exit or not self._is_missing_market_symbol_error(
+                    safe_error_text(exc)
+                ):
+                    raise
+                logger.warning(
+                    "OKX ticker missing from market cache for exit; using position snapshot price",
+                    symbol=decision.symbol,
+                    okx_symbol=okx_symbol,
+                    error=safe_error_text(exc),
+                )
+            price = self._safe_float(ticker.get("last"), 0.0)
+            market = await self._market_for_symbol(okx_symbol, app_symbol=decision.symbol)
+            if price <= 0 and decision.is_exit:
+                target_price_side = "long" if decision.action == Action.CLOSE_LONG else "short"
+                for position in await self.get_positions_strict(decision.symbol):
+                    if position.get("side") != target_price_side:
+                        continue
+                    info = position.get("info") or {}
+                    price = (
+                        self._safe_float(position.get("markPrice"), 0.0)
+                        or self._safe_float(info.get("markPx"), 0.0)
+                        or self._safe_float(position.get("lastPrice"), 0.0)
+                        or self._safe_float(info.get("last"), 0.0)
+                        or self._safe_float(position.get("entryPrice"), 0.0)
+                        or self._safe_float(info.get("avgPx"), 0.0)
+                    )
+                    if price > 0:
+                        break
             contract_size = self._contract_size(market)
             order_quantity = 0.0
             base_quantity = 0.0
             order_resize_note = None
+            market_order_size_adjustment = None
             target_side = None
             position_side = None
             pre_exit_contracts = 0.0
@@ -758,6 +911,37 @@ class OKXExecutor(AbstractExecutor):
                                 "okx_order_rules": okx_order_rules,
                             },
                         )
+                market_size_adjustment = self._entry_market_order_size_adjustment(
+                    decision=decision,
+                    side=side,
+                    price=price,
+                    okx_symbol=okx_symbol,
+                    contract_size=contract_size,
+                    order_quantity=order_quantity,
+                    base_quantity=base_quantity,
+                    okx_order_rules=okx_order_rules,
+                )
+                if isinstance(market_size_adjustment, ExecutionResult):
+                    return market_size_adjustment
+                if market_size_adjustment is not None:
+                    order_quantity = market_size_adjustment["adjusted_order_contracts"]
+                    base_quantity = market_size_adjustment["adjusted_base_quantity"]
+                    market_order_size_adjustment = market_size_adjustment
+                    okx_order_rules = dict(okx_order_rules)
+                    okx_order_rules["final_contracts"] = round(order_quantity, 12)
+                    okx_order_rules["final_base_quantity"] = round(base_quantity, 12)
+                    okx_order_rules["final_notional_usdt"] = round(
+                        order_quantity * contract_size * max(price, 0.0),
+                        8,
+                    )
+                    okx_order_rules["market_order_within_max_size"] = True
+                    okx_order_rules["pre_submit_valid"] = True
+                    okx_order_rules["market_order_size_adjustment"] = market_size_adjustment
+                    order_resize_note = (
+                        f"OKX 单笔市价单上限为 {market_size_adjustment['amount_max_market_contracts']:g} 张，"
+                        f"系统已把原计划 {market_size_adjustment['original_planned_order_contracts']:g} 张"
+                        f"缩到 {order_quantity:g} 张后提交。"
+                    )
                 stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
                     decision,
                     price,
@@ -794,6 +978,61 @@ class OKXExecutor(AbstractExecutor):
                 if position_side:
                     params["positionSide"] = position_side
                 params["reduceOnly"] = True
+                full_close_result = await self._place_okx_native_full_close(
+                    ccxt=ccxt,
+                    decision=decision,
+                    okx_symbol=okx_symbol,
+                    market=market,
+                    side=side,
+                    params=params,
+                    price=price,
+                    contract_size=contract_size,
+                    pre_exit_contracts=pre_exit_contracts,
+                    target_side=target_side,
+                    position_side=position_side,
+                    requested_exit_fraction=requested_exit_fraction,
+                    requested_exit_contracts=requested_exit_contracts,
+                    exit_order_replace_note=exit_order_replace_note,
+                )
+                if full_close_result is not None:
+                    return full_close_result
+                split_exit_result = await self._place_split_exit_market_orders(
+                    ccxt=ccxt,
+                    decision=decision,
+                    okx_symbol=okx_symbol,
+                    side=side,
+                    market=market,
+                    params=params,
+                    price=price,
+                    contract_size=contract_size,
+                    pre_exit_contracts=pre_exit_contracts,
+                    target_side=target_side,
+                    requested_exit_fraction=requested_exit_fraction,
+                    requested_exit_contracts=requested_exit_contracts,
+                    order_quantity=order_quantity,
+                    exit_order_replace_note=exit_order_replace_note,
+                )
+                if split_exit_result is not None:
+                    return split_exit_result
+                native_reduce_result = await self._place_okx_native_reduce_market_order(
+                    ccxt=ccxt,
+                    decision=decision,
+                    okx_symbol=okx_symbol,
+                    market=market,
+                    side=side,
+                    params=params,
+                    price=price,
+                    contract_size=contract_size,
+                    pre_exit_contracts=pre_exit_contracts,
+                    target_side=target_side,
+                    position_side=position_side,
+                    requested_exit_fraction=requested_exit_fraction,
+                    requested_exit_contracts=requested_exit_contracts,
+                    order_quantity=order_quantity,
+                    exit_order_replace_note=exit_order_replace_note,
+                )
+                if native_reduce_result is not None:
+                    return native_reduce_result
 
             # Place the market order
             logger.info(
@@ -869,6 +1108,7 @@ class OKXExecutor(AbstractExecutor):
                 else:
                     raise
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
+            result_symbol = self._execution_result_symbol(order, decision.symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
             execution_price = float(order.get("average") or order.get("price") or price or 0)
             status = self._order_status_from_ccxt(
@@ -886,7 +1126,7 @@ class OKXExecutor(AbstractExecutor):
                 )
                 return ExecutionResult(
                     order_id=order_id or "entry_fill_quantity_missing",
-                    symbol=decision.symbol,
+                    symbol=result_symbol,
                     side=side,
                     order_type="market",
                     quantity=0.0,
@@ -905,6 +1145,8 @@ class OKXExecutor(AbstractExecutor):
                             "等待下一轮 OKX 订单/仓位同步确认。"
                         ),
                         "request_params": params,
+                        "decision_symbol": decision.symbol,
+                        "canonical_exchange_symbol": result_symbol,
                         "okx_symbol": okx_symbol,
                         "contract_size": contract_size,
                         "order_contracts": order_quantity,
@@ -1016,7 +1258,7 @@ class OKXExecutor(AbstractExecutor):
                     if order_id and active_tracking_status:
                         return ExecutionResult(
                             order_id=order_id,
-                            symbol=decision.symbol,
+                            symbol=result_symbol,
                             side=side,
                             order_type="market",
                             quantity=0.0,
@@ -1039,6 +1281,8 @@ class OKXExecutor(AbstractExecutor):
                                 ),
                                 "exit_order_replace_note": exit_order_replace_note,
                                 "request_params": params,
+                                "decision_symbol": decision.symbol,
+                                "canonical_exchange_symbol": result_symbol,
                                 "okx_symbol": okx_symbol,
                                 "contract_size": contract_size,
                                 "order_contracts": order_quantity,
@@ -1051,7 +1295,7 @@ class OKXExecutor(AbstractExecutor):
                         )
                     return ExecutionResult(
                         order_id=order_id or "exit_not_confirmed",
-                        symbol=decision.symbol,
+                        symbol=result_symbol,
                         side=side,
                         order_type="market",
                         quantity=0,
@@ -1071,6 +1315,8 @@ class OKXExecutor(AbstractExecutor):
                                 "本地不会把这笔仓位记为已平仓。"
                             ),
                             "request_params": params,
+                            "decision_symbol": decision.symbol,
+                            "canonical_exchange_symbol": result_symbol,
                             "okx_symbol": okx_symbol,
                             "contract_size": contract_size,
                             "order_contracts": order_quantity,
@@ -1094,7 +1340,7 @@ class OKXExecutor(AbstractExecutor):
 
             return ExecutionResult(
                 order_id=order.get("id", ""),
-                symbol=decision.symbol,
+                symbol=result_symbol,
                 side=side,
                 order_type="market",
                 quantity=(
@@ -1112,6 +1358,8 @@ class OKXExecutor(AbstractExecutor):
                 raw_response={
                     **order,
                     "request_params": params,
+                    "decision_symbol": decision.symbol,
+                    "canonical_exchange_symbol": result_symbol,
                     "okx_symbol": okx_symbol,
                     "contract_size": contract_size,
                     "order_contracts": order_quantity,
@@ -1123,6 +1371,11 @@ class OKXExecutor(AbstractExecutor):
                         else (base_quantity if status == OrderStatus.FILLED else 0.0)
                     ),
                     "order_resize_note": order_resize_note,
+                    **(
+                        {"market_order_size_adjustment": market_order_size_adjustment}
+                        if market_order_size_adjustment is not None
+                        else {}
+                    ),
                     "exit_order_replace_note": exit_order_replace_note,
                     **(
                         {
@@ -1213,6 +1466,551 @@ class OKXExecutor(AbstractExecutor):
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
 
+    async def _place_okx_native_full_close(
+        self,
+        *,
+        ccxt,
+        decision: DecisionOutput,
+        okx_symbol: str,
+        market: dict[str, Any],
+        side: str,
+        params: dict[str, Any],
+        price: float,
+        contract_size: float,
+        pre_exit_contracts: float,
+        target_side: str,
+        position_side: str | None,
+        requested_exit_fraction: float,
+        requested_exit_contracts: float,
+        exit_order_replace_note: str | None,
+    ) -> ExecutionResult | None:
+        if requested_exit_fraction < 0.999 or requested_exit_contracts < pre_exit_contracts * 0.999:
+            return None
+        close_position = getattr(ccxt, "privatePostTradeClosePosition", None)
+        if not callable(close_position):
+            return None
+
+        request_params = {
+            "instId": str(
+                market.get("id") or okx_symbol.replace("/", "-").replace(":USDT", "-SWAP")
+            ),
+            "mgnMode": str(params.get("tdMode") or params.get("marginMode") or "cross"),
+            "autoCxl": params.get("autoCxl", True),
+        }
+        if position_side and position_side != "net":
+            request_params["posSide"] = target_side
+
+        try:
+            response = await self._with_retry(close_position, request_params)
+        except ExchangeAPIError as exc:
+            logger.warning(
+                "OKX native full close failed; will use reduce-only market orders",
+                symbol=okx_symbol,
+                side=target_side,
+                error=safe_error_text(exc),
+            )
+            return None
+
+        after_contracts = pre_exit_contracts
+        snapshot_error: str | None = None
+        tolerance = max(pre_exit_contracts * 0.001, 1e-8)
+        for _ in range(8):
+            await asyncio.sleep(0.75)
+            try:
+                after_contracts = await self._position_contracts_for_side(
+                    decision.symbol,
+                    target_side,
+                )
+            except Exception as exc:
+                snapshot_error = safe_error_text(exc)
+                logger.warning(
+                    "OKX native full close position refresh failed",
+                    symbol=okx_symbol,
+                    side=target_side,
+                    error=snapshot_error,
+                )
+                break
+            if after_contracts <= tolerance:
+                break
+
+        closed_contracts = max(pre_exit_contracts - after_contracts, 0.0)
+        data = response.get("data") if isinstance(response, dict) else None
+        first_item = data[0] if isinstance(data, list) and data else {}
+        if not isinstance(first_item, dict):
+            first_item = {}
+        order_id = str(first_item.get("ordId") or first_item.get("clOrdId") or "").strip()
+        response_code = str(response.get("code") if isinstance(response, dict) else "")
+        s_code = str(first_item.get("sCode") or "")
+        success_code = response_code == "0" or s_code in {"", "0"}
+        raw_response = {
+            **(response if isinstance(response, dict) else {"response": response}),
+            "exit_tracking": True,
+            "okx_native_close_position": True,
+            "exit_order_replace_note": exit_order_replace_note,
+            "request_params": request_params,
+            "fallback_market_order_params": params,
+            "okx_symbol": okx_symbol,
+            "contract_size": contract_size,
+            "position_contracts_before": pre_exit_contracts,
+            "position_contracts_after": after_contracts,
+            "requested_exit_fraction": requested_exit_fraction,
+            "requested_exit_contracts": requested_exit_contracts,
+            "remaining_contracts": max(after_contracts, 0.0),
+            "snapshot_error": snapshot_error,
+            "filled_contracts": closed_contracts,
+            "base_quantity": closed_contracts * contract_size,
+        }
+        if not success_code and closed_contracts <= tolerance:
+            logger.warning(
+                "OKX native full close returned failure; will use reduce-only market orders",
+                symbol=okx_symbol,
+                side=target_side,
+                response=safe_error_text(response, limit=300),
+            )
+            return None
+        if closed_contracts <= tolerance:
+            return ExecutionResult(
+                order_id=order_id or "okx_native_full_close_not_confirmed",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=0.0,
+                price=price,
+                status=OrderStatus.OPEN,
+                exchange_order_id=order_id or None,
+                timestamp=datetime.now(UTC),
+                raw_response={
+                    **raw_response,
+                    "error": snapshot_error
+                    or "OKX native full close was submitted but position is not flat yet.",
+                },
+            )
+        return ExecutionResult(
+            order_id=order_id or "okx_native_full_close",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=closed_contracts * contract_size,
+            price=price,
+            status=OrderStatus.FILLED if after_contracts <= tolerance else OrderStatus.PARTIAL,
+            exchange_order_id=order_id or None,
+            timestamp=datetime.now(UTC),
+            raw_response=raw_response,
+        )
+
+    async def _place_split_exit_market_orders(
+        self,
+        *,
+        ccxt,
+        decision: DecisionOutput,
+        okx_symbol: str,
+        side: str,
+        market: dict[str, Any],
+        params: dict[str, Any],
+        price: float,
+        contract_size: float,
+        pre_exit_contracts: float,
+        target_side: str,
+        requested_exit_fraction: float,
+        requested_exit_contracts: float,
+        order_quantity: float,
+        exit_order_replace_note: str | None,
+    ) -> ExecutionResult | None:
+        chunks = self._exit_market_order_slices(ccxt, market, order_quantity)
+        if not chunks:
+            return None
+
+        max_market_contracts = self._amount_market_max(market)
+        tolerance = max(pre_exit_contracts * 0.001, 1e-8)
+        chunk_results: list[dict[str, Any]] = []
+        order_ids: list[str] = []
+        total_fee = 0.0
+        weighted_price_total = 0.0
+        weighted_contracts = 0.0
+        last_order: dict[str, Any] = {}
+        last_status = OrderStatus.PENDING
+        after_contracts = pre_exit_contracts
+        split_error: str | None = None
+
+        for index, planned_contracts in enumerate(chunks, start=1):
+            closed_so_far = max(pre_exit_contracts - after_contracts, 0.0)
+            remaining_request = max(requested_exit_contracts - closed_so_far, 0.0)
+            if after_contracts <= tolerance or remaining_request <= tolerance:
+                break
+
+            chunk_contracts = min(planned_contracts, remaining_request, after_contracts)
+            chunk_contracts = self._clamp_exit_chunk_contracts(ccxt, market, chunk_contracts)
+            if chunk_contracts <= 0:
+                break
+
+            before_chunk_contracts = after_contracts
+            try:
+                order = await self._with_retry(
+                    ccxt.create_order,
+                    okx_symbol,
+                    "market",
+                    side,
+                    chunk_contracts,
+                    None,
+                    params,
+                )
+                order = await self._confirm_market_order(ccxt, order, okx_symbol)
+            except ExchangeAPIError as exc:
+                split_error = safe_error_text(exc)
+                logger.warning(
+                    "split exit market order rejected by OKX",
+                    symbol=okx_symbol,
+                    chunk_index=index,
+                    chunk_contracts=chunk_contracts,
+                    error=split_error,
+                )
+                break
+
+            last_order = order
+            last_status = self._order_status_from_ccxt(
+                order.get("status") or (order.get("info") or {}).get("state")
+            )
+            order_id = str(order.get("id") or (order.get("info") or {}).get("ordId") or "")
+            if order_id:
+                order_ids.append(order_id)
+            total_fee += self._order_fee_cost(order)
+            order_price = self._safe_float(order.get("average") or order.get("price"), price)
+
+            for _ in range(5):
+                await asyncio.sleep(0.5)
+                try:
+                    after_contracts = await self._position_contracts_for_side(
+                        decision.symbol,
+                        target_side,
+                    )
+                except Exception as exc:
+                    split_error = safe_error_text(exc)
+                    logger.warning(
+                        "split exit position refresh failed",
+                        symbol=okx_symbol,
+                        chunk_index=index,
+                        error=split_error,
+                    )
+                    break
+                if before_chunk_contracts - after_contracts > tolerance:
+                    break
+                if last_status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
+                    break
+
+            chunk_closed = max(before_chunk_contracts - after_contracts, 0.0)
+            if chunk_closed > tolerance and order_price > 0:
+                weighted_price_total += order_price * chunk_closed
+                weighted_contracts += chunk_closed
+            chunk_results.append(
+                {
+                    "index": index,
+                    "order_id": order_id or None,
+                    "requested_contracts": chunk_contracts,
+                    "status": last_status.value,
+                    "fee": self._order_fee_cost(order),
+                    "price": order_price,
+                    "position_contracts_before": before_chunk_contracts,
+                    "position_contracts_after": after_contracts,
+                    "closed_contracts": chunk_closed,
+                }
+            )
+
+            if chunk_closed <= tolerance:
+                break
+
+        closed_contracts = max(pre_exit_contracts - after_contracts, 0.0)
+        execution_price = (
+            weighted_price_total / weighted_contracts if weighted_contracts > 0 else price
+        )
+        raw_response = {
+            **last_order,
+            "exit_tracking": True,
+            "split_exit_order": True,
+            "split_reason": "okx_market_order_max_contracts",
+            "split_error": split_error,
+            "exit_order_replace_note": exit_order_replace_note,
+            "request_params": params,
+            "okx_symbol": okx_symbol,
+            "contract_size": contract_size,
+            "order_contracts": order_quantity,
+            "amount_max_market_contracts": max_market_contracts,
+            "split_chunks": chunk_results,
+            "position_contracts_before": pre_exit_contracts,
+            "position_contracts_after": after_contracts,
+            "requested_exit_fraction": requested_exit_fraction,
+            "requested_exit_contracts": requested_exit_contracts,
+            "remaining_contracts": max(after_contracts, 0.0),
+            "message": (
+                "OKX limits this symbol's single market close size, so the reduce-only "
+                "close was submitted as several market orders within maxMktSz."
+            ),
+        }
+
+        if closed_contracts <= tolerance:
+            return ExecutionResult(
+                order_id=",".join(order_ids) or "split_exit_not_confirmed",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=0.0,
+                price=execution_price,
+                status=(
+                    OrderStatus.REJECTED
+                    if split_error or last_status == OrderStatus.REJECTED
+                    else OrderStatus.OPEN
+                ),
+                fee=total_fee,
+                exchange_order_id=",".join(order_ids) or None,
+                timestamp=datetime.now(UTC),
+                raw_response={
+                    **raw_response,
+                    "error": split_error
+                    or "Split exit orders did not reduce the OKX position yet.",
+                },
+            )
+
+        requested_filled = (
+            requested_exit_contracts <= 0
+            or closed_contracts + tolerance >= requested_exit_contracts
+        )
+        return ExecutionResult(
+            order_id=",".join(order_ids) or "split_exit",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=closed_contracts * contract_size,
+            price=execution_price,
+            status=OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL,
+            fee=total_fee,
+            exchange_order_id=",".join(order_ids) or None,
+            timestamp=datetime.now(UTC),
+            raw_response={
+                **raw_response,
+                "filled_contracts": closed_contracts,
+                "base_quantity": closed_contracts * contract_size,
+            },
+        )
+
+    async def _place_okx_native_reduce_market_order(
+        self,
+        *,
+        ccxt,
+        decision: DecisionOutput,
+        okx_symbol: str,
+        market: dict[str, Any],
+        side: str,
+        params: dict[str, Any],
+        price: float,
+        contract_size: float,
+        pre_exit_contracts: float,
+        target_side: str,
+        position_side: str | None,
+        requested_exit_fraction: float,
+        requested_exit_contracts: float,
+        order_quantity: float,
+        exit_order_replace_note: str | None,
+    ) -> ExecutionResult | None:
+        native_required = bool(
+            market.get("synthetic_from_position") or str(okx_symbol).upper().endswith("-SWAP")
+        )
+        if not native_required:
+            return None
+        place_order = getattr(ccxt, "privatePostTradeOrder", None)
+        if not callable(place_order):
+            return None
+
+        tolerance = max(pre_exit_contracts * 0.001, 1e-8)
+        contracts = min(
+            max(self._safe_float(order_quantity, 0.0), 0.0),
+            max(self._safe_float(requested_exit_contracts, 0.0), 0.0),
+            max(pre_exit_contracts, 0.0),
+        )
+        if contracts <= tolerance:
+            return None
+
+        inst_id = self._native_inst_id_for_market(market, okx_symbol)
+        request_params = {
+            "instId": inst_id,
+            "tdMode": str(params.get("tdMode") or params.get("marginMode") or "cross"),
+            "side": side,
+            "ordType": "market",
+            "sz": self._format_okx_number(contracts),
+            "reduceOnly": "true",
+        }
+        if position_side and position_side != "net":
+            request_params["posSide"] = target_side
+
+        lock_reason = self._contract_delivery_lock_reason(inst_id)
+        if lock_reason:
+            return self._contract_delivery_rejected_result(
+                decision=decision,
+                side=side,
+                price=price,
+                request_params=request_params,
+                params=params,
+                okx_symbol=okx_symbol,
+                reason=lock_reason,
+                lock_hit=True,
+            )
+
+        try:
+            response = await self._with_retry(place_order, request_params)
+        except ExchangeAPIError as exc:
+            error_text = safe_error_text(exc)
+            if self._is_no_position_error(error_text):
+                return ExecutionResult(
+                    order_id="no_position",
+                    symbol=decision.symbol,
+                    side=side,
+                    order_type="market",
+                    quantity=0.0,
+                    price=price,
+                    status=OrderStatus.REJECTED,
+                    timestamp=datetime.now(UTC),
+                    raw_response={
+                        "error": error_text,
+                        "okx_native_reduce_market_order": True,
+                        "request_params": request_params,
+                        "fallback_market_order_params": params,
+                        "okx_symbol": okx_symbol,
+                        "do_not_persist_order": True,
+                    },
+                )
+            if self._is_contract_delivery_error(error_text):
+                self._remember_contract_delivery_lock(inst_id, error_text)
+                return self._contract_delivery_rejected_result(
+                    decision=decision,
+                    side=side,
+                    price=price,
+                    request_params=request_params,
+                    params=params,
+                    okx_symbol=okx_symbol,
+                    reason=error_text,
+                    lock_hit=False,
+                )
+            logger.warning(
+                "OKX native reduce-only market order failed",
+                symbol=okx_symbol,
+                side=target_side,
+                error=error_text,
+            )
+            return ExecutionResult(
+                order_id="native_reduce_rejected",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=0.0,
+                price=price,
+                status=OrderStatus.REJECTED,
+                timestamp=datetime.now(UTC),
+                raw_response={
+                    "error": error_text,
+                    "okx_native_reduce_market_order": True,
+                    "request_params": request_params,
+                    "fallback_market_order_params": params,
+                    "okx_symbol": okx_symbol,
+                    "do_not_persist_order": True,
+                },
+            )
+
+        after_contracts = pre_exit_contracts
+        snapshot_error: str | None = None
+        for _ in range(8):
+            await asyncio.sleep(0.75)
+            try:
+                after_contracts = await self._position_contracts_for_side(
+                    decision.symbol,
+                    target_side,
+                )
+            except Exception as exc:
+                snapshot_error = safe_error_text(exc)
+                logger.warning(
+                    "OKX native reduce-only position refresh failed",
+                    symbol=okx_symbol,
+                    side=target_side,
+                    error=snapshot_error,
+                )
+                break
+            if pre_exit_contracts - after_contracts > tolerance:
+                break
+
+        closed_contracts = max(pre_exit_contracts - after_contracts, 0.0)
+        data = response.get("data") if isinstance(response, dict) else None
+        first_item = data[0] if isinstance(data, list) and data else {}
+        if not isinstance(first_item, dict):
+            first_item = {}
+        order_id = str(first_item.get("ordId") or first_item.get("clOrdId") or "").strip()
+        response_code = str(response.get("code") if isinstance(response, dict) else "")
+        s_code = str(first_item.get("sCode") or "")
+        success_code = response_code == "0" or s_code in {"", "0"}
+        raw_response = {
+            **(response if isinstance(response, dict) else {"response": response}),
+            "exit_tracking": True,
+            "okx_native_reduce_market_order": True,
+            "exit_order_replace_note": exit_order_replace_note,
+            "request_params": request_params,
+            "fallback_market_order_params": params,
+            "okx_symbol": okx_symbol,
+            "canonical_exchange_symbol": normalize_trading_symbol(request_params["instId"]),
+            "contract_size": contract_size,
+            "order_contracts": contracts,
+            "position_contracts_before": pre_exit_contracts,
+            "position_contracts_after": after_contracts,
+            "requested_exit_fraction": requested_exit_fraction,
+            "requested_exit_contracts": requested_exit_contracts,
+            "remaining_contracts": max(after_contracts, 0.0),
+            "snapshot_error": snapshot_error,
+            "filled_contracts": closed_contracts,
+            "base_quantity": closed_contracts * contract_size,
+        }
+        if not success_code and closed_contracts <= tolerance:
+            return ExecutionResult(
+                order_id=order_id or "native_reduce_rejected",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=0.0,
+                price=price,
+                status=OrderStatus.REJECTED,
+                exchange_order_id=order_id or None,
+                timestamp=datetime.now(UTC),
+                raw_response={**raw_response, "do_not_persist_order": True},
+            )
+        if closed_contracts <= tolerance:
+            return ExecutionResult(
+                order_id=order_id or "native_reduce_not_confirmed",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=0.0,
+                price=price,
+                status=OrderStatus.OPEN,
+                exchange_order_id=order_id or None,
+                timestamp=datetime.now(UTC),
+                raw_response={
+                    **raw_response,
+                    "error": snapshot_error
+                    or "OKX native reduce-only order was submitted but position is unchanged.",
+                },
+            )
+
+        requested_filled = (
+            requested_exit_contracts <= 0
+            or closed_contracts + tolerance >= requested_exit_contracts
+        )
+        return ExecutionResult(
+            order_id=order_id or "native_reduce_market",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=closed_contracts * contract_size,
+            price=price,
+            status=OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL,
+            exchange_order_id=order_id or None,
+            timestamp=datetime.now(UTC),
+            raw_response=raw_response,
+        )
+
     async def _confirm_market_order(self, ccxt, order: dict, symbol: str) -> dict:
         """Fetch the final OKX order state after market order submission."""
         order_id = order.get("id")
@@ -1256,6 +2054,21 @@ class OKXExecutor(AbstractExecutor):
         except (TypeError, ValueError):
             return 1.0
 
+    def _native_inst_id_for_market(self, market: dict[str, Any], okx_symbol: str) -> str:
+        info = market.get("info") if isinstance(market.get("info"), dict) else {}
+        inst_id = str(info.get("instId") or market.get("id") or "").strip()
+        if inst_id:
+            return inst_id
+        return str(okx_symbol or "").replace("/", "-").replace(":USDT", "-SWAP")
+
+    @staticmethod
+    def _format_okx_number(value: float) -> str:
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return str(value)
+        return format(decimal_value.normalize(), "f").rstrip("0").rstrip(".") or "0"
+
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
         try:
             if value is None:
@@ -1263,6 +2076,62 @@ class OKXExecutor(AbstractExecutor):
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    def _is_contract_delivery_error(self, message: Any) -> bool:
+        text = str(message or "").lower()
+        return "51028" in text or "contract under delivery" in text
+
+    def _contract_delivery_lock_reason(self, inst_id: str) -> str | None:
+        key = str(inst_id or "").strip().upper()
+        if not key:
+            return None
+        item = self._contract_delivery_locks.get(key)
+        if item is None:
+            return None
+        locked_at, reason = item
+        if time.monotonic() - locked_at > OKX_CONTRACT_DELIVERY_LOCK_SECONDS:
+            self._contract_delivery_locks.pop(key, None)
+            return None
+        return reason
+
+    def _remember_contract_delivery_lock(self, inst_id: str, reason: str) -> None:
+        key = str(inst_id or "").strip().upper()
+        if not key:
+            return
+        self._contract_delivery_locks[key] = (time.monotonic(), reason)
+
+    def _contract_delivery_rejected_result(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        request_params: dict[str, Any],
+        params: dict[str, Any],
+        okx_symbol: str,
+        reason: str,
+        lock_hit: bool,
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            order_id="contract_delivery_paused",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=0.0,
+            price=price,
+            status=OrderStatus.REJECTED,
+            timestamp=datetime.now(UTC),
+            raw_response={
+                "error": reason,
+                "okx_contract_delivery_cooldown": True,
+                "okx_contract_delivery_lock_hit": lock_hit,
+                "okx_native_reduce_market_order": True,
+                "request_params": request_params,
+                "fallback_market_order_params": params,
+                "okx_symbol": okx_symbol,
+                "do_not_persist_order": True,
+            },
+        )
 
     def _position_contracts(self, position: dict[str, Any]) -> float:
         info = position.get("info") or {}
@@ -1498,6 +2367,7 @@ class OKXExecutor(AbstractExecutor):
         contract_size = self._contract_size(market)
         amount_min = self._amount_min(market)
         amount_step = self._amount_step(market)
+        amount_market_max = self._amount_market_max(market)
         planned_contracts = (
             planned_notional_usdt / (price * contract_size)
             if price > 0 and contract_size > 0 and planned_notional_usdt > 0
@@ -1512,6 +2382,7 @@ class OKXExecutor(AbstractExecutor):
             "contract_size": round(contract_size, 12),
             "amount_min_contracts": round(amount_min, 12),
             "amount_step_contracts": round(amount_step, 12),
+            "amount_max_market_contracts": round(amount_market_max, 12),
             "min_notional_usdt": round(min_notional, 8),
             "available_balance_usdt": round(max(balance, 0.0), 8),
             "leverage": round(effective_leverage, 6),
@@ -1525,8 +2396,13 @@ class OKXExecutor(AbstractExecutor):
             "system_adjusted_to_min_contracts": bool(
                 amount_min > 0 and 0 < planned_contracts < amount_min <= final_contracts
             ),
+            "market_order_within_max_size": bool(
+                amount_market_max <= 0 or final_contracts <= amount_market_max
+            ),
             "pre_submit_valid": bool(
-                final_contracts > 0 and (amount_min <= 0 or final_contracts >= amount_min)
+                final_contracts > 0
+                and (amount_min <= 0 or final_contracts >= amount_min)
+                and (amount_market_max <= 0 or final_contracts <= amount_market_max)
             ),
         }
 
@@ -1576,6 +2452,124 @@ class OKXExecutor(AbstractExecutor):
                 "planned_base_quantity": base_quantity,
                 "okx_order_rules": okx_order_rules,
                 "request_params": request_params,
+            },
+        )
+
+    def _entry_market_order_size_adjustment(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        okx_symbol: str,
+        contract_size: float,
+        order_quantity: float,
+        base_quantity: float,
+        okx_order_rules: dict[str, Any],
+    ) -> dict[str, Any] | ExecutionResult | None:
+        max_market_contracts = self._safe_float(
+            okx_order_rules.get("amount_max_market_contracts"), 0.0
+        ) or self._amount_market_max(okx_order_rules)
+        if max_market_contracts <= 0 or order_quantity <= max_market_contracts:
+            return None
+        adjusted_contracts = min(order_quantity, max_market_contracts)
+        adjusted_base_quantity = adjusted_contracts * contract_size
+        adjusted_notional = adjusted_base_quantity * max(price, 0.0)
+        amount_min = self._safe_float(okx_order_rules.get("amount_min_contracts"), 0.0)
+        min_notional = self._safe_float(okx_order_rules.get("min_notional_usdt"), 0.0)
+        if adjusted_contracts <= 0 or (amount_min > 0 and adjusted_contracts + 1e-12 < amount_min):
+            return self._entry_market_order_size_rejection_result(
+                decision=decision,
+                side=side,
+                price=price,
+                okx_symbol=okx_symbol,
+                contract_size=contract_size,
+                order_quantity=order_quantity,
+                base_quantity=base_quantity,
+                okx_order_rules=okx_order_rules,
+                blocker="system_pre_submit_market_order_max_too_small_after_cap",
+                error=(
+                    "计划市价单张数超过 OKX 单笔市价单上限，但按上限缩量后低于 OKX 最小下单张数，"
+                    "系统未提交无效订单。"
+                ),
+            )
+        if min_notional > 0 and adjusted_notional + 1e-12 < min_notional:
+            return self._entry_market_order_size_rejection_result(
+                decision=decision,
+                side=side,
+                price=price,
+                okx_symbol=okx_symbol,
+                contract_size=contract_size,
+                order_quantity=order_quantity,
+                base_quantity=base_quantity,
+                okx_order_rules=okx_order_rules,
+                blocker="system_pre_submit_market_order_max_notional_below_min_after_cap",
+                error=(
+                    "计划市价单张数超过 OKX 单笔市价单上限，但按上限缩量后的名义金额低于 OKX 最小要求，"
+                    "系统未提交无效订单。"
+                ),
+            )
+        original_notional = base_quantity * max(price, 0.0)
+        reduction_ratio = (
+            max(0.0, 1.0 - (adjusted_notional / original_notional))
+            if original_notional > 0
+            else 0.0
+        )
+        return {
+            "applied": True,
+            "reason": "okx_single_market_order_max_size",
+            "original_planned_order_contracts": order_quantity,
+            "original_planned_base_quantity": base_quantity,
+            "original_planned_notional_usdt": round(original_notional, 8),
+            "adjusted_order_contracts": adjusted_contracts,
+            "adjusted_base_quantity": adjusted_base_quantity,
+            "adjusted_notional_usdt": round(adjusted_notional, 8),
+            "amount_max_market_contracts": max_market_contracts,
+            "risk_notional_reduction_ratio": round(reduction_ratio, 8),
+            "okx_symbol": okx_symbol,
+            "contract_size": contract_size,
+        }
+
+    def _entry_market_order_size_rejection_result(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        okx_symbol: str,
+        contract_size: float,
+        order_quantity: float,
+        base_quantity: float,
+        okx_order_rules: dict[str, Any],
+        blocker: str = "system_pre_submit_market_order_max",
+        error: str | None = None,
+    ) -> ExecutionResult:
+        max_market_contracts = self._safe_float(
+            okx_order_rules.get("amount_max_market_contracts"), 0.0
+        ) or self._amount_market_max(okx_order_rules)
+        return ExecutionResult(
+            order_id="rejected",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=0.0,
+            price=price,
+            status=OrderStatus.REJECTED,
+            raw_response={
+                "error": error
+                or (
+                    "计划市场单张数超过 OKX 单笔市价单上限，系统已在提交前拦截，"
+                    "未向 OKX 发送必然被拒绝的订单。"
+                ),
+                "execution_blocker": blocker,
+                "system_pre_submit_rejection": True,
+                "okx_rejection": False,
+                "okx_symbol": okx_symbol,
+                "contract_size": contract_size,
+                "planned_order_contracts": order_quantity,
+                "planned_base_quantity": base_quantity,
+                "amount_max_market_contracts": max_market_contracts,
+                "okx_order_rules": okx_order_rules,
             },
         )
 
@@ -1633,6 +2627,18 @@ class OKXExecutor(AbstractExecutor):
             return precision_amount
         return 0.0
 
+    def _amount_market_max(self, market: dict[str, Any]) -> float:
+        info_max = self._market_info_float(
+            market,
+            "maxMktSz",
+            "maxMarketSz",
+            "maxMarketSize",
+            "max_market_size",
+        )
+        if info_max > 0:
+            return info_max
+        return self._safe_float(((market.get("limits") or {}).get("amount") or {}).get("max"), 0.0)
+
     def _market_info_float(self, market: dict[str, Any], *keys: str) -> float:
         info = market.get("info") or {}
         for key in keys:
@@ -1666,6 +2672,56 @@ class OKXExecutor(AbstractExecutor):
         if normalized <= 0 or (minimum > 0 and normalized < minimum):
             normalized = self._ceil_to_amount_step(max(target, minimum), market)
         return normalized if normalized > 0 else 0.0
+
+    def _exit_market_order_slices(
+        self,
+        ccxt,
+        market: dict[str, Any],
+        contracts: float,
+    ) -> list[float]:
+        max_contracts = self._amount_market_max(market)
+        if contracts <= 0 or max_contracts <= 0 or contracts <= max_contracts:
+            return []
+
+        chunks: list[float] = []
+        remaining = contracts
+        minimum = self._amount_min(market)
+        while remaining > 1e-12:
+            chunk = min(remaining, max_contracts)
+            chunk = self._clamp_exit_chunk_contracts(ccxt, market, chunk)
+            if chunk <= 0:
+                break
+            if minimum > 0 and chunk < minimum:
+                break
+            chunks.append(chunk)
+            remaining = max(remaining - chunk, 0.0)
+            if len(chunks) > 100:
+                logger.warning(
+                    "split exit order exceeded chunk safety limit",
+                    symbol=market.get("symbol"),
+                    requested_contracts=contracts,
+                    max_contracts=max_contracts,
+                )
+                break
+        return chunks if len(chunks) > 1 else []
+
+    def _clamp_exit_chunk_contracts(self, ccxt, market: dict[str, Any], contracts: float) -> float:
+        if contracts <= 0:
+            return 0.0
+        max_contracts = self._amount_market_max(market)
+        amount = min(contracts, max_contracts) if max_contracts > 0 else contracts
+        try:
+            amount = float(ccxt.amount_to_precision(market["symbol"], amount))
+        except Exception as exc:
+            logger.debug(
+                "OKX amount precision failed for split exit chunk",
+                symbol=market.get("symbol"),
+                contracts=amount,
+                error=safe_error_text(exc),
+            )
+        if max_contracts > 0 and amount > max_contracts:
+            amount = max_contracts
+        return amount if amount > 0 else 0.0
 
     def _ceil_to_amount_step(self, amount: float, market: dict[str, Any]) -> float:
         step = self._amount_step(market)
@@ -1811,7 +2867,7 @@ class OKXExecutor(AbstractExecutor):
             )
 
         try:
-            market = ccxt.market(okx_symbol)
+            market = await self._market_for_symbol(okx_symbol)
             inst_id = (market.get("info") or {}).get("instId") or okx_symbol.replace(
                 "/", "-"
             ).replace(":USDT", "-SWAP")
@@ -1858,7 +2914,7 @@ class OKXExecutor(AbstractExecutor):
     async def _set_leverage_if_needed(self, decision: DecisionOutput) -> dict[str, Any]:
         """Apply leverage with a fast happy path and one safe 59670 recovery attempt."""
         ccxt = await self._get_ccxt()
-        okx_symbol = self._to_swap_symbol(decision.symbol)
+        okx_symbol = await self._resolve_swap_symbol(decision.symbol)
         params = {"mgnMode": "cross"}
         requested_leverage = int(
             max(1, min(int(round(decision.suggested_leverage)), settings.max_leverage))
@@ -2186,6 +3242,64 @@ class OKXExecutor(AbstractExecutor):
                 return f"{parts[0]}/USDT:USDT"
         return symbol
 
+    async def _resolve_swap_symbol(self, symbol: str) -> str:
+        """Return the CCXT symbol for an app symbol, honoring OKX native instIds."""
+
+        candidate = self._to_swap_symbol(symbol)
+        try:
+            await self._ensure_markets_loaded()
+            ccxt = await self._get_ccxt()
+            try:
+                ccxt.market(candidate)
+                market = ccxt.market(candidate)
+                native_symbol = symbol_from_okx_payload(market, fallback=symbol)
+                requested_symbol = normalize_trading_symbol(symbol)
+                if native_symbol and requested_symbol and native_symbol != requested_symbol:
+                    raise ExchangeAPIError(
+                        "OKX market symbol mismatch: "
+                        f"requested {requested_symbol}, exchange instrument is {native_symbol}"
+                    )
+                return candidate
+            except Exception as exc:
+                if isinstance(exc, ExchangeAPIError):
+                    raise
+                logger.debug(
+                    "OKX candidate CCXT symbol not found; trying native instId mapping",
+                    symbol=symbol,
+                    candidate=candidate,
+                    error=safe_error_text(exc),
+                )
+            native = normalize_trading_symbol(symbol).replace("/", "-")
+            market_id = f"{native}-SWAP" if native else ""
+            by_id = (getattr(ccxt, "markets_by_id", None) or {}).get(market_id)
+            markets = by_id if isinstance(by_id, list) else [by_id] if by_id else []
+            for market in markets:
+                if isinstance(market, dict) and market.get("symbol"):
+                    return str(market["symbol"])
+            positions = await self.get_positions_strict(symbol)
+            for position in positions or []:
+                info = position.get("info") or {}
+                native_position_symbol = str(
+                    position.get("symbol") or info.get("instId") or ""
+                ).strip()
+                if native_position_symbol:
+                    logger.warning(
+                        "OKX swap symbol resolved from existing position snapshot",
+                        symbol=symbol,
+                        okx_symbol=native_position_symbol,
+                    )
+                    return native_position_symbol
+        except ExchangeAPIError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "OKX swap symbol resolution fell back to direct conversion",
+                symbol=symbol,
+                candidate=candidate,
+                error=safe_error_text(exc),
+            )
+        return candidate
+
     def _from_swap_symbol(self, symbol: str | None) -> str:
         """Convert OKX/CCXT swap symbols back to app symbols."""
         normalized = str(symbol or "").strip().upper()
@@ -2199,6 +3313,12 @@ class OKXExecutor(AbstractExecutor):
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
         return normalized
+
+    @staticmethod
+    def _execution_result_symbol(order: dict[str, Any], decision_symbol: str) -> str:
+        exchange_symbol = symbol_from_okx_payload(order, fallback=decision_symbol)
+        decision_normalized = normalize_trading_symbol(decision_symbol)
+        return exchange_symbol or decision_normalized or str(decision_symbol or "")
 
     def _attached_sl_tp_prices(
         self,
@@ -2464,7 +3584,25 @@ class OKXExecutor(AbstractExecutor):
         await self._ensure_markets_loaded()
         ccxt = await self._get_ccxt()
         symbols = [self._to_swap_symbol(symbol)] if symbol else None
-        return await self._with_retry(ccxt.fetch_positions, symbols)
+        try:
+            return await self._with_retry(ccxt.fetch_positions, symbols)
+        except Exception as exc:
+            if not symbol or not self._is_missing_market_symbol_error(safe_error_text(exc)):
+                raise
+            positions = await self._with_retry(ccxt.fetch_positions, None)
+            matched = [
+                position
+                for position in positions or []
+                if isinstance(position, dict) and self._position_matches_symbol(position, symbol)
+            ]
+            if matched:
+                logger.warning(
+                    "OKX symbol-specific position lookup missing from market cache; using account-wide position match",
+                    symbol=symbol,
+                    matched=len(matched),
+                )
+                return matched
+            return []
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None

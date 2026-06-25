@@ -20,7 +20,7 @@ import httpx
 import structlog
 from sqlalchemy import select
 
-from config.settings import ENSEMBLE_TRADER_NAME, settings
+from config.settings import DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL, ENSEMBLE_TRADER_NAME, settings
 from core.model_runtime import apply_non_thinking_request_controls, completion_token_limit
 from core.safe_output import safe_error_text, safe_response_error_text
 from db.session import get_read_session_ctx, get_session_ctx
@@ -34,6 +34,7 @@ from models.learning import (
 )
 from models.trade import Order, Position
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
+from services.entry_strategy_mode import PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
 from services.okx_error_classifier import is_okx_temporary_service_error
@@ -2941,7 +2942,7 @@ class StrategyScheduler:
             1,
             _safe_int(
                 open_pressure.get("max_open_positions"),
-                int(settings.max_open_positions_per_model or 1),
+                int(settings.max_open_positions_per_model or DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL),
             ),
         )
         open_groups = max(0, _safe_int(open_pressure.get("open_group_count"), 0))
@@ -2990,8 +2991,10 @@ class StrategyScheduler:
             min(
                 int(settings.auto_scan_symbol_limit or 1),
                 max(
+                    PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN,
                     1,
                     math.ceil(max(target_groups - open_groups, 1) * 0.30 * max_open),
+                    math.ceil(max(target_groups - open_groups, 1) * 1.5),
                 ),
             ),
         )
@@ -3806,7 +3809,8 @@ class StrategyLearningService:
             memories=rows["memories"],
             strategy_events=rows["strategy_events"],
             reflections=rows["reflections"],
-            max_open_positions=max_open_positions or int(settings.max_open_positions_per_model),
+            max_open_positions=max_open_positions
+            or int(settings.max_open_positions_per_model or DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL),
         )
 
     def _build_payload_from_feedback(

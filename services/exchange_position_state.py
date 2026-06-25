@@ -11,6 +11,7 @@ import structlog
 from core.safe_output import safe_error_text
 
 logger = structlog.get_logger(__name__)
+ALL_PROTECTION_ORDERS_CACHE_KEY = "__all_position_protection_orders__"
 
 
 def _first_float(*values: Any, default: float | None = 0.0) -> float | None:
@@ -38,6 +39,28 @@ def _first_nonzero_float(*values: Any, default: float = 0.0) -> float:
     return default
 
 
+def _infer_contract_size_from_pnl(
+    *,
+    side: str,
+    contracts: float,
+    mark_price: float,
+    entry_price: float,
+    upl: float | None,
+) -> float:
+    """Infer missing OKX ctVal from exchange UPL when CCXT omits contractSize."""
+
+    if contracts <= 0 or mark_price <= 0 or entry_price <= 0 or upl is None:
+        return 0.0
+    price_delta = entry_price - mark_price if side == "short" else mark_price - entry_price
+    denominator = price_delta * contracts
+    if abs(denominator) <= 1e-12:
+        return 0.0
+    inferred = abs(upl / denominator)
+    if inferred <= 0 or inferred > 100000:
+        return 0.0
+    return inferred
+
+
 def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
     return (
         _first_positive_float(
@@ -51,14 +74,12 @@ def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
 
 
 def exchange_snapshot_quantity(snapshot: dict[str, Any]) -> float:
-    quantity = _first_positive_float(snapshot.get("quantity"), default=0.0)
-    if quantity > 0:
-        return quantity
     contracts = abs(_first_nonzero_float(snapshot.get("contracts"), default=0.0))
     contract_size = abs(_first_positive_float(snapshot.get("contract_size"), default=1.0) or 1.0)
-    if contracts <= 0:
-        return 0.0
-    return contracts * contract_size
+    if contracts > 0:
+        return contracts * contract_size
+    quantity = _first_positive_float(snapshot.get("quantity"), default=0.0)
+    return quantity if quantity > 0 else 0.0
 
 
 def exchange_snapshot_unrealized(snapshot: dict[str, Any], side: str) -> float:
@@ -169,17 +190,17 @@ def parse_exchange_position_snapshot(
         )
         or 0.0
     )
-    contract_size = abs(
+    explicit_contract_size = abs(
         _first_positive_float(
             position.get("contractSize"),
             position.get("contract_size"),
             info.get("ctVal"),
             info.get("contractSize"),
-            default=1.0,
+            default=0.0,
         )
-        or 1.0
+        or 0.0
     )
-    quantity = abs(
+    raw_quantity = abs(
         _first_positive_float(
             position.get("quantity"),
             position.get("baseVolume"),
@@ -188,8 +209,6 @@ def parse_exchange_position_snapshot(
         )
         or 0.0
     )
-    if quantity <= 0 and contracts > 0:
-        quantity = contracts * contract_size
     entry_price = _first_positive_float(
         position.get("entryPrice"),
         position.get("entry_price"),
@@ -197,6 +216,16 @@ def parse_exchange_position_snapshot(
         info.get("avg_price"),
         default=0.0,
     )
+    contract_size = explicit_contract_size or _infer_contract_size_from_pnl(
+        side=side,
+        contracts=contracts,
+        mark_price=mark_price,
+        entry_price=entry_price,
+        upl=upl,
+    )
+    if contract_size <= 0:
+        contract_size = 1.0
+    quantity = contracts * contract_size if contracts > 0 else raw_quantity
     margin_used = (
         _first_positive_float(position.get("initialMargin"), default=0.0)
         or _first_positive_float(position.get("margin"), default=0.0)
@@ -215,6 +244,7 @@ def parse_exchange_position_snapshot(
         "contracts": contracts,
         "contract_size": contract_size,
         "quantity": quantity,
+        "raw_quantity": raw_quantity,
         "margin_used": margin_used,
         "raw_symbol": position.get("symbol") or info.get("instId"),
     }
@@ -285,10 +315,17 @@ class ExchangeProtectionMapProvider:
         }
         symbols.discard("")
 
-        protection_results = await asyncio.gather(
-            *(self._fetch_symbol_orders(executor, symbol) for symbol in symbols),
-            return_exceptions=False,
-        )
+        if not symbols:
+            return protection_by_key
+
+        account_wide_orders = await self._fetch_account_wide_orders(executor, symbols)
+        if account_wide_orders is None:
+            protection_results = await asyncio.gather(
+                *(self._fetch_symbol_orders(executor, symbol) for symbol in symbols),
+                return_exceptions=False,
+            )
+        else:
+            protection_results = [account_wide_orders]
 
         for _symbol, orders in protection_results:
             for order in orders or []:
@@ -307,6 +344,69 @@ class ExchangeProtectionMapProvider:
                 protection_by_key[key] = order
 
         return protection_by_key
+
+    def _filter_orders_for_symbols(
+        self,
+        orders: list[dict[str, Any]],
+        symbols: set[str],
+    ) -> list[dict[str, Any]]:
+        return [
+            order
+            for order in orders or []
+            if self.symbol_normalizer(order.get("symbol")) in symbols
+        ]
+
+    async def _fetch_account_wide_orders(
+        self,
+        executor: Any,
+        symbols: set[str],
+    ) -> tuple[str, list[dict]] | None:
+        now = time.monotonic()
+        cached = self._cache.get(ALL_PROTECTION_ORDERS_CACHE_KEY)
+        if cached and cached.expires_at > now:
+            return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
+                list(cached.orders),
+                symbols,
+            )
+
+        try:
+            orders = await asyncio.wait_for(
+                executor.get_position_protection_orders(None),
+                timeout=self.timeout_seconds,
+            )
+            normalized_orders = list(orders or [])
+            if self.cache_ttl_seconds > 0:
+                self._cache[ALL_PROTECTION_ORDERS_CACHE_KEY] = _ProtectionCacheEntry(
+                    orders=normalized_orders,
+                    expires_at=now + self.cache_ttl_seconds,
+                )
+            return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
+                normalized_orders,
+                symbols,
+            )
+        except TimeoutError:
+            logger.warning(
+                "timed out fetching account-wide OKX TP/SL protection orders",
+                symbols=len(symbols),
+            )
+            if cached:
+                return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
+                    list(cached.orders),
+                    symbols,
+                )
+            return ALL_PROTECTION_ORDERS_CACHE_KEY, []
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch account-wide OKX TP/SL protection orders",
+                symbols=len(symbols),
+                error=safe_error_text(exc),
+            )
+            if cached:
+                return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
+                    list(cached.orders),
+                    symbols,
+                )
+            return None
 
     async def _fetch_symbol_orders(self, executor: Any, symbol: str) -> tuple[str, list[dict]]:
         now = time.monotonic()

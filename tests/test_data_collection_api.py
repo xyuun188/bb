@@ -165,6 +165,39 @@ async def test_data_collection_normalizes_unknown_local_ai_status(
 
 
 @pytest.mark.asyncio
+async def test_data_collection_marks_available_local_ai_bundle_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "status": "unknown",
+                "model_bundle_available": True,
+                "service_available": True,
+                "trained_at": "2026-06-23T16:58:10+00:00",
+                "shadow_sample_count": 12,
+                "trade_sample_count": 3,
+                "text_sentiment_sample_count": 8,
+                "models": {"profit": "trained"},
+            }
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["status"] == "ready"
+    assert status["raw_status"] == "unknown"
+    assert status["model_bundle_available"] is True
+    assert status["service_available"] is True
+    assert status["trained_at"] == "2026-06-23T16:58:10+00:00"
+
+
+@pytest.mark.asyncio
 async def test_data_collection_unknown_local_ai_without_samples_is_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

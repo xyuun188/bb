@@ -7,6 +7,7 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision
+from services.decision_state import DecisionStageStatus, decision_state_from_raw
 from services.text_integrity import sanitize_runtime_text
 
 
@@ -110,6 +111,50 @@ class DecisionRepository(BaseRepository):
         if rows:
             await self.session.flush()
         return len(rows)
+
+    async def finalize_unresolved_decisions(
+        self,
+        decision_updates: list[tuple[int, str, dict[str, Any]]],
+    ) -> int:
+        """Persist final skipped state for non-executed decisions left without a terminal state."""
+
+        if not decision_updates:
+            return 0
+        ids = [int(decision_id) for decision_id, _reason, _raw in decision_updates if decision_id]
+        if not ids:
+            return 0
+        result = await self.session.execute(select(AIDecision).where(AIDecision.id.in_(ids)))
+        rows = {int(row.id): row for row in result.scalars().all()}
+        updated = 0
+        for decision_id, reason, raw_response in decision_updates:
+            row = rows.get(int(decision_id))
+            if row is None or bool(row.was_executed):
+                continue
+            current_machine = decision_state_from_raw(row.raw_llm_response)
+            current_summary = (
+                current_machine.get("summary") if isinstance(current_machine, dict) else {}
+            )
+            current_status = str(current_summary.get("final_status") or "")
+            if (
+                current_status
+                in {
+                    DecisionStageStatus.BLOCKED,
+                    DecisionStageStatus.FAILED,
+                    DecisionStageStatus.SKIPPED,
+                    DecisionStageStatus.COMPLETED,
+                }
+                and str(row.execution_reason or "").strip()
+            ):
+                continue
+            clean_reason = sanitize_runtime_text(reason)
+            clean_response = sanitize_runtime_text(raw_response)
+            row.execution_reason = clean_reason
+            row.raw_llm_response = clean_response
+            _sync_execution_parameters(row, clean_response)
+            updated += 1
+        if updated:
+            await self.session.flush()
+        return updated
 
     async def mark_outcome(
         self, decision_id: int, outcome: str, pnl_pct: float

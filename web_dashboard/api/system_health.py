@@ -1089,7 +1089,7 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
             and latest_scored_entry_at >= latest_missing_score_at
         )
         if has_newer_scored_entry:
-            status = "warning"
+            status = "info"
             message = f"历史旧记录仍有 {len(missing_opportunity_score_decisions)} 条缺评分，但最新开仓决策已补齐评分。"
         else:
             status = "critical"

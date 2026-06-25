@@ -61,6 +61,7 @@ tmp_*.log
 *.rar
 .tmp/
 .rtk/
+.codex/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

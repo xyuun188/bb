@@ -445,6 +445,29 @@ class ExitFeeChurnGuardPolicy:
                 )
 
                 if (
+                    exit_intent == ExitIntent.CAPITAL_ROTATION
+                    and net_now < 0
+                    and not early_hard_risk_confirmed
+                ):
+                    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                    raw["capital_rotation_loss_guard"] = {
+                        "applied": True,
+                        "net_profit_after_fee": round(net_now, 8),
+                        "trend_still_valid": bool(continuation_valid),
+                        "exit_intent": exit_intent.value,
+                        "reason": (
+                            "capital rotation cannot realize a net loss without hard-risk or "
+                            "trend-invalidation evidence"
+                        ),
+                    }
+                    decision.raw_response = raw
+                    return (
+                        f"仓位轮动保护：{decision.symbol} 当前扣费后预计净亏 {net_now:.4f} USDT，"
+                        "未触发硬止损、止盈、严重趋势失效或预测下行风险。低质量仓位释放只能在不制造净亏损"
+                        "或已有明确风险证据时执行，本轮继续持有。"
+                    )
+
+                if (
                     age_minutes < MIN_DISCRETIONARY_HOLD_MINUTES
                     and not invalidation_confirmed
                     and not protective_downside_exit_intent

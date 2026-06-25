@@ -10,6 +10,7 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
@@ -47,11 +48,12 @@ class TradeOrderLogService:
         try:
             async with self._session_context_factory() as session:
                 repo = self._trade_repo_factory(session)
+                symbol = self._result_symbol(result, decision)
                 await repo.create_order(
                     {
                         "model_name": model_name,
                         "execution_mode": self._execution_mode_provider(model_name),
-                        "symbol": result.symbol,
+                        "symbol": symbol,
                         "side": result.side,
                         "order_type": result.order_type,
                         "quantity": result.quantity,
@@ -87,9 +89,42 @@ class TradeOrderLogService:
         tracking_only = bool(raw.get("entry_tracking") or raw.get("exit_tracking"))
         if tracking_only and quantity <= 0:
             return True
+        exchange_confirmed_statuses = {
+            OrderStatus.PARTIAL.value,
+            OrderStatus.FILLED.value,
+        }
+        if status_text in exchange_confirmed_statuses:
+            exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
+            if not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}:
+                return True
         if quantity <= 0 and status_text in active_or_filled:
             return True
         return price <= 0 and status_text in active_or_filled
+
+    @staticmethod
+    def _result_symbol(result: Any, decision: DecisionOutput) -> str:
+        decision_symbol = normalize_trading_symbol(decision.symbol)
+        status = getattr(result, "status", None)
+        status_value = getattr(status, "value", status)
+        status_text = str(status_value or "").lower()
+        exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
+        exchange_confirmed = (
+            status_text in {OrderStatus.PARTIAL.value, OrderStatus.FILLED.value}
+            and bool(exchange_order_id)
+            and exchange_order_id not in {"hold", "rejected", "no_position"}
+        )
+        if not exchange_confirmed:
+            return decision_symbol or normalize_trading_symbol(getattr(result, "symbol", None))
+
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        explicit = normalize_trading_symbol(raw.get("canonical_exchange_symbol"))
+        if explicit:
+            return explicit
+        exchange_symbol = symbol_from_okx_payload(raw, fallback=getattr(result, "symbol", None))
+        if exchange_symbol:
+            return exchange_symbol
+        return normalize_trading_symbol(getattr(result, "symbol", None) or decision.symbol)
 
     @staticmethod
     def _safe_float(value: Any, default: float) -> float:

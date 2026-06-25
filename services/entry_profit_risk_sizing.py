@@ -717,7 +717,7 @@ class EntryProfitRiskSizingPolicy:
                 leverage = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE
                 decision.suggested_leverage = leverage
                 caps.append("服务器盈利模型未支持该方向，降低杠杆")
-        low_payoff_quality = self.entry_low_payoff_quality.is_low_payoff(
+        low_payoff_reasons = self.entry_low_payoff_quality.reasons(
             score=score,
             min_score_required=min_score_required,
             expected_net_return_pct=expected_net,
@@ -728,6 +728,7 @@ class EntryProfitRiskSizingPolicy:
             evidence_score=evidence_score,
             evidence_effective_score=evidence_effective_score,
         )
+        low_payoff_quality = bool(low_payoff_reasons)
         if low_payoff_quality:
             high_quality_entry = False
             if current_size > ENTRY_LOW_QUALITY_MAX_SIZE:
@@ -1205,6 +1206,7 @@ class EntryProfitRiskSizingPolicy:
             "atr_14": round(atr_14, 8),
             "atr_pct": round(atr_pct, 8),
             "low_payoff_quality": bool(low_payoff_quality),
+            "low_payoff_reasons": low_payoff_reasons,
             "quality_caps": caps,
             "evidence_score": evidence_score,
             "high_quality_entry": bool(high_quality_entry),

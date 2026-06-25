@@ -43,6 +43,53 @@ def test_decision_reason_recovery_uses_decision_reasoning_when_evidence_reason_m
     assert "裁决依据：空头动能衰减" in reason
 
 
+def test_decision_reason_recovery_prefers_exchange_failure_from_raw_result() -> None:
+    decision = SimpleNamespace(
+        action="close_long",
+        reasoning="模型建议平仓",
+        raw_llm_response={
+            "close_evidence": {
+                "action_plan": "full_close",
+                "reason": "落袋止盈",
+                "position_unrealized_pnl": 1.5,
+            },
+            "execution_result": {
+                "status": "rejected",
+                "raw_response": {
+                    "error": (
+                        'okx {"code":"1","data":[{"ordId":"","sCode":"51028",'
+                        '"sMsg":"Contract under delivery."}],"msg":"All operations failed"}'
+                    )
+                },
+            },
+        },
+    )
+
+    reason = DecisionReasonRecoveryPolicy().recover(decision)
+
+    assert reason is not None
+    assert "OKX 51028" in reason
+    assert "Contract under delivery" in reason
+    assert "落袋止盈" not in reason
+
+
+def test_decision_reason_recovery_prefers_untradable_exit_error() -> None:
+    decision = SimpleNamespace(
+        action="close_short",
+        reasoning="模型建议平仓",
+        raw_llm_response={
+            "untradable_exit_execution_error": {
+                "reason": "rejected {'sCode': '51028', 'sMsg': 'Contract under delivery.'}"
+            },
+        },
+    )
+
+    reason = DecisionReasonRecoveryPolicy().recover(decision)
+
+    assert reason is not None
+    assert "OKX 51028" in reason
+
+
 def test_decision_reason_recovery_returns_generic_exit_reason_without_detail() -> None:
     decision = SimpleNamespace(action="close_long", reasoning="", raw_llm_response={})
 

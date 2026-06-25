@@ -65,6 +65,11 @@ def test_entry_feature_ranker_uses_secondary_fill_when_hard_candidates_are_not_e
     assert result.diagnostics["tradable_candidates"] == 1
     assert result.diagnostics["secondary_candidates"] == 1
     assert result.diagnostics["symbols"][1]["selection_tier"] == "secondary_fill"
+    assert result.diagnostics["ranked_symbol_sample"][0]["selected"] is True
+    assert (
+        result.diagnostics["ranked_symbol_sample"][0]["non_selected_reason"]
+        == "selected_for_market_analysis"
+    )
 
 
 def test_entry_feature_ranker_penalizes_recent_hold_symbols() -> None:
@@ -81,3 +86,104 @@ def test_entry_feature_ranker_penalizes_recent_hold_symbols() -> None:
     )
 
     assert list(result.selected) == ["LINK/USDT"]
+
+
+def test_entry_feature_ranker_defers_recent_analysis_when_fresh_candidates_exist() -> None:
+    ranker = _ranker()
+    result = ranker.rank(
+        {
+            "SOL/USDT": _feature("SOL/USDT", returns_5=0.060),
+            "LINK/USDT": _feature("LINK/USDT", returns_5=0.050),
+            "XRP/USDT": _feature("XRP/USDT", returns_5=0.006),
+            "ADA/USDT": _feature("ADA/USDT", returns_5=0.005),
+        },
+        2,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda symbol: 1.0 if symbol in {"SOL/USDT", "LINK/USDT"} else 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    assert list(result.selected) == ["XRP/USDT", "ADA/USDT"]
+    diagnostics = {item["symbol"]: item for item in result.diagnostics["ranked_symbol_sample"]}
+    assert diagnostics["SOL/USDT"]["non_selected_reason"] == ("recent_analysis_diversity_deferred")
+    assert result.diagnostics["recent_analysis_diversity"]["applied"] is True
+    assert result.diagnostics["recent_analysis_diversity"]["recent_deferred_count"] == 2
+
+
+def test_entry_feature_ranker_explains_symbols_outside_market_budget() -> None:
+    ranker = _ranker()
+    result = ranker.rank(
+        {
+            "SOL/USDT": _feature("SOL/USDT", returns_5=0.020),
+            "LINK/USDT": _feature("LINK/USDT", returns_5=0.015),
+            "DOGE/USDT": _feature(
+                "DOGE/USDT",
+                volume_ratio=0.10,
+                volume_24h=10_000.0,
+                adx_14=9.0,
+            ),
+            "THIN/USDT": _feature(
+                "THIN/USDT",
+                volume_ratio=0.01,
+                volume_24h=1.0,
+                adx_14=1.0,
+            ),
+        },
+        1,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    diagnostics = {item["symbol"]: item for item in result.diagnostics["ranked_symbol_sample"]}
+
+    assert result.diagnostics["market_symbol_limit"] == 1
+    assert result.diagnostics["filtered_out_candidates"] == 1
+    assert diagnostics["SOL/USDT"]["selected"] is True
+    assert diagnostics["LINK/USDT"]["selected"] is False
+    assert diagnostics["LINK/USDT"]["non_selected_reason"] == "outside_market_symbol_budget"
+    assert diagnostics["DOGE/USDT"]["selection_tier"] == "secondary_fill"
+    assert "THIN/USDT" not in diagnostics
+
+
+def test_entry_feature_ranker_explains_filtered_symbols_when_rank_underfills() -> None:
+    ranker = _ranker()
+    result = ranker.rank(
+        {
+            "SOL/USDT": _feature("SOL/USDT"),
+            "THIN/USDT": _feature(
+                "THIN/USDT",
+                volume_ratio=0.01,
+                volume_24h=1.0,
+                adx_14=1.0,
+            ),
+            "WILD/USDT": _feature(
+                "WILD/USDT",
+                volatility_20=0.30,
+                change_24h_pct=45.0,
+            ),
+        },
+        2,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    filtered = {item["symbol"]: item for item in result.diagnostics["filtered_symbol_sample"]}
+    reason_counts = {
+        item["reason"]: item["count"] for item in result.diagnostics["filtered_out_reason_counts"]
+    }
+
+    assert list(result.selected) == ["SOL/USDT"]
+    assert result.diagnostics["rank_underfilled"] is True
+    assert result.diagnostics["rank_underfill_reason"] == (
+        "insufficient_tradeable_or_secondary_candidates"
+    )
+    assert result.diagnostics["filtered_out_candidates"] == 2
+    assert reason_counts["analysis_volume_ratio_below_floor"] == 1
+    assert reason_counts["analysis_notional_below_floor"] == 1
+    assert reason_counts["analysis_volatility_above_cap"] == 1
+    assert reason_counts["analysis_day_change_above_cap"] == 1
+    assert filtered["THIN/USDT"]["non_selected_reason"] == "feature_filter_rejected"
+    assert "analysis_volume_ratio_below_floor" in filtered["THIN/USDT"]["filter_reasons"]
+    assert filtered["WILD/USDT"]["filter_metrics"]["change_24h"] == 45.0

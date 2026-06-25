@@ -39,6 +39,7 @@ from services.secure_runtime_config import (
     strip_secret_env_updates,
 )
 from services.server_monitor_status import ServerMonitorStatusService, clear_server_monitor_cache
+from services.trading_params import DEFAULT_TRADING_PARAMS, ESTIMATED_TAKER_FEE_PCT
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
@@ -1077,6 +1078,12 @@ class IntervalRequest(BaseModel):
 class ThresholdsRequest(BaseModel):
     decision_interval: int | None = None
     confidence_threshold: float | None = None
+    max_position_pct: float | None = None
+    max_leverage: float | None = None
+    max_daily_loss_pct: float | None = None
+    hard_stop_loss_pct: float | None = None
+    max_open_positions_per_model: int | None = None
+    max_same_symbol_positions_per_side: int | None = None
     total_margin_limit_pct: float | None = None
     max_slippage_pct: float | None = None
     local_ai_tools_enabled: bool | None = None
@@ -1094,18 +1101,464 @@ class ThresholdsRequest(BaseModel):
     high_risk_review_circuit_breaker_cooldown_seconds: float | None = None
 
 
+def _effective_total_margin_limit_pct() -> float:
+    configured = float(settings.max_total_margin_pct or 0.0)
+    if configured > 0:
+        return configured
+    return float(settings.max_position_pct or 0.0) * 3
+
+
+def _pct(value: float, digits: int = 2) -> str:
+    return f"{float(value) * 100:.{digits}f}%"
+
+
+def _ratio(value: float, digits: int = 4) -> str:
+    return f"{float(value):.{digits}f}"
+
+
+def _threshold_item(
+    *,
+    key: str,
+    label: str,
+    current: Any,
+    current_display: str | None = None,
+    effective: Any | None = None,
+    effective_display: str | None = None,
+    unit: str = "",
+    source: str = "",
+    surface: str = "",
+    bounds: dict[str, Any] | None = None,
+    effect: str,
+    increase_effect: str = "",
+    decrease_effect: str = "",
+    automation: str = "",
+    reason: str = "",
+    status: str = "active",
+) -> dict[str, Any]:
+    payload = {
+        "key": key,
+        "label": label,
+        "current": current,
+        "current_display": current_display if current_display is not None else str(current),
+        "effective": current if effective is None else effective,
+        "effective_display": (
+            effective_display
+            if effective_display is not None
+            else (current_display if effective is None else str(effective))
+        ),
+        "unit": unit,
+        "source": source,
+        "surface": surface,
+        "bounds": bounds or {},
+        "effect": effect,
+        "increase_effect": increase_effect,
+        "decrease_effect": decrease_effect,
+        "automation": automation,
+        "reason": reason,
+        "status": status,
+    }
+    return payload
+
+
+def _threshold_catalog() -> dict[str, Any]:
+    from risk_manager.engine import (
+        MIN_ENTRY_CONFIDENCE_AFTER_FEES,
+        MIN_REWARD_RISK_RATIO,
+        MIN_TAKE_PROFIT_AFTER_COSTS,
+    )
+
+    strategy = DEFAULT_TRADING_PARAMS
+    learning = strategy.strategy_learning
+    total_margin_limit_pct = _effective_total_margin_limit_pct()
+    confidence_reference = max(
+        float(settings.confidence_threshold or 0.0),
+        MIN_ENTRY_CONFIDENCE_AFTER_FEES,
+    )
+
+    manual_editable = [
+        _threshold_item(
+            key="decision_interval_seconds",
+            label="决策间隔",
+            current=settings.decision_interval_seconds,
+            current_display=f"{settings.decision_interval_seconds} 秒",
+            unit="seconds",
+            source="DECISION_INTERVAL_SECONDS",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 10, "max": 3600, "step": 5},
+            effect="控制主循环触发市场分析和持仓复盘的基础频率。",
+            increase_effect="调大会降低模型调用频率和成本，但行情响应会变慢。",
+            decrease_effect="调小会更快响应行情，但会增加模型调用、接口压力和重复分析概率。",
+            reason="属于资源节奏配置，系统无法替你决定可接受的成本和延迟。",
+        ),
+        _threshold_item(
+            key="confidence_threshold",
+            label="最低信心阈值",
+            current=settings.confidence_threshold,
+            current_display=_ratio(settings.confidence_threshold, 2),
+            effective=confidence_reference,
+            effective_display=_ratio(confidence_reference, 2),
+            source="CONFIDENCE_THRESHOLD",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 0.10, "max": 1.00, "step": 0.05},
+            effect=(
+                "影响专家提示、集成决策低信心处理和仓位收缩；手续费后参考线 "
+                f"{MIN_ENTRY_CONFIDENCE_AFTER_FEES:.2f} 不会被手动调低。"
+            ),
+            increase_effect="调高会减少低信心候选和小单探针，但可能错过部分早期机会。",
+            decrease_effect="调低会增加候选数量，但不会绕过净收益、容量、滑点和硬风控。",
+            reason="这是交易风格偏好，不应由系统自动放松。",
+        ),
+        _threshold_item(
+            key="total_margin_limit_pct",
+            label="总保证金占用上限",
+            current=settings.max_total_margin_pct,
+            current_display=(
+                _pct(settings.max_total_margin_pct)
+                if float(settings.max_total_margin_pct or 0.0) > 0
+                else "未显式配置"
+            ),
+            effective=total_margin_limit_pct,
+            effective_display=_pct(total_margin_limit_pct),
+            source="MAX_TOTAL_MARGIN_PCT",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 0.10, "max": 1.00, "step": 0.01},
+            effect="限制账户同时占用的保证金比例，达到后停止新开仓但仍复盘和平仓。",
+            increase_effect="调高会允许更多仓位同时占用保证金，回撤和爆仓风险同步放大。",
+            decrease_effect="调低会更早停止新开仓，资金更保守但轮转速度下降。",
+            reason="这是账户最大风险承受能力，必须人工决定。",
+        ),
+        _threshold_item(
+            key="max_slippage_pct",
+            label="最大滑点上限",
+            current=settings.max_slippage_pct,
+            current_display=_pct(settings.max_slippage_pct),
+            source="MAX_SLIPPAGE_PCT",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 0.0002, "max": 0.02, "step": 0.0001},
+            effect="这是下单和评分可接受滑点的安全上限；真实成本由盘口价差和深度动态估算。",
+            increase_effect="调高会放过更差成交价，成交率可能升高但净收益更容易被吃掉。",
+            decrease_effect="调低会拒绝更多流动性差的订单，成交更挑剔但可能错过急速行情。",
+            reason="上限代表你愿意承受的最差成交偏差，不应由系统自动扩大。",
+        ),
+    ]
+
+    manual_service_controls = [
+        _threshold_item(
+            key="local_ai_tools_timeout_seconds",
+            label="本地量化 AI 工具超时",
+            current=settings.local_ai_tools_timeout_seconds,
+            current_display=f"{settings.local_ai_tools_timeout_seconds:.1f} 秒",
+            source="LOCAL_AI_TOOLS_TIMEOUT_SECONDS",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 0.2, "max": 15.0, "step": 0.1},
+            effect="控制盈利、时序、情绪等本地辅助证据的等待时间。",
+            increase_effect="调高会给本地工具更多时间返回证据，但会拖慢一轮分析。",
+            decrease_effect="调低会更快跳过慢服务，但辅助证据缺失会变多。",
+            reason="取决于本地/服务器工具性能，需要人工按部署环境配置。",
+        ),
+        _threshold_item(
+            key="local_ai_tools_circuit_breaker_failures",
+            label="本地工具熔断失败次数",
+            current=settings.local_ai_tools_circuit_breaker_failures,
+            source="LOCAL_AI_TOOLS_CIRCUIT_BREAKER_FAILURES",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 1, "max": 20, "step": 1},
+            effect="连续失败达到次数后，系统暂时跳过本地工具，避免拖垮主交易循环。",
+            increase_effect="调高会更容忍偶发失败，但异常服务会拖慢更久。",
+            decrease_effect="调低会更快隔离异常服务，但短暂网络抖动也可能触发熔断。",
+        ),
+        _threshold_item(
+            key="local_ai_tools_circuit_breaker_cooldown_seconds",
+            label="本地工具熔断冷却",
+            current=settings.local_ai_tools_circuit_breaker_cooldown_seconds,
+            current_display=f"{settings.local_ai_tools_circuit_breaker_cooldown_seconds:.0f} 秒",
+            source="LOCAL_AI_TOOLS_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 5, "max": 3600, "step": 5},
+            effect="本地工具熔断后等待多久再尝试恢复。",
+            increase_effect="调高会减少异常服务反复重试，但恢复变慢。",
+            decrease_effect="调低会更快恢复，但故障未好时会更频繁重试。",
+        ),
+        _threshold_item(
+            key="high_risk_review_timeout_seconds",
+            label="高风险复核超时",
+            current=settings.high_risk_review_timeout_seconds,
+            current_display=f"{settings.high_risk_review_timeout_seconds:.0f} 秒",
+            source="HIGH_RISK_REVIEW_TIMEOUT_SECONDS",
+            surface="系统设置 - 交易参数",
+            bounds={"min": 5, "max": 120, "step": 1},
+            effect="控制重大冲突时等待复核模型的最长时间。",
+            increase_effect="调高会给复核模型更多思考时间，但可能错过快速风控动作。",
+            decrease_effect="调低会更快回到主模型决策，但复核结论缺失会变多。",
+        ),
+        _threshold_item(
+            key="high_risk_review_max_tokens",
+            label="高风险复核最大输出 Token",
+            current=settings.high_risk_review_max_tokens,
+            source="HIGH_RISK_REVIEW_MAX_TOKENS",
+            surface="系统设置 - 交易参数",
+            bounds={
+                "min": HIGH_RISK_REVIEW_TOKEN_FLOOR,
+                "max": HIGH_RISK_REVIEW_TOKEN_CAP,
+                "step": 20,
+            },
+            effect="限制复核模型输出长度，防止长推理拖慢交易链路。",
+            increase_effect="调高会允许更完整解释，但延迟和费用可能上升。",
+            decrease_effect="调低会更快、更省，但复杂冲突可能解释不足。",
+        ),
+    ]
+
+    manual_hard_guards = [
+        _threshold_item(
+            key="max_position_pct",
+            label="单笔保证金上限",
+            current=settings.max_position_pct,
+            current_display=_pct(settings.max_position_pct),
+            source="MAX_POSITION_PCT",
+            surface="系统设置 - 交易参数",
+            effect="限制单笔合约开仓保证金占账户权益的比例。",
+            increase_effect="调高会放大单笔亏损和保证金占用。",
+            decrease_effect="调低会让单笔更小，降低风险但盈利弹性也更低。",
+            reason="硬风险上限只能人工改，系统不会自动放大。",
+        ),
+        _threshold_item(
+            key="max_leverage",
+            label="最大杠杆上限",
+            current=settings.max_leverage,
+            current_display=f"{settings.max_leverage:.1f}x",
+            source="MAX_LEVERAGE",
+            surface="系统设置 - 交易参数",
+            effect="限制所有开仓最终杠杆；运行态会按证据质量再压到 5x/10x/20x 以内。",
+            increase_effect="调高会允许更高名义敞口和更快亏损放大。",
+            decrease_effect="调低会让高质量机会也只能低杠杆执行。",
+            reason="杠杆是账户级硬风险，不允许自动放松。",
+        ),
+        _threshold_item(
+            key="max_daily_loss_pct",
+            label="日内最大亏损比例",
+            current=settings.max_daily_loss_pct,
+            current_display=_pct(settings.max_daily_loss_pct),
+            source="MAX_DAILY_LOSS_PCT",
+            surface="系统设置 - 交易参数",
+            effect="触发账户熔断和执行账户亏损控制。",
+            increase_effect="调高会延后停手，可能扩大当天亏损。",
+            decrease_effect="调低会更早暂停新交易，保护本金但可能错过修复机会。",
+            reason="亏损容忍度必须人工确认。",
+        ),
+        _threshold_item(
+            key="hard_stop_loss_pct",
+            label="硬止损比例",
+            current=settings.hard_stop_loss_pct,
+            current_display=_pct(settings.hard_stop_loss_pct),
+            source="HARD_STOP_LOSS_PCT",
+            surface="系统设置 - 交易参数",
+            effect="用于止损管理和缺省风险测算。",
+            increase_effect="调高会给仓位更大回撤空间，但单笔亏损可能扩大。",
+            decrease_effect="调低会更快止损，降低尾部风险但更容易被普通波动洗出。",
+            reason="止损深度不能交给系统自动放宽。",
+        ),
+        _threshold_item(
+            key="max_same_symbol_positions_per_side",
+            label="同币同向持仓组数上限",
+            current=settings.max_same_symbol_positions_per_side,
+            source="MAX_SAME_SYMBOL_POSITIONS_PER_SIDE",
+            surface="系统设置 - 交易参数",
+            effect="防止同一个币种同方向重复堆仓。",
+            increase_effect="调高会允许同方向加速集中暴露。",
+            decrease_effect="调低会更严格避免重复仓，但可能限制分批建仓。",
+            reason="集中度硬上限不自动放松。",
+        ),
+        _threshold_item(
+            key="max_open_positions_per_model",
+            label="基础持仓组数上限",
+            current=settings.max_open_positions_per_model,
+            source="MAX_OPEN_POSITIONS_PER_MODEL",
+            surface="系统设置 - 交易参数",
+            effect="动态容量策略以此为基础计算运行持仓容量。",
+            increase_effect="调高会扩大组合复杂度和保证金压力。",
+            decrease_effect="调低会减少同时持仓数量，让系统更集中但机会覆盖变少。",
+            reason="这是组合容量的人工上限，动态策略只能在其约束内调度。",
+        ),
+        _threshold_item(
+            key="auto_scan_symbol_limit",
+            label="自动扫描币种上限",
+            current=settings.auto_scan_symbol_limit,
+            source="AUTO_SCAN_SYMBOL_LIMIT",
+            surface=".env / config.settings",
+            effect="限制每轮候选池规模和行情特征抓取成本。",
+            increase_effect="调高会扩大候选覆盖，但接口、模型和延迟成本上升。",
+            decrease_effect="调低会更省资源，但可能漏掉更优交易对。",
+            reason="这是资源预算，不应由系统在未获授权时自动扩大。",
+        ),
+    ]
+
+    auto_tunable = [
+        _threshold_item(
+            key="min_entry_volume_ratio",
+            label="入场量能参考线",
+            current=settings.min_entry_volume_ratio,
+            current_display=_ratio(settings.min_entry_volume_ratio, 2),
+            effective="strategy_learning_runtime",
+            effective_display="策略学习运行态自动计算",
+            source="settings bootstrap + strategy_learning",
+            surface="自动调度，不在交易参数页手动调整",
+            bounds={
+                "min": learning.entry_volume_ratio_min,
+                "default": learning.entry_volume_ratio_default,
+                "max": learning.entry_volume_ratio_max,
+            },
+            effect="用于候选排序、仓位和杠杆质量参考，不是硬开仓门槛。",
+            automation="策略学习根据近期胜率、亏损、释放压力和市场状态动态收紧或放松。",
+            reason="已自动化；配置值只在运行上下文缺失时作为启动默认值。",
+        ),
+        _threshold_item(
+            key="min_entry_adx",
+            label="入场 ADX 参考线",
+            current=settings.min_entry_adx,
+            current_display=_ratio(settings.min_entry_adx, 1),
+            effective="strategy_learning_runtime",
+            effective_display="策略学习运行态自动计算",
+            source="settings bootstrap + strategy_learning",
+            surface="自动调度，不在交易参数页手动调整",
+            bounds={
+                "min": learning.entry_adx_min,
+                "default": learning.entry_adx_default,
+                "max": learning.entry_adx_max,
+            },
+            effect="用于衡量趋势强度，影响排序、仓位和杠杆参考。",
+            automation="策略学习按历史交易质量生成运行态 entry_filters。",
+            reason="已自动化；人工长期固定容易让系统在震荡/趋势切换时走偏。",
+        ),
+        _threshold_item(
+            key="strategy_profile_sizing",
+            label="策略画像仓位参数",
+            current="global_min_score_delta / position_size_multiplier / probe_fraction",
+            effective="active_strategy_profile",
+            effective_display="由策略学习画像和回滚机制管理",
+            source="services.strategy_learning",
+            surface="策略学习页/自动画像，不在交易参数页手动调整",
+            bounds={
+                "global_min_score_delta": [-0.25, 0.35],
+                "position_size_multiplier": [0.10, 1.25],
+                "probe_fraction": [0.0, 0.10],
+                "max_probe_size_pct": [0.0, strategy.entry_risk_sizing.strategy_probe_cap_max_pct],
+            },
+            effect="控制候选门槛、小仓探针比例和仓位放大/收缩。",
+            automation="系统根据策略画像表现启用、禁用或回滚，人工不直接改底层数值。",
+            reason="属于学习策略，不应在交易参数页临时手动改。",
+        ),
+        _threshold_item(
+            key="dynamic_position_capacity",
+            label="动态持仓容量",
+            current=settings.max_open_positions_per_model,
+            effective="runtime_capacity",
+            effective_display="按持仓质量、释放候选和回撤自动计算",
+            source="services.dynamic_position_capacity",
+            surface="自动调度，受基础持仓组数上限约束",
+            effect="决定新开不同币种/方向仓位前是否仍有容量。",
+            automation="低质量持仓多、回撤扩大时收缩；释放轮转需要时预留槽位。",
+            reason="自动调度只在人工硬上限内运行，不会自行扩大账户风险边界。",
+        ),
+        _threshold_item(
+            key="execution_cost_estimate",
+            label="执行成本估算",
+            current=ESTIMATED_TAKER_FEE_PCT,
+            current_display=f"手续费常量 {_pct(ESTIMATED_TAKER_FEE_PCT, 3)} + 动态滑点",
+            effective="orderbook_runtime",
+            effective_display="按盘口价差、深度、失衡和滑点上限动态估算",
+            source="services.execution_cost_model",
+            surface="自动估算，最大滑点上限仍由人工配置",
+            effect="用于净收益评分，避免把最大滑点误当每笔固定成本。",
+            automation="系统逐笔从市场微结构估算，超过人工滑点上限则拒绝或降级。",
+            reason="手续费常量不是后台阈值；滑点真实值应由盘口数据计算。",
+        ),
+    ]
+
+    removed_or_deprecated = [
+        _threshold_item(
+            key="max_auto_trades_per_round",
+            label="每轮最大自动交易数",
+            current="removed",
+            current_display="已删除",
+            source="旧 MAX_AUTO_TRADES_PER_ROUND",
+            effect="旧字段没有执行链读取，保留会误导系统以为它能限制开仓。",
+            reason="已从 Settings 和 .env.example 移除；现在由动态容量、保证金上限和候选评分控制。",
+            status="removed",
+        ),
+        _threshold_item(
+            key="daily_profit_target_usdt_cny",
+            label="每日盈利目标",
+            current="removed",
+            current_display="已删除",
+            source="旧 DAILY_PROFIT_TARGET_USDT / DAILY_PROFIT_TARGET_CNY",
+            effect="每日盈利目标不参与交易判断，不能用来驱动硬开仓或追单。",
+            reason="已从 Settings 和 .env.example 移除；收益页只展示实际盈亏。",
+            status="removed",
+        ),
+        _threshold_item(
+            key="fee.estimated_taker_fee_pct",
+            label="策略快照手续费包装字段",
+            current="removed",
+            current_display="已删除，真实常量为 " + _pct(ESTIMATED_TAKER_FEE_PCT, 3),
+            source="services.trading_params",
+            effect="旧字段只在快照里出现，没有独立行为读取。",
+            reason="保留模块常量 ESTIMATED_TAKER_FEE_PCT，删除伪可调包装字段。",
+            status="removed",
+        ),
+        _threshold_item(
+            key="entry_opportunity_gate.selected_side_positive_net_hard_gate",
+            label="未接入的正净收益硬开关",
+            current="removed",
+            current_display="已删除",
+            source="services.trading_params.EntryOpportunityGateParams",
+            effect="旧字段没有执行链读取，不能实际改变开仓判断。",
+            reason="删除未接入字段，避免后续 AI 把它当成可用硬门槛。",
+            status="removed",
+        ),
+    ]
+
+    return {
+        "status": "ok",
+        "policy": {
+            "name": "threshold_governance_v1",
+            "hard_risk_auto_relax": False,
+            "manual_inputs_require_effect_explanation": True,
+            "auto_tunable_not_rendered_as_manual_inputs": True,
+            "removed_fake_thresholds": True,
+            "strategy_snapshot_version": strategy.version,
+            "notes": [
+                "能由策略学习和运行态证据自动计算的参数，不再放进交易参数页让人手动调。",
+                "账户级硬风险上限只允许人工配置，系统不会为了多开仓自动放松。",
+                "没有行为接入的旧字段已经删除或列入废弃清单，避免开发时读错。",
+            ],
+        },
+        "manual_editable": manual_editable,
+        "manual_service_controls": manual_service_controls,
+        "manual_hard_guards": manual_hard_guards,
+        "auto_tunable": auto_tunable,
+        "removed_or_deprecated": removed_or_deprecated,
+        "risk_references": {
+            "min_entry_confidence_after_fees": MIN_ENTRY_CONFIDENCE_AFTER_FEES,
+            "min_take_profit_after_costs": MIN_TAKE_PROFIT_AFTER_COSTS,
+            "min_reward_risk_ratio": MIN_REWARD_RISK_RATIO,
+        },
+    }
+
+
 @router.get("/settings/thresholds")
 async def get_thresholds():
     """Get current decision interval and confidence threshold."""
     settings.refresh_runtime_env(force=True)
-    total_margin_limit_pct = (
-        float(settings.max_total_margin_pct)
-        if float(settings.max_total_margin_pct or 0.0) > 0
-        else float(settings.max_position_pct or 0.0) * 3
-    )
+    total_margin_limit_pct = _effective_total_margin_limit_pct()
     return {
         "decision_interval": settings.decision_interval_seconds,
         "confidence_threshold": settings.confidence_threshold,
+        "max_position_pct": settings.max_position_pct,
+        "max_leverage": settings.max_leverage,
+        "max_daily_loss_pct": settings.max_daily_loss_pct,
+        "hard_stop_loss_pct": settings.hard_stop_loss_pct,
+        "max_open_positions_per_model": settings.max_open_positions_per_model,
+        "max_same_symbol_positions_per_side": settings.max_same_symbol_positions_per_side,
         "local_ai_tools_enabled": settings.local_ai_tools_enabled,
         "local_ai_tools_api_base": settings.local_ai_tools_api_base,
         "local_ai_tools_timeout_seconds": settings.local_ai_tools_timeout_seconds,
@@ -1125,6 +1578,13 @@ async def get_thresholds():
         "total_margin_limit_pct": total_margin_limit_pct,
         "max_slippage_pct": settings.max_slippage_pct,
     }
+
+
+@router.get("/settings/threshold-catalog")
+async def get_threshold_catalog():
+    """Return threshold governance with automation and manual-change impact notes."""
+    settings.refresh_runtime_env(force=True)
+    return _threshold_catalog()
 
 
 @router.post("/settings/thresholds")
@@ -1147,6 +1607,56 @@ async def update_thresholds(req: ThresholdsRequest):
             raise HTTPException(status_code=400, detail="Confidence threshold must be at most 1.0")
         settings.confidence_threshold = req.confidence_threshold
         updates["CONFIDENCE_THRESHOLD"] = str(req.confidence_threshold)
+
+    if req.max_position_pct is not None:
+        if req.max_position_pct < 0.005:
+            raise HTTPException(status_code=400, detail="单笔保证金上限不能低于 0.5%")
+        if req.max_position_pct > 0.50:
+            raise HTTPException(status_code=400, detail="单笔保证金上限不能超过 50%")
+        settings.max_position_pct = float(req.max_position_pct)
+        updates["MAX_POSITION_PCT"] = str(settings.max_position_pct)
+
+    if req.max_leverage is not None:
+        if req.max_leverage < 1:
+            raise HTTPException(status_code=400, detail="最大杠杆不能低于 1x")
+        if req.max_leverage > 125:
+            raise HTTPException(status_code=400, detail="最大杠杆不能超过 125x")
+        settings.max_leverage = float(req.max_leverage)
+        updates["MAX_LEVERAGE"] = str(settings.max_leverage)
+
+    if req.max_daily_loss_pct is not None:
+        if req.max_daily_loss_pct < 0.001:
+            raise HTTPException(status_code=400, detail="日内最大亏损不能低于 0.1%")
+        if req.max_daily_loss_pct > 0.50:
+            raise HTTPException(status_code=400, detail="日内最大亏损不能超过 50%")
+        settings.max_daily_loss_pct = float(req.max_daily_loss_pct)
+        updates["MAX_DAILY_LOSS_PCT"] = str(settings.max_daily_loss_pct)
+
+    if req.hard_stop_loss_pct is not None:
+        if req.hard_stop_loss_pct < 0.001:
+            raise HTTPException(status_code=400, detail="硬止损不能低于 0.1%")
+        if req.hard_stop_loss_pct > 0.50:
+            raise HTTPException(status_code=400, detail="硬止损不能超过 50%")
+        settings.hard_stop_loss_pct = float(req.hard_stop_loss_pct)
+        updates["HARD_STOP_LOSS_PCT"] = str(settings.hard_stop_loss_pct)
+
+    if req.max_open_positions_per_model is not None:
+        if req.max_open_positions_per_model < 1:
+            raise HTTPException(status_code=400, detail="基础持仓组数上限不能低于 1")
+        if req.max_open_positions_per_model > 200:
+            raise HTTPException(status_code=400, detail="基础持仓组数上限不能超过 200")
+        settings.max_open_positions_per_model = int(req.max_open_positions_per_model)
+        updates["MAX_OPEN_POSITIONS_PER_MODEL"] = str(settings.max_open_positions_per_model)
+
+    if req.max_same_symbol_positions_per_side is not None:
+        if req.max_same_symbol_positions_per_side < 1:
+            raise HTTPException(status_code=400, detail="同币同向持仓组数上限不能低于 1")
+        if req.max_same_symbol_positions_per_side > 20:
+            raise HTTPException(status_code=400, detail="同币同向持仓组数上限不能超过 20")
+        settings.max_same_symbol_positions_per_side = int(req.max_same_symbol_positions_per_side)
+        updates["MAX_SAME_SYMBOL_POSITIONS_PER_SIDE"] = str(
+            settings.max_same_symbol_positions_per_side
+        )
 
     if req.max_slippage_pct is not None:
         if req.max_slippage_pct < 0.0002:
@@ -1281,16 +1791,18 @@ async def update_thresholds(req: ThresholdsRequest):
         if env_updates:
             settings.update_env_file(env_updates)
 
-    total_margin_limit_pct = (
-        float(settings.max_total_margin_pct)
-        if float(settings.max_total_margin_pct or 0.0) > 0
-        else float(settings.max_position_pct or 0.0) * 3
-    )
+    total_margin_limit_pct = _effective_total_margin_limit_pct()
     return {
         "status": "ok",
         "message": "Settings updated.",
         "decision_interval": settings.decision_interval_seconds,
         "confidence_threshold": settings.confidence_threshold,
+        "max_position_pct": settings.max_position_pct,
+        "max_leverage": settings.max_leverage,
+        "max_daily_loss_pct": settings.max_daily_loss_pct,
+        "hard_stop_loss_pct": settings.hard_stop_loss_pct,
+        "max_open_positions_per_model": settings.max_open_positions_per_model,
+        "max_same_symbol_positions_per_side": settings.max_same_symbol_positions_per_side,
         "local_ai_tools_enabled": settings.local_ai_tools_enabled,
         "local_ai_tools_api_base": settings.local_ai_tools_api_base,
         "local_ai_tools_timeout_seconds": settings.local_ai_tools_timeout_seconds,

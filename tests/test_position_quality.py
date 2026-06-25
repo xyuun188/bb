@@ -129,6 +129,44 @@ def test_position_quality_allows_fresh_position_hard_risk_release() -> None:
     assert quality.should_release is True
 
 
+def test_position_quality_flags_stale_tiny_probe_capital_inefficiency() -> None:
+    quality = PositionQualityScorer().score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "CRCL/USDT",
+            "side": "long",
+            "entry_price": 76.15,
+            "current_price": 76.02,
+            "quantity": 0.27,
+            "unrealized_pnl": -0.035,
+            "created_at": (datetime.now(UTC) - timedelta(hours=1.4)).isoformat(),
+        }
+    )
+
+    assert "stale_probe_capital_inefficient" in quality.reasons
+    assert quality.bucket == "release_candidate"
+    assert quality.should_release is True
+
+
+def test_position_quality_keeps_tiny_probe_winner_out_of_release_queue() -> None:
+    quality = PositionQualityScorer().score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "KAITO/USDT",
+            "side": "short",
+            "entry_price": 0.4513,
+            "current_price": 0.44,
+            "quantity": 18.0,
+            "unrealized_pnl": 0.2034,
+            "created_at": (datetime.now(UTC) - timedelta(hours=16)).isoformat(),
+        }
+    )
+
+    assert "winner_has_edge" in quality.reasons
+    assert "stale_probe_capital_inefficient" not in quality.reasons
+    assert quality.should_release is False
+
+
 def test_position_quality_uses_okx_position_timestamp_fields() -> None:
     opened_at = datetime.now(UTC) - timedelta(hours=5)
     quality = PositionQualityScorer().score(
@@ -191,7 +229,7 @@ def test_dynamic_capacity_uses_learned_expansion_above_current_book() -> None:
     assert "学习目标高于当前运行容量" in decision.reason
 
 
-def test_dynamic_capacity_repairs_stale_one_group_config_when_book_is_crowded() -> None:
+def test_dynamic_capacity_stops_new_entries_when_stale_config_book_is_crowded() -> None:
     policy = DynamicPositionCapacityPolicy(lambda: 1)
     decision = policy.evaluate(
         open_positions=[_flat_old_position(f"OLD{i}/USDT") for i in range(6)],
@@ -201,15 +239,17 @@ def test_dynamic_capacity_repairs_stale_one_group_config_when_book_is_crowded() 
     )
 
     assert decision.factors["configured_limit"] == 1
-    assert decision.base_limit > decision.open_group_count
-    assert decision.effective_limit > decision.open_group_count
+    assert decision.base_limit == 1
+    assert decision.entry_limit == 1
+    assert decision.entry_limit < decision.open_group_count
     assert "release_rotation_slots" in decision.factors["reason_codes"]
+    assert "over_capacity_release_first" in decision.factors["reason_codes"]
 
 
 def test_dynamic_capacity_preserves_entry_rotation_slots_under_low_quality_pressure() -> None:
     policy = DynamicPositionCapacityPolicy(lambda: 4)
     decision = policy.evaluate(
-        open_positions=[_flat_old_position(f"OLD{i}/USDT") for i in range(4)],
+        open_positions=[_flat_old_position(f"OLD{i}/USDT") for i in range(3)],
         strategy_context={
             "target_position_groups": 5,
             "rotation_slots": 1,
@@ -220,8 +260,115 @@ def test_dynamic_capacity_preserves_entry_rotation_slots_under_low_quality_press
         account_equity=1000.0,
     )
 
-    assert decision.effective_limit == 5
-    assert decision.entry_limit == 5
-    assert decision.factors["entry_limit"] == 5
+    assert decision.open_group_count == 3
+    assert decision.effective_limit == 4
+    assert decision.entry_limit == 4
+    assert decision.entry_limit > decision.open_group_count
     assert "strategy_rotation_slots" in decision.factors["reason_codes"]
+    assert "release_rotation_slots" in decision.factors["reason_codes"]
+
+
+def test_dynamic_capacity_does_not_expand_entry_limit_when_book_is_already_over_capacity() -> None:
+    policy = DynamicPositionCapacityPolicy(lambda: 20)
+    decision = policy.evaluate(
+        open_positions=[_flat_old_position(f"OLD{i}/USDT") for i in range(23)],
+        strategy_context={
+            "target_position_groups": 20,
+            "rotation_slots": 3,
+            "recent_win_rate": 0.42,
+            "today_risk_pnl": -10.0,
+        },
+        market_regime={"confidence": 0.45},
+        account_equity=1000.0,
+    )
+
+    assert decision.open_group_count == 23
+    assert decision.base_limit == 20
+    assert decision.entry_limit <= 20
+    assert decision.entry_limit < decision.open_group_count
+    assert "over_capacity_release_first" in decision.factors["reason_codes"]
+    assert "rotation_entry_expansion" not in decision.factors["reason_codes"]
+
+
+def test_dynamic_capacity_zero_config_uses_safe_default_without_infinite_expansion() -> None:
+    policy = DynamicPositionCapacityPolicy(lambda: 0)
+    decision = policy.evaluate(
+        open_positions=[_flat_old_position(f"OLD{i}/USDT") for i in range(21)],
+        strategy_context={"target_position_groups": 20, "today_risk_pnl": 0.0},
+        market_regime={"confidence": 0.48},
+        account_equity=1000.0,
+    )
+
+    assert decision.factors["configured_limit"] == 20
+    assert decision.base_limit == 20
+    assert decision.entry_limit <= 20
+    assert decision.entry_limit < decision.open_group_count
+    assert "over_capacity_release_first" in decision.factors["reason_codes"]
+
+
+def test_dynamic_capacity_does_not_shrink_to_advisory_target_when_book_is_full() -> None:
+    policy = DynamicPositionCapacityPolicy(lambda: 20)
+    decision = policy.evaluate(
+        open_positions=[
+            _flat_old_position("OLD0/USDT"),
+            *[_healthy_position(f"GOOD{i}/USDT") for i in range(19)],
+        ],
+        strategy_context={
+            "target_position_groups": 15,
+            "target_open_position_groups": 15,
+            "strategy_learning_release_pressure_active": True,
+            "portfolio_roster": {
+                "target_position_groups": 15,
+                "max_open_positions": 20,
+                "rotation_slots": 3,
+                "release_target_groups": 1,
+                "policy_reason": "release_low_quality_positions_with_rotation_slots",
+            },
+            "strategy_learning": {
+                "runtime": {
+                    "target_position_groups": 15,
+                    "max_open_positions": 20,
+                    "rotation_slots": 3,
+                    "release_target_groups": 1,
+                    "capacity_policy_reason": "release_low_quality_positions_with_rotation_slots",
+                }
+            },
+            "today_risk_pnl": 0.0,
+        },
+        market_regime={"confidence": 0.48},
+        account_equity=1000.0,
+    )
+
+    assert decision.factors["learned_target_limit"] == 15
+    assert decision.target_limit == 20
+    assert decision.effective_limit == 20
+    assert decision.entry_limit <= decision.open_group_count
+    assert "over_capacity_release_first" not in decision.factors["reason_codes"]
+
+
+def test_dynamic_capacity_opens_rotation_slot_for_stale_tiny_probe() -> None:
+    policy = DynamicPositionCapacityPolicy(lambda: 3)
+    positions = [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "CRCL/USDT",
+            "side": "long",
+            "entry_price": 76.15,
+            "current_price": 76.02,
+            "quantity": 0.27,
+            "unrealized_pnl": -0.035,
+            "created_at": (datetime.now(UTC) - timedelta(hours=1.4)).isoformat(),
+        },
+        _healthy_position("KAITO/USDT", hours=16.0, pnl=12.0),
+    ]
+
+    decision = policy.evaluate(
+        open_positions=positions,
+        strategy_context={"target_position_groups": 2, "recent_win_rate": 0.50},
+        market_regime={"confidence": 0.50},
+        account_equity=1000.0,
+    )
+
+    assert decision.low_quality_count == 1
+    assert decision.entry_limit > decision.open_group_count
     assert "release_rotation_slots" in decision.factors["reason_codes"]

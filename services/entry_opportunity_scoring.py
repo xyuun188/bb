@@ -85,6 +85,23 @@ def _tool_signal(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
     return first_tool_payload(raw, *keys)
 
 
+def _independent_probe_expert_support(raw: dict[str, Any], side: str) -> list[str]:
+    opinions = raw.get("opinions")
+    if not isinstance(opinions, list):
+        return []
+    support: list[str] = []
+    for opinion in opinions:
+        if not isinstance(opinion, dict):
+            continue
+        if not opinion.get("independent_expert_retry"):
+            continue
+        action = str(opinion.get("action") or "").lower()
+        confidence = _safe_float(opinion.get("confidence"), 0.0)
+        if action == side and confidence >= 0.55:
+            support.append(str(opinion.get("model_name") or opinion.get("name") or "unknown"))
+    return support
+
+
 @dataclass(slots=True)
 class EntryOpportunityScoringPolicy:
     """Score entry candidates using explicit dependencies instead of TradingService state."""
@@ -894,9 +911,36 @@ class EntryOpportunityScoringPolicy:
             - fee_pct
             - slippage_pct
         )
-        ai_only_profit_bias = ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
-        if not (ml_aligned or local_aligned):
-            ai_only_profit_bias = min(ai_only_profit_bias, 0.15)
+        ai_profit_weight = ENTRY_NET_WEIGHT_AI
+        ai_profit_policy = "standard"
+        ai_profit_note = "按置信度、止盈和止损估算。"
+        evidence_profit_probe = self._safe_dict(raw.get("evidence_profit_probe"))
+        original_probe_hold = bool(
+            evidence_profit_probe.get("triggered")
+            and str(evidence_profit_probe.get("ai_original_action") or "").lower() == "hold"
+        )
+        independent_probe_support = (
+            _independent_probe_expert_support(raw, side) if original_probe_hold else []
+        )
+        if original_probe_hold and not independent_probe_support:
+            ai_profit_weight = 0.0
+            ai_profit_policy = "probe_original_hold_without_independent_support"
+            ai_profit_note = (
+                "AI 原始裁决为观望且没有独立专家确认；AI TP/SL 自估收益不进入 expected_net。"
+            )
+        elif original_probe_hold:
+            ai_profit_weight = min(ENTRY_NET_WEIGHT_AI, 0.08)
+            ai_profit_policy = "probe_original_hold_with_independent_support"
+            ai_profit_note = (
+                "AI 原始裁决为观望，但已有独立专家同向确认；AI 收益贡献仅按有限权重参与。"
+            )
+        ai_only_profit_bias = ai_expected_return_pct * ai_profit_weight
+        if ai_profit_weight > 0 and not (ml_aligned or local_aligned):
+            capped_bias = min(ai_only_profit_bias, 0.15)
+            if capped_bias < ai_only_profit_bias:
+                ai_profit_policy = f"{ai_profit_policy}_quant_unaligned_cap"
+                ai_profit_note = "缺少 ML/盈利模型同向确认时，AI 贡献封顶 0.15%。"
+            ai_only_profit_bias = capped_bias
         expected_net_return_pct = (
             ai_only_profit_bias
             + ml_contribution
@@ -916,13 +960,12 @@ class EntryOpportunityScoringPolicy:
                     "available": True,
                     "side": side,
                     "raw_return_pct": round(ai_expected_return_pct, 6),
-                    "weight": ENTRY_NET_WEIGHT_AI,
+                    "weight": round(ai_profit_weight, 6),
+                    "configured_weight": ENTRY_NET_WEIGHT_AI,
                     "contribution_pct": round(ai_only_profit_bias, 6),
-                    "note": (
-                        "缺少 ML/盈利模型同向确认时，AI 贡献封顶 0.15%。"
-                        if ai_only_profit_bias < ai_expected_return_pct * ENTRY_NET_WEIGHT_AI
-                        else "按置信度、止盈和止损估算。"
-                    ),
+                    "policy": ai_profit_policy,
+                    "independent_probe_support": independent_probe_support,
+                    "note": ai_profit_note,
                 },
                 {
                     "key": "local_ml",
@@ -1194,6 +1237,9 @@ class EntryOpportunityScoringPolicy:
             "confidence": round(confidence, 6),
             "ai_expected_return_pct": round(ai_expected_return_pct, 6),
             "ai_expected_return_contribution_pct": round(ai_only_profit_bias, 6),
+            "ai_expected_return_policy": ai_profit_policy,
+            "ai_expected_return_weight": round(ai_profit_weight, 6),
+            "ai_expected_return_independent_probe_support": independent_probe_support,
             "model_expected_net_return_pct": round(model_expected_net_return_pct, 6),
             "expected_net_return_pct": round(expected_net_return_pct, 6),
             "expected_net_breakdown": expected_net_breakdown,

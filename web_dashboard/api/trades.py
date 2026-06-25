@@ -29,6 +29,13 @@ from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sa
 router = APIRouter()
 EXECUTION_REASON_CLASSIFIER = ExecutionResultClassifier()
 CLOSE_ORDER_POSITION_MATCH_WINDOW_SECONDS = 240
+EXCHANGE_SYNC_DECISION_SOURCES = {
+    "okx_order_pair_repair",
+    "okx_position_reconcile",
+    "okx_tp_sl_backfill",
+}
+SYSTEM_PROTECTION_RECONCILE_ORIGINS = {"system_protection"}
+SYSTEM_PROTECTION_LABEL = "系统保护单"
 
 
 def _normalize_display_symbol(symbol: str | None) -> str:
@@ -51,6 +58,34 @@ def _closed_position_matches_order_side(order_side: str | None, position_side: s
     side = str(position_side or "").lower()
     close_side = "buy" if side == "short" else "sell" if side == "long" else ""
     return bool(close_side and str(order_side or "").lower() == close_side)
+
+
+def _close_price_matches_position_protection(order: Any, position: Any | None) -> bool:
+    if position is None:
+        return False
+    close_price = _safe_float(getattr(order, "price", None), 0.0) or _safe_float(
+        getattr(position, "current_price", None),
+        0.0,
+    )
+    if close_price <= 0:
+        return False
+    side = str(getattr(position, "side", "") or "").lower()
+    tolerance = max(abs(close_price) * 0.015, 1e-12)
+    stop_loss_price = _safe_float(getattr(position, "stop_loss_price", None), 0.0)
+    take_profit_price = _safe_float(getattr(position, "take_profit_price", None), 0.0)
+    if stop_loss_price > 0 and (
+        abs(close_price - stop_loss_price) <= tolerance
+        or (side == "long" and close_price <= stop_loss_price)
+        or (side == "short" and close_price >= stop_loss_price)
+    ):
+        return True
+    if take_profit_price > 0 and (
+        abs(close_price - take_profit_price) <= tolerance
+        or (side == "long" and close_price >= take_profit_price)
+        or (side == "short" and close_price <= take_profit_price)
+    ):
+        return True
+    return False
 
 
 def _matching_closed_positions_for_order(
@@ -124,7 +159,29 @@ def _weighted_entry_price(positions: list[Any]) -> float:
     )
 
 
-def _close_order_position_reason(order: Any, positions: list[Any]) -> str | None:
+def _execution_source_from_decision(decision: Any | None, order: Any) -> tuple[str, str]:
+    if is_manual_close_order(order):
+        return "manual", MANUAL_CLOSE_LABEL
+    if decision is None:
+        return "system", "系统执行"
+    meta = {
+        "raw_llm_response": getattr(decision, "raw_llm_response", None),
+        "feature_snapshot": getattr(decision, "feature_snapshot", None),
+    }
+    raw, snapshot = _decision_raw_and_snapshot(meta)
+    if _is_system_protection_reconcile(raw, snapshot):
+        return "system", SYSTEM_PROTECTION_LABEL
+    if _is_exchange_sync_decision(raw, snapshot):
+        return "okx", "OKX同步"
+    return "system", "系统执行"
+
+
+def _close_order_position_reason(
+    order: Any,
+    positions: list[Any],
+    *,
+    execution_source: str | None = None,
+) -> str | None:
     if not positions:
         return None
     symbol = _normalize_display_symbol(getattr(order, "symbol", None))
@@ -134,9 +191,12 @@ def _close_order_position_reason(order: Any, positions: list[Any]) -> str | None
     pnl = sum(_safe_float(getattr(p, "realized_pnl", None), 0.0) or 0.0 for p in positions)
     side = str(getattr(positions[0], "side", "") or "").lower()
     action_label = "买入平空" if side == "short" else "卖出平多" if side == "long" else "平仓"
-    source = (
-        "OKX 平仓成交已同步" if getattr(order, "exchange_order_id", None) else "本地平仓同步记录"
-    )
+    if execution_source == "okx":
+        source = "OKX 平仓成交已同步"
+    elif execution_source == "manual":
+        source = "手动平仓成交已确认"
+    else:
+        source = "系统平仓成交已确认"
     return (
         f"{source}：{symbol} {action_label} {quantity:g}，成交价 {close_price:g}，"
         f"平掉本地 {len(positions)} 段仓位，开仓均价 {entry_price:g}，"
@@ -321,6 +381,47 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _decision_raw_and_snapshot(
+    meta: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = meta or {}
+    raw = data.get("raw_llm_response") or {}
+    snapshot = data.get("feature_snapshot") or {}
+    return _safe_dict(raw), _safe_dict(snapshot)
+
+
+def _is_exchange_sync_decision(raw: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    source = str(raw.get("source") or snapshot.get("source") or "").lower().strip()
+    if source in EXCHANGE_SYNC_DECISION_SOURCES:
+        return True
+    if raw.get("system_sync"):
+        # system_sync is only an exchange-side execution source when it is tied to
+        # an explicit sync/reconciliation origin. Normal system orders also settle
+        # through OKX and must remain "system" initiated in the execution ledger.
+        return source in EXCHANGE_SYNC_DECISION_SOURCES
+    return False
+
+
+def _reconcile_origin(raw: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    close_fill = _safe_dict(raw.get("close_fill"))
+    return (
+        str(
+            raw.get("reconcile_origin")
+            or close_fill.get("reconcile_origin")
+            or snapshot.get("reconcile_origin")
+            or ""
+        )
+        .lower()
+        .strip()
+    )
+
+
+def _is_system_protection_reconcile(raw: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    if _reconcile_origin(raw, snapshot) not in SYSTEM_PROTECTION_RECONCILE_ORIGINS:
+        return False
+    return _is_exchange_sync_decision(raw, snapshot)
+
+
 def _pct_text(value, digits: int = 2) -> str | None:
     number = _safe_float(value, 0.0)
     if number == 0:
@@ -464,6 +565,7 @@ async def get_trades(
             Position.quantity,
             Position.entry_price,
             Position.current_price,
+            Position.leverage,
             Position.stop_loss_price,
             Position.take_profit_price,
             Position.realized_pnl,
@@ -653,23 +755,18 @@ async def get_trades(
         return "full", "全部平仓"
 
     def display_execution_source(order) -> tuple[str, str]:
+        meta = decision_meta.get(order.decision_id) or {}
+        raw, snapshot = _decision_raw_and_snapshot(meta)
         if is_manual_close_order(order):
             return "manual", MANUAL_CLOSE_LABEL
-        meta = decision_meta.get(order.decision_id) or {}
-        raw = meta.get("raw_llm_response") or {}
-        snapshot = meta.get("feature_snapshot") or {}
-        if not isinstance(raw, dict):
-            raw = {}
-        if not isinstance(snapshot, dict):
-            snapshot = {}
-
-        source = str(raw.get("source") or snapshot.get("source") or "").lower()
-        if raw.get("system_sync") or source in {"okx_position_reconcile", "okx_tp_sl_backfill"}:
-            return "okx", "OKX执行"
-
-        if order.decision_id is None and matching_closed_position(order):
-            return "okx", "OKX执行"
-
+        matched_closed = matching_closed_position(order)
+        if _is_system_protection_reconcile(raw, snapshot) or (
+            _is_exchange_sync_decision(raw, snapshot)
+            and _close_price_matches_position_protection(order, matched_closed)
+        ):
+            return "system", SYSTEM_PROTECTION_LABEL
+        if _is_exchange_sync_decision(raw, snapshot):
+            return "okx", "OKX同步"
         return "system", "系统执行"
 
     def meta_for_order(order) -> dict[str, Any]:
@@ -681,14 +778,25 @@ async def get_trades(
     def execution_leverage_for_order(order) -> dict[str, Any]:
         return _safe_dict(raw_for_order(order).get("execution_leverage"))
 
+    def display_leverage_for_order(
+        order,
+        matched_position,
+        execution_leverage: dict[str, Any],
+        meta: dict[str, Any],
+    ) -> float:
+        action = display_action(order)
+        if action in {"close_long", "close_short"} and matched_position is not None:
+            position_leverage = _safe_float(getattr(matched_position, "leverage", None), 0.0)
+            if position_leverage > 0:
+                return position_leverage
+        return _safe_float(
+            execution_leverage.get("actual_leverage") or meta.get("suggested_leverage"),
+            1.0,
+        )
+
     def display_reason(order) -> str:
         meta = decision_meta.get(order.decision_id) or {}
-        raw = meta.get("raw_llm_response") or {}
-        snapshot = meta.get("feature_snapshot") or {}
-        if not isinstance(raw, dict):
-            raw = {}
-        if not isinstance(snapshot, dict):
-            snapshot = {}
+        raw, snapshot = _decision_raw_and_snapshot(meta)
         if order.status != "filled":
             return _readable_execution_reason(
                 execution_reason=meta.get("execution_reason"),
@@ -702,6 +810,13 @@ async def get_trades(
             close_price = order.price or p.current_price or 0
             if is_manual_close_order(order):
                 return f"用户手动平仓，成交价 {close_price:g}，实现盈亏 {float(p.realized_pnl or 0):.4f}。"
+            system_protection_reconcile = _is_system_protection_reconcile(
+                raw,
+                snapshot,
+            ) or (
+                _is_exchange_sync_decision(raw, snapshot)
+                and _close_price_matches_position_protection(order, p)
+            )
             sl = p.stop_loss_price or 0
             tp = p.take_profit_price or 0
             tolerance = max(abs(close_price) * 0.002, 1e-12)
@@ -710,21 +825,36 @@ async def get_trades(
                 or (p.side == "long" and close_price <= sl)
                 or (p.side == "short" and close_price >= sl)
             ):
-                return f"OKX 止损触发平仓，触发价约 {sl:g}，成交价 {close_price:g}。"
+                prefix = "系统保护单止损触发" if system_protection_reconcile else "OKX 止损触发"
+                return f"{prefix}平仓，触发价约 {sl:g}，成交价 {close_price:g}。"
             if tp and (
                 abs(close_price - tp) <= tolerance
                 or (p.side == "long" and close_price >= tp)
                 or (p.side == "short" and close_price <= tp)
             ):
-                return f"OKX 止盈触发平仓，触发价约 {tp:g}，成交价 {close_price:g}。"
-            if order.decision_id is None or raw.get("system_sync"):
+                prefix = "系统保护单止盈触发" if system_protection_reconcile else "OKX 止盈触发"
+                return f"{prefix}平仓，触发价约 {tp:g}，成交价 {close_price:g}。"
+            if system_protection_reconcile:
+                return (
+                    f"系统保护单触发平仓，成交价 {close_price:g}，"
+                    f"实现盈亏 {float(p.realized_pnl or 0):.4f}。"
+                )
+            if _is_exchange_sync_decision(raw, snapshot):
                 return f"OKX 侧平仓同步，成交价 {close_price:g}，实现盈亏 {float(p.realized_pnl or 0):.4f}。"
 
-        if (
-            raw.get("system_sync")
-            or str(raw.get("source") or snapshot.get("source") or "").lower()
-            == "okx_position_reconcile"
-        ):
+        if _is_system_protection_reconcile(raw, snapshot):
+            close_fill = _safe_dict(raw.get("close_fill"))
+            close_price = order.price or close_fill.get("price") or snapshot.get("exit_price") or 0
+            pnl = close_fill.get("pnl") or snapshot.get("realized_pnl")
+            pnl_text = (
+                f"，实现盈亏 {_safe_float(pnl):.4f}"
+                if isinstance(pnl, (int, float))
+                or str(pnl or "").replace(".", "", 1).replace("-", "", 1).isdigit()
+                else ""
+            )
+            return f"系统保护单触发平仓，成交价 {_safe_float(close_price):g}{pnl_text}。"
+
+        if _is_exchange_sync_decision(raw, snapshot):
             close_fill = _safe_dict(raw.get("close_fill"))
             close_price = order.price or close_fill.get("price") or snapshot.get("exit_price") or 0
             pnl = close_fill.get("pnl") or snapshot.get("realized_pnl")
@@ -770,9 +900,11 @@ async def get_trades(
         )
         execution_leverage = execution_leverage_for_order(order)
         meta = meta_for_order(order)
-        actual_leverage = _safe_float(
-            execution_leverage.get("actual_leverage") or meta.get("suggested_leverage"),
-            1.0,
+        actual_leverage = display_leverage_for_order(
+            order,
+            matched_position,
+            execution_leverage,
+            meta,
         )
         ai_suggested_leverage = _safe_float(
             execution_leverage.get("ai_suggested_leverage") or meta.get("suggested_leverage"),
@@ -811,6 +943,7 @@ async def get_trades(
             "execution_failure_kind": failure_kind,
             "execution_status_label": execution_status_label,
             "success": order.status == "filled",
+            "exchange_order_id": sanitize_text(order.exchange_order_id),
             "filled_at": order.filled_at.isoformat() if order.filled_at else None,
             "created_at": order.created_at.isoformat() if order.created_at else None,
         }
@@ -870,8 +1003,19 @@ async def get_trade_detail(trade_id: int):
         exchange_order_id=order.exchange_order_id,
         status=order.status,
     )
+    execution_source = _execution_source_from_decision(decision, order)
     matched_closed_positions = _matching_closed_positions_for_order(order, closed_positions)
-    position_reason = _close_order_position_reason(order, matched_closed_positions)
+    if (
+        execution_source[0] == "okx"
+        and matched_closed_positions
+        and _close_price_matches_position_protection(order, matched_closed_positions[0])
+    ):
+        execution_source = ("system", SYSTEM_PROTECTION_LABEL)
+    position_reason = _close_order_position_reason(
+        order,
+        matched_closed_positions,
+        execution_source=execution_source[0],
+    )
     if position_reason:
         fallback_reason = sanitize_text(position_reason)
     trace = build_execution_trace(
@@ -899,6 +1043,8 @@ async def get_trade_detail(trade_id: int):
             "status": order.status,
             "fee": order.fee,
             "exchange_order_id": sanitize_text(order.exchange_order_id),
+            "execution_source": execution_source[0],
+            "execution_source_label": execution_source[1],
             "reason": fallback_reason,
             "detail": fallback_reason,
             "display_reason": fallback_reason,
@@ -910,6 +1056,7 @@ async def get_trade_detail(trade_id: int):
                     "quantity": position.quantity,
                     "entry_price": position.entry_price,
                     "close_price": position.current_price,
+                    "leverage": position.leverage,
                     "realized_pnl": position.realized_pnl,
                     "opened_at": position.created_at.isoformat() if position.created_at else None,
                     "closed_at": position.closed_at.isoformat() if position.closed_at else None,

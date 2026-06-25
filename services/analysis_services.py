@@ -75,7 +75,14 @@ class _ScopedAnalysisService:
                     await asyncio.wait_for(self.run_once(), timeout=time_budget)
                 await asyncio.sleep(self._resolve_interval(interval_seconds))
             except asyncio.CancelledError:
-                break
+                task = asyncio.current_task()
+                if not self.is_running() or (task is not None and task.cancelling()):
+                    break
+                logger.warning(
+                    "analysis service round was cancelled while service remains running; continuing next loop",
+                    scope=self.scope,
+                )
+                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except TimeoutError:
                 logger.error(
                     "analysis service loop timed out",

@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
-from services.exit_intent import COOLDOWN_BYPASS_INTENTS, classify_exit_intent
+from services.exit_intent import (
+    COOLDOWN_BYPASS_INTENTS,
+    classify_exit_intent,
+    is_low_quality_release_without_hard_risk,
+)
 from services.exit_position_matcher import ExitPositionMatcher
 
 
@@ -71,17 +75,20 @@ class ExitPartialGuardPolicy:
         exit_quality = _safe_dict(raw.get("exit_quality"))
         invalidation = _safe_dict(exit_quality.get("invalidation"))
         forced_hard_exit = bool(
-            fast_trigger in {"stop_loss", "take_profit", "hard_adverse_move"}
-            or (
-                fast_trigger in {"near_stop_progress", "fast_adverse_move"}
-                and close_fraction >= 0.999
+            not is_low_quality_release_without_hard_risk(raw)
+            and (
+                fast_trigger in {"stop_loss", "take_profit", "hard_adverse_move"}
+                or (
+                    fast_trigger in {"near_stop_progress", "fast_adverse_move"}
+                    and close_fraction >= 0.999
+                )
+                or raw.get("forced_exit")
+                or close_evidence.get("hard_risk")
+                or close_evidence.get("forced_exit")
+                or invalidation.get("severe")
+                or decision.model_name == "risk_engine"
+                or exit_intent in COOLDOWN_BYPASS_INTENTS
             )
-            or raw.get("forced_exit")
-            or close_evidence.get("hard_risk")
-            or close_evidence.get("forced_exit")
-            or invalidation.get("severe")
-            or decision.model_name == "risk_engine"
-            or exit_intent in COOLDOWN_BYPASS_INTENTS
         )
         if forced_hard_exit:
             return None

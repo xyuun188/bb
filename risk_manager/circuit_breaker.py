@@ -46,10 +46,13 @@ class CircuitBreaker:
     """
 
     def __init__(self, cooldown_minutes: int = 60) -> None:
-        self.max_daily_loss_pct = settings.max_daily_loss_pct
         self.max_consecutive_losses = 5
         self.cooldown = timedelta(minutes=cooldown_minutes)
         self._state = CircuitBreakerState()
+
+    @property
+    def max_daily_loss_pct(self) -> float:
+        return float(settings.max_daily_loss_pct or 0.05)
 
     @property
     def is_open(self) -> bool:

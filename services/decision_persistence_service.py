@@ -297,6 +297,44 @@ class DecisionPersistenceService:
         except Exception as exc:
             logger.error("failed to fill missing decision reasons", error=safe_error_text(exc))
 
+    async def finalize_unresolved_decisions(
+        self,
+        decisions: dict[int, DecisionOutput],
+        reason: str,
+    ) -> int:
+        """Persist a skipped risk-check terminal state for unresolved non-executed decisions."""
+
+        if not decisions:
+            return 0
+        try:
+            sanitized_reason = str(sanitize_runtime_text(reason) or reason)
+            updates: list[tuple[int, str, dict[str, Any]]] = []
+            for decision_id, decision in decisions.items():
+                if not decision_id:
+                    continue
+                raw = self.record_stage(
+                    decision,
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.SKIPPED,
+                    sanitized_reason,
+                    data={
+                        "skip_kind": "round_unresolved_terminal_skip",
+                        "fallback_final_state": True,
+                    },
+                )
+                updates.append((int(decision_id), sanitized_reason, raw))
+            if not updates:
+                return 0
+            async with self._session_context_factory() as session:
+                repo = self._decision_repo_factory(session)
+                return await repo.finalize_unresolved_decisions(updates)
+        except Exception as exc:
+            logger.error(
+                "failed to finalize unresolved decision states",
+                error=safe_error_text(exc),
+            )
+            return 0
+
     async def mark_outcome(self, decision_id: int, outcome: str, pnl_pct: float) -> None:
         try:
             async with self._session_context_factory() as session:

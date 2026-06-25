@@ -203,3 +203,76 @@ def test_entry_capacity_prefers_entry_limit_when_rotation_slots_are_open() -> No
     )
 
     assert reason is None
+
+
+def test_entry_capacity_uses_capacity_snapshot_when_open_positions_are_stale() -> None:
+    policy = EntryCapacityPolicy(
+        _normalize,
+        lambda: {
+            "base_limit": 20,
+            "effective_limit": 15,
+            "entry_limit": 15,
+            "open_group_count": 20,
+            "reason": "over_capacity_release_first=1",
+        },
+    )
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("SOL/USDT"),
+        [
+            {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"},
+            {"model_name": "ensemble_trader", "symbol": "ETH/USDT", "side": "short"},
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is not None
+    assert "容量快照 20 组" in reason
+    assert "本轮持仓列表 2 组" in reason
+    assert "执行容量 15 组" in reason
+
+
+def test_entry_capacity_still_allows_same_symbol_add_with_capacity_snapshot_full() -> None:
+    policy = EntryCapacityPolicy(
+        _normalize,
+        lambda: {
+            "base_limit": 20,
+            "effective_limit": 15,
+            "entry_limit": 15,
+            "open_group_count": 20,
+        },
+    )
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("BTC/USDT"),
+        [{"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"}],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is None
+
+
+def test_entry_capacity_does_not_treat_closed_same_symbol_as_add() -> None:
+    policy = EntryCapacityPolicy(
+        _normalize,
+        lambda: {"entry_limit": 1, "open_group_count": 1},
+    )
+
+    reason = policy.reason(
+        "ensemble_trader",
+        _decision("BTC/USDT"),
+        [
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "is_open": False,
+            }
+        ],
+        {"symbol_side": {}, "model_totals": {}},
+    )
+
+    assert reason is not None
+    assert "容量快照 1 组" in reason

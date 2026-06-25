@@ -332,19 +332,20 @@ function apiErrorText(data, fallback = '未知错误') {
 async function fetchJSON(url) {
     try {
         const res = await fetch(url, { cache: 'no-store' });
-        if (res.status === 401) {
-            redirectToLogin('登录已过期，请重新登录。');
-            return null;
-        }
         const data = await res.json().catch(() => ({}));
+        if (res.status === 401) {
+            const message = apiErrorText(data, '登录已过期，请重新登录。');
+            redirectToLogin(message);
+            throw new Error(message);
+        }
         if (!res.ok) {
             console.error(`Fetch failed: ${url}`, data);
-            return null;
+            throw new Error(apiErrorText(data, res.statusText || '请求失败'));
         }
         return data;
     } catch (e) {
         console.error(`Fetch failed: ${url}`, e);
-        return null;
+        throw e;
     }
 }
 
@@ -558,13 +559,9 @@ async function fetchTrades() {
 }
 
 async function fetchPositionTickerSnapshot() {
-    const data = await fetchJSON(`/api/dashboard/positions?mode=${state.mode}&page=1&page_size=200&open_only=true`);
-    if (!data || !data.positions) return;
-    let tickers = buildTickersFromPositions(data.positions);
-    state.positionTickerSymbols = Object.keys(tickers);
-    tickers = await enrichTickersFromOKX(tickers);
-    updateTickers(tickers, { replace: true });
-    refreshAutoPriceChart();
+    const data = await fetchJSON(`/api/dashboard/market?_=${Date.now()}`);
+    if (!data) return;
+    updateMarketData(data, state.accounts || []);
 }
 
 function filterTickersToOpenPositions(tickers) {
@@ -688,7 +685,7 @@ function updateTickers(tickers, options = {}) {
     container.innerHTML = symbols.map(sym => {
         const t = state.tickers[sym];
         const price = t.price || t.last_price || 0;
-        const change = t.change_24h || t.change24h || 0;
+        const change = t.change_24h ?? t.change24h ?? t.change_24h_pct ?? t.percentage ?? 0;
         const isUp = change >= 0;
         return `
             <div class="ticker-card">
@@ -831,9 +828,14 @@ function buildTickersFromPositions(positions) {
         const price = position.current_price || position.entry_price || 0;
         if (!price) return;
         const previous = state.tickers[position.symbol] || {};
+        const positionChange = position.change_24h ?? position.change24h ?? position.change_24h_pct ?? position.percentage ?? null;
+        const previousChange = previous.change_24h ?? previous.change24h ?? previous.change_24h_pct ?? previous.percentage ?? 0;
+        const change = positionChange !== null && Number(positionChange) !== 0
+            ? positionChange
+            : previousChange;
         tickers[position.symbol] = {
             price,
-            change_24h: position.change_24h ?? previous.change_24h ?? previous.change24h ?? 0,
+            change_24h: change,
             volume_24h: 0,
             bid: 0,
             ask: 0,
@@ -914,7 +916,23 @@ function updateMarketData(market, accounts = []) {
         Object.entries(marketTickers).filter(([symbol]) => state.positionTickerSymbols.includes(symbol))
     );
     const tickers = Object.keys(positionTickers).length
-        ? { ...marketPositionTickers, ...positionTickers }
+        ? Object.fromEntries(Object.entries(positionTickers).map(([symbol, ticker]) => {
+            const marketTicker = marketPositionTickers[symbol] || {};
+            const tickerChange = ticker.change_24h ?? ticker.change24h ?? ticker.change_24h_pct ?? ticker.percentage ?? null;
+            const marketChange = marketTicker.change_24h ?? marketTicker.change24h ?? marketTicker.change_24h_pct ?? marketTicker.percentage ?? null;
+            const shouldKeepMarketChange = marketChange !== null && (tickerChange === null || Number(tickerChange) === 0);
+            return [
+                symbol,
+                {
+                    ...marketTicker,
+                    ...ticker,
+                    change_24h: shouldKeepMarketChange ? marketChange : (tickerChange ?? marketChange ?? 0),
+                    volume_24h: ticker.volume_24h || marketTicker.volume_24h || 0,
+                    bid: ticker.bid || marketTicker.bid || 0,
+                    ask: ticker.ask || marketTicker.ask || 0,
+                },
+            ];
+        }))
         : marketPositionTickers;
     updateTickers(tickers, { replace: true });
     refreshAutoPriceChart();
@@ -1613,6 +1631,7 @@ function activateSettingsTab(name = 'okx') {
     document.querySelectorAll('.settings-section[data-settings-section]').forEach(section => {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
+    if (selected === 'trading') fetchTradingParams();
     if (selected === 'external-events') fetchDataCollectionStatus({ silent: true });
     if (selected === 'vector-memory') refreshVectorMemoryStatus({ silent: true });
 }
@@ -5210,6 +5229,19 @@ function systemAuditTone(status) {
     return 'info';
 }
 
+function systemAuditDisplayStatus(item) {
+    if (!item || typeof item !== 'object') return 'info';
+    if (item.display_status) return item.display_status;
+    const state = String(item.state || '').toLowerCase();
+    if (state === 'fixed') return 'ok';
+    if (state === 'observing') return 'warning';
+    if (state === 'unresolved') {
+        const tone = systemAuditTone(item.status);
+        return tone === 'ok' || tone === 'info' ? 'warning' : tone;
+    }
+    return item.status || 'info';
+}
+
 function systemAuditValueText(value) {
     if (value === null || value === undefined || value === '') return '-';
     if (typeof value === 'number') return monitorNumber(value, Number.isInteger(value) ? 0 : 3);
@@ -5437,6 +5469,14 @@ function systemAuditModelTrainingDetails(details) {
 }
 
 function systemAuditGenericDetailsHtml(details) {
+    if (!details || typeof details !== 'object') return '';
+    const rows = Object.entries(details)
+        .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+        .slice(0, 8)
+        .map(([key, value]) => systemAuditMetric(key, value));
+    return rows.length ? `<div class="system-audit-detail-grid">${rows.join('')}</div>` : '';
+}
+
 function systemAuditShadowMissedOpportunityDetails(details) {
     const summary = details.summary || {};
     const blockedCounts = details.blocked_reason_counts || {};
@@ -5472,15 +5512,6 @@ function systemAuditShadowMissedOpportunityDetails(details) {
         ${systemAuditSection('Controlled probe candidates', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.probe_candidates, 'probe')))}
         ${systemAuditSection('Blocked missed opportunities', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.blocked_examples, 'blocked')))}
         ${systemAuditSection('Blocked reason counts', systemAuditTable(['Reason', 'Count'], blockedReasonRows))}`;
-}
-
-
-    if (!details || typeof details !== 'object') return ''; 
-    const rows = Object.entries(details)
-        .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
-        .slice(0, 8)
-        .map(([key, value]) => systemAuditMetric(key, value));
-    return rows.length ? `<div class="system-audit-detail-grid">${rows.join('')}</div>` : ''; 
 }
 
 function systemAuditCardDetailsHtml(card) {
@@ -5640,10 +5671,11 @@ function renderSystemAuditNodes(nodes) {
     }
     const sortedRows = [...rows].sort((left, right) => {
         const priority = { critical: 0, warning: 1, ok: 2 };
-        return (priority[systemAuditTone(left.status)] ?? 3) - (priority[systemAuditTone(right.status)] ?? 3);
+        return (priority[systemAuditTone(systemAuditDisplayStatus(left))] ?? 3) - (priority[systemAuditTone(systemAuditDisplayStatus(right))] ?? 3);
     });
     container.innerHTML = sortedRows.map((node, index) => {
-        const tone = systemAuditTone(node.status);
+        const displayStatus = systemAuditDisplayStatus(node);
+        const tone = systemAuditTone(displayStatus);
         const checks = Array.isArray(node.checks) ? node.checks.slice(0, 4) : [];
         const upstream = Array.isArray(node.upstream) ? node.upstream : [];
         const downstream = Array.isArray(node.downstream) ? node.downstream : [];
@@ -5651,7 +5683,7 @@ function renderSystemAuditNodes(nodes) {
             <article class="system-audit-node system-audit-node-${tone}">
                 <div class="system-audit-node-head">
                     <span>${escHtml(node.layer || '节点')}</span>
-                    <em>${escHtml(systemAuditStatusLabel(node.status))}</em>
+                    <em>${escHtml(node.state_label || systemAuditStatusLabel(displayStatus))}</em>
                 </div>
                 <div class="system-audit-node-index">${String(index + 1).padStart(2, '0')}</div>
                 <strong>${escHtml(node.title || node.key || '-')}</strong>
@@ -6031,7 +6063,7 @@ function renderPlatformRuntimeCard(platformRuntime) {
         ? platformModels.map(item => `
             <div class="server-monitor-process">
                 <span>${escHtml(item.label || item.name || item.model || '-')} · 平台调用 ${escHtml(item.api_base || '-')}<br><em>目标：${escHtml(item.model || '-')} · 返回：${escHtml((item.models || []).join('、') || '未返回模型名')} · ${escHtml(runtimeEndpointSummary(item) || '-')}</em></span>
-                <strong>${item.available ? '正常' : (item.endpoint_ok ? '模型不匹配' : '不可达')}</strong>
+                <strong>${escHtml(runtimeEndpointStatusLabel(item, { model: true }))}</strong>
             </div>
         `).join('')
         : '<div style="color:var(--text-muted);font-size:11px;">未配置平台侧模型端点。</div>';
@@ -6039,7 +6071,7 @@ function renderPlatformRuntimeCard(platformRuntime) {
         ? childRows.map(([name, item]) => `
             <div class="server-monitor-process">
                 <span>${escHtml(name)} · ${escHtml(item.path || '-')}<br><em>${escHtml(runtimeEndpointSummary(item) || item.error || '-')}</em></span>
-                <strong>${item.available ? '正常' : (item.ok ? '接口异常' : '不可达')}</strong>
+                <strong>${escHtml(runtimeEndpointStatusLabel(item))}</strong>
             </div>
         `).join('')
         : '<div style="color:var(--text-muted);font-size:11px;">本地量化工具子接口未返回。</div>';
@@ -6064,6 +6096,25 @@ function renderPlatformRuntimeCard(platformRuntime) {
 
 function runtimeStatusBadge(ok) {
     return `<span class="status-badge ${ok ? 'status-live' : 'status-paused'}">${ok ? '运行中' : '异常'}</span>`;
+}
+
+function runtimeEndpointStatusLabel(item, options = {}) {
+    if (!item || typeof item !== 'object') return '未返回';
+    if (item.available) return '正常';
+    const statusCode = Number(item.status_code || 0);
+    const category = String(item.status_category || '').toLowerCase();
+    if (category === 'auth_failed' || statusCode === 401) return '认证失败';
+    if (category === 'auth_forbidden' || statusCode === 403) return '权限拒绝';
+    if (category === 'not_found' || statusCode === 404) return '路径不存在';
+    if (category === 'server_error' || statusCode >= 500) return '服务异常/启动中';
+    if (item.endpoint_ok || item.endpoint_available || item.ok) {
+        if (options.model && item.model_available === false) return '模型不匹配';
+        if (item.model_bundle_available === false) return '模型未就绪';
+        return '业务未通过';
+    }
+    if (category === 'network_error' || statusCode === 0) return '不可达';
+    if (statusCode > 0) return `HTTP ${statusCode}`;
+    return '不可达';
 }
 
 function runtimeEndpointSummary(health) {
@@ -6164,7 +6215,7 @@ function renderServerModelRuntime(data, container) {
         ? `<div class="server-monitor-process-list">${platformModels.map(item => `
             <div class="server-monitor-process">
                 <span>${escHtml(item.label || item.name || item.model || '-')} · ${escHtml(item.api_base || '-')}</span>
-                <strong>${item.available ? '正常' : (item.endpoint_ok ? '模型不匹配' : '不可达')}</strong>
+                <strong>${escHtml(runtimeEndpointStatusLabel(item, { model: true }))}</strong>
             </div>
         `).join('')}</div>`
         : '<div style="color:var(--text-muted);font-size:11px;">未配置平台侧模型端点。</div>';
@@ -6218,7 +6269,7 @@ function renderServerModelRuntime(data, container) {
                 ${platformToolChildEntries.length ? `<div class="server-monitor-process-list">${platformToolChildEntries.map(([name, item]) => `
                     <div class="server-monitor-process">
                         <span>${escHtml(name)} · ${escHtml(item.path || '-')}</span>
-                        <strong>${item.available ? '正常' : (item.ok ? '接口异常' : '不可达')}</strong>
+                        <strong>${escHtml(runtimeEndpointStatusLabel(item))}</strong>
                     </div>
                 `).join('')}</div>` : ''}
             </div>
@@ -6388,8 +6439,14 @@ function shortBeijingTime(isoStr) {
 function loopErrorLabel(message) {
     const text = String(message || '').trim();
     if (!text) return '';
+    if (text.includes('exchange close-fill lookup timed out')) {
+        return 'OKX 平仓成交回报查询超时：本轮不会估算平仓，系统会等待下一轮拿到真实成交回报后再补记。';
+    }
+    if (text.includes('exchange protection order map timed out')) {
+        return 'OKX 保护单列表同步超时：本轮先使用本地止盈止损记录；若连续出现，请检查 OKX 条件单接口响应。';
+    }
     if (text.includes('reconciliation timed out')) {
-        return 'OKX 仓位/保护单同步超时：本轮已继续使用本地持仓快照；若连续出现，请检查 OKX 网络、API Key 权限或保护单接口响应。';
+        return 'OKX 仓位对账整轮超时：本轮已继续使用本地持仓快照；若连续出现，请检查 OKX 网络、API Key 权限或历史成交接口响应。';
     }
     if (text.includes('position analysis round cancelled by hard watchdog')) {
         return '持仓复盘整轮超时：本轮已被保护性中断，通常是 OKX 同步、行情刷新或持仓复盘阶段累计过慢；系统会进入下一轮继续处理。';
@@ -7674,7 +7731,7 @@ function renderTradePage() {
         const time = t.filled_at || t.created_at || '';
         const success = t.success === true || t.status === 'filled';
         const statusInfo = executionStatusPresentation(t, success);
-        const sourceLabel = t.execution_source_label || (t.execution_source === 'okx' ? 'OKX执行' : '系统执行');
+        const sourceLabel = t.execution_source_label || (t.execution_source === 'okx' ? 'OKX同步' : '系统执行');
         const sourceColor = t.execution_source === 'okx' ? 'var(--accent-light)' : 'var(--text-muted)';
         return `
         <tr>
@@ -7946,7 +8003,7 @@ function renderExecutionTimeline(steps, failedStep) {
 function renderExecutionDetailModal(trade, detailData = null) {
     setDecisionModalWide(false);
     const success = trade.success === true || trade.status === 'filled';
-    const fallbackSource = trade.execution_source === 'okx' ? 'OKX执行' : '系统执行';
+    const fallbackSource = trade.execution_source === 'okx' ? 'OKX同步' : '系统执行';
     const sourceLabel = trade.execution_source_label && !isMojibakeText(String(trade.execution_source_label))
         ? trade.execution_source_label
         : fallbackSource;
@@ -8157,6 +8214,87 @@ function finiteInputNumberAttr(input, attrName, fallback) {
 
 // ========== Trading Parameters ==========
 
+function thresholdCatalogSummaryHtml(data) {
+    const policy = data?.policy || {};
+    const notes = Array.isArray(policy.notes) ? policy.notes : [];
+    const flags = [
+        policy.hard_risk_auto_relax === false ? '硬风险上限不会自动放松' : '',
+        policy.auto_tunable_not_rendered_as_manual_inputs ? '自动调度项不放进手动输入框' : '',
+        policy.removed_fake_thresholds ? '无行为接入的假阈值已清理' : '',
+    ].filter(Boolean);
+    const text = [...flags, ...notes].filter(Boolean).slice(0, 4).join('；');
+    return escHtml(text || '阈值治理规则已读取。');
+}
+
+function thresholdCatalogItemHtml(item) {
+    const current = item?.effective_display || item?.current_display || item?.current || '-';
+    const source = [item?.surface, item?.source].filter(Boolean).join(' / ');
+    const up = item?.increase_effect ? `<span>调高：${escHtml(item.increase_effect)}</span>` : '';
+    const down = item?.decrease_effect ? `<span>调低：${escHtml(item.decrease_effect)}</span>` : '';
+    const impact = up || down ? `<div class="threshold-governance-impact">${up}${down}</div>` : '';
+    const automation = item?.automation ? `<em>${escHtml(item.automation)}</em>` : '';
+    const reason = item?.reason ? `<small>${escHtml(item.reason)}</small>` : '';
+    return `
+        <div class="threshold-governance-item">
+            <div class="threshold-governance-item-head">
+                <strong>${escHtml(item?.label || item?.key || '阈值')}</strong>
+                <span class="threshold-governance-value">${escHtml(String(current))}</span>
+            </div>
+            <p>${escHtml(item?.effect || '-')}</p>
+            ${impact}
+            ${automation}
+            ${source ? `<small>来源：${escHtml(source)}</small>` : ''}
+            ${reason}
+        </div>
+    `;
+}
+
+function renderThresholdCatalogList(elementId, items) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) {
+        el.innerHTML = '<div class="threshold-governance-item"><p>暂无项目</p></div>';
+        return;
+    }
+    el.innerHTML = list.map(thresholdCatalogItemHtml).join('');
+}
+
+function renderThresholdCatalog(data) {
+    const summary = document.getElementById('threshold-governance-summary');
+    if (summary) summary.innerHTML = thresholdCatalogSummaryHtml(data);
+    const stripText = document.getElementById('threshold-governance-strip-text');
+    if (stripText) {
+        stripText.textContent = '手动项只保留账户风控和服务连接参数；策略学习能自动计算的阈值不会放进手动输入框。';
+    }
+    const setCount = (id, label, items) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = `${label} ${Array.isArray(items) ? items.length : 0}`;
+    };
+    setCount('threshold-manual-count', '手动', data?.manual_editable);
+    setCount('threshold-auto-count', '自动', data?.auto_tunable);
+    setCount('threshold-hard-count', '硬上限', data?.manual_hard_guards);
+    setCount('threshold-removed-count', '废弃', data?.removed_or_deprecated);
+    renderThresholdCatalogList('threshold-manual-editable', data?.manual_editable);
+    renderThresholdCatalogList('threshold-service-controls', data?.manual_service_controls);
+    renderThresholdCatalogList('threshold-auto-tunable', data?.auto_tunable);
+    renderThresholdCatalogList('threshold-manual-hard-guards', data?.manual_hard_guards);
+    renderThresholdCatalogList('threshold-removed-deprecated', data?.removed_or_deprecated);
+}
+
+async function fetchThresholdCatalog() {
+    try {
+        const data = await fetchJSON('/api/settings/threshold-catalog');
+        renderThresholdCatalog(data);
+    } catch (err) {
+        const summary = document.getElementById('threshold-governance-summary');
+        if (summary) summary.textContent = `阈值治理接口异常：${err.message || err}`;
+        const stripText = document.getElementById('threshold-governance-strip-text');
+        if (stripText) stripText.textContent = `阈值治理接口异常：${err.message || err}`;
+    }
+}
+
 async function fetchTradingParams() {
     const data = await fetchJSON('/api/settings/thresholds');
     if (!data) return;
@@ -8165,6 +8303,12 @@ async function fetchTradingParams() {
     const thresholdInput = document.getElementById('cfg-confidence-threshold');
     const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
     const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
+    const maxPositionInput = document.getElementById('cfg-max-position-pct');
+    const maxLeverageInput = document.getElementById('cfg-max-leverage');
+    const maxDailyLossInput = document.getElementById('cfg-max-daily-loss-pct');
+    const hardStopLossInput = document.getElementById('cfg-hard-stop-loss-pct');
+    const maxOpenPositionsInput = document.getElementById('cfg-max-open-positions-per-model');
+    const maxSameSymbolInput = document.getElementById('cfg-max-same-symbol-positions-per-side');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -8225,6 +8369,29 @@ async function fetchTradingParams() {
         const pct = valueNumber(data.max_slippage_pct);
         maxSlippageInput.value = pct !== null ? (pct * 100).toFixed(2) : '';
     }
+    if (maxPositionInput) {
+        const pct = valueNumber(data.max_position_pct);
+        maxPositionInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
+    }
+    if (maxLeverageInput) {
+        const leverage = valueNumber(data.max_leverage);
+        maxLeverageInput.value = leverage !== null ? leverage.toFixed(1) : '';
+    }
+    if (maxDailyLossInput) {
+        const pct = valueNumber(data.max_daily_loss_pct);
+        maxDailyLossInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
+    }
+    if (hardStopLossInput) {
+        const pct = valueNumber(data.hard_stop_loss_pct);
+        hardStopLossInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
+    }
+    if (maxOpenPositionsInput) {
+        maxOpenPositionsInput.value = data.max_open_positions_per_model ?? '';
+    }
+    if (maxSameSymbolInput) {
+        maxSameSymbolInput.value = data.max_same_symbol_positions_per_side ?? '';
+    }
+    await fetchThresholdCatalog();
 }
 
 async function saveTradingParams() {
@@ -8232,6 +8399,12 @@ async function saveTradingParams() {
     const thresholdInput = document.getElementById('cfg-confidence-threshold');
     const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
     const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
+    const maxPositionInput = document.getElementById('cfg-max-position-pct');
+    const maxLeverageInput = document.getElementById('cfg-max-leverage');
+    const maxDailyLossInput = document.getElementById('cfg-max-daily-loss-pct');
+    const hardStopLossInput = document.getElementById('cfg-hard-stop-loss-pct');
+    const maxOpenPositionsInput = document.getElementById('cfg-max-open-positions-per-model');
+    const maxSameSymbolInput = document.getElementById('cfg-max-same-symbol-positions-per-side');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -8252,6 +8425,54 @@ async function saveTradingParams() {
     }
     if (thresholdInput && thresholdInput.value) {
         body.confidence_threshold = parseFloat(thresholdInput.value);
+    }
+    if (maxPositionInput && maxPositionInput.value !== '') {
+        const pct = parseFloat(maxPositionInput.value);
+        if (!Number.isFinite(pct) || pct < 0.5 || pct > 50) {
+            alert('保存失败: 单笔保证金上限必须在 0.5% 到 50% 之间');
+            return;
+        }
+        body.max_position_pct = pct / 100;
+    }
+    if (maxLeverageInput && maxLeverageInput.value !== '') {
+        const leverage = parseFloat(maxLeverageInput.value);
+        if (!Number.isFinite(leverage) || leverage < 1 || leverage > 125) {
+            alert('保存失败: 最大杠杆必须在 1x 到 125x 之间');
+            return;
+        }
+        body.max_leverage = leverage;
+    }
+    if (maxDailyLossInput && maxDailyLossInput.value !== '') {
+        const pct = parseFloat(maxDailyLossInput.value);
+        if (!Number.isFinite(pct) || pct < 0.1 || pct > 50) {
+            alert('保存失败: 日内最大亏损必须在 0.1% 到 50% 之间');
+            return;
+        }
+        body.max_daily_loss_pct = pct / 100;
+    }
+    if (hardStopLossInput && hardStopLossInput.value !== '') {
+        const pct = parseFloat(hardStopLossInput.value);
+        if (!Number.isFinite(pct) || pct < 0.1 || pct > 50) {
+            alert('保存失败: 硬止损必须在 0.1% 到 50% 之间');
+            return;
+        }
+        body.hard_stop_loss_pct = pct / 100;
+    }
+    if (maxOpenPositionsInput && maxOpenPositionsInput.value !== '') {
+        const value = parseInt(maxOpenPositionsInput.value, 10);
+        if (!Number.isFinite(value) || value < 1 || value > 200) {
+            alert('保存失败: 基础持仓组数上限必须在 1 到 200 之间');
+            return;
+        }
+        body.max_open_positions_per_model = value;
+    }
+    if (maxSameSymbolInput && maxSameSymbolInput.value !== '') {
+        const value = parseInt(maxSameSymbolInput.value, 10);
+        if (!Number.isFinite(value) || value < 1 || value > 20) {
+            alert('保存失败: 同币同向持仓组数上限必须在 1 到 20 之间');
+            return;
+        }
+        body.max_same_symbol_positions_per_side = value;
     }
     if (localToolsEnabledInput) {
         body.local_ai_tools_enabled = Boolean(localToolsEnabledInput.checked);
@@ -8366,6 +8587,25 @@ async function saveTradingParams() {
     if (maxSlippageInput && data.max_slippage_pct !== undefined) {
         maxSlippageInput.value = (Number(data.max_slippage_pct) * 100).toFixed(2);
     }
+    if (maxPositionInput && data.max_position_pct !== undefined) {
+        maxPositionInput.value = (Number(data.max_position_pct) * 100).toFixed(1);
+    }
+    if (maxLeverageInput && data.max_leverage !== undefined) {
+        maxLeverageInput.value = Number(data.max_leverage).toFixed(1);
+    }
+    if (maxDailyLossInput && data.max_daily_loss_pct !== undefined) {
+        maxDailyLossInput.value = (Number(data.max_daily_loss_pct) * 100).toFixed(1);
+    }
+    if (hardStopLossInput && data.hard_stop_loss_pct !== undefined) {
+        hardStopLossInput.value = (Number(data.hard_stop_loss_pct) * 100).toFixed(1);
+    }
+    if (maxOpenPositionsInput && data.max_open_positions_per_model !== undefined) {
+        maxOpenPositionsInput.value = data.max_open_positions_per_model;
+    }
+    if (maxSameSymbolInput && data.max_same_symbol_positions_per_side !== undefined) {
+        maxSameSymbolInput.value = data.max_same_symbol_positions_per_side;
+    }
+    await fetchThresholdCatalog();
     alert('参数已保存，立即生效');
 }
 

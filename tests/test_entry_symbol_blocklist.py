@@ -23,6 +23,12 @@ def test_entry_symbol_blocklist_classifies_exchange_errors() -> None:
     assert policy.is_untradable_exchange_error("交易对当前不可交易，请稍后重试")
     assert policy.is_untradable_exchange_error("instrument suspended")
     assert policy.is_untradable_exchange_error("not available for trading")
+    assert policy.is_untradable_exchange_error("okx 51028 Contract under delivery.")
+    assert not policy.is_untradable_exchange_error("okx does not have market symbol LAB/USDT:USDT")
+    assert not policy.is_untradable_exchange_error("bad symbol")
+    assert not policy.is_untradable_exchange_error(
+        "OKX market symbol mismatch: requested WLFI/USDT, exchange instrument is H/USDT"
+    )
     assert policy.is_transient_entry_exchange_error("51290 engine currently upgrading")
     assert policy.is_transient_entry_exchange_error(
         'Max retries exceeded: okx {"code":"50001","data":[],"msg":"Service temporarily unavailable. Please try again later."}'

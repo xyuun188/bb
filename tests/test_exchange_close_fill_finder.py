@@ -68,7 +68,7 @@ async def test_exchange_close_fill_finder_uses_latest_closed_order_candidate():
                 "reduceOnly": True,
                 "timestamp": timestamp + 1,
                 "fee": {"cost": "0.25"},
-                "info": {"pnl": "24"},
+                "info": {"pnl": "24", "ordType": "trigger", "algoId": "algo-1"},
             },
         ]
     )
@@ -86,7 +86,45 @@ async def test_exchange_close_fill_finder_uses_latest_closed_order_candidate():
     assert result["fee"] == 0.25
     assert result["pnl"] == 24.0
     assert result["source"] == "closed_orders"
+    assert result["order_type"] == "trigger"
+    assert result["algo_id"] == "algo-1"
+    assert result["order_info"]["algoId"] == "algo-1"
     assert parser_calls == [timestamp + 1]
+
+
+@pytest.mark.asyncio
+async def test_exchange_close_fill_finder_prefers_quantity_match_over_latest_candidate():
+    timestamp = int(datetime(2026, 6, 8, 12, 10, tzinfo=UTC).timestamp() * 1000)
+    ccxt = _FakeCcxt(
+        closed_orders=[
+            {
+                "id": "reduced-ten",
+                "side": "sell",
+                "filled": "10",
+                "average": "3.85",
+                "reduceOnly": True,
+                "timestamp": timestamp,
+                "info": {"pnl": "15.4"},
+            },
+            {
+                "id": "later-six",
+                "side": "sell",
+                "filled": "6",
+                "average": "4.26",
+                "reduceOnly": True,
+                "timestamp": timestamp + 60000,
+                "info": {"pnl": "11.7"},
+            },
+        ],
+        contract_size=1.0,
+    )
+    finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
+
+    result = await finder.find(_position(quantity=10.0))
+
+    assert result["order_id"] == "reduced-ten"
+    assert result["price"] == 3.85
+    assert result["quantity"] == 10.0
 
 
 @pytest.mark.asyncio

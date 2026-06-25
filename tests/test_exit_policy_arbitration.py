@@ -93,6 +93,49 @@ async def test_exit_policy_ordinary_exit_still_uses_guard_chain() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exit_policy_blocks_untradable_cooldown_before_hard_risk_bypass() -> None:
+    first = datetime(2026, 6, 8, tzinfo=UTC)
+    current = first + timedelta(seconds=30)
+    cooldown = ExitCooldownPolicy(
+        normalize_symbol=lambda value: str(value).replace("/", "-"),
+        clock=lambda: first,
+    )
+    cooldown.remember_exit(
+        "ensemble_trader",
+        _decision(
+            {
+                "fast_risk_trigger": "stop_loss",
+                "untradable_exit_execution_error": {
+                    "reason": "OKX 51028: Contract under delivery",
+                },
+            }
+        ),
+    )
+    cooldown.clock = lambda: current
+    policy = ExitPolicy(
+        exit_position_matcher=AlwaysMatch(),
+        exit_cooldown=cooldown,
+    )
+
+    retry = _decision({"fast_risk_trigger": "stop_loss"})
+    result = await policy.evaluate(
+        retry,
+        "ensemble_trader",
+        [{"symbol": "BTC/USDT", "side": "long", "quantity": 1.0}],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "untradable_exit_cooldown"
+    assert result.data is not None
+    assert result.data["exit_arbitration"]["intent"] == "hard_risk"
+    assert result.data["exit_arbitration"]["bypass_cooldown"] is True
+    assert result.reason is not None
+    assert "不可交易平仓冷却" in result.reason
+    assert retry.raw_response["untradable_exit_cooldown"]["symbol"] == "BTC-USDT"
+    assert retry.raw_response["untradable_exit_cooldown"]["last_error"].startswith("OKX 51028")
+
+
+@pytest.mark.asyncio
 async def test_exit_policy_can_skip_snapshot_refresh_for_fast_local_paths() -> None:
     calls: list[str] = []
 

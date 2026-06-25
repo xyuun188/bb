@@ -114,6 +114,29 @@ def test_exit_cooldown_bypasses_hard_risk_exit() -> None:
     assert policy.recent_exit_cooldown_reason("model_a", hard_stop) is None
 
 
+def test_exit_cooldown_blocks_untradable_exit_even_when_hard_risk_retries() -> None:
+    now = datetime(2026, 6, 8, tzinfo=UTC)
+    policy = ExitCooldownPolicy(
+        normalize_symbol=lambda value: str(value).replace("/", "-"),
+        clock=lambda: now,
+    )
+    failed = _decision(
+        raw_response={
+            "fast_risk_trigger": "stop_loss",
+            "untradable_exit_execution_error": {"reason": "OKX instrument suspended for trading"},
+        }
+    )
+    policy.remember_exit("model_a", failed)
+
+    retry = _decision(raw_response={"fast_risk_trigger": "stop_loss"})
+    reason = policy.recent_exit_cooldown_reason("model_a", retry)
+
+    assert reason is not None
+    assert "不可交易平仓冷却" in reason
+    assert retry.raw_response["untradable_exit_cooldown"]["symbol"] == "BTC-USDT"
+    assert retry.raw_response["untradable_exit_cooldown"]["last_error"].startswith("OKX")
+
+
 def test_exit_cooldown_bypasses_predictive_downside_exit() -> None:
     now = datetime(2026, 6, 8, tzinfo=UTC)
     policy = ExitCooldownPolicy(normalize_symbol=str, clock=lambda: now)
@@ -130,6 +153,29 @@ def test_exit_cooldown_bypasses_predictive_downside_exit() -> None:
     )
 
     assert policy.recent_exit_cooldown_reason("model_a", predictive) is None
+
+
+def test_exit_cooldown_blocks_old_low_quality_release_payload() -> None:
+    now = datetime(2026, 6, 8, tzinfo=UTC)
+    policy = ExitCooldownPolicy(normalize_symbol=str, clock=lambda: now)
+    policy.remember_exit("model_a", _decision())
+
+    release = _decision(
+        raw_response={
+            "forced_exit": True,
+            "position_release_policy": {
+                "source": "position_quality_capacity_release",
+                "forced": True,
+            },
+            "close_evidence": {
+                "forced_exit": True,
+                "hard_risk": False,
+                "source": "low_quality_position_release",
+            },
+        }
+    )
+
+    assert policy.recent_exit_cooldown_reason("model_a", release) is not None
 
 
 def test_exit_cooldown_ignores_non_exit_decisions() -> None:

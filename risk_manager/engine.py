@@ -9,6 +9,7 @@ import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
+from core.symbols import normalize_trading_symbol
 from risk_manager.black_swan import BlackSwanDetector, BlackSwanResult
 from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
@@ -240,29 +241,59 @@ class RiskEngine:
             if position.get("model_name") == decision.model_name
         ]
         decision_side = "long" if decision.action == Action.LONG else "short"
+        decision_symbol = normalize_trading_symbol(decision.symbol)
         same_symbol_positions = [
             position
             for position in model_open_positions
-            if position.get("side") == decision_side and position.get("symbol") == decision.symbol
+            if self._is_effective_open_position(position)
+            if position.get("side") == decision_side
+            and normalize_trading_symbol(position.get("symbol")) == decision_symbol
         ]
+        opposite_side = "short" if decision_side == "long" else "long"
+        opposite_symbol_positions = [
+            position
+            for position in model_open_positions
+            if self._is_effective_open_position(position)
+            if position.get("side") == opposite_side
+            and normalize_trading_symbol(position.get("symbol")) == decision_symbol
+        ]
+        if opposite_symbol_positions:
+            return RiskAssessment(
+                approved=False,
+                decision=decision,
+                rejection_reason=(
+                    "OKX 净持仓模式下，同币种反向 entry 会先抵消/平掉已有仓位，"
+                    f"禁止把 {decision_side} 当作普通新开仓提交；请先平掉或反转已有 "
+                    f"{opposite_side} 仓位后再重新评估。"
+                ),
+            )
         is_same_symbol_add = bool(same_symbol_positions)
 
         capacity = self._max_open_positions_context()
-        max_open_positions = int(
-            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
+        max_open_positions = self._capacity_limit(capacity)
+        position_list_open_group_count = self._model_open_group_count(model_open_positions)
+        capacity_open_group_count = self._capacity_open_group_count(capacity)
+        model_open_group_count = max(
+            position_list_open_group_count,
+            capacity_open_group_count,
         )
-        model_open_group_count = self._model_open_group_count(model_open_positions)
         if (
             not is_same_symbol_add
             and max_open_positions > 0
             and model_open_group_count >= max_open_positions
         ):
+            count_detail = self._capacity_count_text(
+                model_open_group_count=model_open_group_count,
+                max_open_positions=max_open_positions,
+                capacity_open_group_count=capacity_open_group_count,
+                position_list_open_group_count=position_list_open_group_count,
+            )
             return RiskAssessment(
                 approved=False,
                 decision=decision,
                 rejection_reason=(
                     "当前持仓组数已达到动态容量上限，暂停新开不同币种/方向仓位。"
-                    f"当前 {model_open_group_count} 组，限制 {max_open_positions} 组。"
+                    f"{count_detail}"
                     f"{self._capacity_suffix(capacity)}"
                 ),
             )
@@ -342,16 +373,63 @@ class RiskEngine:
             "reason": "",
         }
 
+    @classmethod
+    def _capacity_limit(cls, capacity: dict[str, Any]) -> int:
+        return cls._safe_non_negative_int(
+            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
+        )
+
+    @classmethod
+    def _capacity_open_group_count(cls, capacity: dict[str, Any]) -> int:
+        return cls._safe_non_negative_int(capacity.get("open_group_count") or 0)
+
+    @staticmethod
+    def _safe_non_negative_int(value: Any) -> int:
+        try:
+            return max(int(float(value or 0)), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_effective_open_position(position: dict[str, Any]) -> bool:
+        if position.get("is_open", True) is False:
+            return False
+        if "quantity" not in position:
+            return True
+        try:
+            return float(position.get("quantity") or 0.0) > 1e-12
+        except (TypeError, ValueError):
+            return True
+
     @staticmethod
     def _model_open_group_count(positions: list[dict]) -> int:
         groups: set[tuple[str, str]] = set()
         for position in positions or []:
-            if position.get("is_open", True) is False:
+            if not RiskEngine._is_effective_open_position(position):
                 continue
-            symbol = str(position.get("symbol") or "").strip().upper()
+            symbol = normalize_trading_symbol(position.get("symbol"))
             side = str(position.get("side") or "unknown").strip().lower() or "unknown"
             groups.add((symbol, side))
         return len(groups)
+
+    @staticmethod
+    def _capacity_count_text(
+        *,
+        model_open_group_count: int,
+        max_open_positions: int,
+        capacity_open_group_count: int = 0,
+        position_list_open_group_count: int | None = None,
+    ) -> str:
+        if (
+            position_list_open_group_count is not None
+            and capacity_open_group_count > position_list_open_group_count
+        ):
+            return (
+                f"容量快照 {capacity_open_group_count} 组，本次持仓列表 "
+                f"{position_list_open_group_count} 组，按较大值 "
+                f"{model_open_group_count} 组计算，限制 {max_open_positions} 组。"
+            )
+        return f"当前 {model_open_group_count} 组，限制 {max_open_positions} 组。"
 
     @staticmethod
     def _capacity_suffix(capacity: dict[str, Any]) -> str:

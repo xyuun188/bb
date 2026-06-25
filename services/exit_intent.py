@@ -112,6 +112,31 @@ def _contains_protective_downside_text(text: str) -> bool:
     return any(term.lower() in lowered for term in PROTECTIVE_DOWNSIDE_EXIT_TEXT_TERMS)
 
 
+def is_low_quality_release_without_hard_risk(raw: dict[str, Any]) -> bool:
+    policy = _safe_dict(raw.get("position_release_policy"))
+    close_evidence = _safe_dict(raw.get("close_evidence"))
+    exit_quality = _safe_dict(raw.get("exit_quality"))
+    invalidation = _safe_dict(exit_quality.get("invalidation"))
+    source = str(policy.get("source") or close_evidence.get("source") or "").lower()
+    if source not in {"position_quality_capacity_release", "low_quality_position_release"}:
+        return False
+    fast_trigger = str(raw.get("fast_risk_trigger") or "").strip().lower()
+    hard_fast_trigger = fast_trigger in {
+        "stop_loss",
+        "hard_adverse_move",
+        "near_stop_progress",
+        "fast_adverse_move",
+    }
+    return not bool(
+        close_evidence.get("hard_risk")
+        or close_evidence.get("raw_hard_risk")
+        or hard_fast_trigger
+        or invalidation.get("severe")
+        or invalidation.get("key_break")
+        or invalidation.get("trend_reversal")
+    )
+
+
 def classify_exit_intent(
     decision: DecisionOutput,
     *,
@@ -124,14 +149,19 @@ def classify_exit_intent(
 
     raw = _safe_dict(decision.raw_response)
     close_evidence = _safe_dict(raw.get("close_evidence"))
-    existing = (
-        _normalized_existing_intent(raw.get("exit_intent"))
-        or _normalized_existing_intent(close_evidence.get("exit_intent"))
-        or _normalized_existing_intent(close_evidence.get("exit_reason"))
-    )
+    low_quality_release = is_low_quality_release_without_hard_risk(raw)
+    existing = None
+    if low_quality_release:
+        intent = ExitIntent.CAPITAL_ROTATION
+    else:
+        existing = (
+            _normalized_existing_intent(raw.get("exit_intent"))
+            or _normalized_existing_intent(close_evidence.get("exit_intent"))
+            or _normalized_existing_intent(close_evidence.get("exit_reason"))
+        )
     if existing is not None:
         intent = existing
-    else:
+    elif not low_quality_release:
         execution_profit = _safe_dict(raw.get("execution_profit_protection"))
         exit_quality = _safe_dict(raw.get("exit_quality"))
         invalidation = _safe_dict(exit_quality.get("invalidation"))

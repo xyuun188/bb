@@ -188,6 +188,44 @@ async def test_forced_exit_bypasses_entry_settlement_guard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_low_quality_release_does_not_bypass_fee_churn_guard() -> None:
+    decision = _decision(
+        current_price=99.95,
+        confidence=0.95,
+        reasoning="策略纪律触发低质量持仓释放",
+        raw_response={
+            "forced_exit": True,
+            "exit_intent": "hard_risk",
+            "position_release_policy": {
+                "source": "position_quality_capacity_release",
+                "forced": True,
+            },
+            "close_evidence": {
+                "forced_exit": True,
+                "hard_risk": False,
+                "source": "low_quality_position_release",
+            },
+        },
+    )
+    positions = [
+        _position(
+            entry_price=100.0,
+            current_price=99.95,
+            created_at=datetime.now(UTC) - timedelta(minutes=20),
+        )
+    ]
+
+    reason = await _policy(positions, entry_fee=0.05).guard_reason(
+        "ensemble_trader",
+        decision,
+    )
+
+    assert reason is not None
+    assert decision.raw_response["exit_intent"] == "capital_rotation"
+    assert decision.raw_response["exit_quality"]["net_profit_after_fee"] < 0
+
+
+@pytest.mark.asyncio
 async def test_small_partial_profit_lock_is_blocked_when_planned_net_is_too_small() -> None:
     decision = _decision(
         current_price=103.2,

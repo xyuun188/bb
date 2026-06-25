@@ -39,6 +39,38 @@ def test_position_snapshot_syncer_updates_single_position_quantity_and_protectio
     assert isinstance(position.updated_at, datetime)
 
 
+def test_position_snapshot_syncer_corrects_entry_price_after_exchange_contract_adjustment():
+    position = SimpleNamespace(
+        is_open=True,
+        quantity=100.0,
+        current_price=2.44,
+        entry_price=23.21,
+        leverage=6.0,
+        side="long",
+        stop_loss_price=2.2099,
+        take_profit_price=2.6026,
+        unrealized_pnl=13.0,
+        updated_at=None,
+    )
+
+    changed = PositionSnapshotSyncer().sync(
+        [position],
+        exchange_quantity=100.0,
+        current_price=2.44,
+        entry_price=2.31,
+        leverage=6.0,
+        exchange_unrealized=13.0,
+        stop_loss_price=2.2099,
+        take_profit_price=2.6026,
+    )
+
+    assert changed is True
+    assert position.quantity == 100.0
+    assert position.entry_price == 2.31
+    assert position.current_price == 2.44
+    assert position.unrealized_pnl == 13.0
+
+
 def test_position_snapshot_syncer_resizes_fragmented_positions_proportionally():
     first = SimpleNamespace(
         is_open=True,

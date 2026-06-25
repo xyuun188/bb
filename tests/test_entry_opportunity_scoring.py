@@ -403,6 +403,89 @@ def test_entry_opportunity_scoring_caps_ai_only_profit_when_quant_is_not_aligned
     assert breakdown["observed_not_in_formula"][0]["key"] == "sentiment"
 
 
+def test_entry_opportunity_scoring_removes_ai_profit_for_probe_hold_without_support() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.confidence = 0.84
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response["evidence_profit_probe"] = {
+        "triggered": True,
+        "ai_original_action": "hold",
+        "side": "long",
+    }
+    decision.raw_response["opinions"] = [
+        {"model_name": "trend_expert", "action": "hold", "confidence": 0.72},
+        {"model_name": "momentum_expert", "action": "hold", "confidence": 0.70},
+    ]
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": {
+            "available": True,
+            "best_side": "short",
+            "adjusted_long_return_pct": -0.30,
+            "adjusted_short_return_pct": -0.20,
+            "long_loss_probability": 0.49,
+            "profit_quality_score": -0.05,
+        },
+        "time_series_prediction": {
+            "available": True,
+            "best_side": "short",
+            "direction": "down",
+            "expected_move_pct": -0.03,
+            "expected_return_pct": -0.03,
+        },
+    }
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = {row["key"]: row for row in opportunity["expected_net_breakdown"]["components"]}
+    assert opportunity["ai_expected_return_pct"] > 0.0
+    assert opportunity["ai_expected_return_contribution_pct"] == 0.0
+    assert opportunity["ai_expected_return_weight"] == 0.0
+    assert (
+        opportunity["ai_expected_return_policy"]
+        == "probe_original_hold_without_independent_support"
+    )
+    assert components["ai"]["policy"] == "probe_original_hold_without_independent_support"
+    assert components["ai"]["contribution_pct"] == 0.0
+    assert opportunity["expected_net_return_pct"] == opportunity["model_expected_net_return_pct"]
+    assert opportunity["expected_net_return_pct"] < 0.35
+
+
+def test_entry_opportunity_scoring_keeps_limited_ai_profit_for_supported_probe_hold() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    decision = _decision()
+    decision.confidence = 0.84
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response["evidence_profit_probe"] = {
+        "triggered": True,
+        "ai_original_action": "hold",
+        "side": "long",
+    }
+    decision.raw_response["opinions"] = [
+        {
+            "model_name": "trend_expert",
+            "action": "long",
+            "confidence": 0.72,
+            "independent_expert_retry": True,
+        }
+    ]
+
+    _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = {row["key"]: row for row in opportunity["expected_net_breakdown"]["components"]}
+    assert opportunity["ai_expected_return_weight"] == 0.08
+    assert opportunity["ai_expected_return_contribution_pct"] > 0.0
+    assert (
+        opportunity["ai_expected_return_policy"] == "probe_original_hold_with_independent_support"
+    )
+    assert components["ai"]["weight"] == 0.08
+    assert components["ai"]["independent_probe_support"] == ["trend_expert"]
+
+
 def test_entry_opportunity_scoring_uses_advisory_ml_with_reduced_weight() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     decision = _decision()

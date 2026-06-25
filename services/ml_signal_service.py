@@ -55,10 +55,10 @@ AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = (
 AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_learning_only_min_new_samples
 TRAINING_SHADOW_SAMPLE_LIMIT = _LOCAL_ML_PARAMS.training_shadow_sample_limit
 TRAINING_BALANCED_RECENT_CANDIDATE_SHARE = 0.60
-TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE = 0.35
-TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE = 0.60
+TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE = 1.00
+TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE = 1.25
 TRAINING_MIN_NON_HOLD_SHARE = 0.25
-TRAINING_MIN_BEST_TRADE_SHARE = 0.50
+TRAINING_MIN_BEST_TRADE_SHARE = 1.00
 
 FEATURE_KEYS = [
     "change_24h_pct",
@@ -457,22 +457,91 @@ def _shadow_action(row: Any, field: str) -> str:
     return str(getattr(row, field, "") or "").lower().strip()
 
 
+def _shadow_decision_confidence(row: Any) -> float:
+    return _safe_float(getattr(row, "decision_confidence", 0.0), 0.0) or 0.0
+
+
+def _shadow_is_low_confidence_hold(row: Any) -> bool:
+    threshold = DEFAULT_TRADING_PARAMS.training_data_quality.very_low_confidence_threshold
+    return _shadow_action(row, "decision_action") == "hold" and (
+        _shadow_decision_confidence(row) < threshold
+    )
+
+
+def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
+    if _shadow_action(row, "best_action") not in {"long", "short"}:
+        return False
+    if _shadow_action(row, "decision_action") not in {"long", "short"}:
+        return False
+    return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
+
+
+def _shadow_quality_sample(row: Any) -> dict[str, Any]:
+    return {
+        "symbol": getattr(row, "symbol", ""),
+        "analysis_type": getattr(row, "analysis_type", ""),
+        "decision_action": getattr(row, "decision_action", ""),
+        "decision_confidence": _shadow_decision_confidence(row),
+        "horizon_minutes": int(getattr(row, "horizon_minutes", 10) or 10),
+        "features": _parse_json(getattr(row, "feature_snapshot", None)),
+        "long_return_pct": _safe_float(getattr(row, "long_return_pct", None), None),
+        "short_return_pct": _safe_float(getattr(row, "short_return_pct", None), None),
+        "label_timestamp": getattr(row, "due_at", None),
+        "best_action": getattr(row, "best_action", ""),
+        "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
+    }
+
+
+def _shadow_quality_rank(row: Any) -> tuple[int, float, int]:
+    """Prefer trainable directional samples before recent low-confidence holds."""
+
+    assessment = assess_shadow_sample(_shadow_quality_sample(row))
+    action = _shadow_action(row, "decision_action")
+    best_action = _shadow_action(row, "best_action")
+    directional = int(action in {"long", "short"})
+    best_trade = int(best_action in {"long", "short"})
+    missed_trade = int(bool(getattr(row, "missed_opportunity", False)) and best_trade)
+    action_score = directional * 4 + best_trade * 3 + missed_trade
+    trainable_score = 0 if assessment.exclude_from_training else 10
+    return (
+        trainable_score + action_score,
+        float(assessment.weight),
+        int(getattr(row, "id", 0) or 0),
+    )
+
+
+def _sort_shadow_quality_first(rows: list[Any]) -> list[Any]:
+    return sorted(
+        rows,
+        key=lambda row: (_shadow_quality_rank(row), _shadow_sort_key(row)),
+        reverse=True,
+    )
+
+
 def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
-    """Select a recent but not hold-dominated shadow training window."""
+    """Select a trade-opportunity shadow window for the profit-quality model.
+
+    The local ML artifact is used to judge long/short profit quality. Rows whose
+    hindsight ``best_action`` is still hold are useful for audit, but they dilute
+    the directional profit labels and keep readiness degraded. Sample-count gates
+    should block live influence when there are not enough trade-opportunity rows.
+    """
 
     capped_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
     deduped: dict[Any, Any] = {}
     for row in rows:
         deduped.setdefault(_shadow_row_id(row), row)
     recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
-    if len(recent) <= capped_limit:
-        return recent
+    trainable_best_trade = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
+    if len(trainable_best_trade) <= capped_limit:
+        return sorted(trainable_best_trade, key=_shadow_sort_key, reverse=True)
 
     selected: list[Any] = []
     selected_ids: set[Any] = set()
 
-    def add_from(candidates: list[Any], target_count: int) -> None:
-        for candidate in candidates:
+    def add_from(candidates: list[Any], target_count: int, *, quality_first: bool = False) -> None:
+        source = _sort_shadow_quality_first(candidates) if quality_first else candidates
+        for candidate in source:
             if len(selected) >= capped_limit or len(selected) >= target_count:
                 return
             candidate_id = _shadow_row_id(candidate)
@@ -484,13 +553,44 @@ def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
     non_hold_target = int(capped_limit * TRAINING_MIN_NON_HOLD_SHARE)
     best_trade_target = int(capped_limit * TRAINING_MIN_BEST_TRADE_SHARE)
     non_hold = [
-        row for row in recent if _shadow_action(row, "decision_action") in {"long", "short"}
+        row
+        for row in trainable_best_trade
+        if _shadow_action(row, "decision_action") in {"long", "short"}
     ]
-    best_trade = [row for row in recent if _shadow_action(row, "best_action") in {"long", "short"}]
-    add_from(non_hold, min(non_hold_target, len(non_hold)))
-    add_from(best_trade, min(best_trade_target, len(best_trade)) + len(selected))
-    add_from(recent, capped_limit)
+
+    add_from(non_hold, min(non_hold_target, len(non_hold)), quality_first=True)
+    add_from(
+        trainable_best_trade,
+        min(best_trade_target, len(trainable_best_trade)),
+        quality_first=True,
+    )
     return sorted(selected[:capped_limit], key=_shadow_sort_key, reverse=True)
+
+
+def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
+    def counts(column: str) -> dict[str, int]:
+        if column not in frame:
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in Counter(
+                str(item or "unknown").lower().strip() or "unknown"
+                for item in frame[column].tolist()
+            ).most_common()
+        }
+
+    sample_count = int(len(frame))
+    weight_total = float(
+        frame.get("sample_weight", pd.Series([1.0] * len(frame))).astype(float).sum()
+    )
+    return {
+        "sample_count": sample_count,
+        "decision_action_counts": counts("decision_action"),
+        "best_action_counts": counts("best_action"),
+        "data_quality_status_counts": counts("data_quality_status"),
+        "effective_weight": round(weight_total, 4),
+        "effective_weight_ratio": round(weight_total / max(sample_count, 1), 4),
+    }
 
 
 def build_training_frame(rows: list[Any]) -> pd.DataFrame:
@@ -643,6 +743,7 @@ def train_from_frame(
         "completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
+        "training_window_composition": _training_window_composition(frame),
         "quality_report": frame_quality_report,
         "governance_report": governance_report(frame_quality_report),
         "training_shadow_sample_limit": TRAINING_SHADOW_SAMPLE_LIMIT,

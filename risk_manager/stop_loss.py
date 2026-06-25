@@ -56,10 +56,19 @@ class StopLossManager:
     """
 
     def __init__(self) -> None:
-        self.hard_stop_loss_pct = settings.hard_stop_loss_pct
-        self.trailing_activation = settings.trailing_stop_activation
-        self.trailing_distance = settings.trailing_stop_distance
         self._trailing_states: dict[str, TrailingStopState] = {}
+
+    @property
+    def hard_stop_loss_pct(self) -> float:
+        return float(settings.hard_stop_loss_pct or 0.05)
+
+    @property
+    def trailing_activation(self) -> float:
+        return float(settings.trailing_stop_activation or 0.03)
+
+    @property
+    def trailing_distance(self) -> float:
+        return float(settings.trailing_stop_distance or 0.015)
 
     def init_trailing_stop(
         self, symbol: str, side: str, entry_price: float, current_price: float

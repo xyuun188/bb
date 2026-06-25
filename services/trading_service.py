@@ -15,12 +15,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
-from config.settings import ENSEMBLE_TRADER_NAME, settings
+from config.settings import DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL, ENSEMBLE_TRADER_NAME, settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
@@ -305,6 +305,7 @@ AUTO_SCAN_ROTATION_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.rotation_pool_multiplier
 AUTO_SCAN_ROTATION_POOL_MIN = AUTO_SCAN_PARAMS.rotation_pool_min
 AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.feature_fetch_pool_multiplier
 AUTO_SCAN_FEATURE_FETCH_POOL_MIN = AUTO_SCAN_PARAMS.feature_fetch_pool_min
+AUTO_SCAN_FEATURE_FETCH_POOL_MAX = AUTO_SCAN_PARAMS.feature_fetch_pool_max
 AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS = AUTO_SCAN_PARAMS.feature_fetch_timeout_seconds
 AUTO_SCAN_FEATURE_FETCH_CONCURRENCY = AUTO_SCAN_PARAMS.feature_fetch_concurrency
 ALT_LONG_ALLOWED_SYMBOLS = set(AUTO_SCAN_PARAMS.major_symbols)
@@ -703,6 +704,7 @@ class TradingService:
             min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
             min_entry_adx_provider=self._runtime_min_entry_adx,
         )
+        self._market_budget_deferred_symbols: list[str] = []
         self.entry_loss_cooldown = EntryLossCooldownPolicy(self._normalize_position_symbol)
         self.entry_post_crash_rebound_guard = EntryPostCrashReboundGuardPolicy()
         self.entry_probe_market_quality = EntryProbeMarketQualityPolicy()
@@ -803,6 +805,7 @@ class TradingService:
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
             capacity_releaser=self.entry_capacity.release_slot,
+            pre_execution_capacity_reason=self.entry_capacity.reason,
             execution_confirmed_checker=self._is_exchange_confirmed_execution,
         )
         self.market_direct_entry_processor = MarketDirectEntryProcessor(
@@ -1109,6 +1112,12 @@ class TradingService:
     def _round_budget_exhausted(self, started_at: datetime) -> bool:
         return self._round_elapsed_seconds(started_at) >= self.market_round_time_budget_seconds()
 
+    def _market_ai_budget_exhausted(self, market_ai_started_at: datetime) -> bool:
+        return (
+            self._round_elapsed_seconds(market_ai_started_at)
+            >= self.market_round_time_budget_seconds()
+        )
+
     async def _runtime_heartbeat_loop(self) -> None:
         """Keep split-process dashboard heartbeat fresh while a round is busy."""
 
@@ -1187,8 +1196,10 @@ class TradingService:
         """Record the latest loop error through an explicit service boundary."""
 
         error_text = str(reason)[:300]
-        self._last_round_error = error_text
-        self._runtime_state(_analysis_scope_context.get()).last_error = error_text
+        scope = _analysis_scope_context.get()
+        self._runtime_state(scope).last_error = error_text
+        if scope == "full":
+            self._last_round_error = error_text
         self._write_runtime_heartbeat()
 
     def increment_decision_count(self) -> None:
@@ -1516,6 +1527,54 @@ class TradingService:
         """Return active new-entry block reason through the symbol blocklist boundary."""
 
         return self._entry_symbol_blocklist_policy().blocked_symbol_reason(symbol)
+
+    @staticmethod
+    def _decision_execution_error_text(
+        execution_reason: Any,
+        raw_llm_response: Any,
+    ) -> str:
+        """Extract persisted execution-error fields without scanning unrelated LLM text."""
+
+        pieces: list[str] = []
+
+        def add(value: Any, *, depth: int = 0) -> None:
+            if value is None or depth > 5:
+                return
+            if isinstance(value, (str, int, float, bool)):
+                text = str(value).strip()
+                if text:
+                    pieces.append(text[:1200])
+                return
+            if isinstance(value, dict):
+                for key in (
+                    "error",
+                    "raw_error",
+                    "message",
+                    "msg",
+                    "code",
+                    "sCode",
+                    "sMsg",
+                    "status",
+                    "execution_blocker",
+                    "okx_rejection",
+                    "system_pre_submit_rejection",
+                ):
+                    add(value.get(key), depth=depth + 1)
+                data = value.get("data")
+                if isinstance(data, (dict, list, tuple)):
+                    add(data, depth=depth + 1)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in list(value)[:20]:
+                    add(item, depth=depth + 1)
+
+        add(execution_reason)
+        raw = raw_llm_response if isinstance(raw_llm_response, dict) else {}
+        execution_result = raw.get("execution_result")
+        if isinstance(execution_result, dict):
+            add(execution_result)
+            add(execution_result.get("raw_response"))
+        return " ".join(pieces)
 
     async def log_trade(
         self,
@@ -1933,7 +1992,8 @@ class TradingService:
         state.current_stage = stage
         if error is not None:
             state.last_error = str(error)[:300]
-            self._last_round_error = state.last_error
+            if resolved_scope == "full":
+                self._last_round_error = state.last_error
         self._current_stage = stage
         self._write_runtime_heartbeat()
 
@@ -2052,7 +2112,7 @@ class TradingService:
                 f"exchange position reconciliation timed out during {context}; "
                 "continuing with local position state"
             )
-            self._last_round_error = reason
+            self.record_round_error(reason)
             logger.warning(reason)
             return []
 
@@ -2110,6 +2170,7 @@ class TradingService:
     ) -> list[str]:
         """Limit expensive feature fetches per round while rotating the full pool."""
 
+        self._last_auto_feature_fetch_budget_diagnostics = {}
         if not fetch_symbols:
             return []
         normalized_position = {
@@ -2127,12 +2188,31 @@ class TradingService:
             for symbol in fetch_symbols
             if self._normalize_position_symbol(symbol) not in normalized_position
         ]
-        market_budget = max(
+        target_market_budget = max(
             configured_limit,
             configured_limit * int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
             int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
         )
-        market_budget = min(len(market_symbols), market_budget)
+        max_pool = max(int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX), configured_limit)
+        market_budget = min(len(market_symbols), target_market_budget, max_pool)
+        self._last_auto_feature_fetch_budget_diagnostics = {
+            "read_only": True,
+            "is_entry_gate": False,
+            "total_candidates": len(fetch_symbols),
+            "position_symbols": len(position_symbols),
+            "market_candidates": len(market_symbols),
+            "configured_market_symbol_limit": int(configured_limit),
+            "target_market_feature_fetch_count": int(target_market_budget),
+            "max_market_feature_fetch_count": int(max_pool),
+            "selected_market_feature_fetch_count": int(market_budget),
+            "pool_multiplier": int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
+            "pool_min": int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
+            "pool_max": int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX),
+            "diagnostic_boundary": (
+                "Feature-fetch breadth only expands discovery before rank/evidence gates; "
+                "it is not entry permission, leverage, sizing, or ML readiness."
+            ),
+        }
         if market_budget <= 0:
             return self.entry_symbol_universe.dedupe_symbols(position_symbols)
 
@@ -2150,6 +2230,12 @@ class TradingService:
             selected=len(selected),
             market_budget=market_budget,
             next_cursor=self._auto_scan_feature_cursor,
+        )
+        self._last_auto_feature_fetch_budget_diagnostics.update(
+            {
+                "selected_total_feature_fetch_count": len(selected),
+                "next_cursor": int(self._auto_scan_feature_cursor),
+            }
         )
         return selected
 
@@ -2391,7 +2477,9 @@ class TradingService:
         context = getattr(self, "_current_capacity_context", None)
         if isinstance(context, dict):
             return dict(context)
-        fallback = int(settings.max_open_positions_per_model or 0)
+        fallback = int(
+            settings.max_open_positions_per_model or DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
+        )
         return {
             "entry_limit": fallback,
             "effective_limit": fallback,
@@ -3081,7 +3169,247 @@ class TradingService:
             "auto opportunity shortlist",
             **result.diagnostics,
         )
+        self._last_auto_feature_rank_diagnostics = result.diagnostics
         return result.selected
+
+    def _market_candidate_funnel_snapshot(
+        self,
+        *,
+        scan_symbols: list[str],
+        blocked_filter: Any,
+        open_position_filter: Any,
+        unclaimed_filter: Any | None,
+        fetch_symbols: list[str],
+        feature_vectors: dict[str, Any],
+        invalid_symbols: list[str],
+        market_feature_vectors_before_rank: dict[str, Any],
+        market_feature_vectors_after_rank: dict[str, Any],
+        market_feature_vectors_after_dedupe: dict[str, Any],
+        analysis_budget_context: dict[str, Any],
+        market_symbol_budget: int,
+        run_market_analysis: bool,
+        mode_is_auto_scan: bool,
+    ) -> dict[str, Any]:
+        rank_diagnostics = self._safe_dict(
+            getattr(self, "_last_auto_feature_rank_diagnostics", None)
+        )
+        feature_fetch_budget = self._safe_dict(
+            getattr(self, "_last_auto_feature_fetch_budget_diagnostics", None)
+        )
+        recent_dedupe = self._safe_dict(
+            self._safe_dict(analysis_budget_context).get("recent_market_analysis_dedupe")
+        )
+        budget_rotation = self._safe_dict(
+            self._safe_dict(analysis_budget_context).get("market_budget_rotation")
+        )
+        return {
+            "read_only": True,
+            "is_entry_gate": False,
+            "mode": "auto" if mode_is_auto_scan else "manual",
+            "run_market_analysis": bool(run_market_analysis),
+            "scan_symbol_count": len(scan_symbols or []),
+            "blocked_filter_count": len(getattr(blocked_filter, "skipped", []) or []),
+            "open_position_filtered_count": len(getattr(open_position_filter, "skipped", []) or []),
+            "unclaimed_filtered_count": (
+                len(getattr(unclaimed_filter, "skipped", []) or [])
+                if unclaimed_filter is not None
+                else 0
+            ),
+            "feature_fetch_requested_count": len(fetch_symbols or []),
+            "feature_fetch_budget": feature_fetch_budget,
+            "feature_valid_count": len(feature_vectors or {}),
+            "feature_invalid_count": len(invalid_symbols or []),
+            "market_feature_before_rank_count": len(market_feature_vectors_before_rank or {}),
+            "market_symbol_budget": int(market_symbol_budget or 0),
+            "rank_selected_count": len(market_feature_vectors_after_rank or {}),
+            "rank_tradable_candidates": rank_diagnostics.get("tradable_candidates"),
+            "rank_secondary_candidates": rank_diagnostics.get("secondary_candidates"),
+            "rank_total_candidates": rank_diagnostics.get("candidates"),
+            "rank_underfilled": rank_diagnostics.get("rank_underfilled"),
+            "rank_underfill_reason": rank_diagnostics.get("rank_underfill_reason"),
+            "rank_filtered_out_candidates": rank_diagnostics.get("filtered_out_candidates"),
+            "rank_filtered_out_reason_counts": rank_diagnostics.get(
+                "filtered_out_reason_counts", []
+            ),
+            "rank_top_symbols": rank_diagnostics.get("symbols", []),
+            "ranked_symbol_sample": rank_diagnostics.get("ranked_symbol_sample", []),
+            "filtered_symbol_sample": rank_diagnostics.get("filtered_symbol_sample", []),
+            "recent_analysis_dedupe_count": int(recent_dedupe.get("skipped_count") or 0),
+            "recent_analysis_dedupe_symbols": recent_dedupe.get("skipped_symbols", []),
+            "market_budget_rotation": budget_rotation,
+            "market_feature_after_dedupe_count": len(market_feature_vectors_after_dedupe or {}),
+            "market_feature_after_dedupe_symbols": list(
+                (market_feature_vectors_after_dedupe or {}).keys()
+            )[:20],
+            "analysis_budget": {
+                "risk_level": self._safe_dict(analysis_budget_context).get("risk_level"),
+                "market_symbol_limit": self._safe_dict(analysis_budget_context).get(
+                    "market_symbol_limit"
+                ),
+                "position_max_groups": self._safe_dict(analysis_budget_context).get(
+                    "position_max_groups"
+                ),
+                "budget_source": self._safe_dict(analysis_budget_context).get("budget_source"),
+                "market_limit_policy": self._safe_dict(analysis_budget_context).get(
+                    "market_limit_policy"
+                ),
+                "configured_market_symbol_limit": self._safe_dict(analysis_budget_context).get(
+                    "configured_market_symbol_limit"
+                ),
+                "position_group_count": self._safe_dict(analysis_budget_context).get(
+                    "position_group_count"
+                ),
+                "target_position_groups": self._safe_dict(analysis_budget_context).get(
+                    "target_position_groups"
+                ),
+                "roster_underfilled": self._safe_dict(analysis_budget_context).get(
+                    "roster_underfilled"
+                ),
+                "market_limit_diagnostics": self._safe_dict(analysis_budget_context).get(
+                    "market_limit_diagnostics"
+                ),
+                "reason": self._safe_dict(analysis_budget_context).get("reason"),
+            },
+            "diagnostic_boundary": (
+                "Read-only market candidate funnel; use it to locate scan/fetch/rank/dedupe "
+                "concentration before changing any entry threshold, leverage, sizing, ML "
+                "readiness, or risk veto."
+            ),
+        }
+
+    def _attach_market_candidate_funnel(
+        self,
+        decision: DecisionOutput,
+        funnel: dict[str, Any] | None,
+        progress: dict[str, Any] | None = None,
+    ) -> None:
+        if not funnel and not progress:
+            return
+        raw = self._safe_dict(decision.raw_response)
+        if funnel:
+            raw["market_candidate_funnel"] = funnel
+        if progress:
+            raw["market_analysis_progress"] = self._safe_dict(progress)
+        decision.raw_response = raw
+
+    def _market_analysis_progress_snapshot(
+        self,
+        *,
+        symbol: str,
+        market_index: int,
+        market_total: int,
+        round_start: datetime,
+        market_ai_started_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        market_ai_started_at = market_ai_started_at or round_start
+        full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
+        market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
+        budget_seconds = self.market_round_time_budget_seconds()
+        return {
+            "read_only": True,
+            "is_entry_gate": False,
+            "symbol": symbol,
+            "processed_index": int(market_index) + 1,
+            "ranked_market_symbol_count": int(market_total),
+            "remaining_after_this_symbol": max(int(market_total) - int(market_index) - 1, 0),
+            "round_elapsed_seconds_before_ai": round(full_round_elapsed_seconds, 3),
+            "full_round_elapsed_seconds_before_ai": round(full_round_elapsed_seconds, 3),
+            "market_ai_elapsed_seconds_before_symbol": round(market_ai_elapsed_seconds, 3),
+            "market_round_time_budget_seconds": round(budget_seconds, 3),
+            "budget_used_ratio_before_ai": round(
+                market_ai_elapsed_seconds / max(budget_seconds, 1e-6),
+                6,
+            ),
+            "market_ai_budget_used_ratio_before_symbol": round(
+                market_ai_elapsed_seconds / max(budget_seconds, 1e-6),
+                6,
+            ),
+            "budget_clock_scope": "market_ai_phase",
+            "diagnostic_boundary": (
+                "Read-only market AI throughput diagnostics; it explains how many ranked "
+                "symbols this round can analyze before soft scheduling budget is exhausted. "
+                "The soft budget clock starts when the market AI phase begins, not at full "
+                "round startup. It is not entry permission, sizing, leverage, ML readiness, "
+                "or risk veto."
+            ),
+        }
+
+    def _rotate_market_feature_vectors_for_budget_coverage(
+        self,
+        market_feature_vectors: dict[str, Any],
+        *,
+        analysis_budget_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        items = list((market_feature_vectors or {}).items())
+        deferred = list(getattr(self, "_market_budget_deferred_symbols", []) or [])
+        if len(items) <= 1 or not deferred:
+            if isinstance(analysis_budget_context, dict):
+                analysis_budget_context["market_budget_rotation"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "applied": False,
+                    "deferred_symbol_count": len(deferred),
+                    "reason": "no deferred market symbols available for coverage rotation",
+                }
+            return dict(items)
+
+        normalized_index = {
+            self._normalize_position_symbol(symbol): index
+            for index, (symbol, _fv) in enumerate(items)
+            if self._normalize_position_symbol(symbol)
+        }
+        start_key = None
+        start_index = 0
+        for deferred_symbol in deferred:
+            key = self._normalize_position_symbol(deferred_symbol)
+            if key in normalized_index:
+                start_key = key
+                start_index = normalized_index[key]
+                break
+        if start_key is None or start_index <= 0:
+            if isinstance(analysis_budget_context, dict):
+                analysis_budget_context["market_budget_rotation"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "applied": False,
+                    "deferred_symbol_count": len(deferred),
+                    "reason": (
+                        "deferred symbols no longer match current shortlist"
+                        if start_key is None
+                        else "deferred symbol already leads current shortlist"
+                    ),
+                }
+            return dict(items)
+
+        rotated_items = items[start_index:] + items[:start_index]
+        if isinstance(analysis_budget_context, dict):
+            analysis_budget_context["market_budget_rotation"] = {
+                "read_only": True,
+                "is_entry_gate": False,
+                "applied": True,
+                "start_symbol": rotated_items[0][0],
+                "start_index": start_index,
+                "ranked_symbol_count": len(items),
+                "deferred_symbol_count": len(deferred),
+                "deferred_symbols": deferred[:20],
+                "reason": (
+                    "previous market AI round hit the soft time budget; current shortlist "
+                    "is rotated to give deferred ranked symbols coverage without changing "
+                    "ranking scores, entry thresholds, sizing, leverage, ML readiness, or risk gates"
+                ),
+            }
+        return dict(rotated_items)
+
+    def _remember_market_budget_deferred_symbols(self, symbols: list[str]) -> None:
+        normalized_seen: set[str] = set()
+        remembered: list[str] = []
+        for symbol in symbols or []:
+            key = self._normalize_position_symbol(symbol)
+            if not key or key in normalized_seen:
+                continue
+            normalized_seen.add(key)
+            remembered.append(symbol)
+        self._market_budget_deferred_symbols = remembered[:50]
 
     async def _try_claim_analysis_symbol(self, symbol: str, scope: str) -> bool:
         normalized = self._normalize_position_symbol(symbol)
@@ -3107,13 +3435,35 @@ class TradingService:
 
             async with get_session_ctx() as session:
                 result = await session.execute(
-                    select(AIDecision.symbol, AIDecision.execution_reason, AIDecision.created_at)
-                    .where(AIDecision.execution_reason.is_not(None))
+                    select(
+                        AIDecision.model_name,
+                        AIDecision.symbol,
+                        AIDecision.action,
+                        AIDecision.confidence,
+                        AIDecision.position_size_pct,
+                        AIDecision.suggested_leverage,
+                        AIDecision.stop_loss_pct,
+                        AIDecision.take_profit_pct,
+                        AIDecision.reasoning,
+                        AIDecision.feature_snapshot,
+                        AIDecision.execution_reason,
+                        AIDecision.raw_llm_response,
+                        AIDecision.created_at,
+                    )
+                    .where(
+                        or_(
+                            AIDecision.execution_reason.is_not(None),
+                            AIDecision.raw_llm_response.is_not(None),
+                        )
+                    )
                     .order_by(AIDecision.created_at.desc())
                     .limit(300)
                 )
                 for row in result.all():
-                    reason = row.execution_reason or ""
+                    reason = self._decision_execution_error_text(
+                        row.execution_reason,
+                        row.raw_llm_response,
+                    )
                     created_at = row.created_at
                     if created_at and created_at.tzinfo is None:
                         created_at = created_at.replace(tzinfo=UTC)
@@ -3122,6 +3472,35 @@ class TradingService:
                     )
                     if recent and self.is_untradable_exchange_error(reason):
                         self.remember_untradable_symbol(row.symbol, reason)
+                        action = Action.from_string(str(row.action or ""))
+                        if action.is_exit():
+                            self.exit_cooldown.remember_exit(
+                                str(row.model_name or ENSEMBLE_TRADER_NAME),
+                                DecisionOutput(
+                                    model_name=str(row.model_name or ENSEMBLE_TRADER_NAME),
+                                    symbol=str(row.symbol or ""),
+                                    action=action,
+                                    confidence=float(row.confidence or 0.0),
+                                    reasoning=str(
+                                        row.reasoning
+                                        or "Restored untradable exit cooldown from recent OKX error."
+                                    ),
+                                    position_size_pct=float(row.position_size_pct or 1.0),
+                                    suggested_leverage=float(row.suggested_leverage or 1.0),
+                                    stop_loss_pct=float(row.stop_loss_pct or 0.0),
+                                    take_profit_pct=float(row.take_profit_pct or 0.0),
+                                    raw_response={
+                                        "untradable_exit_execution_error": {
+                                            "reason": reason,
+                                        }
+                                    },
+                                    feature_snapshot=(
+                                        row.feature_snapshot
+                                        if isinstance(row.feature_snapshot, dict)
+                                        else {}
+                                    ),
+                                ),
+                            )
                     elif (
                         created_at
                         and datetime.now(UTC) - created_at
@@ -3254,6 +3633,7 @@ class TradingService:
             "warnings": [],
         }
         round_decision_ids: set[int] = set()
+        round_decisions: dict[int, DecisionOutput] = {}
         claimed_analysis_symbols: list[str] = []
         claimed_symbol_keys: set[str] = set()
         published_dashboard_update = False
@@ -3269,11 +3649,17 @@ class TradingService:
             # 0. Refresh per-model execution mode mapping from current config
             self._refresh_model_modes()
             self._set_loop_stage("sync_exchange_positions")
-            await self.okx_sync_service.reconcile_positions(
-                f"{analysis_scope} round start",
-                timeout_seconds=self.round_start_reconcile_timeout_seconds(),
-                lock_wait_seconds=0.35,
-            )
+            if self._should_run_full_reconciliation_at_round_start(analysis_scope):
+                await self.okx_sync_service.reconcile_positions(
+                    f"{analysis_scope} round start",
+                    timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+                    lock_wait_seconds=0.35,
+                )
+            else:
+                logger.debug(
+                    "market-only round skips full OKX reconciliation at start",
+                    scope=analysis_scope,
+                )
             self._set_loop_stage("load_open_positions")
             open_positions = await self.okx_sync_service.get_open_positions_context()
             await self._recover_pending_exit_decisions(
@@ -3419,6 +3805,7 @@ class TradingService:
                     position_scan_symbols,
                     configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
                 )
+            unclaimed_filter_for_funnel = unclaimed_filter if run_market_analysis else None
             if not fetch_symbols:
                 diagnostics = {
                     "scan_symbol_count": len(scan_symbols or []),
@@ -3547,6 +3934,7 @@ class TradingService:
                 return results
 
             self._set_loop_stage("build_strategy_context")
+            self._last_auto_feature_rank_diagnostics = {}
             market_scan_keys = {
                 self._normalize_position_symbol(s)
                 for s in market_scan_symbols
@@ -3560,6 +3948,8 @@ class TradingService:
 
             if not run_market_analysis:
                 market_feature_vectors = {}
+            market_feature_vectors_before_rank = dict(market_feature_vectors)
+            market_feature_vectors_after_rank = dict(market_feature_vectors)
             base_market_limit = (
                 max(1, int(settings.auto_scan_symbol_limit))
                 if mode_manager.is_auto_scan
@@ -3586,10 +3976,12 @@ class TradingService:
             if run_market_analysis and market_feature_vectors:
                 if market_symbol_budget <= 0:
                     market_feature_vectors = {}
+                    market_feature_vectors_after_rank = {}
                 elif mode_manager.is_auto_scan:
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, market_symbol_budget
                     )
+                    market_feature_vectors_after_rank = dict(market_feature_vectors)
                 elif len(market_feature_vectors) > market_symbol_budget:
                     allowed_keys = {
                         self._normalize_position_symbol(s)
@@ -3600,6 +3992,7 @@ class TradingService:
                         for s, fv in market_feature_vectors.items()
                         if self._normalize_position_symbol(s) in allowed_keys
                     }
+                    market_feature_vectors_after_rank = dict(market_feature_vectors)
                 dedupe_policy = self._entry_market_hold_penalty_policy()
                 recently_analyzed_symbols = [
                     symbol
@@ -3621,6 +4014,28 @@ class TradingService:
                             "持仓复盘不受该去重影响。"
                         ),
                     }
+                market_feature_vectors = self._rotate_market_feature_vectors_for_budget_coverage(
+                    market_feature_vectors,
+                    analysis_budget_context=analysis_budget_context,
+                )
+            market_feature_vectors_after_dedupe = dict(market_feature_vectors)
+            market_candidate_funnel = self._market_candidate_funnel_snapshot(
+                scan_symbols=list(scan_symbols or []),
+                blocked_filter=blocked_filter,
+                open_position_filter=open_position_filter,
+                unclaimed_filter=unclaimed_filter_for_funnel,
+                fetch_symbols=list(fetch_symbols or []),
+                feature_vectors=feature_vectors,
+                invalid_symbols=invalid_symbols,
+                market_feature_vectors_before_rank=market_feature_vectors_before_rank,
+                market_feature_vectors_after_rank=market_feature_vectors_after_rank,
+                market_feature_vectors_after_dedupe=market_feature_vectors_after_dedupe,
+                analysis_budget_context=analysis_budget_context,
+                market_symbol_budget=market_symbol_budget,
+                run_market_analysis=run_market_analysis,
+                mode_is_auto_scan=mode_manager.is_auto_scan,
+            )
+            results["market_candidate_funnel"] = market_candidate_funnel
             results["analysis_budget"] = analysis_budget_context
             logger.info(
                 "analysis budget selected",
@@ -3702,21 +4117,25 @@ class TradingService:
                 )
 
             market_feature_items = list(market_feature_vectors.items())
+            market_ai_started_at = datetime.now(UTC)
             for market_index, (symbol, fv) in enumerate(market_feature_items):
-                if market_index > 0 and self._round_budget_exhausted(round_start):
+                if market_index > 0 and self._market_ai_budget_exhausted(market_ai_started_at):
                     remaining = [
                         item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
                     ]
                     market_round_skipped_by_budget = remaining
                     budget_seconds = self.market_round_time_budget_seconds()
-                    elapsed_seconds = self._round_elapsed_seconds(round_start)
+                    market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
+                    full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
                     warning = (
                         "本轮市场 AI 分析已达到调度时间预算，剩余候选顺延到后续轮次；"
                         "这不是开仓门槛，只用于防止单轮分析拖住系统心跳。"
                     )
                     logger.warning(
                         "market analysis round reached time budget",
-                        elapsed_seconds=round(elapsed_seconds, 3),
+                        elapsed_seconds=round(market_ai_elapsed_seconds, 3),
+                        market_ai_elapsed_seconds=round(market_ai_elapsed_seconds, 3),
+                        full_round_elapsed_seconds=round(full_round_elapsed_seconds, 3),
                         budget_seconds=round(budget_seconds, 3),
                         skipped_count=len(remaining),
                         skipped_symbols=remaining[:10],
@@ -3726,11 +4145,14 @@ class TradingService:
                             "model": ENSEMBLE_TRADER_NAME,
                             "symbol": "ALL",
                             "warning": warning,
-                            "elapsed_seconds": round(elapsed_seconds, 3),
+                            "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                            "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                            "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
                             "budget_seconds": round(budget_seconds, 3),
                             "skipped_symbols": remaining[:20],
                         }
                     )
+                    self._remember_market_budget_deferred_symbols(remaining)
                     break
                 quarantine_reason = self.entry_symbol_profit_quarantine.reason(
                     symbol,
@@ -3758,6 +4180,13 @@ class TradingService:
                     logger.warning("skip symbol after fresh feature check failed", symbol=symbol)
                     continue
                 feature_vectors[symbol] = fv
+                market_analysis_progress = self._market_analysis_progress_snapshot(
+                    symbol=symbol,
+                    market_index=market_index,
+                    market_total=len(market_feature_items),
+                    round_start=round_start,
+                    market_ai_started_at=market_ai_started_at,
+                )
                 model_name = ENSEMBLE_TRADER_NAME
                 model_mode = self._get_model_execution_mode(model_name)
                 memory_context = await self._memory_context_with_vector_feedback(symbol)
@@ -3819,6 +4248,7 @@ class TradingService:
                         "local_ai_tools": local_ai_tools_context,
                         "direction_competition": direction_competition_context,
                         "entry_candidate_evidence": entry_candidate_evidence,
+                        "market_candidate_funnel": market_candidate_funnel,
                         "agent_skills": {
                             "version": 1,
                             "phases": {
@@ -3845,12 +4275,18 @@ class TradingService:
                         raw_response=quick_raw,
                         feature_snapshot=fv.to_dict() if hasattr(fv, "to_dict") else {},
                     )
+                    self._attach_market_candidate_funnel(
+                        quick_decision,
+                        market_candidate_funnel,
+                        market_analysis_progress,
+                    )
                     self._attach_strategy_learning_context(quick_decision, strategy_mode_context)
                     decision_db_id = await self._log_decision(
                         quick_decision, is_paper=(model_mode == "paper")
                     )
                     if decision_db_id is not None:
                         round_decision_ids.add(decision_db_id)
+                        round_decisions[decision_db_id] = quick_decision
                         await self._mark_decision_reason(decision_db_id, prefilter_reason)
                     self._decision_count += 1
                     self.market_decision_result_recorder.append_result(
@@ -3889,6 +4325,11 @@ class TradingService:
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
                     )
+                self._attach_market_candidate_funnel(
+                    decision,
+                    market_candidate_funnel,
+                    market_analysis_progress,
+                )
                 if decision.is_entry:
                     self._candidate_opportunity_score(decision, strategy_mode_context)
                 self._attach_strategy_learning_context(decision, strategy_mode_context)
@@ -3904,6 +4345,7 @@ class TradingService:
                 )
                 if decision_db_id is not None:
                     round_decision_ids.add(decision_db_id)
+                    round_decisions[decision_db_id] = decision
                 self._decision_count += 1
                 await self.shadow_backtest_service.create(
                     decision_db_id,
@@ -3991,6 +4433,11 @@ class TradingService:
                         self._candidate_opportunity_score(executed, strategy_mode_context)
                         self._attach_strategy_learning_context(executed, strategy_mode_context)
                         if decision_db_id is not None:
+                            if isinstance(executed.raw_response, dict):
+                                await self._mark_decision_raw_response(
+                                    decision_db_id,
+                                    executed.raw_response,
+                                )
                             await self._mark_decision_reason(
                                 decision_db_id,
                                 f"AI 原始裁决为观望；{probe_source_label}触发正期望候选，另建一条候选决策继续风控。",
@@ -4000,6 +4447,7 @@ class TradingService:
                         )
                         if probe_decision_db_id is not None:
                             round_decision_ids.add(probe_decision_db_id)
+                            round_decisions[probe_decision_db_id] = executed
                             decision_db_id = probe_decision_db_id
                             self._decision_count += 1
                         assessment = await self.market_decision_risk_assessment.assess(
@@ -4052,6 +4500,11 @@ class TradingService:
                     )
                     self._remember_market_hold_symbol(symbol, fv, hold_reason)
                     if decision_db_id is not None:
+                        if isinstance(executed.raw_response, dict):
+                            await self._mark_decision_raw_response(
+                                decision_db_id,
+                                executed.raw_response,
+                            )
                         await self._mark_decision_reason(
                             decision_db_id,
                             "多模型裁决结果为观望，未提交订单。",
@@ -4171,9 +4624,14 @@ class TradingService:
                 continue
 
             if market_round_skipped_by_budget:
+                market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
+                full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
                 results["market_analysis_budget"] = {
                     "budget_seconds": round(self.market_round_time_budget_seconds(), 3),
-                    "elapsed_seconds": round(self._round_elapsed_seconds(round_start), 3),
+                    "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                    "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                    "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
+                    "budget_clock_scope": "market_ai_phase",
                     "processed_symbols": int(results.get("symbols_processed") or 0),
                     "deferred_symbols": market_round_skipped_by_budget[:50],
                     "deferred_count": len(market_round_skipped_by_budget),
@@ -4183,6 +4641,9 @@ class TradingService:
                         "该预算不参与开仓风控评分。"
                     ),
                 }
+
+            if not market_round_skipped_by_budget and market_feature_items:
+                self._remember_market_budget_deferred_symbols([])
 
             ranked_entry_candidates = self._entry_candidate_queue_policy().ranked(
                 all_candidates,
@@ -4296,6 +4757,11 @@ class TradingService:
                 "本轮已经结束，但这条候选没有进入下单阶段，也没有拿到最终执行结果。"
                 "系统已跳过本次旧信号，下一轮会用最新行情重新排序和评估。",
             )
+            await self._finalize_unresolved_decision_states(
+                round_decisions,
+                "本轮已经结束，但这条候选没有进入下单阶段，也没有拿到最终执行结果。"
+                "系统已跳过本次旧信号，下一轮会用最新行情重新排序和评估。",
+            )
 
             # 6. Push updates to dashboard
             await self._publish_dashboard_update(results)
@@ -4321,6 +4787,10 @@ class TradingService:
             await self._fill_missing_decision_reasons(
                 round_decision_ids,
                 f"\u672c\u8f6e\u6267\u884c\u5f02\u5e38\u4e2d\u65ad\uff0c\u672a\u80fd\u5b8c\u6210\u6700\u7ec8\u72b6\u6001\u56de\u5199\uff1a{safe_error_text(e, limit=120)}",
+            )
+            await self._finalize_unresolved_decision_states(
+                round_decisions,
+                f"本轮执行异常中断，未能完成最终状态回写：{safe_error_text(e, limit=120)}",
             )
             logger.error("trading loop iteration failed", error=error_text)
             results["status"] = "error"
@@ -4349,6 +4819,10 @@ class TradingService:
                     )
             _analysis_scope_context.reset(scope_token)
         return results
+
+    @staticmethod
+    def _should_run_full_reconciliation_at_round_start(analysis_scope: str) -> bool:
+        return analysis_scope in {"full", "position"}
 
     async def start(self) -> None:
         """Start the continuous trading loop."""
@@ -5549,6 +6023,8 @@ class TradingService:
         closed_at: datetime,
         reason: str,
         close_fill: dict[str, Any] | None = None,
+        position_size_pct: float | None = None,
+        reconcile_origin: str | None = None,
     ) -> int | None:
         """Record a synthetic close decision for exchange-side position closes."""
         try:
@@ -5558,6 +6034,8 @@ class TradingService:
                 key: (value.isoformat() if isinstance(value, datetime) else value)
                 for key, value in (close_fill or {}).items()
             }
+            close_fraction = self._safe_float(position_size_pct, 1.0)
+            close_fraction = min(max(close_fraction, 0.0), 1.0) or 1.0
             repo = DecisionRepository(session)
             record = await repo.log_decision(
                 {
@@ -5566,7 +6044,7 @@ class TradingService:
                     "action": action.value,
                     "confidence": 1.0,
                     "reasoning": sanitize_text(reason),
-                    "position_size_pct": 1.0,
+                    "position_size_pct": close_fraction,
                     "suggested_leverage": pos.leverage or 1.0,
                     "stop_loss_pct": 0.0,
                     "take_profit_pct": 0.0,
@@ -5578,11 +6056,13 @@ class TradingService:
                         "quantity": pos.quantity,
                         "side": pos.side,
                         "realized_pnl": realized_pnl,
+                        "reconcile_origin": reconcile_origin or "external_okx_sync",
                     },
                     "raw_llm_response": {
                         "system_sync": True,
                         "source": "okx_position_reconcile",
                         "close_fill": close_fill_safe,
+                        "reconcile_origin": reconcile_origin or "external_okx_sync",
                     },
                     "analysis_type": "position",
                     "is_paper": pos.execution_mode != "live",
@@ -6170,50 +6650,30 @@ class TradingService:
                     )
                     fv = None
 
-            scan = fast_scan.get((model_name, symbol), {})
-            release_policy = self._position_release_decision_policy()
-            if release_policy.should_release(scan):
-                release_decision = release_policy.build(
-                    model_name=model_name,
-                    symbol=symbol,
-                    positions=positions,
-                    scan=scan,
-                    feature_vector=fv,
-                )
-                if isinstance(release_decision, DecisionOutput):
-                    model_mode = self._get_model_execution_mode(model_name)
-                    decision_db_id = await self._log_decision(
-                        release_decision,
-                        is_paper=(model_mode == "paper"),
-                    )
-                    self._decision_count += 1
-                    if decision_db_id is not None and round_decision_ids is not None:
-                        round_decision_ids.add(decision_db_id)
-                    handled_keys.add((model_name, self._normalize_position_symbol(symbol)))
-                    risk_alert = self.position_review_risk_alert_policy.build_alert(
-                        release_decision,
-                        positions,
-                    )
-                    if risk_alert:
-                        self.position_review_risk_alert_policy.attach(
-                            release_decision,
-                            risk_alert,
-                        )
-                    process_result = await self.position_review_decision_processor.process(
-                        decision=release_decision,
-                        model_name=model_name,
-                        symbol=symbol,
-                        model_mode=model_mode,
-                        decision_db_id=decision_db_id,
-                        open_positions=open_positions,
-                        feature_vector=fv,
-                        position_entry_pause_reason=position_entry_pause_reason,
-                        risk_alert=risk_alert,
-                        results=results,
-                    )
-                    if process_result.candidate is not None:
-                        candidates.append(process_result.candidate)
-                    continue
+            scan = self._position_release_scan(
+                model_name=model_name,
+                symbol=symbol,
+                normalized_symbol=normalized_symbol,
+                positions=positions,
+                fast_scan=fast_scan.get((model_name, symbol), {}),
+                feature_vector=fv,
+            )
+            release_result = await self._process_position_release_decision(
+                model_name=model_name,
+                symbol=symbol,
+                positions=positions,
+                scan=scan,
+                feature_vector=fv,
+                open_positions=open_positions,
+                position_entry_pause_reason=position_entry_pause_reason,
+                results=results,
+                round_decision_ids=round_decision_ids,
+            )
+            if release_result is not None:
+                handled_keys.add((model_name, normalized_symbol))
+                if release_result.candidate is not None:
+                    candidates.append(release_result.candidate)
+                continue
             if fv is None:
                 continue
 
@@ -6284,6 +6744,141 @@ class TradingService:
                 candidates.append(process_result.candidate)
 
         return candidates, handled_keys
+
+    def _position_release_scan(
+        self,
+        *,
+        model_name: str,
+        symbol: str,
+        normalized_symbol: str,
+        positions: list[dict[str, Any]],
+        fast_scan: dict[str, Any] | None,
+        feature_vector: Any | None,
+    ) -> dict[str, Any]:
+        scan = dict(fast_scan) if isinstance(fast_scan, dict) else {}
+        if bool(scan.get("force_exit_candidate")):
+            return scan
+
+        by_side: dict[str, list[dict[str, Any]]] = {}
+        for position in positions or []:
+            side = str(position.get("side") or "").lower()
+            if side in {"long", "short"}:
+                by_side.setdefault(side, []).append(position)
+
+        capacity = self._dynamic_capacity_context()
+        capacity_release_pressure = bool(
+            self._safe_float(capacity.get("open_group_count"), 0.0)
+            > self._safe_float(capacity.get("effective_limit"), 0.0)
+            and self._safe_float(capacity.get("low_quality_count"), 0.0) > 0
+        )
+        best_scan = scan
+        best_exit_score = self._safe_float(scan.get("exit_score"), 0.0)
+        for side, side_positions in by_side.items():
+            aggregate = self._position_group_aggregator_policy().aggregate(
+                side_positions,
+                model_name,
+                normalized_symbol or symbol,
+                side,
+            )
+            if not aggregate:
+                continue
+            quality = self.position_quality_scorer.score(
+                aggregate,
+                feature_vector=feature_vector,
+            )
+            should_release = bool(
+                quality.bucket == "release_now"
+                or (capacity_release_pressure and quality.should_release)
+            )
+            if not should_release:
+                continue
+            exit_score = max(
+                best_exit_score,
+                94.0 if quality.bucket == "release_now" else 92.0,
+            )
+            if exit_score < best_exit_score:
+                continue
+            reason = "; ".join(quality.reasons) or quality.bucket
+            best_exit_score = exit_score
+            best_scan = {
+                **scan,
+                "priority_score": max(
+                    self._safe_float(scan.get("priority_score"), 0.0),
+                    exit_score,
+                ),
+                "exit_score": exit_score,
+                "force_exit_candidate": True,
+                "release_action": "close_long" if side == "long" else "close_short",
+                "release_fraction": 1.0,
+                "release_reason": reason[:260],
+                "reason": "; ".join(
+                    dict.fromkeys(
+                        [
+                            str(scan.get("reason") or ""),
+                            reason,
+                            "deterministic_position_quality_release",
+                        ]
+                    )
+                ).strip("; ")[:260],
+                "position_quality": quality.as_dict(),
+            }
+        return best_scan
+
+    async def _process_position_release_decision(
+        self,
+        *,
+        model_name: str,
+        symbol: str,
+        positions: list[dict[str, Any]],
+        scan: dict[str, Any],
+        feature_vector: Any | None,
+        open_positions: list[dict[str, Any]],
+        position_entry_pause_reason: str | None,
+        results: dict[str, Any] | None,
+        round_decision_ids: set[int] | None,
+    ) -> Any | None:
+        release_policy = self._position_release_decision_policy()
+        if not release_policy.should_release(scan):
+            return None
+        release_decision = release_policy.build(
+            model_name=model_name,
+            symbol=symbol,
+            positions=positions,
+            scan=scan,
+            feature_vector=feature_vector,
+        )
+        if not isinstance(release_decision, DecisionOutput):
+            return None
+
+        model_mode = self._get_model_execution_mode(model_name)
+        decision_db_id = await self._log_decision(
+            release_decision,
+            is_paper=(model_mode == "paper"),
+        )
+        self._decision_count += 1
+        if decision_db_id is not None and round_decision_ids is not None:
+            round_decision_ids.add(decision_db_id)
+        risk_alert = self.position_review_risk_alert_policy.build_alert(
+            release_decision,
+            positions,
+        )
+        if risk_alert:
+            self.position_review_risk_alert_policy.attach(
+                release_decision,
+                risk_alert,
+            )
+        return await self.position_review_decision_processor.process(
+            decision=release_decision,
+            model_name=model_name,
+            symbol=symbol,
+            model_mode=model_mode,
+            decision_db_id=decision_db_id,
+            open_positions=open_positions,
+            feature_vector=feature_vector,
+            position_entry_pause_reason=position_entry_pause_reason,
+            risk_alert=risk_alert,
+            results=results,
+        )
 
     def _position_review_priority_policy(self) -> PositionReviewPriorityPolicy:
         policy = getattr(self, "position_review_priority", None)
@@ -7376,6 +7971,13 @@ class TradingService:
         reason: str,
     ) -> None:
         await self.decision_persistence.fill_missing_reasons(decision_ids, reason)
+
+    async def _finalize_unresolved_decision_states(
+        self,
+        decisions: dict[int, DecisionOutput],
+        reason: str,
+    ) -> None:
+        await self.decision_persistence.finalize_unresolved_decisions(decisions, reason)
 
     def _execution_reason_from_result(self, result: ExecutionResult | None) -> str:
         return self.execution_result_classifier.reason_from_result(result)

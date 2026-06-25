@@ -52,7 +52,7 @@ class PositionReleaseDecisionPolicy:
         reason = self._reason(scan, quality)
         raw_response = {
             "analysis_type": "position_review",
-            "forced_exit": True,
+            "exit_intent": "capital_rotation",
             "position_release_policy": {
                 "forced": True,
                 "source": "position_quality_capacity_release",
@@ -63,10 +63,11 @@ class PositionReleaseDecisionPolicy:
             },
             "position_quality": quality,
             "close_evidence": {
-                "forced_exit": True,
                 "hard_risk": False,
+                "capital_rotation": True,
                 "source": "low_quality_position_release",
                 "reason": reason,
+                "exit_intent": "capital_rotation",
             },
         }
         return DecisionOutput(

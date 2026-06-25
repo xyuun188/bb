@@ -142,11 +142,14 @@ def _visible_local_ai_training_status(
     raw_status: str,
     *,
     available: bool,
+    model_bundle_available: bool = False,
     shadow_count: int,
     trade_count: int,
     text_count: int,
 ) -> str:
     normalized = str(raw_status or "unknown").lower()
+    if available and model_bundle_available and normalized in {"unknown", "learning_only"}:
+        return "ready"
     if normalized == "unknown" and available:
         return "learning_only" if shadow_count or trade_count or text_count else "ready"
     return normalized
@@ -494,6 +497,7 @@ async def _local_ai_training_status() -> dict[str, Any]:
     visible_status = _visible_local_ai_training_status(
         raw_status,
         available=bool(status.get("available")),
+        model_bundle_available=bool(status.get("model_bundle_available")),
         shadow_count=shadow_count,
         trade_count=trade_count,
         text_count=text_count,
@@ -502,6 +506,9 @@ async def _local_ai_training_status() -> dict[str, Any]:
         "available": bool(status.get("available")),
         "status": visible_status,
         "raw_status": raw_status,
+        "model_bundle_available": bool(status.get("model_bundle_available")),
+        "service_available": bool(status.get("service_available", status.get("available"))),
+        "trained_at": status.get("trained_at"),
         "shadow_sample_count": shadow_count,
         "trade_sample_count": trade_count,
         "sequence_sample_count": int(status.get("sequence_sample_count") or 0),

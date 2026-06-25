@@ -205,8 +205,22 @@ def _ai_component(
         reason = "Original AI committee held; probe direction cannot count as AI alignment."
     elif probe_derived:
         points = min(full_points, 8.0)
-        status = "probe_derived_limited"
-        reason = "Probe-derived entry gets capped AI evidence points."
+        if any(
+            bool(opinion.get("independent_expert_retry"))
+            for opinion in (raw.get("opinions") if isinstance(raw.get("opinions"), list) else [])
+            if isinstance(opinion, dict)
+            and str(opinion.get("action") or "").lower() == entry_side
+            and safe_float(opinion.get("confidence"), 0.0) >= 0.55
+        ):
+            points = min(full_points, 14.0 if len(support_sources) == 1 else 18.0)
+            status = "probe_derived_independent_expert_support"
+            reason = (
+                "Probe-derived entry has independent directional expert confirmation; "
+                "AI evidence remains capped."
+            )
+        else:
+            status = "probe_derived_limited"
+            reason = "Probe-derived entry gets capped AI evidence points."
     elif opinions_present and not support_sources:
         points = min(full_points, 8.0)
         status = "limited_no_expert_support"

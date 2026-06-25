@@ -29,6 +29,27 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _probe_thresholds() -> dict[str, float]:
+    return {
+        "min_expected_net_return_pct": round(
+            _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct,
+            6,
+        ),
+        "min_profit_quality_ratio": round(
+            _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality,
+            6,
+        ),
+        "max_loss_probability": round(
+            _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability,
+            6,
+        ),
+        "max_tail_risk_score": round(
+            _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk,
+            6,
+        ),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class EntryEvidenceProbePolicy:
     """Create a small entry candidate from evidence when the LLM stayed in HOLD."""
@@ -76,32 +97,80 @@ class EntryEvidenceProbePolicy:
             and missed_count >= 6
             and positive_count >= max(risk_count + 1, 2)
         )
-        if (
-            expected_net < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct
-            or quality < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
-            or loss_probability > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
-            or tail_risk > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
-        ):
+        threshold_block_reasons = self._threshold_block_reasons(
+            expected_net=expected_net,
+            quality=quality,
+            loss_probability=loss_probability,
+            tail_risk=tail_risk,
+        )
+        if threshold_block_reasons:
+            self._record_block(
+                original,
+                side=side,
+                expected_net=expected_net,
+                quality=quality,
+                loss_probability=loss_probability,
+                tail_risk=tail_risk,
+                recommendation=recommendation,
+                review_feedback=review_feedback,
+                block_kind="probe_threshold_not_met",
+                block_reasons=threshold_block_reasons,
+                reason=(
+                    "Entry evidence was retained for shadow learning, but it did not meet "
+                    "the controlled probe conversion thresholds."
+                ),
+            )
             return None
 
         market_quality_block = self.market_quality.block_reason(feature_vector, side)
         if market_quality_block and not high_profit:
-            raw["evidence_profit_probe_blocked"] = {
-                "blocked": True,
-                "reason": market_quality_block,
-                "side": side,
-                "expected_net_return_pct": round(expected_net, 6),
-                "profit_quality_ratio": round(quality, 6),
-            }
-            original.raw_response = raw
+            self._record_block(
+                original,
+                side=side,
+                expected_net=expected_net,
+                quality=quality,
+                loss_probability=loss_probability,
+                tail_risk=tail_risk,
+                recommendation=recommendation,
+                review_feedback=review_feedback,
+                block_kind="market_quality_block",
+                block_reasons=["market_quality_block"],
+                reason=market_quality_block,
+            )
             return None
         if (
             score < max(min_ref - 0.65, 0.20)
             and "high_profit" not in recommendation
             and not memory_supported
         ):
+            self._record_block(
+                original,
+                side=side,
+                expected_net=expected_net,
+                quality=quality,
+                loss_probability=loss_probability,
+                tail_risk=tail_risk,
+                recommendation=recommendation,
+                review_feedback=review_feedback,
+                block_kind="score_below_probe_floor",
+                block_reasons=["score_below_probe_floor"],
+                reason="Entry evidence score is below the controlled probe floor.",
+            )
             return None
         if recommendation == "hold_or_tiny_probe_only" and not high_profit:
+            self._record_block(
+                original,
+                side=side,
+                expected_net=expected_net,
+                quality=quality,
+                loss_probability=loss_probability,
+                tail_risk=tail_risk,
+                recommendation=recommendation,
+                review_feedback=review_feedback,
+                block_kind="hold_or_tiny_probe_only",
+                block_reasons=["hold_or_tiny_probe_only"],
+                reason="Entry evidence explicitly recommends hold or tiny shadow probe only.",
+            )
             return None
 
         sizing = self._sizing(expected_net, quality, loss_probability, tail_risk, high_profit)
@@ -168,6 +237,57 @@ class EntryEvidenceProbePolicy:
                 else (original.feature_snapshot or {})
             ),
         )
+
+    @staticmethod
+    def _threshold_block_reasons(
+        *,
+        expected_net: float,
+        quality: float,
+        loss_probability: float,
+        tail_risk: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if expected_net < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct:
+            reasons.append("expected_net_below_probe_threshold")
+        if quality < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality:
+            reasons.append("profit_quality_below_probe_threshold")
+        if loss_probability > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability:
+            reasons.append("loss_probability_above_probe_threshold")
+        if tail_risk > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk:
+            reasons.append("tail_risk_above_probe_threshold")
+        return reasons
+
+    @staticmethod
+    def _record_block(
+        original: DecisionOutput,
+        *,
+        side: str,
+        expected_net: float,
+        quality: float,
+        loss_probability: float,
+        tail_risk: float,
+        recommendation: str,
+        review_feedback: dict[str, Any],
+        block_kind: str,
+        block_reasons: list[str],
+        reason: str,
+    ) -> None:
+        raw = original.raw_response if isinstance(original.raw_response, dict) else {}
+        raw["evidence_profit_probe_blocked"] = {
+            "blocked": True,
+            "block_kind": block_kind,
+            "block_reasons": block_reasons,
+            "reason": reason,
+            "side": side,
+            "expected_net_return_pct": round(expected_net, 6),
+            "profit_quality_ratio": round(quality, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk, 6),
+            "recommendation": recommendation,
+            "review_feedback": review_feedback,
+            "thresholds": _probe_thresholds(),
+        }
+        original.raw_response = raw
 
     @staticmethod
     def _score_side(evidence: dict[str, Any], side: str) -> float:

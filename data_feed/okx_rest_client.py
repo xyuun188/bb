@@ -15,6 +15,7 @@ import structlog
 
 from config.settings import settings
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_from_okx_market
 from core.trading_mode import mode_manager
 
 logger = structlog.get_logger(__name__)
@@ -433,13 +434,7 @@ class OKXRestClient:
         )
 
     def _display_symbol(self, market: dict[str, Any]) -> str:
-        base = market.get("base") or ""
-        if base:
-            return f"{base}/USDT"
-        inst_id = str(market.get("id") or "")
-        if inst_id.endswith("-USDT-SWAP"):
-            return f"{inst_id.removesuffix('-USDT-SWAP')}/USDT"
-        return ""
+        return symbol_from_okx_market(market)
 
     def _safe_float(self, value: Any) -> float:
         try:
@@ -541,6 +536,9 @@ class OKXRestClient:
         normalized = (symbol or "").strip().upper().replace("_", "-")
         if not normalized or ":" in normalized:
             return symbol
+        resolved = self._resolve_loaded_swap_symbol(symbol)
+        if resolved:
+            return resolved
         if normalized.endswith("-SWAP"):
             base = normalized.removesuffix("-USDT-SWAP")
             return f"{base}/USDT:USDT"
@@ -554,6 +552,20 @@ class OKXRestClient:
             if len(parts) >= 2 and parts[1] == "USDT":
                 return f"{parts[0]}/USDT:USDT"
         return symbol
+
+    def _resolve_loaded_swap_symbol(self, symbol: str) -> str | None:
+        if self._exchange is None:
+            return None
+        markets_by_id = getattr(self._exchange, "markets_by_id", None) or {}
+        native = normalize_trading_symbol(symbol).replace("/", "-")
+        if not native:
+            return None
+        by_id = markets_by_id.get(f"{native}-SWAP")
+        markets = by_id if isinstance(by_id, list) else [by_id] if by_id else []
+        for market in markets:
+            if isinstance(market, dict) and market.get("symbol"):
+                return str(market["symbol"])
+        return None
 
     def _sort_symbols(self, symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deduped = {s["symbol"]: s for s in symbols}

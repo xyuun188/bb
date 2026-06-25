@@ -10,6 +10,7 @@ import pytest
 import services.sync_service as sync_module
 import services.trading_service as trading_service
 from ai_brain.base_model import Action, DecisionOutput
+from core.symbols import normalize_trading_symbol
 from core.trading_mode import mode_manager
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.account_accounting_service import AccountAccountingService
@@ -34,6 +35,7 @@ from services.exchange_position_state import (
 from services.execution_allocation_service import ExecutionAllocationService
 from services.execution_pipelines import EntryExecutionPipeline, ExitExecutionPipeline
 from services.execution_service import ExecutionService
+from services.exit_cooldown import ExitCooldownPolicy
 from services.expert_memory_service import ExpertMemoryService
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
@@ -170,6 +172,7 @@ def test_successful_runtime_round_clears_recovered_scope_error(
     payload = json.loads((data_dir / "trading_runtime_status.json").read_text(encoding="utf-8"))
     assert payload["market_last_error"]
     assert payload["last_round_error"]
+    assert service._last_round_error is None
 
     service._finish_runtime_round("market", datetime.now(UTC), ok=True)
     service._write_runtime_heartbeat()
@@ -179,6 +182,12 @@ def test_successful_runtime_round_clears_recovered_scope_error(
     assert payload["market_current_stage"] == "idle"
     assert payload["market_last_error"] is None
     assert payload["last_round_error"] is None
+
+
+def test_market_scope_skips_full_reconciliation_at_round_start() -> None:
+    assert TradingService._should_run_full_reconciliation_at_round_start("market") is False
+    assert TradingService._should_run_full_reconciliation_at_round_start("position") is True
+    assert TradingService._should_run_full_reconciliation_at_round_start("full") is True
 
 
 @pytest.mark.asyncio
@@ -454,6 +463,38 @@ async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
 
     assert calls == ["market"]
     assert sleeps == [0.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_analysis_service_loop_continues_after_internal_round_cancellation(monkeypatch):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(calls) >= 2 and len(sleeps) > 2:
+            running = False
+
+    async def run_once(scope):
+        calls.append(scope)
+        if len(calls) == 1:
+            raise asyncio.CancelledError()
+        return {"scope": scope}
+
+    service = PositionReviewService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        round_watchdog_provider=lambda: 30.0,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert calls == ["position", "position"]
+    assert sleeps == [0.0, 30.0, 30.0]
 
 
 @pytest.mark.asyncio
@@ -1211,6 +1252,187 @@ def test_entry_opportunity_gate_blocks_known_untradable_symbol_before_execution(
 
 
 @pytest.mark.asyncio
+async def test_trading_service_restores_untradable_symbol_from_raw_execution_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    rows = [
+        SimpleNamespace(
+            model_name="ensemble_trader",
+            symbol="RESOLV/USDT",
+            action="long",
+            confidence=0.8,
+            position_size_pct=0.05,
+            suggested_leverage=3.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.1,
+            reasoning="test",
+            feature_snapshot={"current_price": 1.0},
+            execution_reason="OKX returned a generic translated rejection.",
+            raw_llm_response={
+                "execution_result": {
+                    "status": "rejected",
+                    "raw_response": {
+                        "error": "OKX rejected entry order",
+                        "raw_error": (
+                            '{"code":"1","data":[{"sCode":"51155","sMsg":'
+                            '"Due to local compliance restrictions, you currently cannot trade this pair."}]}'
+                        ),
+                    },
+                }
+            },
+            created_at=now,
+        )
+    ]
+
+    class FakeResult:
+        def all(self):
+            return rows
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
+        lambda symbol: str(symbol or "").replace("-", "/")
+    )
+    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
+
+    await service._load_untradable_symbol_blocks()
+
+    reason = service.blocked_symbol_reason("RESOLV-USDT")
+    assert reason is not None
+    assert "51155" in reason
+
+
+@pytest.mark.asyncio
+async def test_trading_service_restores_untradable_exit_cooldown_from_contract_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    rows = [
+        SimpleNamespace(
+            model_name="ensemble_trader",
+            symbol="LAB/USDT",
+            action="close_long",
+            confidence=0.7,
+            position_size_pct=1.0,
+            suggested_leverage=3.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.1,
+            reasoning="test",
+            feature_snapshot={"current_price": 18.7},
+            execution_reason=(
+                'okx {"code":"1","data":[{"sCode":"51028",'
+                '"sMsg":"Contract under delivery."}],"msg":"All operations failed"}'
+            ),
+            raw_llm_response={},
+            created_at=now,
+        )
+    ]
+
+    class FakeResult:
+        def all(self):
+            return rows
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
+        lambda symbol: str(symbol or "").replace("-", "/")
+    )
+    service.exit_cooldown = ExitCooldownPolicy(
+        normalize_symbol=lambda value: str(value or "").replace("/", "-")
+    )
+    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
+
+    await service._load_untradable_symbol_blocks()
+
+    retry = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="LAB/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.7,
+        reasoning="retry",
+        position_size_pct=1.0,
+        raw_response={"fast_risk_trigger": "stop_loss"},
+    )
+    reason = service.exit_cooldown.recent_exit_cooldown_reason(
+        "ensemble_trader",
+        retry,
+    )
+
+    assert service.blocked_symbol_reason("LAB-USDT") is not None
+    assert reason is not None
+    assert "51028" in retry.raw_response["untradable_exit_cooldown"]["last_error"]
+    assert retry.raw_response["untradable_exit_cooldown"]["symbol"] == "LAB-USDT"
+
+
+@pytest.mark.asyncio
+async def test_trading_service_does_not_restore_untradable_block_from_generic_raw_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        SimpleNamespace(
+            model_name="ensemble_trader",
+            symbol="MAGIC/USDT",
+            action="long",
+            confidence=0.8,
+            position_size_pct=0.05,
+            suggested_leverage=3.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.1,
+            reasoning="test",
+            feature_snapshot={"current_price": 1.0},
+            execution_reason="OKX rejected entry order.",
+            raw_llm_response={
+                "execution_result": {
+                    "status": "rejected",
+                    "raw_response": {
+                        "error": "OKX rejected entry order",
+                        "raw_error": "51008 Insufficient USDT margin",
+                    },
+                }
+            },
+            created_at=datetime.now(UTC),
+        )
+    ]
+
+    class FakeResult:
+        def all(self):
+            return rows
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
+        lambda symbol: str(symbol or "").replace("-", "/")
+    )
+    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
+
+    await service._load_untradable_symbol_blocks()
+
+    assert service.blocked_symbol_reason("MAGIC-USDT") is None
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
     calls: list[tuple[str, str, int]] = []
 
@@ -1274,6 +1496,60 @@ async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_priva
     assert sizing["risk_mode"] == "normal"
     assert sizing["quality_tier"] == "base"
     assert sizing["planned_stop_loss_usdt"] > 0
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_records_low_payoff_reason_codes():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.80,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.20,
+            "expected_loss_pct": 1.0,
+            "tail_risk_score": 0.55,
+            "raw_expected_return_pct": -0.05,
+            "profit_quality_ratio": 0.40,
+            "server_profit_loss_probability": 0.55,
+            "small_win_big_loss_penalty": 0.70,
+            "model_contribution_adjustment": {"hard_caution": True},
+            "ml_aligned": False,
+            "local_profit_aligned": False,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "small",
+                "effective_score": 59.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        }
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["low_payoff_quality"] is True
+    assert sizing["low_payoff_reasons"] == [
+        "score_below_required",
+        "expected_net_below_min",
+        "profit_quality_below_min",
+        "raw_expected_return_negative",
+        "small_win_big_loss_penalty_high",
+        "hard_contribution_caution",
+        "evidence_low_payoff_quality",
+    ]
 
 
 def test_entry_opportunity_gate_treats_strategy_learning_pause_as_advisory():
@@ -2061,6 +2337,7 @@ def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
     )
     monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
     monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 20)
     symbols = [f"S{i}/USDT" for i in range(10)]
 
     first = service._budget_auto_scan_feature_symbols(
@@ -2081,6 +2358,319 @@ def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
     assert first != second
     assert first[1:] == ["S0/USDT", "S1/USDT", "S2/USDT", "S3/USDT"]
     assert second[1:] == ["S4/USDT", "S5/USDT", "S6/USDT", "S7/USDT"]
+    assert service._last_auto_feature_fetch_budget_diagnostics["read_only"] is True
+    assert service._last_auto_feature_fetch_budget_diagnostics["is_entry_gate"] is False
+    assert (
+        service._last_auto_feature_fetch_budget_diagnostics["selected_market_feature_fetch_count"]
+        == 4
+    )
+
+
+def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._auto_scan_feature_cursor = 0
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 5)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 48)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 64)
+    symbols = [f"S{i}/USDT" for i in range(120)]
+
+    selected = service._budget_auto_scan_feature_symbols(
+        symbols,
+        [],
+        configured_limit=8,
+    )
+
+    assert len(selected) == 48
+    diagnostics = service._last_auto_feature_fetch_budget_diagnostics
+    assert diagnostics["selected_market_feature_fetch_count"] == 48
+    assert diagnostics["configured_market_symbol_limit"] == 8
+    assert diagnostics["pool_min"] == 48
+    assert diagnostics["pool_max"] == 64
+    assert diagnostics["is_entry_gate"] is False
+    assert "not entry permission" in diagnostics["diagnostic_boundary"]
+
+
+def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_counts() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service._last_auto_feature_fetch_budget_diagnostics = {
+        "read_only": True,
+        "is_entry_gate": False,
+        "selected_market_feature_fetch_count": 48,
+    }
+    service._last_auto_feature_rank_diagnostics = {
+        "candidates": 4,
+        "tradable_candidates": 2,
+        "secondary_candidates": 1,
+        "filtered_out_candidates": 1,
+        "rank_underfilled": False,
+        "rank_underfill_reason": "",
+        "filtered_out_reason_counts": [{"reason": "analysis_volume_ratio_below_floor", "count": 1}],
+        "symbols": [{"symbol": "BTC/USDT", "score": 80.0}],
+        "ranked_symbol_sample": [
+            {
+                "symbol": "BTC/USDT",
+                "selected": True,
+                "non_selected_reason": "selected_for_market_analysis",
+            },
+            {
+                "symbol": "ETH/USDT",
+                "selected": False,
+                "non_selected_reason": "outside_market_symbol_budget",
+            },
+        ],
+        "filtered_symbol_sample": [
+            {
+                "symbol": "THIN/USDT",
+                "selected": False,
+                "non_selected_reason": "feature_filter_rejected",
+            },
+        ],
+    }
+    skipped = SimpleNamespace(skipped=[SimpleNamespace(symbol="OLD/USDT")])
+    empty_filter = SimpleNamespace(skipped=[])
+    analysis_budget = {
+        "risk_level": "low",
+        "market_symbol_limit": 2,
+        "position_max_groups": 3,
+        "budget_source": "config",
+        "market_limit_policy": "position_first_low_risk",
+        "configured_market_symbol_limit": 12,
+        "position_group_count": 1,
+        "target_position_groups": 3,
+        "roster_underfilled": True,
+        "market_limit_diagnostics": {
+            "read_only": True,
+            "selected_market_symbol_limit": 2,
+        },
+        "reason": "position_first_low_risk",
+        "recent_market_analysis_dedupe": {
+            "skipped_count": 1,
+            "skipped_symbols": ["ETH/USDT"],
+        },
+        "market_budget_rotation": {
+            "read_only": True,
+            "is_entry_gate": False,
+            "applied": True,
+            "start_symbol": "ETH/USDT",
+        },
+    }
+
+    funnel = service._market_candidate_funnel_snapshot(
+        scan_symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        blocked_filter=empty_filter,
+        open_position_filter=empty_filter,
+        unclaimed_filter=skipped,
+        fetch_symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        feature_vectors={"BTC/USDT": object(), "ETH/USDT": object()},
+        invalid_symbols=["SOL/USDT"],
+        market_feature_vectors_before_rank={
+            "BTC/USDT": object(),
+            "ETH/USDT": object(),
+            "SOL/USDT": object(),
+        },
+        market_feature_vectors_after_rank={"BTC/USDT": object(), "ETH/USDT": object()},
+        market_feature_vectors_after_dedupe={"BTC/USDT": object()},
+        analysis_budget_context=analysis_budget,
+        market_symbol_budget=2,
+        run_market_analysis=True,
+        mode_is_auto_scan=True,
+    )
+    decision = _decision(Action.HOLD)
+    service._attach_market_candidate_funnel(decision, funnel)
+
+    assert funnel["read_only"] is True
+    assert funnel["is_entry_gate"] is False
+    assert funnel["scan_symbol_count"] == 3
+    assert funnel["feature_valid_count"] == 2
+    assert funnel["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48
+    assert funnel["feature_fetch_budget"]["is_entry_gate"] is False
+    assert funnel["feature_invalid_count"] == 1
+    assert funnel["market_feature_before_rank_count"] == 3
+    assert funnel["rank_selected_count"] == 2
+    assert funnel["rank_tradable_candidates"] == 2
+    assert funnel["rank_filtered_out_candidates"] == 1
+    assert funnel["rank_filtered_out_reason_counts"][0]["reason"] == (
+        "analysis_volume_ratio_below_floor"
+    )
+    assert funnel["rank_underfilled"] is False
+    assert funnel["rank_underfill_reason"] == ""
+    assert funnel["ranked_symbol_sample"][1]["non_selected_reason"] == (
+        "outside_market_symbol_budget"
+    )
+    assert funnel["filtered_symbol_sample"][0]["non_selected_reason"] == ("feature_filter_rejected")
+    assert funnel["recent_analysis_dedupe_count"] == 1
+    assert funnel["market_budget_rotation"]["read_only"] is True
+    assert funnel["market_budget_rotation"]["is_entry_gate"] is False
+    assert funnel["market_budget_rotation"]["applied"] is True
+    assert funnel["market_budget_rotation"]["start_symbol"] == "ETH/USDT"
+    assert funnel["market_feature_after_dedupe_count"] == 1
+    assert funnel["analysis_budget"]["market_limit_policy"] == "position_first_low_risk"
+    assert funnel["analysis_budget"]["configured_market_symbol_limit"] == 12
+    assert funnel["analysis_budget"]["position_group_count"] == 1
+    assert funnel["analysis_budget"]["target_position_groups"] == 3
+    assert funnel["analysis_budget"]["roster_underfilled"] is True
+    assert funnel["analysis_budget"]["market_limit_diagnostics"]["read_only"] is True
+    assert "threshold" in funnel["diagnostic_boundary"]
+    assert decision.raw_response["market_candidate_funnel"] == funnel
+
+
+def test_market_budget_deferred_rotation_starts_from_skipped_symbol() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._market_budget_deferred_symbols = ["SOL/USDT", "XRP/USDT"]
+    analysis_budget = {}
+
+    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
+        {
+            "BTC/USDT": "btc",
+            "ETH/USDT": "eth",
+            "SOL/USDT": "sol",
+            "XRP/USDT": "xrp",
+        },
+        analysis_budget_context=analysis_budget,
+    )
+
+    assert list(rotated) == ["SOL/USDT", "XRP/USDT", "BTC/USDT", "ETH/USDT"]
+    rotation = analysis_budget["market_budget_rotation"]
+    assert rotation["read_only"] is True
+    assert rotation["is_entry_gate"] is False
+    assert rotation["applied"] is True
+    assert rotation["start_symbol"] == "SOL/USDT"
+    assert "thresholds" in rotation["reason"]
+    assert "risk gates" in rotation["reason"]
+
+
+def test_market_budget_deferred_rotation_keeps_order_when_no_match() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._market_budget_deferred_symbols = ["DOGE/USDT"]
+    analysis_budget = {}
+
+    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
+        {
+            "BTC/USDT": "btc",
+            "ETH/USDT": "eth",
+        },
+        analysis_budget_context=analysis_budget,
+    )
+
+    assert list(rotated) == ["BTC/USDT", "ETH/USDT"]
+    rotation = analysis_budget["market_budget_rotation"]
+    assert rotation["read_only"] is True
+    assert rotation["is_entry_gate"] is False
+    assert rotation["applied"] is False
+    assert rotation["reason"] == "deferred symbols no longer match current shortlist"
+
+
+def test_market_budget_deferred_symbols_are_deduped_and_clearable() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+
+    service._remember_market_budget_deferred_symbols(
+        ["BTC/USDT", "BTC/USDT", "", "ETH/USDT"],
+    )
+    assert service._market_budget_deferred_symbols == ["BTC/USDT", "ETH/USDT"]
+
+    service._remember_market_budget_deferred_symbols([])
+    assert service._market_budget_deferred_symbols == []
+
+
+def test_market_analysis_progress_snapshot_is_read_only_and_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    started_at = datetime.now(UTC) - timedelta(seconds=3)
+    market_ai_started_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    progress = service._market_analysis_progress_snapshot(
+        symbol="BTC/USDT",
+        market_index=1,
+        market_total=8,
+        round_start=started_at,
+        market_ai_started_at=market_ai_started_at,
+    )
+    decision = _decision(Action.HOLD)
+    service._attach_market_candidate_funnel(
+        decision,
+        {"read_only": True},
+        progress,
+    )
+
+    assert progress["read_only"] is True
+    assert progress["is_entry_gate"] is False
+    assert progress["processed_index"] == 2
+    assert progress["ranked_market_symbol_count"] == 8
+    assert progress["remaining_after_this_symbol"] == 6
+    assert progress["market_round_time_budget_seconds"] == 27.0
+    assert progress["budget_clock_scope"] == "market_ai_phase"
+    assert progress["full_round_elapsed_seconds_before_ai"] >= 3.0
+    assert progress["market_ai_elapsed_seconds_before_symbol"] < 2.0
+    assert progress["budget_used_ratio_before_ai"] < 0.1
+    assert (
+        progress["market_ai_budget_used_ratio_before_symbol"]
+        == progress["budget_used_ratio_before_ai"]
+    )
+    assert "not entry permission" in progress["diagnostic_boundary"]
+    assert decision.raw_response["market_candidate_funnel"]["read_only"] is True
+    assert decision.raw_response["market_analysis_progress"] == progress
+
+
+def test_market_ai_budget_clock_ignores_pre_ai_round_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    full_round_started_at = datetime.now(UTC) - timedelta(seconds=60)
+    market_ai_started_at = datetime.now(UTC) - timedelta(seconds=2)
+
+    assert service._round_budget_exhausted(full_round_started_at) is True
+    assert service._market_ai_budget_exhausted(market_ai_started_at) is False
+
+    progress = service._market_analysis_progress_snapshot(
+        symbol="ETH/USDT",
+        market_index=0,
+        market_total=8,
+        round_start=full_round_started_at,
+        market_ai_started_at=market_ai_started_at,
+    )
+
+    assert progress["budget_clock_scope"] == "market_ai_phase"
+    assert progress["full_round_elapsed_seconds_before_ai"] >= 60.0
+    assert (
+        progress["round_elapsed_seconds_before_ai"]
+        == progress["full_round_elapsed_seconds_before_ai"]
+    )
+    assert progress["market_ai_elapsed_seconds_before_symbol"] < 3.0
+    assert progress["budget_used_ratio_before_ai"] < 0.12
 
 
 def test_market_round_time_budget_tracks_runtime_decision_interval(
@@ -3673,6 +4263,189 @@ async def test_sync_service_reconcile_exchange_positions_requires_close_fill_fin
 
 
 @pytest.mark.asyncio
+async def test_sync_service_close_fill_lookup_timeout_is_phase_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    errors: list[str] = []
+    service = OkxSyncService(round_error_recorder=errors.append)
+    monkeypatch.setattr(sync_module, "EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS", 0.001)
+
+    async def slow_lookup(_position):
+        await asyncio.sleep(0.05)
+        return {"order_id": "late-close"}
+
+    result = await service._find_exchange_close_fill_with_timeout(
+        slow_lookup,
+        SimpleNamespace(id=7, symbol="LINK/USDT", side="short"),
+        context="missing exchange position",
+    )
+
+    assert result == {"lookup_unavailable": True, "error": "timeout"}
+    assert errors
+    assert "exchange close-fill lookup timed out during missing exchange position" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_missing_market_symbol_close_fill_allows_snapshot_correction() -> None:
+    errors: list[str] = []
+    service = OkxSyncService(round_error_recorder=errors.append)
+
+    async def missing_market_lookup(_position):
+        raise RuntimeError("okx does not have market symbol NG/USDT:USDT")
+
+    result = await service._find_exchange_close_fill_with_timeout(
+        missing_market_lookup,
+        SimpleNamespace(id=1599, symbol="NG/USDT", side="short"),
+        context="missing exchange position",
+    )
+
+    assert result == {}
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_sync_service_missing_market_symbol_active_order_does_not_block_local_correction():
+    class FakeExecutor:
+        async def get_open_orders_strict(self, _symbol):
+            raise RuntimeError("okx does not have market symbol NG/USDT:USDT")
+
+    async def okx_executor(_mode):
+        return FakeExecutor()
+
+    service = OkxSyncService(
+        symbol_normalizer=lambda symbol: str(symbol or ""),
+        okx_executor_provider=okx_executor,
+    )
+
+    active = await service.active_exchange_order_for_local_position(
+        SimpleNamespace(
+            id=1599,
+            execution_mode="paper",
+            symbol="NG/USDT",
+            side="short",
+        )
+    )
+
+    assert active is None
+
+
+@pytest.mark.asyncio
+async def test_sync_service_missing_exchange_position_closes_snapshot_without_fake_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    created_at = datetime.now(UTC) - timedelta(days=2)
+    local_position = SimpleNamespace(
+        id=1599,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="NG/USDT",
+        side="short",
+        is_open=True,
+        entry_price=3.339,
+        current_price=3.333,
+        quantity=1.0,
+        leverage=2.0,
+        unrealized_pnl=0.006,
+        realized_pnl=0.0,
+        stop_loss_price=3.39,
+        take_profit_price=3.094,
+        created_at=created_at,
+        closed_at=None,
+    )
+    created_orders: list[dict[str, Any]] = []
+    decision_logs: list[dict[str, Any]] = []
+
+    class FakeSession:
+        async def refresh(self, _pos):
+            return None
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return []
+
+    class FakeExecutor:
+        async def get_open_orders_strict(self, _symbol):
+            raise RuntimeError("okx does not have market symbol NG/USDT:USDT")
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [local_position]
+
+        async def create_order(self, payload):
+            created_orders.append(payload)
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(_paper_okx, _exchange_positions):
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    async def close_fill(_pos):
+        raise RuntimeError("okx does not have market symbol NG/USDT:USDT")
+
+    async def okx_executor(_mode):
+        return FakeExecutor()
+
+    async def entry_fee(_session, _pos, close_qty):
+        assert close_qty == 1.0
+        return 0.0016695
+
+    async def log_close_decision(**kwargs):
+        decision_logs.append(kwargs)
+        return 8801
+
+    async def fresh_feature_vector(_symbol):
+        return SimpleNamespace(current_price=3.333)
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=lambda symbol: str(symbol or ""),
+        okx_executor_provider=okx_executor,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        exchange_close_fill_finder=close_fill,
+        fresh_feature_vector_provider=fresh_feature_vector,
+        market_value_reader=lambda source, key: getattr(source, key, None),
+        entry_fee_provider=entry_fee,
+        exchange_sync_close_decision_logger=log_close_decision,
+        trade_reflection_recorder=lambda *_args, **_kwargs: None,
+        position_margin_calculator=lambda notional, leverage: notional / float(leverage or 1.0),
+        memory_position_remover=lambda _model_name, _symbol, _side: None,
+    ).reconcile_exchange_positions()
+
+    assert local_position.is_open is False
+    assert local_position.realized_pnl == 0.0
+    assert local_position.unrealized_pnl == 0.0
+    assert local_position.closed_at is not None
+    assert created_orders == []
+    assert decision_logs[0]["realized_pnl"] == 0.0
+    assert decision_logs[0]["reconcile_origin"] == "local_snapshot_correction"
+    assert decision_logs[0]["close_fill"]["estimated_pnl"] == pytest.approx(0.0043305)
+    assert decision_logs[0]["close_fill"]["pnl"] == 0.0
+    assert result[0]["realized_pnl"] == 0.0
+    assert result[0]["estimated_pnl"] == pytest.approx(0.0043305)
+
+
+@pytest.mark.asyncio
 async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_syncer(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3771,6 +4544,243 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_reconcile_exchange_positions_records_exchange_quantity_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    created_at = datetime(2026, 6, 24, 5, 20, tzinfo=UTC)
+    closed_at = datetime(2026, 6, 24, 5, 26, tzinfo=UTC)
+    local_position = SimpleNamespace(
+        id=31,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="USAR/USDT",
+        side="long",
+        is_open=True,
+        entry_price=2.31,
+        current_price=2.44,
+        quantity=16.0,
+        leverage=6.0,
+        unrealized_pnl=2.08,
+        realized_pnl=0.0,
+        stop_loss_price=2.0,
+        take_profit_price=4.2,
+        created_at=created_at,
+        closed_at=None,
+    )
+    closed_positions: list[Any] = []
+    created_orders: list[dict[str, Any]] = []
+    balance_updates: list[tuple[str, float, float]] = []
+    trade_results: list[tuple[str, bool]] = []
+    decision_logs: list[dict[str, Any]] = []
+    reflection_calls: list[dict[str, Any]] = []
+    close_fill_probes: list[Any] = []
+
+    class FakeScalarResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeScalarResult()
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "USAR/USDT",
+                    "side": "long",
+                    "contracts": "6",
+                    "contractSize": "1",
+                    "entryPrice": "2.31",
+                    "markPrice": "4.05",
+                    "leverage": "6",
+                    "unrealizedPnl": "10.44",
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [local_position]
+
+        async def open_position(self, payload):
+            closed_position = SimpleNamespace(id=99, **payload)
+            closed_positions.append(closed_position)
+            return closed_position
+
+        async def create_order(self, payload):
+            created_orders.append(payload)
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+        async def update_balance(self, model_name, amount, realized_pnl):
+            balance_updates.append((model_name, amount, realized_pnl))
+
+        async def record_trade_result(self, model_name, is_win):
+            trade_results.append((model_name, is_win))
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(_paper_okx, _exchange_positions):
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    def sync_snapshot(positions, **_kwargs):
+        positions[0].quantity = 6.0
+        return True
+
+    async def close_fill(pos):
+        close_fill_probes.append(pos)
+        return {
+            "order_id": "usar-close-10",
+            "price": 3.85,
+            "fee": 0.02,
+            "quantity": 10.0,
+            "timestamp": closed_at,
+        }
+
+    async def entry_fee(_session, _pos, close_qty):
+        assert close_qty == 10.0
+        return 0.01
+
+    async def log_close_decision(**kwargs):
+        decision_logs.append(kwargs)
+        return 909
+
+    async def record_reflection(_session, pos, **kwargs):
+        reflection_calls.append({"pos": pos, "kwargs": kwargs})
+
+    def position_margin(notional, leverage):
+        return notional / leverage
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=lambda symbol: symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=sync_snapshot,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        exchange_close_fill_finder=close_fill,
+        fresh_feature_vector_provider=lambda _symbol: None,
+        market_value_reader=lambda source, key: getattr(source, key, None),
+        entry_fee_provider=entry_fee,
+        exchange_sync_close_decision_logger=log_close_decision,
+        trade_reflection_recorder=record_reflection,
+        position_margin_calculator=position_margin,
+        memory_position_remover=lambda _model_name, _symbol, _side: None,
+    ).reconcile_exchange_positions()
+
+    assert close_fill_probes[0].symbol == "USAR/USDT"
+    assert close_fill_probes[0].side == "long"
+    assert close_fill_probes[0].quantity == 10.0
+    assert local_position.quantity == 6.0
+    assert len(closed_positions) == 1
+    closed = closed_positions[0]
+    assert closed.quantity == 10.0
+    assert closed.entry_price == 2.31
+    assert closed.current_price == 3.85
+    assert closed.realized_pnl == pytest.approx(15.37)
+    assert closed.closed_at == closed_at
+    assert decision_logs[0]["position_size_pct"] == pytest.approx(10.0 / 16.0)
+    assert decision_logs[0]["close_fill"]["partial_reduction"] is True
+    assert decision_logs[0]["close_fill"]["order_id"] == "usar-close-10"
+    assert reflection_calls[0]["kwargs"]["source"] == "okx_reconcile"
+    assert created_orders == [
+        {
+            "model_name": "ensemble_trader",
+            "execution_mode": "paper",
+            "symbol": "USAR/USDT",
+            "side": "sell",
+            "order_type": "market",
+            "quantity": 10.0,
+            "price": 3.85,
+            "status": OrderStatus.FILLED.value,
+            "fee": 0.02,
+            "decision_id": 909,
+            "exchange_order_id": "usar-close-10",
+            "filled_at": closed_at,
+        }
+    ]
+    assert balance_updates == [("ensemble_trader", pytest.approx(19.22), pytest.approx(15.37))]
+    assert trade_results == [("ensemble_trader", True)]
+    assert result[0]["quantity"] == 10.0
+    assert result[0]["remaining_quantity"] == 6.0
+    assert result[0]["exchange_order_id"] == "usar-close-10"
+
+
+@pytest.mark.asyncio
+async def test_sync_service_does_not_record_quantity_reduction_without_close_fill():
+    pos = SimpleNamespace(
+        id=1700,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LAB/USDT",
+        side="long",
+        entry_price=16.865555555555556,
+        current_price=18.0,
+        quantity=0.9,
+        leverage=3.0,
+        realized_pnl=0.0,
+        stop_loss_price=14.3,
+        take_profit_price=22.463,
+        created_at=datetime(2026, 6, 25, 9, 50, tzinfo=UTC),
+        closed_at=None,
+    )
+    opened_positions: list[dict[str, Any]] = []
+    orders: list[dict[str, Any]] = []
+    balance_updates: list[Any] = []
+
+    class FakeTradeRepository:
+        async def open_position(self, payload):
+            opened_positions.append(payload)
+            return SimpleNamespace(id=1701, **payload)
+
+        async def create_order(self, payload):
+            orders.append(payload)
+
+    class FakeAccountRepository:
+        async def update_balance(self, *args):
+            balance_updates.append(args)
+
+        async def record_trade_result(self, *args):
+            balance_updates.append(args)
+
+    result = await OkxSyncService()._record_exchange_quantity_reduction(
+        session=object(),
+        trade_repo=FakeTradeRepository(),
+        account_repo=FakeAccountRepository(),
+        positions=[pos],
+        quantity_before_by_id={1700: 9.0},
+        exchange_quantity=0.9,
+        exit_price=18.0,
+        close_fill=None,
+        entry_fee_for_position=lambda *_args: 0.0,
+        log_exchange_sync_close_decision=lambda **_kwargs: None,
+        record_trade_reflection=lambda *_args, **_kwargs: None,
+        calculate_position_margin=lambda notional, leverage: notional / float(leverage or 1.0),
+    )
+
+    assert result == []
+    assert opened_positions == []
+    assert orders == []
+    assert balance_updates == []
 
 
 @pytest.mark.asyncio
@@ -4163,13 +5173,16 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_price_rec
     assert fresh_calls == ["BTC/USDT"]
     assert market_value_calls == ["current_price"]
     assert decision_logs[0]["exit_price"] == 115.0
-    assert decision_logs[0]["realized_pnl"] == 29.0
-    assert created_orders[0]["decision_id"] == 77
+    assert decision_logs[0]["realized_pnl"] == 0.0
+    assert decision_logs[0]["close_fill"]["estimated_pnl"] == pytest.approx(29.0)
+    assert decision_logs[0]["close_fill"]["pnl"] == 0.0
+    assert created_orders == []
     assert position.is_open is False
     assert position.current_price == 115.0
-    assert position.realized_pnl == 29.0
+    assert position.realized_pnl == 0.0
     assert result[0]["exit_price"] == 115.0
-    assert result[0]["realized_pnl"] == 29.0
+    assert result[0]["realized_pnl"] == 0.0
+    assert result[0]["estimated_pnl"] == pytest.approx(29.0)
     assert result[0]["exchange_order_id"] is None
 
 
@@ -4240,6 +5253,85 @@ async def test_refresh_position_prices_uses_injected_profit_peak_boundaries(
     assert peak_calls[0]["unrealized_pnl"] == 5.0
     assert peak_calls[0]["hold_minutes"] == 12.5
     assert pruned_contexts[0][0]["symbol"] == "BTC/USDT"
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    updated_prices: list[tuple[int, float, float]] = []
+    peak_calls: list[dict[str, Any]] = []
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [
+                SimpleNamespace(
+                    id=17,
+                    model_name="ensemble_trader",
+                    symbol="LAB/USDT",
+                    side="long",
+                    entry_price=16.865555555555556,
+                    current_price=17.32,
+                    quantity=0.9,
+                    created_at="created",
+                )
+            ]
+
+        async def update_position_price(self, position_id, current_price, unrealized_pnl):
+            updated_prices.append((position_id, current_price, unrealized_pnl))
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+        async def update_unrealized_pnl(self, _model_name, _unrealized_pnl):
+            pass
+
+    class FakePaperOkx:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "LAB-USDT-SWAP",
+                    "side": "long",
+                    "contracts": 9.0,
+                    "markPrice": 18.192,
+                    "entryPrice": 16.865555555555556,
+                    "unrealizedPnl": 1.1937999999999998,
+                    "info": {
+                        "instId": "LAB-USDT-SWAP",
+                        "pos": "9",
+                        "avgPx": "16.8655555555555556",
+                        "markPx": "18.192",
+                        "last": "17.32",
+                        "upl": "1.1937999999999998",
+                    },
+                }
+            ]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    service = OkxSyncService(
+        paper_okx_provider=lambda: FakePaperOkx(),
+        symbol_normalizer=normalize_trading_symbol,
+        position_profit_peak_recorder=lambda **kwargs: peak_calls.append(kwargs),
+        position_age_minutes_provider=lambda created_at: 12.5 if created_at else None,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    await service.refresh_position_prices({"LAB/USDT": SimpleNamespace(current_price=17.32)})
+
+    assert updated_prices == [(17, pytest.approx(18.192), pytest.approx(1.1938))]
+    assert peak_calls[0]["current_price"] == pytest.approx(18.192)
+    assert peak_calls[0]["unrealized_pnl"] == pytest.approx(1.1938)
 
 
 @pytest.mark.asyncio

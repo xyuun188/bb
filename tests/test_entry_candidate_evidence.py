@@ -210,7 +210,59 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
     assert evidence["long"]["score"] == 0.70
     assert evidence["long"]["expected_net_return_pct"] == 0.35
     assert evidence["long"]["recommendation"] == "memory_supported_probe_candidate"
+    assert evidence["long"]["probe_conversion_ready"] is True
+    assert evidence["long"]["probe_conversion_block_reasons"] == []
     assert evidence["long"]["review_feedback"]["missed_opportunity_count"] == 5
+
+
+def test_candidate_evidence_does_not_label_subthreshold_memory_as_probe_candidate() -> None:
+    opportunities = {
+        "long": {
+            "expected_net_return_pct": 0.34,
+            "tail_risk_score": 0.32,
+            "server_profit_loss_probability": 0.50,
+            "profit_quality_ratio": 0.45,
+            "min_score_required": 0.7,
+        },
+        "short": {
+            "expected_net_return_pct": -0.05,
+            "tail_risk_score": 0.7,
+            "server_profit_loss_probability": 0.55,
+            "profit_quality_ratio": -0.1,
+            "min_score_required": 0.7,
+        },
+    }
+    memory_feedback = {
+        "enabled": True,
+        "by_side": {
+            "long": {
+                "side": "long",
+                "candidate_score_bonus": 0.24,
+                "score_adjustment": 0.18,
+                "allow_probe": True,
+                "action_bias": "prefer_small_probe_when_current_ev_positive",
+                "missed_opportunity_count": 90,
+                "positive_evidence_count": 90,
+                "risk_evidence_count": 0,
+            }
+        },
+    }
+
+    evidence = _policy(opportunities, {"long": -0.8, "short": -1.2}).build(
+        _feature(),
+        {"mode": "test"},
+        {},
+        {},
+        {"preferred_side": "long"},
+        memory_feedback,
+    )
+
+    assert evidence["long"]["recommendation"] == "memory_watchlist_needs_probe_threshold"
+    assert evidence["long"]["probe_conversion_ready"] is False
+    assert evidence["long"]["probe_conversion_block_reasons"] == [
+        "expected_net_below_probe_threshold"
+    ]
+    assert evidence["long"]["probe_conversion_thresholds"]["min_expected_net_return_pct"] == 0.35
 
 
 def test_trading_service_candidate_evidence_delegates_to_policy() -> None:

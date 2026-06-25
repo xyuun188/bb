@@ -141,6 +141,15 @@ class PositionQualityScorer:
         if margin > 0 and hold_hours >= 4 and abs(unrealized) < max(margin * 0.003, estimated_fee):
             score -= 14.0
             reasons.append("capital_efficiency_low")
+        if self._stale_probe_capital_is_inefficient(
+            hold_hours=hold_hours,
+            notional=notional,
+            unrealized=unrealized,
+            pnl_ratio=pnl_ratio,
+            estimated_fee=estimated_fee,
+        ):
+            score -= 54.0
+            reasons.append("stale_probe_capital_inefficient")
 
         strategy_profile_id = str(
             position.get("strategy_profile_id")
@@ -209,6 +218,37 @@ class PositionQualityScorer:
         if hold_hours >= self.params.fresh_position_min_release_hold_hours:
             return False
         return self.params.fresh_position_hard_risk_loss_ratio < pnl_ratio < 0.0
+
+    def _stale_probe_capital_is_inefficient(
+        self,
+        *,
+        hold_hours: float,
+        notional: float,
+        unrealized: float,
+        pnl_ratio: float,
+        estimated_fee: float,
+    ) -> bool:
+        min_hold_hours = _safe_float(getattr(self.params, "stale_probe_min_hold_hours", 1.0), 1.0)
+        max_notional = _safe_float(
+            getattr(self.params, "stale_probe_max_notional_usdt", 40.0),
+            40.0,
+        )
+        max_fee_multiple = _safe_float(
+            getattr(self.params, "stale_probe_max_abs_pnl_fee_multiple", 2.0),
+            2.0,
+        )
+        max_profit_ratio = _safe_float(
+            getattr(self.params, "stale_probe_max_profit_ratio", 0.004),
+            0.004,
+        )
+        if hold_hours < min_hold_hours:
+            return False
+        if notional <= 0 or notional > max_notional:
+            return False
+        if pnl_ratio >= max_profit_ratio:
+            return False
+        fee_reference = max(estimated_fee, 1e-9)
+        return abs(unrealized) <= fee_reference * max_fee_multiple
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

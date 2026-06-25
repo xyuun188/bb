@@ -35,10 +35,14 @@ from services.exchange_position_state import (
 from services.model_dynamic_routing import ModelDynamicRoutingService
 from services.model_expert_competition import ModelExpertCompetitionService
 from services.model_expert_health import ModelExpertHealthService
+from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
+from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.server_monitor_status import collect_platform_runtime_status
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
 )
+from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
+from services.strong_opportunity import StrongOpportunityService
 from services.trade_execution_contract import TradeExecutionContractService
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api import data_collection as data_collection_api
@@ -48,7 +52,7 @@ router = APIRouter()
 
 AUDIT_WINDOWS = {"fast_minutes": 10, "trade_hours": 2, "strategy_hours": 24}
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
-KLINE_STALE_LIMIT_SECONDS = {"1m": 120, "5m": 600, "15m": 1800, "1h": 7200}
+KLINE_STALE_LIMIT_SECONDS = {"1m": 180, "5m": 600, "15m": 1800, "1h": 7200}
 STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
@@ -56,21 +60,37 @@ POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
+SYSTEM_AUDIT_MAX_CONCURRENCY = 4
 MODEL_EXPERT_AUDIT_HOURS = 24
 MODEL_EXPERT_AUDIT_LIMIT = 200
 SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS = 24
 SHADOW_MISSED_OPPORTUNITY_AUDIT_LIMIT = 200
+STRONG_OPPORTUNITY_AUDIT_HOURS = 24
+STRONG_OPPORTUNITY_AUDIT_LIMIT = 500
+POSITION_CAPACITY_RELEASE_AUDIT_HOURS = 24
+POSITION_CAPACITY_RELEASE_AUDIT_LIMIT = 500
+STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_HOURS = 24
+STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_LIMIT = 500
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
 TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
+OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
+OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
 PRIORITY_AUDIT_KEYS = ("trade_execution_contract",)
+HEAVY_AUDIT_KEYS = (
+    "model_expert_health",
+    "model_expert_competition",
+    "runtime_text_integrity",
+)
 CARD_OWNER_PATHS = {
     "trade_loop": "services/trading_service.py",
     "okx_reconciliation": "scripts/repair_missing_closed_positions_from_orders.py",
+    "okx_trade_fact_integrity": "services/okx_trade_fact_integrity.py",
     "position_price_integrity": "web_dashboard/api/system_audit.py",
     "market_data": "models/market_data.py",
     "strategy_quality": "web_dashboard/api/system_audit.py",
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
+    "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
     "strategy_gate_contract": "services/runtime_entry_filters.py",
     "model_training": "web_dashboard/api/data_collection.py",
     "model_expert_health": "services/model_expert_health.py",
@@ -78,6 +98,8 @@ CARD_OWNER_PATHS = {
     "model_dynamic_routing": "services/model_dynamic_routing.py",
     "crypto_feature_coverage": "services/crypto_feature_coverage.py",
     "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
+    "strong_opportunity": "services/strong_opportunity.py",
+    "position_capacity_release": "services/position_capacity_release_audit.py",
     "trade_execution_contract": "services/trade_execution_contract.py",
     "visible_text_encoding": "web_dashboard/api/system_audit.py",
     "runtime_text_integrity": "scripts/audit_runtime_text_integrity.py",
@@ -91,13 +113,16 @@ NODE_OWNER_PATHS = {
     "model_expert_competition": "services/model_expert_competition.py",
     "model_dynamic_routing": "services/model_dynamic_routing.py",
     "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
+    "strong_opportunity": "services/strong_opportunity.py",
+    "position_capacity_release": "services/position_capacity_release_audit.py",
     "strategy_decision": "services/trading_policies.py",
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
+    "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
     "strategy_gate_contract": "services/runtime_entry_filters.py",
     "risk_guard": "services/trading_policies.py",
     "okx_execution": "services/execution_service.py",
     "position_sync": "services/position_sync_service.py",
-    "training_data": "services/training_data_quality.py",
+    "training_data": "services/okx_trade_fact_integrity.py",
     "dashboard_observability": "web_dashboard/static/js/dashboard.js",
     "visible_text_encoding": "web_dashboard/api/system_audit.py",
     "runtime_text_integrity": "scripts/audit_runtime_text_integrity.py",
@@ -284,6 +309,51 @@ def _safe_shadow_missed_opportunity_report(report: dict[str, Any]) -> dict[str, 
     return safe
 
 
+def _safe_strong_opportunity_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["audit_only"] = True
+    safe["live_entry_mutation"] = False
+    safe["live_sizing_mutation"] = False
+    safe["can_bypass_risk_controls"] = False
+    safe["can_force_open"] = False
+    safe["can_apply_live_sizing"] = False
+    for key in ("strong_candidates", "near_misses"):
+        rows = safe.get(key) if isinstance(safe.get(key), list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row["can_bypass_risk_controls"] = False
+            row["can_force_open"] = False
+            row["can_apply_live_sizing"] = False
+    return safe
+
+
+def _safe_position_capacity_release_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["read_only"] = True
+    safe["audit_only"] = True
+    safe["live_exit_mutation"] = False
+    safe["live_entry_mutation"] = False
+    safe["live_sizing_mutation"] = False
+    safe["can_force_close"] = False
+    safe["can_close_winners"] = False
+    safe["can_bypass_risk_controls"] = False
+    for key in (
+        "current_release_candidates",
+        "old_profit_rotation_candidates",
+        "unclosed_release_decisions",
+        "crowded_blocks",
+    ):
+        rows = safe.get(key) if isinstance(safe.get(key), list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row["can_force_close"] = False
+            row["can_close_winners"] = False
+            row["can_bypass_risk_controls"] = False
+    return safe
+
+
 def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, Any]:
     safe = copy.deepcopy(report if isinstance(report, dict) else {})
     safe["audit_only"] = True
@@ -385,6 +455,36 @@ async def _audit_maybe_async(factory: Any) -> dict[str, Any]:
             timeout=max(float(SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS or 20.0), 0.001),
         )
     return result
+
+
+async def _run_audit_specs(
+    specs: list[tuple[str, Any]],
+    *,
+    max_concurrency: int = SYSTEM_AUDIT_MAX_CONCURRENCY,
+) -> dict[str, dict[str, Any] | Exception]:
+    if not specs:
+        return {}
+    concurrency = max(1, int(max_concurrency or 1))
+    if concurrency == 1:
+        results: dict[str, dict[str, Any] | Exception] = {}
+        for key, factory in specs:
+            try:
+                results[key] = await _audit_maybe_async(factory)
+            except Exception as exc:
+                results[key] = exc
+        return results
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def run_one(key: str, factory: Any) -> tuple[str, dict[str, Any] | Exception]:
+        async with semaphore:
+            try:
+                return key, await _audit_maybe_async(factory)
+            except Exception as exc:
+                return key, exc
+
+    pairs = await asyncio.gather(*(run_one(key, factory) for key, factory in specs))
+    return dict(pairs)
 
 
 def _cached_okx_reconciliation_card() -> dict[str, Any] | None:
@@ -656,11 +756,18 @@ async def _trade_loop_audit() -> dict[str, Any]:
         and (recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600))
     )
     cold_start_no_orders = cold_start and orders_count == 0
+    orderless_observation = (
+        orders_count == 0
+        and decisions_count > 30
+        and recent_count > 0
+        and not stalled
+        and not cold_start
+        and not market_analysis_paused
+        and runtime_heartbeat_fresh
+    )
     status = _status_from_counts(
         critical=stalled,
-        warning=market_analysis_paused
-        or cold_start_no_orders
-        or (orders_count == 0 and decisions_count > 30),
+        warning=market_analysis_paused or cold_start_no_orders or orderless_observation,
     )
     summary = (
         "交易服务刚重启，当前处于冷启动观察窗口，暂不判定为不开仓异常。"
@@ -694,6 +801,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "latest_order_at": _iso(orders_2h[1]),
             "cold_start": cold_start,
             "cold_start_no_orders": cold_start_no_orders,
+            "orderless_observation": orderless_observation,
             "market_analysis_paused": market_analysis_paused,
             "runtime_heartbeat_fresh": runtime_heartbeat_fresh,
             "runtime_age_seconds": (
@@ -799,6 +907,77 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
                 "如果缺失不为 0，先不要做策略收益判断，避免训练和盈亏被脏账影响。",
             ],
         )
+    )
+
+
+async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
+    try:
+        report = await asyncio.wait_for(
+            OkxTradeFactIntegrityService(
+                lookback_hours=OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS,
+                limit=OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT,
+            ).audit(),
+            timeout=8.0,
+        )
+    except Exception as exc:
+        return _audit_card(
+            "okx_trade_fact_integrity",
+            "OKX/本地交易事实一致性",
+            "warning",
+            "交易事实一致性巡检执行失败；当前不能证明口径已干净，需要先恢复只读审计。",
+            details={
+                "error": safe_error_text(exc, limit=180),
+                "hard_failure": True,
+                "read_only": True,
+                "live_repair_mutation": False,
+            },
+            evidence=[{"label": "审计错误", "value": 1}],
+            next_actions=[
+                "先恢复只读审计链路，再判断 orders、positions、OKX raw 回报和训练样本是否一致。",
+                "审计不可用时不要直接批量修历史仓位，也不要把近期收益样本作为放大仓位依据。",
+            ],
+        )
+
+    details = dict(report if isinstance(report, dict) else {})
+    details["read_only"] = True
+    details["live_repair_mutation"] = False
+    details["can_apply_historical_repair"] = False
+    status = str(details.get("status") or "ok")
+    issue_count = int(details.get("issue_count") or 0)
+    critical_count = int(details.get("critical_count") or 0)
+    warning_count = int(details.get("warning_count") or 0)
+    summary = (
+        "发现 OKX 原始成交、订单、持仓之间存在关键口径不一致；需先完成备份和 dry-run 对账。"
+        if critical_count
+        else (
+            "发现 OKX/本地交易事实存在需要关注项；暂不应自动写历史数据。"
+            if warning_count
+            else "OKX 原始成交、订单和持仓口径在巡检窗口内一致。"
+        )
+    )
+    return _audit_card(
+        "okx_trade_fact_integrity",
+        "OKX/本地交易事实一致性",
+        status,
+        summary,
+        details=details,
+        evidence=[
+            {"label": "检查订单", "value": int(details.get("checked_orders") or 0)},
+            {"label": "检查持仓", "value": int(details.get("checked_positions") or 0)},
+            {"label": "关键问题", "value": critical_count},
+            {"label": "关注项", "value": warning_count},
+        ],
+        next_actions=(
+            [
+                "按 issue 的 order_id、decision_id、position_id 对 OKX raw 回报、orders、positions 做备份和 dry-run 对账。",
+                "关键口径未清洁前，不使用相关收益样本训练 server_profit，也不把异常盈利单作为放大仓位模板。",
+                "确认 OKX instId、contract_size、filled_contracts、base quantity、entry/exit price 同源后，再制定精确修复脚本。",
+            ]
+            if issue_count
+            else [
+                "保持只读巡检常开，后续历史修复或同步逻辑改动后必须先看这张卡是否仍为正常。",
+            ]
+        ),
     )
 
 
@@ -1498,6 +1677,270 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
     )
 
 
+async def _strong_opportunity_audit() -> dict[str, Any]:
+    try:
+        report = _safe_strong_opportunity_report(
+            await StrongOpportunityService(
+                lookback_hours=STRONG_OPPORTUNITY_AUDIT_HOURS,
+                limit=STRONG_OPPORTUNITY_AUDIT_LIMIT,
+            ).report()
+        )
+    except Exception as exc:
+        return _audit_card(
+            "strong_opportunity",
+            "Strong opportunity",
+            "warning",
+            "Strong opportunity report failed; keep Phase 2 promotion shadow-only.",
+            details={
+                "error": safe_error_text(exc, limit=180),
+                "audit_only": True,
+                "live_entry_mutation": False,
+                "live_sizing_mutation": False,
+                "can_bypass_risk_controls": False,
+                "can_force_open": False,
+                "can_apply_live_sizing": False,
+            },
+            next_actions=[
+                "Check recent entry decision raw opportunity_score and entry_candidate_evidence.",
+                "Do not promote sizing or entry behavior while the report is unavailable.",
+            ],
+        )
+    strong_count = int(report.get("strong_candidate_count") or 0)
+    near_miss_count = int(report.get("near_miss_count") or 0)
+    entry_decisions = int(report.get("entry_decisions") or 0)
+    executed_strong = int(report.get("executed_strong_candidate_count") or 0)
+    blockers = _safe_dict(report.get("blocker_counts"))
+    warning = bool(strong_count == 0 or near_miss_count or blockers)
+    return _audit_card(
+        "strong_opportunity",
+        "Strong opportunity",
+        "warning" if warning else "ok",
+        (
+            "Strong opportunity classifier is shadow-only; no live sizing promotion is allowed."
+            if warning
+            else "Strong opportunity classifier found auditable candidates in shadow mode."
+        ),
+        details={
+            "audit_only": True,
+            "live_entry_mutation": False,
+            "live_sizing_mutation": False,
+            "can_bypass_risk_controls": False,
+            "can_force_open": False,
+            "can_apply_live_sizing": False,
+            "lookback_hours": report.get("lookback_hours"),
+            "checked_decisions": int(report.get("checked_decisions") or 0),
+            "entry_decisions": entry_decisions,
+            "strong_candidate_count": strong_count,
+            "executed_strong_candidate_count": executed_strong,
+            "near_miss_count": near_miss_count,
+            "blocker_counts": blockers,
+            "evidence_tier_counts": _safe_dict(report.get("evidence_tier_counts")),
+            "side_counts": _safe_dict(report.get("side_counts")),
+            "thresholds": _safe_dict(report.get("thresholds")),
+            "strong_candidates": _safe_list(report.get("strong_candidates"))[:10],
+            "near_misses": _safe_list(report.get("near_misses"))[:10],
+            "diagnostic_boundary": report.get("diagnostic_boundary"),
+        },
+        evidence=[
+            {"label": "entries", "value": entry_decisions},
+            {"label": "strong", "value": strong_count},
+            {"label": "executed_strong", "value": executed_strong},
+            {"label": "near_miss", "value": near_miss_count},
+        ],
+        next_actions=[
+            "Use this card only as Phase 2 shadow evidence; it cannot force open orders.",
+            "Before live promotion, verify OKX fact integrity, selected-side expected net, profit quality, loss probability, tail risk and evidence tier.",
+            "Do not increase leverage, position size, or bypass risk gates from this report alone.",
+        ],
+    )
+
+
+async def _position_capacity_release_audit() -> dict[str, Any]:
+    try:
+        report = _safe_position_capacity_release_report(
+            await PositionCapacityReleaseAuditService(
+                lookback_hours=POSITION_CAPACITY_RELEASE_AUDIT_HOURS,
+                limit=POSITION_CAPACITY_RELEASE_AUDIT_LIMIT,
+            ).report()
+        )
+    except Exception as exc:
+        return _audit_card(
+            "position_capacity_release",
+            "Position capacity release",
+            "warning",
+            "Position capacity release report failed; do not tune entries from capacity guesses.",
+            details={
+                "error": safe_error_text(exc, limit=180),
+                "read_only": True,
+                "audit_only": True,
+                "live_exit_mutation": False,
+                "live_entry_mutation": False,
+                "live_sizing_mutation": False,
+                "can_force_close": False,
+                "can_close_winners": False,
+                "can_bypass_risk_controls": False,
+            },
+            next_actions=[
+                "Check position quality, release decisions, linked close orders, and crowded-side blocks.",
+                "Do not force-close winners or open new capacity while release audit is unavailable.",
+            ],
+        )
+    capacity = _safe_dict(report.get("capacity"))
+    current_release_count = int(report.get("current_release_candidate_count") or 0)
+    old_profit_count = int(report.get("old_profit_rotation_candidate_count") or 0)
+    unclosed_release_count = int(report.get("unclosed_release_decision_count") or 0)
+    crowded_block_count = int(report.get("crowded_block_count") or 0)
+    open_group_count = int(report.get("open_group_count") or 0)
+    entry_limit = int(capacity.get("entry_limit") or 0)
+    over_capacity = bool(entry_limit and open_group_count >= entry_limit)
+    warning = bool(
+        current_release_count
+        or old_profit_count
+        or unclosed_release_count
+        or crowded_block_count
+        or over_capacity
+    )
+    return _audit_card(
+        "position_capacity_release",
+        "Position capacity release",
+        "warning" if warning else "ok",
+        (
+            "Capacity release audit is observing release gaps, old profit candidates, or crowded-side pressure."
+            if warning
+            else "Capacity release audit sees no current release backlog or crowded-side pressure."
+        ),
+        details={
+            "read_only": True,
+            "audit_only": True,
+            "live_exit_mutation": False,
+            "live_entry_mutation": False,
+            "live_sizing_mutation": False,
+            "can_force_close": False,
+            "can_close_winners": False,
+            "can_bypass_risk_controls": False,
+            "lookback_hours": report.get("lookback_hours"),
+            "checked_decisions": int(report.get("checked_decisions") or 0),
+            "open_position_count": int(report.get("open_position_count") or 0),
+            "open_group_count": open_group_count,
+            "side_counts": _safe_dict(report.get("side_counts")),
+            "quality_bucket_counts": _safe_dict(report.get("quality_bucket_counts")),
+            "capacity": capacity,
+            "current_release_candidate_count": current_release_count,
+            "old_profit_rotation_candidate_count": old_profit_count,
+            "release_decision_count": int(report.get("release_decision_count") or 0),
+            "executed_release_decision_count": int(
+                report.get("executed_release_decision_count") or 0
+            ),
+            "unclosed_release_decision_count": unclosed_release_count,
+            "crowded_block_count": crowded_block_count,
+            "current_release_candidates": _safe_list(report.get("current_release_candidates"))[:8],
+            "old_profit_rotation_candidates": _safe_list(
+                report.get("old_profit_rotation_candidates")
+            )[:8],
+            "unclosed_release_decisions": _safe_list(report.get("unclosed_release_decisions"))[:8],
+            "crowded_blocks": _safe_list(report.get("crowded_blocks"))[:8],
+            "diagnostic_boundary": report.get("diagnostic_boundary"),
+        },
+        evidence=[
+            {"label": "open_groups", "value": open_group_count},
+            {"label": "entry_limit", "value": entry_limit},
+            {"label": "release_candidates", "value": current_release_count},
+            {"label": "old_profit_candidates", "value": old_profit_count},
+            {"label": "unclosed_release", "value": unclosed_release_count},
+            {"label": "crowded_blocks", "value": crowded_block_count},
+        ],
+        next_actions=[
+            "Use this card to explain capacity pressure before changing entry thresholds or position size.",
+            "If release decisions are unclosed, inspect linked execution reasons and close-order results.",
+            "Old profitable positions require continuation evidence before live lock-profit or close policy promotion.",
+        ],
+    )
+
+
+def _safe_strategy_signal_root_cause_report(report: dict[str, Any]) -> dict[str, Any]:
+    safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe["read_only"] = True
+    safe["audit_only"] = True
+    safe["live_entry_mutation"] = False
+    safe["live_sizing_mutation"] = False
+    safe["live_leverage_mutation"] = False
+    safe["can_force_open"] = False
+    safe["can_override_thresholds"] = False
+    safe["can_change_ml_readiness"] = False
+    safe["can_bypass_risk_controls"] = False
+    root_causes = safe.get("root_causes") if isinstance(safe.get("root_causes"), list) else []
+    for row in root_causes:
+        if not isinstance(row, dict):
+            continue
+        row["can_force_open"] = False
+        row["can_override_thresholds"] = False
+        row["can_change_ml_readiness"] = False
+        row["can_bypass_risk_controls"] = False
+    return safe
+
+
+async def _strategy_signal_root_cause_audit() -> dict[str, Any]:
+    try:
+        report = _safe_strategy_signal_root_cause_report(
+            await StrategySignalRootCauseAuditService(
+                lookback_hours=STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_HOURS,
+                limit=STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_LIMIT,
+            ).report()
+        )
+    except Exception as exc:
+        return _audit_card(
+            "strategy_signal_root_cause",
+            "策略信号根因",
+            "warning",
+            "策略信号根因审计读取失败；先修审计链路，不改交易阈值。",
+            details={
+                "error": safe_error_text(exc, limit=180),
+                "read_only": True,
+                "audit_only": True,
+                "live_entry_mutation": False,
+                "live_sizing_mutation": False,
+                "live_leverage_mutation": False,
+                "can_force_open": False,
+                "can_override_thresholds": False,
+                "can_change_ml_readiness": False,
+                "can_bypass_risk_controls": False,
+            },
+            next_actions=[
+                "先恢复只读审计报告，再判断 ML、server_profit、shadow missed opportunity 卡点。",
+                "审计失败期间不得通过降阈值、放大仓位或硬改 ML readiness 制造成交。",
+            ],
+            owner_path="services/strategy_signal_root_cause_audit.py",
+        )
+
+    ml = _safe_dict(report.get("ml"))
+    server_profit = _safe_dict(report.get("server_profit"))
+    shadow = _safe_dict(report.get("shadow_missed_opportunity"))
+    root_causes = report.get("root_causes") if isinstance(report.get("root_causes"), list) else []
+    status = str(report.get("status") or "warning")
+    return _audit_card(
+        "strategy_signal_root_cause",
+        "策略信号根因",
+        status if status in {"ok", "warning", "critical"} else "warning",
+        str(report.get("summary") or "策略信号根因审计已完成。"),
+        details=report,
+        evidence=[
+            {"label": "开仓候选", "value": int(report.get("entry_decision_count") or 0)},
+            {"label": "高质量候选", "value": int(report.get("high_quality_entry_count") or 0)},
+            {"label": "ML可用率", "value": ml.get("usable_rate", 0.0)},
+            {
+                "label": "server_profit反向/负向",
+                "value": int(server_profit.get("negative_or_opposite_count") or 0),
+            },
+            {"label": "影子错过机会", "value": int(shadow.get("missed_count") or 0)},
+            {"label": "根因数", "value": len(root_causes)},
+        ],
+        next_actions=(
+            report.get("next_actions") if isinstance(report.get("next_actions"), list) else []
+        ),
+        owner_path="services/strategy_signal_root_cause_audit.py",
+    )
+
+
 def _trade_contract_violation_counts(summary: dict[str, Any]) -> tuple[int, int]:
     hard = (
         int(summary.get("weak_evidence_executed_count") or 0)
@@ -1873,7 +2316,17 @@ async def _model_training_audit() -> dict[str, Any]:
     if hard_failure:
         summary = "模型服务或训练数据源存在硬故障，需要处理。"
     elif observing:
-        summary = "模型服务可用；可选增强数据源未配置、运行探针超时或模型仍在学习观察。"
+        observing_reasons: list[str] = []
+        if optional_source_warnings:
+            observing_reasons.append("可选增强数据源未配置")
+        if runtime_probe_timeout:
+            observing_reasons.append("运行探针超时")
+        if local_tools_status == "learning_only":
+            observing_reasons.append("模型仍在学习观察")
+        if local_tools_unconfigured:
+            observing_reasons.append("本地量化工具未配置")
+        reason_text = "、".join(observing_reasons) or "存在观察项"
+        summary = f"模型服务可用；{reason_text}。"
     return _audit_card(
         "model_training",
         "模型与训练",
@@ -2562,6 +3015,90 @@ def _issue_ledger_state(
         return "observing", "观察项 / 服务冷启动"
     if key == "trade_loop" and status == "warning" and bool(details.get("market_analysis_paused")):
         return "observing", "观察项 / 新币种分析暂停"
+    if key == "trade_loop" and status == "warning" and bool(details.get("orderless_observation")):
+        return "observing", "观察项 / 有分析但当前未触发订单"
+    if (
+        key == "model_expert_health"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_weight_mutation"))
+        and not bool(details.get("disable_or_replace_count"))
+        and not bool(details.get("reduce_weight_count"))
+    ):
+        return "observing", "观察项 / 只读影子体检"
+    if (
+        key == "model_expert_competition"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_weight_mutation"))
+        and not bool(details.get("can_apply_live_weight"))
+    ):
+        return "observing", "观察项 / baseline 或竞赛样本不足"
+    if (
+        key == "model_dynamic_routing"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_route_mutation"))
+        and not bool(details.get("can_apply_live_route"))
+        and not bool(details.get("unsafe_live_mutation_attempts"))
+    ):
+        return "observing", "观察项 / 动态路由影子阶段"
+    if (
+        key == "crypto_feature_coverage"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_signal_mutation"))
+        and not bool(details.get("can_missing_features_drive_live_entry"))
+        and bool(details.get("feature_defaults_are_neutral"))
+    ):
+        return "observing", "观察项 / 缺失特征已中性阻断"
+    if (
+        key == "shadow_missed_opportunity"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_entry_mutation"))
+        and not bool(details.get("can_bypass_risk_controls"))
+        and not bool(details.get("weak_evidence_execution_allowed"))
+        and not bool(details.get("global_missed_count_can_drive_entries"))
+    ):
+        return "observing", "观察项 / missed opportunity 保守学习"
+    if (
+        key == "strong_opportunity"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_entry_mutation"))
+        and not bool(details.get("live_sizing_mutation"))
+        and not bool(details.get("can_bypass_risk_controls"))
+        and not bool(details.get("can_force_open"))
+        and not bool(details.get("can_apply_live_sizing"))
+    ):
+        return "observing", "Observation / strong opportunity shadow audit"
+    if (
+        key == "position_capacity_release"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and not bool(details.get("live_exit_mutation"))
+        and not bool(details.get("live_entry_mutation"))
+        and not bool(details.get("live_sizing_mutation"))
+        and not bool(details.get("can_force_close"))
+        and not bool(details.get("can_close_winners"))
+        and not bool(details.get("can_bypass_risk_controls"))
+    ):
+        return "observing", "Observation / capacity release audit"
+    if (
+        key == "strategy_signal_root_cause"
+        and status == "warning"
+        and bool(details.get("audit_only"))
+        and bool(details.get("read_only"))
+        and not bool(details.get("live_entry_mutation"))
+        and not bool(details.get("live_sizing_mutation"))
+        and not bool(details.get("live_leverage_mutation"))
+        and not bool(details.get("can_force_open"))
+        and not bool(details.get("can_override_thresholds"))
+        and not bool(details.get("can_change_ml_readiness"))
+        and not bool(details.get("can_bypass_risk_controls"))
+    ):
+        return "observing", "Observation / strategy signal root-cause audit"
     if (
         key == "strategy_quality"
         and status == "warning"
@@ -2621,6 +3158,18 @@ def _node_state_from_cards(
     return min(states, key=lambda item: state_priority.get(item[0], 9))
 
 
+def _node_display_status(status: Any, state: Any) -> str:
+    normalized_status = str(status or "info")
+    normalized_state = str(state or "")
+    if normalized_state == "fixed":
+        return "ok"
+    if normalized_state == "observing":
+        return "warning"
+    if normalized_state == "unresolved":
+        return normalized_status if normalized_status in {"critical", "warning"} else "warning"
+    return normalized_status if normalized_status in STATUS_RANK else "info"
+
+
 def _card_map(cards: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(card.get("key") or ""): card for card in cards if card.get("key")}
 
@@ -2640,6 +3189,7 @@ def _node_from_cards(
     related_cards = [cards_by_key[item] for item in card_keys if item in cards_by_key]
     status = _worst_status(*(card.get("status") for card in related_cards))
     state, state_label = _node_state_from_cards(related_cards, cards_by_key)
+    display_status = _node_display_status(status, state)
     summaries = [str(card.get("summary") or "") for card in related_cards if card.get("summary")]
     evidence: list[dict[str, Any]] = []
     next_actions: list[str] = []
@@ -2651,6 +3201,7 @@ def _node_from_cards(
         "title": title,
         "layer": layer,
         "status": status,
+        "display_status": display_status,
         "state": state,
         "state_label": state_label,
         "summary": "；".join(summaries[:2]) or "节点暂无异常。",
@@ -2761,13 +3312,66 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ],
         ),
         _node_from_cards(
+            "strong_opportunity",
+            "Strong opportunity",
+            "Strategy layer",
+            cards_by_key,
+            ["strong_opportunity"],
+            impact="Audits Phase 2 strong opportunity shape without changing live entries, sizing, leverage, or risk gates.",
+            upstream=[
+                "market_data",
+                "model_training",
+                "shadow_missed_opportunity",
+                "okx_execution",
+            ],
+            downstream=["strategy_decision", "risk_guard", "training_data"],
+            checks=[
+                "selected-side expected net",
+                "profit quality",
+                "loss probability",
+                "tail risk",
+                "aligned sources",
+                "read-only flags",
+            ],
+        ),
+        _node_from_cards(
+            "position_capacity_release",
+            "Position capacity release",
+            "Risk layer",
+            cards_by_key,
+            ["position_capacity_release"],
+            impact="Audits capacity pressure, release candidates, old profit rotation candidates, and unclosed release decisions before entry thresholds are changed.",
+            upstream=["position_sync", "strong_opportunity", "strategy_closed_loop"],
+            downstream=["strategy_decision", "risk_guard", "okx_execution"],
+            checks=[
+                "current capacity",
+                "release candidates",
+                "old profit candidates",
+                "unclosed release decisions",
+                "crowded-side blocks",
+                "read-only flags",
+            ],
+        ),
+        _node_from_cards(
             "strategy_decision",
             "策略决策质量",
             "策略层",
             cards_by_key,
-            ["strategy_quality", "trade_execution_contract"],
+            [
+                "strategy_quality",
+                "strategy_signal_root_cause",
+                "strong_opportunity",
+                "position_capacity_release",
+                "trade_execution_contract",
+            ],
             impact="影响是否开仓、仓位大小、重复亏损复开和快进快出。",
-            upstream=["market_data", "model_training", "position_sync"],
+            upstream=[
+                "market_data",
+                "model_training",
+                "position_sync",
+                "strong_opportunity",
+                "position_capacity_release",
+            ],
             downstream=["risk_guard", "okx_execution"],
             checks=["负净收益候选", "零净收益候选", "快亏平样本", "拦截原因"],
         ),
@@ -2776,11 +3380,28 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "策略闭环有效性",
             "策略层",
             cards_by_key,
-            ["strategy_closed_loop"],
+            ["strategy_closed_loop", "strategy_signal_root_cause"],
             impact="把数据、模型、决策、仓位、执行、平仓、训练反馈串起来，判断问题卡在哪一层。",
             upstream=["market_data", "model_training", "position_sync"],
             downstream=["risk_guard", "okx_execution", "training_data"],
             checks=["证据档位分布", "弱证据执行", "ML可用率", "快亏平", "收益样本"],
+        ),
+        _node_from_cards(
+            "strategy_signal_root_cause",
+            "策略信号根因",
+            "策略层",
+            cards_by_key,
+            ["strategy_signal_root_cause"],
+            impact="只读解释不开仓、小单、候选集中、ML/server_profit/shadow 证据未闭环的具体卡点。",
+            upstream=["model_training", "shadow_missed_opportunity", "market_data"],
+            downstream=["strategy_decision", "strategy_closed_loop"],
+            checks=[
+                "ML readiness",
+                "server_profit contribution",
+                "shadow missed conversion",
+                "expected-net components",
+                "candidate concentration",
+            ],
         ),
         _node_from_cards(
             "strategy_gate_contract",
@@ -2802,6 +3423,8 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "strategy_quality",
                 "strategy_closed_loop",
                 "trade_execution_contract",
+                "position_capacity_release",
+                "okx_trade_fact_integrity",
                 "position_price_integrity",
             ],
             impact="影响动态证据、低质量释放、快速平仓和下单前校验。",
@@ -2814,7 +3437,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "OKX执行与历史对账",
             "执行层",
             cards_by_key,
-            ["okx_reconciliation", "position_price_integrity"],
+            ["okx_trade_fact_integrity", "okx_reconciliation", "position_price_integrity"],
             impact="影响下单、平仓、历史仓位、账户余额和盈亏记录。",
             upstream=["risk_guard"],
             downstream=["position_sync", "training_data"],
@@ -2825,7 +3448,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "持仓同步与PnL",
             "同步层",
             cards_by_key,
-            ["position_price_integrity", "okx_reconciliation"],
+            ["okx_trade_fact_integrity", "position_price_integrity", "okx_reconciliation"],
             impact="影响主面板余额、持仓分析、平仓判断和训练标签。",
             upstream=["okx_execution"],
             downstream=["strategy_decision", "training_data", "dashboard_observability"],
@@ -2840,6 +3463,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "model_training",
                 "strategy_quality",
                 "strategy_closed_loop",
+                "okx_trade_fact_integrity",
                 "position_price_integrity",
             ],
             impact="影响模型是否越学越聪明，避免错误价格/错误盈亏污染训练。",
@@ -2884,9 +3508,9 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _node_summary(nodes: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "nodes": len(nodes),
-        "critical": sum(1 for node in nodes if node.get("status") == "critical"),
-        "warning": sum(1 for node in nodes if node.get("status") == "warning"),
-        "ok": sum(1 for node in nodes if node.get("status") == "ok"),
+        "critical": sum(1 for node in nodes if node.get("display_status") == "critical"),
+        "warning": sum(1 for node in nodes if node.get("display_status") == "warning"),
+        "ok": sum(1 for node in nodes if node.get("display_status") == "ok"),
     }
 
 
@@ -2945,16 +3569,20 @@ async def collect_system_audit_status(
     audit_specs = [
         ("trade_loop", _trade_loop_audit),
         ("okx_reconciliation", _okx_reconciliation_audit),
+        ("okx_trade_fact_integrity", _okx_trade_fact_integrity_audit),
         ("position_price_integrity", _position_price_integrity_audit),
         ("market_data", _market_data_audit),
         ("strategy_quality", _strategy_quality_audit),
         ("strategy_closed_loop", _strategy_closed_loop_audit),
+        ("strategy_signal_root_cause", _strategy_signal_root_cause_audit),
         ("model_training", _model_training_audit),
         ("model_expert_health", _model_expert_health_audit),
         ("model_expert_competition", _model_expert_competition_audit),
         ("model_dynamic_routing", _model_dynamic_routing_audit),
         ("crypto_feature_coverage", _crypto_feature_coverage_audit),
         ("shadow_missed_opportunity", _shadow_missed_opportunity_audit),
+        ("strong_opportunity", _strong_opportunity_audit),
+        ("position_capacity_release", _position_capacity_release_audit),
         ("trade_execution_contract", _trade_execution_contract_audit),
         (
             "strategy_gate_contract",
@@ -2963,40 +3591,26 @@ async def collect_system_audit_status(
         ("visible_text_encoding", lambda: asyncio.to_thread(_source_visible_text_audit)),
         ("runtime_text_integrity", _runtime_text_integrity_audit),
     ]
-    results = await asyncio.gather(
-        *(
-            _audit_maybe_async(factory)
-            for _key, factory in audit_specs
-            if _key in PRIORITY_AUDIT_KEYS
-        ),
-        return_exceptions=True,
-    )
-    remaining_results = await asyncio.gather(
-        *(
-            _audit_maybe_async(factory)
-            for _key, factory in audit_specs
-            if _key not in PRIORITY_AUDIT_KEYS
-        ),
-        return_exceptions=True,
-    )
-    result_by_key = {
-        key: result
-        for key, result in zip(
-            [key for key, _factory in audit_specs if key in PRIORITY_AUDIT_KEYS],
-            results,
-            strict=True,
-        )
-    }
+    priority_specs = [(key, factory) for key, factory in audit_specs if key in PRIORITY_AUDIT_KEYS]
+    heavy_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in HEAVY_AUDIT_KEYS and key not in PRIORITY_AUDIT_KEYS
+    ]
+    regular_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key not in PRIORITY_AUDIT_KEYS and key not in HEAVY_AUDIT_KEYS
+    ]
+    result_by_key: dict[str, dict[str, Any] | Exception] = {}
+    result_by_key.update(await _run_audit_specs(priority_specs, max_concurrency=1))
     result_by_key.update(
-        {
-            key: result
-            for key, result in zip(
-                [key for key, _factory in audit_specs if key not in PRIORITY_AUDIT_KEYS],
-                remaining_results,
-                strict=True,
-            )
-        }
+        await _run_audit_specs(
+            regular_specs,
+            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+        )
     )
+    result_by_key.update(await _run_audit_specs(heavy_specs, max_concurrency=1))
     cards: list[dict[str, Any]] = []
     for section_key, _factory in audit_specs:
         result = result_by_key[section_key]
@@ -3098,6 +3712,27 @@ async def shadow_missed_opportunity_status(
 ) -> dict[str, Any]:
     report = await ShadowMissedOpportunityClosedLoopService().report(hours=hours, limit=limit)
     return sanitize_payload(_safe_shadow_missed_opportunity_report(report))
+
+
+@router.get("/strong-opportunity/status")
+async def strong_opportunity_status(
+    hours: int = STRONG_OPPORTUNITY_AUDIT_HOURS,
+    limit: int = STRONG_OPPORTUNITY_AUDIT_LIMIT,
+) -> dict[str, Any]:
+    report = await StrongOpportunityService(lookback_hours=hours, limit=limit).report()
+    return sanitize_payload(_safe_strong_opportunity_report(report))
+
+
+@router.get("/position-capacity-release/status")
+async def position_capacity_release_status(
+    hours: int = POSITION_CAPACITY_RELEASE_AUDIT_HOURS,
+    limit: int = POSITION_CAPACITY_RELEASE_AUDIT_LIMIT,
+) -> dict[str, Any]:
+    report = await PositionCapacityReleaseAuditService(
+        lookback_hours=hours,
+        limit=limit,
+    ).report()
+    return sanitize_payload(_safe_position_capacity_release_report(report))
 
 
 @router.get("/trade-execution-contract/status")

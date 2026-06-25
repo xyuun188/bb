@@ -42,3 +42,22 @@ def test_forced_exit_policy_detects_model_and_reason_keywords() -> None:
 
 def test_forced_exit_policy_ignores_ordinary_exit() -> None:
     assert not ForcedExitPolicy().is_forced_exit(_decision())
+
+
+def test_forced_exit_policy_ignores_low_quality_release_without_hard_risk() -> None:
+    decision = _decision(
+        raw_response={
+            "forced_exit": True,
+            "position_release_policy": {
+                "source": "position_quality_capacity_release",
+                "forced": True,
+            },
+            "close_evidence": {
+                "forced_exit": True,
+                "hard_risk": False,
+                "source": "low_quality_position_release",
+            },
+        }
+    )
+
+    assert not ForcedExitPolicy().is_forced_exit(decision)

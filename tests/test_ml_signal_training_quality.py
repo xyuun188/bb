@@ -95,13 +95,23 @@ def _shadow_row(
     action: str = "hold",
     best_action: str = "hold",
     missed: bool = False,
+    confidence: float = 0.7,
+    feature_snapshot: dict[str, object] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=row_id,
         created_at=datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC),
+        symbol=f"TEST{row_id}/USDT",
+        analysis_type="market",
         decision_action=action,
+        decision_confidence=confidence,
+        horizon_minutes=30,
+        feature_snapshot=feature_snapshot or {"current_price": 100.0, "spread_pct": 0.01},
+        long_return_pct=0.16 if best_action == "long" else -0.06,
+        short_return_pct=0.14 if best_action == "short" else -0.05,
         best_action=best_action,
         missed_opportunity=missed,
+        due_at=datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC) + timedelta(minutes=30),
     )
 
 
@@ -258,10 +268,15 @@ async def test_train_ml_signal_script_dry_run_does_not_quarantine_or_persist(
     assert result["metadata"] == {"artifact_persisted": False}
 
 
-def test_shadow_training_selection_preserves_trade_and_best_action_samples() -> None:
+def test_shadow_training_selection_uses_only_best_trade_samples() -> None:
     recent_hold_rows = [_shadow_row(10_000 - idx) for idx in range(20)]
     trade_rows = [
-        _shadow_row(1_000 - idx, action="long" if idx % 2 == 0 else "short") for idx in range(8)
+        _shadow_row(
+            1_000 - idx,
+            action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
+        )
+        for idx in range(8)
     ]
     missed_rows = [
         _shadow_row(500 - idx, best_action="long" if idx % 2 == 0 else "short", missed=True)
@@ -276,11 +291,125 @@ def test_shadow_training_selection_preserves_trade_and_best_action_samples() -> 
     selected_ids = [row.id for row in selected]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 20
+    assert len(selected) == 8
     assert len(set(selected_ids)) == len(selected_ids)
-    assert non_hold_count >= 5
-    assert best_trade_count >= 10
-    assert any(row.id in {item.id for item in recent_hold_rows} for row in selected)
+    assert non_hold_count == 8
+    assert best_trade_count == len(selected)
+    assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
+
+
+def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality_hold() -> None:
+    noisy_holds = [
+        _shadow_row(20_000 - idx, action="hold", best_action="hold", confidence=0.01)
+        for idx in range(30)
+    ]
+    clean_trade_rows = [
+        _shadow_row(
+            1_000 - idx,
+            action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
+            confidence=0.78,
+        )
+        for idx in range(12)
+    ]
+    clean_missed_rows = [
+        _shadow_row(
+            500 - idx,
+            action="hold",
+            best_action="long" if idx % 2 == 0 else "short",
+            missed=True,
+            confidence=0.66,
+        )
+        for idx in range(12)
+    ]
+
+    selected = select_shadow_training_rows(
+        [*noisy_holds, *clean_trade_rows, *clean_missed_rows],
+        limit=20,
+    )
+
+    noisy_selected = [row for row in selected if row.decision_confidence < 0.05]
+    non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
+    best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
+    assert len(selected) == 12
+    assert len(noisy_selected) == 0
+    assert non_hold_count == len(selected)
+    assert best_trade_count == len(selected)
+
+
+def test_shadow_training_selection_excludes_missed_hold_opportunities_from_profit_model() -> None:
+    noisy_missed_holds = [
+        _shadow_row(
+            30_000 - idx,
+            action="hold",
+            best_action="long" if idx % 2 == 0 else "short",
+            missed=True,
+            confidence=0.01,
+        )
+        for idx in range(40)
+    ]
+    clean_trade_rows = [
+        _shadow_row(
+            2_000 - idx,
+            action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
+            confidence=0.82,
+        )
+        for idx in range(8)
+    ]
+
+    selected = select_shadow_training_rows(
+        [*noisy_missed_holds, *clean_trade_rows],
+        limit=20,
+    )
+
+    assert len(selected) == 8
+    assert all(row.decision_action in {"long", "short"} for row in selected)
+    assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
+
+
+def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds() -> None:
+    noisy_holds = [
+        _shadow_row(40_000 - idx, action="hold", best_action="hold", confidence=0.01)
+        for idx in range(40)
+    ]
+    clean_missed_rows = [
+        _shadow_row(
+            3_000 - idx,
+            action="hold",
+            best_action="long" if idx % 2 == 0 else "short",
+            missed=True,
+            confidence=0.72,
+        )
+        for idx in range(12)
+    ]
+
+    selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows], limit=20)
+
+    assert len(selected) == 0
+    assert not any(row.id in {item.id for item in noisy_holds} for row in selected)
+
+
+def test_train_from_frame_reports_training_window_composition() -> None:
+    frame = _training_frame(120)
+    frame["decision_action"] = ["hold", "long", "short"] * 40
+    frame["best_action"] = ["short", "long", "short"] * 40
+    frame["data_quality_status"] = ["downweighted", "included", "included"] * 40
+    frame["sample_weight"] = [0.25, 1.0, 1.0] * 40
+
+    metadata = train_from_frame(
+        frame,
+        min_samples=10,
+        completed_sample_count=120,
+        persist_artifact=False,
+    )
+
+    composition = metadata["training_window_composition"]
+    assert composition["sample_count"] == 120
+    assert composition["decision_action_counts"] == {"hold": 40, "long": 40, "short": 40}
+    assert composition["best_action_counts"] == {"short": 80, "long": 40}
+    assert composition["data_quality_status_counts"] == {"downweighted": 40, "included": 80}
+    assert composition["effective_weight_ratio"] == pytest.approx((40 * 0.25 + 80) / 120)
 
 
 @pytest.mark.asyncio
@@ -298,6 +427,7 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
             1_000 + idx,
             base_time - timedelta(hours=2, minutes=idx),
             action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
         )
         for idx in range(8)
     ]
@@ -322,13 +452,46 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 20
+    assert len(selected) == 8
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
-    assert sum(row.decision_action in {"long", "short"} for row in selected) >= 5
-    assert sum(row.best_action in {"long", "short"} for row in selected) >= 10
-    assert any(row.id >= 10_000 for row in selected)
+    assert sum(row.decision_action in {"long", "short"} for row in selected) == len(selected)
+    assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
+    assert not any(row.id >= 10_000 for row in selected)
+
+
+@pytest.mark.asyncio
+async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 23, 3, 0, tzinfo=UTC)
+    recent_holds = [
+        _db_shadow_row(20_000 + idx, base_time - timedelta(minutes=idx)) for idx in range(80)
+    ]
+    deeper_best_trade_rows = [
+        _db_shadow_row(
+            2_000 + idx,
+            base_time - timedelta(hours=2, minutes=idx),
+            action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
+        )
+        for idx in range(25)
+    ]
+    async with get_session_ctx() as session:
+        session.add_all([*recent_holds, *deeper_best_trade_rows])
+
+    try:
+        selected = await load_shadow_training_rows(limit=20)
+    finally:
+        await close_db()
+
+    assert len(selected) == 20
+    assert {row.decision_action for row in selected} <= {"long", "short"}
+    assert {row.best_action for row in selected} <= {"long", "short"}
+    assert not any(row.id >= 20_000 for row in selected)
 
 
 def test_ml_signal_quality_report_excludes_shadow_future_leakage() -> None:

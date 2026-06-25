@@ -58,6 +58,7 @@ def _processor(
     gate_reason: str | None = None,
     immediate_reason: str | None = "强信号",
     capacity_reason: str | None = None,
+    pre_execution_capacity_reason: str | None = None,
     execute_error: Exception | None = None,
     execution_result: ExecutionResult | None = None,
 ) -> MarketAutoEntryProcessor:
@@ -82,6 +83,15 @@ def _processor(
     ) -> str | None:
         calls.append(("capacity", model_name, len(open_positions)))
         return capacity_reason
+
+    def pre_execution_capacity(
+        model_name: str,
+        decision: DecisionOutput,
+        open_positions: list[dict[str, Any]],
+        staged_counts: dict[str, dict[Any, int]],
+    ) -> str | None:
+        calls.append(("pre_execution_capacity", model_name, len(open_positions)))
+        return pre_execution_capacity_reason
 
     def reserve(
         model_name: str,
@@ -155,6 +165,9 @@ def _processor(
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
         capacity_releaser=release,
+        pre_execution_capacity_reason=(
+            pre_execution_capacity if pre_execution_capacity_reason is not None else None
+        ),
         execution_confirmed_checker=lambda result: bool(
             result and result.status == OrderStatus.FILLED and result.exchange_order_id
         ),
@@ -325,7 +338,41 @@ async def test_market_auto_entry_processor_records_capacity_skip() -> None:
         DecisionStage.RISK_CHECK,
         DecisionStageStatus.SKIPPED,
     )
+    assert _decision_state_skip_kind(calls, 8) == "entry_capacity"
     assert not any(call[0] == "reserve" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_rechecks_capacity_before_execution() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    staged_counts: dict[str, dict[Any, int]] = {}
+
+    result = await _processor(
+        calls,
+        pre_execution_capacity_reason="容量快照 21 组，执行容量 20 组。",
+    ).process(
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=_decision(),
+        assessment=object(),
+        decision_db_id=12,
+        results=results,
+        model_mode="paper",
+        open_positions=[{"symbol": "ETH/USDT"}],
+        staged_entry_counts=staged_counts,
+        strategy_mode_context=None,
+    )
+
+    expected_reason = "开仓信号执行前容量复核未通过：容量快照 21 组，执行容量 20 组。"
+    assert result.handled is True
+    assert result.execution_attempted is False
+    assert result.reason == expected_reason
+    assert ("reserve", "ensemble_trader", "BTC/USDT") in calls
+    assert ("release", "ensemble_trader", "BTC/USDT") in calls
+    assert not any(call[0] == "execute" for call in calls)
+    assert _decision_state_skip_kind(calls, 12) == "entry_capacity"
+    assert ("reason", 12, expected_reason) in calls
 
 
 @pytest.mark.asyncio
@@ -423,3 +470,24 @@ def _decision_state_status(
         if isinstance(machine, dict):
             return str(machine.get("current_stage") or ""), str(machine.get("current_status") or "")
     return None
+
+
+def _decision_state_skip_kind(
+    calls: list[tuple[str, Any]],
+    decision_id: int,
+) -> str:
+    for call in calls:
+        if call[0] != "raw" or call[1] != decision_id:
+            continue
+        raw = call[2]
+        if not isinstance(raw, dict):
+            continue
+        machine = raw.get("decision_state_machine")
+        if not isinstance(machine, dict):
+            continue
+        stages = machine.get("stages")
+        event = stages[-1] if isinstance(stages, list) and stages else {}
+        data = event.get("data") if isinstance(event, dict) else {}
+        if isinstance(data, dict):
+            return str(data.get("skip_kind") or "")
+    return ""

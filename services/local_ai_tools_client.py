@@ -349,6 +349,8 @@ class LocalAIToolsClient:
         status.setdefault("api_base", self._public_api_base())
         if status_error:
             status["status_error"] = status_error
+        if model_bundle_available and not str(status.get("status") or "").strip():
+            status["status"] = "ready"
         if child_available and not model_bundle_available:
             status.setdefault(
                 "message",

@@ -23,6 +23,8 @@ logger = structlog.get_logger(__name__)
 
 UNTRADABLE_EXCHANGE_ERROR_MARKERS = (
     "51155",
+    "51028",
+    "contract under delivery",
     "can't trade this pair",
     "cannot trade this pair",
     "can not trade this pair",

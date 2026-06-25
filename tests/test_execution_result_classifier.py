@@ -116,6 +116,26 @@ def test_execution_reason_translates_okx_json_parameter_errors() -> None:
     assert "clOrdId" not in reason
 
 
+def test_execution_reason_translates_okx_contract_delivery_error() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.REJECTED,
+        raw_response={
+            "error": (
+                'okx {"code":"1","data":[{"ordId":"","sCode":"51028",'
+                '"sMsg":"Contract under delivery."}],"msg":"All operations failed"}'
+            )
+        },
+        exchange_order_id=None,
+    )
+
+    reason = policy.reason_from_result(result)
+
+    assert "OKX 51028" in reason
+    assert "Contract under delivery" in reason
+    assert "暂停重复提交平仓" in reason
+
+
 def test_execution_reason_uses_untradable_checker() -> None:
     policy = ExecutionResultClassifier(
         untradable_exchange_error_checker=lambda text: "instrument suspended" in text

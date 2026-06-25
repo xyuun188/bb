@@ -49,13 +49,13 @@ class EntryCapacityPolicy:
         existing_same_symbol += int(staged_symbol_side.get(staged_key, 0))
         is_same_symbol_add = existing_same_symbol > 0
 
-        live_open_count = self._model_open_group_count(model_name, open_positions)
+        capacity = self._capacity_context()
+        position_list_open_count = self._model_open_group_count(model_name, open_positions)
+        capacity_open_count = self._capacity_open_group_count(capacity)
+        live_open_count = max(position_list_open_count, capacity_open_count)
         staged_open_count = int(staged_model_totals.get(model_name, 0))
         model_open_count = live_open_count + staged_open_count
-        capacity = self._capacity_context()
-        max_open_positions = int(
-            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
-        )
+        max_open_positions = self._capacity_limit(capacity)
         if (
             not is_same_symbol_add
             and max_open_positions > 0
@@ -65,6 +65,8 @@ class EntryCapacityPolicy:
                 live_open_count,
                 staged_open_count,
                 max_open_positions,
+                capacity_open_count=capacity_open_count,
+                position_list_open_count=position_list_open_count,
             )
             return (
                 "策略执行容量已达到本轮动态上限，暂停新开不同币种/方向仓位。"
@@ -89,6 +91,23 @@ class EntryCapacityPolicy:
             "base_limit": effective,
             "reason": "",
         }
+
+    @classmethod
+    def _capacity_limit(cls, capacity: dict[str, Any]) -> int:
+        return cls._safe_non_negative_int(
+            capacity.get("entry_limit") or capacity.get("effective_limit") or 0
+        )
+
+    @classmethod
+    def _capacity_open_group_count(cls, capacity: dict[str, Any]) -> int:
+        return cls._safe_non_negative_int(capacity.get("open_group_count") or 0)
+
+    @staticmethod
+    def _safe_non_negative_int(value: Any) -> int:
+        try:
+            return max(int(float(value or 0)), 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _capacity_suffix(capacity: dict[str, Any]) -> str:
@@ -130,7 +149,22 @@ class EntryCapacityPolicy:
         live_open_count: int,
         staged_open_count: int,
         max_open_positions: int,
+        *,
+        capacity_open_count: int = 0,
+        position_list_open_count: int | None = None,
     ) -> str:
+        if position_list_open_count is not None and capacity_open_count > position_list_open_count:
+            prefix = (
+                f"容量快照 {capacity_open_count} 组，本轮持仓列表 "
+                f"{position_list_open_count} 组，按较大值 {live_open_count} 组计算。"
+            )
+            if staged_open_count > 0:
+                return (
+                    f"{prefix}本轮待确认开仓 {staged_open_count} 组，"
+                    f"合计占用 {live_open_count + staged_open_count} 组，"
+                    f"执行容量 {max_open_positions} 组。"
+                )
+            return f"{prefix}执行容量 {max_open_positions} 组。"
         if staged_open_count > 0:
             return (
                 f"真实持仓 {live_open_count} 组，本轮待确认开仓 {staged_open_count} 组，"

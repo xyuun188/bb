@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from math import ceil
 from typing import Any
 
-from config.settings import settings
+from config.settings import DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL, settings
 from services.position_quality import PositionQualityScorer
 
 MaxOpenPositionsProvider = Callable[[], int]
@@ -78,7 +78,7 @@ class DynamicPositionCapacityPolicy:
         account_equity: float | None = None,
         active_strategy_profile_id: str | None = None,
     ) -> DynamicCapacityDecision:
-        configured_limit = max(int(self.max_open_positions_provider() or 0), 1)
+        configured_limit = self._configured_limit()
         rows = [row for row in (open_positions or []) if row.get("is_open", True) is not False]
         open_group_count = self._open_group_count(rows)
         market_confidence = self._market_confidence(market_regime, strategy_context)
@@ -98,7 +98,7 @@ class DynamicPositionCapacityPolicy:
             configured_limit=configured_limit,
         )
         rotation_slots = max(policy_rotation_slots, strategy_rotation_slots)
-        base_limit = max(configured_limit, open_group_count + rotation_slots)
+        base_limit = configured_limit
         learned_target_limit = self._learned_target_limit(strategy_context)
         target_limit = self._target_limit(
             base_limit,
@@ -237,18 +237,29 @@ class DynamicPositionCapacityPolicy:
     @classmethod
     def _learned_target_limit(cls, strategy_context: dict[str, Any] | None) -> int | None:
         context = strategy_context if isinstance(strategy_context, dict) else {}
+        roster = _safe_dict(context.get("portfolio_roster"))
+        learning = _safe_dict(context.get("strategy_learning"))
         candidates = [
             context.get("target_open_position_groups"),
             context.get("target_position_groups"),
-            _safe_dict(context.get("portfolio_roster")).get("target_position_groups"),
-            _safe_dict(context.get("strategy_learning")).get("target_position_groups"),
-            _safe_dict(context.get("strategy_learning")).get("max_open_positions"),
+            roster.get("target_position_groups"),
+            learning.get("target_position_groups"),
+            learning.get("max_open_positions"),
         ]
         for value in candidates:
             target = int(_safe_float(value, 0.0))
             if target > 0:
                 return max(target, 1)
         return None
+
+    def _configured_limit(self) -> int:
+        try:
+            raw = int(float(self.max_open_positions_provider() or 0))
+        except (TypeError, ValueError):
+            raw = 0
+        if raw <= 0:
+            return DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
+        return raw
 
     @staticmethod
     def _strategy_rotation_slots(strategy_context: dict[str, Any] | None) -> int:
@@ -280,6 +291,8 @@ class DynamicPositionCapacityPolicy:
         )
         if learned_target_limit is None:
             return max(base_limit, adaptive_floor)
+        if learned_target_limit < base_limit and open_group_count >= base_limit:
+            return base_limit
         return max(learned_target_limit, adaptive_floor)
 
     @staticmethod
@@ -320,7 +333,7 @@ class DynamicPositionCapacityPolicy:
         base_limit: int,
     ) -> int:
         floor = max(1, ceil(max(target_limit, 1) * CAPACITY_MIN_FLOOR_RATIO))
-        if rotation_slots > 0:
+        if rotation_slots > 0 and open_group_count < base_limit:
             floor = max(floor, min(base_limit, open_group_count + rotation_slots))
         return min(max(base_limit, 1), floor)
 
@@ -334,6 +347,8 @@ class DynamicPositionCapacityPolicy:
         release_candidate_count: int,
     ) -> int:
         entry_limit = max(effective_limit, 1)
+        if open_group_count >= entry_limit:
+            return entry_limit
         if rotation_slots <= 0 and release_candidate_count <= 0:
             return entry_limit
         rotation_ceiling = min(

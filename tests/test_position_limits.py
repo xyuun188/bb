@@ -1,6 +1,33 @@
 from risk_manager.position_limits import PositionLimitChecker
 
 
+def test_position_limit_checker_reads_runtime_settings(monkeypatch):
+    checker = PositionLimitChecker()
+    monkeypatch.setattr("risk_manager.position_limits.settings.max_position_pct", 0.10)
+    monkeypatch.setattr("risk_manager.position_limits.settings.max_leverage", 4.0)
+
+    assert checker.max_position_pct == 0.10
+    assert checker.max_leverage == 4.0
+    result = checker.check_leverage(6.0)
+
+    assert result.adjusted_size_pct == 4.0
+
+
+def test_contract_exposure_snapshot_reads_runtime_hard_stop(monkeypatch):
+    checker = PositionLimitChecker()
+    monkeypatch.setattr("risk_manager.position_limits.settings.hard_stop_loss_pct", 0.02)
+
+    snapshot = checker.contract_exposure_snapshot(
+        proposed_margin_pct=0.10,
+        proposed_leverage=5.0,
+        proposed_stop_loss_pct=0.0,
+        current_positions=[],
+        account_balance=1000,
+    )
+
+    assert snapshot.proposed_stop_risk_pct == 0.01
+
+
 def test_contract_exposure_uses_okx_contract_size_for_swap_positions():
     checker = PositionLimitChecker()
     position = {

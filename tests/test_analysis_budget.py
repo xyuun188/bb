@@ -61,8 +61,43 @@ def _position(symbol: str, side: str = "long", model_name: str = "ensemble_trade
     return {"symbol": symbol, "side": side, "model_name": model_name, "is_open": True}
 
 
-def test_analysis_budget_keeps_market_budget_small_when_positions_exist() -> None:
+def test_analysis_budget_expands_market_budget_when_low_risk_roster_underfilled() -> None:
     policy, scans_seen = _policy(
+        config=AnalysisBudgetConfig(target_position_groups=3, roster_fill_market_symbol_min=7)
+    )
+
+    result = policy.context(
+        [_position("BTC/USDT")],
+        {},
+        base_market_limit=8,
+        run_position_analysis=False,
+        run_market_analysis=True,
+    )
+
+    assert result["risk_level"] == "low"
+    assert result["market_symbol_limit"] == 7
+    assert result["configured_market_symbol_limit"] == 8
+    assert result["market_limit_policy"] == "position_first_low_risk_underfilled"
+    assert result["market_symbol_limit_is_entry_gate"] is False
+    assert result["position_first_scheduling"] is True
+    assert result["roster_underfilled"] is True
+    assert "持仓复盘由独立 position loop 并行负责" in result["reason"]
+    diagnostics = result["market_limit_diagnostics"]
+    assert diagnostics["read_only"] is True
+    assert diagnostics["is_entry_gate"] is False
+    assert diagnostics["selected_market_symbol_limit"] == 7
+    assert diagnostics["configured_market_symbol_limit"] == 8
+    assert diagnostics["market_limit_policy"] == "position_first_low_risk_underfilled"
+    assert diagnostics["position_group_count"] == 1
+    assert diagnostics["target_position_groups"] == 3
+    assert diagnostics["roster_underfilled"] is True
+    assert diagnostics["market_caps"]["low_risk_open_position_cap"] == 3
+    assert diagnostics["market_caps"]["roster_fill_market_symbol_min"] == 7
+    assert scans_seen == []
+
+
+def test_analysis_budget_underfilled_market_budget_respects_base_limit() -> None:
+    policy, _scans_seen = _policy(
         config=AnalysisBudgetConfig(target_position_groups=3, roster_fill_market_symbol_min=7)
     )
 
@@ -78,11 +113,6 @@ def test_analysis_budget_keeps_market_budget_small_when_positions_exist() -> Non
     assert result["market_symbol_limit"] == 2
     assert result["configured_market_symbol_limit"] == 2
     assert result["market_limit_policy"] == "position_first_low_risk_underfilled"
-    assert result["market_symbol_limit_is_entry_gate"] is False
-    assert result["position_first_scheduling"] is True
-    assert result["roster_underfilled"] is True
-    assert "持仓复盘由独立 position loop 并行负责" in result["reason"]
-    assert scans_seen == []
 
 
 def test_analysis_budget_without_positions_uses_dynamic_market_cap_not_full_pool() -> None:
@@ -245,7 +275,45 @@ def test_analysis_budget_uses_strategy_learning_runtime_targets() -> None:
     assert result["market_symbol_limit"] == 2
     assert result["configured_market_symbol_limit"] == 2
     assert result["market_limit_policy"] == "position_first_low_risk_underfilled"
+    diagnostics = result["market_limit_diagnostics"]
+    assert diagnostics["budget_source"] == "strategy_learning"
+    assert diagnostics["target_position_groups"] == 5
+    assert diagnostics["position_review_caps"]["selected_position_max_groups"] == 9
+    assert diagnostics["market_caps"]["low_risk_open_position_cap"] == 3
+    assert "must not be treated as trade permission" in diagnostics["diagnostic_boundary"]
     assert scans_seen
+
+
+def test_analysis_budget_runtime_roster_fill_cannot_lower_candidate_floor() -> None:
+    policy, _scans_seen = _policy()
+    strategy_context = {
+        "strategy_profile_id": "candidate_2",
+        "strategy_learning": {
+            "runtime": {
+                "target_position_groups": 12,
+                "max_open_positions": 12,
+                "analysis_budget": {
+                    "roster_fill_market_symbol_min": 2,
+                    "market_low_risk_open_position_cap": 2,
+                },
+            }
+        },
+    }
+
+    result = policy.context(
+        [_position(f"OPEN{i}/USDT") for i in range(7)],
+        {},
+        base_market_limit=8,
+        run_position_analysis=True,
+        run_market_analysis=True,
+        strategy_context=strategy_context,
+    )
+
+    assert result["budget_source"] == "strategy_learning"
+    assert result["roster_underfilled"] is True
+    assert result["market_symbol_limit"] == 6
+    assert result["configured_market_symbol_limit"] == 8
+    assert result["market_limit_diagnostics"]["market_caps"]["roster_fill_market_symbol_min"] == 6
 
 
 def test_trading_service_analysis_budget_context_delegates_to_policy() -> None:

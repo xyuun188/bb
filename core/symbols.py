@@ -12,6 +12,55 @@ from collections.abc import Iterable
 from typing import Any
 
 
+def symbol_from_okx_inst_id(inst_id: Any, *, fallback: Any = "") -> str:
+    """Return the app symbol represented by an OKX instrument id."""
+
+    text = str(inst_id or "").strip().upper()
+    if not text:
+        return normalize_trading_symbol(fallback)
+    if text.endswith("-SWAP"):
+        text = text[: -len("-SWAP")]
+    parts = [part for part in text.replace("_", "-").split("-") if part]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return normalize_trading_symbol(fallback or text)
+
+
+def symbol_from_okx_market(market: dict[str, Any] | None, *, fallback: Any = "") -> str:
+    """Return the exchange-native display symbol for an OKX market payload.
+
+    CCXT can expose OKX's H-USDT-SWAP contract as WLFI/USDT because OKX reports
+    uly=WLFI-USDT while the actual instrument and contract value currency remain
+    H. For trade facts and dashboard history, instId is the authoritative symbol.
+    """
+
+    payload = market if isinstance(market, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    inst_symbol = symbol_from_okx_inst_id(info.get("instId") or payload.get("id"))
+    if inst_symbol:
+        return inst_symbol
+    return normalize_trading_symbol(fallback or payload.get("symbol"))
+
+
+def symbol_from_okx_payload(payload: dict[str, Any] | None, *, fallback: Any = "") -> str:
+    """Extract the authoritative OKX symbol from an order/position payload."""
+
+    data = payload if isinstance(payload, dict) else {}
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    for candidate in (
+        info.get("instId"),
+        data.get("instId"),
+        data.get("id"),
+        data.get("okx_inst_id"),
+        data.get("okx_symbol"),
+        data.get("symbol"),
+    ):
+        symbol = symbol_from_okx_inst_id(candidate)
+        if symbol:
+            return symbol
+    return normalize_trading_symbol(fallback)
+
+
 def normalize_trading_symbol(symbol: Any) -> str:
     """Return the canonical app symbol, e.g. `MET/USDT` for OKX swap variants."""
 

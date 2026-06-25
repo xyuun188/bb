@@ -11,6 +11,7 @@ import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
@@ -117,6 +118,18 @@ class PositionExecutionPersistenceService:
             logger.error("failed to persist position", error=safe_error_text(exc))
 
     @staticmethod
+    def _result_symbol(result: Any, decision: DecisionOutput) -> str:
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        explicit = normalize_trading_symbol(raw.get("canonical_exchange_symbol"))
+        if explicit:
+            return explicit
+        exchange_symbol = symbol_from_okx_payload(raw, fallback=getattr(result, "symbol", None))
+        if exchange_symbol:
+            return exchange_symbol
+        return normalize_trading_symbol(getattr(result, "symbol", None) or decision.symbol)
+
+    @staticmethod
     async def _persist_entry(
         repo: TradeRepository,
         model_name: str,
@@ -125,6 +138,7 @@ class PositionExecutionPersistenceService:
         execution_mode: str,
     ) -> None:
         side = "long" if decision.action == Action.LONG else "short"
+        symbol = PositionExecutionPersistenceService._result_symbol(result, decision)
         stop_loss = (
             result.price * (1 - decision.stop_loss_pct)
             if side == "long"
@@ -139,7 +153,7 @@ class PositionExecutionPersistenceService:
             {
                 "model_name": model_name,
                 "execution_mode": execution_mode,
-                "symbol": result.symbol,
+                "symbol": symbol,
                 "side": side,
                 "quantity": result.quantity,
                 "entry_price": result.price,
@@ -162,9 +176,10 @@ class PositionExecutionPersistenceService:
         execution_mode: str,
     ) -> None:
         side = "long" if decision.action == Action.CLOSE_LONG else "short"
+        symbol = self._result_symbol(result, decision)
         positions = await repo.get_matching_open_positions(
             model_name=model_name,
-            symbol=result.symbol,
+            symbol=symbol,
             side=side,
             execution_mode=execution_mode,
         )
@@ -177,7 +192,7 @@ class PositionExecutionPersistenceService:
                 result=result,
             )
             if recovered is not None:
-                self._position_peak_remover(model_name, result.symbol, side)
+                self._position_peak_remover(model_name, symbol, side)
                 if result.pnl == 0.0 and recovered.plan.realized_pnl != 0.0:
                     result.pnl = recovered.plan.realized_pnl
                 await self._record_reflection(
@@ -238,7 +253,7 @@ class PositionExecutionPersistenceService:
                     {
                         "model_name": model_name,
                         "execution_mode": execution_mode,
-                        "symbol": result.symbol,
+                        "symbol": symbol,
                         "side": side,
                         "quantity": close_qty,
                         "entry_price": position.entry_price,
@@ -263,7 +278,7 @@ class PositionExecutionPersistenceService:
                     decision,
                 )
             else:
-                self._position_peak_remover(model_name, result.symbol, side)
+                self._position_peak_remover(model_name, symbol, side)
                 position.is_open = False
                 position.current_price = result.price
                 position.unrealized_pnl = 0.0

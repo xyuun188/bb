@@ -16,11 +16,6 @@ ESTIMATED_TAKER_FEE_PCT = 0.0005
 
 
 @dataclass(frozen=True, slots=True)
-class FeeParams:
-    estimated_taker_fee_pct: float = ESTIMATED_TAKER_FEE_PCT
-
-
-@dataclass(frozen=True, slots=True)
 class ExecutionCostParams:
     default_max_slippage_pct: float = 0.005
     default_paper_slippage_pct: float = 0.05
@@ -93,7 +88,6 @@ class EntryOpportunityGateParams:
     portfolio_roster_fill_max_loss_probability: float = 0.66
     portfolio_roster_fill_min_net_pct: float = 0.20
     portfolio_roster_fill_min_profit_quality_ratio: float = 0.25
-    selected_side_positive_net_hard_gate: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,8 +333,9 @@ class AutoScanParams:
 
     rotation_pool_multiplier: int = 20
     rotation_pool_min: int = 240
-    feature_fetch_pool_multiplier: int = 1
-    feature_fetch_pool_min: int = 12
+    feature_fetch_pool_multiplier: int = 5
+    feature_fetch_pool_min: int = 48
+    feature_fetch_pool_max: int = 64
     feature_fetch_timeout_seconds: float = 8.0
     feature_fetch_concurrency: int = 8
     major_symbols: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")
@@ -845,6 +840,10 @@ class ExitPositionQualityParams:
     fresh_position_min_release_hold_hours: float = 0.25
     fresh_position_score_floor: float = 72.0
     fresh_position_hard_risk_loss_ratio: float = -0.05
+    stale_probe_min_hold_hours: float = 1.0
+    stale_probe_max_notional_usdt: float = 40.0
+    stale_probe_max_abs_pnl_fee_multiple: float = 2.0
+    stale_probe_max_profit_ratio: float = 0.004
 
 
 @dataclass(frozen=True, slots=True)
@@ -869,7 +868,6 @@ class ExitArbitrationParams:
 
 @dataclass(frozen=True, slots=True)
 class TradingParameterSnapshot:
-    fee: FeeParams = field(default_factory=FeeParams)
     execution_cost: ExecutionCostParams = field(default_factory=ExecutionCostParams)
     entry_tiers: EntryTierParams = field(default_factory=EntryTierParams)
     entry_evidence: EntryEvidenceParams = field(default_factory=EntryEvidenceParams)

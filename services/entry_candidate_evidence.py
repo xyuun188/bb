@@ -9,9 +9,11 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_profit_risk_sizing import ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+from services.trading_params import DEFAULT_TRADING_PARAMS
 
 CandidateScorer = Callable[[DecisionOutput, dict[str, Any] | None], float]
 FeatureOpportunityScorer = Callable[[Any], float]
+_ENTRY_EVIDENCE_PARAMS = DEFAULT_TRADING_PARAMS.entry_evidence
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -159,14 +161,22 @@ class EntryCandidateEvidencePolicy:
                 or opportunity.get("timeseries_aligned")
             )
         )
+        probe_block_reasons = self._probe_conversion_block_reasons(
+            expected_net=expected_net,
+            profit_quality=profit_quality,
+            loss_probability=loss_probability,
+            tail_risk=tail_risk,
+        )
         recommendation = self._recommendation(
             score,
             min_score,
             expected_net,
             profit_quality,
+            loss_probability,
             tail_risk,
             high_profit_potential,
             side_feedback,
+            probe_conversion_ready=not probe_block_reasons,
         )
         return {
             "side": side,
@@ -206,6 +216,9 @@ class EntryCandidateEvidencePolicy:
             "abnormal_wick_count_72h": opportunity.get("abnormal_wick_count_72h"),
             "abnormal_wick_max_pct": opportunity.get("abnormal_wick_max_pct"),
             "abnormal_wick_recent_hours": opportunity.get("abnormal_wick_recent_hours"),
+            "probe_conversion_ready": bool(not probe_block_reasons),
+            "probe_conversion_block_reasons": probe_block_reasons,
+            "probe_conversion_thresholds": self._probe_conversion_thresholds(),
             "recommendation": recommendation,
         }
 
@@ -215,9 +228,12 @@ class EntryCandidateEvidencePolicy:
         min_score: float,
         expected_net: float,
         profit_quality: float,
+        loss_probability: float,
         tail_risk: float,
         high_profit_potential: bool,
         side_feedback: dict[str, Any],
+        *,
+        probe_conversion_ready: bool,
     ) -> str:
         action_bias = str(side_feedback.get("action_bias") or "")
         allow_probe = bool(side_feedback.get("allow_probe"))
@@ -225,13 +241,61 @@ class EntryCandidateEvidencePolicy:
             return "memory_risk_requires_stronger_confirmation"
         if high_profit_potential:
             return "high_profit_candidate_allow_larger_size_and_leverage"
-        if allow_probe and expected_net > 0 and profit_quality >= 0.20 and tail_risk < 1.05:
+        if allow_probe and probe_conversion_ready:
             return "memory_supported_probe_candidate"
+        if (
+            allow_probe
+            and expected_net > 0
+            and profit_quality >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
+            and loss_probability <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
+            and tail_risk <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
+        ):
+            return "memory_watchlist_needs_probe_threshold"
         if expected_net <= 0 or profit_quality <= 0.12 or tail_risk >= 1.15:
             return "hold_or_tiny_probe_only"
         if score >= min_score and expected_net > 0 and tail_risk < 0.95:
             return "tradable_if_ai_thesis_confirms"
         return "needs_stronger_ai_confirmation"
+
+    @staticmethod
+    def _probe_conversion_block_reasons(
+        *,
+        expected_net: float,
+        profit_quality: float,
+        loss_probability: float,
+        tail_risk: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if expected_net < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct:
+            reasons.append("expected_net_below_probe_threshold")
+        if profit_quality < _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality:
+            reasons.append("profit_quality_below_probe_threshold")
+        if loss_probability > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability:
+            reasons.append("loss_probability_above_probe_threshold")
+        if tail_risk > _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk:
+            reasons.append("tail_risk_above_probe_threshold")
+        return reasons
+
+    @staticmethod
+    def _probe_conversion_thresholds() -> dict[str, float]:
+        return {
+            "min_expected_net_return_pct": round(
+                _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct,
+                6,
+            ),
+            "min_profit_quality_ratio": round(
+                _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality,
+                6,
+            ),
+            "max_loss_probability": round(
+                _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability,
+                6,
+            ),
+            "max_tail_risk_score": round(
+                _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk,
+                6,
+            ),
+        }
 
     @staticmethod
     def _side_memory_feedback(

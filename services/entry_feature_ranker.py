@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -230,6 +231,16 @@ class EntryFeatureRankerPolicy:
             for item in all_items
             if item not in tradable_items and self.is_auto_analysis_candidate_feature(item[1])
         ]
+        tradable_symbols = {symbol for symbol, _ in tradable_items}
+        soft_symbols = {symbol for symbol, _ in soft_items}
+        filtered_items = [
+            (symbol, feature)
+            for symbol, feature in all_items
+            if symbol not in tradable_symbols and symbol not in soft_symbols
+        ]
+        filter_diagnostics = {
+            symbol: self._feature_filter_diagnostic(feature) for symbol, feature in all_items
+        }
 
         def ranking_score(item: tuple[str, Any]) -> float:
             symbol, feature = item
@@ -241,7 +252,6 @@ class EntryFeatureRankerPolicy:
                 - rotation_penalty
             )
 
-        tradable_symbols = {symbol for symbol, _ in tradable_items}
         ranked_tradable = sorted(
             tradable_items,
             key=lambda item: (ranking_score(item),),
@@ -252,37 +262,297 @@ class EntryFeatureRankerPolicy:
             key=ranking_score,
             reverse=True,
         )
+        ranked_filtered = sorted(
+            filtered_items,
+            key=ranking_score,
+            reverse=True,
+        )
 
-        selected_items = list(ranked_tradable[:limit])
-        if len(selected_items) < limit:
-            selected_items.extend(ranked_soft[: max(limit - len(selected_items), 0)])
+        def split_recent_analysis(
+            items: list[tuple[str, Any]],
+        ) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]]:
+            fresh_items: list[tuple[str, Any]] = []
+            recent_items: list[tuple[str, Any]] = []
+            for symbol, feature in items:
+                if recent_analysis_penalty(symbol) > 0:
+                    recent_items.append((symbol, feature))
+                else:
+                    fresh_items.append((symbol, feature))
+            return fresh_items, recent_items
+
+        fresh_tradable, recent_tradable = split_recent_analysis(ranked_tradable)
+        fresh_soft, recent_soft = split_recent_analysis(ranked_soft)
+        selected_items: list[tuple[str, Any]] = []
+        for bucket in (fresh_tradable, fresh_soft, recent_tradable, recent_soft):
+            if len(selected_items) >= limit:
+                break
+            selected_items.extend(bucket[: max(limit - len(selected_items), 0)])
         if not selected_items:
             selected_items = sorted(all_items, key=ranking_score, reverse=True)[:limit]
 
         selected = dict(selected_items)
+        selected_symbols = {symbol for symbol, _ in selected_items}
+        recent_candidate_symbols = {
+            symbol
+            for symbol, _feature in [*ranked_tradable, *ranked_soft]
+            if recent_analysis_penalty(symbol) > 0
+        }
+        recent_selected_symbols = {
+            symbol for symbol in selected_symbols if symbol in recent_candidate_symbols
+        }
+        recent_deferred_symbols = sorted(recent_candidate_symbols - selected_symbols)
+
+        def symbol_diagnostic(
+            symbol: str,
+            feature: Any,
+            *,
+            selected_item: bool,
+            fallback_item: bool = False,
+        ) -> dict[str, Any]:
+            raw_score = self.feature_opportunity_score(feature)
+            hold_penalty = recent_hold_penalty(symbol)
+            analysis_penalty = recent_analysis_penalty(symbol)
+            rotation_penalty = no_opportunity_rotation_penalty(symbol, feature)
+            if symbol in tradable_symbols:
+                tier = "hard_filter"
+            elif self.is_auto_analysis_candidate_feature(feature):
+                tier = "secondary_fill"
+            elif fallback_item:
+                tier = "fallback_score"
+            else:
+                tier = "filtered_out"
+            filter_diag = filter_diagnostics.get(symbol, {})
+            if selected_item:
+                reason = "selected_for_market_analysis"
+            elif symbol in recent_deferred_symbols:
+                reason = "recent_analysis_diversity_deferred"
+            elif tier == "filtered_out":
+                reason = "feature_filter_rejected"
+            else:
+                reason = "outside_market_symbol_budget"
+            return {
+                "symbol": symbol,
+                "score": round(raw_score, 2),
+                "net_score": round(
+                    raw_score - hold_penalty - analysis_penalty - rotation_penalty, 2
+                ),
+                "recent_hold_penalty": round(hold_penalty, 2),
+                "recent_analysis_penalty": round(analysis_penalty, 2),
+                "rotation_penalty": round(rotation_penalty, 2),
+                "selection_tier": tier,
+                "selected": selected_item,
+                "non_selected_reason": reason,
+                "filter_reasons": list(
+                    filter_diag.get(
+                        (
+                            "analysis_reasons"
+                            if tier in {"filtered_out", "fallback_score"}
+                            else "tradable_reasons"
+                        ),
+                        [],
+                    )
+                ),
+                "filter_metrics": dict(filter_diag.get("metrics") or {}),
+                "volume_ratio": round(_feature_float(feature, "volume_ratio"), 2),
+                "adx": round(_feature_float(feature, "adx_14"), 1),
+                "change_24h": round(_feature_float(feature, "change_24h_pct"), 2),
+            }
+
+        ranked_candidates = [*ranked_tradable, *ranked_soft]
+        if not ranked_candidates:
+            ranked_candidates = sorted(all_items, key=ranking_score, reverse=True)
+            fallback_symbols = {symbol for symbol, _ in ranked_candidates}
+        else:
+            fallback_symbols = set()
+        rank_sample_items = []
+        seen_symbols: set[str] = set()
+        for symbol, feature in [*selected_items, *ranked_candidates]:
+            if symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+            rank_sample_items.append((symbol, feature))
+            if len(rank_sample_items) >= 12:
+                break
+        filtered_reason_counts = Counter()
+        for symbol, _feature in filtered_items:
+            reasons = list(filter_diagnostics.get(symbol, {}).get("analysis_reasons") or [])
+            filtered_reason_counts.update(reasons or ["filtered_without_reason"])
+
+        rank_underfilled = len(selected) < max(0, int(limit or 0))
+        if rank_underfilled and ranked_candidates:
+            rank_underfill_reason = "insufficient_tradeable_or_secondary_candidates"
+        elif rank_underfilled and all_items:
+            rank_underfill_reason = "fallback_selected_filtered_candidates"
+        else:
+            rank_underfill_reason = ""
         diagnostics = {
             "selected": len(selected),
             "candidates": len(feature_vectors),
             "tradable_candidates": len(tradable_items),
             "secondary_candidates": len(soft_items),
+            "filtered_out_candidates": len(filtered_items),
+            "market_symbol_limit": max(0, int(limit or 0)),
+            "rank_underfilled": rank_underfilled,
+            "rank_underfill_reason": rank_underfill_reason,
+            "recent_analysis_diversity": {
+                "read_only": True,
+                "is_entry_gate": False,
+                "applied": bool(recent_deferred_symbols),
+                "recent_candidate_count": len(recent_candidate_symbols),
+                "recent_deferred_count": len(recent_deferred_symbols),
+                "recent_selected_count": len(recent_selected_symbols),
+                "recent_deferred_symbols": recent_deferred_symbols[:20],
+                "recent_selected_symbols": sorted(recent_selected_symbols)[:20],
+                "reason": (
+                    "recently analyzed symbols are deferred while fresh qualified "
+                    "market-analysis candidates are available; execution gates, sizing, "
+                    "leverage, and risk checks are unchanged"
+                ),
+            },
+            "filtered_out_reason_counts": [
+                {"reason": reason, "count": int(count)}
+                for reason, count in filtered_reason_counts.most_common(12)
+            ],
+            "ranked_symbol_sample": [
+                symbol_diagnostic(
+                    symbol,
+                    feature,
+                    selected_item=symbol in selected_symbols,
+                    fallback_item=symbol in fallback_symbols,
+                )
+                for symbol, feature in rank_sample_items
+            ],
+            "filtered_symbol_sample": [
+                symbol_diagnostic(symbol, feature, selected_item=False)
+                for symbol, feature in ranked_filtered[: min(8, len(ranked_filtered))]
+            ],
             "symbols": [
-                {
-                    "symbol": symbol,
-                    "score": round(self.feature_opportunity_score(feature), 2),
-                    "recent_hold_penalty": round(recent_hold_penalty(symbol), 2),
-                    "recent_analysis_penalty": round(recent_analysis_penalty(symbol), 2),
-                    "rotation_penalty": round(no_opportunity_rotation_penalty(symbol, feature), 2),
-                    "selection_tier": (
-                        "hard_filter" if symbol in tradable_symbols else "secondary_fill"
-                    ),
-                    "volume_ratio": round(_feature_float(feature, "volume_ratio"), 2),
-                    "adx": round(_feature_float(feature, "adx_14"), 1),
-                    "change_24h": round(_feature_float(feature, "change_24h_pct"), 2),
-                }
+                symbol_diagnostic(symbol, feature, selected_item=True)
                 for symbol, feature in selected_items[: min(8, len(selected_items))]
             ],
         }
         return EntryFeatureRankResult(selected=selected, diagnostics=diagnostics)
+
+    def _feature_filter_diagnostic(self, feature: Any) -> dict[str, Any]:
+        params = self.params
+        parsed = self._parse_filter_inputs(feature)
+        symbol = str(getattr(feature, "symbol", "") or "").upper()
+        if parsed is None:
+            reason = (
+                "suspicious_symbol"
+                if symbol and self.suspicious_symbol_reason(symbol)
+                else "invalid_feature_values"
+            )
+            return {
+                "symbol": symbol,
+                "tradable_reasons": [reason],
+                "analysis_reasons": [reason],
+                "metrics": {},
+            }
+
+        symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14 = parsed
+        abnormal_wick = self._has_recent_abnormal_wick(feature)
+        notional_24h = current_price * volume_24h
+        tradable_min_notional = (
+            params.tradable_major_min_notional_usdt
+            if symbol in self.major_symbols
+            else params.tradable_alt_min_notional_usdt
+        )
+        analysis_min_notional = (
+            params.analysis_major_min_notional_usdt
+            if symbol in self.major_symbols
+            else params.analysis_alt_min_notional_usdt
+        )
+        tradable_volume_floor = max(
+            min(
+                max(
+                    float(self.min_entry_volume_ratio_provider() or 0.0),
+                    params.tradable_volume_provider_floor,
+                )
+                * params.tradable_volume_multiplier,
+                params.tradable_volume_cap,
+            ),
+            params.tradable_volume_floor,
+        )
+        analysis_volume_floor = max(
+            min(
+                max(
+                    float(self.min_entry_volume_ratio_provider() or 0.0),
+                    params.analysis_volume_provider_floor,
+                )
+                * params.analysis_volume_multiplier,
+                params.analysis_volume_cap,
+            ),
+            params.analysis_volume_floor,
+        )
+        tradable_adx_floor = max(
+            min(
+                max(
+                    float(self.min_entry_adx_provider() or 0.0)
+                    - params.tradable_adx_provider_offset,
+                    params.tradable_adx_provider_floor,
+                ),
+                params.tradable_adx_cap,
+            ),
+            params.tradable_adx_floor,
+        )
+        analysis_adx_floor = max(
+            min(
+                max(
+                    float(self.min_entry_adx_provider() or 0.0)
+                    - params.analysis_adx_provider_offset,
+                    params.analysis_adx_provider_floor,
+                ),
+                params.analysis_adx_cap,
+            ),
+            params.analysis_adx_floor,
+        )
+
+        tradable_reasons: list[str] = []
+        analysis_reasons: list[str] = []
+        if abnormal_wick:
+            tradable_reasons.append("recent_abnormal_wick")
+            analysis_reasons.append("recent_abnormal_wick")
+        if volume_ratio < tradable_volume_floor:
+            tradable_reasons.append("tradable_volume_ratio_below_floor")
+        if notional_24h < tradable_min_notional:
+            tradable_reasons.append("tradable_notional_below_floor")
+        if volatility_20 > params.tradable_max_volatility:
+            tradable_reasons.append("tradable_volatility_above_cap")
+        if change_24h > params.tradable_max_day_change_pct:
+            tradable_reasons.append("tradable_day_change_above_cap")
+        if symbol not in self.major_symbols and adx_14 < tradable_adx_floor:
+            tradable_reasons.append("tradable_adx_below_floor")
+
+        if volume_ratio < analysis_volume_floor:
+            analysis_reasons.append("analysis_volume_ratio_below_floor")
+        if notional_24h < analysis_min_notional:
+            analysis_reasons.append("analysis_notional_below_floor")
+        if volatility_20 > params.analysis_max_volatility:
+            analysis_reasons.append("analysis_volatility_above_cap")
+        if change_24h > params.analysis_max_day_change_pct:
+            analysis_reasons.append("analysis_day_change_above_cap")
+        if symbol not in self.major_symbols and adx_14 < analysis_adx_floor:
+            analysis_reasons.append("analysis_adx_below_floor")
+
+        return {
+            "symbol": symbol,
+            "tradable_reasons": tradable_reasons,
+            "analysis_reasons": analysis_reasons,
+            "metrics": {
+                "notional_24h": round(notional_24h, 2),
+                "volume_ratio": round(volume_ratio, 4),
+                "adx": round(adx_14, 2),
+                "volatility_20": round(volatility_20, 4),
+                "change_24h": round(change_24h, 4),
+                "tradable_volume_floor": round(tradable_volume_floor, 4),
+                "analysis_volume_floor": round(analysis_volume_floor, 4),
+                "tradable_min_notional": round(tradable_min_notional, 2),
+                "analysis_min_notional": round(analysis_min_notional, 2),
+                "tradable_adx_floor": round(tradable_adx_floor, 2),
+                "analysis_adx_floor": round(analysis_adx_floor, 2),
+            },
+        }
 
     def _parse_filter_inputs(
         self,

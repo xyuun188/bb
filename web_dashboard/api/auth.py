@@ -72,7 +72,19 @@ async def login_page(request: Request):
 
 
 @router.get("/auth/status")
-async def auth_status(request: Request) -> dict[str, object]:
+async def auth_status(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_dashboard_admin_key: str | None = Header(default=None),
+) -> dict[str, object]:
+    if dashboard_admin_key_matches(authorization, x_dashboard_admin_key):
+        return {
+            "authenticated": True,
+            "username": configured_dashboard_username(),
+            "login_required": dashboard_login_required(request),
+            "auth_enabled": bool(settings.dashboard_auth_enabled),
+            "auth_method": "admin_key",
+        }
     session = ensure_dashboard_login(request)
     if session is not None and settings.dashboard_auth_enabled:
         async with get_session_ctx() as db_session:
@@ -87,6 +99,7 @@ async def auth_status(request: Request) -> dict[str, object]:
         "username": session.username if session else "",
         "login_required": dashboard_login_required(request),
         "auth_enabled": bool(settings.dashboard_auth_enabled),
+        "auth_method": "session" if session else "local",
     }
 
 

@@ -6,7 +6,7 @@ import pytest
 
 import executor.okx_executor as okx_module
 from ai_brain.base_model import Action, DecisionOutput
-from core.exceptions import OrderPlacementError
+from core.exceptions import ExchangeAPIError, OrderPlacementError
 from executor.okx_executor import OKXExecutor
 
 
@@ -44,6 +44,22 @@ class _BalanceOnlyCcxt:
         return {
             "USDT": {"free": 12.0, "used": 3.0, "total": 15.0},
             "info": {"data": [{"details": [{"ccy": "USDT", "cashBal": "15", "eq": "16"}]}]},
+        }
+
+
+class _AliasMismatchMarketCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+    markets = {"WLFI/USDT:USDT": {"symbol": "WLFI/USDT:USDT"}}
+    markets_by_id: dict[str, Any] = {}
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        if symbol != "WLFI/USDT:USDT":
+            raise RuntimeError("bad symbol")
+        return {
+            "symbol": "WLFI/USDT:USDT",
+            "id": "H-USDT-SWAP",
+            "info": {"instId": "H-USDT-SWAP"},
         }
 
 
@@ -122,6 +138,54 @@ class _FailingOpenOrdersCcxt:
 
     async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
         raise RuntimeError(self.error_text)
+
+
+class _ReloadableMarketCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.markets: dict[str, dict[str, Any]] = {}
+        self.reload_calls = 0
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.reload_calls += 1
+        return {
+            "data": [
+                {
+                    "instType": "SWAP",
+                    "state": "live",
+                    "ctType": "linear",
+                    "settleCcy": "USDT",
+                    "instId": "USAR-USDT-SWAP",
+                    "ctVal": "1",
+                    "ctValCcy": "USAR",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "tickSz": "0.01",
+                    "uly": "USAR-USDT",
+                }
+            ]
+        }
+
+    def parse_markets(self, _items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "USAR/USDT:USDT",
+                "id": "USAR-USDT-SWAP",
+                "contractSize": 1.0,
+                "limits": {"amount": {"min": 1.0}},
+                "info": {"instId": "USAR-USDT-SWAP"},
+            }
+        ]
+
+    def set_markets(self, markets: list[dict[str, Any]]) -> None:
+        self.markets = {market["symbol"]: market for market in markets}
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        if symbol not in self.markets:
+            raise RuntimeError(f"okx does not have market symbol {symbol}")
+        return self.markets[symbol]
 
 
 class _FailingPositionsForExitCcxt:
@@ -318,6 +382,186 @@ class _PrecisionEntryCcxt:
         }
 
 
+class _EntryMaxMarketSizeCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.create_calls: list[tuple[Any, ...]] = []
+        self.orders: dict[str, dict[str, Any]] = {}
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "BTC-USDT-SWAP", "maxMktSz": "100", "lotSz": "1"},
+        }
+
+    def amount_to_precision(self, _symbol: str, amount: float) -> str:
+        return str(float(amount))
+
+    def price_to_precision(self, _symbol: str, price: float) -> str:
+        return str(float(price))
+
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        return {"last": 1.0, "bid": 0.999, "ask": 1.001}
+
+    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    async def fetch_market_leverage_tiers(self, _symbol: str) -> list[dict[str, Any]]:
+        return [{"maxLeverage": 20}]
+
+    async def privateGetAccountAdjustLeverageInfo(
+        self,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"data": [{"maxLever": "20"}]}
+
+    async def fetch_leverage(
+        self,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"longLeverage": 5, "shortLeverage": 5}
+
+    async def set_leverage(
+        self,
+        leverage: int,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"info": {"lever": str(leverage)}}
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.create_calls.append((symbol, order_type, side, quantity, price, params))
+        order = {
+            "id": "entry-max-market",
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": quantity,
+            "filled": quantity,
+            "price": price or 1.0,
+            "average": 1.0,
+            "status": "closed",
+            "info": {"state": "filled", "ordId": "entry-max-market", "side": side},
+        }
+        self.orders["entry-max-market"] = order
+        return order
+
+    async def fetch_order(self, order_id: str, _symbol: str) -> dict[str, Any]:
+        return self.orders[order_id]
+
+
+class _ExitMaxMarketSizeCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(
+        self,
+        position_contracts: float = 100.0,
+        *,
+        native_close_error: bool = False,
+    ) -> None:
+        self.position_contracts = position_contracts
+        self.native_close_error = native_close_error
+        self.create_calls: list[tuple[Any, ...]] = []
+        self.close_position_calls: list[dict[str, Any]] = []
+        self.orders: dict[str, dict[str, Any]] = {}
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "USAR-USDT-SWAP", "maxMktSz": "10", "lotSz": "1"},
+        }
+
+    def amount_to_precision(self, _symbol: str, amount: float) -> str:
+        return str(float(amount))
+
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        return {"last": 3.0, "bid": 3.0, "ask": 3.01}
+
+    async def fetch_positions(self, _symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "USAR/USDT:USDT",
+                "side": "long",
+                "contracts": self.position_contracts,
+                "contractSize": 1.0,
+                "entryPrice": 2.31,
+                "markPrice": 3.0,
+                "info": {"pos": str(self.position_contracts), "posSide": "long"},
+            }
+        ]
+
+    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        if quantity > 10:
+            raise AssertionError("exit market order must be split below maxMktSz")
+        self.create_calls.append((symbol, order_type, side, quantity, price, dict(params)))
+        self.position_contracts = max(self.position_contracts - quantity, 0.0)
+        order_id = f"exit-{len(self.create_calls)}"
+        order = {
+            "id": order_id,
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": quantity,
+            "filled": quantity,
+            "price": price or 3.0,
+            "average": 3.0,
+            "status": "closed",
+            "fee": {"cost": quantity * 0.001},
+            "info": {
+                "state": "filled",
+                "ordId": order_id,
+                "side": side,
+                "reduceOnly": "true",
+            },
+        }
+        self.orders[order_id] = order
+        return order
+
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        if self.native_close_error:
+            raise ExchangeAPIError("native close-position unavailable")
+        self.position_contracts = 0.0
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "clOrdId": "native-close-client",
+                    "ordId": "native-close-order",
+                    "sCode": "0",
+                    "sMsg": "",
+                }
+            ],
+        }
+
+
 def _executor(exchange: Any) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
@@ -395,6 +639,17 @@ async def test_okx_balance_snapshot_does_not_require_instrument_rules() -> None:
     assert result["free"] == 12.0
     assert result["allocatable"] == 16.0
     assert exchange.instrument_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_okx_resolve_swap_symbol_rejects_ccxt_alias_to_different_inst_id() -> None:
+    executor = _executor(_AliasMismatchMarketCcxt())
+    executor._markets_loaded = True
+
+    with pytest.raises(
+        ExchangeAPIError, match="requested WLFI/USDT, exchange instrument is H/USDT"
+    ):
+        await executor._resolve_swap_symbol("WLFI/USDT")
 
 
 @pytest.mark.asyncio
@@ -623,3 +878,127 @@ def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None
     )
 
     assert contracts == 1.1
+
+
+@pytest.mark.asyncio
+async def test_okx_market_lookup_reloads_when_new_swap_missing_from_cache() -> None:
+    exchange = _ReloadableMarketCcxt()
+    executor = _executor(exchange)
+    executor._markets_loaded = True
+
+    market = await executor._market_for_symbol("USAR/USDT:USDT")
+
+    assert market["symbol"] == "USAR/USDT:USDT"
+    assert exchange.reload_calls == 1
+
+
+def test_okx_entry_rule_snapshot_reads_raw_market_max_size() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "SAHARA/USDT:USDT",
+        "contractSize": 1.0,
+        "limits": {"amount": {"min": 1.0}},
+        "info": {"maxMktSz": "100", "lotSz": "1"},
+    }
+
+    snapshot = executor._entry_order_rule_snapshot(
+        market,
+        price=1.0,
+        balance=100.0,
+        leverage=5.0,
+        planned_notional_usdt=200.0,
+        final_contracts=200.0,
+    )
+
+    assert snapshot["amount_max_market_contracts"] == 100.0
+    assert snapshot["market_order_within_max_size"] is False
+    assert snapshot["pre_submit_valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_caps_market_order_above_exchange_max_before_submit() -> None:
+    exchange = _EntryMaxMarketSizeCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.position_size_pct = 0.4
+    decision.suggested_leverage = 5.0
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status.value == "filled"
+    assert result.quantity == 100.0
+    assert [call[3] for call in exchange.create_calls] == [100.0]
+    adjustment = result.raw_response["market_order_size_adjustment"]
+    assert adjustment["applied"] is True
+    assert adjustment["original_planned_order_contracts"] == 200.0
+    assert adjustment["adjusted_order_contracts"] == 100.0
+    assert adjustment["amount_max_market_contracts"] == 100.0
+    assert result.raw_response["okx_order_rules"]["market_order_within_max_size"] is True
+    assert result.raw_response["okx_order_rules"]["pre_submit_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_splits_market_order_above_exchange_max_size() -> None:
+    exchange = _ExitMaxMarketSizeCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 0.45
+
+    result = await executor.place_order(decision)
+
+    assert result.status.value == "filled"
+    assert result.quantity == 45.0
+    assert [call[3] for call in exchange.create_calls] == [10.0, 10.0, 10.0, 10.0, 5.0]
+    assert all(call[5]["reduceOnly"] is True for call in exchange.create_calls)
+    assert result.raw_response["split_exit_order"] is True
+    assert result.raw_response["amount_max_market_contracts"] == 10.0
+    assert result.raw_response["position_contracts_before"] == 100.0
+    assert result.raw_response["position_contracts_after"] == 55.0
+    assert result.raw_response["requested_exit_contracts"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_splits_full_close_above_exchange_max_size() -> None:
+    exchange = _ExitMaxMarketSizeCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    result = await executor.place_order(decision)
+
+    assert result.status.value == "filled"
+    assert result.quantity == 100.0
+    assert exchange.create_calls == []
+    assert exchange.close_position_calls == [
+        {"instId": "USAR-USDT-SWAP", "mgnMode": "cross", "autoCxl": True, "posSide": "long"}
+    ]
+    assert result.raw_response["okx_native_close_position"] is True
+    assert result.raw_response["position_contracts_before"] == 100.0
+    assert result.raw_response["position_contracts_after"] == 0.0
+    assert result.raw_response["requested_exit_fraction"] == 1.0
+    assert result.raw_response["requested_exit_contracts"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_full_close_falls_back_to_split_when_native_close_fails() -> None:
+    exchange = _ExitMaxMarketSizeCcxt(
+        position_contracts=100.0,
+        native_close_error=True,
+    )
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    result = await executor.place_order(decision)
+
+    assert result.status.value == "filled"
+    assert result.quantity == 100.0
+    assert exchange.close_position_calls == [
+        {"instId": "USAR-USDT-SWAP", "mgnMode": "cross", "autoCxl": True, "posSide": "long"}
+    ]
+    assert [call[3] for call in exchange.create_calls] == [10.0] * 10
+    assert result.raw_response["split_exit_order"] is True
+    assert result.raw_response["position_contracts_after"] == 0.0

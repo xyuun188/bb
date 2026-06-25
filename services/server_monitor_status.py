@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import paramiko
 
 from config.settings import settings
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
@@ -79,6 +80,48 @@ def _host_from_api_base(value: Any) -> str:
 
 def _normalized_base_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
+
+
+def _redacted_info(info: Any) -> dict[str, Any]:
+    if hasattr(info, "redacted"):
+        try:
+            value = info.redacted()
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            return {}
+    return {
+        "host": getattr(info, "host", ""),
+        "access_host": getattr(info, "access_host", "") or getattr(info, "host", ""),
+        "port": getattr(info, "port", ""),
+        "username": getattr(info, "username", ""),
+        "source_path": str(getattr(info, "source_path", "") or ""),
+    }
+
+
+def _ssh_failure_payload(
+    exc: Exception,
+    *,
+    checked_at: str,
+    info: Any | None,
+) -> dict[str, Any]:
+    if isinstance(exc, paramiko.AuthenticationException):
+        status = "ssh_auth_failed"
+        message = (
+            "SSH authentication failed for the configured model-server monitor. "
+            "Update the SSH password in the server settings; the password is not printed."
+        )
+    else:
+        status = "ssh_failed"
+        message = safe_error_text(exc)
+    return {
+        "available": False,
+        "remote_monitor_available": False,
+        "status": status,
+        "message": message,
+        "checked_at": checked_at,
+        "credential_source": _redacted_info(info) if info is not None else {},
+    }
 
 
 def _http_probe_error(status_code: int, data: Any) -> str:
@@ -199,6 +242,7 @@ class ServerMonitorStatusService:
         primary_model_id = self.model_id_provider()
         primary_model_label = display_provider_model_name(primary_model_id)
         checked_at = datetime.now(UTC).isoformat()
+        info: Any | None = None
         try:
             info = info_override if info_override is not None else self.info_loader(self.root_dir)
             command = render_python_here_doc(
@@ -228,6 +272,7 @@ class ServerMonitorStatusService:
             if result.status != 0:
                 return {
                     "available": False,
+                    "remote_monitor_available": False,
                     "status": "remote_command_failed",
                     "message": safe_error_text(
                         err or out or "remote server monitor command failed"
@@ -239,6 +284,7 @@ class ServerMonitorStatusService:
             except json.JSONDecodeError:
                 return {
                     "available": False,
+                    "remote_monitor_available": False,
                     "status": "remote_payload_invalid",
                     "message": safe_error_text(
                         out or err or "remote monitor returned invalid JSON"
@@ -248,6 +294,7 @@ class ServerMonitorStatusService:
             if not isinstance(payload, dict):
                 return {
                     "available": False,
+                    "remote_monitor_available": False,
                     "status": "remote_payload_invalid",
                     "message": "remote monitor returned a non-object JSON payload",
                     "checked_at": checked_at,
@@ -265,6 +312,7 @@ class ServerMonitorStatusService:
         except ModelServerConfigNotConfigured as exc:
             return {
                 "available": False,
+                "remote_monitor_available": False,
                 "status": "model_server_not_configured",
                 "message": safe_error_text(exc),
                 "checked_at": checked_at,
@@ -272,6 +320,7 @@ class ServerMonitorStatusService:
         except ModelServerConfigError as exc:
             return {
                 "available": False,
+                "remote_monitor_available": False,
                 "status": "model_server_config_error",
                 "message": safe_error_text(exc),
                 "checked_at": checked_at,
@@ -279,6 +328,7 @@ class ServerMonitorStatusService:
         except ModuleNotFoundError as exc:
             return {
                 "available": False,
+                "remote_monitor_available": False,
                 "status": "paramiko_unavailable",
                 "message": safe_error_text(f"SSH dependency unavailable: {exc}"),
                 "checked_at": checked_at,
@@ -286,6 +336,7 @@ class ServerMonitorStatusService:
         except TimeoutError as exc:
             return {
                 "available": False,
+                "remote_monitor_available": False,
                 "status": "remote_command_timeout",
                 "message": safe_error_text(
                     exc,
@@ -294,12 +345,7 @@ class ServerMonitorStatusService:
                 "checked_at": checked_at,
             }
         except Exception as exc:
-            return {
-                "available": False,
-                "status": "ssh_failed",
-                "message": safe_error_text(exc),
-                "checked_at": checked_at,
-            }
+            return _ssh_failure_payload(exc, checked_at=checked_at, info=info)
 
     def clear_cache(self) -> None:
         """Clear the short-lived server monitor cache."""
@@ -657,6 +703,12 @@ def _local_ai_tools_probe_payload() -> dict[str, Any]:
     }
 
 
+def _local_ai_tools_api_key_for_platform_probe() -> str:
+    return str(
+        settings.local_ai_tools_api_key or os.environ.get("LOCAL_AI_TOOLS_API_KEY") or ""
+    ).strip()
+
+
 async def _probe_local_ai_tools_child_endpoints(
     client: httpx.AsyncClient,
     local_base: str,
@@ -752,6 +804,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         local_tools: dict[str, Any] = {"configured": bool(settings.local_ai_tools_api_base)}
         local_base = str(settings.local_ai_tools_api_base or "").strip().rstrip("/")
         if local_base:
+            local_tools_api_key = _local_ai_tools_api_key_for_platform_probe()
             tunnel_contract = _platform_tunnel_contract(
                 local_base,
                 ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE,
@@ -759,17 +812,17 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             health = await _probe_platform_json(
                 client,
                 f"{local_base}/health",
-                api_key=str(settings.local_ai_tools_api_key or ""),
+                api_key=local_tools_api_key,
             )
             status = await _probe_platform_json(
                 client,
                 f"{local_base}/models/status",
-                api_key=str(settings.local_ai_tools_api_key or ""),
+                api_key=local_tools_api_key,
             )
             child_endpoints = await _probe_local_ai_tools_child_endpoints(
                 client,
                 local_base,
-                str(settings.local_ai_tools_api_key or ""),
+                local_tools_api_key,
             )
             child_available = any(
                 bool(item.get("available") or item.get("ok"))

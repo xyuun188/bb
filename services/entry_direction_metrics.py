@@ -76,6 +76,39 @@ def selected_side_evidence(raw: dict[str, Any], side: str) -> dict[str, Any]:
     return {}
 
 
+def independent_probe_expert_support(raw: dict[str, Any], side: str) -> list[str]:
+    """Return independent retry experts that explicitly support the probe side."""
+
+    opinions = raw.get("opinions")
+    if not isinstance(opinions, list):
+        return []
+    support: list[str] = []
+    for opinion in opinions:
+        if not isinstance(opinion, dict):
+            continue
+        if not opinion.get("independent_expert_retry"):
+            continue
+        action = str(opinion.get("action") or "").lower()
+        confidence = safe_float(opinion.get("confidence"), 0.0)
+        if action == side and confidence >= 0.55:
+            support.append(str(opinion.get("model_name") or opinion.get("name") or "unknown"))
+    return support
+
+
+def original_hold_probe_without_support(raw: dict[str, Any], side: str) -> bool:
+    """Return whether this is an AI-HOLD probe without independent side support."""
+
+    probe = safe_dict(raw.get("evidence_profit_probe"))
+    if not probe.get("triggered"):
+        return False
+    if str(probe.get("ai_original_action") or "").lower() != Action.HOLD.value:
+        return False
+    probe_side = str(probe.get("side") or "").lower()
+    if probe_side and probe_side != side:
+        return False
+    return not independent_probe_expert_support(raw, side)
+
+
 def selected_entry_metrics(decision: DecisionOutput) -> SelectedEntryMetrics:
     """Resolve opportunity metrics for the action that will be submitted."""
 
@@ -88,34 +121,55 @@ def selected_entry_metrics(decision: DecisionOutput) -> SelectedEntryMetrics:
     source = "opportunity_score"
     if side_evidence:
         source = "entry_candidate_evidence"
+    expected_net = safe_float(
+        side_evidence.get("expected_net_return_pct"),
+        aggregate_expected_net,
+    )
+    profit_quality = safe_float(
+        side_evidence.get("profit_quality_ratio"),
+        aggregate_profit_quality,
+    )
+    server_profit_expected = safe_float(
+        side_evidence.get(
+            "server_profit_expected_return_pct",
+            opportunity.get("server_profit_expected_return_pct"),
+        ),
+        0.0,
+    )
+    loss_probability = safe_float(
+        side_evidence.get(
+            "loss_probability",
+            opportunity.get("server_profit_loss_probability"),
+        ),
+        1.0,
+    )
+    tail_risk = safe_float(
+        side_evidence.get("tail_risk_score", opportunity.get("tail_risk_score")),
+        0.0,
+    )
+    if side_evidence and original_hold_probe_without_support(raw, side):
+        source = "entry_candidate_evidence:original_hold_probe_conservative"
+        expected_net = min(expected_net, aggregate_expected_net)
+        profit_quality = min(profit_quality, aggregate_profit_quality)
+        server_profit_expected = min(
+            server_profit_expected,
+            safe_float(opportunity.get("server_profit_expected_return_pct"), 0.0),
+        )
+        loss_probability = max(
+            loss_probability,
+            safe_float(opportunity.get("server_profit_loss_probability"), loss_probability),
+        )
+        tail_risk = max(
+            tail_risk,
+            safe_float(opportunity.get("tail_risk_score"), tail_risk),
+        )
     return SelectedEntryMetrics(
         side=side,
-        expected_net_return_pct=safe_float(
-            side_evidence.get("expected_net_return_pct"),
-            aggregate_expected_net,
-        ),
-        profit_quality_ratio=safe_float(
-            side_evidence.get("profit_quality_ratio"),
-            aggregate_profit_quality,
-        ),
-        server_profit_expected_return_pct=safe_float(
-            side_evidence.get(
-                "server_profit_expected_return_pct",
-                opportunity.get("server_profit_expected_return_pct"),
-            ),
-            0.0,
-        ),
-        loss_probability=safe_float(
-            side_evidence.get(
-                "loss_probability",
-                opportunity.get("server_profit_loss_probability"),
-            ),
-            1.0,
-        ),
-        tail_risk_score=safe_float(
-            side_evidence.get("tail_risk_score", opportunity.get("tail_risk_score")),
-            0.0,
-        ),
+        expected_net_return_pct=expected_net,
+        profit_quality_ratio=profit_quality,
+        server_profit_expected_return_pct=server_profit_expected,
+        loss_probability=loss_probability,
+        tail_risk_score=tail_risk,
         aggregate_expected_net_return_pct=aggregate_expected_net,
         aggregate_profit_quality_ratio=aggregate_profit_quality,
         source=source,
