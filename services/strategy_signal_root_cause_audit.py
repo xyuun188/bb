@@ -120,6 +120,7 @@ def _ml_readiness_summary(status: dict[str, Any]) -> dict[str, Any]:
     readiness = _safe_dict(status.get("readiness"))
     metrics = _safe_dict(readiness.get("metrics"))
     blocking = _safe_list(readiness.get("blocking_reasons"))
+    thresholds = _safe_dict(readiness.get("thresholds"))
     if not metrics:
         metrics = {
             key: status.get(key)
@@ -127,10 +128,14 @@ def _ml_readiness_summary(status: dict[str, Any]) -> dict[str, Any]:
                 "sample_count",
                 "test_count",
                 "dirty_sample_ratio",
+                "long_accuracy",
+                "short_accuracy",
                 "long_pr_auc",
                 "short_pr_auc",
                 "top_long_avg_return_pct",
+                "bottom_long_avg_return_pct",
                 "top_short_avg_return_pct",
+                "bottom_short_avg_return_pct",
                 "training_data_version",
                 "required_training_data_version",
             )
@@ -150,6 +155,8 @@ def _ml_readiness_summary(status: dict[str, Any]) -> dict[str, Any]:
             for item in blocking
             if isinstance(item, dict) and item.get("code")
         ],
+        "blocking_reasons": [item for item in blocking if isinstance(item, dict)][:12],
+        "thresholds": thresholds,
         "metrics": metrics,
     }
 
@@ -350,6 +357,7 @@ class StrategySignalRootCauseAuditService:
             count for key, count in relief_counts.items() if key.endswith(":tradeable")
         )
 
+        ml_readiness = _ml_readiness_summary(ml_status)
         root_causes = self._root_causes(
             entry_count=len(entry_decisions),
             market_entry_count=len(market_entry_decisions),
@@ -366,6 +374,7 @@ class StrategySignalRootCauseAuditService:
             positive_expected_net_count=sum(1 for value in expected_net_values if value > 0),
             weak_count=weak_count,
             score_gap_distribution=_distribution(score_gaps),
+            ml_readiness=ml_readiness,
         )
         status = "warning" if root_causes else "ok"
         return {
@@ -415,7 +424,7 @@ class StrategySignalRootCauseAuditService:
             "advisory_wait_reason_counts": dict(advisory_wait_reasons.most_common(12)),
             "entry_evidence_relief_counts": dict(relief_counts.most_common(12)),
             "ml": {
-                "readiness": _ml_readiness_summary(ml_status),
+                "readiness": ml_readiness,
                 "component_status_counts": ml_component_counts,
                 "usable_rate": ml_usable_rate,
                 "usable_count": ml_usable,
@@ -461,6 +470,7 @@ class StrategySignalRootCauseAuditService:
         positive_expected_net_count: int,
         weak_count: int,
         score_gap_distribution: dict[str, Any],
+        ml_readiness: dict[str, Any],
     ) -> list[dict[str, Any]]:
         causes: list[dict[str, Any]] = []
         if entry_count == 0:
@@ -480,6 +490,42 @@ class StrategySignalRootCauseAuditService:
                     "message": "ML components are mostly ignored or missing in entry evidence.",
                     "count": ml_total,
                     "rate": ml_usable_rate,
+                }
+            )
+        ml_blocking_codes = {
+            str(code) for code in _safe_list(ml_readiness.get("blocking_reason_codes")) if code
+        }
+        metrics = _safe_dict(ml_readiness.get("metrics"))
+        thresholds = _safe_dict(ml_readiness.get("thresholds"))
+        top_return_blockers = sorted(
+            code for code in ml_blocking_codes if code.endswith("_top_return_below_threshold")
+        )
+        if top_return_blockers:
+            causes.append(
+                {
+                    "code": "ml_top_return_not_profitable",
+                    "severity": "warning",
+                    "message": (
+                        "ML top-score buckets are not profitable enough for live influence."
+                    ),
+                    "blocking_reason_codes": top_return_blockers,
+                    "readiness_state": ml_readiness.get("readiness_state"),
+                    "allow_live_position_influence": bool(
+                        ml_readiness.get("allow_live_position_influence")
+                    ),
+                    "top_long_avg_return_pct": _maybe_float(metrics.get("top_long_avg_return_pct")),
+                    "top_short_avg_return_pct": _maybe_float(
+                        metrics.get("top_short_avg_return_pct")
+                    ),
+                    "bottom_long_avg_return_pct": _maybe_float(
+                        metrics.get("bottom_long_avg_return_pct")
+                    ),
+                    "bottom_short_avg_return_pct": _maybe_float(
+                        metrics.get("bottom_short_avg_return_pct")
+                    ),
+                    "required_min_top_return_pct": _maybe_float(
+                        thresholds.get("min_top_return_pct")
+                    ),
                 }
             )
         if entry_count >= 10 and server_negative_or_opposite_count > server_aligned_count:
@@ -559,6 +605,10 @@ class StrategySignalRootCauseAuditService:
         if "ml_not_contributing" in by_code:
             actions.append(
                 "Fix ML training quality/readiness first; do not hard-set ML ready or relax entry gates."
+            )
+        if "ml_top_return_not_profitable" in by_code:
+            actions.append(
+                "Keep ML in observation until top-score buckets show positive fee-adjusted returns; inspect labels, window selection, and dirty samples before retraining."
             )
         if "server_profit_negative_or_opposite" in by_code:
             actions.append(

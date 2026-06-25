@@ -134,6 +134,67 @@ def test_strategy_signal_root_cause_summarizes_ml_server_profit_and_shadow_block
     }.issubset(codes)
 
 
+def test_strategy_signal_root_cause_reports_ml_top_return_blocker() -> None:
+    service = StrategySignalRootCauseAuditService(
+        now=lambda: datetime(2026, 6, 25, tzinfo=UTC),
+        ml_status_provider=lambda: {
+            "available": True,
+            "status": "degraded",
+            "readiness_state": "degraded",
+            "allow_live_position_influence": False,
+            "readiness": {
+                "state": "degraded",
+                "allow_live_position_influence": False,
+                "blocking_reasons": [
+                    {
+                        "code": "long_top_return_below_threshold",
+                        "actual": -0.05,
+                        "required": 0.05,
+                    },
+                    {
+                        "code": "short_top_return_below_threshold",
+                        "actual": -0.02,
+                        "required": 0.05,
+                    },
+                ],
+                "thresholds": {"min_top_return_pct": 0.05},
+                "metrics": {
+                    "sample_count": 5900,
+                    "test_count": 1400,
+                    "top_long_avg_return_pct": -0.05,
+                    "bottom_long_avg_return_pct": -0.12,
+                    "top_short_avg_return_pct": -0.02,
+                    "bottom_short_avg_return_pct": -0.08,
+                },
+            },
+        },
+    )
+
+    report = service.summarize(
+        decisions=[_entry_decision(f"SYM{index}/USDT", decision_id=index) for index in range(12)],
+        shadows=[],
+        ml_status=service._ml_status_provider(),
+    )
+
+    cause = next(
+        item for item in report["root_causes"] if item["code"] == "ml_top_return_not_profitable"
+    )
+    assert cause["blocking_reason_codes"] == [
+        "long_top_return_below_threshold",
+        "short_top_return_below_threshold",
+    ]
+    assert cause["top_long_avg_return_pct"] == -0.05
+    assert cause["top_short_avg_return_pct"] == -0.02
+    assert cause["required_min_top_return_pct"] == 0.05
+    assert report["ml"]["readiness"]["blocking_reasons"][0]["code"] == (
+        "long_top_return_below_threshold"
+    )
+    assert (
+        "Keep ML in observation until top-score buckets show positive fee-adjusted returns"
+        in " ".join(report["next_actions"])
+    )
+
+
 def test_strategy_signal_root_cause_is_ok_when_signal_chain_has_quality() -> None:
     service = StrategySignalRootCauseAuditService(
         now=lambda: datetime(2026, 6, 25, tzinfo=UTC),

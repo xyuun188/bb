@@ -3364,3 +3364,103 @@ Git 与线上部署：
 回滚点：
 - 代码层可回滚 `web_dashboard/api/system_audit.py` 与 `tests/test_system_audit_api.py`。
 - 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。
+
+---
+
+## 六十四、Batch I 二期阶段 5 补充记录：ML 不贡献根因细化与当前 ML 观察分桶（2026-06-26）
+
+触发原因：
+- 继续按总控推进二期时，线上 `strategy_signal_root_cause` 仍显示 `ml_not_contributing`，但这个根因太笼统，后续 AI 容易误判成“ML 没接上”或“readiness 阈值太严”，然后走偏到硬改 ready、降阈值或放大仓位。
+- 线上只读诊断确认：
+  - ML 样本量足够：`sample_count=5922`、`test_count=1481`。
+  - 数据版本一致：`training_data_version=2026-06-23.v3`。
+  - 脏样本比例可控：`dirty_sample_ratio=0.0263`，低于 `max_dirty_sample_ratio=0.08`。
+  - PR-AUC 不是当前 blocker：`long_pr_auc≈0.5269`、`short_pr_auc≈0.5442`，均高于 `min_pr_auc=0.52`。
+  - 真正 blocker 是高分桶收益仍为负：`top_long_avg_return_pct≈-0.0595`、`top_short_avg_return_pct≈-0.0291`，低于 `min_top_return_pct=0.05`。
+- 线上 dry-run 训练窗口评估 `/data/bb/app/.venv/bin/python scripts/evaluate_ml_training_windows.py --limit 20000` 也显示 `ready_variants=[]`，推荐结论为 `No variant passed readiness; do not enable local ML live influence.`。
+
+本次修复范围：
+- `services/strategy_signal_root_cause_audit.py`
+  - `ml.readiness` 额外透出 `blocking_reasons`、`thresholds`、bottom/top return 指标。
+  - 新增根因码 `ml_top_return_not_profitable`。
+  - 当 readiness blocker 包含 `long_top_return_below_threshold` 或 `short_top_return_below_threshold` 时，根因卡会输出：
+    - `blocking_reason_codes`
+    - `readiness_state`
+    - `allow_live_position_influence`
+    - `top_long_avg_return_pct`
+    - `top_short_avg_return_pct`
+    - `bottom_long_avg_return_pct`
+    - `bottom_short_avg_return_pct`
+    - `required_min_top_return_pct`
+  - 新增 next action：必须继续观察，直到高分桶费后收益为正；先查标签、训练窗口、脏样本和收益口径，不得硬改 ready。
+- `web_dashboard/api/system_audit.py`
+  - `strategy_closed_loop` 中 `current_ml_not_effective` 从“当前硬 unresolved”移到“观察诊断”。
+  - 若当前仅 ML 不贡献，而弱证据执行、快亏、高质量候选缺口、shadow-only 执行、执行无订单均未出现，则 `strategy_closed_loop` 进入 observing。
+  - 若当前真的出现弱证据执行、高质量候选持续为 0、快亏平集群、shadow-only 执行或执行无订单，仍进入 unresolved。
+  - 摘要从笼统“当前运行窗口仍存在弱证据执行、高质量候选不足、ML弱参与或快亏平风险”细化为“当前运行窗口 ML 仍未有效参与；执行硬错误暂未复现，需继续治理 ML readiness 与收益样本。”
+- 测试：
+  - `tests/test_strategy_signal_root_cause_audit.py` 新增 `ml_top_return_not_profitable` 根因与 next action 覆盖。
+  - `tests/test_system_audit_api.py` 新增“当前仅 ML 不贡献时 strategy_closed_loop 进入 observing”的覆盖。
+
+本地验证：
+- `pytest tests/test_system_audit_api.py tests/test_strategy_signal_root_cause_audit.py -q`：45 passed。
+- 全量测试 `pytest -q`：1521 passed。
+- `ruff check web_dashboard/api/system_audit.py tests/test_system_audit_api.py services/strategy_signal_root_cause_audit.py tests/test_strategy_signal_root_cause_audit.py`：All checks passed。
+- `black --check web_dashboard/api/system_audit.py tests/test_system_audit_api.py services/strategy_signal_root_cause_audit.py tests/test_strategy_signal_root_cause_audit.py`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 使用 `scripts/sync_to_online_server.py --skip-restart` 分两次上传：
+  - `/data/bb/app/services/strategy_signal_root_cause_audit.py`
+  - `/data/bb/app/web_dashboard/api/system_audit.py`
+- 远端 `py_compile web_dashboard/api/system_audit.py services/strategy_signal_root_cause_audit.py` 通过。
+- 远端 hash 与本地一致：
+  - `services/strategy_signal_root_cause_audit.py`：`a10741caa005cfd1e625173fef977a1c17337a9530b0d05e77dee5c671374c37`
+  - `web_dashboard/api/system_audit.py`：`2b572bb2dd0ba0f28d7599a2c4dce7c650e73ec869d4b7a4f2a4f05e7931da98`
+- 仅重启 `bb-dashboard.service`，未重启交易主进程；最终 Dashboard：
+  - `bb-dashboard.service=active`
+  - `MainPID=942124`
+  - `ActiveEnterTimestamp=Thu 2026-06-25 22:59:00 UTC`
+  - Dashboard HTTP 返回 `302`
+- 线上 `strategy_signal_root_cause` 单卡复验：
+  - `audit_only=true`
+  - `read_only=true`
+  - `live_entry_mutation=false`
+  - `live_sizing_mutation=false`
+  - `live_leverage_mutation=false`
+  - `can_force_open=false`
+  - `can_override_thresholds=false`
+  - `can_change_ml_readiness=false`
+  - `can_bypass_risk_controls=false`
+  - 根因码：`ml_not_contributing`、`ml_top_return_not_profitable`
+  - `top_long_avg_return_pct=-0.05951014678283073`
+  - `top_short_avg_return_pct=-0.029080449850134617`
+  - `required_min_top_return_pct=0.05`
+- 线上完整系统巡检第二次稳定复验：
+  - overall `status=warning`
+  - `cards=20`
+  - `critical=0`
+  - `warning=11`
+  - `ok=9`
+  - `issue_ledger.fixed=9`
+  - `issue_ledger.unresolved=0`
+  - `issue_ledger.observing=11`
+  - `unresolved_keys=[]`
+  - observing 包括 `strategy_closed_loop` 与 `strategy_signal_root_cause`
+
+当前真实结论：
+- 本批没有让 ML 参与实盘，也没有让系统更激进；它把“ML 不贡献”从笼统根因细化为“高分桶收益不达标”。
+- 当前 local ML 不能 live influence 是正确保护：样本量和 PR-AUC 虽然够，但模型最高分组仍未证明能筛出费后正收益。
+- “现在不开仓/小单/不赚钱”的一部分原因是 ML 不贡献，但不能通过硬改 readiness 解决；必须先让训练样本的高分桶收益变正，并用真实已平仓费后收益验证。
+- 本批也确认了候选交易对并非只剩 5 个：最近 120 分钟市场分析 42 个交易对、市场 entry 5 个且各不重复；真正卡点仍是收益质量、ML 高分桶收益、候选过滤和执行所确认。
+
+后续 AI 防偏要求：
+- 看到 `ml_top_return_not_profitable` 时，必须解释为“模型最高分组仍不赚钱”，不得解释为“阈值太严”。
+- 不得用 `sample_count` 足够或 PR-AUC 达标单独证明 ML 可用；必须同时满足高分桶费后收益为正、top bucket 优于 bottom bucket、模型新鲜度、数据版本和脏样本比例。
+- 任何 ML live promotion 都必须先跑 dry-run 训练窗口评估，并确认至少一个窗口通过 readiness；若 `ready_variants=[]`，禁止启用。
+- 后续若要真正修复 ML，需要优先检查收益标签、shadow backtest 口径、训练窗口选择、持仓/平仓脏数据、OKX 事实同步和费后收益计算；不得通过降门槛或扩大仓位制造“看起来更会交易”。
+- 看到 `strategy_closed_loop` observing 且 `current_ml_not_effective=true` 时，应解释为“当前执行硬错误未复现，但 ML/收益样本仍未闭环”，不得重复改 OKX 平仓、容量释放或订单同步链路。
+
+回滚点：
+- 代码层可回滚 `services/strategy_signal_root_cause_audit.py`、`web_dashboard/api/system_audit.py`、`tests/test_strategy_signal_root_cause_audit.py`、`tests/test_system_audit_api.py`。
+- 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。

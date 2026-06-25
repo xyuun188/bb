@@ -2113,6 +2113,40 @@ def test_issue_ledger_observes_strategy_closed_loop_history_and_sample_warnings(
     assert ledger["observing"][0]["key"] == "strategy_closed_loop"
 
 
+def test_issue_ledger_observes_strategy_closed_loop_current_ml_only_warning() -> None:
+    strategy_closed_loop = system_audit._audit_card(
+        "strategy_closed_loop",
+        "Strategy closed loop",
+        "warning",
+        "Current runtime ML is still not contributing.",
+        details={
+            "current_runtime_window": {
+                "historical_legacy_issues": False,
+                "weak_executed_count": 0,
+                "fast_loss_under_15m_count": 0,
+                "entry_decision_count": 14,
+                "high_quality_entry_count": 7,
+                "ml_usable_rate": 0.0,
+            },
+            "diagnostics": {
+                "current_weak_executed": False,
+                "current_no_high_quality_entries": False,
+                "current_fast_loss_cluster": False,
+                "current_ml_not_effective": True,
+                "shadow_only_executed": False,
+                "executed_without_order": False,
+                "historical_ml_not_effective": True,
+                "insufficient_effectiveness_samples": True,
+            },
+        },
+    )
+
+    ledger = system_audit._issue_ledger_from_cards([strategy_closed_loop])
+
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "strategy_closed_loop"
+
+
 def test_issue_ledger_keeps_strategy_closed_loop_current_quality_warning_unresolved() -> None:
     strategy_closed_loop = system_audit._audit_card(
         "strategy_closed_loop",

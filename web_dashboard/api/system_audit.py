@@ -2857,15 +2857,16 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         "historical_legacy_issues": bool(current_window.get("historical_legacy_issues")),
     }
     critical = diagnostics["shadow_only_executed"] or diagnostics["executed_without_order"]
-    current_warning = any(
+    current_execution_warning = any(
         diagnostics[key]
         for key in (
             "current_weak_executed",
             "current_no_high_quality_entries",
             "current_fast_loss_cluster",
-            "current_ml_not_effective",
         )
     )
+    current_ml_warning = diagnostics["current_ml_not_effective"]
+    current_warning = current_execution_warning or current_ml_warning
     historical_warning = any(
         diagnostics[key]
         for key in (
@@ -2880,9 +2881,14 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
     if critical:
         status = "critical"
         summary = "策略闭环存在执行状态硬错误，需要先修执行契约。"
-    elif current_warning:
+    elif current_execution_warning:
         status = "warning"
-        summary = "当前运行窗口仍存在弱证据执行、高质量候选不足、ML弱参与或快亏平风险。"
+        summary = "当前运行窗口仍存在弱证据执行、高质量候选不足或快亏平风险。"
+    elif current_ml_warning:
+        status = "warning"
+        summary = (
+            "当前运行窗口 ML 仍未有效参与；执行硬错误暂未复现，需继续治理 ML readiness 与收益样本。"
+        )
     elif warning:
         status = "warning"
         summary = "24小时历史窗口仍有遗留问题；当前运行窗口暂未复现硬执行错误，需继续观察新样本。"
@@ -3001,12 +3007,12 @@ _STRATEGY_CLOSED_LOOP_CURRENT_DIAGNOSTICS = (
     "current_weak_executed",
     "current_no_high_quality_entries",
     "current_fast_loss_cluster",
-    "current_ml_not_effective",
     "shadow_only_executed",
     "executed_without_order",
 )
 
 _STRATEGY_CLOSED_LOOP_OBSERVATION_DIAGNOSTICS = (
+    "current_ml_not_effective",
     "historical_weak_executed",
     "historical_no_high_quality_entries",
     "historical_fast_loss_cluster",
