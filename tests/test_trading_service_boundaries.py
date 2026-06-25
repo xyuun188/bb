@@ -2575,6 +2575,39 @@ def test_market_budget_deferred_rotation_keeps_order_when_no_match() -> None:
     assert rotation["reason"] == "deferred symbols no longer match current shortlist"
 
 
+def test_market_budget_rotation_uses_recent_analysis_coverage_when_deferred_no_match() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._market_budget_deferred_symbols = ["DOGE/USDT"]
+    service._recent_market_analysis_penalty = lambda symbol: {
+        "BTC/USDT": 12.0,
+        "ETH/USDT": 0.0,
+        "SOL/USDT": 8.0,
+    }.get(symbol, 0.0)
+    analysis_budget = {}
+
+    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
+        {
+            "BTC/USDT": "btc",
+            "ETH/USDT": "eth",
+            "SOL/USDT": "sol",
+        },
+        analysis_budget_context=analysis_budget,
+    )
+
+    assert list(rotated) == ["ETH/USDT", "SOL/USDT", "BTC/USDT"]
+    rotation = analysis_budget["market_budget_rotation"]
+    assert rotation["read_only"] is True
+    assert rotation["is_entry_gate"] is False
+    assert rotation["applied"] is True
+    assert rotation["start_symbol"] == "ETH/USDT"
+    assert rotation["rotation_source"] == "recent_analysis_coverage"
+    assert "entry thresholds" in rotation["reason"]
+
+
 def test_market_budget_deferred_symbols_are_deduped_and_clearable() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(

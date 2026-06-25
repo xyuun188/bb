@@ -3367,19 +3367,40 @@ class TradingService:
                 start_index = normalized_index[key]
                 break
         if start_key is None or start_index <= 0:
+            recent_start_index = self._recent_analysis_rotation_start_index(items)
+            if recent_start_index <= 0:
+                if isinstance(analysis_budget_context, dict):
+                    analysis_budget_context["market_budget_rotation"] = {
+                        "read_only": True,
+                        "is_entry_gate": False,
+                        "applied": False,
+                        "deferred_symbol_count": len(deferred),
+                        "reason": (
+                            "deferred symbols no longer match current shortlist"
+                            if start_key is None
+                            else "deferred symbol already leads current shortlist"
+                        ),
+                    }
+                return dict(items)
+            rotated_items = items[recent_start_index:] + items[:recent_start_index]
             if isinstance(analysis_budget_context, dict):
                 analysis_budget_context["market_budget_rotation"] = {
                     "read_only": True,
                     "is_entry_gate": False,
-                    "applied": False,
+                    "applied": True,
+                    "start_symbol": rotated_items[0][0],
+                    "start_index": recent_start_index,
+                    "ranked_symbol_count": len(items),
                     "deferred_symbol_count": len(deferred),
+                    "rotation_source": "recent_analysis_coverage",
                     "reason": (
-                        "deferred symbols no longer match current shortlist"
-                        if start_key is None
-                        else "deferred symbol already leads current shortlist"
+                        "current shortlist no longer contains deferred symbols, so recent "
+                        "analysis coverage rotates the shortlist toward less-covered ranked "
+                        "symbols without changing ranking scores, entry thresholds, sizing, "
+                        "leverage, ML readiness, or risk gates"
                     ),
                 }
-            return dict(items)
+            return dict(rotated_items)
 
         rotated_items = items[start_index:] + items[:start_index]
         if isinstance(analysis_budget_context, dict):
@@ -3399,6 +3420,20 @@ class TradingService:
                 ),
             }
         return dict(rotated_items)
+
+    def _recent_analysis_rotation_start_index(self, items: list[tuple[str, Any]]) -> int:
+        if len(items) <= 1:
+            return 0
+        penalties = [max(0.0, self._recent_market_analysis_penalty(symbol)) for symbol, _ in items]
+        if not any(penalty > 0.0 for penalty in penalties):
+            return 0
+        lowest_penalty = min(penalties)
+        if penalties[0] <= lowest_penalty + 1e-9:
+            return 0
+        for index, penalty in enumerate(penalties[1:], start=1):
+            if penalty <= lowest_penalty + 1e-9:
+                return index
+        return 0
 
     def _remember_market_budget_deferred_symbols(self, symbols: list[str]) -> None:
         normalized_seen: set[str] = set()
