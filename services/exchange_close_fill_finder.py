@@ -307,13 +307,29 @@ class ExchangeCloseFillFinder:
         try:
             response = await paper_okx._with_retry(fetch_fills, params)
         except Exception:
-            return []
+            try:
+                response = await paper_okx._with_retry(
+                    fetch_fills,
+                    {
+                        "instType": "SWAP",
+                        "limit": "100",
+                    },
+                )
+            except Exception:
+                return []
 
         rows = response.get("data", []) if isinstance(response, dict) else []
         min_timestamp = (since or 0) - 1000
         groups: dict[str, dict[str, Any]] = {}
         for row in rows or []:
             if not isinstance(row, dict):
+                continue
+            row_inst_id = str(row.get("instId") or "").strip().upper()
+            if (
+                row_inst_id
+                and row_inst_id != okx_inst_id
+                and not row_inst_id.startswith(f"{okx_inst_id}-OFF")
+            ):
                 continue
             if str(row.get("side") or "").lower() != close_side:
                 continue
