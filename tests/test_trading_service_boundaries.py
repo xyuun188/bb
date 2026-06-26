@@ -50,6 +50,7 @@ from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.sync_service import OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND, OkxSyncService
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 from services.trading_service import TradingService, _AnalysisRuntimeState
+from services.training_data_quality import DATA_QUALITY_VERSION
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -3464,12 +3465,37 @@ async def test_ml_signal_auto_train_quarantines_before_training(
         return [object()]
 
     def train_frame(_frame: list[Any], **kwargs: Any) -> dict[str, Any]:
-        calls.append("train_frame")
+        calls.append(f"train_frame:{bool(kwargs['persist_artifact'])}")
         assert kwargs["completed_sample_count"] == 318
+        now = datetime.now(UTC).isoformat()
         return {
-            "sample_count": 318,
+            "version": now,
+            "trained_at": now,
+            "sample_count": 1200,
+            "test_count": 240,
             "last_trained_completed_shadow_sample_count": 318,
-            "trained_at": datetime.now(UTC).isoformat(),
+            "training_run_mode": "persist" if kwargs["persist_artifact"] else "dry_run",
+            "artifact_persisted": bool(kwargs["persist_artifact"]),
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+            },
+            "metrics": {
+                "long_auc": 0.64,
+                "short_auc": 0.63,
+                "long_pr_auc": 0.60,
+                "short_pr_auc": 0.59,
+                "long_accuracy": 0.61,
+                "short_accuracy": 0.60,
+                "top_long_avg_return_pct": 0.16,
+                "bottom_long_avg_return_pct": -0.03,
+                "top_short_avg_return_pct": 0.15,
+                "bottom_short_avg_return_pct": -0.02,
+                "top_long_win_rate": 0.72,
+                "bottom_long_win_rate": 0.41,
+                "top_short_win_rate": 0.71,
+                "bottom_short_win_rate": 0.40,
+            },
         }
 
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
@@ -3488,7 +3514,7 @@ async def test_ml_signal_auto_train_quarantines_before_training(
     assert result["completed_sample_count"] == 318
     assert result["training_quarantine"]["quarantined"] == 2
     assert calls[:4] == ["quarantine", "load_rows", "quality_report", "build_frame"]
-    assert "train_frame" in calls
+    assert calls[-2:] == ["train_frame:False", "train_frame:True"]
 
 
 @pytest.mark.asyncio

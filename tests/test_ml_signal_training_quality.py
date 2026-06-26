@@ -137,6 +137,51 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _ml_training_metadata(
+    *,
+    artifact_persisted: bool,
+    ready: bool,
+    completed_sample_count: int = 1300,
+) -> dict[str, object]:
+    top_return = 0.16 if ready else -0.08
+    bottom_return = -0.03 if ready else -0.12
+    now = datetime.now(UTC).isoformat()
+    return {
+        "version": now,
+        "trained_at": now,
+        "sample_count": 1200,
+        "test_count": 240,
+        "last_trained_completed_shadow_sample_count": completed_sample_count,
+        "training_run_mode": "persist" if artifact_persisted else "dry_run",
+        "artifact_persisted": artifact_persisted,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+        },
+        "training_window_composition": {
+            "sample_count": 1200,
+            "decision_action_counts": {"long": 600, "short": 600},
+            "best_action_counts": {"long": 600, "short": 600},
+        },
+        "metrics": {
+            "long_auc": 0.64,
+            "short_auc": 0.63,
+            "long_pr_auc": 0.60,
+            "short_pr_auc": 0.59,
+            "long_accuracy": 0.61,
+            "short_accuracy": 0.60,
+            "top_long_avg_return_pct": top_return,
+            "bottom_long_avg_return_pct": bottom_return,
+            "top_short_avg_return_pct": top_return,
+            "bottom_short_avg_return_pct": bottom_return,
+            "top_long_win_rate": 0.72 if ready else 0.48,
+            "bottom_long_win_rate": 0.41 if ready else 0.52,
+            "top_short_win_rate": 0.71 if ready else 0.47,
+            "bottom_short_win_rate": 0.40 if ready else 0.51,
+        },
+    }
+
+
 def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -266,6 +311,120 @@ async def test_train_ml_signal_script_dry_run_does_not_quarantine_or_persist(
     }
     assert calls[0]["persist_artifact"] is False
     assert result["metadata"] == {"artifact_persisted": False}
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_auto_train_rejects_degraded_candidate_without_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MLSignalService()
+    calls: list[bool] = []
+    ensure_load_calls: list[str] = []
+
+    async def completed_shadow_sample_count() -> int:
+        return 1300
+
+    async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
+        return {"scanned": 1300, "quarantined": 0}
+
+    async def load_rows(*, limit: int) -> list[object]:
+        assert limit > 0
+        return [object()]
+
+    def quality_report(_rows: list[object]) -> dict[str, object]:
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[object]) -> pd.DataFrame:
+        return _training_frame()
+
+    def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
+        calls.append(bool(kwargs.get("persist_artifact")))
+        return _ml_training_metadata(
+            artifact_persisted=bool(kwargs["persist_artifact"]),
+            ready=False,
+        )
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: {  # type: ignore[method-assign]
+        "sample_count": 1000,
+        "last_trained_completed_shadow_sample_count": 1000,
+        "trained_at": datetime.now(UTC).isoformat(),
+    }
+    service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
+    service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
+    monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
+    monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+
+    result = await service.maybe_auto_train(force=True)
+
+    assert calls == [False]
+    assert ensure_load_calls == []
+    assert result["trained"] is False
+    assert result["reason"] == "candidate_readiness_rejected"
+    assert result["artifact_persisted"] is False
+    assert result["candidate"]["artifact_persisted"] is False
+    assert result["candidate_readiness"]["allow_live_position_influence"] is False
+    reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
+    assert "long_top_return_below_threshold" in reason_codes
+    assert "short_top_return_below_threshold" in reason_codes
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MLSignalService()
+    calls: list[bool] = []
+    ensure_load_calls: list[str] = []
+
+    async def completed_shadow_sample_count() -> int:
+        return 1300
+
+    async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
+        return {"scanned": 1300, "quarantined": 0}
+
+    async def load_rows(*, limit: int) -> list[object]:
+        assert limit > 0
+        return [object()]
+
+    def quality_report(_rows: list[object]) -> dict[str, object]:
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[object]) -> pd.DataFrame:
+        return _training_frame()
+
+    def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
+        persist_artifact = bool(kwargs["persist_artifact"])
+        calls.append(persist_artifact)
+        return _ml_training_metadata(
+            artifact_persisted=persist_artifact,
+            ready=True,
+        )
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: {  # type: ignore[method-assign]
+        "sample_count": 1000,
+        "last_trained_completed_shadow_sample_count": 1000,
+        "trained_at": datetime.now(UTC).isoformat(),
+    }
+    service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
+    service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
+    monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
+    monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+
+    result = await service.maybe_auto_train(force=True)
+
+    assert calls == [False, True]
+    assert ensure_load_calls == ["load"]
+    assert result["trained"] is True
+    assert result["reason"] == "trained"
+    assert result["artifact_persisted"] is True
+    assert result["candidate"]["artifact_persisted"] is False
+    assert result["candidate_readiness"]["allow_live_position_influence"] is True
 
 
 def test_shadow_training_selection_uses_only_best_trade_samples() -> None:

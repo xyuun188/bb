@@ -3739,3 +3739,74 @@ Git 与线上部署：
   - 候选诊断字段已经在线上打通，后续看到 `analysis_volume_ratio_below_floor` 时必须同时看量比来源和时间框架。
   - 本批仍不代表“不赚钱、不开仓、小单、ML degraded、server_profit 反向、历史脏数据、乱码代码”全部完成；这些仍按二期未完成闭环继续推进。
   - 不得用本批结果作为降量比阈值、放大仓位、提高杠杆、硬启 ML readiness 或绕过 OKX/风控的依据。
+
+---
+
+## 六十九、Batch I 二期阶段 3 补充记录：ML 自动训练 artifact 晋级门，阻止 degraded 候选替换线上模型（2026-06-26）
+
+触发原因：
+- 继续二期收益闭环时，线上 6 小时根因审计显示 `ml_not_contributing` 与 `ml_top_return_not_profitable` 仍是核心阻塞；当前线上 `local_ml_readiness=degraded`，`allow_live_position_influence=false`。
+- 生产等价 dry-run 训练评估显示，当前候选训练窗口没有任何 variant 通过 readiness；主要指标包括 long/short top bucket fee 后收益为负、long PR-AUC 不达标、top return 不优于 bottom bucket 等。
+- 复查 `MLSignalService.maybe_auto_train()` 发现自动训练会直接调用 `train_from_frame()` 的默认持久化路径：先写 `data/ml_signal/winrate_model.joblib` 和 metadata，再热加载。也就是说，即便新训练结果 degraded，也可能先替换线上 artifact。
+
+本次修复范围：
+- `services/ml_signal_service.py`：自动训练改为两阶段晋级：
+  - 第一阶段只调用 `train_from_frame(..., persist_artifact=False)` 生成候选元数据，不写模型文件、不热加载。
+  - 立即使用现有 `_influence_policy()` 与 `build_ml_readiness_report()` 评估候选 readiness。
+  - 候选 `allow_live_position_influence=false` 时返回 `candidate_readiness_rejected`，保留上一版线上 artifact，并输出候选 metrics、readiness blockers、训练窗口组成和质量 totals。
+  - 只有候选 readiness 通过时，才第二次调用 `train_from_frame(..., persist_artifact=True)` 写 artifact，并热加载。
+- `services/ml_signal_service.py`：`training_policy` 增加 `promotion_requires_readiness=true`、`candidate_artifact_persisted=false`、`persist_artifact_only_when_readiness_allows_live_influence=true`，避免后续 AI 把“训练已跑”误读成“模型可上线影响交易”。
+- `services/ml_signal_service.py`：候选被拒后增加进程内冷却判断；在未达到重新评估间隔或新增样本门槛前，自动训练不会每 30 分钟反复跑同一批 degraded 候选。
+- `tests/test_ml_signal_training_quality.py`：新增两条契约测试，锁定 degraded 候选不得持久化、不得热加载、必须返回 readiness 阻塞原因；ready 候选必须先 dry-run 再 persist。
+- `tests/test_trading_service_boundaries.py`：更新旧自动训练边界测试，明确 `force=True` 只强制评估候选，不代表绕过 readiness 强制写 artifact。
+
+安全边界：
+- 本批不降低 ML readiness 阈值，不硬启 `allow_live_position_influence`，不改变开仓阈值、收益质量门、server_profit、仓位、杠杆、止盈止损、OKX 下单或平仓规则。
+- 本批不替换线上模型 artifact；只有未来候选模型真实通过现有 readiness 才允许自动晋级。
+- 这不会直接让系统多开仓、放大仓位或立刻盈利；它解决的是“不要把不赚钱/不达标的候选模型写上线继续污染判断”。
+- 如果后续用户看到 ML 仍 degraded，这是正确受控状态，不得为了页面好看改成 ready。
+
+本地验证：
+- `pytest tests/test_ml_signal_training_quality.py::test_ml_signal_auto_train_rejects_degraded_candidate_without_persisting tests/test_ml_signal_training_quality.py::test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_quarantines_before_training -q`：3 passed。
+- `pytest tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_uses_completed_cursor_for_new_samples tests/test_trading_service_boundaries.py::test_ml_signal_auto_train_quarantines_before_training -q`：19 passed。
+- 全量测试 `pytest -q`：1536 passed。
+- `ruff check services/ml_signal_service.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：通过。
+- `ruff check .`：通过。
+- `black --check services/ml_signal_service.py tests/test_ml_signal_training_quality.py tests/test_trading_service_boundaries.py`：通过。
+- `black --check .`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 使用 `python scripts/sync_to_online_server.py --split-services` 上传 `docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md` 与 `services/ml_signal_service.py`，并重启 split services。
+- 三项服务均 active，Dashboard 返回 `302`。
+- 远端 `py_compile services/ml_signal_service.py` 通过。
+- 远端服务状态：
+  - `bb-paper-trading.service active MainPID=1112733 ActiveEnterTimestamp=Fri 2026-06-26 02:48:26 UTC`
+  - `bb-dashboard.service active MainPID=1112737 ActiveEnterTimestamp=Fri 2026-06-26 02:48:26 UTC`
+  - `bb-model-tunnels.service active MainPID=1112656 ActiveEnterTimestamp=Fri 2026-06-26 02:48:19 UTC`
+- 远端无副作用桩验证通过：degraded candidate 返回 `candidate_readiness_rejected`，`train_persist_calls=[false]`，`artifact_persisted=false`，`candidate_artifact_persisted=false`，`ensure_load_calls=[]`，阻塞码包含 `long_top_return_below_threshold`、`short_top_return_below_threshold`。
+- 15 分钟线上策略健康：
+  - `trade_execution_contract.status=ok`
+  - `orders=0`、`failed_orders=0`、`rejected_orders=0`、`fast_loss_close_under_15m=0`
+  - `local_ml_readiness.status=degraded`、`allow_live_position_influence=false`
+- 120 分钟线上策略健康：
+  - `trade_execution_contract.status=ok`
+  - `orders=1`、`filled_orders=1`、`failed_orders=0`、`rejected_orders=0`、`fast_loss_close_under_15m=0`
+  - `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`
+  - `local_ml_readiness.status=degraded`，阻塞仍包括 long PR-AUC、long/short top return 和 top-vs-bottom 分层问题。
+
+当前真实结论：
+- 这轮修复把 ML 自动训练从“训练即替换”改成“候选先评估，ready 才晋级”，防止 degraded 模型反复覆盖线上 artifact。
+- 当前线上历史 dry-run 已证明候选模型没有通过 readiness，因此正确行为是拒绝晋级，而不是放宽门槛或强启 ML。
+- 下一步仍要继续做收益闭环：分析为什么训练样本/特征无法让高分桶稳定盈利，继续处理 server_profit、shadow missed opportunity、强机会识别、历史脏数据/乱码代码和真实费后收益归因。
+
+后续 AI 防偏要求：
+- 后续看到 `candidate_readiness_rejected` 时，必须解释为“候选模型未准入，线上 artifact 保持不变”，不得说成训练失败或系统故障。
+- 后续不得把 `force=True` 当作强制写模型；它只能强制跑候选评估，不能绕过 readiness。
+- 任何“让 ML 参与实盘影响”的动作，都必须以 `candidate_readiness.allow_live_position_influence=true` 且本地/线上验证通过为前提。
+- 如果自动训练反复被拒，必须回到样本选择、标签、特征、side-aware 分桶、费后收益和 shadow 质量，而不是降低 readiness 阈值。
+
+回滚点：
+- 代码层可回滚 `services/ml_signal_service.py`、`tests/test_ml_signal_training_quality.py` 与 `tests/test_trading_service_boundaries.py`。
+- 线上回滚后必须重启 `bb-paper-trading.service`，否则交易主进程仍会保留新/旧 MLSignalService 逻辑。
+- 本批无 DB 迁移、无历史数据覆盖、无交易参数放宽、无模型 artifact 替换。
