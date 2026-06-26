@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from data_feed.okx_ticker_volume import okx_swap_volume_fields
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -37,6 +39,11 @@ class FeatureVector:
     high_24h: float = 0.0
     low_24h: float = 0.0
     volume_24h: float = 0.0
+    volume_24h_base: float = 0.0
+    volume_24h_contracts: float = 0.0
+    volume_24h_quote: float = 0.0
+    notional_24h_usdt: float = 0.0
+    volume_24h_source: str = ""
     volume: float = 0.0
     change_24h_pct: float = 0.0
     spread_pct: float = 0.0
@@ -146,7 +153,7 @@ Current Price: {self.current_price:.4f}
 Bid/Ask: {self.bid:.4f} / {self.ask:.4f}
 Spread: {self.spread_pct:.4f}%
 24h High/Low: {self.high_24h:.4f} / {self.low_24h:.4f}
-24h Volume: {self.volume_24h:.2f}
+24h Volume: base={self.volume_24h:.2f}, notional_usdt={self.notional_24h_usdt:.2f}
 
 Technical Indicators:
   RSI(14): {self.rsi_14:.1f} | RSI(7): {self.rsi_7:.1f}
@@ -208,7 +215,19 @@ def build_feature_vector(
         fv.ask = _safe_float(ticker.get("ask"), 0.0)
         fv.high_24h = _safe_float(ticker.get("high_24h"), 0.0)
         fv.low_24h = _safe_float(ticker.get("low_24h"), 0.0)
-        fv.volume_24h = _safe_float(ticker.get("volume_24h"), 0.0)
+        volume_fields = okx_swap_volume_fields(ticker, fv.current_price)
+        legacy_volume = _safe_float(ticker.get("volume_24h"), 0.0)
+        fv.volume_24h_base = _safe_float(volume_fields.get("volume_24h_base"), 0.0)
+        fv.volume_24h_contracts = _safe_float(volume_fields.get("volume_24h_contracts"), 0.0)
+        fv.volume_24h_quote = _safe_float(volume_fields.get("volume_24h_quote"), 0.0)
+        fv.notional_24h_usdt = _safe_float(volume_fields.get("notional_24h_usdt"), 0.0)
+        fv.volume_24h_source = str(volume_fields.get("volume_24h_source") or "")
+        if fv.volume_24h_base <= 0 and fv.notional_24h_usdt <= 0 and legacy_volume > 0:
+            fv.volume_24h_base = legacy_volume
+            fv.notional_24h_usdt = legacy_volume * max(fv.current_price, 0.0)
+            fv.volume_24h_quote = fv.notional_24h_usdt
+            fv.volume_24h_source = "legacy_volume_24h"
+        fv.volume_24h = fv.volume_24h_base if fv.volume_24h_base > 0 else legacy_volume
         fv.change_24h_pct = _safe_float(ticker.get("change_24h_pct"), 0.0)
         fv.spread_pct = _safe_float(ticker.get("spread_pct"), 0.0)
 

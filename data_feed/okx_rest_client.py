@@ -17,6 +17,7 @@ from config.settings import settings
 from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol, symbol_from_okx_market
 from core.trading_mode import mode_manager
+from data_feed.okx_ticker_volume import okx_swap_volume_fields
 
 logger = structlog.get_logger(__name__)
 
@@ -337,13 +338,15 @@ class OKXRestClient:
                 ticker = self._ticker_for_market(tickers, market, symbol)
                 ticker_info = ticker.get("info") or {}
                 info = market.get("info") or {}
-                volume = self._safe_float(
-                    ticker.get("baseVolume") or ticker_info.get("vol24h") or info.get("vol24h")
-                )
-                base_volume = self._safe_float(
-                    ticker_info.get("volCcy24h") or info.get("volCcy24h")
-                )
                 last = self._safe_float(ticker.get("last") or ticker_info.get("last"))
+                volume_fields = okx_swap_volume_fields(ticker or info, last)
+                volume = self._safe_float(
+                    volume_fields.get("volume_24h_base")
+                    or ticker.get("baseVolume")
+                    or ticker_info.get("vol24h")
+                    or info.get("vol24h")
+                )
+                base_volume = self._safe_float(volume_fields.get("volume_24h_base") or volume)
                 open_24h = self._safe_float(
                     ticker.get("open") or ticker_info.get("open24h") or ticker_info.get("sodUtc8")
                 )
@@ -374,6 +377,7 @@ class OKXRestClient:
                         "ccxt_symbol": market.get("symbol", market_id),
                         "volume_24h": volume,
                         "base_volume_24h": base_volume,
+                        **volume_fields,
                         "change_24h_pct": change_pct,
                         "range_24h_pct": range_pct,
                         "spread_pct": spread_pct,

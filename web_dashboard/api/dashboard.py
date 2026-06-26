@@ -25,6 +25,7 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol, symbol_query_variants
 from core.trading_mode import mode_manager
 from data_feed.okx_rest_client import OKXRestClient
+from data_feed.okx_ticker_volume import okx_swap_volume_fields
 from executor.okx_executor import OKXExecutor
 from services.account_accounting_service import (
     allocatable_balance_from_snapshot,
@@ -2436,7 +2437,16 @@ def _merge_market_and_public_ticker(market_ticker: dict, public_ticker: dict) ->
         if market_change is not None and abs(market_change) > 1e-12
         else public_change if public_change is not None else market_change or 0.0
     )
-    for key in ("volume_24h", "bid", "ask"):
+    for key in (
+        "volume_24h",
+        "volume_24h_contracts",
+        "volume_24h_base",
+        "volume_24h_quote",
+        "notional_24h_usdt",
+        "volume_24h_source",
+        "bid",
+        "ask",
+    ):
         if _safe_float(market_ticker.get(key), 0.0) == 0.0:
             merged[key] = public_ticker.get(key, market_ticker.get(key, 0.0))
     return merged
@@ -2551,13 +2561,18 @@ def _parse_public_tickers(
             or info.get("lastPx"),
             0.0,
         )
+        volume_fields = okx_swap_volume_fields(ticker, price)
         parsed[symbol] = {
             "price": price,
             "change_24h": _okx_display_change_pct(ticker),
             "volume_24h": _safe_float(
-                ticker.get("baseVolume") or info.get("volCcy24h") or info.get("vol24h"),
+                volume_fields.get("volume_24h_base")
+                or ticker.get("baseVolume")
+                or info.get("volCcy24h")
+                or info.get("vol24h"),
                 0.0,
             ),
+            **volume_fields,
             "bid": _safe_float(ticker.get("bid") or info.get("bidPx"), 0.0),
             "ask": _safe_float(ticker.get("ask") or info.get("askPx"), 0.0),
         }

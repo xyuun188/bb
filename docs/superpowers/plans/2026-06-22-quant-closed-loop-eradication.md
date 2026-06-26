@@ -3612,3 +3612,55 @@ Git 与线上部署：
 - 代码层可回滚 `services/trading_service.py` 与 `tests/test_trading_service_boundaries.py`。
 - 线上回滚后必须重启 `bb-paper-trading.service`，否则交易主进程仍会保留旧 provider。
 - 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽。
+
+---
+
+## 六十七、Batch I 二期阶段 2 补充记录：OKX swap 成交量/名义额口径修正，解除候选误杀（2026-06-26）
+
+触发原因：
+- 线上候选池仍然反复集中，最新漏斗里 `analysis_notional_below_floor` 频繁出现；进一步核对发现低价合约（例如 `PEPE-USDT-SWAP`）被算成极低名义额。
+- OKX swap ticker 的 `vol24h` 是合约张数，不是基础币成交量；`volCcy24h` 才是基础币数量。旧链路把 WebSocket 的 `vol24h` 写入 `volume_24h`，ranker 再用 `current_price * volume_24h` 计算 USDT 名义额。
+- 实测例子：`PEPE-USDT-SWAP` 的 `last=0.000002355`、`vol24h=5357584.8`、`volCcy24h=53575848000000`；旧算法得到 `12.617U`，正确基础币名义额约 `126171122.04U`。这会把真实高流动性低价合约误判为名义额不足。
+
+本次修复范围：
+- 新增 `data_feed/okx_ticker_volume.py`，统一抽取 OKX swap ticker 的 `volume_24h_contracts`、`volume_24h_base`、`volume_24h_quote`、`notional_24h_usdt`、`volume_24h_source`。
+- `data_feed/okx_ws_client.py`：WebSocket ticker 不再把 `vol24h` 当基础币成交量；`volume_24h` 兼容保持为基础币成交量，额外保留合约张数和名义额。
+- `services/data_service.py` 与 `data_feed/feature_vector.py`：FeatureVector 增加显式成交量/名义额字段；DB `market_tickers.volume_24h` 保持兼容，不做迁移，额外诊断字段进入 `raw_data` 和实时 market state。
+- `services/entry_feature_ranker.py`：候选流动性评分、tradable/analysis 名义额门、诊断输出统一优先读取 `notional_24h_usdt`，仅旧数据缺失时才退回 `price * volume_24h`。
+- `data_feed/okx_rest_client.py`、`data_feed/okx_sdk_client.py`、`web_dashboard/api/dashboard.py`：REST/SDK/Dashboard 公共 ticker 解析同步保留 base/contracts/notional，避免不同页面口径不一致。
+
+安全边界：
+- 本批不放宽 `analysis_notional`、`analysis_volume_ratio`、收益质量、ML readiness、仓位、杠杆、止盈止损、OKX 下单或平仓规则。
+- 本批不修改历史订单/持仓/收益数据，不做 DB 迁移，不替换模型 artifact。
+- 这次只修正“名义额计算单位错误导致候选误杀”，不能解释为“不赚钱/小单/不开仓全部解决”。
+
+本地验证：
+- 相关测试：`91 passed`。
+- 全量测试：`pytest -q`，`1529 passed`。
+- `ruff check data_feed services web_dashboard tests`：通过。
+- `black --check data_feed services web_dashboard tests`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 使用 `scripts/sync_to_online_server.py --split-services` 上传并重启 split services；上传变更文件 8 个：`data_feed/feature_vector.py`、`data_feed/okx_rest_client.py`、`data_feed/okx_sdk_client.py`、`data_feed/okx_ticker_volume.py`、`data_feed/okx_ws_client.py`、`services/data_service.py`、`services/entry_feature_ranker.py`、`web_dashboard/api/dashboard.py`。
+- 远端 `py_compile` 通过。
+- 服务状态：`bb-paper-trading.service=active MainPID=1027761 ActiveEnterTimestamp=Fri 2026-06-26 00:44:21 UTC`；`bb-dashboard.service=active MainPID=1027765 ActiveEnterTimestamp=Fri 2026-06-26 00:44:21 UTC`；`bb-model-tunnels.service=active MainPID=1027729 ActiveEnterTimestamp=Fri 2026-06-26 00:44:17 UTC`。
+- 重启后 10 分钟只读策略健康：`trade_execution_contract.status=ok`；`orders=0`、`failed_orders=0`、`rejected_orders=0`；`market_decisions=8`、`market_unique_symbol_count=6`。
+- 最新候选漏斗：`rank_selected_count=2`、`rank_underfilled=true`；`rank_filtered_out_reason_counts` 中 `analysis_notional_below_floor=2`，主因已变为 `analysis_volume_ratio_below_floor=26`。
+- 最新选中样本：`ETH/USDT notional_24h=10372469947.47`、`BNB/USDT notional_24h=78290768.8`，说明名义额口径已回到真实量级。
+- `local_ml_readiness` 仍为 `degraded`，阻塞仍是 `long_top_return_below_threshold` 与 `short_top_return_below_threshold`。
+
+当前真实结论：
+- “低价合约被合约张数误算成极低 USDT 名义额”的根因已修复，候选池不应再因为 `vol24h` 单位错误被系统性误杀。
+- 这次修复后，最新漏斗的主瓶颈已经从“名义额误杀”转为“量比不足/后续收益质量/ML degraded”。因此系统仍可能不开仓，这不是本批代码未上线，而是剩余策略质量闭环仍未完成。
+- 后续如果仍看到候选集中，不得再先调低名义额阈值；必须先看 `notional_24h_usdt`、`volume_24h_source`、`analysis_volume_ratio_below_floor`、ML top return、server_profit selected-side 与 shadow missed opportunity 的证据链。
+
+后续 AI 防偏要求：
+- 看到 `analysis_notional_below_floor` 时，必须先确认该样本是否有 `notional_24h_usdt`，以及来源是否为 OKX `volCcy24h`/base volume；不得直接放宽名义额阈值。
+- 看到低价币 notional 异常小（例如小于几十 U）时，必须先怀疑成交量单位，不得解释为“币本身没流动性”。
+- 看到 `rank_underfilled=true` 时，必须区分是名义额不足、量比不足、异常影线、ADX、波动上限还是市场 AI 时间预算，不得笼统说“候选少/不开仓”。
+- 本批不允许作为放大仓位、提高杠杆、硬启 ML readiness、降低收益门、降低量比门或绕过 OKX 风控的依据。
+
+回滚点：
+- 代码层可回滚 `data_feed/okx_ticker_volume.py`、`data_feed/okx_ws_client.py`、`data_feed/feature_vector.py`、`services/data_service.py`、`services/entry_feature_ranker.py`、`data_feed/okx_rest_client.py`、`data_feed/okx_sdk_client.py`、`web_dashboard/api/dashboard.py` 及对应测试。
+- 线上回滚后必须重启 `bb-paper-trading.service` 与 `bb-dashboard.service`，否则交易主进程会保留旧/新混合行情解析逻辑。

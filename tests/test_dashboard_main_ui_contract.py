@@ -1080,6 +1080,27 @@ def test_parse_public_tickers_accepts_internal_market_state_fields() -> None:
     assert parsed["ETH/USDT"]["change_24h"] == -2.4
 
 
+def test_parse_public_tickers_uses_okx_swap_base_volume_for_notional() -> None:
+    parsed = dashboard._parse_public_tickers(
+        {
+            "PEPE/USDT": {
+                "symbol": "PEPE/USDT",
+                "last": 0.000002355,
+                "info": {
+                    "instId": "PEPE-USDT-SWAP",
+                    "vol24h": "5357584.8",
+                    "volCcy24h": "53575848000000",
+                },
+            }
+        },
+        {"PEPE/USDT"},
+    )
+
+    assert parsed["PEPE/USDT"]["volume_24h"] == pytest.approx(53_575_848_000_000)
+    assert parsed["PEPE/USDT"]["volume_24h_contracts"] == pytest.approx(5_357_584.8)
+    assert parsed["PEPE/USDT"]["notional_24h_usdt"] == pytest.approx(126_171_122.04)
+
+
 def test_dashboard_js_preserves_market_change_when_position_snapshot_change_is_zero() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     position_builder = script[

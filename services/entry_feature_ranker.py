@@ -64,7 +64,7 @@ class EntryFeatureRankerPolicy:
         except (TypeError, ValueError):
             return 0.0
 
-        notional_24h = max(volume_24h * max(current_price, 0.0), 0.0)
+        notional_24h = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
         liquidity = math.log10(notional_24h + 1.0) * params.liquidity_log_weight
         participation = (
             min(max(volume_ratio, 0.0), params.volume_ratio_score_cap) * params.participation_weight
@@ -128,7 +128,7 @@ class EntryFeatureRankerPolicy:
         if self._has_recent_abnormal_wick(feature):
             return False
 
-        notional_24h = current_price * volume_24h
+        notional_24h = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
         min_notional = (
             params.tradable_major_min_notional_usdt
             if symbol in self.major_symbols
@@ -175,7 +175,7 @@ class EntryFeatureRankerPolicy:
         if self._has_recent_abnormal_wick(feature):
             return False
 
-        notional_24h = current_price * volume_24h
+        notional_24h = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
         min_notional = (
             params.analysis_major_min_notional_usdt
             if symbol in self.major_symbols
@@ -452,7 +452,7 @@ class EntryFeatureRankerPolicy:
 
         symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14 = parsed
         abnormal_wick = self._has_recent_abnormal_wick(feature)
-        notional_24h = current_price * volume_24h
+        notional_24h = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
         tradable_min_notional = (
             params.tradable_major_min_notional_usdt
             if symbol in self.major_symbols
@@ -541,6 +541,9 @@ class EntryFeatureRankerPolicy:
             "analysis_reasons": analysis_reasons,
             "metrics": {
                 "notional_24h": round(notional_24h, 2),
+                "notional_24h_source": str(
+                    getattr(feature, "volume_24h_source", "") or "price_x_volume_24h"
+                ),
                 "volume_ratio": round(volume_ratio, 4),
                 "adx": round(adx_14, 2),
                 "volatility_20": round(volatility_20, 4),
@@ -553,6 +556,23 @@ class EntryFeatureRankerPolicy:
                 "analysis_adx_floor": round(analysis_adx_floor, 2),
             },
         }
+
+    @staticmethod
+    def _feature_notional_24h_usdt(
+        feature: Any,
+        current_price: float,
+        volume_24h: float,
+    ) -> float:
+        explicit_notional = _feature_float(feature, "notional_24h_usdt", 0.0)
+        if explicit_notional > 0:
+            return explicit_notional
+        quote_volume = _feature_float(feature, "volume_24h_quote", 0.0)
+        if quote_volume > 0:
+            return quote_volume
+        base_volume = _feature_float(feature, "volume_24h_base", 0.0)
+        if base_volume > 0:
+            return max(base_volume * max(current_price, 0.0), 0.0)
+        return max(volume_24h * max(current_price, 0.0), 0.0)
 
     def _parse_filter_inputs(
         self,

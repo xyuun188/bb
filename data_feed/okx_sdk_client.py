@@ -16,6 +16,7 @@ import structlog
 from config.settings import settings
 from core.exceptions import ConfigError, ExchangeAPIError
 from core.safe_output import safe_error_text
+from data_feed.okx_ticker_volume import okx_swap_volume_fields
 
 logger = structlog.get_logger(__name__)
 
@@ -163,10 +164,13 @@ async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
             last = float(t.get("last", 0))
             open24h = float(t.get("open24h", 0))
             change_pct = ((last - open24h) / open24h * 100) if open24h else 0
+            volume_fields = okx_swap_volume_fields(t, last)
             tickers[symbol] = {
                 "price": last,
                 "change_24h": change_pct,
-                "volume_24h": float(t.get("vol24h", 0)),
+                "volume_24h": volume_fields["volume_24h_base"]
+                or volume_fields["volume_24h_contracts"],
+                **volume_fields,
                 "bid": float(t.get("bidPx", 0)),
                 "ask": float(t.get("askPx", 0)),
             }

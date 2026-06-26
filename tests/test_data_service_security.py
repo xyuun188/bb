@@ -382,6 +382,28 @@ def test_feature_vector_keeps_fresh_ticker_when_indicator_close_diverges() -> No
     )
 
 
+def test_feature_vector_keeps_okx_swap_volume_units_separate() -> None:
+    from data_feed.feature_vector import build_feature_vector
+
+    vector = build_feature_vector(
+        "PEPE/USDT",
+        ticker={
+            "last_price": 0.000002355,
+            "volume_24h": 5_357_584.8,
+            "volume_24h_contracts": 5_357_584.8,
+            "volume_24h_base": 53_575_848_000_000,
+            "notional_24h_usdt": 126_171_122.04,
+            "volume_24h_source": "quote",
+        },
+    )
+
+    assert vector.volume_24h_contracts == pytest.approx(5_357_584.8)
+    assert vector.volume_24h == pytest.approx(53_575_848_000_000)
+    assert vector.volume_24h_base == pytest.approx(53_575_848_000_000)
+    assert vector.notional_24h_usdt == pytest.approx(126_171_122.04)
+    assert vector.volume_24h_source == "quote"
+
+
 @pytest.mark.asyncio
 async def test_ticker_snapshot_refreshes_stale_ws_cache_from_swap_rest() -> None:
     service = _service()

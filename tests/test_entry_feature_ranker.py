@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 
 
@@ -41,6 +43,42 @@ def test_entry_feature_ranker_classifies_hard_and_soft_candidates() -> None:
     assert ranker.is_auto_analysis_candidate_feature(hard) is True
     assert ranker.is_auto_tradeable_feature(soft) is False
     assert ranker.is_auto_analysis_candidate_feature(soft) is True
+
+
+def test_entry_feature_ranker_uses_explicit_okx_swap_notional() -> None:
+    ranker = _ranker()
+    pepe_like = _feature(
+        "PEPE/USDT",
+        current_price=0.000002355,
+        volume_24h=5_357_584.8,
+        volume_24h_base=53_575_848_000_000,
+        notional_24h_usdt=126_171_122.04,
+        volume_24h_source="quote",
+        volume_ratio=0.40,
+        adx_14=18.0,
+    )
+    legacy_contract_only = _feature(
+        "PEPE/USDT",
+        current_price=0.000002355,
+        volume_24h=5_357_584.8,
+        volume_ratio=0.40,
+        adx_14=18.0,
+    )
+
+    assert ranker.is_auto_tradeable_feature(pepe_like) is True
+    assert ranker.is_auto_analysis_candidate_feature(pepe_like) is True
+    assert ranker.is_auto_analysis_candidate_feature(legacy_contract_only) is False
+
+    result = ranker.rank(
+        {"PEPE/USDT": pepe_like},
+        1,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+    metrics = result.diagnostics["symbols"][0]["filter_metrics"]
+    assert metrics["notional_24h"] == pytest.approx(126_171_122.04)
+    assert metrics["notional_24h_source"] == "quote"
 
 
 def test_entry_feature_ranker_uses_secondary_fill_when_hard_candidates_are_not_enough() -> None:

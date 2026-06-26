@@ -19,6 +19,7 @@ import websockets
 from config.settings import settings
 from core.exceptions import WebSocketConnectionError
 from core.safe_output import safe_error_text
+from data_feed.okx_ticker_volume import okx_swap_volume_fields, safe_float
 
 logger = structlog.get_logger(__name__)
 
@@ -129,19 +130,23 @@ class OKXWebSocketClient:
         if channel == "tickers":
             for ticker in data["data"]:
                 symbol = inst_id.replace("-SWAP", "").replace("-", "/")
-                last = float(ticker.get("last", 0))
-                open24h = float(ticker.get("open24h", 0))
+                last = safe_float(ticker.get("last"), 0.0)
+                open24h = safe_float(ticker.get("open24h"), 0.0)
                 change_pct = ((last - open24h) / open24h * 100) if open24h else 0
+                volume_fields = okx_swap_volume_fields(ticker, last)
                 parsed = {
                     "symbol": symbol,
                     "last_price": last,
-                    "bid": float(ticker.get("bidPx", 0)),
-                    "ask": float(ticker.get("askPx", 0)),
-                    "high_24h": float(ticker.get("high24h", 0)),
-                    "low_24h": float(ticker.get("low24h", 0)),
-                    "volume_24h": float(ticker.get("vol24h", 0)),
+                    "bid": safe_float(ticker.get("bidPx"), 0.0),
+                    "ask": safe_float(ticker.get("askPx"), 0.0),
+                    "high_24h": safe_float(ticker.get("high24h"), 0.0),
+                    "low_24h": safe_float(ticker.get("low24h"), 0.0),
+                    "volume_24h": volume_fields["volume_24h_base"]
+                    or volume_fields["volume_24h_contracts"],
+                    **volume_fields,
                     "change_24h_pct": change_pct,
-                    "timestamp": int(ticker.get("ts", 0)),
+                    "timestamp": int(safe_float(ticker.get("ts"), 0.0)),
+                    "inst_type": "SWAP",
                 }
                 self._latest_tickers[symbol] = parsed
                 for cb in self._ticker_callbacks:

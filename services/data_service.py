@@ -22,6 +22,7 @@ from core.url_safety import normalize_external_http_url
 from data_feed.feature_vector import FeatureVector, build_feature_vector
 from data_feed.news_fetcher import NewsFetcher
 from data_feed.okx_rest_client import OKXRestClient
+from data_feed.okx_ticker_volume import okx_swap_volume_fields
 from data_feed.okx_ws_client import OKXWebSocketClient
 from data_feed.sentiment_scraper import SentimentScraper
 from data_feed.technical_indicators import compute_all_indicators, extract_latest_features
@@ -158,13 +159,19 @@ class DataService:
             normalized = self._normalize_symbols([symbol])[0]
             source = str(data.get("source") or "websocket")
             timestamp = data.get("timestamp")
+            last_price = self._safe_float(data.get("last_price"), 0.0)
+            volume_fields = okx_swap_volume_fields(data, last_price)
+            volume_24h = self._safe_float(
+                volume_fields.get("volume_24h_base") or data.get("volume_24h"),
+                0.0,
+            )
             payload = {
-                "last_price": self._safe_float(data.get("last_price"), 0.0),
+                "last_price": last_price,
                 "bid": self._safe_float(data.get("bid"), 0.0),
                 "ask": self._safe_float(data.get("ask"), 0.0),
                 "high_24h": self._safe_float(data.get("high_24h"), 0.0),
                 "low_24h": self._safe_float(data.get("low_24h"), 0.0),
-                "volume_24h": self._safe_float(data.get("volume_24h"), 0.0),
+                "volume_24h": volume_24h,
                 "change_24h_pct": self._safe_float(data.get("change_24h_pct"), 0.0),
                 "raw_data": json.dumps(
                     {
@@ -172,6 +179,7 @@ class DataService:
                         "timestamp": timestamp,
                         "source": source,
                         "inst_type": data.get("inst_type") or "SWAP",
+                        **volume_fields,
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -709,14 +717,18 @@ class DataService:
             bid = self._safe_float(raw_ticker.get("bid") or ticker_info.get("bidPx"), 0.0)
             ask = self._safe_float(raw_ticker.get("ask") or ticker_info.get("askPx"), 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
+            last_price = self._safe_float(raw_ticker.get("last"), 0.0)
+            volume_fields = okx_swap_volume_fields(raw_ticker, last_price)
             snapshot = {
                 "symbol": normalized,
-                "last_price": raw_ticker.get("last", 0),
+                "last_price": last_price,
                 "bid": bid,
                 "ask": ask,
                 "high_24h": raw_ticker.get("high", 0),
                 "low_24h": raw_ticker.get("low", 0),
-                "volume_24h": raw_ticker.get("baseVolume", 0),
+                "volume_24h": volume_fields["volume_24h_base"]
+                or self._safe_float(raw_ticker.get("baseVolume"), 0.0),
+                **volume_fields,
                 "change_24h_pct": raw_ticker.get("percentage", 0),
                 "spread_pct": ((ask - bid) / mid * 100) if mid and ask and bid else 0,
                 "timestamp": self._ticker_timestamp_from_raw(raw_ticker),
@@ -1381,6 +1393,11 @@ class DataService:
                     "price": d.get("last_price", 0),
                     "change_24h": d.get("change_24h_pct", 0),
                     "volume_24h": d.get("volume_24h", 0),
+                    "volume_24h_contracts": d.get("volume_24h_contracts", 0),
+                    "volume_24h_base": d.get("volume_24h_base", 0),
+                    "volume_24h_quote": d.get("volume_24h_quote", 0),
+                    "notional_24h_usdt": d.get("notional_24h_usdt", 0),
+                    "volume_24h_source": d.get("volume_24h_source", ""),
                     "bid": d.get("bid", 0),
                     "ask": d.get("ask", 0),
                 }
