@@ -152,7 +152,7 @@ async def _matching_order(session: Any, position: Position, *, entry: bool) -> O
     candidates = [
         order
         for order in rows.scalars().all()
-        if _quantity_close(_safe_float(order.quantity), _safe_float(position.quantity))
+        if _quantity_covers(_safe_float(order.quantity), _safe_float(position.quantity))
         and _price_close(
             _safe_float(order.price),
             _safe_float(position.entry_price if entry else position.current_price),
@@ -195,9 +195,11 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _quantity_close(left: float, right: float) -> bool:
-    tolerance = max(abs(left), abs(right), 1e-9) * QUANTITY_TOLERANCE_RATIO
-    return abs(left - right) <= tolerance
+def _quantity_covers(order_quantity: float, position_quantity: float) -> bool:
+    if order_quantity <= 0 or position_quantity <= 0:
+        return False
+    tolerance = max(abs(order_quantity), abs(position_quantity), 1e-9) * QUANTITY_TOLERANCE_RATIO
+    return order_quantity + tolerance >= position_quantity
 
 
 def _price_close(left: float, right: float) -> bool:
