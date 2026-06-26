@@ -61,6 +61,56 @@ def symbol_from_okx_payload(payload: dict[str, Any] | None, *, fallback: Any = "
     return normalize_trading_symbol(fallback)
 
 
+def okx_inst_id_from_symbol(symbol: Any) -> str:
+    """Return the OKX USDT swap instrument id represented by an app symbol."""
+
+    normalized = normalize_trading_symbol(symbol)
+    if not normalized or "/" not in normalized:
+        return ""
+    return f"{normalized.replace('/', '-')}-SWAP".upper()
+
+
+def okx_inst_id_from_payload(payload: dict[str, Any] | None, *, fallback: Any = "") -> str:
+    """Extract an authoritative OKX instId, falling back to the app symbol."""
+
+    data = payload if isinstance(payload, dict) else {}
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    request_params = (
+        data.get("request_params") if isinstance(data.get("request_params"), dict) else {}
+    )
+    native_close_fill = (
+        data.get("native_close_fill") if isinstance(data.get("native_close_fill"), dict) else {}
+    )
+    native_fill_info = (
+        native_close_fill.get("order_info")
+        if isinstance(native_close_fill.get("order_info"), dict)
+        else {}
+    )
+    close_fill = data.get("close_fill") if isinstance(data.get("close_fill"), dict) else {}
+    close_fill_info = (
+        close_fill.get("order_info") if isinstance(close_fill.get("order_info"), dict) else {}
+    )
+    for candidate in (
+        info.get("instId"),
+        data.get("instId"),
+        data.get("okx_inst_id"),
+        request_params.get("instId"),
+        native_fill_info.get("instId"),
+        native_close_fill.get("instId"),
+        close_fill_info.get("instId"),
+        close_fill.get("instId"),
+    ):
+        text = str(candidate or "").strip().upper()
+        if text:
+            if text.endswith("-SWAP"):
+                return text
+            symbol = symbol_from_okx_inst_id(text)
+            inst_id = okx_inst_id_from_symbol(symbol)
+            if inst_id:
+                return inst_id
+    return okx_inst_id_from_symbol(fallback or data.get("canonical_exchange_symbol") or data.get("symbol"))
+
+
 def normalize_trading_symbol(symbol: Any) -> str:
     """Return the canonical app symbol, e.g. `MET/USDT` for OKX swap variants."""
 

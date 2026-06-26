@@ -188,9 +188,10 @@ async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
             symbol="WLFI/USDT",
             price=0.0817,
             quantity=1176.0,
+            exchange_order_id="h-entry",
             raw_response={
                 "symbol": "WLFI/USDT:USDT",
-                "info": {"instId": "H-USDT-SWAP"},
+                "info": {"instId": "H-USDT-SWAP", "posId": "h-pos"},
                 "canonical_exchange_symbol": "H/USDT",
             },
         ),
@@ -199,6 +200,9 @@ async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
 
     assert repo.opened[0]["symbol"] == "H/USDT"
     assert repo.opened[0]["side"] == "short"
+    assert repo.opened[0]["okx_inst_id"] == "H-USDT-SWAP"
+    assert repo.opened[0]["okx_pos_id"] == "h-pos"
+    assert repo.opened[0]["entry_exchange_order_id"] == "h-entry"
 
 
 @pytest.mark.asyncio
@@ -242,7 +246,13 @@ async def test_persist_full_exit_closes_positions_and_removes_profit_peaks() -> 
     repo = FakeTradeRepo([first, second])
     reflections: list[dict[str, Any]] = []
     removed_peaks: list[tuple[str, str, str]] = []
-    result = _result(quantity=2.0, price=110.0, fee=2.0)
+    result = _result(
+        quantity=2.0,
+        price=110.0,
+        fee=2.0,
+        exchange_order_id="close-order-1",
+        raw_response={"info": {"instId": "BTC-USDT-SWAP", "posId": "btc-pos"}},
+    )
 
     await _service(
         session=session,
@@ -262,6 +272,12 @@ async def test_persist_full_exit_closes_positions_and_removes_profit_peaks() -> 
     assert second.is_open is False
     assert first.realized_pnl == pytest.approx(8.5)
     assert second.realized_pnl == pytest.approx(8.5)
+    assert first.okx_inst_id == "BTC-USDT-SWAP"
+    assert second.okx_inst_id == "BTC-USDT-SWAP"
+    assert first.okx_pos_id == "btc-pos"
+    assert second.okx_pos_id == "btc-pos"
+    assert first.close_exchange_order_id == "close-order-1"
+    assert second.close_exchange_order_id == "close-order-1"
     assert result.pnl == pytest.approx(17.0)
     assert removed_peaks == [
         ("ensemble_trader", "BTC/USDT", "long"),

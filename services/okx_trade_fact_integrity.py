@@ -32,6 +32,9 @@ QUANTITY_MISMATCH_SEVERITY = "critical"
 PRICE_MISMATCH_SEVERITY = "warning"
 NOTIONAL_MISMATCH_SEVERITY = "warning"
 ORDER_POSITION_MISSING_SEVERITY = "warning"
+POSITION_LINK_MISSING_SEVERITY = "critical"
+POSITION_LINK_MISMATCH_SEVERITY = "critical"
+POSITION_LINK_ORDER_MISSING_SEVERITY = "warning"
 QUANTITY_TOLERANCE_RATIO = 0.02
 PRICE_TOLERANCE_RATIO = 0.01
 NOTIONAL_TOLERANCE_RATIO = 0.05
@@ -147,6 +150,7 @@ class OkxTradeFactIntegrityService:
                     positions,
                 )
             )
+        issues.extend(self._audit_position_authority_links(positions, orders, since=since))
 
         return _summary(
             issues,
@@ -332,6 +336,91 @@ class OkxTradeFactIntegrityService:
                 )
         return issues
 
+    def _audit_position_authority_links(
+        self,
+        positions: list[Position],
+        orders: list[Order],
+        *,
+        since: datetime,
+    ) -> list[TradeFactIssue]:
+        issues: list[TradeFactIssue] = []
+        exchange_orders_by_id: dict[str, list[Order]] = {}
+        for order in orders:
+            for exchange_order_id in _split_exchange_order_ids(order.exchange_order_id):
+                exchange_orders_by_id.setdefault(exchange_order_id, []).append(order)
+
+        for position in positions:
+            position_symbol = normalize_trading_symbol(position.symbol)
+            okx_inst_id = str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            if okx_inst_id:
+                expected_symbol = symbol_from_okx_inst_id(okx_inst_id)
+                if expected_symbol and position_symbol and expected_symbol != position_symbol:
+                    issues.append(
+                        TradeFactIssue(
+                            kind="position_okx_inst_id_symbol_mismatch",
+                            severity=POSITION_LINK_MISMATCH_SEVERITY,
+                            position_id=int(position.id),
+                            symbol=position_symbol,
+                            expected_symbol=expected_symbol,
+                            reason=(
+                                "Position okx_inst_id points to a different OKX instrument "
+                                "than the local position symbol."
+                            ),
+                        )
+                    )
+
+            entry_ids = _split_exchange_order_ids(
+                getattr(position, "entry_exchange_order_id", None)
+            )
+            close_ids = _split_exchange_order_ids(
+                getattr(position, "close_exchange_order_id", None)
+            )
+            if _position_has_exchange_order_match(position, orders, entry=True) and not entry_ids:
+                issues.append(
+                    TradeFactIssue(
+                        kind="position_missing_entry_order_link",
+                        severity=POSITION_LINK_MISSING_SEVERITY,
+                        position_id=int(position.id),
+                        symbol=position_symbol,
+                        expected_symbol=position_symbol,
+                        reason=(
+                            "Exchange-backed local position has no entry_exchange_order_id; "
+                            "future reconciliation would have to infer the entry by symbol/time."
+                        ),
+                    )
+                )
+            if (
+                not bool(position.is_open)
+                and _safe_float(getattr(position, "realized_pnl", None), 0.0) != 0.0
+                and not close_ids
+            ):
+                issues.append(
+                    TradeFactIssue(
+                        kind="closed_position_missing_close_order_link",
+                        severity=POSITION_LINK_MISSING_SEVERITY,
+                        position_id=int(position.id),
+                        symbol=position_symbol,
+                        expected_symbol=position_symbol,
+                        reason=(
+                            "Closed position has realized PnL but no close_exchange_order_id; "
+                            "profit, replay, and training cannot prove the OKX close fill."
+                        ),
+                    )
+                )
+            recent_entry = _is_recent(position.created_at, since)
+            recent_close = _is_recent(position.closed_at, since)
+            for linked_order_id in (entry_ids if recent_entry else ()):
+                if linked_order_id not in exchange_orders_by_id:
+                    issues.append(
+                        _linked_order_missing_issue(position, position_symbol, linked_order_id)
+                    )
+            for linked_order_id in (close_ids if recent_close else ()):
+                if linked_order_id not in exchange_orders_by_id:
+                    issues.append(
+                        _linked_order_missing_issue(position, position_symbol, linked_order_id)
+                    )
+        return issues
+
 
 def _execution_result_payload(decision: AIDecision | None) -> dict[str, Any]:
     raw = getattr(decision, "raw_llm_response", None)
@@ -439,6 +528,14 @@ def _related_positions_for_order(
         expected_symbols.update(trading_symbol_variants(symbol))
     expected_symbols = {normalize_trading_symbol(symbol) for symbol in expected_symbols if symbol}
 
+    direct_matches = _directly_linked_positions_for_order(
+        order,
+        positions,
+        entry_action=entry_action,
+    )
+    if direct_matches:
+        return direct_matches
+
     matches: list[tuple[float, Position]] = []
     for position in positions:
         if str(position.model_name or "") != str(order.model_name or ""):
@@ -482,6 +579,82 @@ def _related_positions_for_order(
         matches.append((score, position))
     matches.sort(key=lambda item: item[0])
     return [position for _score, position in matches[:5]]
+
+
+def _directly_linked_positions_for_order(
+    order: Order,
+    positions: list[Position],
+    *,
+    entry_action: bool,
+) -> list[Position]:
+    order_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+    if not order_ids:
+        return []
+    field_name = "entry_exchange_order_id" if entry_action else "close_exchange_order_id"
+    matches = [
+        position
+        for position in positions
+        if str(position.model_name or "") == str(order.model_name or "")
+        and str(position.execution_mode or "") == str(order.execution_mode or "")
+        and order_ids.intersection(_split_exchange_order_ids(getattr(position, field_name, None)))
+    ]
+    return sorted(matches, key=lambda position: getattr(position, "id", 0) or 0)[:5]
+
+
+def _position_has_exchange_order_match(
+    position: Position,
+    orders: list[Order],
+    *,
+    entry: bool,
+) -> bool:
+    position_symbol = normalize_trading_symbol(position.symbol)
+    side = str(position.side or "").lower()
+    expected_order_side = "buy" if (entry and side == "long") or (not entry and side == "short") else "sell"
+    position_time = _ensure_aware(position.created_at if entry else position.closed_at)
+    if position_time is None:
+        return False
+    for order in orders:
+        if not str(getattr(order, "exchange_order_id", "") or "").strip():
+            continue
+        if str(order.execution_mode or "") != str(position.execution_mode or ""):
+            continue
+        if normalize_trading_symbol(order.symbol) != position_symbol:
+            continue
+        if str(order.side or "").lower() != expected_order_side:
+            continue
+        order_time = _order_time(order)
+        if order_time is None:
+            continue
+        if abs((order_time - position_time).total_seconds()) <= POSITION_MATCH_WINDOW.total_seconds():
+            return True
+    return False
+
+
+def _linked_order_missing_issue(
+    position: Position,
+    position_symbol: str,
+    linked_order_id: str,
+) -> TradeFactIssue:
+    return TradeFactIssue(
+        kind="position_order_link_missing_local_order",
+        severity=POSITION_LINK_ORDER_MISSING_SEVERITY,
+        position_id=int(position.id),
+        symbol=position_symbol,
+        expected_symbol=position_symbol,
+        reason=(
+            "Position references OKX order id "
+            f"{linked_order_id}, but that order is not present in recent local filled orders."
+        ),
+    )
+
+
+def _is_recent(value: datetime | None, since: datetime) -> bool:
+    aware = _ensure_aware(value)
+    return aware is not None and aware >= since
+
+
+def _split_exchange_order_ids(value: Any) -> set[str]:
+    return {item.strip() for item in str(value or "").split(",") if item.strip()}
 
 
 def _order_time(order: Order) -> datetime | None:

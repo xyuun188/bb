@@ -32,6 +32,7 @@ def test_normalized_open_position_context_uses_contract_value_and_stable_open_ti
             "leverage": 10,
             "info": {
                 "instId": "AUCTION-USDT-SWAP",
+                "posId": "auction-pos",
                 "pos": "99.5",
                 "ctVal": "0.1",
                 "avgPx": "3.532",
@@ -50,6 +51,8 @@ def test_normalized_open_position_context_uses_contract_value_and_stable_open_ti
     assert context["base_quantity"] == pytest.approx(9.95)
     assert context["contracts"] == pytest.approx(99.5)
     assert context["contract_size"] == pytest.approx(0.1)
+    assert context["okx_inst_id"] == "AUCTION-USDT-SWAP"
+    assert context["okx_pos_id"] == "auction-pos"
     assert context["notional"] == pytest.approx(35.1434)
     assert context["unrealized_pnl"] == pytest.approx(0.0398)
     assert str(context["created_at"]).startswith(opened_at.isoformat(timespec="seconds")[:19])

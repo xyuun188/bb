@@ -94,6 +94,8 @@ async def test_contract_count_converts_to_base_quantity_without_false_issue(
                         current_price=2.44,
                         leverage=3.0,
                         is_open=True,
+                        okx_inst_id="H-USDT-SWAP",
+                        entry_exchange_order_id="entry-ok",
                         created_at=filled_at + timedelta(seconds=10),
                     ),
                 ]
@@ -104,6 +106,66 @@ async def test_contract_count_converts_to_base_quantity_without_false_issue(
         assert report["status"] == "ok"
         assert report["issue_count"] == 0
         assert report["checked_orders"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_order_direct_link_wins_over_time_window(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=55)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="H/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(contracts=100, contract_size=0.1),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="H/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=10.0,
+                        price=2.44,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="entry-direct",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="H/USDT",
+                        side="long",
+                        quantity=10.0,
+                        entry_price=2.44,
+                        current_price=2.44,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="H-USDT-SWAP",
+                        entry_exchange_order_id="entry-direct",
+                        created_at=filled_at + timedelta(minutes=30),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
     finally:
         await close_db()
 
@@ -229,6 +291,42 @@ async def test_filled_close_order_without_position_is_a_warning(
 
 
 @pytest.mark.asyncio
+async def test_closed_position_with_realized_pnl_requires_close_order_link(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="LAB/USDT",
+                    side="long",
+                    quantity=0.9,
+                    entry_price=16.86,
+                    current_price=17.44,
+                    realized_pnl=0.51,
+                    leverage=3.0,
+                    is_open=False,
+                    okx_inst_id="LAB-USDT-SWAP",
+                    entry_exchange_order_id="lab-entry",
+                    closed_at=closed_at,
+                    created_at=closed_at - timedelta(minutes=15),
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert report["status"] == "critical"
+        assert "closed_position_missing_close_order_link" in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_entry_order_matches_existing_position_lifecycle_without_false_warning(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -276,11 +374,12 @@ async def test_entry_order_matches_existing_position_lifecycle_without_false_war
                         quantity=1.0,
                         entry_price=0.3902,
                         current_price=0.3948,
-                        realized_pnl=0.0042,
+                        realized_pnl=0.0,
                         leverage=3.0,
-                        is_open=False,
+                        is_open=True,
+                        okx_inst_id="PROS-USDT-SWAP",
+                        entry_exchange_order_id="pros-add-fill",
                         created_at=filled_at - timedelta(days=10),
-                        closed_at=filled_at + timedelta(hours=2),
                     ),
                 ]
             )
@@ -438,6 +537,8 @@ async def test_split_exit_order_uses_weighted_child_fill_price(
                         realized_pnl=37.19755,
                         leverage=6.0,
                         is_open=False,
+                        okx_inst_id="USAR-USDT-SWAP",
+                        close_exchange_order_id="child-1,child-2,child-3",
                         created_at=filled_at - timedelta(hours=5),
                         closed_at=filled_at + timedelta(seconds=1),
                     ),
@@ -514,6 +615,8 @@ async def test_position_matching_does_not_use_absolute_one_price_floor(
                         current_price=0.0817,
                         leverage=3.0,
                         is_open=True,
+                        okx_inst_id="H-USDT-SWAP",
+                        entry_exchange_order_id="h-entry",
                         created_at=filled_at + timedelta(seconds=10),
                     ),
                 ]

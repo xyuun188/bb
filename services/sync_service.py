@@ -15,6 +15,7 @@ from sqlalchemy import select
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
+from core.symbols import okx_inst_id_from_payload, trading_symbol_variants
 from core.trading_mode import mode_manager
 from db.repositories.account_repo import AccountRepository
 from db.repositories.trade_repo import TradeRepository
@@ -70,6 +71,47 @@ def _close_fill_order_info(close_fill: dict[str, Any] | None) -> dict[str, Any]:
         return info
     raw = _dict_value(fill.get("raw"))
     return _dict_value(raw.get("info"))
+
+
+def _okx_inst_id_from_position_payload(position_payload: dict[str, Any]) -> str:
+    info = _dict_value(position_payload.get("info"))
+    return okx_inst_id_from_payload(
+        {
+            **position_payload,
+            "info": info,
+            "instId": _first_value(info.get("instId"), position_payload.get("instId")),
+        },
+        fallback=position_payload.get("symbol"),
+    )
+
+
+def _okx_pos_id_from_position_payload(position_payload: dict[str, Any]) -> str:
+    info = _dict_value(position_payload.get("info"))
+    for candidate in (
+        info.get("posId"),
+        position_payload.get("posId"),
+        position_payload.get("okx_pos_id"),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _okx_inst_id_from_close_fill(close_fill: dict[str, Any] | None, *, fallback: Any) -> str:
+    fill = _dict_value(close_fill)
+    info = _close_fill_order_info(fill)
+    return okx_inst_id_from_payload({**fill, "info": info}, fallback=fallback)
+
+
+def _okx_pos_id_from_close_fill(close_fill: dict[str, Any] | None) -> str:
+    fill = _dict_value(close_fill)
+    info = _close_fill_order_info(fill)
+    for candidate in (info.get("posId"), fill.get("posId"), fill.get("okx_pos_id")):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _close_fill_has_protection_metadata(close_fill: dict[str, Any] | None) -> bool:
@@ -143,6 +185,8 @@ def normalized_open_position_context(
 ) -> dict[str, Any]:
     raw_info = position_payload.get("info")
     info = raw_info if isinstance(raw_info, dict) else {}
+    okx_inst_id = _okx_inst_id_from_position_payload(position_payload)
+    okx_pos_id = _okx_pos_id_from_position_payload(position_payload)
     snapshot = parse_exchange_position_snapshot(
         position_payload,
         symbol_normalizer=symbol_normalizer,
@@ -215,6 +259,8 @@ def normalized_open_position_context(
             "take_profit": position_payload.get("take_profit"),
             "is_open": position_payload.get("is_open", True),
             "created_at": _position_context_opened_at(position_payload, info),
+            "okx_inst_id": okx_inst_id,
+            "okx_pos_id": okx_pos_id,
             "info": info,
         }
 
@@ -313,6 +359,8 @@ def normalized_open_position_context(
         "take_profit": position_payload.get("take_profit"),
         "is_open": position_payload.get("is_open", True),
         "created_at": _position_context_opened_at(position_payload, info),
+        "okx_inst_id": okx_inst_id,
+        "okx_pos_id": okx_pos_id,
         "info": info,
     }
 
@@ -988,6 +1036,9 @@ class OkxSyncService:
                     key = (symbol, side)
 
                     info = exchange_pos.get("info") or {}
+                    symbol_variants = trading_symbol_variants(symbol)
+                    okx_inst_id = _okx_inst_id_from_position_payload(exchange_pos)
+                    okx_pos_id = _okx_pos_id_from_position_payload(exchange_pos)
                     quantity = parse_float(snapshot.get("quantity"), 0.0)
                     entry_price = parse_float(snapshot.get("entry_price"), 0.0)
                     if quantity <= 0 or entry_price <= 0:
@@ -1049,6 +1100,11 @@ class OkxSyncService:
                             stop_loss_price=stop_loss_price,
                             take_profit_price=take_profit_price,
                         )
+                        for local_position in matching_local_positions:
+                            if okx_inst_id:
+                                local_position.okx_inst_id = okx_inst_id
+                            if okx_pos_id:
+                                local_position.okx_pos_id = okx_pos_id
                         local_open_keys.add(key)
                         quantity_tolerance = max(
                             abs(local_total_before) * 0.001,
@@ -1127,7 +1183,7 @@ class OkxSyncService:
                         select(Position)
                         .where(
                             Position.execution_mode == "paper",
-                            Position.symbol == symbol,
+                            Position.symbol.in_(symbol_variants),
                             Position.side == side,
                             Position.is_open.is_(False),
                         )
@@ -1146,6 +1202,9 @@ class OkxSyncService:
                         closed_position.stop_loss_price = stop_loss_price
                         closed_position.take_profit_price = take_profit_price
                         closed_position.closed_at = None
+                        closed_position.okx_inst_id = okx_inst_id or closed_position.okx_inst_id
+                        closed_position.okx_pos_id = okx_pos_id or closed_position.okx_pos_id
+                        closed_position.close_exchange_order_id = None
                         closed_position.updated_at = datetime.now(UTC)
                         local_open_keys.add(key)
                         reconciled.append(
@@ -1170,7 +1229,7 @@ class OkxSyncService:
                         select(Order)
                         .where(
                             Order.execution_mode == "paper",
-                            Order.symbol == symbol,
+                            Order.symbol.in_(symbol_variants),
                             Order.side == entry_side,
                             Order.exchange_order_id.is_not(None),
                             Order.exchange_order_id != "",
@@ -1210,22 +1269,27 @@ class OkxSyncService:
                     order.price = order.price or entry_price
                     order.filled_at = order.filled_at or opened_at
 
-                    await trade_repo.open_position(
-                        {
-                            "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
-                            "execution_mode": "paper",
-                            "symbol": symbol,
-                            "side": side,
-                            "quantity": quantity,
-                            "entry_price": entry_price,
-                            "current_price": current_price,
-                            "leverage": leverage,
-                            "unrealized_pnl": exchange_unrealized,
-                            "realized_pnl": exchange_realized,
-                            "stop_loss_price": stop_loss_price,
-                            "take_profit_price": take_profit_price,
-                        }
-                    )
+                    position_payload = {
+                        "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
+                        "execution_mode": "paper",
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": quantity,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "leverage": leverage,
+                        "unrealized_pnl": exchange_unrealized,
+                        "realized_pnl": exchange_realized,
+                        "stop_loss_price": stop_loss_price,
+                        "take_profit_price": take_profit_price,
+                    }
+                    if okx_inst_id:
+                        position_payload["okx_inst_id"] = okx_inst_id
+                    if okx_pos_id:
+                        position_payload["okx_pos_id"] = okx_pos_id
+                    if order.exchange_order_id:
+                        position_payload["entry_exchange_order_id"] = order.exchange_order_id
+                    await trade_repo.open_position(position_payload)
                     local_open_keys.add(key)
                     reconciled.append(
                         {
@@ -1386,6 +1450,12 @@ class OkxSyncService:
                         )
                         continue
                     close_fee = float(close_fill.get("fee") or 0.0)
+                    close_order_id = str(close_fill.get("order_id") or "").strip()
+                    close_okx_inst_id = _okx_inst_id_from_close_fill(
+                        close_fill,
+                        fallback=pos.symbol,
+                    )
+                    close_okx_pos_id = _okx_pos_id_from_close_fill(close_fill)
                     if pos.side == "short":
                         gross_pnl = (pos.entry_price - exit_price) * pos.quantity
                         close_side = "buy"
@@ -1401,6 +1471,12 @@ class OkxSyncService:
                     pos.unrealized_pnl = 0.0
                     pos.realized_pnl = realized_pnl
                     pos.closed_at = close_fill.get("timestamp") or datetime.now(UTC)
+                    if close_okx_inst_id:
+                        pos.okx_inst_id = close_okx_inst_id
+                    if close_okx_pos_id:
+                        pos.okx_pos_id = close_okx_pos_id
+                    if close_order_id:
+                        pos.close_exchange_order_id = close_order_id
                     decision_id = await log_exchange_sync_close_decision(
                         session=session,
                         pos=pos,
@@ -1426,7 +1502,6 @@ class OkxSyncService:
                     )
 
                     existing_close_order = None
-                    close_order_id = str(close_fill.get("order_id") or "")
                     if close_order_id:
                         existing_close_order_result = await session.execute(
                             select(Order.id)
@@ -1451,7 +1526,7 @@ class OkxSyncService:
                                 "status": OrderStatus.FILLED.value,
                                 "fee": close_fee,
                                 "decision_id": decision_id,
-                                "exchange_order_id": close_fill.get("order_id"),
+                                "exchange_order_id": close_order_id,
                                 "filled_at": pos.closed_at,
                             }
                         )
@@ -1477,7 +1552,7 @@ class OkxSyncService:
                             "realized_pnl": realized_pnl,
                             "gross_pnl": gross_pnl,
                             "fees": entry_fee + close_fee,
-                            "exchange_order_id": close_fill.get("order_id"),
+                            "exchange_order_id": close_order_id or None,
                         }
                     )
 
@@ -1549,6 +1624,11 @@ class OkxSyncService:
             close_order_id = (
                 str((close_fill or {}).get("order_id") or "").strip() if fill_matches_slice else ""
             )
+            close_okx_inst_id = _okx_inst_id_from_close_fill(
+                close_fill,
+                fallback=pos.symbol,
+            )
+            close_okx_pos_id = _okx_pos_id_from_close_fill(close_fill)
             closed_at = (
                 (close_fill or {}).get("timestamp")
                 if fill_matches_slice and (close_fill or {}).get("timestamp")
@@ -1579,6 +1659,17 @@ class OkxSyncService:
                 "closed_at": closed_at,
                 "created_at": pos.created_at,
             }
+            okx_inst_id = getattr(pos, "okx_inst_id", None) or close_okx_inst_id
+            okx_pos_id = getattr(pos, "okx_pos_id", None) or close_okx_pos_id
+            entry_exchange_order_id = getattr(pos, "entry_exchange_order_id", None)
+            if okx_inst_id:
+                closed_position_payload["okx_inst_id"] = okx_inst_id
+            if okx_pos_id:
+                closed_position_payload["okx_pos_id"] = okx_pos_id
+            if entry_exchange_order_id:
+                closed_position_payload["entry_exchange_order_id"] = entry_exchange_order_id
+            if close_order_id:
+                closed_position_payload["close_exchange_order_id"] = close_order_id
             closed_position = await trade_repo.open_position(closed_position_payload)
             decision_pos = SimpleNamespace(
                 **{
@@ -1740,6 +1831,8 @@ class OkxSyncService:
                                 "take_profit": p.take_profit_price,
                                 "is_open": p.is_open,
                                 "created_at": p.created_at,
+                                "okx_inst_id": getattr(p, "okx_inst_id", None),
+                                "okx_pos_id": getattr(p, "okx_pos_id", None),
                             }
                         )
         except Exception as e:

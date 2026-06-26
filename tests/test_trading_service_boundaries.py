@@ -4845,6 +4845,8 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
     assert closed.current_price == 3.85
     assert closed.realized_pnl == pytest.approx(15.37)
     assert closed.closed_at == closed_at
+    assert closed.okx_inst_id == "USAR-USDT-SWAP"
+    assert closed.close_exchange_order_id == "usar-close-10"
     assert decision_logs[0]["position_size_pct"] == pytest.approx(10.0 / 16.0)
     assert decision_logs[0]["close_fill"]["partial_reduction"] is True
     assert decision_logs[0]["close_fill"]["order_id"] == "usar-close-10"
@@ -5042,6 +5044,8 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_
             "realized_pnl": 0.0,
             "stop_loss_price": 95.0,
             "take_profit_price": 125.0,
+            "okx_inst_id": "BTC-USDT-SWAP",
+            "entry_exchange_order_id": "entry-order-1",
         }
     ]
     assert result == [

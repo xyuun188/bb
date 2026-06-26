@@ -42,3 +42,7 @@ class Position(Base, TimestampMixin):
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    okx_inst_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    okx_pos_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    entry_exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    close_exchange_order_id: Mapped[str | None] = mapped_column(String(500), nullable=True)

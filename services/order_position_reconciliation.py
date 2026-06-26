@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 
 from ai_brain.base_model import Action, DecisionOutput
-from core.symbols import normalize_trading_symbol, trading_symbol_variants
+from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, trading_symbol_variants
 from models.decision import AIDecision
 from models.trade import Order, Position
 
@@ -42,6 +42,8 @@ class MissingClosedPositionPlan:
     closed_at: datetime
     entry_order_id: int
     close_order_id: int
+    okx_inst_id: str | None
+    okx_pos_id: str | None
     entry_exchange_order_id: str | None
     close_exchange_order_id: str | None
 
@@ -146,6 +148,8 @@ async def plan_missing_closed_position(
         closed_at=closed_at,
         entry_order_id=int(entry_order.id),
         close_order_id=int(close_order.id),
+        okx_inst_id=okx_inst_id_from_symbol(symbol) or None,
+        okx_pos_id=None,
         entry_exchange_order_id=entry_order.exchange_order_id,
         close_exchange_order_id=close_order.exchange_order_id,
     )
@@ -173,6 +177,10 @@ async def apply_missing_closed_position_plan(
         is_open=False,
         closed_at=plan.closed_at,
         created_at=plan.created_at,
+        okx_inst_id=plan.okx_inst_id,
+        okx_pos_id=plan.okx_pos_id,
+        entry_exchange_order_id=plan.entry_exchange_order_id,
+        close_exchange_order_id=plan.close_exchange_order_id,
     )
     session.add(position)
     await session.flush()

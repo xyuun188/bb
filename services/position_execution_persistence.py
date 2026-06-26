@@ -11,7 +11,7 @@ import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
+from core.symbols import normalize_trading_symbol, okx_inst_id_from_payload, symbol_from_okx_payload
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
@@ -130,6 +130,38 @@ class PositionExecutionPersistenceService:
         return normalize_trading_symbol(getattr(result, "symbol", None) or decision.symbol)
 
     @staticmethod
+    def _result_exchange_order_id(result: Any) -> str:
+        value = str(
+            getattr(result, "exchange_order_id", None) or getattr(result, "order_id", None) or ""
+        ).strip()
+        return value if value not in {"hold", "rejected", "no_position"} else ""
+
+    @staticmethod
+    def _result_okx_inst_id(result: Any, symbol: str) -> str:
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        exchange_order_id = PositionExecutionPersistenceService._result_exchange_order_id(result)
+        if not raw and not exchange_order_id:
+            return ""
+        return okx_inst_id_from_payload(raw, fallback=symbol)
+
+    @staticmethod
+    def _result_okx_pos_id(result: Any) -> str:
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        for candidate in (
+            info.get("posId"),
+            raw.get("posId"),
+            raw.get("okx_pos_id"),
+            raw.get("position_id"),
+        ):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
     async def _persist_entry(
         repo: TradeRepository,
         model_name: str,
@@ -139,6 +171,11 @@ class PositionExecutionPersistenceService:
     ) -> None:
         side = "long" if decision.action == Action.LONG else "short"
         symbol = PositionExecutionPersistenceService._result_symbol(result, decision)
+        okx_inst_id = PositionExecutionPersistenceService._result_okx_inst_id(result, symbol)
+        okx_pos_id = PositionExecutionPersistenceService._result_okx_pos_id(result)
+        entry_exchange_order_id = PositionExecutionPersistenceService._result_exchange_order_id(
+            result
+        )
         stop_loss = (
             result.price * (1 - decision.stop_loss_pct)
             if side == "long"
@@ -149,22 +186,27 @@ class PositionExecutionPersistenceService:
             if side == "long"
             else result.price * (1 - decision.take_profit_pct)
         )
-        await repo.open_position(
-            {
-                "model_name": model_name,
-                "execution_mode": execution_mode,
-                "symbol": symbol,
-                "side": side,
-                "quantity": result.quantity,
-                "entry_price": result.price,
-                "current_price": result.price,
-                "leverage": decision.suggested_leverage,
-                "unrealized_pnl": 0.0,
-                "realized_pnl": 0.0,
-                "stop_loss_price": stop_loss,
-                "take_profit_price": take_profit,
-            }
-        )
+        payload = {
+            "model_name": model_name,
+            "execution_mode": execution_mode,
+            "symbol": symbol,
+            "side": side,
+            "quantity": result.quantity,
+            "entry_price": result.price,
+            "current_price": result.price,
+            "leverage": decision.suggested_leverage,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "stop_loss_price": stop_loss,
+            "take_profit_price": take_profit,
+        }
+        if okx_inst_id:
+            payload["okx_inst_id"] = okx_inst_id
+        if okx_pos_id:
+            payload["okx_pos_id"] = okx_pos_id
+        if entry_exchange_order_id:
+            payload["entry_exchange_order_id"] = entry_exchange_order_id
+        await repo.open_position(payload)
 
     async def _persist_exit(
         self,
@@ -177,6 +219,9 @@ class PositionExecutionPersistenceService:
     ) -> None:
         side = "long" if decision.action == Action.CLOSE_LONG else "short"
         symbol = self._result_symbol(result, decision)
+        result_okx_inst_id = self._result_okx_inst_id(result, symbol)
+        result_okx_pos_id = self._result_okx_pos_id(result)
+        close_exchange_order_id = self._result_exchange_order_id(result)
         positions = await repo.get_matching_open_positions(
             model_name=model_name,
             symbol=symbol,
@@ -249,25 +294,35 @@ class PositionExecutionPersistenceService:
             if not closes_position:
                 position.quantity -= close_qty
                 remaining_qty = 0
-                closed_pos = await repo.open_position(
-                    {
-                        "model_name": model_name,
-                        "execution_mode": execution_mode,
-                        "symbol": symbol,
-                        "side": side,
-                        "quantity": close_qty,
-                        "entry_price": position.entry_price,
-                        "current_price": result.price,
-                        "leverage": position.leverage,
-                        "unrealized_pnl": 0.0,
-                        "realized_pnl": pnl,
-                        "stop_loss_price": position.stop_loss_price,
-                        "take_profit_price": position.take_profit_price,
-                        "is_open": False,
-                        "closed_at": result.timestamp,
-                        "created_at": position.created_at,
-                    }
-                )
+                closed_payload = {
+                    "model_name": model_name,
+                    "execution_mode": execution_mode,
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": close_qty,
+                    "entry_price": position.entry_price,
+                    "current_price": result.price,
+                    "leverage": position.leverage,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": pnl,
+                    "stop_loss_price": position.stop_loss_price,
+                    "take_profit_price": position.take_profit_price,
+                    "is_open": False,
+                    "closed_at": result.timestamp,
+                    "created_at": position.created_at,
+                }
+                okx_inst_id = getattr(position, "okx_inst_id", None) or result_okx_inst_id
+                okx_pos_id = getattr(position, "okx_pos_id", None) or result_okx_pos_id
+                entry_exchange_order_id = getattr(position, "entry_exchange_order_id", None)
+                if okx_inst_id:
+                    closed_payload["okx_inst_id"] = okx_inst_id
+                if okx_pos_id:
+                    closed_payload["okx_pos_id"] = okx_pos_id
+                if entry_exchange_order_id:
+                    closed_payload["entry_exchange_order_id"] = entry_exchange_order_id
+                if close_exchange_order_id:
+                    closed_payload["close_exchange_order_id"] = close_exchange_order_id
+                closed_pos = await repo.open_position(closed_payload)
                 await self._record_reflection(
                     session,
                     closed_pos,
@@ -284,6 +339,12 @@ class PositionExecutionPersistenceService:
                 position.unrealized_pnl = 0.0
                 position.realized_pnl = pnl
                 position.closed_at = result.timestamp
+                if result_okx_inst_id and not getattr(position, "okx_inst_id", None):
+                    position.okx_inst_id = result_okx_inst_id
+                if result_okx_pos_id and not getattr(position, "okx_pos_id", None):
+                    position.okx_pos_id = result_okx_pos_id
+                if close_exchange_order_id:
+                    position.close_exchange_order_id = close_exchange_order_id
                 remaining_qty -= close_qty
                 await self._record_reflection(
                     session,

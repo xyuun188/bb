@@ -161,6 +161,9 @@ async def init_db() -> None:
                     WHERE closed_at IS NULL
                       AND position_id IS NOT NULL
                     """))
+        await _ensure_trade_fact_columns(conn)
+        await _ensure_trade_fact_indexes(conn)
+        if "sqlite" in settings.database_url:
             for ddl in [
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created ON ai_decisions (is_paper, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_model_mode_created ON ai_decisions (model_name, is_paper, created_at DESC)",
@@ -185,6 +188,42 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_secure_setting_audit_key_created ON secure_setting_audit (key, created_at DESC)",
             ]:
                 await conn.execute(text(ddl))
+
+
+async def _ensure_trade_fact_columns(conn: Any) -> None:
+    """Backfill lightweight trade fact linkage columns for existing databases."""
+
+    if "sqlite" in settings.database_url:
+        result = await conn.execute(text("PRAGMA table_info(positions)"))
+        columns = {row[1] for row in result.fetchall()}
+        sqlite_columns = {
+            "okx_inst_id": "VARCHAR(64)",
+            "okx_pos_id": "VARCHAR(100)",
+            "entry_exchange_order_id": "VARCHAR(100)",
+            "close_exchange_order_id": "VARCHAR(500)",
+        }
+        for name, column_type in sqlite_columns.items():
+            if name not in columns:
+                await conn.execute(text(f"ALTER TABLE positions ADD COLUMN {name} {column_type}"))
+        return
+
+    if "postgresql" in settings.database_url:
+        for ddl in (
+            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS okx_inst_id VARCHAR(64)",
+            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS okx_pos_id VARCHAR(100)",
+            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_exchange_order_id VARCHAR(100)",
+            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_exchange_order_id VARCHAR(500)",
+        ):
+            await conn.execute(text(ddl))
+
+
+async def _ensure_trade_fact_indexes(conn: Any) -> None:
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_positions_okx_inst_side ON positions (okx_inst_id, side)",
+        "CREATE INDEX IF NOT EXISTS idx_positions_entry_exchange_order ON positions (entry_exchange_order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_positions_close_exchange_order ON positions (close_exchange_order_id)",
+    ):
+        await conn.execute(text(ddl))
 
 
 async def close_db() -> None:
