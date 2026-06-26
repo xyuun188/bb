@@ -148,7 +148,7 @@ def parse_exchange_position_snapshot(
     if not ExchangePositionStatePolicy.is_open(position):
         return None
     info = position.get("info") or {}
-    symbol = symbol_normalizer(position.get("symbol") or info.get("instId"))
+    symbol = symbol_normalizer(info.get("instId") or position.get("symbol"))
     side = str(position.get("side") or info.get("posSide") or "").lower()
     if not symbol or side not in {"long", "short"}:
         return None
@@ -246,7 +246,8 @@ def parse_exchange_position_snapshot(
         "quantity": quantity,
         "raw_quantity": raw_quantity,
         "margin_used": margin_used,
-        "raw_symbol": position.get("symbol") or info.get("instId"),
+        "raw_symbol": info.get("instId") or position.get("symbol"),
+        "ccxt_symbol": position.get("symbol"),
     }
 
 

@@ -32,7 +32,6 @@ EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS = 6.0
 EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS = 8.0
 RECONCILE_ORIGIN_SYSTEM_PROTECTION = "system_protection"
 RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
-RECONCILE_ORIGIN_LOCAL_SNAPSHOT_CORRECTION = "local_snapshot_correction"
 
 
 def _first_value(*values: Any) -> Any:
@@ -923,8 +922,6 @@ class OkxSyncService:
         sync_local_open_position_snapshot = self._required_local_position_snapshot_syncer()
         datetime_from_ms = self._required_datetime_from_ms_parser()
         find_exchange_close_fill = self._required_exchange_close_fill_finder()
-        fresh_feature_vector_for_price_recheck = self._required_fresh_feature_vector_provider()
-        read_market_value = self._required_market_value_reader()
         entry_fee_for_position = self._required_entry_fee_provider()
         log_exchange_sync_close_decision = self._required_exchange_sync_close_decision_logger()
         record_trade_reflection = self._required_trade_reflection_recorder()
@@ -1357,77 +1354,25 @@ class OkxSyncService:
                             )
                             continue
 
-                        exit_price = pos.current_price or pos.entry_price
-                        fresh = await fresh_feature_vector_for_price_recheck(pos.symbol)
-                        if fresh is not None:
-                            fresh_price = parse_float(
-                                read_market_value(fresh, "current_price")
-                                or read_market_value(fresh, "close")
-                                or read_market_value(fresh, "bid")
-                                or read_market_value(fresh, "ask"),
-                                0.0,
-                            )
-                            if fresh_price > 0:
-                                exit_price = fresh_price
-                        if pos.side == "short":
-                            gross_pnl = (
-                                float(pos.entry_price or 0.0) - float(exit_price or 0.0)
-                            ) * float(pos.quantity or 0.0)
-                        else:
-                            gross_pnl = (
-                                float(exit_price or 0.0) - float(pos.entry_price or 0.0)
-                            ) * float(pos.quantity or 0.0)
-                        entry_fee = await entry_fee_for_position(session, pos, pos.quantity)
-                        estimated_pnl = gross_pnl - entry_fee
-                        await log_exchange_sync_close_decision(
-                            session=session,
-                            pos=pos,
-                            exit_price=exit_price,
-                            realized_pnl=0.0,
-                            closed_at=now,
-                            reason=(
-                                "OKX 已没有这笔持仓，但没有查到对应平仓成交回报；"
-                                "系统按交易所仓位状态同步为平仓，并用本地开仓价与同步平仓价估算盈亏。"
-                            ),
-                            close_fill={
-                                "estimated": True,
-                                "price": exit_price,
-                                "gross_pnl": gross_pnl,
-                                "entry_fee": entry_fee,
-                                "fee": 0.0,
-                                "estimated_pnl": estimated_pnl,
-                                "pnl": 0.0,
-                                "fresh_price_used": bool(fresh is not None),
-                                "note": (
-                                    "close fill not found; local stale-open snapshot closed without "
-                                    "recording estimated pnl as realized trading pnl"
-                                ),
-                            },
-                            reconcile_origin=RECONCILE_ORIGIN_LOCAL_SNAPSHOT_CORRECTION,
-                        )
-                        pos.is_open = False
-                        pos.current_price = exit_price
-                        pos.unrealized_pnl = 0.0
-                        pos.realized_pnl = 0.0
-                        pos.closed_at = now
                         reconciled.append(
                             {
                                 "model_name": pos.model_name,
                                 "symbol": pos.symbol,
                                 "side": pos.side,
-                                "exit_price": pos.current_price,
-                                "realized_pnl": 0.0,
-                                "estimated_pnl": estimated_pnl,
                                 "exchange_order_id": None,
-                                "note": "OKX 已无对应持仓，未查到平仓成交回报；本地已按同步价格估算盈亏并关闭仓位。",
+                                "requires_attention": True,
+                                "note": (
+                                    "OKX did not return this position and no matching close fill "
+                                    "was found; the local position remains open until an exchange "
+                                    "fill or authoritative position snapshot confirms closure."
+                                ),
                             }
                         )
                         logger.warning(
-                            "closed stale local position snapshot without recording realized pnl",
+                            "skip local close because OKX close fill is missing",
                             position_id=pos.id,
                             symbol=pos.symbol,
                             side=pos.side,
-                            estimated_pnl=estimated_pnl,
                         )
                         continue
                     exit_price = close_fill.get("price") or pos.current_price or pos.entry_price

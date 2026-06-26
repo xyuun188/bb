@@ -47,6 +47,36 @@ def test_parse_okx_position_snapshot_prefers_info_markpx_upl_and_ctval() -> None
     assert exchange_snapshot_unrealized(snapshot, "long") == pytest.approx(-0.82)
 
 
+def test_parse_okx_position_snapshot_prefers_inst_id_over_ccxt_alias_symbol() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "SAHARA/USDT:USDT",
+            "side": "short",
+            "contracts": 100,
+            "markPrice": 0.01751,
+            "entryPrice": 0.0179,
+            "info": {
+                "instId": "SPK-USDT-SWAP",
+                "uly": "SAHARA-USDT",
+                "ctValCcy": "SPK",
+                "pos": "-100",
+                "ctVal": "1",
+                "avgPx": "0.0179",
+                "markPx": "0.01751",
+                "upl": "0.039",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["symbol"] == "SPK/USDT"
+    assert snapshot["ccxt_symbol"] == "SAHARA/USDT:USDT"
+    assert snapshot["raw_symbol"] == "SPK-USDT-SWAP"
+    assert snapshot["side"] == "short"
+    assert snapshot["quantity"] == pytest.approx(100.0)
+
+
 def test_parse_okx_position_snapshot_treats_quantity_as_contracts_when_contracts_exist() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

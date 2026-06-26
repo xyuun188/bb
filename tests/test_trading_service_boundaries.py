@@ -4434,7 +4434,9 @@ async def test_sync_service_close_fill_lookup_timeout_is_phase_specific(
 
 
 @pytest.mark.asyncio
-async def test_sync_service_missing_market_symbol_close_fill_allows_snapshot_correction() -> None:
+async def test_sync_service_missing_market_symbol_close_fill_returns_empty_without_round_error() -> (
+    None
+):
     errors: list[str] = []
     service = OkxSyncService(round_error_recorder=errors.append)
 
@@ -4452,7 +4454,7 @@ async def test_sync_service_missing_market_symbol_close_fill_allows_snapshot_cor
 
 
 @pytest.mark.asyncio
-async def test_sync_service_missing_market_symbol_active_order_does_not_block_local_correction():
+async def test_sync_service_missing_market_symbol_active_order_returns_no_active_order():
     class FakeExecutor:
         async def get_open_orders_strict(self, _symbol):
             raise RuntimeError("okx does not have market symbol NG/USDT:USDT")
@@ -4478,7 +4480,7 @@ async def test_sync_service_missing_market_symbol_active_order_does_not_block_lo
 
 
 @pytest.mark.asyncio
-async def test_sync_service_missing_exchange_position_closes_snapshot_without_fake_order(
+async def test_sync_service_missing_exchange_position_keeps_snapshot_open_without_close_fill(
     monkeypatch: pytest.MonkeyPatch,
 ):
     created_at = datetime.now(UTC) - timedelta(days=2)
@@ -4580,17 +4582,14 @@ async def test_sync_service_missing_exchange_position_closes_snapshot_without_fa
         memory_position_remover=lambda _model_name, _symbol, _side: None,
     ).reconcile_exchange_positions()
 
-    assert local_position.is_open is False
+    assert local_position.is_open is True
     assert local_position.realized_pnl == 0.0
-    assert local_position.unrealized_pnl == 0.0
-    assert local_position.closed_at is not None
+    assert local_position.unrealized_pnl == 0.006
+    assert local_position.closed_at is None
     assert created_orders == []
-    assert decision_logs[0]["realized_pnl"] == 0.0
-    assert decision_logs[0]["reconcile_origin"] == "local_snapshot_correction"
-    assert decision_logs[0]["close_fill"]["estimated_pnl"] == pytest.approx(0.0043305)
-    assert decision_logs[0]["close_fill"]["pnl"] == 0.0
-    assert result[0]["realized_pnl"] == 0.0
-    assert result[0]["estimated_pnl"] == pytest.approx(0.0043305)
+    assert decision_logs == []
+    assert result[0]["requires_attention"] is True
+    assert "no matching close fill" in result[0]["note"]
 
 
 @pytest.mark.asyncio
@@ -5212,7 +5211,7 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_close_bou
 
 
 @pytest.mark.asyncio
-async def test_sync_service_reconcile_exchange_positions_uses_injected_price_recheck(
+async def test_sync_service_reconcile_exchange_positions_does_not_estimate_missing_close_fill(
     monkeypatch: pytest.MonkeyPatch,
 ):
     position = SimpleNamespace(
@@ -5318,19 +5317,14 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_price_rec
     service.active_exchange_order_for_local_position = no_active_order  # type: ignore[method-assign]
     result = await service.reconcile_exchange_positions()
 
-    assert fresh_calls == ["BTC/USDT"]
-    assert market_value_calls == ["current_price"]
-    assert decision_logs[0]["exit_price"] == 115.0
-    assert decision_logs[0]["realized_pnl"] == 0.0
-    assert decision_logs[0]["close_fill"]["estimated_pnl"] == pytest.approx(29.0)
-    assert decision_logs[0]["close_fill"]["pnl"] == 0.0
+    assert fresh_calls == []
+    assert market_value_calls == []
+    assert decision_logs == []
     assert created_orders == []
-    assert position.is_open is False
-    assert position.current_price == 115.0
+    assert position.is_open is True
+    assert position.current_price == 104.0
     assert position.realized_pnl == 0.0
-    assert result[0]["exit_price"] == 115.0
-    assert result[0]["realized_pnl"] == 0.0
-    assert result[0]["estimated_pnl"] == pytest.approx(29.0)
+    assert result[0]["requires_attention"] is True
     assert result[0]["exchange_order_id"] is None
 
 

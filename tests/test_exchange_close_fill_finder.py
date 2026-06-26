@@ -7,12 +7,25 @@ from services.exchange_close_fill_finder import ExchangeCloseFillFinder, order_f
 
 
 class _FakeCcxt:
-    def __init__(self, *, closed_orders=None, trades=None, contract_size=0.5) -> None:
+    def __init__(
+        self,
+        *,
+        closed_orders=None,
+        trades=None,
+        fills_history=None,
+        contract_size=0.5,
+        market_error: Exception | None = None,
+    ) -> None:
         self.closed_orders = closed_orders or []
         self.trades = trades or []
+        self.fills_history = fills_history or []
         self.contract_size = contract_size
+        self.market_error = market_error
+        self.fill_history_params: list[dict] = []
 
     def market(self, _symbol):
+        if self.market_error:
+            raise self.market_error
         return {"contractSize": self.contract_size}
 
     async def fetch_closed_orders(self, *_args):
@@ -20,6 +33,10 @@ class _FakeCcxt:
 
     async def fetch_my_trades(self, *_args):
         return self.trades
+
+    async def privateGetTradeFillsHistory(self, params):
+        self.fill_history_params.append(params)
+        return {"data": self.fills_history}
 
 
 class _FakePaperOkx:
@@ -164,6 +181,57 @@ async def test_exchange_close_fill_finder_groups_my_trades_when_orders_missing()
     assert result["fee"] == 0.30000000000000004
     assert result["pnl"] == 8.0
     assert result["source"] == "my_trades"
+
+
+@pytest.mark.asyncio
+async def test_exchange_close_fill_finder_reads_native_okx_fills_history_when_market_missing():
+    timestamp = int(datetime(2026, 6, 26, 3, 20, tzinfo=UTC).timestamp() * 1000)
+    ccxt = _FakeCcxt(
+        market_error=RuntimeError("okx does not have market symbol LAB/USDT:USDT"),
+        fills_history=[
+            {
+                "instId": "LAB-USDT-SWAP",
+                "ordId": "close-lab",
+                "side": "sell",
+                "fillSz": "4",
+                "fillPx": "17.43",
+                "fee": "-0.006972",
+                "ts": str(timestamp),
+            },
+            {
+                "instId": "LAB-USDT-SWAP",
+                "ordId": "close-lab",
+                "side": "sell",
+                "fillSz": "5",
+                "fillPx": "17.448",
+                "fee": "-0.008724",
+                "ts": str(timestamp + 1),
+            },
+            {
+                "instId": "LAB-USDT-SWAP",
+                "ordId": "entry-lab",
+                "side": "buy",
+                "fillSz": "9",
+                "fillPx": "16.86",
+                "ts": str(timestamp - 1000),
+            },
+        ],
+    )
+    finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
+
+    result = await finder.find(_position(symbol="LAB/USDT", side="long", quantity=0.9))
+
+    assert ccxt.fill_history_params == [
+        {"instType": "SWAP", "instId": "LAB-USDT-SWAP", "limit": "100"}
+    ]
+    assert result["source"] == "okx_fills_history"
+    assert result["order_id"] == "close-lab"
+    assert result["price"] == pytest.approx(((4 * 17.43) + (5 * 17.448)) / 9)
+    assert result["quantity"] == pytest.approx(0.9)
+    assert result["contracts"] == pytest.approx(9.0)
+    assert result["contract_size"] == pytest.approx(0.1)
+    assert result["contract_size_inferred_from_target"] is True
+    assert result["fee"] == pytest.approx(0.015696)
 
 
 @pytest.mark.asyncio
