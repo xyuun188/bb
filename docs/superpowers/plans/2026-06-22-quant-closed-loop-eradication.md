@@ -3664,3 +3664,78 @@ Git 与线上部署：
 回滚点：
 - 代码层可回滚 `data_feed/okx_ticker_volume.py`、`data_feed/okx_ws_client.py`、`data_feed/feature_vector.py`、`services/data_service.py`、`services/entry_feature_ranker.py`、`data_feed/okx_rest_client.py`、`data_feed/okx_sdk_client.py`、`web_dashboard/api/dashboard.py` 及对应测试。
 - 线上回滚后必须重启 `bb-paper-trading.service` 与 `bb-dashboard.service`，否则交易主进程会保留旧/新混合行情解析逻辑。
+
+---
+
+## 六十八、Batch I 二期阶段 2 补充记录：候选量比与指标缺失口径修正，避免默认指标伪候选和 1h 量比误杀（2026-06-26）
+
+触发原因：
+- 线上候选漏斗在 OKX swap 名义额修正后仍反复 `rank_underfilled=true`，最新 30-120 分钟窗口主因转为 `analysis_volume_ratio_below_floor`。
+- 只读线上探针确认：候选池不是只剩 5 个交易对，最近 30 分钟市场分析已覆盖 21 个交易对、120 分钟覆盖 42 个交易对；真正收窄发生在 ranker 过滤后。
+- 探针进一步发现两个根因：
+  - 部分被选中的样本呈现 `volume_ratio=1.0`、`ADX=20`、`volatility_20=0` 的默认值形态，而线上 DB K 线已经滞后数小时。这说明指标快照缺失后，FeatureVector 默认值把无指标候选伪装成可分析候选。
+  - `volume_ratio` 原先沿用趋势周期优先级，通常来自 `1h`。入场候选筛选需要的是当前活跃度，直接拿 1h 量比会把短周期正在活跃、但 1h 量比低或当前 1h 蜡烛未完成的交易对误杀。
+
+本次修复范围：
+- `data_feed/feature_vector.py`：新增 `indicator_snapshot_available`、`volume_ratio_timeframe`、`entry_activity_volume_ratio`、`entry_activity_volume_timeframe`，并在 LLM 上下文输出入场活跃量比来源。
+- `services/data_service.py`：K 线指标计算前丢弃当前未完成蜡烛；趋势量比保留原 `volume_ratio`，短周期活跃度写入 `entry_activity_volume_ratio`；真实指标存在时才写 `indicator_snapshot_available=true`。
+- `services/entry_feature_ranker.py`：候选评分与 tradable/analysis 量比门统一使用 `entry_activity_volume_ratio`；`indicator_snapshot_available=false` 的 FeatureVector 归因 `missing_indicator_snapshot`，不得进入 hard/secondary candidate，也不得 fallback 消耗市场分析。
+- `scripts/inspect_online_strategy_health.py`：market symbol compact 输出保留 `volume_ratio_source`、趋势量比和短周期活跃量比字段，线上排查不再只看到一个模糊 `volume_ratio`。
+- `tests/test_data_service_security.py`、`tests/test_entry_feature_ranker.py`、`tests/test_inspect_online_strategy_health.py`：覆盖未完成 K 线丢弃、短周期活跃量比用于候选过滤、指标缺失不能 fallback、诊断保留量比来源。
+- `tests/test_strong_opportunity.py`：修复固定日期导致的 24 小时 lookback 脆弱测试，改为相对当前时间。
+
+安全边界：
+- 本批不降低 `analysis_volume_ratio`、`analysis_notional`、收益质量、ML readiness、仓位、杠杆、止盈止损、OKX 下单或平仓规则。
+- 本批不改训练样本、不改模型 artifact、不写历史订单/持仓/收益数据、不做 DB 迁移。
+- `entry_activity_volume_ratio` 只改变“候选是否值得花 AI 分析预算”的活跃度口径；它不是执行许可，也不能绕过证据、收益质量、风控、仓位、杠杆、OKX 合约规则。
+- `missing_indicator_snapshot` 出现时，后续必须优先检查 K 线缓存、OKX fetch、feature batch timeout、服务运行环境和数据源刷新；不得把默认指标当成真实技术形态。
+
+本地验证：
+- 定向测试：`pytest tests/test_entry_feature_ranker.py tests/test_data_service_security.py tests/test_inspect_online_strategy_health.py -q`，48 passed。
+- 相关边界测试：`pytest tests/test_trading_service_boundaries.py tests/test_crypto_feature_coverage.py tests/test_trading_params.py -q`，165 passed。
+- 相关辅助测试：`pytest tests/test_entry_candidate_filter.py tests/test_market_hold_penalty.py tests/test_entry_probe_market_quality.py tests/test_market_decision_risk_assessment.py -q`，22 passed。
+- 全量测试：`pytest -q`，1532 passed。
+- `ruff check .`：通过。
+- `black --check .`：通过。
+
+当前真实结论：
+- 本批解决的是“候选量比口径错误”和“指标缺失默认值伪候选”问题。它应减少无真实技术指标的市场分析消耗，并减少 1h 量比对短周期活跃候选的误杀。
+- 这不是“强行多开仓”的改法。后续是否开仓仍取决于证据、预期净收益、收益质量、server_profit、ML readiness、执行契约和 OKX 风控。
+- 如果部署后候选仍 underfilled，下一步必须看 `rank_filtered_out_reason_counts` 中 `missing_indicator_snapshot`、`analysis_volume_ratio_below_floor`、`analysis_notional_below_floor` 的新比例，以及 `volume_ratio_source` 是否已经从 `entry_activity_volume_ratio` 生效。
+- 当前仍未完成的问题包括：ML top return 为负、server_profit selected-side 质量、shadow missed opportunity、强机会 canary、历史脏数据/乱码代码治理、以及不开仓/小单/不赚钱的收益闭环。
+
+后续 AI 防偏要求：
+- 看到 `volume_ratio=1.0`、`ADX=20`、`volatility_20=0` 时，必须先检查 `indicator_snapshot_available` 和 timeframe，不得把默认形态解释成“技术指标健康”。
+- 看到 `analysis_volume_ratio_below_floor` 时，必须同时输出 `volume_ratio_source`、`trend_volume_ratio_timeframe`、`entry_activity_volume_timeframe`；不得直接降阈值。
+- 看到候选交易对重复时，必须区分 scan 覆盖、feature valid、rank filter、recent dedupe、market AI budget 和执行 gate，不能笼统说“全市场没扫到”。
+- 任何后续“多开一点、仓位大一点”的动作，都必须建立在真实强机会识别、收益质量和已成交费后收益验证上，不能用本批候选口径修复当理由。
+
+回滚点：
+- 代码层可回滚 `data_feed/feature_vector.py`、`services/data_service.py`、`services/entry_feature_ranker.py`、`scripts/inspect_online_strategy_health.py` 与对应测试。
+- 线上回滚后必须重启 `bb-paper-trading.service` 与 `bb-dashboard.service`，否则交易主进程仍可能保留旧 FeatureVector/ranker 逻辑。
+
+线上复验补记（2026-06-26 09:49 北京时间）：
+
+- 本轮追加修正了 `scripts/inspect_online_strategy_health.py` 的远端采样模板 compact 层。原因是本地 compact 已输出 `volume_ratio_source` 等字段，但线上 `--market-symbol-only` 实际走的是远端模板；若只补本地层，后续仍会看到模糊 `volume_ratio`，容易误判为没有上线或继续走向降阈值。
+- 本地最终验证：
+  - `pytest tests/test_entry_feature_ranker.py tests/test_inspect_online_strategy_health.py -q`：34 passed。
+  - `pytest -q`：1533 passed。
+  - `ruff check .`：通过。
+  - `black --check .`：通过。
+  - `git diff --check`：通过。
+- 线上部署：
+  - 第一次同步上传 `scripts/inspect_online_strategy_health.py`、`services/entry_feature_ranker.py` 并重启 split services。
+  - 第二次同步仅上传 `scripts/inspect_online_strategy_health.py`，补齐远端模板 compact 层，并重启 split services。
+  - 最终服务状态：`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
+  - 最终远端进程：`bb-paper-trading.service MainPID=1069302 ActiveEnterTimestamp=Fri 2026-06-26 01:44:01 UTC`；后续第二次脚本同步也已重启三项服务。
+  - 远端 `py_compile services/entry_feature_ranker.py scripts/inspect_online_strategy_health.py` 通过。
+- 线上 5 分钟只读复验：
+  - `trade_execution_contract.status=ok`。
+  - `orders=0`、`failed_orders=0`、`rejected_orders=0`、`fast_loss_close_under_15m=0`。
+  - 最新候选漏斗已显示：`volume_ratio_source=entry_activity_volume_ratio`、`trend_volume_ratio_timeframe=1h`、`entry_activity_volume_timeframe=15m/1h`。
+  - 最新漏斗样本示例：`ADA/USDT volume_ratio=0.44 trend_volume_ratio=0.12 entry_activity_volume_ratio=0.4403 entry_activity_volume_timeframe=15m`。
+  - 当前 `rank_filtered_out_reason_counts` 仍以 `analysis_volume_ratio_below_floor` 为主；`missing_indicator_snapshot` 在短窗口中已可被单独计数。
+- 当前真实结论：
+  - 候选诊断字段已经在线上打通，后续看到 `analysis_volume_ratio_below_floor` 时必须同时看量比来源和时间框架。
+  - 本批仍不代表“不赚钱、不开仓、小单、ML degraded、server_profit 反向、历史脏数据、乱码代码”全部完成；这些仍按二期未完成闭环继续推进。
+  - 不得用本批结果作为降量比阈值、放大仓位、提高杠杆、硬启 ML readiness 或绕过 OKX/风控的依据。

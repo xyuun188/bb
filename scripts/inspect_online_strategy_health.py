@@ -1530,6 +1530,26 @@ def compact_candidate_funnel(funnel):
             "selection_tier": item.get("selection_tier"),
             "filter_reasons": safe_list(item.get("filter_reasons")),
             "volume_ratio": item.get("volume_ratio", metrics.get("volume_ratio")),
+            "volume_ratio_source": item.get(
+                "volume_ratio_source",
+                metrics.get("volume_ratio_source"),
+            ),
+            "trend_volume_ratio": item.get(
+                "trend_volume_ratio",
+                metrics.get("trend_volume_ratio"),
+            ),
+            "trend_volume_ratio_timeframe": item.get(
+                "trend_volume_ratio_timeframe",
+                metrics.get("trend_volume_ratio_timeframe"),
+            ),
+            "entry_activity_volume_ratio": item.get(
+                "entry_activity_volume_ratio",
+                metrics.get("entry_activity_volume_ratio"),
+            ),
+            "entry_activity_volume_timeframe": item.get(
+                "entry_activity_volume_timeframe",
+                metrics.get("entry_activity_volume_timeframe"),
+            ),
             "adx": item.get("adx", metrics.get("adx")),
             "change_24h": item.get("change_24h", metrics.get("change_24h")),
             "notional_24h": metrics.get("notional_24h"),
@@ -3159,6 +3179,26 @@ def _compact_candidate_funnel(funnel: dict) -> dict:
             "selection_tier": item.get("selection_tier"),
             "filter_reasons": item.get("filter_reasons", []),
             "volume_ratio": item.get("volume_ratio", metrics.get("volume_ratio")),
+            "volume_ratio_source": item.get(
+                "volume_ratio_source",
+                metrics.get("volume_ratio_source"),
+            ),
+            "trend_volume_ratio": item.get(
+                "trend_volume_ratio",
+                metrics.get("trend_volume_ratio"),
+            ),
+            "trend_volume_ratio_timeframe": item.get(
+                "trend_volume_ratio_timeframe",
+                metrics.get("trend_volume_ratio_timeframe"),
+            ),
+            "entry_activity_volume_ratio": item.get(
+                "entry_activity_volume_ratio",
+                metrics.get("entry_activity_volume_ratio"),
+            ),
+            "entry_activity_volume_timeframe": item.get(
+                "entry_activity_volume_timeframe",
+                metrics.get("entry_activity_volume_timeframe"),
+            ),
             "adx": item.get("adx", metrics.get("adx")),
             "change_24h": item.get("change_24h", metrics.get("change_24h")),
             "notional_24h": metrics.get("notional_24h"),

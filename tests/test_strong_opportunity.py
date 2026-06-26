@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -59,6 +59,7 @@ async def test_strong_opportunity_report_identifies_shadow_candidate(
 ) -> None:
     await _reset_db(tmp_path, monkeypatch)
     try:
+        created_at = datetime.now(UTC) - timedelta(hours=1)
         async with get_session_ctx() as session:
             session.add(
                 AIDecision(
@@ -68,7 +69,7 @@ async def test_strong_opportunity_report_identifies_shadow_candidate(
                     confidence=0.86,
                     raw_llm_response=_strong_raw(),
                     was_executed=True,
-                    created_at=datetime(2026, 6, 25, 1, 0, tzinfo=UTC),
+                    created_at=created_at,
                 )
             )
 
@@ -95,6 +96,7 @@ async def test_strong_opportunity_report_explains_near_miss_blockers(
 ) -> None:
     await _reset_db(tmp_path, monkeypatch)
     try:
+        created_at = datetime.now(UTC) - timedelta(hours=1)
         raw = _strong_raw()
         raw["entry_candidate_evidence"]["long"]["expected_net_return_pct"] = 0.25
         raw["entry_candidate_evidence"]["long"]["loss_probability"] = 0.58
@@ -108,7 +110,7 @@ async def test_strong_opportunity_report_explains_near_miss_blockers(
                     confidence=0.72,
                     raw_llm_response=raw,
                     was_executed=False,
-                    created_at=datetime(2026, 6, 25, 1, 5, tzinfo=UTC),
+                    created_at=created_at,
                 )
             )
 

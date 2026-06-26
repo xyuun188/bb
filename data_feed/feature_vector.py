@@ -51,6 +51,7 @@ class FeatureVector:
     indicator_close_price: float = 0.0
     indicator_price_gap_pct: float = 0.0
     price_reconciliation_warning: str = ""
+    indicator_snapshot_available: bool = False
 
     # --- Technical indicators (from latest candle) ---
     rsi_14: float = 50.0
@@ -77,6 +78,9 @@ class FeatureVector:
     price_vs_sma50: float = 0.0
     technical_indicator_timeframe: str = ""
     short_returns_timeframe: str = ""
+    volume_ratio_timeframe: str = ""
+    entry_activity_volume_ratio: float = 0.0
+    entry_activity_volume_timeframe: str = ""
     abnormal_wick_count_72h: int = 0
     abnormal_wick_max_pct: float = 0.0
     abnormal_wick_recent_hours: float = 9999.0
@@ -164,11 +168,12 @@ Technical Indicators:
   BB Position: {self.bb_pct:.2f} (0=lower, 1=upper)
   ATR(14): {self.atr_14:.4f}
   Volume Ratio (vs 20MA): {self.volume_ratio:.2f}
+  Entry Activity Volume Ratio: {self.entry_activity_volume_ratio:.2f}
   EMA 12/26: {self.ema_12:.4f} / {self.ema_26:.4f}
   Price vs SMA20: {self.price_vs_sma20*100:.2f}% | vs SMA50: {self.price_vs_sma50*100:.2f}%
   Returns: 1p={self.returns_1*100:.2f}%, 5p={self.returns_5*100:.2f}%, 20p={self.returns_20*100:.2f}%
   Volatility(20): {self.volatility_20*100:.2f}%
-  Feature Sources: short_returns={self.short_returns_timeframe or "unknown"}, trend={self.technical_indicator_timeframe or "unknown"}
+  Feature Sources: short_returns={self.short_returns_timeframe or "unknown"}, trend={self.technical_indicator_timeframe or "unknown"}, activity_volume={self.entry_activity_volume_timeframe or "unknown"}
   Abnormal Wick: count72h={self.abnormal_wick_count_72h}, max={self.abnormal_wick_max_pct:.2f}%, recent_hours={self.abnormal_wick_recent_hours:.1f}
 
 Perpetual Swap Data:
@@ -233,6 +238,11 @@ def build_feature_vector(
 
     # Technical indicators
     if indicators:
+        fv.indicator_snapshot_available = bool(
+            indicators.get("indicator_snapshot_available")
+            or indicators.get("technical_indicator_timeframe")
+            or indicators.get("short_returns_timeframe")
+        )
         for key, value in indicators.items():
             if hasattr(fv, key):
                 setattr(fv, key, value)

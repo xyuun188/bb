@@ -33,6 +33,43 @@ def _service() -> DataService:
     return service
 
 
+def test_indicator_snapshot_ignores_incomplete_latest_kline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    now = data_service_module.pd.Timestamp.now(tz="UTC")
+    complete_start = now - data_service_module.pd.Timedelta(minutes=22)
+    klines = [
+        [
+            (complete_start + data_service_module.pd.Timedelta(minutes=index)).timestamp() * 1000.0,
+            100.0,
+            101.0,
+            99.0,
+            100.0 + index,
+            10.0,
+        ]
+        for index in range(21)
+    ]
+    latest_incomplete = now.floor("min").timestamp() * 1000.0
+    klines.append([latest_incomplete, 100.0, 101.0, 99.0, 999.0, 99999.0])
+
+    monkeypatch.setattr(data_service_module, "compute_all_indicators", lambda df: df)
+    monkeypatch.setattr(
+        data_service_module,
+        "extract_latest_features",
+        lambda df: {
+            "close": float(df["close"].iloc[-1]),
+            "volume": float(df["volume"].iloc[-1]),
+        },
+    )
+
+    features, df = service._features_from_klines(klines, "1m")
+
+    assert len(df) == 21
+    assert features["close"] != pytest.approx(999.0)
+    assert features["volume"] == pytest.approx(10.0)
+
+
 @pytest.mark.asyncio
 async def test_indicator_snapshot_persists_all_training_timeframes(
     monkeypatch: pytest.MonkeyPatch,
@@ -70,6 +107,7 @@ async def test_indicator_snapshot_persists_all_training_timeframes(
     features = await service._get_indicator_snapshot("BTC/USDT")
 
     assert features["close"] == 100.5
+    assert features["indicator_snapshot_available"] is True
     assert set(fetch_calls) == set(data_service_module.KLINE_PERSIST_TIMEFRAME_LIMITS.items())
     assert {timeframe for _symbol, timeframe, _count in persisted} == {
         "1m",
@@ -151,6 +189,7 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
             return {
                 "close": latest_close,
                 "volume": 10.0,
+                "volume_ratio": 1.35,
                 "returns_1": 0.011,
                 "returns_5": 0.055,
                 "returns_20": 0.12,
@@ -161,6 +200,7 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
         return {
             "close": latest_close,
             "volume": 10.0,
+            "volume_ratio": 0.04,
             "returns_1": -0.001,
             "returns_5": -0.002,
             "returns_20": -0.003,
@@ -183,6 +223,11 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
 
     assert features["short_returns_timeframe"] == "1m"
     assert features["technical_indicator_timeframe"] == "1h"
+    assert features["volume_ratio_timeframe"] == "1h"
+    assert features["indicator_snapshot_available"] is True
+    assert features["volume_ratio"] == pytest.approx(0.04)
+    assert features["entry_activity_volume_ratio"] == pytest.approx(1.35)
+    assert features["entry_activity_volume_timeframe"] == "1m"
     assert features["returns_1"] == pytest.approx(0.011)
     assert features["returns_5"] == pytest.approx(0.055)
     assert features["returns_20"] == pytest.approx(0.12)
@@ -348,13 +393,20 @@ def test_feature_vector_keeps_market_feature_source_timeframes() -> None:
             "volatility_20": 0.03,
             "short_returns_timeframe": "1m",
             "technical_indicator_timeframe": "1h",
+            "volume_ratio_timeframe": "1h",
+            "entry_activity_volume_ratio": 1.4,
+            "entry_activity_volume_timeframe": "1m",
         },
     )
 
     assert vector.short_returns_timeframe == "1m"
     assert vector.technical_indicator_timeframe == "1h"
+    assert vector.volume_ratio_timeframe == "1h"
+    assert vector.indicator_snapshot_available is True
+    assert vector.entry_activity_volume_ratio == pytest.approx(1.4)
     assert "short_returns=1m" in vector.to_llm_context()
     assert "trend=1h" in vector.to_llm_context()
+    assert "activity_volume=1m" in vector.to_llm_context()
 
 
 def test_feature_vector_keeps_fresh_ticker_when_indicator_close_diverges() -> None:

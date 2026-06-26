@@ -81,6 +81,69 @@ def test_entry_feature_ranker_uses_explicit_okx_swap_notional() -> None:
     assert metrics["notional_24h_source"] == "quote"
 
 
+def test_entry_feature_ranker_uses_entry_activity_volume_for_candidate_filter() -> None:
+    ranker = _ranker()
+    active = _feature(
+        "SOL/USDT",
+        volume_ratio=0.01,
+        volume_ratio_timeframe="1h",
+        entry_activity_volume_ratio=0.40,
+        entry_activity_volume_timeframe="1m",
+        indicator_snapshot_available=True,
+    )
+
+    assert ranker.is_auto_analysis_candidate_feature(active) is True
+
+    result = ranker.rank(
+        {"SOL/USDT": active},
+        1,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+    metrics = result.diagnostics["symbols"][0]["filter_metrics"]
+    assert metrics["volume_ratio"] == pytest.approx(0.40)
+    assert metrics["volume_ratio_source"] == "entry_activity_volume_ratio"
+    assert metrics["trend_volume_ratio"] == pytest.approx(0.01)
+    assert metrics["entry_activity_volume_timeframe"] == "1m"
+    preview = result.diagnostics["ranked_symbol_sample"][0]
+    assert preview["volume_ratio"] == pytest.approx(0.40)
+    assert preview["volume_ratio_source"] == "entry_activity_volume_ratio"
+    assert preview["trend_volume_ratio"] == pytest.approx(0.01)
+    assert preview["trend_volume_ratio_timeframe"] == "1h"
+    assert preview["entry_activity_volume_timeframe"] == "1m"
+
+
+def test_entry_feature_ranker_rejects_missing_indicator_snapshot_without_fallback() -> None:
+    ranker = _ranker()
+    missing = _feature(
+        "SOL/USDT",
+        volume_ratio=1.0,
+        adx_14=20.0,
+        indicator_snapshot_available=False,
+        technical_indicator_timeframe="",
+        short_returns_timeframe="",
+    )
+
+    result = ranker.rank(
+        {"SOL/USDT": missing},
+        1,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    assert result.selected == {}
+    assert result.diagnostics["rank_underfilled"] is True
+    assert result.diagnostics["rank_underfill_reason"] == "missing_indicator_snapshot"
+    reason_counts = {
+        item["reason"]: item["count"] for item in result.diagnostics["filtered_out_reason_counts"]
+    }
+    assert reason_counts["missing_indicator_snapshot"] == 1
+    filtered = result.diagnostics["filtered_symbol_sample"][0]
+    assert filtered["filter_reasons"] == ["missing_indicator_snapshot"]
+
+
 def test_entry_feature_ranker_uses_secondary_fill_when_hard_candidates_are_not_enough() -> None:
     ranker = _ranker()
     result = ranker.rank(

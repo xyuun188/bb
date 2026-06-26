@@ -1070,9 +1070,16 @@ class DataService:
             for key in ("close", "volume"):
                 if key in short_features:
                     features[key] = short_features[key]
+            if "volume_ratio" in short_features:
+                features["entry_activity_volume_ratio"] = short_features["volume_ratio"]
+                features["entry_activity_volume_timeframe"] = short_timeframe
             features["short_returns_timeframe"] = short_timeframe
         if trend_features:
             features["technical_indicator_timeframe"] = trend_timeframe
+            features["volume_ratio_timeframe"] = trend_timeframe
+        elif short_features:
+            features["volume_ratio_timeframe"] = short_timeframe
+        features["indicator_snapshot_available"] = True
         anomaly_df = trend_df if not trend_df.empty else short_df
         features.update(self._kline_anomaly_snapshot(anomaly_df))
         return features
@@ -1084,12 +1091,16 @@ class DataService:
     ) -> tuple[str, dict[str, Any], pd.DataFrame]:
         for timeframe in priority:
             klines = klines_by_timeframe.get(timeframe) or []
-            features, df = self._features_from_klines(klines)
+            features, df = self._features_from_klines(klines, timeframe)
             if features:
                 return timeframe, features, df
         return "", {}, pd.DataFrame()
 
-    def _features_from_klines(self, klines: list) -> tuple[dict[str, Any], pd.DataFrame]:
+    def _features_from_klines(
+        self,
+        klines: list,
+        timeframe: str = "",
+    ) -> tuple[dict[str, Any], pd.DataFrame]:
         if len(klines) < MIN_INDICATOR_ROWS:
             return {}, pd.DataFrame()
         df = pd.DataFrame(
@@ -1099,10 +1110,28 @@ class DataService:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df = df.dropna(subset=["timestamp", "close"]).drop_duplicates("timestamp")
         df = df.sort_values("timestamp").tail(max(len(klines), MIN_INDICATOR_ROWS))
+        df = self._drop_incomplete_latest_kline(df, timeframe)
         if len(df) < MIN_INDICATOR_ROWS:
             return {}, df
         computed = compute_all_indicators(df)
         return extract_latest_features(computed), computed
+
+    @staticmethod
+    def _drop_incomplete_latest_kline(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        seconds = TIMEFRAME_SECONDS.get(str(timeframe or ""))
+        if not seconds or df.empty:
+            return df
+        latest = df.iloc[-1].get("timestamp")
+        if not isinstance(latest, pd.Timestamp):
+            return df
+        if latest.tzinfo is None:
+            latest = latest.tz_localize("UTC")
+        now = pd.Timestamp.now(tz="UTC")
+        if latest + pd.Timedelta(seconds=seconds) <= now:
+            return df
+        if len(df) <= 1:
+            return df.iloc[0:0].copy()
+        return df.iloc[:-1].copy()
 
     async def _fetch_and_persist_klines(
         self,

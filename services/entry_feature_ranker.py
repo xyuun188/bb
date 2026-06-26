@@ -28,6 +28,10 @@ def _feature_float(feature: Any, key: str, default: float = 0.0) -> float:
         return default
 
 
+def _feature_text(feature: Any, key: str) -> str:
+    return str(getattr(feature, key, "") or "").strip()
+
+
 @dataclass(frozen=True, slots=True)
 class EntryFeatureRankResult:
     selected: dict[str, Any]
@@ -45,10 +49,12 @@ class EntryFeatureRankerPolicy:
     params: Any = DEFAULT_TRADING_PARAMS.entry_feature_ranker
 
     def feature_opportunity_score(self, feature: Any) -> float:
+        if self._missing_indicator_snapshot(feature):
+            return 0.0
         params = self.params
         try:
             volume_24h = float(getattr(feature, "volume_24h", 0) or 0)
-            volume_ratio = float(getattr(feature, "volume_ratio", 0) or 0)
+            volume_ratio = self._entry_activity_volume_ratio(feature)
             adx_14 = float(getattr(feature, "adx_14", 0) or 0)
             returns_1 = abs(float(getattr(feature, "returns_1", 0) or 0))
             returns_5 = abs(float(getattr(feature, "returns_5", 0) or 0))
@@ -288,7 +294,10 @@ class EntryFeatureRankerPolicy:
                 break
             selected_items.extend(bucket[: max(limit - len(selected_items), 0)])
         if not selected_items:
-            selected_items = sorted(all_items, key=ranking_score, reverse=True)[:limit]
+            fallback_items = [
+                item for item in all_items if not self._missing_indicator_snapshot(item[1])
+            ]
+            selected_items = sorted(fallback_items, key=ranking_score, reverse=True)[:limit]
 
         selected = dict(selected_items)
         selected_symbols = {symbol for symbol, _ in selected_items}
@@ -353,14 +362,32 @@ class EntryFeatureRankerPolicy:
                     )
                 ),
                 "filter_metrics": dict(filter_diag.get("metrics") or {}),
-                "volume_ratio": round(_feature_float(feature, "volume_ratio"), 2),
+                "volume_ratio": round(self._entry_activity_volume_ratio(feature), 2),
+                "trend_volume_ratio": round(_feature_float(feature, "volume_ratio"), 2),
+                "volume_ratio_source": self._entry_activity_volume_ratio_source(feature),
+                "trend_volume_ratio_timeframe": _feature_text(feature, "volume_ratio_timeframe"),
+                "entry_activity_volume_ratio": round(
+                    _feature_float(feature, "entry_activity_volume_ratio"),
+                    4,
+                ),
+                "entry_activity_volume_timeframe": _feature_text(
+                    feature,
+                    "entry_activity_volume_timeframe",
+                ),
                 "adx": round(_feature_float(feature, "adx_14"), 1),
                 "change_24h": round(_feature_float(feature, "change_24h_pct"), 2),
             }
 
         ranked_candidates = [*ranked_tradable, *ranked_soft]
         if not ranked_candidates:
-            ranked_candidates = sorted(all_items, key=ranking_score, reverse=True)
+            fallback_items = [
+                item for item in all_items if not self._missing_indicator_snapshot(item[1])
+            ]
+            ranked_candidates = sorted(
+                fallback_items or all_items,
+                key=ranking_score,
+                reverse=True,
+            )
             fallback_symbols = {symbol for symbol, _ in ranked_candidates}
         else:
             fallback_symbols = set()
@@ -379,7 +406,12 @@ class EntryFeatureRankerPolicy:
             filtered_reason_counts.update(reasons or ["filtered_without_reason"])
 
         rank_underfilled = len(selected) < max(0, int(limit or 0))
-        if rank_underfilled and ranked_candidates:
+        missing_indicator_count = sum(
+            1 for _symbol, feature in all_items if self._missing_indicator_snapshot(feature)
+        )
+        if rank_underfilled and all_items and missing_indicator_count == len(all_items):
+            rank_underfill_reason = "missing_indicator_snapshot"
+        elif rank_underfilled and ranked_candidates:
             rank_underfill_reason = "insufficient_tradeable_or_secondary_candidates"
         elif rank_underfilled and all_items:
             rank_underfill_reason = "fallback_selected_filtered_candidates"
@@ -439,9 +471,13 @@ class EntryFeatureRankerPolicy:
         symbol = str(getattr(feature, "symbol", "") or "").upper()
         if parsed is None:
             reason = (
-                "suspicious_symbol"
-                if symbol and self.suspicious_symbol_reason(symbol)
-                else "invalid_feature_values"
+                "missing_indicator_snapshot"
+                if self._missing_indicator_snapshot(feature)
+                else (
+                    "suspicious_symbol"
+                    if symbol and self.suspicious_symbol_reason(symbol)
+                    else "invalid_feature_values"
+                )
             )
             return {
                 "symbol": symbol,
@@ -545,6 +581,17 @@ class EntryFeatureRankerPolicy:
                     getattr(feature, "volume_24h_source", "") or "price_x_volume_24h"
                 ),
                 "volume_ratio": round(volume_ratio, 4),
+                "volume_ratio_source": self._entry_activity_volume_ratio_source(feature),
+                "trend_volume_ratio": round(_feature_float(feature, "volume_ratio"), 4),
+                "trend_volume_ratio_timeframe": _feature_text(feature, "volume_ratio_timeframe"),
+                "entry_activity_volume_ratio": round(
+                    _feature_float(feature, "entry_activity_volume_ratio"),
+                    4,
+                ),
+                "entry_activity_volume_timeframe": _feature_text(
+                    feature,
+                    "entry_activity_volume_timeframe",
+                ),
                 "adx": round(adx_14, 2),
                 "volatility_20": round(volatility_20, 4),
                 "change_24h": round(change_24h, 4),
@@ -582,17 +629,40 @@ class EntryFeatureRankerPolicy:
             symbol = str(getattr(feature, "symbol", "") or "").upper()
             if self.suspicious_symbol_reason(symbol):
                 return None
+            if self._missing_indicator_snapshot(feature):
+                return None
             current_price = float(
                 getattr(feature, "current_price", 0) or getattr(feature, "close", 0) or 0
             )
             volume_24h = float(getattr(feature, "volume_24h", 0) or 0)
-            volume_ratio = float(getattr(feature, "volume_ratio", 0) or 0)
+            volume_ratio = self._entry_activity_volume_ratio(feature)
             volatility_20 = float(getattr(feature, "volatility_20", 0) or 0)
             change_24h = abs(float(getattr(feature, "change_24h_pct", 0) or 0))
             adx_14 = float(getattr(feature, "adx_14", 0) or 0)
         except (TypeError, ValueError):
             return None
         return symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14
+
+    @staticmethod
+    def _missing_indicator_snapshot(feature: Any) -> bool:
+        marker = getattr(feature, "indicator_snapshot_available", None)
+        if marker is None:
+            return False
+        if isinstance(marker, str):
+            marker = marker.strip().lower() in {"1", "true", "yes", "y"}
+        return not bool(marker)
+
+    @staticmethod
+    def _entry_activity_volume_ratio(feature: Any) -> float:
+        if _feature_text(feature, "entry_activity_volume_timeframe"):
+            return max(_feature_float(feature, "entry_activity_volume_ratio"), 0.0)
+        return max(_feature_float(feature, "volume_ratio"), 0.0)
+
+    @staticmethod
+    def _entry_activity_volume_ratio_source(feature: Any) -> str:
+        if _feature_text(feature, "entry_activity_volume_timeframe"):
+            return "entry_activity_volume_ratio"
+        return "volume_ratio"
 
     @staticmethod
     def _has_recent_abnormal_wick(feature: Any) -> bool:

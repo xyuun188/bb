@@ -12,6 +12,15 @@ def test_strategy_health_remote_template_is_valid_python() -> None:
     compile(template, "<inspect_online_strategy_health_remote_template>", "exec")
 
 
+def test_strategy_health_remote_template_keeps_volume_source_diagnostics() -> None:
+    template = inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE
+
+    assert '"volume_ratio_source": item.get(' in template
+    assert '"trend_volume_ratio_timeframe": item.get(' in template
+    assert '"entry_activity_volume_ratio": item.get(' in template
+    assert '"entry_activity_volume_timeframe": item.get(' in template
+
+
 def test_strategy_health_remote_command_uses_unique_temp_files() -> None:
     command = inspect_online_strategy_health._build_remote_command(120, token="abc123")
 
@@ -874,7 +883,15 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                     {
                         "symbol": f"R{i}/USDT",
                         "selected": i < 2,
-                        "filter_metrics": {"notional_24h": i * 1000, "extra": "omit"},
+                        "filter_metrics": {
+                            "notional_24h": i * 1000,
+                            "volume_ratio_source": "entry_activity_volume_ratio",
+                            "trend_volume_ratio": 0.04,
+                            "trend_volume_ratio_timeframe": "1h",
+                            "entry_activity_volume_ratio": 1.35,
+                            "entry_activity_volume_timeframe": "1m",
+                            "extra": "omit",
+                        },
                     }
                     for i in range(20)
                 ],
@@ -951,6 +968,9 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert len(latest["ranked_symbol_sample"]) == 2
     assert len(latest["filtered_symbol_sample"]) == 2
     assert latest["ranked_symbol_sample"][1]["notional_24h"] == 1000
+    assert latest["ranked_symbol_sample"][0]["volume_ratio_source"] == "entry_activity_volume_ratio"
+    assert latest["ranked_symbol_sample"][0]["trend_volume_ratio_timeframe"] == "1h"
+    assert latest["ranked_symbol_sample"][0]["entry_activity_volume_timeframe"] == "1m"
     assert "filter_metrics" not in latest["ranked_symbol_sample"][0]
     assert latest["analysis_budget"]["budget_source"] == "strategy_learning"
     assert "unused_large_payload" not in latest["analysis_budget"]
@@ -962,6 +982,33 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert budget_diag["position_group_count"] == 6
     assert "market_caps" not in budget_diag
     assert "Read-only compact market symbol" in compact["diagnostic_boundary"]
+
+
+def test_strategy_health_compact_candidate_funnel_keeps_top_level_volume_source() -> None:
+    compact = inspect_online_strategy_health._compact_candidate_funnel(
+        {
+            "ranked_symbol_sample": [
+                {
+                    "symbol": "SOL/USDT",
+                    "volume_ratio": 0.42,
+                    "volume_ratio_source": "entry_activity_volume_ratio",
+                    "trend_volume_ratio": 0.08,
+                    "trend_volume_ratio_timeframe": "1h",
+                    "entry_activity_volume_ratio": 0.42,
+                    "entry_activity_volume_timeframe": "1m",
+                    "filter_metrics": {"volume_ratio_source": "legacy_metrics_source"},
+                }
+            ]
+        }
+    )
+
+    item = compact["ranked_symbol_sample"][0]
+    assert item["volume_ratio"] == 0.42
+    assert item["volume_ratio_source"] == "entry_activity_volume_ratio"
+    assert item["trend_volume_ratio"] == 0.08
+    assert item["trend_volume_ratio_timeframe"] == "1h"
+    assert item["entry_activity_volume_ratio"] == 0.42
+    assert item["entry_activity_volume_timeframe"] == "1m"
 
 
 def test_strategy_health_report_splits_market_and_position_review_decisions() -> None:
