@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -562,6 +563,50 @@ class _ExitMaxMarketSizeCcxt:
         }
 
 
+class _NativeFullCloseFillsHistoryCcxt(_ExitMaxMarketSizeCcxt):
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        self.position_contracts = 0.0
+        return {"code": "0", "data": [{"clOrdId": "native-close-client", "sCode": "0"}]}
+
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        assert params["instId"] == "USAR-USDT-SWAP"
+        return {
+            "data": [
+                {
+                    "ordId": "native-fill-order",
+                    "instId": "USAR-USDT-SWAP",
+                    "side": "sell",
+                    "fillSz": "100",
+                    "fillPx": "3.01",
+                    "fillPnl": "71",
+                    "fee": "-0.1505",
+                    "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+                }
+            ]
+        }
+
+
+class _NativeFullCloseAccountWideFillsCcxt(_NativeFullCloseFillsHistoryCcxt):
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        if params.get("instId"):
+            raise RuntimeError("instrument-specific history unavailable")
+        return {
+            "data": [
+                {
+                    "ordId": "native-fill-offline-order",
+                    "instId": "USAR-USDT-SWAP-OFF",
+                    "side": "sell",
+                    "fillSz": "100",
+                    "fillPx": "3.02",
+                    "fillPnl": "72",
+                    "fee": "-0.151",
+                    "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+                }
+            ]
+        }
+
+
 def _executor(exchange: Any) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
@@ -979,6 +1024,46 @@ async def test_okx_exit_splits_full_close_above_exchange_max_size() -> None:
     assert result.raw_response["position_contracts_after"] == 0.0
     assert result.raw_response["requested_exit_fraction"] == 1.0
     assert result.raw_response["requested_exit_contracts"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_okx_native_full_close_uses_fills_history_when_response_has_no_order_id() -> None:
+    exchange = _NativeFullCloseFillsHistoryCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    result = await executor.place_order(decision)
+
+    assert result.status.value == "filled"
+    assert result.order_id == "native-fill-order"
+    assert result.exchange_order_id == "native-fill-order"
+    assert result.quantity == 100.0
+    assert result.price == 3.01
+    assert result.fee == 0.1505
+    assert result.pnl == 71.0
+    assert result.raw_response["native_close_fill"]["order_id"] == "native-fill-order"
+    assert result.raw_response["native_close_fill"]["source"] == (
+        "okx_fills_history_after_native_close"
+    )
+
+
+@pytest.mark.asyncio
+async def test_okx_native_full_close_falls_back_to_account_wide_fills_history() -> None:
+    exchange = _NativeFullCloseAccountWideFillsCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    result = await executor.place_order(decision)
+
+    assert result.status.value == "filled"
+    assert result.exchange_order_id == "native-fill-offline-order"
+    assert result.price == 3.02
+    assert result.fee == 0.151
+    assert result.pnl == 72.0
 
 
 @pytest.mark.asyncio

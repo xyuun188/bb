@@ -1500,6 +1500,7 @@ class OKXExecutor(AbstractExecutor):
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
 
+        submitted_at_ms = int(time.time() * 1000)
         try:
             response = await self._with_retry(close_position, request_params)
         except ExchangeAPIError as exc:
@@ -1538,7 +1539,8 @@ class OKXExecutor(AbstractExecutor):
         first_item = data[0] if isinstance(data, list) and data else {}
         if not isinstance(first_item, dict):
             first_item = {}
-        order_id = str(first_item.get("ordId") or first_item.get("clOrdId") or "").strip()
+        order_id = str(first_item.get("ordId") or "").strip()
+        client_order_id = str(first_item.get("clOrdId") or "").strip()
         response_code = str(response.get("code") if isinstance(response, dict) else "")
         s_code = str(first_item.get("sCode") or "")
         success_code = response_code == "0" or s_code in {"", "0"}
@@ -1560,6 +1562,35 @@ class OKXExecutor(AbstractExecutor):
             "filled_contracts": closed_contracts,
             "base_quantity": closed_contracts * contract_size,
         }
+        fill_confirmation = None
+        if closed_contracts > tolerance:
+            fill_confirmation = await self._native_full_close_fill_confirmation(
+                ccxt=ccxt,
+                inst_id=str(request_params["instId"]),
+                side=side,
+                submitted_at_ms=submitted_at_ms,
+                expected_contracts=closed_contracts,
+                contract_size=contract_size,
+            )
+            if fill_confirmation:
+                order_id = str(fill_confirmation.get("order_id") or order_id or "").strip()
+                price = self._safe_float(fill_confirmation.get("price"), price)
+                raw_response["native_close_fill"] = {
+                    "source": fill_confirmation.get("source"),
+                    "order_id": order_id or None,
+                    "price": price,
+                    "fee": self._safe_float(fill_confirmation.get("fee"), 0.0),
+                    "pnl": self._safe_float(fill_confirmation.get("pnl"), 0.0),
+                    "contracts": self._safe_float(fill_confirmation.get("contracts"), 0.0),
+                    "quantity": self._safe_float(fill_confirmation.get("quantity"), 0.0),
+                    "timestamp_ms": fill_confirmation.get("timestamp_ms"),
+                    "timestamp": (
+                        fill_confirmation["timestamp"].isoformat()
+                        if fill_confirmation.get("timestamp") is not None
+                        else None
+                    ),
+                    "order_info": fill_confirmation.get("order_info") or {},
+                }
         if not success_code and closed_contracts <= tolerance:
             logger.warning(
                 "OKX native full close returned failure; will use reduce-only market orders",
@@ -1570,7 +1601,7 @@ class OKXExecutor(AbstractExecutor):
             return None
         if closed_contracts <= tolerance:
             return ExecutionResult(
-                order_id=order_id or "okx_native_full_close_not_confirmed",
+                order_id=order_id or client_order_id or "okx_native_full_close_not_confirmed",
                 symbol=decision.symbol,
                 side=side,
                 order_type="market",
@@ -1586,17 +1617,146 @@ class OKXExecutor(AbstractExecutor):
                 },
             )
         return ExecutionResult(
-            order_id=order_id or "okx_native_full_close",
+            order_id=order_id or client_order_id or "okx_native_full_close",
             symbol=decision.symbol,
             side=side,
             order_type="market",
             quantity=closed_contracts * contract_size,
             price=price,
             status=OrderStatus.FILLED if after_contracts <= tolerance else OrderStatus.PARTIAL,
+            fee=self._safe_float(
+                (fill_confirmation or {}).get("fee"),
+                0.0,
+            ),
+            pnl=self._safe_float(
+                (fill_confirmation or {}).get("pnl"),
+                0.0,
+            ),
             exchange_order_id=order_id or None,
-            timestamp=datetime.now(UTC),
+            timestamp=(fill_confirmation or {}).get("timestamp") or datetime.now(UTC),
             raw_response=raw_response,
         )
+
+    async def _native_full_close_fill_confirmation(
+        self,
+        *,
+        ccxt,
+        inst_id: str,
+        side: str,
+        submitted_at_ms: int,
+        expected_contracts: float,
+        contract_size: float,
+    ) -> dict[str, Any] | None:
+        fetch_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
+        if not callable(fetch_fills) or expected_contracts <= 0:
+            return None
+
+        try:
+            response = await self._with_retry(
+                fetch_fills,
+                {
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "limit": "100",
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "OKX native full close instrument fill lookup failed; trying account-wide history",
+                inst_id=inst_id,
+                side=side,
+                error=safe_error_text(exc),
+            )
+            try:
+                response = await self._with_retry(
+                    fetch_fills,
+                    {
+                        "instType": "SWAP",
+                        "limit": "100",
+                    },
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "OKX native full close fill confirmation failed",
+                    inst_id=inst_id,
+                    side=side,
+                    error=safe_error_text(fallback_exc),
+                )
+                return None
+
+        rows = response.get("data", []) if isinstance(response, dict) else []
+        min_timestamp = max(int(submitted_at_ms or 0) - 30_000, 0)
+        groups: dict[str, dict[str, Any]] = {}
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row_inst_id = str(row.get("instId") or "").strip()
+            if (
+                row_inst_id
+                and row_inst_id != inst_id
+                and not row_inst_id.startswith(f"{inst_id}-OFF")
+            ):
+                continue
+            if str(row.get("side") or "").lower() != str(side or "").lower():
+                continue
+            timestamp_ms = self._safe_float(row.get("ts") or row.get("fillTime"), 0.0)
+            if timestamp_ms > 0 and timestamp_ms < min_timestamp:
+                continue
+            contracts = self._safe_float(row.get("fillSz") or row.get("sz"), 0.0)
+            price = self._safe_float(row.get("fillPx") or row.get("price"), 0.0)
+            order_id = str(row.get("ordId") or "").strip()
+            if contracts <= 0 or price <= 0 or not order_id:
+                continue
+            group = groups.setdefault(
+                order_id,
+                {
+                    "order_id": order_id,
+                    "contracts": 0.0,
+                    "price_value": 0.0,
+                    "fee": 0.0,
+                    "pnl": 0.0,
+                    "timestamp_ms": timestamp_ms,
+                    "order_info": row,
+                    "source": "okx_fills_history_after_native_close",
+                },
+            )
+            group["contracts"] += contracts
+            group["price_value"] += price * contracts
+            group["fee"] += abs(self._safe_float(row.get("fee"), 0.0))
+            group["pnl"] += self._safe_float(row.get("fillPnl") or row.get("pnl"), 0.0)
+            if timestamp_ms >= self._safe_float(group.get("timestamp_ms"), 0.0):
+                group["timestamp_ms"] = timestamp_ms
+                group["order_info"] = row
+
+        candidates = []
+        for group in groups.values():
+            contracts = self._safe_float(group.get("contracts"), 0.0)
+            if contracts <= 0:
+                continue
+            timestamp_ms = self._safe_float(group.get("timestamp_ms"), 0.0)
+            candidates.append(
+                {
+                    **group,
+                    "price": self._safe_float(group.get("price_value"), 0.0) / contracts,
+                    "quantity": contracts * (contract_size if contract_size > 0 else 1.0),
+                    "timestamp": (
+                        datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
+                        if timestamp_ms > 0
+                        else None
+                    ),
+                }
+            )
+        if not candidates:
+            return None
+        tolerance = max(abs(expected_contracts) * 0.05, 1e-8)
+        return sorted(
+            candidates,
+            key=lambda item: (
+                abs(self._safe_float(item.get("contracts"), 0.0) - expected_contracts) > tolerance,
+                abs(self._safe_float(item.get("contracts"), 0.0) - expected_contracts),
+                -self._safe_float(item.get("timestamp_ms"), 0.0),
+            ),
+        )[0]
 
     async def _place_split_exit_market_orders(
         self,
