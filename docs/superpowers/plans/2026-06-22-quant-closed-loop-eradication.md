@@ -3536,3 +3536,79 @@ Git 与线上部署：
 回滚点：
 - 代码层可回滚 `scripts/repair_missing_closed_positions_from_orders.py`、`web_dashboard/api/system_audit.py`、`tests/test_order_position_reconciliation.py`、`tests/test_system_audit_api.py` 与本节文档。
 - 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽、无 OKX 下单/平仓调用。
+
+---
+
+## 六十六、Batch I 二期阶段 2 补充记录：OKX 51155 不可交易交易对执行前阻断刷新（2026-06-26）
+
+触发原因：
+- 线上最近窗口反复出现 `RESOLV/USDT` 开仓被 OKX 返回 `51155 local compliance restrictions`，用户指出“明知道不符合 OKX，为什么还提交到开仓这一步再失败”。
+- 代码里已有 `EntrySymbolBlocklistPolicy`、`remember_untradable_symbol()` 和启动时 `_load_untradable_symbol_blocks()`，但历史拒单恢复只在 `TradingService.initialize()` 执行一次，且只扫最近 300 条错误决策。
+- 交易主进程长时间运行、仅重启 Dashboard、或最近 300 条被大量分析/hold 记录挤掉时，已知不可交易交易对可能再次进入执行链并提交 OKX。
+
+本次修复范围：
+- `services/trading_service.py`
+  - 新增 `ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS=60.0` 与 `_entry_symbol_blocks_refreshed_at`。
+  - 新增 `_refresh_entry_symbol_blocks_if_stale()`，启动、每轮 `run_once()` 和真正 entry execution policy 评估前都会刷新最近不可交易/临时阻断事实。
+  - `ExecutionService` 的 entry policy provider 从直接调用 `entry_execution_pipeline.evaluate` 改为 `evaluate_entry_execution_policy()`，确保提交 OKX 前一定先恢复最近持久拒单事实。
+  - `_load_untradable_symbol_blocks()` 从“最近 300 条”改为“最近 24 小时错误决策窗口，最多 2000 条”，避免真实 51155 被普通分析记录挤出恢复窗口。
+- `tests/test_trading_service_boundaries.py`
+  - 新增回归测试：数据库已有 `RESOLV/USDT` 51155 拒单时，新的 entry 在执行策略阶段必须被 `entry_opportunity_gate` 阻断，不能再进入 OKX 提交。
+
+安全边界：
+- 本批不放宽开仓阈值、不放大仓位、不提高杠杆、不改变 ML readiness、不改 OKX 下单参数、不改止盈止损、不覆盖历史订单/持仓/收益。
+- 本批只让“已经被 OKX 明确拒绝、且属于不可交易/合规限制/交割合约等不可提交原因”的交易对，在下一次 entry 执行前被本地阻断。
+- `51155` 阻断不是盈利能力优化，不能解释为“不赚钱/小单/不开仓已经解决”；它只减少重复失败订单和无意义 OKX 提交。
+
+本地验证：
+- `pytest tests/test_entry_symbol_blocklist.py tests/test_trading_service_boundaries.py -q`：147 passed。
+- `pytest tests/test_execution_result_classifier.py tests/test_system_audit_api.py tests/test_order_position_reconciliation.py -q`：61 passed。
+- 合并相关测试：208 passed。
+- 全量测试 `pytest -q`：1523 passed。
+- `ruff check services/trading_service.py tests/test_trading_service_boundaries.py`：All checks passed。
+- `black --check services/trading_service.py tests/test_trading_service_boundaries.py`：通过。
+- `git diff --check`：通过。
+
+线上部署与复验：
+- 使用 `python scripts/sync_to_online_server.py --split-services` 上传 `services/trading_service.py` 并重启 split services。
+- 三项服务均 active，Dashboard 返回 `302`。
+- 远端 `py_compile services/trading_service.py` 通过。
+- 交易主进程已重启，确认不是只重启 Dashboard：
+  - `bb-paper-trading.service=active`
+  - `MainPID=993899`
+  - `ActiveEnterTimestamp=Thu 2026-06-25 23:57:33 UTC`
+  - `bb-dashboard.service=active`
+  - `MainPID=993904`
+- 线上真实库只读探针确认：
+  - `RESOLV/USDT`、`RESOLV-USDT`、`RESOLV-USDT-SWAP` 均能从最近 51155 决策恢复为 active block。
+  - 该探针同时发现 `LAB/USDT` 也有大量历史不可交易拒单，会被同一机制阻断。
+- 重启后窗口检查：
+  - `post_restart_51155_count=0`
+  - `post_restart_order_status_counts={}`
+- 120 分钟策略健康脚本：
+  - `trade_execution_contract.status=ok`
+  - `contract_violation_count=0`
+  - `weak_evidence_executed_count=0`
+  - `negative_expected_executed_count=0`
+  - `fast_loss_without_strong_exit_count=0`
+  - `local_ml_readiness=degraded`，阻塞仍为 `long_top_return_below_threshold` 与 `short_top_return_below_threshold`
+- 系统巡检必须使用 Dashboard/交易服务等价环境验证；裸 `sudo -u bb` 环境没有 `/etc/bb/bb-runtime.env` 会误报 local AI tools 401。
+  - 服务等价环境复验：overall `warning`、cards `20`、critical `0`、warning `9`、ok `11`
+  - issue ledger：`fixed=11`、`unresolved=0`、`observing=9`
+  - `model_training=warning`，原因是可选增强数据源未配置，不是 local AI tools 硬故障。
+
+当前真实结论：
+- 已知不可交易交易对的重复 OKX 提交链路已收口到执行前阻断，并且交易主进程已加载新代码。
+- 本批降低的是失败订单/重复拒单风险，不会让系统自动多开仓，也不会让小单自动变大。
+- 当前仍未完成的核心问题仍是收益闭环：ML 高分桶收益为负、部分候选收益质量不足、强机会可复制识别和历史脏数据/收益样本治理仍需继续。
+
+后续 AI 防偏要求：
+- 后续看到 `51155`、`local compliance restrictions`、`cannot trade this pair`、`contract under delivery` 等交易所明确不可交易错误时，必须先检查 blocklist 是否已恢复和是否在 entry policy 前生效，不得重复提交 OKX。
+- 不得把这类本地阻断显示成“OKX 已执行”或“OKX 同步平仓”；执行来源和状态必须如实标为本地策略阻断/跳过。
+- 验证系统巡检时必须加载线上服务等价环境；裸命令缺少 runtime env 时出现 local AI tools 401，不能当作真实线上故障。
+- 若后续 51155 在重启后再次新增，优先检查交易主进程 PID、`_load_untradable_symbol_blocks()` 查询窗口、`AIDecision.raw_llm_response/execution_reason` 是否写入了 OKX 原始错误；不得用延长冷却时间代替根因排查。
+
+回滚点：
+- 代码层可回滚 `services/trading_service.py` 与 `tests/test_trading_service_boundaries.py`。
+- 线上回滚后必须重启 `bb-paper-trading.service`，否则交易主进程仍会保留旧 provider。
+- 本批无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无真实交易参数放宽。

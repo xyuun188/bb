@@ -1311,6 +1311,95 @@ async def test_trading_service_restores_untradable_symbol_from_raw_execution_err
 
 
 @pytest.mark.asyncio
+async def test_entry_execution_policy_refreshes_untradable_symbol_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    rows = [
+        SimpleNamespace(
+            model_name="ensemble_trader",
+            symbol="RESOLV/USDT",
+            action="long",
+            confidence=0.8,
+            position_size_pct=0.05,
+            suggested_leverage=3.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.1,
+            reasoning="test",
+            feature_snapshot={"current_price": 1.0},
+            execution_reason=None,
+            raw_llm_response={
+                "execution_result": {
+                    "status": "rejected",
+                    "raw_response": {
+                        "raw_error": (
+                            '{"code":"1","data":[{"sCode":"51155","sMsg":'
+                            '"Due to local compliance restrictions, you currently cannot trade this pair."}]}'
+                        ),
+                    },
+                }
+            },
+            created_at=now,
+        )
+    ]
+
+    class FakeResult:
+        def all(self):
+            return rows
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    class FakeSizing:
+        async def apply(self, decision, model_mode, open_positions=None):
+            decision.position_size_pct = 0.04
+
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
+        lambda symbol: str(symbol or "").replace("-", "/")
+    )
+    service._entry_symbol_blocks_refreshed_at = None
+    service.entry_policy = EntryPolicy(
+        entry_profit_risk_sizing=FakeSizing(),
+        entry_opportunity_gate=EntryOpportunityGatePolicy(
+            blocked_symbol_reason=service.blocked_symbol_reason,
+        ),
+    )
+    service.entry_execution_pipeline = EntryExecutionPipeline(lambda: service.entry_policy)
+    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
+
+    decision = _decision(Action.LONG)
+    decision.symbol = "RESOLV/USDT"
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 1.4,
+            "expected_net_return_pct": 0.8,
+            "profit_quality_ratio": 1.2,
+            "success_probability": 0.62,
+            "tail_risk_score": 0.2,
+        }
+    }
+
+    result = await service.evaluate_entry_execution_policy(
+        decision,
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "entry_opportunity_gate"
+    assert "51155" in result.reason
+    assert service.blocked_symbol_reason("RESOLV-USDT") is not None
+    assert service._entry_symbol_blocks_refreshed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_trading_service_restores_untradable_exit_cooldown_from_contract_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

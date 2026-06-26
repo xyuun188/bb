@@ -191,7 +191,7 @@ from services.sync_service import OkxSyncService
 from services.trade_order_log_service import TradeOrderLogService
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.trading_policies import EntryPolicy, ExitPolicy
+from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.text_sanitize import sanitize_text
 
@@ -269,6 +269,7 @@ AGENT_SKILLS_TRADING_EFFECTS_ENABLED = True
 LOCAL_QUANT_PROMPT_ENABLED = True
 LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
 OKX_BALANCE_SNAPSHOT_CACHE_SECONDS = 120.0
+ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
 MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
 ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
 DISCRETIONARY_CLOSE_CONFIDENCE = 0.66
@@ -366,6 +367,7 @@ class TradingService:
         self.market_decision_result_recorder = MarketDecisionResultRecorder()
         self.redis = redis_client
         self.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(self._normalize_position_symbol)
+        self._entry_symbol_blocks_refreshed_at: datetime | None = None
         self.execution_result_classifier = ExecutionResultClassifier(
             untradable_exchange_error_checker=self.is_untradable_exchange_error
         )
@@ -429,7 +431,7 @@ class TradingService:
             account_update_persister=self.persist_account_update,
             account_balance_provider=self.get_account_balance,
             decision_outcome_marker=self.mark_decision_outcome,
-            entry_policy_evaluator=self.entry_execution_pipeline.evaluate,
+            entry_policy_evaluator=self.evaluate_entry_execution_policy,
             exit_policy_evaluator=self.exit_execution_pipeline.evaluate,
             execution_skills_provider=self.execution_agent_skills,
             execution_skills_attacher=self.attach_execution_agent_skills,
@@ -1527,6 +1529,34 @@ class TradingService:
         """Return active new-entry block reason through the symbol blocklist boundary."""
 
         return self._entry_symbol_blocklist_policy().blocked_symbol_reason(symbol)
+
+    async def _refresh_entry_symbol_blocks_if_stale(self, *, force: bool = False) -> None:
+        last_refresh = getattr(self, "_entry_symbol_blocks_refreshed_at", None)
+        now = datetime.now(UTC)
+        if (
+            not force
+            and isinstance(last_refresh, datetime)
+            and (now - last_refresh).total_seconds() < ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS
+        ):
+            return
+        await self._load_untradable_symbol_blocks()
+
+    async def evaluate_entry_execution_policy(
+        self,
+        decision: DecisionOutput,
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict[str, Any]] | None,
+    ) -> PolicyGateResult:
+        """Refresh persisted entry blocks before the execution-facing entry policy."""
+
+        await self._refresh_entry_symbol_blocks_if_stale()
+        return await self.entry_execution_pipeline.evaluate(
+            decision,
+            model_name,
+            model_mode,
+            open_positions,
+        )
 
     @staticmethod
     def _decision_execution_error_text(
@@ -3468,6 +3498,8 @@ class TradingService:
         try:
             from models.decision import AIDecision
 
+            now = datetime.now(UTC)
+            cutoff = now - timedelta(hours=UNTRADABLE_SYMBOL_BLOCK_HOURS)
             async with get_session_ctx() as session:
                 result = await session.execute(
                     select(
@@ -3489,10 +3521,11 @@ class TradingService:
                         or_(
                             AIDecision.execution_reason.is_not(None),
                             AIDecision.raw_llm_response.is_not(None),
-                        )
+                        ),
+                        AIDecision.created_at >= cutoff,
                     )
                     .order_by(AIDecision.created_at.desc())
-                    .limit(300)
+                    .limit(2000)
                 )
                 for row in result.all():
                     reason = self._decision_execution_error_text(
@@ -3502,7 +3535,7 @@ class TradingService:
                     created_at = row.created_at
                     if created_at and created_at.tzinfo is None:
                         created_at = created_at.replace(tzinfo=UTC)
-                    recent = not created_at or (datetime.now(UTC) - created_at) <= timedelta(
+                    recent = not created_at or (now - created_at) <= timedelta(
                         hours=UNTRADABLE_SYMBOL_BLOCK_HOURS
                     )
                     if recent and self.is_untradable_exchange_error(reason):
@@ -3538,8 +3571,7 @@ class TradingService:
                             )
                     elif (
                         created_at
-                        and datetime.now(UTC) - created_at
-                        <= timedelta(minutes=TRANSIENT_ENTRY_BLOCK_MINUTES)
+                        and now - created_at <= timedelta(minutes=TRANSIENT_ENTRY_BLOCK_MINUTES)
                         and self.is_transient_entry_exchange_error(reason)
                     ):
                         self.remember_temporary_entry_block(
@@ -3549,8 +3581,7 @@ class TradingService:
                         )
                     elif (
                         created_at
-                        and datetime.now(UTC) - created_at
-                        <= timedelta(minutes=PRICE_GUARD_ENTRY_BLOCK_MINUTES)
+                        and now - created_at <= timedelta(minutes=PRICE_GUARD_ENTRY_BLOCK_MINUTES)
                         and self.entry_symbol_blocklist.is_entry_price_guard_skip(reason)
                     ):
                         self.remember_temporary_entry_block(
@@ -3558,6 +3589,7 @@ class TradingService:
                             reason,
                             PRICE_GUARD_ENTRY_BLOCK_MINUTES,
                         )
+            self._entry_symbol_blocks_refreshed_at = now
         except Exception as e:
             logger.warning("failed to load untradable symbol blocks", error=safe_error_text(e))
 
@@ -3607,7 +3639,7 @@ class TradingService:
             )
             self._trade_count = trade_count.scalar() or 0
 
-        await self._load_untradable_symbol_blocks()
+        await self._refresh_entry_symbol_blocks_if_stale(force=True)
         await self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value)
 
         # Subscribe to mode changes to reinitialize LLM agent
@@ -3623,6 +3655,7 @@ class TradingService:
         settings.refresh_runtime_env(force=True)
         if not self._running:
             return {"status": "stopped"}
+        await self._refresh_entry_symbol_blocks_if_stale()
 
         analysis_scope = (
             analysis_scope if analysis_scope in {"full", "market", "position"} else "full"
