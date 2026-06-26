@@ -51,6 +51,31 @@ def _as_utc(value: Any) -> datetime | None:
     return value.astimezone(UTC)
 
 
+def _position_trade_fact_trusted(position: Position) -> bool:
+    """Return true when a closed trade sample has authoritative OKX links."""
+
+    if not str(getattr(position, "entry_exchange_order_id", "") or "").strip():
+        return False
+    if (
+        not bool(getattr(position, "is_open", False))
+        and _as_float(getattr(position, "realized_pnl", None)) != 0.0
+        and not str(getattr(position, "close_exchange_order_id", "") or "").strip()
+    ):
+        return False
+    return True
+
+
+def _reflection_trade_fact_trusted(
+    reflection: TradeReflection,
+    positions_by_id: dict[int, Position],
+) -> bool:
+    position_id = int(getattr(reflection, "position_id", None) or 0)
+    if position_id <= 0:
+        return True
+    position = positions_by_id.get(position_id)
+    return bool(position is not None and _position_trade_fact_trusted(position))
+
+
 def _snapshot(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -187,9 +212,21 @@ async def _load_trade_reflection_samples(limit: int) -> list[dict[str, Any]]:
             select(TradeReflection).order_by(TradeReflection.id.desc()).limit(max(int(limit), 1))
         )
         rows = list(result.scalars().all())
+        position_ids = {int(row.position_id or 0) for row in rows if int(row.position_id or 0) > 0}
+        positions_by_id = {}
+        if position_ids:
+            position_result = await session.execute(
+                select(Position).where(Position.id.in_(position_ids))
+            )
+            positions_by_id = {
+                int(position.id): position for position in position_result.scalars().all()
+            }
 
     samples: list[dict[str, Any]] = []
     for row in rows:
+        position = positions_by_id.get(int(row.position_id or 0))
+        if position is not None and not _position_trade_fact_trusted(position):
+            continue
         samples.append(
             {
                 "source": "trade_reflection",
@@ -235,6 +272,8 @@ async def _load_closed_position_samples(limit: int) -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     for row in rows:
         if position_has_manual_close_order(row, manual_orders):
+            continue
+        if not _position_trade_fact_trusted(row):
             continue
         opened = _as_utc(row.created_at)
         closed = _as_utc(row.closed_at)
@@ -307,15 +346,26 @@ async def _completed_shadow_sample_count() -> int:
 
 async def _completed_trade_sample_count() -> int:
     async with get_session_ctx() as session:
-        reflection_result = await session.execute(select(func.count(TradeReflection.id)))
-        reflection_count = int(reflection_result.scalar() or 0)
-
-        reflected_position_result = await session.execute(select(TradeReflection.position_id))
+        reflection_rows_result = await session.execute(select(TradeReflection))
+        reflection_rows = list(reflection_rows_result.scalars().all())
         reflected_position_ids = {
-            int(position_id or 0)
-            for position_id in reflected_position_result.scalars().all()
-            if int(position_id or 0) > 0
+            int(row.position_id or 0)
+            for row in reflection_rows
+            if int(row.position_id or 0) > 0
         }
+        reflected_positions_by_id = {}
+        if reflected_position_ids:
+            reflected_positions_result = await session.execute(
+                select(Position).where(Position.id.in_(reflected_position_ids))
+            )
+            reflected_positions_by_id = {
+                int(position.id): position for position in reflected_positions_result.scalars().all()
+            }
+        reflection_count = sum(
+            1
+            for row in reflection_rows
+            if _reflection_trade_fact_trusted(row, reflected_positions_by_id)
+        )
 
         closed_stmt = select(Position).where(
             Position.is_open.is_(False),
@@ -340,6 +390,7 @@ async def _completed_trade_sample_count() -> int:
             1
             for position in closed_positions
             if not position_has_manual_close_order(position, manual_orders)
+            and _position_trade_fact_trusted(position)
         )
         return reflection_count + eligible_closed_count
 
