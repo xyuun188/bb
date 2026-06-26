@@ -3810,3 +3810,67 @@ Git 与线上部署：
 - 代码层可回滚 `services/ml_signal_service.py`、`tests/test_ml_signal_training_quality.py` 与 `tests/test_trading_service_boundaries.py`。
 - 线上回滚后必须重启 `bb-paper-trading.service`，否则交易主进程仍会保留新/旧 MLSignalService 逻辑。
 - 本批无 DB 迁移、无历史数据覆盖、无交易参数放宽、无模型 artifact 替换。
+
+---
+
+## 七十、Batch I 二期阶段 3 补充记录：ML 训练窗口 extended dry-run，确认不能靠挑漂亮样本启用 ML（2026-06-26）
+
+触发原因：
+- 六十九节已修复自动训练“训练即替换”的 artifact 晋级问题，但线上根因审计仍显示 `ml_not_contributing` 与 `ml_top_return_not_profitable`。
+- 进一步查看线上当前 artifact 的 `score_bucket_diagnostics`：ML top bucket 的胜率略有提高，但 fee 后平均收益反而更差；例如 long top return 为负且低于 bottom，short top return 也为负。这说明模型可能学到“小胜率/弱方向”，没有学到“真实费后收益质量”。
+- 为避免后续 AI 挑一个看起来漂亮的窗口就硬启 ML，本轮把手工只读实验产品化到 dry-run 脚本里。
+
+本次修复范围：
+- `scripts/evaluate_ml_training_windows.py` 新增 `--extended`，默认行为不变；显式开启时额外评估 side/horizon/方向一致性诊断窗口。
+- 新增诊断窗口包括：
+  - `diagnostic_decision_equals_best`
+  - `diagnostic_decision_not_equals_best`
+  - `diagnostic_horizon_10/30/60`
+  - `diagnostic_decision_long/short`
+  - `diagnostic_best_long/short`
+  - `diagnostic_decision_equals_best_long/short`
+- 这些窗口全部标注为 diagnostic-only；特别是 `decision_equals_best` 有幸存者偏差，不能直接作为生产训练窗口。
+- `tests/test_ml_signal_training_quality.py` 新增测试，锁定 extended variant 名称和 selector 行为，避免以后只剩临时脚本或口头结论。
+
+安全边界：
+- 本批只改只读诊断脚本和测试，不改生产训练选择策略，不改 artifact 晋级门，不改 ML readiness 阈值，不改开仓、仓位、杠杆、止盈止损、OKX 执行或风控。
+- `--extended` 输出中的任何单个漂亮窗口，都不能作为直接启用 ML live influence 的依据；必须仍通过 readiness、线上 shadow/canary、真实已平仓费后收益验证。
+- `decision_equals_best`、`best_long`、`best_short` 等窗口可能剔除了失败样本或只保留 hindsight 成功侧，必须用于定位标签/特征问题，不能用于生产投机。
+
+本地验证：
+- `python scripts/evaluate_ml_training_windows.py --help`：新增 `--extended` 参数可见。
+- `pytest tests/test_ml_signal_training_quality.py::test_ml_training_window_evaluator_exposes_extended_diagnostic_variants tests/test_ml_signal_training_quality.py::test_train_from_frame_can_evaluate_without_persisting_artifacts -q`：2 passed。
+- `pytest tests/test_ml_signal_training_quality.py -q`：18 passed。
+- `ruff check scripts/evaluate_ml_training_windows.py tests/test_ml_signal_training_quality.py`：通过。
+- `black --check scripts/evaluate_ml_training_windows.py tests/test_ml_signal_training_quality.py`：通过。
+- `git diff --check`：通过。
+
+线上只读复验：
+- 使用 `python scripts/sync_to_online_server.py --split-services --skip-restart` 上传 `scripts/evaluate_ml_training_windows.py` 与总控文档，未重启交易服务。
+- 线上真实库 `run(limit=6000, candidate_multiplier=4.0, include_extended=True)`：
+  - `dry_run=true`
+  - `artifact_persisted=false`
+  - `database_mutated=false`
+  - `extended_diagnostics=true`
+  - `candidate_row_count=26418`
+  - `completed_shadow_sample_count=150905`
+  - `ready_variants=[]`
+- 关键结论：
+  - 默认/生产相近窗口仍没有 ready variant。
+  - `diagnostic_decision_equals_best` 在小窗口里 top long/short return 和 PR-AUC 很好，但只剩 1004 条，且 `dirty_sample_ratio_high`；更重要的是它剔除了 AI 方向错的失败样本，存在幸存者偏差。
+  - `diagnostic_decision_not_equals_best` 也出现较好收益，但样本数不足，且其本质是“原方向错、反向更好”的诊断，不是生产开仓依据。
+  - 单 horizon 和单 side 变体没有通过 readiness；部分 top return 为正，但 AUC/PR-AUC/样本数/dirty ratio 不稳定。
+
+当前真实结论：
+- 当前 ML 问题不是“阈值太严”，也不是“随便换一个窗口就能上线”；更准确地说，是现有特征/标签/side 口径还无法稳定排序出费后高收益样本。
+- 下一步应做 selected-side 标签与特征根治：让训练评估能够解释“AI 当前选择的 side 是否赚钱”，同时保留失败样本，避免只用 hindsight 成功样本制造假高分。
+- 在 selected-side 训练/评估没有通过 readiness 和线上 canary 前，ML 必须保持学习观察，不参与实盘放大。
+
+后续 AI 防偏要求：
+- 看到 `diagnostic_decision_equals_best` 指标好时，必须先标注幸存者偏差，不得把它直接变成生产训练窗口。
+- 看到 `ready_variants=[]` 时，必须继续查标签、side 特征、失败样本覆盖、手续费/滑点和真实平仓 PnL，不得降低 readiness 阈值。
+- 若要推进 ML canary，必须新增 selected-side 只读报表和失败样本对照，而不是复用全局 long/short 模型的漂亮分桶。
+
+回滚点：
+- 代码层可回滚 `scripts/evaluate_ml_training_windows.py` 与 `tests/test_ml_signal_training_quality.py`。
+- 本批无服务重启、无 DB 迁移、无历史数据覆盖、无模型 artifact 替换、无交易参数放宽。

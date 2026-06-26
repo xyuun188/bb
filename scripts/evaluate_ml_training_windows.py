@@ -170,6 +170,63 @@ def _select_balanced_action_exclude_best_hold(rows: list[Any], limit: int) -> li
     return selected
 
 
+def _trainable_trade_rows(rows: list[Any]) -> list[Any]:
+    return _quality_sorted(
+        [row for row in _dedupe_rows(rows) if _shadow_is_trainable_trade_opportunity(row)]
+    )
+
+
+def _select_decision_equals_best(rows: list[Any], limit: int) -> list[Any]:
+    candidates = [
+        row
+        for row in _trainable_trade_rows(rows)
+        if _shadow_action(row, "decision_action") == _shadow_action(row, "best_action")
+    ]
+    return candidates[:limit]
+
+
+def _select_decision_not_equals_best(rows: list[Any], limit: int) -> list[Any]:
+    candidates = [
+        row
+        for row in _trainable_trade_rows(rows)
+        if _shadow_action(row, "decision_action") != _shadow_action(row, "best_action")
+    ]
+    return candidates[:limit]
+
+
+def _select_horizon(rows: list[Any], limit: int, horizon_minutes: int) -> list[Any]:
+    candidates = [
+        row
+        for row in _trainable_trade_rows(rows)
+        if int(getattr(row, "horizon_minutes", 0) or 0) == int(horizon_minutes)
+    ]
+    return candidates[:limit]
+
+
+def _select_decision_side(rows: list[Any], limit: int, side: str) -> list[Any]:
+    candidates = [
+        row for row in _trainable_trade_rows(rows) if _shadow_action(row, "decision_action") == side
+    ]
+    return candidates[:limit]
+
+
+def _select_best_side(rows: list[Any], limit: int, side: str) -> list[Any]:
+    candidates = [
+        row for row in _trainable_trade_rows(rows) if _shadow_action(row, "best_action") == side
+    ]
+    return candidates[:limit]
+
+
+def _select_decision_equals_best_side(rows: list[Any], limit: int, side: str) -> list[Any]:
+    candidates = [
+        row
+        for row in _trainable_trade_rows(rows)
+        if _shadow_action(row, "decision_action") == side
+        and _shadow_action(row, "best_action") == side
+    ]
+    return candidates[:limit]
+
+
 def variants() -> list[WindowVariant]:
     return [
         WindowVariant(
@@ -203,6 +260,79 @@ def variants() -> list[WindowVariant]:
             name="balanced_action_exclude_best_hold",
             selector=_select_balanced_action_exclude_best_hold,
             description="Exclude best_action=hold and balance decision_action buckets.",
+        ),
+    ]
+
+
+def extended_variants() -> list[WindowVariant]:
+    """Diagnostic-only windows for side/horizon root-cause analysis.
+
+    These variants intentionally do not imply production promotion. Some of them
+    are biased views, such as decision=best, and are useful only to reveal where
+    the current ML labels or features fail.
+    """
+
+    return [
+        WindowVariant(
+            name="diagnostic_decision_equals_best",
+            selector=_select_decision_equals_best,
+            description=(
+                "Diagnostic only: rows where the original decision side matched hindsight "
+                "best_action. Watch for survivorship bias before promoting anything."
+            ),
+        ),
+        WindowVariant(
+            name="diagnostic_decision_not_equals_best",
+            selector=_select_decision_not_equals_best,
+            description=(
+                "Diagnostic only: rows where the original decision side disagreed with "
+                "hindsight best_action; useful for direction-error analysis."
+            ),
+        ),
+        WindowVariant(
+            name="diagnostic_horizon_10",
+            selector=lambda rows, limit: _select_horizon(rows, limit, 10),
+            description="Diagnostic only: trade-opportunity rows with 10 minute labels.",
+        ),
+        WindowVariant(
+            name="diagnostic_horizon_30",
+            selector=lambda rows, limit: _select_horizon(rows, limit, 30),
+            description="Diagnostic only: trade-opportunity rows with 30 minute labels.",
+        ),
+        WindowVariant(
+            name="diagnostic_horizon_60",
+            selector=lambda rows, limit: _select_horizon(rows, limit, 60),
+            description="Diagnostic only: trade-opportunity rows with 60 minute labels.",
+        ),
+        WindowVariant(
+            name="diagnostic_decision_long",
+            selector=lambda rows, limit: _select_decision_side(rows, limit, "long"),
+            description="Diagnostic only: rows whose original decision was long.",
+        ),
+        WindowVariant(
+            name="diagnostic_decision_short",
+            selector=lambda rows, limit: _select_decision_side(rows, limit, "short"),
+            description="Diagnostic only: rows whose original decision was short.",
+        ),
+        WindowVariant(
+            name="diagnostic_best_long",
+            selector=lambda rows, limit: _select_best_side(rows, limit, "long"),
+            description="Diagnostic only: rows whose hindsight best_action was long.",
+        ),
+        WindowVariant(
+            name="diagnostic_best_short",
+            selector=lambda rows, limit: _select_best_side(rows, limit, "short"),
+            description="Diagnostic only: rows whose hindsight best_action was short.",
+        ),
+        WindowVariant(
+            name="diagnostic_decision_equals_best_long",
+            selector=lambda rows, limit: _select_decision_equals_best_side(rows, limit, "long"),
+            description="Diagnostic only: long rows where decision_action matched best_action.",
+        ),
+        WindowVariant(
+            name="diagnostic_decision_equals_best_short",
+            selector=lambda rows, limit: _select_decision_equals_best_side(rows, limit, "short"),
+            description="Diagnostic only: short rows where decision_action matched best_action.",
         ),
     ]
 
@@ -366,9 +496,18 @@ def evaluate_variant(
     return result
 
 
-async def run(limit: int, min_samples: int, candidate_multiplier: float) -> dict[str, Any]:
+async def run(
+    limit: int,
+    min_samples: int,
+    candidate_multiplier: float,
+    *,
+    include_extended: bool = False,
+) -> dict[str, Any]:
     candidates = await load_candidate_rows(limit, multiplier=candidate_multiplier)
     completed_count = await count_shadow_training_rows()
+    selected_variants = variants()
+    if include_extended:
+        selected_variants = [*selected_variants, *extended_variants()]
     results = [
         evaluate_variant(
             variant,
@@ -377,7 +516,7 @@ async def run(limit: int, min_samples: int, candidate_multiplier: float) -> dict
             min_samples=min_samples,
             completed_count=completed_count,
         )
-        for variant in variants()
+        for variant in selected_variants
     ]
     ready_variants = [
         item["variant"] for item in results if item.get("allow_live_position_influence")
@@ -389,6 +528,7 @@ async def run(limit: int, min_samples: int, candidate_multiplier: float) -> dict
         "limit": int(limit),
         "min_samples": int(min_samples),
         "candidate_multiplier": float(candidate_multiplier),
+        "extended_diagnostics": bool(include_extended),
         "candidate_row_count": len(candidates),
         "completed_shadow_sample_count": completed_count,
         "ready_variants": ready_variants,
@@ -406,6 +546,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=TRAINING_SHADOW_SAMPLE_LIMIT)
     parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
     parser.add_argument("--candidate-multiplier", type=float, default=2.0)
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="Also evaluate side/horizon diagnostic windows. Slower and read-only.",
+    )
     args = parser.parse_args()
 
     result = asyncio.run(
@@ -413,6 +558,7 @@ def main() -> None:
             limit=max(int(args.limit), 1),
             min_samples=max(int(args.min_samples), 1),
             candidate_multiplier=max(float(args.candidate_multiplier), 1.0),
+            include_extended=bool(args.extended),
         )
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

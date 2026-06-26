@@ -11,6 +11,7 @@ import pytest
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
+from scripts import evaluate_ml_training_windows as ml_window_eval
 from scripts import train_ml_signal_model as train_ml_signal_script
 from services import ml_signal_service as ml_signal_module
 from services.ml_signal_service import (
@@ -455,6 +456,29 @@ def test_shadow_training_selection_uses_only_best_trade_samples() -> None:
     assert non_hold_count == 8
     assert best_trade_count == len(selected)
     assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
+
+
+def test_ml_training_window_evaluator_exposes_extended_diagnostic_variants() -> None:
+    names = [variant.name for variant in ml_window_eval.extended_variants()]
+    assert "diagnostic_decision_equals_best" in names
+    assert "diagnostic_decision_not_equals_best" in names
+    assert "diagnostic_horizon_60" in names
+    assert "diagnostic_decision_equals_best_short" in names
+
+    rows = [
+        _shadow_row(1, action="long", best_action="long"),
+        _shadow_row(2, action="short", best_action="long"),
+        _shadow_row(3, action="short", best_action="short"),
+    ]
+    selectors = {variant.name: variant.selector for variant in ml_window_eval.extended_variants()}
+
+    matched = selectors["diagnostic_decision_equals_best"](rows, 10)
+    mismatched = selectors["diagnostic_decision_not_equals_best"](rows, 10)
+    matched_short = selectors["diagnostic_decision_equals_best_short"](rows, 10)
+
+    assert {row.id for row in matched} == {1, 3}
+    assert {row.id for row in mismatched} == {2}
+    assert [row.id for row in matched_short] == [3]
 
 
 def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality_hold() -> None:
