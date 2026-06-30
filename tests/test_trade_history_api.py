@@ -384,6 +384,109 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
 
 
 @pytest.mark.asyncio
+async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'sky-reused-posid-ledger.db').as_posix()}",
+    )
+    await init_db()
+    first_opened_at = datetime(2026, 6, 30, 9, 22, 36, tzinfo=UTC)
+    first_closed_at = datetime(2026, 6, 30, 10, 43, 50, tzinfo=UTC)
+    second_opened_at = datetime(2026, 6, 30, 10, 48, 57, tzinfo=UTC)
+    second_closed_at = datetime(2026, 6, 30, 11, 56, 21, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "execution_mode": "paper",
+                    "symbol": "SKY/USDT",
+                    "side": "short",
+                    "quantity": 900.0,
+                    "entry_price": 0.0526,
+                    "current_price": 0.0529,
+                    "leverage": 3.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": -0.0325,
+                    "is_open": False,
+                    "okx_inst_id": "SKY-USDT-SWAP",
+                    "okx_pos_id": "sky-reused-pos",
+                    "entry_exchange_order_id": "sky-entry-a,sky-entry-b",
+                    "close_exchange_order_id": "sky-close-a,sky-close-b",
+                    "closed_at": second_closed_at,
+                    "created_at": first_opened_at,
+                }
+            )
+            for order_id, side, quantity, price, filled_at, pnl in (
+                ("sky-entry-a", "sell", 400.0, 0.05294, second_opened_at, None),
+                ("sky-close-a", "buy", 400.0, 0.05306, second_closed_at, 0.24),
+                ("sky-entry-b", "sell", 500.0, 0.05235, first_opened_at, None),
+                ("sky-close-b", "buy", 500.0, 0.05286, first_closed_at, 0.11),
+            ):
+                raw_fills = {
+                    "order_id": order_id,
+                    "trade_ids": [f"trade-{order_id}"],
+                    "inst_id": "SKY-USDT-SWAP",
+                    "contracts": quantity,
+                    "contract_size": 1.0,
+                    "base_quantity": quantity,
+                    "avg_price": price,
+                    "fee_abs": 0.01,
+                    "timestamp": filled_at.isoformat(),
+                }
+                if pnl is not None:
+                    raw_fills["fill_pnl"] = pnl
+                await repo.create_order(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "SKY/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": quantity,
+                        "price": price,
+                        "status": "filled",
+                        "fee": 0.01,
+                        "exchange_order_id": order_id,
+                        "filled_at": filled_at,
+                        "created_at": filled_at,
+                        "okx_inst_id": "SKY-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": quantity,
+                        "okx_fill_pnl": pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": raw_fills,
+                    }
+                )
+
+        dashboard_payload = await get_dashboard_positions(mode="paper", closed_only=True)
+        trade_payload = await get_trade_positions(mode="paper")
+    finally:
+        await close_db()
+
+    for payload in (dashboard_payload, trade_payload):
+        sky_rows = [row for row in payload["positions"] if row["symbol"] == "SKY/USDT"]
+        assert len(sky_rows) == 2
+        assert {row["quantity"] for row in sky_rows} == {400.0, 500.0}
+        assert all(row["linked_order_count"] == 2 for row in sky_rows)
+        assert all(len(row["entry_order_ids"]) == 1 for row in sky_rows)
+        assert all(len(row["close_order_ids"]) == 1 for row in sky_rows)
+        by_quantity = {row["quantity"]: row for row in sky_rows}
+        assert by_quantity[400.0]["entry_order_ids"] == ["sky-entry-a"]
+        assert by_quantity[400.0]["close_order_ids"] == ["sky-close-a"]
+        assert by_quantity[400.0]["realized_pnl"] == pytest.approx(0.24)
+        assert by_quantity[500.0]["entry_order_ids"] == ["sky-entry-b"]
+        assert by_quantity[500.0]["close_order_ids"] == ["sky-close-b"]
+        assert by_quantity[500.0]["realized_pnl"] == pytest.approx(0.11)
+
+
+@pytest.mark.asyncio
 async def test_trade_positions_api_groups_closed_positions_with_okx_ledger(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -400,7 +503,7 @@ async def test_trade_positions_api_groups_closed_positions_with_okx_ledger(
     try:
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
-            for idx, qty, pnl in ((1, 10.0, 0.5), (2, 15.0, 0.75)):
+            for _idx, qty, pnl in ((1, 10.0, 0.5), (2, 15.0, 0.75)):
                 await repo.open_position(
                     {
                         "model_name": "okx_authoritative_sync",

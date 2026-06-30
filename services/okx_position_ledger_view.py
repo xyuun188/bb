@@ -135,6 +135,30 @@ class OkxPositionLedgerGroup:
         return payload
 
 
+@dataclass(slots=True)
+class _LedgerPositionFragment:
+    """Read-only split of one polluted local row into OKX lifecycle fragments."""
+
+    id: int | None
+    model_name: str
+    execution_mode: str
+    symbol: str
+    side: str
+    quantity: float
+    entry_price: float
+    current_price: float
+    leverage: float
+    unrealized_pnl: float
+    realized_pnl: float
+    is_open: bool
+    closed_at: datetime | None
+    created_at: datetime | None
+    okx_inst_id: str | None
+    okx_pos_id: str | None
+    entry_exchange_order_id: str | None
+    close_exchange_order_id: str | None
+
+
 def build_okx_position_ledger_groups(
     positions: list[Position],
     orders: list[Order],
@@ -147,6 +171,10 @@ def build_okx_position_ledger_groups(
         if not bool(getattr(position, "is_open", False))
         and not _is_zero_quantity_residual(position)
     ]
+    closed_positions = _split_polluted_sequential_lifecycle_positions(
+        closed_positions,
+        orders_by_id,
+    )
     closed_positions = [
         position
         for position in closed_positions
@@ -154,7 +182,11 @@ def build_okx_position_ledger_groups(
     ]
     result: list[OkxPositionLedgerGroup] = []
     for key, rows in _group_closed_positions_by_lifecycle(closed_positions):
-        rows = sorted(rows, key=lambda item: _as_utc(getattr(item, "created_at", None)) or datetime.min.replace(tzinfo=UTC))
+        rows = sorted(
+            rows,
+            key=lambda item: _as_utc(getattr(item, "created_at", None))
+            or datetime.min.replace(tzinfo=UTC),
+        )
         rows = _deduplicate_superseded_position_rows(rows)
         group = _build_group_from_positions(key, rows, orders_by_id)
         result.append(group)
@@ -174,10 +206,8 @@ def _group_closed_positions_by_lifecycle(
         positions,
         key=lambda item: (
             _position_base_key(item),
-            _as_utc(getattr(item, "created_at", None))
-            or datetime.min.replace(tzinfo=UTC),
-            _as_utc(getattr(item, "closed_at", None))
-            or datetime.min.replace(tzinfo=UTC),
+            _as_utc(getattr(item, "created_at", None)) or datetime.min.replace(tzinfo=UTC),
+            _as_utc(getattr(item, "closed_at", None)) or datetime.min.replace(tzinfo=UTC),
             int(getattr(item, "id", 0) or 0),
         ),
     )
@@ -203,7 +233,12 @@ def _position_belongs_to_lifecycle_group(
     position_pos_id = _position_pos_id(position)
     group_pos_ids = {_position_pos_id(row) for row in rows if _position_pos_id(row)}
     if position_pos_id and group_pos_ids:
-        return position_pos_id in group_pos_ids
+        if position_pos_id not in group_pos_ids:
+            return False
+        return _position_order_sets_overlap(position, rows) or _position_time_window_matches_group(
+            position,
+            rows,
+        )
     if position_pos_id and not group_pos_ids:
         return _position_order_sets_overlap(position, rows) or _position_time_window_matches_group(
             position,
@@ -222,14 +257,10 @@ def _position_order_sets_overlap(position: Position, rows: list[Position]) -> bo
     if not (position_entry or position_close):
         return False
     group_entry = {
-        token
-        for row in rows
-        for token in _position_order_key(row, "entry_exchange_order_id")
+        token for row in rows for token in _position_order_key(row, "entry_exchange_order_id")
     }
     group_close = {
-        token
-        for row in rows
-        for token in _position_order_key(row, "close_exchange_order_id")
+        token for row in rows for token in _position_order_key(row, "close_exchange_order_id")
     }
     return bool((position_entry & group_entry) or (position_close & group_close))
 
@@ -240,20 +271,195 @@ def _position_time_window_matches_group(position: Position, rows: list[Position]
     if opened is None or closed is None:
         return False
     group_opened = [
-        value
-        for row in rows
-        if (value := _as_utc(getattr(row, "created_at", None))) is not None
+        value for row in rows if (value := _as_utc(getattr(row, "created_at", None))) is not None
     ]
     group_closed = [
-        value
-        for row in rows
-        if (value := _as_utc(getattr(row, "closed_at", None))) is not None
+        value for row in rows if (value := _as_utc(getattr(row, "closed_at", None))) is not None
     ]
     if not group_opened or not group_closed:
         return False
     opened_near = min(abs((opened - item).total_seconds()) for item in group_opened) <= 300
     closed_near = min(abs((closed - item).total_seconds()) for item in group_closed) <= 1800
     return bool(opened_near and closed_near)
+
+
+def _split_polluted_sequential_lifecycle_positions(
+    positions: list[Position],
+    orders_by_id: dict[str, Order],
+) -> list[Position]:
+    result: list[Position] = []
+    for position in positions:
+        result.extend(_split_polluted_sequential_lifecycle_position(position, orders_by_id))
+    return result
+
+
+def _split_polluted_sequential_lifecycle_position(
+    position: Position,
+    orders_by_id: dict[str, Order],
+) -> list[Position]:
+    entry_ids = _position_order_key(position, "entry_exchange_order_id")
+    close_ids = _position_order_key(position, "close_exchange_order_id")
+    if len(entry_ids) < 2 or len(close_ids) < 2 or len(entry_ids) != len(close_ids):
+        return [position]
+
+    side = str(getattr(position, "side", "") or "").lower()
+    expected_entry_side = "sell" if side == "short" else "buy" if side == "long" else ""
+    expected_close_side = "buy" if side == "short" else "sell" if side == "long" else ""
+    if not expected_entry_side or not expected_close_side:
+        return [position]
+
+    entry_orders = _matched_side_orders(entry_ids, orders_by_id, expected_entry_side)
+    close_orders = _matched_side_orders(close_ids, orders_by_id, expected_close_side)
+    if len(entry_orders) != len(entry_ids) or len(close_orders) != len(close_ids):
+        return [position]
+
+    pairs = _pair_sequential_entry_close_orders(entry_orders, close_orders)
+    if len(pairs) < 2 or not _order_pairs_are_separate_lifecycles(pairs):
+        return [position]
+    if not _order_pairs_cover_position_quantity(position, pairs):
+        return [position]
+
+    return [_position_fragment_from_order_pair(position, entry, close) for entry, close in pairs]
+
+
+def _matched_side_orders(
+    order_ids: tuple[str, ...],
+    orders_by_id: dict[str, Order],
+    expected_side: str,
+) -> list[Order]:
+    orders: list[Order] = []
+    for order_id in order_ids:
+        order = orders_by_id.get(order_id)
+        if order is None:
+            continue
+        if str(getattr(order, "side", "") or "").lower() != expected_side:
+            continue
+        if _order_time(order) is None:
+            continue
+        orders.append(order)
+    return orders
+
+
+def _pair_sequential_entry_close_orders(
+    entry_orders: list[Order],
+    close_orders: list[Order],
+) -> list[tuple[Order, Order]]:
+    remaining_closes = sorted(
+        close_orders,
+        key=lambda order: _order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+    pairs: list[tuple[Order, Order]] = []
+    for entry_order in sorted(
+        entry_orders,
+        key=lambda order: _order_time(order) or datetime.max.replace(tzinfo=UTC),
+    ):
+        entry_time = _order_time(entry_order)
+        entry_quantity = _order_quantity(entry_order)
+        if entry_time is None or entry_quantity <= 0:
+            return []
+        candidates = [
+            close_order
+            for close_order in remaining_closes
+            if (close_time := _order_time(close_order)) is not None
+            and close_time >= entry_time
+            and _quantities_match(entry_quantity, _order_quantity(close_order))
+        ]
+        if not candidates:
+            return []
+        close_order = min(
+            candidates,
+            key=lambda order: _order_time(order) or datetime.max.replace(tzinfo=UTC),
+        )
+        pairs.append((entry_order, close_order))
+        remaining_closes.remove(close_order)
+    if remaining_closes:
+        return []
+    return sorted(
+        pairs,
+        key=lambda pair: _order_time(pair[0]) or datetime.max.replace(tzinfo=UTC),
+    )
+
+
+def _order_pairs_are_separate_lifecycles(pairs: list[tuple[Order, Order]]) -> bool:
+    ordered = sorted(
+        pairs,
+        key=lambda pair: _order_time(pair[0]) or datetime.max.replace(tzinfo=UTC),
+    )
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        previous_close_time = _order_time(previous[1])
+        current_entry_time = _order_time(current[0])
+        if previous_close_time is None or current_entry_time is None:
+            return False
+        if previous_close_time > current_entry_time:
+            return False
+    return True
+
+
+def _order_pairs_cover_position_quantity(
+    position: Position,
+    pairs: list[tuple[Order, Order]],
+) -> bool:
+    position_quantity = abs(_safe_float(getattr(position, "quantity", None)))
+    if position_quantity <= 0:
+        return True
+    paired_quantity = sum(
+        min(_order_quantity(entry), _order_quantity(close)) for entry, close in pairs
+    )
+    return _quantities_match(position_quantity, paired_quantity, tolerance_ratio=0.05)
+
+
+def _position_fragment_from_order_pair(
+    position: Position,
+    entry_order: Order,
+    close_order: Order,
+) -> Position:
+    entry_quantity = _order_quantity(entry_order)
+    close_quantity = _order_quantity(close_order)
+    quantity = (
+        min(entry_quantity, close_quantity)
+        if entry_quantity > 0 and close_quantity > 0
+        else max(entry_quantity, close_quantity)
+    )
+    entry_price = _safe_float(getattr(entry_order, "price", None), 0.0) or _safe_float(
+        getattr(position, "entry_price", None),
+        0.0,
+    )
+    close_price = _safe_float(getattr(close_order, "price", None), 0.0) or _safe_float(
+        getattr(position, "current_price", None),
+        0.0,
+    )
+    realized_pnl = _order_realized_pnl(close_order)
+    if realized_pnl is None:
+        realized_pnl = _estimated_pair_pnl(
+            side=str(getattr(position, "side", "") or "").lower(),
+            quantity=quantity,
+            entry_price=entry_price,
+            close_price=close_price,
+        )
+    return _LedgerPositionFragment(
+        id=getattr(position, "id", None),
+        model_name=str(getattr(position, "model_name", "") or ""),
+        execution_mode=str(getattr(position, "execution_mode", "") or ""),
+        symbol=str(getattr(position, "symbol", "") or ""),
+        side=str(getattr(position, "side", "") or "").lower(),
+        quantity=quantity,
+        entry_price=entry_price,
+        current_price=close_price or entry_price,
+        leverage=_safe_float(getattr(position, "leverage", None), 1.0) or 1.0,
+        unrealized_pnl=0.0,
+        realized_pnl=realized_pnl or 0.0,
+        is_open=False,
+        closed_at=_order_time(close_order),
+        created_at=_order_time(entry_order),
+        okx_inst_id=getattr(position, "okx_inst_id", None)
+        or getattr(entry_order, "okx_inst_id", None)
+        or getattr(close_order, "okx_inst_id", None),
+        okx_pos_id=getattr(position, "okx_pos_id", None),
+        entry_exchange_order_id=str(getattr(entry_order, "exchange_order_id", "") or "").strip()
+        or None,
+        close_exchange_order_id=str(getattr(close_order, "exchange_order_id", "") or "").strip()
+        or None,
+    )
 
 
 def _build_group_from_positions(
@@ -281,7 +487,9 @@ def _build_group_from_positions(
     )
 
     all_order_ids = _ordered_tokens([*entry_ids, *close_ids])
-    linked_orders = [orders_by_id[order_id] for order_id in all_order_ids if order_id in orders_by_id]
+    linked_orders = [
+        orders_by_id[order_id] for order_id in all_order_ids if order_id in orders_by_id
+    ]
     linked_fills = [_fill_row_from_order(order) for order in linked_orders]
     linked_fills = sorted(
         [row for row in linked_fills if row is not None],
@@ -331,7 +539,9 @@ def _build_group_from_positions(
     if entry_notional > 0:
         realized_pct = realized_pnl / entry_notional * 100.0
 
-    leverage = max((_safe_float(getattr(pos, "leverage", None), 0.0) for pos in positions), default=0.0)
+    leverage = max(
+        (_safe_float(getattr(pos, "leverage", None), 0.0) for pos in positions), default=0.0
+    )
     gaps: list[str] = []
     if not inst_id:
         gaps.append("missing_okx_inst_id")
@@ -392,8 +602,7 @@ def _deduplicate_superseded_position_rows(positions: list[Position]) -> list[Pos
 
 def _is_superseded_position_residual(position: Position, positions: list[Position]) -> bool:
     return any(
-        other is not position and _position_supersedes(other, position)
-        for other in positions
+        other is not position and _position_supersedes(other, position) for other in positions
     )
 
 
@@ -446,10 +655,13 @@ def _position_supersedes(candidate: Position, other: Position) -> bool:
 
 
 def _same_position_quantity(left: Position, right: Position) -> bool:
-    return abs(
-        abs(_safe_float(getattr(left, "quantity", None)))
-        - abs(_safe_float(getattr(right, "quantity", None)))
-    ) <= 1e-12
+    return (
+        abs(
+            abs(_safe_float(getattr(left, "quantity", None)))
+            - abs(_safe_float(getattr(right, "quantity", None)))
+        )
+        <= 1e-12
+    )
 
 
 def _same_position_lifecycle(left: Position, right: Position) -> bool:
@@ -515,7 +727,9 @@ def _position_group_key(position: Position) -> tuple[str, str, str, str]:
 def _position_base_key(position: Position) -> tuple[str, str, str]:
     mode = str(getattr(position, "execution_mode", "") or "")
     inst_id = _position_inst_id(position)
-    symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(getattr(position, "symbol", None))
+    symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(
+        getattr(position, "symbol", None)
+    )
     side = str(getattr(position, "side", "") or "").lower()
     return mode, symbol, side
 
@@ -561,23 +775,35 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
         default=0.0,
     )
     contract_size = _first_positive(raw.get("contract_size"), raw.get("contractSize"), default=0.0)
-    quantity = _first_positive(raw.get("base_quantity"), getattr(order, "quantity", None), default=0.0)
+    quantity = _first_positive(
+        raw.get("base_quantity"), getattr(order, "quantity", None), default=0.0
+    )
     if quantity <= 0 and contracts > 0:
         quantity = contracts * (contract_size if contract_size > 0 else 1.0)
-    price = _first_positive(raw.get("avg_price"), raw.get("average"), getattr(order, "price", None), default=0.0)
+    price = _first_positive(
+        raw.get("avg_price"), raw.get("average"), getattr(order, "price", None), default=0.0
+    )
     fee = _first_positive(raw.get("fee_abs"), getattr(order, "fee", None), default=0.0)
     pnl = _safe_float(raw.get("fill_pnl"), None)
     if pnl is None:
         pnl = _safe_float(getattr(order, "okx_fill_pnl", None), None)
-    timestamp = _as_utc(raw.get("timestamp")) or _as_utc(getattr(order, "filled_at", None)) or _as_utc(getattr(order, "created_at", None))
+    timestamp = (
+        _as_utc(raw.get("timestamp"))
+        or _as_utc(getattr(order, "filled_at", None))
+        or _as_utc(getattr(order, "created_at", None))
+    )
     trade_ids = raw.get("trade_ids")
     if not isinstance(trade_ids, list):
-        trade_ids = [token for token in str(getattr(order, "okx_trade_ids", "") or "").split(",") if token]
+        trade_ids = [
+            token for token in str(getattr(order, "okx_trade_ids", "") or "").split(",") if token
+        ]
     trade_id = ",".join(str(item) for item in trade_ids if str(item).strip())
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
     okx_confirmed = sync_status in {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
     source = "okx_raw_fills" if raw else "local_order_cache"
-    if bool(raw.get("position_snapshot_confirmed")) and not bool(raw.get("fills_history_confirmed")):
+    if bool(raw.get("position_snapshot_confirmed")) and not bool(
+        raw.get("fills_history_confirmed")
+    ):
         source = "okx_current_position_snapshot"
     return OkxLinkedFillRow(
         side=str(getattr(order, "side", "") or "").lower(),
@@ -594,6 +820,76 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
         okx_confirmed=okx_confirmed,
         source=source,
     )
+
+
+def _order_time(order: Order) -> datetime | None:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    return (
+        _as_utc(raw.get("timestamp"))
+        or _as_utc(getattr(order, "filled_at", None))
+        or _as_utc(getattr(order, "created_at", None))
+    )
+
+
+def _order_quantity(order: Order) -> float:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    contracts = _first_positive(
+        raw.get("contracts"),
+        raw.get("filled_contracts"),
+        getattr(order, "okx_fill_contracts", None),
+        default=0.0,
+    )
+    contract_size = _first_positive(raw.get("contract_size"), raw.get("contractSize"), default=0.0)
+    quantity = _first_positive(
+        raw.get("base_quantity"),
+        raw.get("filled_base_quantity"),
+        getattr(order, "quantity", None),
+        default=0.0,
+    )
+    if quantity <= 0 and contracts > 0:
+        quantity = contracts * (contract_size if contract_size > 0 else 1.0)
+    return quantity
+
+
+def _order_realized_pnl(order: Order) -> float | None:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    pnl = _safe_float(raw.get("fill_pnl"), None)
+    if pnl is None:
+        pnl = _safe_float(getattr(order, "okx_fill_pnl", None), None)
+    return pnl
+
+
+def _estimated_pair_pnl(
+    *,
+    side: str,
+    quantity: float,
+    entry_price: float,
+    close_price: float,
+) -> float:
+    if quantity <= 0 or entry_price <= 0 or close_price <= 0:
+        return 0.0
+    if side == "short":
+        return (entry_price - close_price) * quantity
+    if side == "long":
+        return (close_price - entry_price) * quantity
+    return 0.0
+
+
+def _quantities_match(
+    left: float,
+    right: float,
+    *,
+    tolerance_ratio: float = 0.001,
+) -> bool:
+    left = abs(_safe_float(left) or 0.0)
+    right = abs(_safe_float(right) or 0.0)
+    if left <= 0 or right <= 0:
+        return left <= 1e-12 and right <= 1e-12
+    tolerance = max(left, right) * tolerance_ratio
+    return abs(left - right) <= max(tolerance, 1e-12)
 
 
 def _split_exchange_order_ids(value: Any) -> list[str]:
