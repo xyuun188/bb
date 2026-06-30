@@ -15,6 +15,34 @@ At the beginning of a session, do not run broad live recall by default. Use `hin
 
 Durable project changes are retained automatically by the user-level CODEX++ watcher and local Git hooks under `C:\Users\Administrator\.codex\hindsight-memory`. Do not duplicate this by saving every turn manually.
 
+## Required Post-Change Workflow
+
+After every completed code change in this repository, update all three places before finishing:
+
+1. Verify the change with the smallest relevant tests/checks.
+2. Sync the code to the online server, normally with:
+
+```powershell
+python scripts/sync_to_online_server.py --split-services
+```
+
+Use narrower options such as `--skip-restart`, `--include-tests`, or `--only` only when the task explicitly calls for staged validation.
+
+3. Commit and push the change to GitHub from `F:\BB`:
+
+```powershell
+rtk git status --short
+rtk git add <changed files>
+rtk git commit -m "<concise change summary>"
+rtk git push origin main
+```
+
+4. Update project memory for meaningful durable facts with the `bb` Hindsight bank. Prefer the configured CODEX++ automation/manual sync path, and never store secrets:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1" -ProjectRoot "F:\BB" -Event "manual"
+```
+
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
 
