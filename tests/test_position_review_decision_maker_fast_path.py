@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -155,3 +156,84 @@ async def test_position_hold_blocks_decision_maker_entry_when_add_evidence_denie
     guard = result.raw_response["decision_maker_position_add_guard"]
     assert guard["applied"] is True
     assert guard["add_evidence"]["should_add"] is False
+
+
+def test_position_close_evidence_locks_small_profitable_weak_continuation_position() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+
+    evidence = coordinator._position_close_evidence(
+        current_side="short",
+        close_action=Action.CLOSE_SHORT,
+        exit_votes=[],
+        risk_vetoes=[],
+        score=0.0,
+        raw_opinions=[],
+        symbol_positions=[
+            {
+                "side": "short",
+                "entry_price": 0.1713667,
+                "current_price": 0.1599,
+                "quantity": 150.0,
+                "unrealized_pnl": 1.72,
+                "stop_loss": 0.1911,
+                "created_at": datetime.now(UTC) - timedelta(hours=12),
+            }
+        ],
+        features=FeatureVector(
+            symbol="MET/USDT",
+            current_price=0.1599,
+            returns_1=0.0,
+            returns_5=0.0,
+            volume_ratio=0.42,
+            bb_pct=0.50,
+            rsi_14=50.0,
+        ),
+        context={},
+    )
+
+    assert evidence["should_close"] is True
+    assert evidence["action_plan"] == "reduce"
+    assert evidence["profit_protection"] is True
+    assert evidence["small_position_profit_lock"] is True
+    assert evidence["meaningful_reduce_lock"] is False
+    assert evidence["small_position_profit_lock_fee_multiple"] >= 8.0
+    assert "小仓动态锁盈" in evidence["reason"]
+
+
+def test_position_close_evidence_keeps_strong_small_winner_running() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+
+    evidence = coordinator._position_close_evidence(
+        current_side="short",
+        close_action=Action.CLOSE_SHORT,
+        exit_votes=[],
+        risk_vetoes=[],
+        score=-0.35,
+        raw_opinions=[],
+        symbol_positions=[
+            {
+                "side": "short",
+                "entry_price": 0.1713667,
+                "current_price": 0.1599,
+                "quantity": 150.0,
+                "unrealized_pnl": 1.72,
+                "stop_loss": 0.1911,
+                "created_at": datetime.now(UTC) - timedelta(hours=12),
+            }
+        ],
+        features=FeatureVector(
+            symbol="MET/USDT",
+            current_price=0.1599,
+            returns_1=-0.002,
+            returns_5=-0.003,
+            volume_ratio=1.20,
+            bb_pct=0.50,
+            rsi_14=48.0,
+        ),
+        context={},
+    )
+
+    assert evidence["should_close"] is False
+    assert evidence["small_position_profit_lock"] is False
+    assert evidence["winner_run_protected"] is True
+    assert "盈利仓继续奔跑" in evidence["block_reason"]

@@ -8,8 +8,10 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.exit_intent import PROTECTIVE_DOWNSIDE_INTENTS, classify_exit_intent
+from services.trading_params import DEFAULT_TRADING_PARAMS, ESTIMATED_TAKER_FEE_PCT
 
 PROFIT_PROTECTION_MIN_NET_USDT = 3.00
+_EXIT_PARAMS = DEFAULT_TRADING_PARAMS.ensemble_exit_decision
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -73,6 +75,7 @@ class ExitProfitPrecheckPolicy:
         reported_unrealized = 0.0
         reported_available = False
         total_qty = 0.0
+        total_notional = 0.0
         for pos in matches:
             qty = abs(
                 _safe_float(pos.get("quantity") or pos.get("contracts") or pos.get("sz"), 0.0)
@@ -96,6 +99,7 @@ class ExitProfitPrecheckPolicy:
             )
             estimated_unrealized += gross
             total_qty += qty_for_pnl
+            total_notional += entry * qty_for_pnl
             reported = _safe_float(
                 (
                     pos.get("unrealized_pnl")
@@ -135,7 +139,22 @@ class ExitProfitPrecheckPolicy:
             else:
                 total_unrealized = reported_unrealized
 
-        min_profit = max(self.min_net_usdt * 0.25, 0.05)
+        standard_min_profit = max(self.min_net_usdt * 0.25, 0.05)
+        estimated_fee_buffer = max(total_notional * ESTIMATED_TAKER_FEE_PCT * 2.0, 0.0)
+        small_position_min_profit = max(
+            _EXIT_PARAMS.small_position_profit_lock_min_net_usdt,
+            total_notional * _EXIT_PARAMS.small_position_profit_lock_min_pnl_ratio,
+            estimated_fee_buffer * _EXIT_PARAMS.small_position_profit_lock_min_fee_multiple,
+        )
+        small_position_profit_lock = bool(
+            close_evidence.get("small_position_profit_lock")
+            and 0 < total_notional <= _EXIT_PARAMS.small_position_profit_lock_max_notional_usdt
+        )
+        min_profit = (
+            min(standard_min_profit, small_position_min_profit)
+            if small_position_profit_lock
+            else standard_min_profit
+        )
         if total_unrealized > min_profit:
             return None
 
@@ -160,6 +179,10 @@ class ExitProfitPrecheckPolicy:
             ),
             "estimated_unrealized_pnl": round(total_unrealized, 6),
             "min_required_profit": round(min_profit, 6),
+            "standard_min_required_profit": round(standard_min_profit, 6),
+            "small_position_profit_lock": small_position_profit_lock,
+            "small_position_min_required_profit": round(small_position_min_profit, 6),
+            "total_notional": round(total_notional, 6),
             "non_profit_exit_evidence": non_profit_exit_evidence,
             "reason": (
                 "最新价格复核显示该仓位已不满足纯锁盈条件；但存在趋势反转/硬风险证据，"

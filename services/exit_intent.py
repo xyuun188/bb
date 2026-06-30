@@ -217,6 +217,7 @@ def classify_exit_intent(
         profit_protection = bool(
             close_evidence.get("profit_protection")
             or close_evidence.get("portfolio_focus_profit_lock")
+            or close_evidence.get("small_position_profit_lock")
             or close_evidence.get("quick_profit")
             or execution_profit.get("allow")
             or fast_trigger == "take_profit"

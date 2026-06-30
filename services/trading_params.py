@@ -732,6 +732,15 @@ class EnsembleExitDecisionParams:
     profit_lock_reduce_fee_multiple: float = 10.0
     profit_lock_reduce_notional_ratio: float = 0.008
     profit_lock_reduce_risk_ratio: float = 0.16
+    small_position_profit_lock_max_notional_usdt: float = 80.0
+    small_position_profit_lock_min_pnl_ratio: float = 0.010
+    small_position_profit_lock_min_fee_multiple: float = 8.0
+    small_position_profit_lock_min_net_usdt: float = 0.25
+    small_position_profit_lock_min_planned_net_usdt: float = 0.12
+    small_position_profit_lock_min_hold_minutes: float = 45.0
+    small_position_profit_lock_max_continuation_score: float = 0.20
+    small_position_profit_lock_partial_fee_multiple: float = 4.0
+    small_position_profit_lock_partial_notional_ratio: float = 0.004
     portfolio_focus_lock_min_usdt: float = 3.0
     portfolio_focus_lock_min_share: float = 0.20
     portfolio_focus_lock_reduce_size: float = 0.35

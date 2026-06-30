@@ -102,6 +102,23 @@ async def test_exit_profit_precheck_allows_structured_predictive_downside_intent
 
 
 @pytest.mark.asyncio
+async def test_exit_profit_precheck_uses_small_position_profit_floor() -> None:
+    decision = _decision(
+        {
+            "close_evidence": {
+                "profit_protection": True,
+                "small_position_profit_lock": True,
+            }
+        }
+    )
+
+    reason = await _policy(101.2).guard_reason(decision, [_position(quantity=0.5)])
+
+    assert reason is None
+    assert "execution_profit_protection_guard" not in decision.raw_response
+
+
+@pytest.mark.asyncio
 async def test_exit_profit_precheck_allows_profitable_fresh_recheck() -> None:
     reason = await _policy(102.0).guard_reason(_decision(), [_position()])
 

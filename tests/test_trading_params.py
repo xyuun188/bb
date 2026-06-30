@@ -328,6 +328,14 @@ def test_sizing_and_probe_modules_use_central_params() -> None:
     assert ensemble_coordinator.LOSS_COMPRESS_FULL_USDT == exit_params.loss_compress_full_usdt
     assert ensemble_coordinator.PROFIT_LOCK_FEE_MULTIPLE == exit_params.profit_lock_fee_multiple
     assert (
+        ensemble_coordinator.SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
+        == exit_params.small_position_profit_lock_max_notional_usdt
+    )
+    assert (
+        ensemble_coordinator.SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
+        == exit_params.small_position_profit_lock_min_fee_multiple
+    )
+    assert (
         ensemble_coordinator.LOSS_REPAIR_REDUCE_SUPPORT_COUNT
         == exit_params.loss_repair_reduce_support_count
     )

@@ -96,6 +96,25 @@ def test_fast_position_exit_score_uses_profit_peak_retrace() -> None:
     assert any(reason.startswith("profit_retrace:") for reason in reasons)
 
 
+def test_fast_position_exit_score_prioritizes_small_profitable_position_lock() -> None:
+    score, reasons = _policy().fast_position_exit_score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "MET/USDT",
+            "side": "short",
+            "entry_price": 0.1713667,
+            "current_price": 0.1599,
+            "quantity": 150.0,
+            "unrealized_pnl": 1.72,
+            "created_at": (datetime.now(UTC) - timedelta(hours=12)).isoformat(),
+        },
+        None,
+    )
+
+    assert score >= 74.0
+    assert "small_position_profit_lock_candidate" in reasons
+
+
 def test_fast_position_add_score_detects_winner_add_candidate() -> None:
     score, reason = _policy().fast_position_add_score(
         [

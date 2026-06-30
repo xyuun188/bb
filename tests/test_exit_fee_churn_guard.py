@@ -250,6 +250,41 @@ async def test_small_partial_profit_lock_is_blocked_when_planned_net_is_too_smal
 
 
 @pytest.mark.asyncio
+async def test_small_position_profit_lock_uses_dynamic_partial_floor() -> None:
+    decision = _decision(
+        action=Action.CLOSE_SHORT,
+        current_price=0.1599,
+        confidence=0.82,
+        reasoning="小仓动态锁盈",
+        position_size_pct=0.45,
+        raw_response={
+            "close_evidence": {
+                "profit_protection": True,
+                "small_position_profit_lock": True,
+                "action_plan": "reduce",
+            },
+        },
+    )
+    positions = [
+        _position(
+            symbol="MET/USDT",
+            quantity=150.0,
+            entry_price=0.1713667,
+            current_price=0.1599,
+            created_at=datetime.now(UTC) - timedelta(hours=12),
+        )
+    ]
+
+    reason = await _policy(positions).guard_reason("ensemble_trader", decision)
+
+    assert reason is None
+    assert "small_profit_lock_guard" not in decision.raw_response
+    protection = decision.raw_response["execution_profit_protection"]
+    assert protection["allow"] is True
+    assert protection["small_position_lock"] is True
+
+
+@pytest.mark.asyncio
 async def test_winner_run_guard_blocks_ordinary_full_close_when_trend_still_valid() -> None:
     decision = _decision(
         current_price=104.0,

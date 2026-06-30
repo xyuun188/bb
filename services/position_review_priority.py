@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from services.exit_fast_risk import FAST_RISK_NEAR_STOP_PROGRESS
@@ -13,12 +14,28 @@ from services.exit_predictive_reversal import (
     ExitPredictiveReversalPolicy,
 )
 from services.position_quality import PositionQualityScorer
-from services.trading_params import ESTIMATED_TAKER_FEE_PCT
+from services.trading_params import DEFAULT_TRADING_PARAMS, ESTIMATED_TAKER_FEE_PCT
 
 PROFIT_PROTECTION_MIN_NET_PNL_RATIO = 0.004
 PROFIT_PROTECTION_MIN_NET_USDT = 3.00
 PROFIT_PROTECTION_MIN_FEE_MULTIPLE = 4.0
 PORTFOLIO_PROFIT_PROTECTION_EXIT_SCORE = 82.0
+_EXIT_PARAMS = DEFAULT_TRADING_PARAMS.ensemble_exit_decision
+SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT = (
+    _EXIT_PARAMS.small_position_profit_lock_max_notional_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO = (
+    _EXIT_PARAMS.small_position_profit_lock_min_pnl_ratio
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE = (
+    _EXIT_PARAMS.small_position_profit_lock_min_fee_multiple
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT = (
+    _EXIT_PARAMS.small_position_profit_lock_min_net_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES = (
+    _EXIT_PARAMS.small_position_profit_lock_min_hold_minutes
+)
 
 NormalizeSymbol = Callable[[Any], str]
 PositionPeakKeyProvider = Callable[[str, str, str], Any]
@@ -89,6 +106,21 @@ class PositionReviewPriorityPolicy:
         notional = max(entry * qty, 1e-9)
         pnl_ratio = unrealized / notional
         estimated_round_trip_fee = max(notional * ESTIMATED_TAKER_FEE_PCT * 2.0, 1e-9)
+        fee_multiple = unrealized / estimated_round_trip_fee
+        age_minutes = 9999.0
+        opened_at = pos.get("created_at")
+        if opened_at:
+            try:
+                parsed_at = (
+                    datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+                    if not hasattr(opened_at, "tzinfo")
+                    else opened_at
+                )
+                if parsed_at.tzinfo is None:
+                    parsed_at = parsed_at.replace(tzinfo=UTC)
+                age_minutes = max((datetime.now(UTC) - parsed_at).total_seconds() / 60.0, 0.0)
+            except (TypeError, ValueError):
+                age_minutes = 9999.0
         score = 0.0
         if self.quality_scorer is not None:
             quality = self.quality_scorer.score(pos, feature_vector=feature_vector)
@@ -145,6 +177,20 @@ class PositionReviewPriorityPolicy:
         ):
             score = max(score, 72.0)
             reasons.append("profit_lock_candidate")
+        if (
+            0 < notional <= SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
+            and pnl_ratio >= SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
+            and unrealized
+            >= max(
+                notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
+                estimated_round_trip_fee * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
+                SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
+            )
+            and fee_multiple >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
+            and age_minutes >= SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES
+        ):
+            score = max(score, 74.0)
+            reasons.append("small_position_profit_lock_candidate")
         if peak_pnl >= 0.8 and unrealized > 0 and unrealized <= peak_pnl * 0.72:
             score = max(score, 80.0)
             retrace_ratio = (peak_pnl - unrealized) / max(peak_pnl, 1e-9)

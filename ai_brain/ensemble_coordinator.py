@@ -145,6 +145,33 @@ PROFIT_LOCK_MEANINGFUL_REDUCE_USDT = (
 PROFIT_LOCK_REDUCE_FEE_MULTIPLE = ENSEMBLE_EXIT_DECISION_PARAMS.profit_lock_reduce_fee_multiple
 PROFIT_LOCK_REDUCE_NOTIONAL_RATIO = ENSEMBLE_EXIT_DECISION_PARAMS.profit_lock_reduce_notional_ratio
 PROFIT_LOCK_REDUCE_RISK_RATIO = ENSEMBLE_EXIT_DECISION_PARAMS.profit_lock_reduce_risk_ratio
+SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_max_notional_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_min_pnl_ratio
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_min_fee_multiple
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_min_net_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_min_planned_net_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_min_hold_minutes
+)
+SMALL_POSITION_PROFIT_LOCK_MAX_CONTINUATION_SCORE = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_max_continuation_score
+)
+SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_partial_fee_multiple
+)
+SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO = (
+    ENSEMBLE_EXIT_DECISION_PARAMS.small_position_profit_lock_partial_notional_ratio
+)
 PORTFOLIO_FOCUS_LOCK_MIN_USDT = ENSEMBLE_EXIT_DECISION_PARAMS.portfolio_focus_lock_min_usdt
 PORTFOLIO_FOCUS_LOCK_MIN_SHARE = ENSEMBLE_EXIT_DECISION_PARAMS.portfolio_focus_lock_min_share
 PORTFOLIO_FOCUS_LOCK_REDUCE_SIZE = ENSEMBLE_EXIT_DECISION_PARAMS.portfolio_focus_lock_reduce_size
@@ -5392,8 +5419,54 @@ class EnsembleCoordinator:
                 or profit_retrace_ratio >= dynamic_retrace_full_ratio
             )
         )
+        small_position_profit_lock_line = max(
+            SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
+            estimated_fee_usdt * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
+            position_notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
+        )
+        small_position_profit_lock_size = min(
+            max(
+                PROFIT_PROTECT_REDUCE_SIZE,
+                SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT
+                / max(position_unrealized_pnl, 1e-9),
+            ),
+            0.70,
+        )
+        small_position_planned_lock_net = max(
+            position_unrealized_pnl * small_position_profit_lock_size
+            - estimated_fee_usdt * small_position_profit_lock_size,
+            0.0,
+        )
+        small_position_planned_lock_line = max(
+            SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT,
+            estimated_fee_usdt
+            * SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE
+            * small_position_profit_lock_size,
+            position_notional
+            * SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO
+            * small_position_profit_lock_size,
+        )
+        small_position_fee_multiple = position_unrealized_pnl / max(estimated_fee_usdt, 1e-9)
+        small_position_quality_weakened = bool(
+            weak_continuation
+            or momentum_waning
+            or low_participation
+            or support
+            or moderate_opposite_pressure
+        )
+        small_position_profit_lock = (
+            position_profit
+            and 0 < position_notional <= SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
+            and position_profit_pct >= SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
+            and position_unrealized_pnl >= small_position_profit_lock_line
+            and small_position_fee_multiple >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
+            and small_position_planned_lock_net >= small_position_planned_lock_line
+            and age_minutes >= SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES
+            and continuation_score <= SMALL_POSITION_PROFIT_LOCK_MAX_CONTINUATION_SCORE
+            and small_position_quality_weakened
+        )
         profit_lock_ready_for_exit = bool(
-            profit_floor_ready
+            (profit_floor_ready or small_position_profit_lock)
             and (
                 profit_protect
                 or strong_profit
@@ -5405,6 +5478,7 @@ class EnsembleCoordinator:
                 or predictive_reduce_lock_ready
                 or predictive_full_lock_ready
                 or portfolio_focus_profit_lock
+                or small_position_profit_lock
             )
         )
         abnormal_wick_max_pct = (
@@ -5620,6 +5694,18 @@ class EnsembleCoordinator:
                 "已覆盖手续费和动态利润保护线；为避免浮盈回吐，先减仓锁定一部分已实现利润。"
             )
             suggested_confidence = max(max_conf, 0.62)
+        elif small_position_profit_lock:
+            should_close = True
+            action_plan = "reduce"
+            position_size_pct = small_position_profit_lock_size
+            reason = (
+                f"小仓动态锁盈：当前浮盈 {position_unrealized_pnl:.2f}U / "
+                f"{position_profit_pct * 100:.2f}%，约覆盖手续费 {small_position_fee_multiple:.1f} 倍；"
+                f"延续分 {continuation_score:.2f} 不强，且动能、量能或退出线索显示继续占用资金的优势下降。"
+                f"先按 {position_size_pct * 100:.0f}% 减仓，把高比例浮盈的一部分转为已实现利润，"
+                "剩余仓位继续观察。"
+            )
+            suggested_confidence = max(max_conf, 0.64)
         elif portfolio_focus_profit_lock:
             should_close = True
             action_plan = "reduce"
@@ -5822,6 +5908,28 @@ class EnsembleCoordinator:
             "low_participation": bool(low_participation),
             "quick_profit": bool(quick_profit),
             "capital_rotation_profit": bool(rotation_profit),
+            "small_position_profit_lock": bool(small_position_profit_lock),
+            "small_position_profit_lock_line_usdt": round(small_position_profit_lock_line, 6),
+            "small_position_profit_lock_max_notional_usdt": (
+                SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
+            ),
+            "small_position_profit_lock_min_pnl_ratio": (
+                SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
+            ),
+            "small_position_profit_lock_min_fee_multiple": (
+                SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
+            ),
+            "small_position_profit_lock_fee_multiple": round(
+                small_position_fee_multiple, 6
+            ),
+            "small_position_profit_lock_size": round(small_position_profit_lock_size, 6),
+            "small_position_planned_lock_net_usdt": round(
+                small_position_planned_lock_net, 6
+            ),
+            "small_position_planned_lock_line_usdt": round(
+                small_position_planned_lock_line, 6
+            ),
+            "small_position_quality_weakened": bool(small_position_quality_weakened),
             "profit_retrace_protection": bool(profit_retrace_protection),
             "dynamic_profit_lock_line_usdt": round(dynamic_profit_lock_line, 6),
             "meaningful_reduce_lock_line_usdt": round(meaningful_reduce_lock_line, 6),

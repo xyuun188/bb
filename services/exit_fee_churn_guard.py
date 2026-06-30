@@ -19,7 +19,7 @@ from services.exit_intent import (
     ExitIntent,
     classify_exit_intent,
 )
-from services.trading_params import ESTIMATED_TAKER_FEE_PCT
+from services.trading_params import DEFAULT_TRADING_PARAMS, ESTIMATED_TAKER_FEE_PCT
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +33,28 @@ PROFIT_PROTECTION_MIN_FEE_MULTIPLE = 4.0
 PROFIT_PROTECTION_STRONG_FEE_MULTIPLE = 5.0
 PROFIT_DRAWDOWN_PARTIAL_RETRACE = 0.38
 FAST_RISK_REDUCE_LOSS_PCT = 0.012
+_EXIT_PARAMS = DEFAULT_TRADING_PARAMS.ensemble_exit_decision
+SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT = (
+    _EXIT_PARAMS.small_position_profit_lock_max_notional_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO = (
+    _EXIT_PARAMS.small_position_profit_lock_min_pnl_ratio
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE = (
+    _EXIT_PARAMS.small_position_profit_lock_min_fee_multiple
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT = (
+    _EXIT_PARAMS.small_position_profit_lock_min_net_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT = (
+    _EXIT_PARAMS.small_position_profit_lock_min_planned_net_usdt
+)
+SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE = (
+    _EXIT_PARAMS.small_position_profit_lock_partial_fee_multiple
+)
+SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO = (
+    _EXIT_PARAMS.small_position_profit_lock_partial_notional_ratio
+)
 
 PROTECTIVE_DOWNSIDE_EXIT_TEXT_TERMS = (
     "可能会跌",
@@ -124,10 +146,27 @@ def exit_profit_protection_state(
     net_now = float(net_now or 0.0)
     confidence = float(confidence or 0.0)
     pnl_ratio = net_now / abs_notional if abs_notional > 0 else 0.0
-    min_net_profit = max(
+    standard_min_net_profit = max(
         abs_notional * min_net_pnl_ratio,
         fee_buffer * min_fee_multiple,
         min_net_usdt,
+    )
+    small_position_min_net_profit = max(
+        abs_notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
+        fee_buffer * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
+        SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
+    )
+    small_position_lock = (
+        0 < abs_notional <= SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
+        and pnl_ratio >= SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
+        and net_now >= small_position_min_net_profit
+        and net_now / max(fee_buffer, 1e-9) >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
+        and age_minutes >= min_hold_minutes
+    )
+    min_net_profit = (
+        min(standard_min_net_profit, small_position_min_net_profit)
+        if small_position_lock
+        else standard_min_net_profit
     )
     strong_net_profit = max(
         abs_notional * strong_net_pnl_ratio,
@@ -146,6 +185,9 @@ def exit_profit_protection_state(
         "notional": round(abs_notional, 8),
         "fee_buffer": round(fee_buffer, 8),
         "min_net_profit": round(min_net_profit, 8),
+        "standard_min_net_profit": round(standard_min_net_profit, 8),
+        "small_position_lock": bool(small_position_lock),
+        "small_position_min_net_profit": round(small_position_min_net_profit, 8),
         "strong_net_profit": round(strong_net_profit, 8),
         "confidence": round(confidence, 4),
         "age_minutes": round(age_minutes, 3),
@@ -543,10 +585,31 @@ class ExitFeeChurnGuardPolicy:
                             "本次不执行普通全平，继续让优势仓位运行；若后续出现明显回撤、趋势失效、"
                             "硬风险或交易所止盈止损触发，再允许平仓。"
                         )
-                    meaningful_partial_lock = max(
+                    standard_meaningful_partial_lock = max(
                         PROFIT_PROTECTION_MIN_NET_USDT,
                         fee_buffer * max(PROFIT_PROTECTION_MIN_FEE_MULTIPLE, 6.0),
                         abs(notional) * max(PROFIT_PROTECTION_MIN_NET_PNL_RATIO, 0.008),
+                    )
+                    small_position_partial_lock = bool(
+                        close_evidence.get("small_position_profit_lock")
+                        or profit_protection.get("small_position_lock")
+                    )
+                    small_position_meaningful_partial_lock = max(
+                        SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT,
+                        fee_buffer
+                        * SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE
+                        * close_pct,
+                        abs(notional)
+                        * SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO
+                        * close_pct,
+                    )
+                    meaningful_partial_lock = (
+                        min(
+                            standard_meaningful_partial_lock,
+                            small_position_meaningful_partial_lock,
+                        )
+                        if small_position_partial_lock
+                        else standard_meaningful_partial_lock
                     )
                     if 0.0 < close_pct < 0.999 and planned_lock_net < meaningful_partial_lock:
                         raw = (
@@ -559,6 +622,13 @@ class ExitFeeChurnGuardPolicy:
                             "net_profit_after_fee": round(net_now, 8),
                             "planned_lock_net": round(planned_lock_net, 8),
                             "meaningful_partial_lock": round(meaningful_partial_lock, 8),
+                            "standard_meaningful_partial_lock": round(
+                                standard_meaningful_partial_lock, 8
+                            ),
+                            "small_position_meaningful_partial_lock": round(
+                                small_position_meaningful_partial_lock, 8
+                            ),
+                            "small_position_partial_lock": small_position_partial_lock,
                             "reason": "本次部分锁盈预计落袋利润太小，继续持有等待更有意义的锁盈或明确反转。",
                         }
                         decision.raw_response = raw
