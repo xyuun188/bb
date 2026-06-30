@@ -409,6 +409,113 @@ def test_positive_net_weak_conflict_probe_stays_shadow_only_without_score_lift()
     assert evidence["shadow_only"] is True
 
 
+def test_roster_underfilled_positive_expectancy_lifts_to_tradeable_probe() -> None:
+    decision = _decision(
+        Action.LONG,
+        {
+            "ml_signal": {
+                "available": True,
+                "influence_enabled": False,
+                "predictions": [{"best_side": "short", "best_expected_return_pct": 0.4}],
+            },
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.35,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.2,
+                },
+            },
+            "memory_feedback": {
+                "by_side": {
+                    "long": {
+                        "score_adjustment": 0.08,
+                        "allow_probe": True,
+                        "missed_opportunity_count": 3,
+                    }
+                }
+            },
+        },
+        confidence=0.64,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": -0.20,
+            "min_score_required": 0.65,
+            "expected_net_return_pct": 0.22,
+            "profit_quality_ratio": 0.32,
+            "server_profit_loss_probability": 0.58,
+            "tail_risk_score": 0.42,
+            "confidence": 0.64,
+            "ml_influence_enabled": False,
+            "timeseries_aligned": True,
+            "portfolio_roster": {
+                "underfilled": True,
+                "gap": 8,
+                "target_position_groups": 10,
+                "current_position_groups": 2,
+            },
+        },
+    )
+
+    assert evidence["tier"] == "exploration"
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
+    assert evidence["size_multiplier"] > 0.0
+    assert evidence["portfolio_roster_fill_relief"]["applied"] is True
+    assert evidence["portfolio_roster_fill_relief"]["expected_net_return_pct"] == pytest.approx(
+        0.22
+    )
+
+
+def test_roster_underfilled_relief_keeps_major_opposite_blocked() -> None:
+    decision = _decision(
+        Action.LONG,
+        {
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "available": True,
+                    "best_side": "short",
+                    "expected_return_pct": 0.5,
+                },
+                "sentiment_analysis": {
+                    "available": True,
+                    "best_side": "long",
+                    "expected_return_pct": 0.2,
+                },
+            },
+            "memory_feedback": {
+                "by_side": {"long": {"score_adjustment": 0.12, "allow_probe": True}}
+            },
+        },
+        confidence=0.72,
+    )
+
+    evidence = build_entry_evidence_score(
+        decision,
+        {
+            "score": 0.1,
+            "min_score_required": 0.65,
+            "expected_net_return_pct": 0.30,
+            "profit_quality_ratio": 0.45,
+            "server_profit_loss_probability": 0.45,
+            "tail_risk_score": 0.35,
+            "confidence": 0.72,
+            "portfolio_roster": {"underfilled": True, "gap": 8},
+        },
+    )
+
+    assert "timeseries" in evidence["major_opposites"]
+    assert evidence["portfolio_roster_fill_relief"]["applied"] is False
+    assert evidence["tier"] == "blocked"
+
+
 def test_repeated_missed_opportunity_memory_lifts_positive_weak_probe_to_tradeable():
     decision = _decision(
         Action.LONG,

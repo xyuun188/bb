@@ -21,6 +21,7 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _ENTRY_TIER_PARAMS = DEFAULT_TRADING_PARAMS.entry_tiers
 _ENTRY_EVIDENCE_PARAMS = DEFAULT_TRADING_PARAMS.entry_evidence
+_ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
 ENTRY_EVIDENCE_SCORE_NORMAL = _ENTRY_TIER_PARAMS.normal_score
 ENTRY_EVIDENCE_SCORE_MEDIUM = _ENTRY_TIER_PARAMS.medium_score
 ENTRY_EVIDENCE_SCORE_SMALL = _ENTRY_TIER_PARAMS.small_score
@@ -50,6 +51,13 @@ ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_DIRECTION_GAP = (
 )
 ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MAX_LOSS_PROBABILITY = (
     _ENTRY_EVIDENCE_PARAMS.short_probe_relief_max_loss_probability
+)
+PORTFOLIO_ROSTER_FILL_MIN_NET_PCT = _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_min_net_pct
+PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO = (
+    _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_min_profit_quality_ratio
+)
+PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY = (
+    _ENTRY_RISK_SIZING_PARAMS.portfolio_roster_fill_max_loss_probability
 )
 
 
@@ -628,6 +636,7 @@ def build_entry_evidence_score(
     positive_net_probe_relief: dict[str, Any] = {"applied": False}
     strong_positive_net_relief: dict[str, Any] = {"applied": False}
     memory_missed_opportunity_relief: dict[str, Any] = {"applied": False}
+    portfolio_roster_fill_relief: dict[str, Any] = {"applied": False}
     tradeable_probe = False
     if entry_side == "short" and (
         ENTRY_EVIDENCE_SHORT_PROBE_RELIEF_MIN_EFFECTIVE_SCORE
@@ -871,6 +880,48 @@ def build_entry_evidence_score(
                 "但仍保留方向冲突、最大仓位和执行前行情复核。"
             ),
         }
+    roster = opportunity.get("portfolio_roster") if isinstance(opportunity, dict) else {}
+    roster = roster if isinstance(roster, dict) else {}
+    roster_underfilled = bool(roster.get("underfilled")) or safe_float(roster.get("gap"), 0.0) > 0
+    roster_fill_relief_allowed = bool(
+        roster_underfilled
+        and not hard_block_reasons
+        and expected_net_return >= PORTFOLIO_ROSTER_FILL_MIN_NET_PCT
+        and profit_quality_ratio >= PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO
+        and loss_probability <= PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY
+        and tail_risk_score <= 0.88
+        and confidence >= 0.60
+        and aligned_support_count >= 3
+        and not major_opposites
+        and not strong_opposites
+    )
+    if roster_fill_relief_allowed:
+        original_effective_score = effective_score
+        effective_score = max(effective_score, ENTRY_EVIDENCE_SCORE_PROBE)
+        tradeable_probe = True
+        portfolio_roster_fill_relief = {
+            "applied": True,
+            "tradeable_probe": True,
+            "shadow_only": False,
+            "from_effective_score": round(original_effective_score, 6),
+            "to_effective_score": round(effective_score, 6),
+            "expected_net_return_pct": round(expected_net_return, 6),
+            "profit_quality_ratio": round(profit_quality_ratio, 6),
+            "loss_probability": round(loss_probability, 6),
+            "tail_risk_score": round(tail_risk_score, 6),
+            "confidence": round(confidence, 6),
+            "aligned_support_sources": list(aligned_support_sources),
+            "portfolio_roster": {
+                "target_position_groups": roster.get("target_position_groups"),
+                "current_position_groups": roster.get("current_position_groups"),
+                "gap": roster.get("gap"),
+                "underfilled": bool(roster_underfilled),
+            },
+            "reason": (
+                "组合持仓组数低于目标，且当前信号达到正期望补齐阈值；允许小而有效的"
+                "组合补齐探针，但不绕过方向冲突、收益质量、亏损概率、尾部风险和执行前风控。"
+            ),
+        }
     if effective_score < ENTRY_EVIDENCE_SCORE_HARD_BLOCK:
         advisory_wait_reasons.append("动态证据评分低于可交易底线，当前仅保留观望或极小探针")
 
@@ -974,6 +1025,7 @@ def build_entry_evidence_score(
         "positive_net_probe_relief": positive_net_probe_relief,
         "memory_missed_opportunity_relief": memory_missed_opportunity_relief,
         "strong_positive_net_relief": strong_positive_net_relief,
+        "portfolio_roster_fill_relief": portfolio_roster_fill_relief,
         "short_probe_relief": short_probe_relief,
         "tradeable_probe": bool(tradeable_probe),
         "shadow_only": final_shadow_only,

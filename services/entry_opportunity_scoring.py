@@ -1372,6 +1372,9 @@ class EntryOpportunityScoringPolicy:
             score += evidence_adjustment
             raw["opportunity_score"]["score"] = round(score, 6)
             raw["opportunity_score"]["evidence_score"] = evidence_score
+            raw["opportunity_score"]["portfolio_roster_fill_relief"] = self._safe_dict(
+                evidence_score.get("portfolio_roster_fill_relief")
+            )
             raw["opportunity_score"]["evidence_score_adjustment"] = round(evidence_adjustment, 6)
             raw["opportunity_score"][
                 "server_profit_weight_policy"
