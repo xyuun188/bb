@@ -15,7 +15,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.exit_arbitrator import ExitArbitrationResult, ExitArbitrator
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.profit_first_exit_binding import attach_profit_first_exit_reference
-from services.profit_first_stage2 import RecentProbePnLBrakePolicy
+from services.profit_first_stage2 import DefensiveProbeShadowPolicy, RecentProbePnLBrakePolicy
 from services.profit_first_trade_plan import attach_profit_first_trade_plan
 
 
@@ -53,6 +53,7 @@ class EntryPolicy:
         entry_opportunity_gate: Any | None = None,
         high_risk_review_gate: Any | None = None,
         profit_first_probe_brake: Any | None = None,
+        defensive_probe_shadow: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
         self.entry_priority = entry_priority
@@ -63,6 +64,7 @@ class EntryPolicy:
         self.entry_opportunity_gate = entry_opportunity_gate
         self.high_risk_review_gate_policy = high_risk_review_gate
         self.profit_first_probe_brake = profit_first_probe_brake or RecentProbePnLBrakePolicy()
+        self.defensive_probe_shadow = defensive_probe_shadow or DefensiveProbeShadowPolicy()
 
     def score_candidate(
         self,
@@ -243,6 +245,17 @@ class EntryPolicy:
                     "pipeline_context": context.public_data(),
                     "stage_status": "skipped",
                     **(probe_brake.data or {}),
+                },
+            )
+        defensive_probe_shadow = self.defensive_probe_shadow.evaluate(raw, decision)
+        if not defensive_probe_shadow.allowed:
+            return PolicyGateResult.block(
+                "profit_first_defensive_probe_shadow",
+                defensive_probe_shadow.reason,
+                {
+                    "pipeline_context": context.public_data(),
+                    "stage_status": "skipped",
+                    **(defensive_probe_shadow.data or {}),
                 },
             )
         evidence_score = {}

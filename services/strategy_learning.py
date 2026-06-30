@@ -318,7 +318,95 @@ def _closed_at(row: Any) -> datetime | None:
 
 
 def _position_pnl(row: Any) -> float:
-    return _safe_float(getattr(row, "realized_pnl", None), 0.0)
+    return _safe_float(_row_get(row, "realized_pnl"), 0.0)
+
+
+def _closed_position_dedupe_key(row: Any) -> tuple[Any, ...] | None:
+    entry_order_id = str(_row_get(row, "entry_exchange_order_id") or "").strip()
+    close_order_id = str(_row_get(row, "close_exchange_order_id") or "").strip()
+    if not entry_order_id or not close_order_id:
+        return None
+    return (
+        str(_row_get(row, "execution_mode") or "").strip().lower(),
+        _normalized_symbol_key(_row_get(row, "symbol")),
+        _position_side(_row_get(row, "side")),
+        entry_order_id,
+        close_order_id,
+    )
+
+
+def _closed_position_evidence_score(row: Any) -> tuple[int, float, float, int]:
+    return (
+        1 if str(_row_get(row, "close_exchange_order_id") or "").strip() else 0,
+        _as_timestamp(_closed_at(row)),
+        _as_timestamp(_created_at(row)),
+        _safe_int(_row_get(row, "id"), 0),
+    )
+
+
+def _as_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    return value.timestamp()
+
+
+def _deduplicate_training_positions(positions: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+    buckets: dict[tuple[Any, ...], list[Any]] = {}
+    passthrough: list[Any] = []
+    for position in positions:
+        key = _closed_position_dedupe_key(position)
+        if key is None:
+            passthrough.append(position)
+        else:
+            buckets.setdefault(key, []).append(position)
+    deduped = list(passthrough)
+    duplicate_groups: list[dict[str, Any]] = []
+    for key, rows in buckets.items():
+        if len(rows) == 1:
+            deduped.append(rows[0])
+            continue
+        winner = max(rows, key=_closed_position_evidence_score)
+        deduped.append(winner)
+        duplicate_groups.append(
+            {
+                "key": {
+                    "execution_mode": key[0],
+                    "symbol": key[1],
+                    "side": key[2],
+                    "entry_exchange_order_id": key[3],
+                    "close_exchange_order_id": key[4],
+                },
+                "kept_position_id": _safe_int(_row_get(winner, "id"), 0),
+                "dropped_position_ids": [
+                    _safe_int(_row_get(row, "id"), 0)
+                    for row in rows
+                    if row is not winner and _safe_int(_row_get(row, "id"), 0) > 0
+                ],
+                "duplicate_count": len(rows) - 1,
+            }
+        )
+    deduped.sort(
+        key=lambda row: (
+            _closed_at(row) or _created_at(row) or datetime.min.replace(tzinfo=UTC),
+            _safe_int(_row_get(row, "id"), 0),
+        )
+    )
+    duplicate_count = sum(item["duplicate_count"] for item in duplicate_groups)
+    duplicate_position_ids = [
+        pid
+        for item in duplicate_groups
+        for pid in item["dropped_position_ids"]
+        if pid > 0
+    ]
+    return deduped, {
+        "deduplicated_position_count": duplicate_count,
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_position_ids": sorted(duplicate_position_ids),
+        "duplicate_groups": duplicate_groups[:50],
+        "policy": (
+            "strategy learning counts one closed trade per authoritative OKX entry/close order pair"
+        ),
+    }
 
 
 def _open_position_pnl(row: Any) -> float:
@@ -674,6 +762,9 @@ class StrategyFeedbackCompiler:
                 )
                 continue
             training_positions.append(position)
+        training_positions, duplicate_fact_quarantine = _deduplicate_training_positions(
+            training_positions
+        )
 
         side_performance = self._side_performance(training_positions)
         open_pressure = self._open_position_pressure(open_positions, max_open_positions)
@@ -681,9 +772,16 @@ class StrategyFeedbackCompiler:
         shadow_feedback = self._shadow_feedback(shadows, decisions)
         expert_memory = self._expert_memory(memories)
         event_feedback = self._event_feedback(strategy_events or [])
+        duplicate_position_ids = {
+            int(pid)
+            for pid in duplicate_fact_quarantine.get("duplicate_position_ids", [])
+            if _safe_int(pid, 0) > 0
+        }
         reflection_feedback = self._reflection_feedback(
             reflections or [],
-            excluded_position_ids=manual_position_ids | untrusted_fact_position_ids,
+            excluded_position_ids=manual_position_ids
+            | untrusted_fact_position_ids
+            | duplicate_position_ids,
         )
         manual_intervention = {
             "manual_close_orders": len(manual_orders),
@@ -695,9 +793,14 @@ class StrategyFeedbackCompiler:
             "excluded_position_count": len(untrusted_fact_position_ids),
             "reason_counts": untrusted_fact_reasons,
             "position_ids": sorted(pid for pid in untrusted_fact_position_ids if pid > 0)[:50],
+            "duplicate_position_count": duplicate_fact_quarantine["deduplicated_position_count"],
+            "duplicate_group_count": duplicate_fact_quarantine["duplicate_group_count"],
+            "duplicate_position_ids": duplicate_fact_quarantine["duplicate_position_ids"][:50],
+            "duplicate_groups": duplicate_fact_quarantine["duplicate_groups"],
             "policy": (
                 "closed positions missing authoritative OKX entry/close order links are kept for "
-                "audit, but excluded from strategy learning and reflection feedback"
+                "audit, and duplicate authoritative order pairs are counted once for strategy "
+                "learning and reflection feedback"
             ),
         }
 

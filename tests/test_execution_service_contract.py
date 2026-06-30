@@ -108,6 +108,62 @@ def test_profit_first_entry_contract_blocks_incomplete_entry_before_submit() -> 
     assert result.data["profit_first_trade_plan"]["is_complete_for_real_trade"] is False
 
 
+def test_profit_first_entry_contract_blocks_low_payoff_one_x_probe_before_submit() -> None:
+    decision = _entry_decision("LINK/USDT")
+    decision.position_size_pct = 0.006
+    decision.suggested_leverage = 1.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "analysis_type": "entry_candidate",
+        "current_price": 100.0,
+        "strategy_learning_context": {"strategy_profile_id": "profile_1"},
+        "opportunity_score": {
+            "score": 1.4,
+            "side": "short",
+            "expected_net_return_pct": 0.2,
+            "fee_pct": 0.05,
+            "slippage_pct": 0.04,
+            "expected_loss_pct": 0.2,
+            "profit_quality_ratio": 0.5,
+            "reward_risk_ratio": 0.9,
+            "server_profit_loss_probability": 0.48,
+            "tail_risk_score": 0.7,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "server_profit_expected_return_pct": 0.4,
+            "evidence_score": {"tier": "normal", "effective_score": 72.0},
+        },
+        "profit_risk_sizing": {
+            "low_payoff_quality": True,
+            "quality_tier": "base",
+            "high_quality_entry": False,
+            "position_size_pct": 0.006,
+            "final_notional_usdt": 30.0,
+            "planned_stop_loss_usdt": 1.5,
+            "max_stop_loss_usdt": 1.5,
+            "expected_profit_usdt": 0.12,
+            "dynamic_leverage_decision": {
+                "final_integer_leverage": 1,
+                "limiting_factor": "risk_budget",
+                "reasons": ["limited_by_risk_budget"],
+            },
+            "profit_first_position_ladder": {
+                "lane": "tiny_probe",
+                "adjusted_size_pct": 0.006,
+            },
+        },
+    }
+
+    result = _profit_first_entry_contract_result(decision)
+
+    assert result.passed is False
+    assert result.blocker == "profit_first_defensive_probe_shadow"
+    assert result.data["shadow_only"] is True
+    assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
+    assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"
+
+
 @pytest.mark.asyncio
 async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> None:
     calls: dict[str, int] = {"okx": 0}

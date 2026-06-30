@@ -2838,6 +2838,77 @@ async def test_entry_policy_blocks_legacy_positive_net_tradeable_probe() -> None
     assert calls == ["sizing"]
 
 
+@pytest.mark.asyncio
+async def test_entry_policy_keeps_low_payoff_risk_budget_probe_shadow_only() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.SHORT)
+    decision.position_size_pct = 0.02
+    decision.suggested_leverage = 1.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "analysis_type": "entry_candidate",
+        "current_price": 100.0,
+        "strategy_learning_context": {"strategy_profile_id": "profile_1"},
+        "opportunity_score": {
+            "score": 1.4,
+            "min_score_required": 0.7,
+            "side": "short",
+            "expected_net_return_pct": 0.2,
+            "fee_pct": 0.05,
+            "slippage_pct": 0.04,
+            "expected_loss_pct": 0.2,
+            "profit_quality_ratio": 0.5,
+            "reward_risk_ratio": 0.9,
+            "server_profit_loss_probability": 0.48,
+            "tail_risk_score": 0.7,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "server_profit_expected_return_pct": 0.4,
+            "evidence_score": {"tier": "normal", "effective_score": 72.0},
+        },
+        "profit_risk_sizing": {
+            "low_payoff_quality": True,
+            "quality_tier": "base",
+            "high_quality_entry": False,
+            "position_size_pct": 0.006,
+            "final_notional_usdt": 30.0,
+            "planned_stop_loss_usdt": 1.5,
+            "max_stop_loss_usdt": 1.5,
+            "expected_profit_usdt": 0.12,
+            "dynamic_leverage_decision": {
+                "final_integer_leverage": 1,
+                "limiting_factor": "risk_budget",
+                "reasons": ["limited_by_risk_budget"],
+            },
+            "profit_first_position_ladder": {"lane": "tiny_probe", "adjusted_size_pct": 0.006},
+        },
+    }
+
+    async def fake_sizing(sized_decision, _model_mode, _open_positions):
+        calls.append("sizing")
+        assert sized_decision is decision
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            calls.append("gate")
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
+    assert result.passed is False
+    assert result.blocker == "profit_first_defensive_probe_shadow"
+    assert result.data["shadow_only"] is True
+    assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
+    assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"
+    assert calls == ["sizing"]
+
+
 def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:
     calls: list[str] = []
     decision = _decision(Action.SHORT)

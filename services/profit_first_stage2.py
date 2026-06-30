@@ -66,6 +66,75 @@ class RecentProbePnLBrakePolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class DefensiveProbeShadowPolicy:
+    """Keep low-quality, risk-budget-capped probes out of real execution."""
+
+    min_real_expected_profit_usdt: float = 0.25
+
+    def evaluate(self, raw: dict[str, Any], decision: Any) -> ProfitFirstStage2Decision:
+        if not isinstance(raw, dict):
+            return ProfitFirstStage2Decision(True)
+        plan = raw.get("profit_first_trade_plan")
+        plan = plan if isinstance(plan, dict) else {}
+        lane = str(plan.get("decision_lane") or "").lower().strip()
+        if lane not in {"tiny_probe", "validated_probe"}:
+            return ProfitFirstStage2Decision(True, data={"lane": lane})
+
+        sizing = raw.get("profit_risk_sizing")
+        sizing = sizing if isinstance(sizing, dict) else {}
+        low_payoff = bool(sizing.get("low_payoff_quality"))
+        quality_tier = str(sizing.get("quality_tier") or "").lower().strip()
+        high_quality = bool(sizing.get("high_quality_entry"))
+        expected_profit = _safe_float(sizing.get("expected_profit_usdt"), 0.0)
+        dynamic = raw.get("dynamic_leverage_decision")
+        if not isinstance(dynamic, dict):
+            dynamic = sizing.get("dynamic_leverage_decision")
+        dynamic = dynamic if isinstance(dynamic, dict) else {}
+        final_leverage = _safe_float(
+            dynamic.get("final_integer_leverage"),
+            _safe_float(getattr(decision, "suggested_leverage", None), 0.0),
+        )
+        limiting_factor = str(dynamic.get("limiting_factor") or "").lower().strip()
+        dynamic_reasons = {str(item).lower() for item in dynamic.get("reasons") or []}
+        risk_budget_capped = limiting_factor == "risk_budget" or "limited_by_risk_budget" in dynamic_reasons
+
+        should_shadow = bool(
+            low_payoff
+            and not high_quality
+            and quality_tier not in {"strong_probe", "quality_override", "high_profit", "elite"}
+            and final_leverage <= 1.0
+            and risk_budget_capped
+            and expected_profit < self.min_real_expected_profit_usdt
+        )
+        data = {
+            "lane": lane,
+            "low_payoff_quality": low_payoff,
+            "quality_tier": quality_tier,
+            "high_quality_entry": high_quality,
+            "expected_profit_usdt": expected_profit,
+            "final_integer_leverage": final_leverage,
+            "dynamic_leverage_limiting_factor": limiting_factor,
+            "risk_budget_capped": risk_budget_capped,
+        }
+        if not should_shadow:
+            return ProfitFirstStage2Decision(True, data=data)
+        return ProfitFirstStage2Decision(
+            False,
+            reason=(
+                "Profit-First defensive probe guard: low-payoff tiny/probe entry was capped to "
+                "1x by risk budget and has too little expected profit; keep it shadow-only until "
+                "quality upgrades."
+            ),
+            data={
+                **data,
+                "skip_kind": "profit_first_defensive_probe_shadow",
+                "shadow_only": True,
+                "min_real_expected_profit_usdt": self.min_real_expected_profit_usdt,
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReleaseNetBenefitPolicy:
     """Protect losing stale probes from release-only churn."""
 

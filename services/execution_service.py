@@ -21,6 +21,7 @@ from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.profit_first_position_ladder import ProfitFirstPositionLadderPolicy
+from services.profit_first_stage2 import DefensiveProbeShadowPolicy
 from services.profit_first_trade_plan import attach_profit_first_trade_plan
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
@@ -147,6 +148,18 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
                 "skip_kind": "profit_first_position_ladder_shadow_only",
                 "shadow_only": True,
                 "profit_first_position_ladder": ladder,
+            },
+        )
+
+    defensive_probe = DefensiveProbeShadowPolicy().evaluate(raw, decision)
+    if not defensive_probe.allowed:
+        return PolicyGateResult.block(
+            "profit_first_defensive_probe_shadow",
+            defensive_probe.reason,
+            {
+                **base_data,
+                "stage_status": "skipped",
+                **(defensive_probe.data or {}),
             },
         )
 

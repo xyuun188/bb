@@ -109,6 +109,43 @@ def test_strategy_learning_excludes_untrusted_closed_position_facts() -> None:
     }
 
 
+def test_strategy_learning_deduplicates_authoritative_closed_position_pairs() -> None:
+    compiler = StrategyLearningEngine().compiler
+    first = _position(side="short", pnl=-0.7, position_id=201)
+    first.symbol = "GOOGL/USDT"
+    first.entry_exchange_order_id = "entry-dup"
+    first.close_exchange_order_id = "close-dup"
+    second = _position(side="short", pnl=-0.7, position_id=202)
+    second.symbol = "GOOGL/USDT"
+    second.entry_exchange_order_id = "entry-dup"
+    second.close_exchange_order_id = "close-dup"
+
+    feedback = compiler.compile(
+        mode="paper",
+        window_hours=24,
+        positions=[first, second],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        reflections=[
+            _reflection(position_id=201, pnl=-0.7),
+            _reflection(position_id=202, pnl=-0.7),
+        ],
+    ).to_dict()
+
+    assert feedback["totals"]["closed_trade_count"] == 2
+    assert feedback["totals"]["training_trade_count"] == 1
+    assert feedback["totals"]["net_pnl"] == -0.7
+    assert feedback["side_performance"]["short"]["losses"] == 1
+    quarantine = feedback["trade_fact_quarantine"]
+    assert quarantine["duplicate_position_count"] == 1
+    assert quarantine["duplicate_group_count"] == 1
+    assert quarantine["duplicate_position_ids"] == [201]
+    assert feedback["reflection_feedback"]["training_count"] == 1
+
+
 def _open_position(symbol: str, side: str, pnl: float) -> dict[str, Any]:
 
     return {
