@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, suppress
 from time import perf_counter
 from typing import Any
 
@@ -795,6 +795,47 @@ class ExecutionService:
             }
             decision.raw_response = raw_response
 
+        async def await_exchange_place_order(
+            executor: Any,
+            *,
+            timeout_seconds: float,
+            retry: bool = False,
+        ) -> ExecutionResult | None:
+            deadline = perf_counter() + max(float(timeout_seconds), 0.0)
+            order_task = asyncio.create_task(
+                executor.place_order(
+                    decision,
+                    account_id=model_name,
+                    override_balance=override_balance,
+                )
+            )
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(order_task),
+                    timeout=max(deadline - perf_counter(), 0.001),
+                )
+            except asyncio.CancelledError:
+                if order_task.done():
+                    return order_task.result()
+                logger.warning(
+                    "exchange place_order shielded from outer cancellation",
+                    model=model_name,
+                    symbol=symbol,
+                    action=decision.action.value,
+                    mode=model_mode,
+                    retry=retry,
+                )
+                return await asyncio.wait_for(
+                    asyncio.shield(order_task),
+                    timeout=max(deadline - perf_counter(), 0.001),
+                )
+            except TimeoutError:
+                if not order_task.done():
+                    order_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await order_task
+                raise
+
         async def mark_stage(
             stage: str,
             status: str,
@@ -1055,13 +1096,9 @@ class ExecutionService:
             else:
                 execution_timeout = 90.0 if decision.is_exit else 60.0
                 submitted_to_exchange = True
-                execution_result = await asyncio.wait_for(
-                    executor.place_order(
-                        decision,
-                        account_id=model_name,
-                        override_balance=override_balance,
-                    ),
-                    timeout=execution_timeout,
+                execution_result = await await_exchange_place_order(
+                    executor,
+                    timeout_seconds=execution_timeout,
                 )
             if submitted_to_exchange and (decision.is_entry or decision.is_exit):
                 await mark_stage(
@@ -1219,13 +1256,10 @@ class ExecutionService:
             elif local_has_position or exchange_has_position is True:
                 try:
                     retry_executor = await get_okx_executor(model_mode)
-                    execution_result = await asyncio.wait_for(
-                        retry_executor.place_order(
-                            decision,
-                            account_id=model_name,
-                            override_balance=override_balance,
-                        ),
-                        timeout=45.0,
+                    execution_result = await await_exchange_place_order(
+                        retry_executor,
+                        timeout_seconds=45.0,
+                        retry=True,
                     )
                     if execution_result is not None:
                         raw = (

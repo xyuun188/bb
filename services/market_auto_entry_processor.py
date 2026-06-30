@@ -17,6 +17,7 @@ from services.decision_state import (
     append_decision_stage,
 )
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
+from services.entry_execution_handoff import await_entry_execution_handoff
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 logger = structlog.get_logger(__name__)
@@ -180,14 +181,20 @@ class MarketAutoEntryProcessor:
 
         self.set_loop_stage(f"execute:{symbol}")
         try:
-            execution_result = await self.candidate_executor(
-                symbol,
-                model_name,
-                decision,
-                assessment,
-                decision_db_id,
-                results,
-                open_positions=open_positions,
+            execution_result = await await_entry_execution_handoff(
+                self.candidate_executor(
+                    symbol,
+                    model_name,
+                    decision,
+                    assessment,
+                    decision_db_id,
+                    results,
+                    open_positions=open_positions,
+                ),
+                symbol=symbol,
+                model_name=model_name,
+                action=decision.action.value,
+                source="market_auto_entry",
             )
             execution_confirmed = self._execution_confirmed(execution_result)
             if not execution_confirmed:

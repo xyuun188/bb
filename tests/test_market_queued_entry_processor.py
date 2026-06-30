@@ -169,6 +169,61 @@ async def test_market_queued_entry_processor_keeps_capacity_on_confirmed_executi
 
 
 @pytest.mark.asyncio
+async def test_market_queued_entry_processor_waits_for_execution_after_outer_timeout() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    staged_counts = {"reserved": {"ensemble_trader": 1}}
+
+    async def slow_execute(*args: Any, **kwargs: Any) -> ExecutionResult:
+        decision = args[2]
+        calls.append(("execute_start", args[0], args[1], decision.action.value, bool(kwargs)))
+        await asyncio.sleep(0.03)
+        calls.append(("execute_done", args[0], args[1], decision.action.value))
+        return _result(OrderStatus.FILLED)
+
+    processor = _processor(calls, execution_result=_result(OrderStatus.FILLED))
+    processor = MarketQueuedEntryProcessor(
+        normalize_symbol=processor.normalize_symbol,
+        analysis_symbol_claimer=processor.analysis_symbol_claimer,
+        annotate_candidate_selection=processor.annotate_candidate_selection,
+        mark_decision_raw_response=processor.mark_decision_raw_response,
+        mark_decision_reason=processor.mark_decision_reason,
+        mark_decision_pending_execution=processor.mark_decision_pending_execution,
+        result_recorder=processor.result_recorder,
+        model_execution_mode_provider=processor.model_execution_mode_provider,
+        set_loop_stage=processor.set_loop_stage,
+        candidate_executor=slow_execute,
+        final_state_ensurer=processor.final_state_ensurer,
+        capacity_releaser=processor.capacity_releaser,
+        execution_confirmed_checker=processor.execution_confirmed_checker,
+    )
+
+    result = await asyncio.wait_for(
+        processor.process(
+            symbol="LIT/USDT",
+            model_name="ensemble_trader",
+            decision=_decision("LIT/USDT"),
+            assessment=object(),
+            decision_db_id=11,
+            results=results,
+            open_positions=[],
+            claimed_symbol_keys=set(),
+            staged_entry_counts=staged_counts,
+        ),
+        timeout=0.01,
+    )
+
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is True
+    assert result.execution_error is None
+    assert staged_counts["reserved"]["ensemble_trader"] == 1
+    assert ("execute_start", "LIT/USDT", "ensemble_trader", "long", True) in calls
+    assert ("execute_done", "LIT/USDT", "ensemble_trader", "long") in calls
+    assert not any(call[0] == "reason" and "外层超时保护取消" in str(call[2]) for call in calls)
+    assert ("ensure", 11, "LIT/USDT", "ensemble_trader", "long") in calls
+
+
+@pytest.mark.asyncio
 async def test_market_queued_entry_processor_releases_capacity_on_unconfirmed_execution() -> None:
     calls: list[tuple[str, Any]] = []
     staged_counts = {"reserved": {"ensemble_trader": 1}}

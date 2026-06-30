@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from executor.base_executor import ExecutionResult, OrderStatus
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _profit_first_entry_contract_result
 from services.trading_policies import PolicyGateResult
@@ -14,6 +16,87 @@ from services.trading_policies import PolicyGateResult
 
 async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
     return None
+
+
+def _test_execution_service(
+    *,
+    okx_executor_provider,
+    raw_updates: list[dict[str, Any] | None] | None = None,
+    reasons: list[str | None] | None = None,
+    stages: list[tuple[str, str, str]] | None = None,
+) -> ExecutionService:
+    async def mark_reason(_decision_id: int, reason: str | None) -> None:
+        if reasons is not None:
+            reasons.append(reason)
+
+    async def mark_raw(_decision_id: int, raw: dict[str, Any] | None) -> None:
+        if raw_updates is not None:
+            raw_updates.append(raw)
+
+    async def record_stage(
+        _decision_id: int | None,
+        _decision: DecisionOutput,
+        stage: str,
+        status: str,
+        reason: str,
+        _data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if stages is not None:
+            stages.append((stage, status, reason))
+        return _decision.raw_response if isinstance(_decision.raw_response, dict) else {}
+
+    async def allow_entry(*_args: Any, **_kwargs: Any) -> PolicyGateResult:
+        return PolicyGateResult.allow()
+
+    return ExecutionService(
+        execution_lock=asyncio.Lock(),
+        risk_event_logger=_noop_async,
+        model_execution_mode_provider=lambda _model: "paper",
+        decision_stage_recorder=record_stage,
+        decision_reason_marker=mark_reason,
+        decision_raw_response_marker=mark_raw,
+        position_review_alert_context_provider=lambda _decision: None,
+        position_review_risk_result_logger=_noop_async,
+        duplicate_decision_order_reason_provider=lambda *_args: _noop_async(),
+        okx_executor_provider=okx_executor_provider,
+        allocated_order_balance_provider=lambda *_args: _noop_async(),
+        rejected_execution_result_factory=ExecutionResultFactory().rejected,
+        execution_leverage_summary_attacher=lambda *_args: None,
+        execution_reason_provider=lambda result: result.raw_response.get("error") if result else "",
+        pending_execution_marker=_noop_async,
+        untradable_exchange_error_checker=lambda _text: False,
+        untradable_symbol_rememberer=lambda *_args: None,
+        transient_entry_exchange_error_checker=lambda _text: False,
+        temporary_entry_block_rememberer=lambda *_args: None,
+        transient_entry_block_minutes_provider=lambda _text: 5.0,
+        trade_logger=_noop_async,
+        exchange_confirmed_checker=lambda result: bool(
+            result
+            and result.status == OrderStatus.FILLED
+            and result.exchange_order_id
+        ),
+        exit_progress_checker=lambda _result: False,
+        no_exchange_position_result_checker=lambda _result: False,
+        trade_count_incrementer=lambda: None,
+        position_execution_persister=_noop_async,
+        open_positions_execution_applier=lambda *_args: None,
+        decision_executed_marker=_noop_async,
+        market_no_opportunity_symbol_clearer=lambda _symbol: None,
+        account_update_persister=_noop_async,
+        account_balance_provider=lambda _model: _noop_async(),
+        decision_outcome_marker=_noop_async,
+        entry_policy_evaluator=allow_entry,
+        exit_policy_evaluator=allow_entry,
+        execution_skills_provider=lambda **_kwargs: [],
+        execution_skills_attacher=lambda *_args, **_kwargs: None,
+        execution_skills_block_reason_provider=lambda *_args, **_kwargs: None,
+        position_reconciler=_noop_async,
+        open_positions_context_provider=lambda: _noop_async(),
+        matching_exit_local_position_checker=lambda *_args: False,
+        matching_exit_exchange_position_checker=lambda *_args: _noop_async(),
+        exit_cooldown_recorder=lambda *_args: None,
+        trade_notional_recorder=lambda _notional: None,
+    )
 
 
 def _entry_decision(symbol: str = "SPK/USDT") -> DecisionOutput:
@@ -248,3 +331,68 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
     assert reasons and "执行链交易对不一致" in reasons[-1]
     assert raw_updates[-1]["policy_blocker"] == "execution_symbol_mismatch"
     assert results["decisions"][0]["execution_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_execution_service_shields_exchange_submit_from_outer_timeout() -> None:
+    calls: list[tuple[str, Any]] = []
+    raw_updates: list[dict[str, Any] | None] = []
+    stages: list[tuple[str, str, str]] = []
+    reasons: list[str | None] = []
+
+    class SlowExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            calls.append(("place_start", decision.symbol, account_id, override_balance))
+            await asyncio.sleep(0.03)
+            calls.append(("place_done", decision.symbol, account_id, override_balance))
+            return ExecutionResult(
+                order_id="local-order-1",
+                exchange_order_id="okx-order-1",
+                symbol=decision.symbol,
+                side=decision.action.value,
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return SlowExecutor()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        raw_updates=raw_updates,
+        reasons=reasons,
+        stages=stages,
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+    decision = _profit_first_ready_position_review_decision()
+
+    result = await asyncio.wait_for(
+        service.execute_candidate(
+            "BTC/USDT",
+            "ensemble_trader",
+            decision,
+            SimpleNamespace(warnings=[]),
+            991,
+            results,
+            open_positions=[],
+        ),
+        timeout=0.01,
+    )
+
+    assert result is not None
+    assert result.status == OrderStatus.FILLED
+    assert result.exchange_order_id == "okx-order-1"
+    assert ("place_start", "BTC/USDT", "ensemble_trader", None) in calls
+    assert ("place_done", "BTC/USDT", "ensemble_trader", None) in calls
+    assert results["executions"][0]["order_id"] == "local-order-1"
+    assert results["decisions"][0]["executed"] is True
+    assert any(stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.COMPLETED for stage, status, _reason in stages)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
