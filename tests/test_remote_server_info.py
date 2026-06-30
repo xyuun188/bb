@@ -149,6 +149,19 @@ def test_find_server_info_file_prefers_platform_file(tmp_path) -> None:
     assert find_server_info_file(tmp_path) == platform_path
 
 
+def test_find_server_info_file_uses_account_info_dir(tmp_path, monkeypatch) -> None:
+    account_dir = tmp_path / "accounts"
+    account_dir.mkdir()
+    platform_path = account_dir / "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt"
+    platform_path.write_text(
+        "IP\uff1a10.0.0.1\n\u7528\u6237\u540d\uff1aadmin\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a22",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BB_ACCOUNT_INFO_DIR", str(account_dir))
+
+    assert find_server_info_file(tmp_path / "project") == platform_path
+
+
 def test_find_model_server_info_file_prefers_model_file(tmp_path) -> None:
     model_path = tmp_path / "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
     model_path.write_text(
@@ -161,6 +174,21 @@ def test_find_model_server_info_file_prefers_model_file(tmp_path) -> None:
     )
 
     assert find_model_server_info_file(tmp_path) == model_path
+
+
+def test_find_model_server_info_file_prefers_new_model_file(tmp_path) -> None:
+    old_model_path = tmp_path / "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
+    old_model_path.write_text(
+        "IP\uff1a10.0.0.2\n\u7528\u6237\u540d\uff1aold\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a22",
+        encoding="utf-8",
+    )
+    new_model_path = tmp_path / "\u65b0\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
+    new_model_path.write_text(
+        "IP\uff1a10.0.0.3\n\u7528\u6237\u540d\uff1anew\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a62001",
+        encoding="utf-8",
+    )
+
+    assert find_model_server_info_file(tmp_path) == new_model_path
 
 
 def test_configure_ssh_host_keys_rejects_unknown_hosts(tmp_path, monkeypatch) -> None:

@@ -17,7 +17,7 @@
 ### 1. Install Dependencies
 
 ```bash
-cd D:\bb
+cd D:\BB
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt

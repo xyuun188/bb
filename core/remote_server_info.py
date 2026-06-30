@@ -8,11 +8,15 @@ secrets are never included in diagnostics.
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
 
 from core.secret_utils import mask_secret
+
+ACCOUNT_INFO_DIR_ENV = "BB_ACCOUNT_INFO_DIR"
+DEFAULT_ACCOUNT_INFO_DIR = Path("F:/\u8d26\u6237\u4fe1\u606f")
 
 SERVER_INFO_CANDIDATE_NAMES = (
     "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt",  # platform server info
@@ -23,6 +27,7 @@ SERVER_INFO_CANDIDATE_NAMES = (
 )
 
 MODEL_SERVER_INFO_CANDIDATE_NAMES = (
+    "\u65b0\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt",  # new large-model server info
     "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt",  # large-model server info
     "\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt",  # model server info
     "model_server_info.txt",
@@ -202,10 +207,11 @@ def _candidate_paths(
     globs: tuple[str, ...] = SERVER_INFO_GLOBS,
 ) -> list[Path]:
     candidates: list[Path] = []
-    for name in names:
-        candidates.append(project_root / name)
-    for pattern in globs:
-        candidates.extend(project_root.glob(pattern))
+    for root in _candidate_roots(project_root):
+        for name in names:
+            candidates.append(root / name)
+        for pattern in globs:
+            candidates.extend(root.glob(pattern))
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -218,6 +224,20 @@ def _candidate_paths(
     return deduped
 
 
+def _candidate_roots(project_root: Path) -> list[Path]:
+    """Return local credential search roots in priority order."""
+
+    roots = [project_root]
+    configured = os.environ.get(ACCOUNT_INFO_DIR_ENV, "").strip()
+    for raw_path in (configured, str(DEFAULT_ACCOUNT_INFO_DIR)):
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
 def find_server_info_file(project_root: Path) -> Path:
     """Find an ignored server-info file without inspecting unrelated files."""
     for path in _candidate_paths(project_root):
@@ -225,7 +245,7 @@ def find_server_info_file(project_root: Path) -> Path:
             return path
     raise FileNotFoundError(
         "Could not find server info file. Expected an ignored local server info file "
-        "in the project root."
+        "in the project root or configured account-info directory."
     )
 
 
@@ -240,7 +260,8 @@ def find_model_server_info_file(project_root: Path) -> Path:
             return path
     raise FileNotFoundError(
         "Could not find model server info file. Expected ignored local file "
-        "'\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt' in the project root."
+        "'\u65b0\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt' in the project root "
+        "or configured account-info directory."
     )
 
 
