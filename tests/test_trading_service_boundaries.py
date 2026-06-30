@@ -3532,6 +3532,90 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
     assert service.market_round_watchdog_seconds() >= 180.0
 
 
+def test_market_round_time_budget_expands_when_roster_underfilled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    strategy_context = {
+        "risk_mode": "normal",
+        "portfolio_roster": {
+            "underfilled": True,
+            "gap": 8,
+            "market_symbol_min": 6,
+        },
+    }
+
+    assert service.market_round_time_budget_seconds() == 27.0
+    assert (
+        service.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        == pytest.approx(63.0)
+    )
+
+    started_at = datetime.now(UTC) - timedelta(seconds=40)
+    assert service._market_ai_budget_exhausted(started_at) is True
+    assert (
+        service._market_ai_budget_exhausted(
+            started_at,
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        is False
+    )
+
+    progress = service._market_analysis_progress_snapshot(
+        symbol="BTC/USDT",
+        market_index=1,
+        market_total=8,
+        round_start=started_at,
+        market_ai_started_at=started_at,
+        strategy_context=strategy_context,
+    )
+
+    assert progress["market_round_time_budget_seconds"] == 63.0
+    assert progress["base_market_round_time_budget_seconds"] == 27.0
+    assert (
+        progress["market_round_time_budget_policy"]
+        == "portfolio_roster_underfilled_extension"
+    )
+
+
+def test_market_round_time_budget_does_not_expand_in_hard_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    strategy_context = {
+        "risk_mode": "hard_recovery",
+        "portfolio_roster": {
+            "underfilled": True,
+            "gap": 8,
+            "market_symbol_min": 6,
+        },
+    }
+
+    assert (
+        service.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        == 27.0
+    )
+
+
 def test_parallel_loop_intervals_are_not_market_throttles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -37,6 +37,7 @@ from risk_manager.engine import RiskEngine
 from services.account_accounting_service import (
     AccountAccountingService,
     allocatable_balance_from_snapshot,
+    balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
 from services.analysis_budget import (
@@ -948,12 +949,35 @@ class TradingService:
             + float(settings.local_ai_tools_timeout_seconds or 0.0),
         )
 
-    def market_round_time_budget_seconds(self) -> float:
+    def market_round_time_budget_seconds(
+        self,
+        strategy_context: dict[str, Any] | None = None,
+        market_symbol_count: int | None = None,
+    ) -> float:
         """Return the soft per-round scan budget used inside market analysis."""
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        return max(8.0, interval * 0.90)
+        base_budget = max(8.0, interval * 0.90)
+        context = self._safe_dict(strategy_context)
+        roster = self._safe_dict(context.get("portfolio_roster"))
+        roster_underfilled = bool(roster.get("underfilled")) or self._safe_int(
+            roster.get("gap"), 0
+        ) > 0
+        risk_mode = str(context.get("risk_mode") or "").lower()
+        if not roster_underfilled or risk_mode in {"hard_recovery", "defensive_recovery"}:
+            return base_budget
+
+        requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
+        roster_symbol_min = max(self._safe_int(roster.get("market_symbol_min"), 0), 0)
+        target_symbols = max(4, roster_symbol_min)
+        if requested_symbols > 0:
+            target_symbols = min(target_symbols, requested_symbols)
+        target_symbols = min(max(target_symbols, 1), 8)
+        per_symbol_floor = max(8.0, min(14.0, interval * 0.35))
+        expanded_budget = max(base_budget, target_symbols * per_symbol_floor)
+        watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
+        return min(expanded_budget, watchdog_ceiling)
 
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
@@ -1331,10 +1355,19 @@ class TradingService:
     def _round_budget_exhausted(self, started_at: datetime) -> bool:
         return self._round_elapsed_seconds(started_at) >= self.market_round_time_budget_seconds()
 
-    def _market_ai_budget_exhausted(self, market_ai_started_at: datetime) -> bool:
+    def _market_ai_budget_exhausted(
+        self,
+        market_ai_started_at: datetime,
+        *,
+        strategy_context: dict[str, Any] | None = None,
+        market_symbol_count: int | None = None,
+    ) -> bool:
         return (
             self._round_elapsed_seconds(market_ai_started_at)
-            >= self.market_round_time_budget_seconds()
+            >= self.market_round_time_budget_seconds(
+                strategy_context=strategy_context,
+                market_symbol_count=market_symbol_count,
+            )
         )
 
     async def _runtime_heartbeat_loop(self) -> None:
@@ -3628,11 +3661,16 @@ class TradingService:
         market_total: int,
         round_start: datetime,
         market_ai_started_at: datetime | None = None,
+        strategy_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         market_ai_started_at = market_ai_started_at or round_start
         full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
         market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
-        budget_seconds = self.market_round_time_budget_seconds()
+        base_budget_seconds = self.market_round_time_budget_seconds()
+        budget_seconds = self.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=market_total,
+        )
         return {
             "read_only": True,
             "is_entry_gate": False,
@@ -3644,6 +3682,12 @@ class TradingService:
             "full_round_elapsed_seconds_before_ai": round(full_round_elapsed_seconds, 3),
             "market_ai_elapsed_seconds_before_symbol": round(market_ai_elapsed_seconds, 3),
             "market_round_time_budget_seconds": round(budget_seconds, 3),
+            "base_market_round_time_budget_seconds": round(base_budget_seconds, 3),
+            "market_round_time_budget_policy": (
+                "portfolio_roster_underfilled_extension"
+                if budget_seconds > base_budget_seconds + 1e-9
+                else "base_interval_budget"
+            ),
             "budget_used_ratio_before_ai": round(
                 market_ai_elapsed_seconds / max(budget_seconds, 1e-6),
                 6,
@@ -4485,12 +4529,19 @@ class TradingService:
             market_feature_items = list(market_feature_vectors.items())
             market_ai_started_at = datetime.now(UTC)
             for market_index, (symbol, fv) in enumerate(market_feature_items):
-                if market_index > 0 and self._market_ai_budget_exhausted(market_ai_started_at):
+                if market_index > 0 and self._market_ai_budget_exhausted(
+                    market_ai_started_at,
+                    strategy_context=strategy_mode_context,
+                    market_symbol_count=len(market_feature_items),
+                ):
                     remaining = [
                         item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
                     ]
                     market_round_skipped_by_budget = remaining
-                    budget_seconds = self.market_round_time_budget_seconds()
+                    budget_seconds = self.market_round_time_budget_seconds(
+                        strategy_context=strategy_mode_context,
+                        market_symbol_count=len(market_feature_items),
+                    )
                     market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
                     full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
                     warning = (
@@ -4552,6 +4603,7 @@ class TradingService:
                     market_total=len(market_feature_items),
                     round_start=round_start,
                     market_ai_started_at=market_ai_started_at,
+                    strategy_context=strategy_mode_context,
                 )
                 model_name = ENSEMBLE_TRADER_NAME
                 model_mode = self._get_model_execution_mode(model_name)
