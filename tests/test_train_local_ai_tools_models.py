@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +15,13 @@ from scripts.train_local_ai_tools_models import (
     _normalize_base_url,
     _post_training_payload,
 )
+
+
+def test_local_ai_tools_autotrain_task_persists_artifacts() -> None:
+    command = Path("scripts/run_local_ai_tools_autotrain.cmd").read_text(encoding="utf-8")
+
+    assert "--persist-artifact" in command
+    assert "--confirm-phase3-rebuild" in command
 
 
 def test_local_ai_tools_training_headers_use_bearer_token() -> None:

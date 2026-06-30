@@ -1106,6 +1106,122 @@ async def test_local_ai_tools_auto_train_blocks_when_okx_daily_training_gate_blo
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import train_local_ai_tools_models as train_script
+
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+    captured: dict[str, Any] = {}
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            raise TimeoutError("phase3 status endpoint timed out")
+
+        async def train(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return {
+                "trained": True,
+                "shadow_sample_count": len(args[0]),
+                "trade_sample_count": len(args[1]),
+                "trained_at": "2026-06-30T08:00:00+00:00",
+            }
+
+    async def load_shadow_samples(_limit: int) -> list[dict[str, Any]]:
+        return [{"id": 1, "features": {"symbol": "BTC/USDT"}}]
+
+    async def load_trade_reflections(_limit: int) -> list[dict[str, Any]]:
+        return [{"id": 2, "symbol": "BTC/USDT", "side": "long", "pnl": 1.2}]
+
+    async def load_empty(_limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def completed_trade_count() -> int:
+        return 33
+
+    def annotate_payload(
+        *,
+        shadow_samples: list[dict[str, Any]],
+        trade_samples: list[dict[str, Any]],
+        sequence_samples: list[dict[str, Any]],
+        text_sentiment_samples: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "shadow_samples": shadow_samples,
+            "trade_samples": trade_samples,
+            "sequence_samples": sequence_samples,
+            "text_sentiment_samples": text_sentiment_samples,
+            "quality_report": {
+                "totals": {
+                    "total": 1,
+                    "excluded": 0,
+                    "effective_weight_ratio": 1.0,
+                }
+            },
+            "governance_report": {
+                "trainable_sample_count": 1,
+                "contamination_risk": "low",
+            },
+        }
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {
+            "allowed": True,
+            "reason": "okx_daily_reconciliation_allows_training_refresh",
+            "can_refresh_training": True,
+            "read_only": True,
+            "mutates_database": False,
+        },
+    )
+    monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
+    monkeypatch.setattr(train_script, "_load_trade_reflection_samples", load_trade_reflections)
+    monkeypatch.setattr(train_script, "_load_closed_position_samples", load_empty)
+    monkeypatch.setattr(train_script, "_load_sequence_samples", load_empty)
+    monkeypatch.setattr(train_script, "_load_text_sentiment_samples", load_empty)
+    monkeypatch.setattr(train_script, "_merge_trade_samples", lambda a, b: [*a, *b])
+    monkeypatch.setattr(train_script, "_completed_trade_sample_count", completed_trade_count)
+    monkeypatch.setattr(
+        "services.training_data_quality.annotate_training_payload",
+        annotate_payload,
+    )
+    monkeypatch.setattr(
+        trading_service,
+        "load_latest_paper_observation_report",
+        lambda: {
+            "available": True,
+            "status": "ok",
+            "can_use_for_promotion": True,
+            "starts_trading_service": False,
+            "submits_orders": False,
+            "changes_model_routing": False,
+        },
+    )
+    service.local_ai_tools = FakeLocalAITools()
+    service._completed_shadow_backtest_total = lambda: _async_value(9999)  # type: ignore[method-assign]
+
+    result = await service._maybe_train_local_ai_tools(force=True)
+
+    assert result["trained"] is True
+    assert result["completed_shadow_sample_count"] == 9999
+    assert result["completed_trade_sample_count"] == 33
+    assert captured["kwargs"]["persist_artifact"] is True
+    assert captured["kwargs"]["confirm_phase3_rebuild"] is True
+    assert captured["kwargs"]["training_mode"] == "shadow"
+    assert captured["kwargs"]["model_stage"] == "shadow"
+    assert captured["kwargs"]["evaluation_policy"]["live_mutation"] is False
+    assert captured["kwargs"]["raw_trade_sample_count"] == 1
+    assert captured["kwargs"]["trainable_trade_sample_count"] == 1
+    assert captured["kwargs"]["trade_sample_cursor_policy"] == "clean_training_view_only"
+    assert result["training_policy"]["status_probe_fallback"] == "train_when_due_from_local_counts"
+
+
+@pytest.mark.asyncio
 async def test_entry_execution_policy_blocks_entries_when_okx_sync_is_unhealthy() -> None:
     service = TradingService.__new__(TradingService)
     service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)

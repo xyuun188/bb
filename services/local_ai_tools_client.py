@@ -466,7 +466,7 @@ class LocalAIToolsClient:
             return self._write_status_cache(status)
 
         error = status_error or "local AI tools service is unavailable"
-        self._record_failure(error)
+        self._record_failure(error, open_circuit=False)
         return self._write_status_cache(
             {
                 "available": False,

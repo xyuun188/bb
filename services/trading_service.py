@@ -5320,7 +5320,22 @@ class TradingService:
                 "trade_sample_cursor_policy": "clean_training_view_only",
             }
 
-        status = await self.local_ai_tools.status()
+        status_probe_error = ""
+        try:
+            status = await self.local_ai_tools.status()
+        except Exception as exc:
+            status_probe_error = safe_error_text(exc, limit=180)
+            status = {
+                "available": False,
+                "service_available": False,
+                "model_bundle_available": False,
+                "status": "status_probe_error",
+                "error": status_probe_error,
+            }
+            logger.warning(
+                "local AI tools status probe failed before training; continuing with local cursors",
+                error=status_probe_error,
+            )
         now = datetime.now(UTC)
         trained_at_raw = status.get("trained_at") if isinstance(status, dict) else None
         trained_at = self._parse_datetime(trained_at_raw)
@@ -5431,6 +5446,9 @@ class TradingService:
             "trade_cursor_source": "last_trained_completed_trade_sample_count",
             "trade_cursor_policy": "clean_training_view_only",
         }
+        if status_probe_error:
+            training_policy["status_probe_error"] = status_probe_error
+            training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
         if completed_shadow_total < LOCAL_ML_TRAINING_PARAMS.min_training_samples:
             return {
                 "trained": False,
@@ -5494,8 +5512,14 @@ class TradingService:
             source="local_trading_system_auto",
             completed_shadow_sample_count=completed_shadow_total,
             completed_trade_sample_count=completed_trade_total,
+            raw_trade_sample_count=raw_trade_sample_count,
+            trainable_trade_sample_count=trainable_trade_count,
+            quarantined_trade_sample_count=quarantined_trade_count,
+            trade_sample_cursor_policy="clean_training_view_only",
             quality_report=quality_report,
             governance_report=governance_report,
+            training_mode="shadow",
+            model_stage="shadow",
             evaluation_policy={
                 "promotion_flow": "shadow_to_canary_to_live",
                 "live_mutation": False,
@@ -5504,6 +5528,8 @@ class TradingService:
                 "phase": "phase3_model_factory",
             },
             paper_observation_report=paper_observation_report,
+            persist_artifact=True,
+            confirm_phase3_rebuild=True,
         )
         if result.get("trained"):
             result["completed_shadow_sample_count"] = completed_shadow_total

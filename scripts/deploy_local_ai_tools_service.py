@@ -117,6 +117,43 @@ ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
 _BUNDLE_CACHE: dict[str, Any] | None = None
 _BUNDLE_MTIME: float | None = None
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
+_STATUS_METADATA_KEYS = (
+    "artifact_policy_id",
+    "phase",
+    "trained_at",
+    "source",
+    "shadow_sample_count",
+    "completed_shadow_sample_count",
+    "last_trained_completed_shadow_sample_count",
+    "trade_sample_count",
+    "completed_trade_sample_count",
+    "last_trained_completed_trade_sample_count",
+    "sequence_sample_count",
+    "text_sentiment_sample_count",
+    "torch_patch_available",
+    "torch_patch_status",
+    "transformers_sentiment_backend",
+    "feature_count",
+    "horizons",
+    "profile_count",
+    "round_trip_cost_pct",
+    "tail_loss_threshold_pct",
+    "quality_report",
+    "governance_report",
+    "training_policy",
+    "trade_sample_cursor_policy",
+    "training_mode",
+    "model_stage",
+    "evaluation_policy",
+    "artifact_persisted",
+    "preflight_only",
+    "persist_artifact_requested",
+    "confirm_phase3_rebuild",
+    "promotion_recommendation",
+    "training_objective",
+    "models",
+    "objective",
+)
 
 
 def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
@@ -360,6 +397,70 @@ def load_bundle() -> dict[str, Any] | None:
         _BUNDLE_CACHE = None
         _BUNDLE_MTIME = None
         return None
+
+
+def _file_stat(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return {
+            "exists": False,
+            "error": safe_error(exc),
+        }
+    return {
+        "exists": True,
+        "size_bytes": int(stat.st_size),
+        "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+    }
+
+
+def _read_metadata_file() -> dict[str, Any]:
+    try:
+        if not METADATA_PATH.exists():
+            return {}
+        parsed = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+    except Exception:
+        return {}
+
+
+def _status_metadata() -> dict[str, Any]:
+    metadata = _read_metadata_file()
+    if not metadata and _BUNDLE_CACHE and isinstance(_BUNDLE_CACHE.get("metadata"), dict):
+        metadata = _BUNDLE_CACHE["metadata"]
+    return {
+        key: metadata.get(key)
+        for key in _STATUS_METADATA_KEYS
+        if key in metadata
+    }
+
+
+def _model_artifact_status() -> dict[str, Any]:
+    bundle_stat = _file_stat(BUNDLE_PATH)
+    metadata_stat = _file_stat(METADATA_PATH)
+    metadata = _status_metadata()
+    bundle_exists = bool(bundle_stat.get("exists"))
+    metadata_exists = bool(metadata_stat.get("exists"))
+    metadata_ready = bool(metadata)
+    model_bundle_available = bool(bundle_exists and metadata_ready)
+    status = "ready" if model_bundle_available else "heuristic_fallback_available"
+    if bundle_exists and not metadata_ready:
+        status = "metadata_missing"
+    return {
+        "available": model_bundle_available,
+        "model_bundle_available": model_bundle_available,
+        "trained_models_available": model_bundle_available,
+        "status": status,
+        "model_path": str(BUNDLE_PATH),
+        "metadata_path": str(METADATA_PATH),
+        "bundle_file": bundle_stat,
+        "metadata_file": metadata_stat,
+        "metadata_loaded": metadata_ready,
+        "metadata_source": "metadata_file" if metadata_exists else ("bundle_cache" if metadata_ready else "missing"),
+        **metadata,
+    }
 
 
 def predict_proba_positive(model: Pipeline, x: list[list[float]]) -> float:
@@ -1751,10 +1852,7 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    bundle = load_bundle()
-    metadata = {}
-    if bundle and isinstance(bundle.get("metadata"), dict):
-        metadata = bundle["metadata"]
+    artifact_status = _model_artifact_status()
     payload = {
         "ok": True,
         "service": "phase3_quant_api",
@@ -1769,17 +1867,18 @@ def health() -> dict[str, Any]:
         "live_trading_mutation": False,
         "route_mode": "shadow_observation",
         "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
-        "trained_models_available": bool(bundle),
-        "trained_at": metadata.get("trained_at"),
-        "shadow_sample_count": metadata.get("shadow_sample_count", 0),
-        "trade_sample_count": metadata.get("trade_sample_count", 0),
-        "completed_shadow_sample_count": metadata.get("completed_shadow_sample_count", 0),
-        "completed_trade_sample_count": metadata.get("completed_trade_sample_count", 0),
-        "quality_report": metadata.get("quality_report", {}),
-        "governance_report": metadata.get("governance_report", {}),
         "review_backend": "disabled_use_trading_app_online_model",
         "model_dir": MODEL_DIR.as_posix(),
+        "status_endpoint_uses_metadata_only": True,
     }
+    payload.update(artifact_status)
+    payload.setdefault("trained_at", None)
+    payload.setdefault("shadow_sample_count", 0)
+    payload.setdefault("trade_sample_count", 0)
+    payload.setdefault("completed_shadow_sample_count", 0)
+    payload.setdefault("completed_trade_sample_count", 0)
+    payload.setdefault("quality_report", {})
+    payload.setdefault("governance_report", {})
     payload.update(_phase3_inventory_status())
     payload["specialist_model_chains"] = {
         "timeseries": _specialist_model_chain("timeseries"),
@@ -1790,19 +1889,18 @@ def health() -> dict[str, Any]:
 
 @app.get("/models/status")
 def local_models_status() -> dict[str, Any]:
-    bundle = load_bundle()
-    if not bundle:
-        return {
-            "available": False,
-            "message": "No trained local quant bundle found; heuristic fallback is active.",
-            "model_path": str(BUNDLE_PATH),
-            "specialist_adapter_preflight": _specialist_adapter_preflight(),
-        }
+    artifact_status = _model_artifact_status()
+    message = ""
+    if not artifact_status.get("available"):
+        if artifact_status.get("status") == "metadata_missing":
+            message = "Trained bundle exists but metadata is missing; rebuild training artifacts."
+        else:
+            message = "No trained local quant bundle found; heuristic fallback is active."
     return {
-        "available": True,
-        "model_path": str(BUNDLE_PATH),
+        **artifact_status,
+        "message": message,
         "specialist_adapter_preflight": _specialist_adapter_preflight(),
-        **(bundle.get("metadata") or {}),
+        "status_endpoint_uses_metadata_only": True,
     }
 
 

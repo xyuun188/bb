@@ -757,22 +757,36 @@ async def _phase3_completed_shadow_count() -> int:
 
 
 async def _phase3_completed_trade_count() -> int:
+    trade_reflection_count = 0
+    closed_position_count = 0
     async with get_session_ctx() as session:
-        trade_reflection_result = await session.execute(
-            select(func.count(TradeReflection.id)).where(
-                TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
+        try:
+            trade_reflection_result = await session.execute(
+                select(func.count(TradeReflection.id)).where(
+                    TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
+                )
             )
-        )
-        closed_position_result = await session.execute(
-            select(func.count(Position.id)).where(
-                Position.is_open.is_(False),
-                Position.closed_at.is_not(None),
-                Position.created_at >= PHASE3_CLEAN_START_UTC,
+            trade_reflection_count = int(trade_reflection_result.scalar() or 0)
+        except Exception as exc:
+            logger.warning(
+                "data collection trade reflection count unavailable",
+                error=safe_error_text(exc, limit=180),
             )
-        )
-    return int(trade_reflection_result.scalar() or 0) + int(
-        closed_position_result.scalar() or 0
-    )
+        try:
+            closed_position_result = await session.execute(
+                select(func.count(Position.id)).where(
+                    Position.is_open.is_(False),
+                    Position.closed_at.is_not(None),
+                    Position.created_at >= PHASE3_CLEAN_START_UTC,
+                )
+            )
+            closed_position_count = int(closed_position_result.scalar() or 0)
+        except Exception as exc:
+            logger.warning(
+                "data collection closed position count unavailable",
+                error=safe_error_text(exc, limit=180),
+            )
+    return trade_reflection_count + closed_position_count
 
 
 async def _training_governance_snapshot() -> dict[str, Any]:
@@ -1048,6 +1062,8 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             evaluation_policy=evaluation_policy,
             paper_observation_report=paper_observation_report,
             promotion_recommendation=promotion_recommendation,
+            persist_artifact=True,
+            confirm_phase3_rebuild=True,
         )
         result.setdefault("quality_report", payload["quality_report"])
         result.setdefault("governance_report", payload["governance_report"])
@@ -1057,6 +1073,8 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
         result.setdefault("trainable_trade_sample_count", trainable_trade_sample_count)
         result.setdefault("quarantined_trade_sample_count", quarantined_trade_sample_count)
         result.setdefault("trade_sample_cursor_policy", "clean_training_view_only")
+        result.setdefault("persist_artifact_requested", True)
+        result.setdefault("confirm_phase3_rebuild", True)
         return result
     except Exception as exc:
         return {

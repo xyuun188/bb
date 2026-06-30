@@ -748,10 +748,14 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
 
     assert result["trained"] is True
     assert captured["kwargs"]["source"] == "dashboard_training_governance_refresh"
+    assert captured["kwargs"]["persist_artifact"] is True
+    assert captured["kwargs"]["confirm_phase3_rebuild"] is True
     assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
     assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
         "phase3_shadow_to_canary_to_live"
     )
+    assert result["persist_artifact_requested"] is True
+    assert result["confirm_phase3_rebuild"] is True
     assert result["promotion_recommendation"]["policy"] == "phase3_shadow_to_canary_to_live"
     assert result["promotion_recommendation"]["live_ready"] is False
 

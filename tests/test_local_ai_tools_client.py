@@ -514,6 +514,7 @@ async def test_local_ai_tools_status_failure_is_redacted(
     assert result["error"] == "Authorization: *** failed"
     assert result["api_base"] == "http://local-ai-tools.test"
     assert client._last_failure == "Authorization: *** failed"
+    assert client._circuit_open_until is None
 
 
 @pytest.mark.asyncio

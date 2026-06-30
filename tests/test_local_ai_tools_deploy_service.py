@@ -44,14 +44,14 @@ def test_local_ai_tools_generated_service_disables_local_high_risk_review() -> N
 
 
 def test_local_ai_tools_health_returns_service_status_without_trained_bundle() -> None:
-    assert 'if bundle and isinstance(bundle.get("metadata"), dict):' in SERVICE_CODE
-    assert 'metadata = bundle["metadata"]' in SERVICE_CODE
+    assert "def _model_artifact_status()" in SERVICE_CODE
+    assert "def _status_metadata()" in SERVICE_CODE
     assert '"ok": True' in SERVICE_CODE
     assert '"service": "phase3_quant_api"' in SERVICE_CODE
     assert '"root": PHASE3_ROOT.as_posix()' in SERVICE_CODE
     assert '"port": PHASE3_API_PORT' in SERVICE_CODE
     assert '"live_mutation": False' in SERVICE_CODE
-    assert '"trained_models_available": bool(bundle)' in SERVICE_CODE
+    assert '"status_endpoint_uses_metadata_only": True' in SERVICE_CODE
     assert '"review_backend": "disabled_use_trading_app_online_model"' in SERVICE_CODE
 
 
@@ -110,6 +110,45 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert payload["shadow_payload"]["expected_return_pct"] == 0.42
     assert payload["shadow_payload"]["adjusted_expected_return_pct"] == 0.31
     assert payload["shadow_payload"]["loss_probability"] == 0.18
+
+
+def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_metadata_status_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.MODEL_DIR = tmp_path
+    module.BUNDLE_PATH = tmp_path / "local_quant_models.joblib"
+    module.METADATA_PATH = tmp_path / "local_quant_models_metadata.json"
+    module.BUNDLE_PATH.write_bytes(b"not-a-joblib-bundle")
+    module.METADATA_PATH.write_text(
+        json.dumps(
+            {
+                "trained_at": "2026-06-30T08:00:00+00:00",
+                "shadow_sample_count": 222,
+                "trade_sample_count": 33,
+                "profile_count": 7,
+                "artifact_persisted": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_load_bundle() -> None:
+        raise AssertionError("status endpoints must not deserialize model bundles")
+
+    module.load_bundle = fail_load_bundle
+
+    health = module.health()
+    status = module.local_models_status()
+
+    assert health["ok"] is True
+    assert health["trained_models_available"] is True
+    assert health["shadow_sample_count"] == 222
+    assert health["trade_sample_count"] == 33
+    assert health["status_endpoint_uses_metadata_only"] is True
+    assert status["available"] is True
+    assert status["profile_count"] == 7
+    assert status["metadata_loaded"] is True
+    assert status["status_endpoint_uses_metadata_only"] is True
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
