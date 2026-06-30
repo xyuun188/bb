@@ -199,10 +199,7 @@ def _weighted_average(items: list[tuple[float, float]]) -> float:
     if total_weight <= 0:
         return 0.0
     return (
-        sum(
-            max(float(weight or 0.0), 0.0) * float(value or 0.0)
-            for weight, value in items
-        )
+        sum(max(float(weight or 0.0), 0.0) * float(value or 0.0) for weight, value in items)
         / total_weight
     )
 
@@ -1094,13 +1091,16 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
             (snapshot or {}).get("equity") or (snapshot or {}).get("total"),
             None,
         )
-        allocated = _safe_float(
-            (snapshot or {}).get("allocatable")
-            or (snapshot or {}).get("equity")
-            or (snapshot or {}).get("total")
-            or (snapshot or {}).get("free"),
-            0.0,
-        ) or 0.0
+        allocated = (
+            _safe_float(
+                (snapshot or {}).get("allocatable")
+                or (snapshot or {}).get("equity")
+                or (snapshot or {}).get("total")
+                or (snapshot or {}).get("free"),
+                0.0,
+            )
+            or 0.0
+        )
     except Exception as exc:
         _log_dashboard_fallback(
             "dashboard balance snapshot fallback",
@@ -1581,22 +1581,10 @@ def _build_execution_account_status(
         )
         used_margin = okx_used
         wallet = (
-            okx_cash
-            if okx_cash is not None
-            else (
-                okx_total
-                if okx_total is not None
-                else None
-            )
+            okx_cash if okx_cash is not None else (okx_total if okx_total is not None else None)
         )
         equity = (
-            okx_equity
-            if okx_equity is not None
-            else (
-                okx_total
-                if okx_total is not None
-                else None
-            )
+            okx_equity if okx_equity is not None else (okx_total if okx_total is not None else None)
         )
         payload.update(
             {
@@ -2115,7 +2103,12 @@ async def _dashboard_closed_position_ledger_rows(
     if paginate:
         start = (page - 1) * page_size
         selected_groups = ledger_groups[start : start + page_size]
-    return [group.as_dict(include_fills=True) for group in selected_groups], total, page, total_pages
+    return (
+        [group.as_dict(include_fills=True) for group in selected_groups],
+        total,
+        page,
+        total_pages,
+    )
 
 
 def _is_live_position_open(position: dict) -> bool:
@@ -2147,11 +2140,11 @@ async def _get_open_position_symbols(mode: str | None = None) -> set[str]:
         async with get_session_ctx() as session:
             result = await session.execute(
                 select(Position.symbol)
-                  .where(
-                      Position.execution_mode == selected_mode,
-                      Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                      Position.is_open.is_(True),
-                  )
+                .where(
+                    Position.execution_mode == selected_mode,
+                    Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                    Position.is_open.is_(True),
+                )
                 .distinct()
             )
             symbols.update(_normalize_dashboard_symbol(row[0]) for row in result.all())
@@ -2570,8 +2563,7 @@ async def _get_display_open_positions_snapshot(
                     continue
 
                 local_quantity = sum(
-                    _safe_float(getattr(row, "quantity", None), 0.0) or 0.0
-                    for row in group_rows
+                    _safe_float(getattr(row, "quantity", None), 0.0) or 0.0 for row in group_rows
                 )
                 local_entry_price = _weighted_average(
                     [
@@ -2718,17 +2710,21 @@ async def _get_display_open_positions_snapshot(
                     "local_quantity": getattr(local_position, "quantity", None),
                     "local_entry_price": getattr(local_position, "entry_price", None),
                     "local_unrealized_pnl": getattr(local_position, "unrealized_pnl", None),
-                    "realized_pnl": getattr(local_position, "realized_pnl", 0.0)
-                    if local_position is not None
-                    else 0.0,
+                    "realized_pnl": (
+                        getattr(local_position, "realized_pnl", 0.0)
+                        if local_position is not None
+                        else 0.0
+                    ),
                     "leverage": getattr(local_position, "leverage", None)
                     or snapshot.get("leverage"),
                     "stop_loss": getattr(local_position, "stop_loss_price", None),
                     "take_profit": getattr(local_position, "take_profit_price", None),
                     "is_open": True,
-                    "db_is_open": bool(getattr(local_position, "is_open", False))
-                    if local_position is not None
-                    else False,
+                    "db_is_open": (
+                        bool(getattr(local_position, "is_open", False))
+                        if local_position is not None
+                        else False
+                    ),
                     "exchange_synced": True,
                     "close_status": "open",
                     "close_status_label": "持有中",
@@ -3078,12 +3074,12 @@ async def get_ml_signal_status():
             else {}
         )
         auto_new = (
-            auto_last.get("phase3_new_shadow_sample_count")
-            if isinstance(auto_last, dict)
-            else None
+            auto_last.get("phase3_new_shadow_sample_count") if isinstance(auto_last, dict) else None
         )
         if auto_new is None:
-            auto_new = max(int(completed_total) - training_count, 0)
+            trained_cursor = _phase3_trained_shadow_cursor(status, completed_total)
+            status["last_trained_phase3_shadow_sample_count"] = trained_cursor
+            auto_new = max(int(completed_total) - trained_cursor, 0)
         status["phase3_new_shadow_sample_count"] = int(auto_new or 0)
         status["new_shadow_sample_count"] = int(auto_new or 0)
     except Exception as exc:
@@ -3095,6 +3091,41 @@ async def get_ml_signal_status():
         status["new_shadow_sample_count"] = 0
 
     return status
+
+
+def _phase3_trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
+    """Return the trained shadow cursor using the same Phase 3 sample-count scale."""
+    candidates = (
+        status.get("last_trained_phase3_shadow_sample_count"),
+        status.get("phase3_trained_shadow_sample_count"),
+        status.get("last_trained_completed_shadow_sample_count"),
+        status.get("last_trained_completed_sample_count"),
+        status.get("sample_count"),
+        status.get("trained_sample_count"),
+    )
+    for value in candidates:
+        cursor = _optional_non_negative_int(value)
+        if cursor is not None and cursor <= completed_total:
+            return cursor
+    return min(
+        _safe_int_value(
+            status.get("training_shadow_sample_count")
+            or status.get("sample_count")
+            or status.get("trained_sample_count"),
+            0,
+        ),
+        completed_total,
+    )
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 @router.get("/local-ai-tools/status")
@@ -3134,9 +3165,7 @@ async def get_local_ai_tools_status():
                 "phase3_clean_completed_shadow_sample_count",
             )
             phase3_count = int(
-                explicit_phase3_count
-                if explicit_phase3_count is not None
-                else completed_total
+                explicit_phase3_count if explicit_phase3_count is not None else completed_total
             )
             status["phase3_clean_trainable_shadow_sample_count"] = phase3_count
             status["phase3_clean_completed_shadow_sample_count"] = phase3_count
@@ -3351,9 +3380,7 @@ async def get_positions(
             ledger_groups = build_okx_position_ledger_groups(closed_rows, order_rows)
             display_total = len(ledger_groups)
             display_total_pages = (
-                max(1, (display_total + page_size - 1) // page_size)
-                if display_total
-                else 1
+                max(1, (display_total + page_size - 1) // page_size) if display_total else 1
             )
             page = min(page, display_total_pages)
             start = (page - 1) * page_size
@@ -4441,7 +4468,7 @@ async def get_analysis_records(
         position_stmt = select(
             Position.execution_mode,
             Position.symbol,
-          ).where(
+        ).where(
             Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
             Position.is_open.is_(True),
         )
@@ -4878,11 +4905,11 @@ async def get_profit_attribution(
 
     async with get_session_ctx() as session:
         position_result = await session.execute(
-              select(Position)
-              .where(
-                  Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                  Position.execution_mode == selected_mode,
-                  Position.is_open.is_(False),
+            select(Position)
+            .where(
+                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                Position.execution_mode == selected_mode,
+                Position.is_open.is_(False),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )
@@ -5082,11 +5109,11 @@ async def get_model_contribution_stats(
 
     async with get_session_ctx() as session:
         position_result = await session.execute(
-              select(Position)
-              .where(
-                  Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                  Position.execution_mode == selected_mode,
-                  Position.is_open.is_(False),
+            select(Position)
+            .where(
+                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                Position.execution_mode == selected_mode,
+                Position.is_open.is_(False),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )
@@ -5501,7 +5528,13 @@ async def get_account_balance():
     selected_mode = mode_manager.mode.value
     okx_account = await _get_dashboard_okx_account_snapshot(selected_mode)
     okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
-    okx_equity = None if okx_error else _safe_float((okx_account or {}).get("equity") or (okx_account or {}).get("total"), None)
+    okx_equity = (
+        None
+        if okx_error
+        else _safe_float(
+            (okx_account or {}).get("equity") or (okx_account or {}).get("total"), None
+        )
+    )
     okx_available = None if okx_error else _safe_float((okx_account or {}).get("free"), None)
 
     return {
@@ -5511,7 +5544,9 @@ async def get_account_balance():
         "okx_account": okx_account,
         "account_equity": okx_equity,
         "available_balance": okx_available,
-        "balance_source": "okx_authoritative" if okx_account and not okx_error else "okx_unavailable",
+        "balance_source": (
+            "okx_authoritative" if okx_account and not okx_error else "okx_unavailable"
+        ),
         "balance_error": okx_error,
     }
 
@@ -5519,7 +5554,9 @@ async def get_account_balance():
 @router.get("/dashboard/pnl-history")
 async def get_pnl_history(mode: str | None = None):
     """PnL equity curve history for each model."""
-    selected_mode = "live" if mode == "live" else "paper" if mode == "paper" else mode_manager.mode.value
+    selected_mode = (
+        "live" if mode == "live" else "paper" if mode == "paper" else mode_manager.mode.value
+    )
     okx_history = await _build_okx_equity_pnl_history(selected_mode)
     return {"history": _format_okx_equity_pnl_history(okx_history)}
 
@@ -5580,15 +5617,15 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         exchange_marks = {}
     async with get_session_ctx() as session:
         result = await session.execute(
-              select(Position)
-              .where(
+            select(Position)
+            .where(
                 Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                  Position.execution_mode == selected_mode,
-                  or_(
-                      Position.created_at >= PHASE3_CLEAN_START_UTC,
-                      Position.closed_at >= PHASE3_CLEAN_START_UTC,
-                  ),
-              )
+                Position.execution_mode == selected_mode,
+                or_(
+                    Position.created_at >= PHASE3_CLEAN_START_UTC,
+                    Position.closed_at >= PHASE3_CLEAN_START_UTC,
+                ),
+            )
             .order_by(Position.closed_at.asc(), Position.created_at.asc())
         )
         positions = list(result.scalars().all())
@@ -5620,7 +5657,8 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         positions = [
             pos
             for pos in positions
-            if pos.is_open or closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
+            if pos.is_open
+            or closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
         ]
         from models.account import ExecutionEquitySnapshot
 
@@ -5722,8 +5760,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
                 None,
             )
             current_okx_equity_at = (
-                str(okx_account.get("timestamp") or okx_account.get("snapshot_at") or "")
-                or None
+                str(okx_account.get("timestamp") or okx_account.get("snapshot_at") or "") or None
             )
     except Exception as exc:
         _log_dashboard_fallback(
@@ -5779,7 +5816,9 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
                     else None
                 )
                 row["okx_equity"] = round(latest_equity, 8)
-                row["okx_equity_snapshot_at"] = current_okx_equity_at or datetime.now(UTC).isoformat()
+                row["okx_equity_snapshot_at"] = (
+                    current_okx_equity_at or datetime.now(UTC).isoformat()
+                )
                 row["okx_equity_source"] = "okx_current_balance"
                 row["okx_today_baseline_equity"] = (
                     round(baseline_for_today, 8) if baseline_for_today is not None else None
@@ -5885,7 +5924,9 @@ async def _build_okx_equity_pnl_history(mode: str) -> dict[str, list[dict]]:
                     ExecutionEquitySnapshot.source == "okx_snapshot",
                     ExecutionEquitySnapshot.snapshot_date >= PHASE3_FIRST_CLEAN_DAY,
                 )
-                .order_by(ExecutionEquitySnapshot.snapshot_at.asc(), ExecutionEquitySnapshot.id.asc())
+                .order_by(
+                    ExecutionEquitySnapshot.snapshot_at.asc(), ExecutionEquitySnapshot.id.asc()
+                )
                 .limit(500)
             )
             rows = list(result.scalars().all())

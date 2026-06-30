@@ -321,3 +321,38 @@ async def test_ml_signal_status_does_not_promote_legacy_sample_counts(
     assert result["phase3_new_shadow_sample_count"] == 0
     assert result["raw_shadow_sample_count"] == 150810
     assert result["legacy_shadow_sample_count"] == 150810
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_status_uses_training_window_when_legacy_cursor_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+
+    class FakeMLSignalService:
+        def status(self) -> dict:
+            return {
+                "available": True,
+                "status": "learning_only",
+                "sample_count": 5940,
+                "last_trained_completed_shadow_sample_count": 150810,
+                "auto_train_enabled": True,
+            }
+
+    async def completed_count() -> int:
+        return 6906
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_ml_signal_status_service", FakeMLSignalService())
+    monkeypatch.setattr(dashboard, "_completed_ml_shadow_sample_count", completed_count)
+
+    try:
+        result = await dashboard.get_ml_signal_status()
+    finally:
+        await close_db()
+
+    assert result["phase3_clean_completed_shadow_sample_count"] == 6906
+    assert result["last_trained_phase3_shadow_sample_count"] == 5940
+    assert result["phase3_new_shadow_sample_count"] == 966
+    assert result["new_shadow_sample_count"] == 966
