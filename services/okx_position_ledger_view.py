@@ -682,17 +682,20 @@ def _same_position_lifecycle(left: Position, right: Position) -> bool:
     return True
 
 
-def _position_evidence_score(position: Position) -> tuple[int, int, int, int, int]:
+def _position_evidence_score(position: Position) -> tuple[int, int, int, int, float, int]:
     entry_ids = _position_order_key(position, "entry_exchange_order_id")
     close_ids = _position_order_key(position, "close_exchange_order_id")
     quantity = abs(_safe_float(getattr(position, "quantity", None)))
     realized = abs(_safe_float(getattr(position, "realized_pnl", None)))
+    updated_at = _as_utc(getattr(position, "updated_at", None))
+    updated_key = updated_at.timestamp() if updated_at else 0.0
     return (
         1 if entry_ids else 0,
         1 if close_ids else 0,
         1 if quantity > 1e-12 else 0,
         1 if realized > 1e-12 else 0,
-        -(int(getattr(position, "id", 0) or 0)),
+        updated_key,
+        int(getattr(position, "id", 0) or 0),
     )
 
 

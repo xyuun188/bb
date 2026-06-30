@@ -423,11 +423,53 @@ async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
                     "created_at": first_opened_at,
                 }
             )
+            await repo.open_position(
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "execution_mode": "paper",
+                    "symbol": "SKY/USDT",
+                    "side": "short",
+                    "quantity": 500.0,
+                    "entry_price": 0.05235,
+                    "current_price": 0.05286,
+                    "leverage": 3.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": -0.280615,
+                    "is_open": False,
+                    "okx_inst_id": "SKY-USDT-SWAP",
+                    "okx_pos_id": "sky-reused-pos",
+                    "entry_exchange_order_id": "sky-entry-b",
+                    "close_exchange_order_id": "sky-close-b",
+                    "closed_at": first_closed_at,
+                    "created_at": first_opened_at,
+                }
+            )
+            await repo.open_position(
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "execution_mode": "paper",
+                    "symbol": "SKY/USDT",
+                    "side": "short",
+                    "quantity": 500.0,
+                    "entry_price": 0.05235,
+                    "current_price": 0.05286,
+                    "leverage": 3.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.11,
+                    "is_open": False,
+                    "okx_inst_id": "SKY-USDT-SWAP",
+                    "okx_pos_id": "sky-reused-pos",
+                    "entry_exchange_order_id": "sky-entry-b",
+                    "close_exchange_order_id": "sky-close-b",
+                    "closed_at": first_closed_at,
+                    "created_at": first_opened_at,
+                }
+            )
             for order_id, side, quantity, price, filled_at, pnl in (
                 ("sky-entry-a", "sell", 400.0, 0.05294, second_opened_at, None),
                 ("sky-close-a", "buy", 400.0, 0.05306, second_closed_at, 0.24),
                 ("sky-entry-b", "sell", 500.0, 0.05235, first_opened_at, None),
-                ("sky-close-b", "buy", 500.0, 0.05286, first_closed_at, 0.11),
+                ("sky-close-b", "buy", 500.0, 0.05286, first_closed_at, -0.255),
             ):
                 raw_fills = {
                     "order_id": order_id,
@@ -797,7 +839,7 @@ async def test_trade_positions_api_hides_zero_quantity_residual_and_dedupes_cano
     row = payload["positions"][0]
     assert row["symbol"] == "BNB/USDT"
     assert row["quantity"] == pytest.approx(0.45)
-    assert row["realized_pnl"] == pytest.approx(-0.5487)
+    assert row["realized_pnl"] == pytest.approx(-0.4632)
     assert len(row["position_ids"]) == 1
     assert row["entry_order_ids"] == ["bnb-entry-a", "bnb-entry-b"]
     assert row["close_order_ids"] == ["bnb-close"]
