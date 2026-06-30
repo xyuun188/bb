@@ -272,6 +272,81 @@ def test_okx_daily_reconciliation_superseded_link_candidates_do_not_block_traini
     assert report["requires_attention"] is False
 
 
+def test_okx_daily_reconciliation_warning_info_only_residuals_do_not_block_entry() -> None:
+    card = _card("okx_trade_fact_integrity", "warning")
+    card["details"] = {
+        "issue_count": 4,
+        "critical_count": 0,
+        "warning_count": 0,
+        "severity_counts": {"info": 4},
+        "issues": [
+            {
+                "kind": "superseded_position_residual",
+                "severity": "info",
+                "position_id": 987,
+                "symbol": "GRASS/USDT",
+            },
+            {
+                "kind": "superseded_position_residual",
+                "severity": "info",
+                "position_id": 984,
+                "symbol": "LIT/USDT",
+            },
+            {
+                "kind": "superseded_position_residual",
+                "severity": "info",
+                "position_id": 973,
+                "symbol": "ETHFI/USDT",
+            },
+            {
+                "kind": "superseded_position_residual",
+                "severity": "info",
+                "position_id": 985,
+                "symbol": "LAB/USDT",
+            },
+        ],
+        "position_fact_link_repair": {
+            "candidate_link_count": 4,
+            "diagnostics": [
+                {"position_id": 987, "status": "manual_review"},
+                {"position_id": 984, "status": "manual_review"},
+                {"position_id": 973, "status": "manual_review"},
+                {"position_id": 985, "status": "manual_review"},
+            ],
+        },
+        "okx_authoritative_sync": {
+            "okx_pull_available": True,
+            "status": "ok",
+            "issue_count": 0,
+            "manual_review_count": 0,
+            "repairable_count": 0,
+            "severity_counts": {},
+        },
+        "runtime_okx_entry_gate": {
+            "entry_blocked": False,
+            "status": "ok",
+            "sync_status": "ok",
+            "last_requires_attention_count": 0,
+        },
+    }
+
+    report = report_script.build_report(
+        [
+            _card("okx_reconciliation", "ok"),
+            card,
+            _card("position_price_integrity", "ok"),
+            _card("trade_execution_contract", "ok"),
+        ],
+        generated_at=datetime(2026, 6, 30, 18, 35, tzinfo=UTC),
+    )
+
+    assert report["issue_ledger"]["summary"]["unresolved"] == 0
+    assert report["issue_ledger"]["summary"]["observing"] == 1
+    assert report["can_open_new_entries"] is True
+    assert report["can_refresh_training"] is True
+    assert report["requires_attention"] is False
+
+
 def test_okx_daily_reconciliation_unresolved_warning_exits_warning() -> None:
     report = report_script.build_report(
         [

@@ -1429,6 +1429,8 @@ def _closed_position_fill_pair_candidates(
 
 
 def _apply_position_history_payload(position: Position, payload: dict[str, Any], *, now: datetime) -> None:
+    existing_entry_exchange_order_id = getattr(position, "entry_exchange_order_id", None)
+    existing_close_exchange_order_id = getattr(position, "close_exchange_order_id", None)
     position.model_name = str(payload["model_name"])
     position.execution_mode = str(payload["execution_mode"])
     position.symbol = str(payload["symbol"])
@@ -1444,8 +1446,18 @@ def _apply_position_history_payload(position: Position, payload: dict[str, Any],
     position.created_at = payload["created_at"]
     position.okx_inst_id = payload.get("okx_inst_id")
     position.okx_pos_id = payload.get("okx_pos_id")
-    position.entry_exchange_order_id = payload.get("entry_exchange_order_id")
-    position.close_exchange_order_id = payload.get("close_exchange_order_id")
+    payload_entry_exchange_order_id = payload.get("entry_exchange_order_id")
+    payload_close_exchange_order_id = payload.get("close_exchange_order_id")
+    position.entry_exchange_order_id = (
+        str(payload_entry_exchange_order_id)
+        if str(payload_entry_exchange_order_id or "").strip()
+        else existing_entry_exchange_order_id
+    )
+    position.close_exchange_order_id = (
+        str(payload_close_exchange_order_id)
+        if str(payload_close_exchange_order_id or "").strip()
+        else existing_close_exchange_order_id
+    )
     position.updated_at = now
 
 

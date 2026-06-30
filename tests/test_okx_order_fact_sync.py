@@ -17,6 +17,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_UNVERIFIED,
     PHASE3_DEFAULT_ORDER_SYNC_START,
     OkxOrderFactSyncService,
+    _apply_position_history_payload,
     _db_naive_since,
 )
 from web_dashboard.api.trades import get_trade_detail, get_trades
@@ -194,6 +195,56 @@ class _Executor:
 
     async def shutdown(self) -> None:
         return None
+
+
+def test_position_history_payload_preserves_existing_order_links() -> None:
+    position = Position(
+        model_name="manual_repair",
+        execution_mode="paper",
+        symbol="LAB/USDT",
+        side="long",
+        quantity=100.0,
+        entry_price=0.1,
+        current_price=0.11,
+        leverage=1.0,
+        unrealized_pnl=0.0,
+        realized_pnl=-0.12,
+        is_open=False,
+        okx_inst_id="LAB-USDT-SWAP-OFF20260630-5",
+        okx_pos_id="lab-pos",
+        entry_exchange_order_id="entry-repaired",
+        close_exchange_order_id="close-repaired",
+        closed_at=datetime(2026, 6, 28, 22, 17, tzinfo=UTC),
+        created_at=datetime(2026, 6, 28, 21, 45, tzinfo=UTC),
+    )
+    now = datetime(2026, 6, 30, 18, 55, tzinfo=UTC)
+
+    _apply_position_history_payload(
+        position,
+        {
+            "model_name": "okx_authoritative_sync",
+            "execution_mode": "paper",
+            "symbol": "LAB/USDT",
+            "side": "long",
+            "quantity": 100.0,
+            "entry_price": 0.1,
+            "current_price": 0.11,
+            "leverage": 1.0,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": -0.12,
+            "closed_at": datetime(2026, 6, 28, 22, 17, tzinfo=UTC),
+            "created_at": datetime(2026, 6, 28, 21, 45, tzinfo=UTC),
+            "okx_inst_id": "LAB-USDT-SWAP-OFF20260630-5",
+            "okx_pos_id": "lab-pos",
+            "entry_exchange_order_id": None,
+            "close_exchange_order_id": None,
+        },
+        now=now,
+    )
+
+    assert position.entry_exchange_order_id == "entry-repaired"
+    assert position.close_exchange_order_id == "close-repaired"
+    assert position.updated_at == now
 
 
 class _CurrentPositionOnlyCcxt:

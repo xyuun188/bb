@@ -5524,7 +5524,7 @@ def _issue_ledger_state(
             for value in (
                 details.get("critical_count"),
                 details.get("warning_count"),
-                link_repair.get("candidate_link_count"),
+                _okx_unresolved_link_candidate_count(details, link_repair),
                 _safe_dict(authoritative_sync.get("severity_counts")).get("critical"),
                 _safe_dict(authoritative_sync.get("severity_counts")).get("warning"),
                 authoritative_sync.get("manual_review_count"),
@@ -5546,6 +5546,20 @@ def _issue_ledger_state(
             and (runtime_only_blocked or runtime_sync_healthy)
         ):
             return "observing", "Observation / OKX runtime sync healthy or runtime-only state"
+        if not has_data_integrity_issue and runtime_sync_healthy:
+            severity_counts = _safe_dict(details.get("severity_counts"))
+            issues = _safe_list(details.get("issues"))
+            info_only = (
+                int(severity_counts.get("critical") or 0) == 0
+                and int(severity_counts.get("warning") or 0) == 0
+                and all(
+                    not isinstance(issue, dict)
+                    or str(issue.get("severity") or "info").lower() == "info"
+                    for issue in issues
+                )
+            )
+            if info_only:
+                return "observing", "Observation / OKX integrity info-only residuals"
     if key == "phase3_go_no_go" and status == "warning":
         next_step = str(details.get("next_step") or "")
         status_key = str(details.get("status") or "")
