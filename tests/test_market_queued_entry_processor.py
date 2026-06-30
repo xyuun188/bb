@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -14,10 +15,10 @@ from services.market_queued_entry_processor import (
 )
 
 
-def _decision() -> DecisionOutput:
+def _decision(symbol: str = "BTC/USDT") -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",
-        symbol="BTC/USDT",
+        symbol=symbol,
         action=Action.LONG,
         confidence=0.8,
         reasoning="entry",
@@ -42,7 +43,7 @@ def _processor(
     calls: list[tuple[str, Any]],
     *,
     claim_result: bool = True,
-    execute_error: Exception | None = None,
+    execute_error: BaseException | None = None,
     execution_result: ExecutionResult | None = None,
 ) -> MarketQueuedEntryProcessor:
     async def claim(symbol: str, scope: str) -> bool:
@@ -241,6 +242,41 @@ async def test_market_queued_entry_processor_records_execution_error() -> None:
         DecisionStageStatus.FAILED,
     )
     assert any(call[0] == "reason" and call[1] == 9 for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_market_queued_entry_processor_finalizes_cancelled_execution() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    staged_counts = {"reserved": {"ensemble_trader": 1}}
+
+    result = await _processor(calls, execute_error=asyncio.CancelledError()).process(
+        symbol="LIT/USDT",
+        model_name="ensemble_trader",
+        decision=_decision("LIT/USDT"),
+        assessment=object(),
+        decision_db_id=10,
+        results=results,
+        open_positions=[],
+        claimed_symbol_keys=set(),
+        staged_entry_counts=staged_counts,
+    )
+
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is False
+    assert result.execution_error == "cancelled"
+    assert staged_counts["reserved"]["ensemble_trader"] == 0
+    assert results["decisions"][0]["execution_status"] == "error"
+    assert "被外层超时保护取消" in results["decisions"][0]["reason"]
+    assert ("release", "ensemble_trader", "LIT/USDT") in calls
+    assert any(
+        call[0] == "reason" and call[1] == 10 and "被外层超时保护取消" in call[2]
+        for call in calls
+    )
+    assert _decision_state_status(calls, 10) == (
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.FAILED,
+    )
 
 
 def _decision_state_status(

@@ -1096,12 +1096,15 @@ class ExecutionService:
                     "本轮按未执行处理，下一轮会继续复盘该仓位。"
                 ),
             )
-            if submitted_to_exchange:
+            if decision.is_entry or decision.is_exit:
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
                     DecisionStageStatus.FAILED,
                     "OKX 下单请求超时，未拿到交易所明确接收结果。",
-                    {"error_type": "timeout"},
+                    {
+                        "error_type": "timeout",
+                        "submitted_to_exchange": bool(submitted_to_exchange),
+                    },
                 )
             await mark_stage(
                 DecisionStage.EXCHANGE_CONFIRM,
@@ -1113,6 +1116,41 @@ class ExecutionService:
                 "warning",
                 symbol,
                 f"[{model_name}] OKX execution timed out",
+                model_name,
+            )
+        except asyncio.CancelledError:
+            reason = (
+                "OKX 下单流程被外层超时保护取消，系统没有拿到最终订单结果；"
+                "本轮按未执行处理，下一轮会用最新行情重新分析。"
+            )
+            logger.error(
+                "decision execution cancelled",
+                model=model_name,
+                symbol=symbol,
+                action=decision.action.value,
+                mode=model_mode,
+            )
+            execution_result = rejected_execution_result(decision, reason)
+            if decision.is_entry or decision.is_exit:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    "OKX 下单流程被外层超时保护取消，未拿到交易所明确接收结果。",
+                    {
+                        "error_type": "cancelled",
+                        "submitted_to_exchange": bool(submitted_to_exchange),
+                    },
+                )
+            await mark_stage(
+                DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStageStatus.FAILED,
+                execution_reason_from_result(execution_result),
+                {"error_type": "cancelled"},
+            )
+            await log_risk_event(
+                "warning",
+                symbol,
+                f"[{model_name}] OKX execution cancelled by outer watchdog",
                 model_name,
             )
         except Exception as e:

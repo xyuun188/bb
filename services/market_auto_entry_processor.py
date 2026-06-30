@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -204,6 +205,45 @@ class MarketAutoEntryProcessor:
                 execution_attempted=True,
                 execution_confirmed=execution_confirmed,
                 reason=immediate_plan.reason,
+            )
+        except asyncio.CancelledError:
+            self._release_capacity(model_name, decision, staged_entry_counts)
+            reason = (
+                "开仓信号已进入 OKX 下单流程，但本轮分析/执行任务被外层超时保护取消；"
+                "系统已按未执行处理，下一轮会用最新行情重新分析。"
+            )
+            logger.error(
+                "entry execution cancelled",
+                symbol=symbol,
+                model=model_name,
+                action=decision.action.value,
+            )
+            if decision_db_id is not None:
+                decision.raw_response = append_decision_stage(
+                    decision.raw_response if isinstance(decision.raw_response, dict) else {},
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    reason,
+                    {"skip_kind": "entry_execution_cancelled"},
+                )
+                await self.mark_decision_raw_response(decision_db_id, decision.raw_response)
+                await self.mark_decision_reason(decision_db_id, reason)
+            self.result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=decision,
+                model_mode=model_mode,
+                approved=True,
+                execution_status="error",
+                reason=reason,
+            )
+            return MarketAutoEntryProcessResult(
+                handled=True,
+                execution_attempted=True,
+                execution_confirmed=False,
+                execution_error="cancelled",
+                reason=reason,
             )
         except Exception as exc:
             self._release_capacity(model_name, decision, staged_entry_counts)

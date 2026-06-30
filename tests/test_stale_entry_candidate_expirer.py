@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.stale_entry_candidate_expirer import (
     StaleEntryCandidateExpirer,
     action_label,
     is_pending_execution_reason,
+    pending_execution_is_stale,
     pending_execution_failed_reason,
 )
 
@@ -26,6 +29,8 @@ def _row(
     symbol: str = "BTC/USDT",
     action: str = "long",
     raw: Any | None = None,
+    created_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=row_id,
@@ -33,6 +38,8 @@ def _row(
         action=action,
         raw_llm_response=raw if raw is not None else {},
         execution_reason="",
+        created_at=created_at,
+        updated_at=updated_at,
     )
 
 
@@ -103,6 +110,63 @@ async def test_stale_entry_candidate_expirer_marks_pending_rows_by_order_state()
     assert (
         pending_with_order.raw_llm_response["opportunity_score"]["selected_for_execution"] is False
     )
+
+
+@pytest.mark.asyncio
+async def test_pending_execution_expiry_uses_pending_state_time_not_decision_time() -> None:
+    now = datetime(2026, 6, 30, 12, 0, 0)
+    old_decision_recent_pending = _row(
+        row_id=21,
+        created_at=now - timedelta(minutes=5),
+        updated_at=now - timedelta(seconds=10),
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [],
+        [old_decision_recent_pending],
+        now=now,
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 0
+    assert old_decision_recent_pending.execution_reason == ""
+    assert not pending_execution_is_stale(old_decision_recent_pending, now)
+
+
+@pytest.mark.asyncio
+async def test_pending_execution_expiry_prefers_exchange_submit_stage_time() -> None:
+    now = datetime(2026, 6, 30, 12, 0, 0)
+    raw = append_decision_stage(
+        {},
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.PENDING,
+        "正在提交 OKX 订单并等待交易所返回结果。",
+        at=now - timedelta(seconds=46),
+    )
+    pending_row = _row(
+        row_id=22,
+        symbol="LIT/USDT",
+        raw=raw,
+        created_at=now - timedelta(minutes=5),
+        updated_at=now - timedelta(seconds=5),
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [],
+        [pending_row],
+        now=now,
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    assert "45 秒内没有生成本地订单记录" in pending_row.execution_reason
+    assert pending_execution_is_stale(pending_row, now)
 
 
 @pytest.mark.asyncio

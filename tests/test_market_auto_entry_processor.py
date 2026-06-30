@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -15,10 +16,10 @@ from services.market_auto_entry_processor import (
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 
-def _decision() -> DecisionOutput:
+def _decision(symbol: str = "BTC/USDT") -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",
-        symbol="BTC/USDT",
+        symbol=symbol,
         action=Action.LONG,
         confidence=0.8,
         reasoning="entry",
@@ -59,7 +60,7 @@ def _processor(
     immediate_reason: str | None = "强信号",
     capacity_reason: str | None = None,
     pre_execution_capacity_reason: str | None = None,
-    execute_error: Exception | None = None,
+    execute_error: BaseException | None = None,
     execution_result: ExecutionResult | None = None,
 ) -> MarketAutoEntryProcessor:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
@@ -454,6 +455,43 @@ async def test_market_auto_entry_processor_records_execution_error() -> None:
     assert "强信号已进入即时执行" in results["decisions"][0]["reason"]
     assert ("release", "ensemble_trader", "BTC/USDT") in calls
     assert any(call[0] == "reason" and call[1] == 10 for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_finalizes_cancelled_execution() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    staged_counts: dict[str, dict[Any, int]] = {}
+
+    result = await _processor(calls, execute_error=asyncio.CancelledError()).process(
+        symbol="LIT/USDT",
+        model_name="ensemble_trader",
+        decision=_decision("LIT/USDT"),
+        assessment=object(),
+        decision_db_id=13,
+        results=results,
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts=staged_counts,
+        strategy_mode_context=None,
+    )
+
+    assert result.handled is True
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is False
+    assert result.execution_error == "cancelled"
+    assert staged_counts["reserved"]["ensemble_trader"] == 0
+    assert results["decisions"][0]["execution_status"] == "error"
+    assert "被外层超时保护取消" in results["decisions"][0]["reason"]
+    assert ("release", "ensemble_trader", "LIT/USDT") in calls
+    assert any(
+        call[0] == "reason" and call[1] == 13 and "被外层超时保护取消" in call[2]
+        for call in calls
+    )
+    assert _decision_state_status(calls, 13) == (
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.FAILED,
+    )
 
 
 def _decision_state_status(

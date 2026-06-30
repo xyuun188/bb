@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -17,6 +17,7 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_freshness import ENTRY_DECISION_MAX_AGE_SECONDS
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from web_dashboard.api.text_sanitize import sanitize_text
@@ -98,7 +99,6 @@ class StaleEntryCandidateExpirer:
 
         now = datetime.utcnow()
         waiting_cutoff = now - timedelta(seconds=ENTRY_DECISION_MAX_AGE_SECONDS)
-        pending_cutoff = now - timedelta(seconds=ENTRY_PENDING_EXECUTION_MAX_SECONDS)
         try:
             async with get_session_ctx() as session:
                 waiting_rows = await self._load_rows(
@@ -108,7 +108,7 @@ class StaleEntryCandidateExpirer:
                 )
                 pending_rows = await self._load_rows(
                     session,
-                    cutoff=pending_cutoff,
+                    cutoff=None,
                     reason_patterns=PENDING_EXECUTION_PATTERNS,
                 )
 
@@ -123,6 +123,7 @@ class StaleEntryCandidateExpirer:
                 expired = await self.expire_rows(
                     waiting_rows,
                     pending_rows,
+                    now=now,
                     order_count_provider=order_count_provider,
                     flush_callback=session.flush,
                 )
@@ -142,11 +143,13 @@ class StaleEntryCandidateExpirer:
         waiting_rows: list[Any],
         pending_rows: list[Any],
         *,
+        now: datetime | None = None,
         order_count_provider: OrderCountProvider,
         flush_callback: FlushCallback | None = None,
     ) -> int:
         """Apply stale-entry expiration rules to already-loaded decision rows."""
 
+        current_time = now or datetime.utcnow()
         expired = 0
         for row in waiting_rows:
             reason = self._waiting_expiration_reason(row)
@@ -154,6 +157,8 @@ class StaleEntryCandidateExpirer:
             expired += 1
 
         for row in pending_rows:
+            if not pending_execution_is_stale(row, current_time):
+                continue
             order_count = await order_count_provider(int(row.id))
             if order_count > 0:
                 reason = (
@@ -173,15 +178,16 @@ class StaleEntryCandidateExpirer:
         self,
         session: Any,
         *,
-        cutoff: datetime,
+        cutoff: datetime | None,
         reason_patterns: tuple[str, ...],
     ) -> list[AIDecision]:
         stmt = select(AIDecision).where(
             AIDecision.was_executed.is_(False),
             AIDecision.action.in_(["long", "short", "open_long", "open_short"]),
-            AIDecision.created_at <= cutoff,
             or_(*[AIDecision.execution_reason.like(pattern) for pattern in reason_patterns]),
         )
+        if cutoff is not None:
+            stmt = stmt.where(AIDecision.created_at <= cutoff)
         return list((await session.execute(stmt)).scalars().all())
 
     def _waiting_expiration_reason(self, row: Any) -> str:
@@ -241,3 +247,57 @@ def _safe_raw_response(value: Any) -> dict[str, Any]:
         except Exception:
             raw = {}
     return raw if isinstance(raw, dict) else {}
+
+
+def pending_execution_is_stale(row: Any, now: datetime | None = None) -> bool:
+    current_time = _as_naive_utc(now or datetime.utcnow())
+    pending_started_at = _pending_execution_started_at(row)
+    if pending_started_at is None:
+        pending_started_at = _as_naive_utc(getattr(row, "updated_at", None))
+    if pending_started_at is None:
+        pending_started_at = _as_naive_utc(getattr(row, "created_at", None))
+    if pending_started_at is None:
+        return True
+    elapsed = (current_time - pending_started_at).total_seconds()
+    return elapsed >= ENTRY_PENDING_EXECUTION_MAX_SECONDS
+
+
+def _pending_execution_started_at(row: Any) -> datetime | None:
+    raw = _safe_raw_response(getattr(row, "raw_llm_response", None))
+    machine = raw.get("decision_state_machine")
+    if not isinstance(machine, dict):
+        return None
+    stages = machine.get("stages")
+    if not isinstance(stages, list):
+        return None
+    for event in reversed(stages):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("stage") or "") != DecisionStage.EXCHANGE_SUBMIT:
+            continue
+        if str(event.get("status") or "") != DecisionStageStatus.PENDING:
+            continue
+        started_at = _as_naive_utc(event.get("at"))
+        if started_at is not None:
+            return started_at
+    return None
+
+
+def _as_naive_utc(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            value = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return value
