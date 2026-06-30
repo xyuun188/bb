@@ -80,6 +80,75 @@ def _entry_decision(symbol: str, *, decision_id: int) -> SimpleNamespace:
     )
 
 
+def _scheduler_decision(
+    symbol: str,
+    *,
+    decision_id: int,
+    action: str = "hold",
+    strategy: str = "drawdown_clamp",
+    cache_status: str = "baseline_timeout",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=decision_id,
+        symbol=symbol,
+        action=action,
+        analysis_type="market",
+        created_at=datetime(2026, 6, 25, tzinfo=UTC),
+        raw_llm_response={
+            "analysis_type": "market",
+            "strategy_mode": {
+                "strategy": strategy,
+                "posture": "tight_selective",
+                "reason": "Daily drawdown is active; allow only higher-quality opportunities.",
+                "scheduler_reason": "profile drawdown guard selected tight entries",
+                "risk_mode": "hard_recovery",
+                "strategy_profile_id": "phase3-profit",
+                "strategy_profile_version": "2026-06-26",
+                "expert_integrity_mode": "strict",
+                "strategy_learning_cache_status": cache_status,
+                "strategy_learning_runtime_timeout_seconds": 0.01,
+                "strategy_learning_entry_pause": True,
+                "strategy_learning_entry_pause_reason": "profile pause after loss cluster",
+                "strategy_learning_execution_guard_active": True,
+                "strategy_learning_release_pressure_active": True,
+                "strategy_learning_health_guard_active": True,
+                "soft_avoided_directions": ["short"],
+                "market_regime": {
+                    "mode": "mixed",
+                    "confidence": 0.28,
+                },
+                "dynamic_position_capacity": {
+                    "base_limit": 25,
+                    "target_limit": 25,
+                    "effective_limit": 18,
+                    "entry_limit": 18,
+                    "open_group_count": 18,
+                    "low_quality_count": 5,
+                    "release_candidate_count": 2,
+                    "reason": "drawdown and low-quality pressure",
+                    "factors": {
+                        "reason_codes": [
+                            "drawdown",
+                            "low_quality_pressure",
+                            "release_rotation_slots",
+                        ]
+                    },
+                },
+            },
+            "strategy_learning_context": {
+                "strategy_profile_id": "phase3-profit",
+                "strategy_profile_version": "2026-06-26",
+                "scheduler_reason": "profile drawdown guard selected tight entries",
+                "expert_integrity_mode": "strict",
+                "strategy_learning_entry_pause": True,
+                "strategy_learning_execution_guard_active": True,
+                "strategy_learning_release_pressure_active": True,
+                "strategy_learning_health_guard_active": True,
+            },
+        },
+    )
+
+
 def test_strategy_signal_root_cause_summarizes_ml_server_profit_and_shadow_blockers() -> None:
     service = StrategySignalRootCauseAuditService(
         now=lambda: datetime(2026, 6, 25, tzinfo=UTC),
@@ -132,6 +201,51 @@ def test_strategy_signal_root_cause_summarizes_ml_server_profit_and_shadow_block
         "positive_ev_still_below_evidence_quality",
         "weak_evidence_dominates",
     }.issubset(codes)
+
+
+def test_strategy_signal_root_cause_summarizes_scheduler_posture_and_capacity() -> None:
+    service = StrategySignalRootCauseAuditService(
+        now=lambda: datetime(2026, 6, 25, tzinfo=UTC),
+        ml_status_provider=lambda: {"available": True, "status": "ready"},
+    )
+    decisions = [
+        _scheduler_decision(f"SYM{index}/USDT", decision_id=index)
+        for index in range(3)
+    ]
+
+    report = service.summarize(decisions=decisions, shadows=[], ml_status={})
+    scheduler = report["scheduler"]
+
+    assert scheduler["read_only"] is True
+    assert scheduler["audit_only"] is True
+    assert scheduler["can_force_open"] is False
+    assert scheduler["can_override_thresholds"] is False
+    assert scheduler["can_bypass_risk_controls"] is False
+    assert scheduler["sample_count"] == 3
+    assert scheduler["strategy_counts"] == {"drawdown_clamp": 3}
+    assert scheduler["risk_mode_counts"] == {"hard_recovery": 3}
+    assert scheduler["cache_status_counts"] == {"baseline_timeout": 3}
+    assert scheduler["flag_counts"]["strategy_learning_context_timeout"] == 3
+    assert scheduler["flag_counts"]["strategy_learning_entry_pause_active"] == 3
+    assert scheduler["flag_counts"]["drawdown_clamp_active"] == 3
+    assert scheduler["flag_counts"]["market_regime_soft_bias_active"] == 3
+    assert scheduler["dynamic_capacity"]["constrained_count"] == 3
+    assert scheduler["dynamic_capacity"]["entry_blocked_count"] == 3
+    assert scheduler["dynamic_capacity"]["reason_code_counts"]["drawdown"] == 3
+    assert scheduler["latest_samples"][0]["dynamic_position_capacity"]["constrained"] is True
+    assert scheduler["latest_samples"][0]["can_force_open"] is False
+    codes = {item["code"] for item in report["root_causes"]}
+    assert {
+        "no_entry_candidates",
+        "strategy_learning_context_timeout",
+        "strategy_learning_entry_pause_active",
+        "dynamic_capacity_constrained",
+        "drawdown_clamp_active",
+        "market_regime_soft_bias_active",
+    }.issubset(codes)
+    actions = " ".join(report["next_actions"])
+    assert "dynamic capacity reason codes" in actions
+    assert "strategy-learning context latency" in actions
 
 
 def test_strategy_signal_root_cause_reports_ml_top_return_blocker() -> None:

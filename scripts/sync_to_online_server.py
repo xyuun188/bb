@@ -10,6 +10,7 @@ logs, virtualenvs, caches, and Git metadata stay on their current machine.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import posixpath
 import secrets
@@ -141,19 +142,15 @@ WantedBy=multi-user.target
 
 
 def _online_tunnel_ai_models_json() -> str:
-    qwen_names = {"trend_expert", "momentum_expert", "decision_maker"}
-    deepseek_names = {"sentiment_expert", "position_expert", "risk_expert"}
     rows = []
     for slot in FIXED_AI_MODEL_SLOTS:
         name = str(slot["name"])
-        if name in qwen_names:
+        if name == "decision_maker":
             api_base = "http://127.0.0.1:18000/v1"
-            model = "qwen3-14b-trade"
-        elif name in deepseek_names:
-            api_base = "http://127.0.0.1:18002/v1"
-            model = "deepseek-r1-14b-risk"
+            model = "qwen3-32b-trade"
         else:
-            raise ValueError(f"No online tunnel assignment for fixed AI slot: {name}")
+            api_base = "http://127.0.0.1:18003/v1"
+            model = "BB-FinQuant-Expert-14B"
         rows.append(
             {
                 "name": name,
@@ -169,27 +166,37 @@ def _online_tunnel_ai_models_json() -> str:
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
-def _install_split_service_command(
+def _runtime_env_update_script(
     *,
     remote_app_dir: str,
-    owner: str,
-    trading_service: str,
-    dashboard_service: str,
-    model_tunnel_service: str,
     local_ai_tools_key_file: str = "",
+    backup_runtime_env: bool = False,
+    emit_summary: bool = False,
 ) -> str:
-    dashboard_unit = _render_dashboard_service(remote_app_dir, owner)
-    model_tunnel_unit = _render_model_tunnel_service(remote_app_dir, owner)
     local_ai_tools_key_path = local_ai_tools_key_file if local_ai_tools_key_file else ""
     online_ai_models = _online_tunnel_ai_models_json()
-    runtime_env_script = f"""from pathlib import Path
+    return f"""from pathlib import Path
+import json
 import os
 import secrets
+import time
 
 runtime_path = Path({REMOTE_RUNTIME_ENV_PATH!r})
 app_env_path = Path({remote_app_dir!r}) / '.env'
 local_ai_tools_key_path = Path({local_ai_tools_key_path!r}) if {bool(local_ai_tools_key_path)!r} else None
 online_ai_models = {online_ai_models!r}
+backup_runtime_env = {bool(backup_runtime_env)!r}
+emit_summary = {bool(emit_summary)!r}
+app_env_ai_route_keys = {{
+    'AI_MODELS',
+    'AI_API_BASE',
+    'AI_MODEL',
+    'LOCAL_AI_TOOLS_ENABLED',
+    'LOCAL_AI_TOOLS_API_BASE',
+    'HIGH_RISK_REVIEW_ENABLED',
+    'HIGH_RISK_REVIEW_API_BASE',
+    'HIGH_RISK_REVIEW_MODEL',
+}}
 
 def parse_env(path):
     values = {{}}
@@ -213,6 +220,50 @@ def read_secret_file(path):
     return value
 
 
+def scrub_app_env_ai_routes(path, keys):
+    if not path.exists():
+        return {{
+            'exists': False,
+            'backup': '',
+            'removed_keys': [],
+        }}
+    original_text = path.read_text(encoding='utf-8')
+    removed = []
+    kept_lines = []
+    for raw_line in original_text.splitlines():
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0].strip()
+            normalized_key = key.upper()
+            if normalized_key in keys:
+                removed.append(normalized_key)
+                continue
+        kept_lines.append(raw_line)
+    removed_unique = sorted(set(removed))
+    if not removed_unique:
+        return {{
+            'exists': True,
+            'backup': '',
+            'removed_keys': [],
+        }}
+    backup_path = path.with_name(path.name + '.ai-route-cleanup.bak.' + time.strftime('%Y%m%d%H%M%S'))
+    backup_path.write_text(original_text, encoding='utf-8')
+    os.chmod(backup_path, 0o600)
+    path.write_text(chr(10).join(kept_lines).rstrip() + chr(10), encoding='utf-8')
+    return {{
+        'exists': True,
+        'backup': str(backup_path),
+        'removed_keys': removed_unique,
+    }}
+
+
+rows = json.loads(online_ai_models)
+if any(row.get('model') == 'qwen3-14b-expert-pool' for row in rows):
+    raise RuntimeError('refusing to write stale qwen3-14b-expert-pool AI_MODELS')
+if not any(row.get('model') == 'BB-FinQuant-Expert-14B' for row in rows):
+    raise RuntimeError('refusing to write AI_MODELS without BB-FinQuant-Expert-14B')
+
+current_runtime_text = runtime_path.read_text(encoding='utf-8') if runtime_path.exists() else ''
 values = parse_env(runtime_path)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
 app_env_values = parse_env(app_env_path)
@@ -255,9 +306,61 @@ except ValueError:
 if current_tools_breaker < 3:
     values['LOCAL_AI_TOOLS_CIRCUIT_BREAKER_FAILURES'] = '3'
 runtime_path.parent.mkdir(parents=True, exist_ok=True)
+backup_path = ''
+if backup_runtime_env and runtime_path.exists():
+    backup_path = str(runtime_path.with_name(runtime_path.name + '.bak.' + time.strftime('%Y%m%d%H%M%S')))
+    Path(backup_path).write_text(current_runtime_text, encoding='utf-8')
+    os.chmod(backup_path, 0o600)
 runtime_path.write_text(''.join(f'{{key}}={{value}}\\n' for key, value in values.items()), encoding='utf-8')
 os.chmod(runtime_path, 0o600)
+app_env_cleanup = scrub_app_env_ai_routes(app_env_path, app_env_ai_route_keys)
+if emit_summary:
+    print(json.dumps({{
+        'updated': True,
+        'backup': backup_path,
+        'app_env_ai_route_cleanup': app_env_cleanup,
+        'ai_models': [(row.get('name'), row.get('api_base'), row.get('model')) for row in rows],
+        'old_name_remaining': 'qwen3-14b-expert-pool' in runtime_path.read_text(encoding='utf-8'),
+        'starts_trading_service': False,
+        'submits_orders': False,
+    }}, ensure_ascii=False))
 """
+
+
+def _runtime_env_only_command(
+    *,
+    remote_app_dir: str,
+    local_ai_tools_key_file: str = "",
+) -> str:
+    runtime_env_script = _runtime_env_update_script(
+        remote_app_dir=remote_app_dir,
+        local_ai_tools_key_file=local_ai_tools_key_file,
+        backup_runtime_env=True,
+        emit_summary=True,
+    )
+    cleanup_prefix = (
+        f'trap "rm -f {_remote_quote(local_ai_tools_key_file)}" EXIT; '
+        if local_ai_tools_key_file
+        else ""
+    )
+    return cleanup_prefix + f"python3 - <<'PY'\n{runtime_env_script}\nPY"
+
+
+def _install_split_service_command(
+    *,
+    remote_app_dir: str,
+    owner: str,
+    trading_service: str,
+    dashboard_service: str,
+    model_tunnel_service: str,
+    local_ai_tools_key_file: str = "",
+) -> str:
+    dashboard_unit = _render_dashboard_service(remote_app_dir, owner)
+    model_tunnel_unit = _render_model_tunnel_service(remote_app_dir, owner)
+    runtime_env_script = _runtime_env_update_script(
+        remote_app_dir=remote_app_dir,
+        local_ai_tools_key_file=local_ai_tools_key_file,
+    )
     trading_dropin = f"""[Service]
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
@@ -319,6 +422,48 @@ def iter_upload_files(include_tests: bool) -> list[Path]:
             continue
         files.append(path)
     return sorted(files, key=lambda item: item.as_posix().lower())
+
+
+def _normalise_only_filter(value: str) -> str:
+    normalised = str(value or "").strip().replace("\\", "/")
+    if not normalised:
+        raise ValueError("--only filters must not be empty")
+    if (
+        normalised == ".."
+        or normalised.startswith("/")
+        or normalised.startswith("../")
+        or normalised.endswith("/..")
+        or "/../" in normalised
+    ):
+        raise ValueError(f"unsafe --only filter: {value!r}")
+    while normalised.startswith("./"):
+        normalised = normalised[2:]
+    if not normalised:
+        raise ValueError("--only filters must not be empty")
+    return normalised.rstrip("/") if normalised != "." else normalised
+
+
+def _matches_only_filter(rel_name: str, only_filter: str) -> bool:
+    if any(marker in only_filter for marker in ("*", "?", "[")):
+        return fnmatch.fnmatchcase(rel_name, only_filter)
+    return rel_name == only_filter or rel_name.startswith(f"{only_filter}/")
+
+
+def filter_upload_files(files: list[Path], only_filters: list[str] | None) -> list[Path]:
+    if not only_filters:
+        return files
+    filters = [_normalise_only_filter(value) for value in only_filters]
+    selected = [
+        path
+        for path in files
+        if any(
+            _matches_only_filter(path.relative_to(ROOT).as_posix(), only_filter)
+            for only_filter in filters
+        )
+    ]
+    if not selected:
+        raise SystemExit(f"No upload files matched --only filters: {', '.join(filters)}")
+    return selected
 
 
 def remote_path_for(local_path: Path, remote_app_dir: str) -> str:
@@ -409,18 +554,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not copy the model server local AI tools API key into the platform runtime env.",
     )
+    parser.add_argument(
+        "--sync-legacy-local-ai-tools-key",
+        action="store_true",
+        help="Legacy-only: copy /data/trade_ai local-ai-tools key into platform runtime env.",
+    )
+    parser.add_argument(
+        "--runtime-env-only",
+        action="store_true",
+        help=(
+            "Only update /etc/bb/bb-runtime.env from the Phase 3 tunnel contract; "
+            "do not upload files or restart any service."
+        ),
+    )
     parser.add_argument("--skip-restart", action="store_true")
     parser.add_argument("--skip-secret-file-purge", action="store_true")
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="PATH_OR_PREFIX",
+        help=(
+            "Limit uploads to a relative file, directory prefix, or glob. "
+            "Repeat for multiple paths. Useful with --skip-restart for staged online validation."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    files = iter_upload_files(include_tests=args.include_tests)
+    files = filter_upload_files(
+        iter_upload_files(include_tests=args.include_tests),
+        list(args.only or []),
+    )
     safe_print(f"Prepared {len(files)} files for upload to {args.remote_app_dir}.")
     local_ai_tools_api_key = ""
-    if args.split_services and not args.skip_restart and not args.skip_local_ai_tools_key_sync:
+    if (
+        args.split_services
+        and args.sync_legacy_local_ai_tools_key
+        and not args.skip_restart
+        and not args.skip_local_ai_tools_key_sync
+    ):
         try:
             local_ai_tools_api_key = load_local_ai_tools_api_key_from_model_server(ROOT)
         except Exception as exc:
@@ -438,6 +614,17 @@ def main() -> None:
 
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
+        if args.runtime_env_only:
+            safe_print("Updating runtime env only; no file upload or service restart will run.")
+            safe_print(
+                run_remote_text(
+                    ssh,
+                    _runtime_env_only_command(remote_app_dir=args.remote_app_dir),
+                    timeout=60,
+                    check=True,
+                )
+            )
+            return
         run_remote_text(ssh, f"mkdir -p {_remote_quote(args.remote_app_dir)}", timeout=30)
         if not args.skip_secret_file_purge:
             purge_script = secret_file_audit_script(
@@ -499,7 +686,7 @@ def main() -> None:
                 "python3 -c "
                 + _remote_quote(
                     "import socket, time\n"
-                    "for port in (18000, 18001, 18002):\n"
+                    "for port in (18000, 18001, 18002, 18003):\n"
                     "    deadline = time.time() + 20\n"
                     "    while True:\n"
                     "        try:\n"

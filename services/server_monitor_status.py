@@ -41,6 +41,14 @@ from services.model_server_config import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_MONITOR_CACHE_TTL_SECONDS = 10.0
 SERVER_MONITOR_STALE_CACHE_TTL_SECONDS = 60.0
+PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS = 3.5
+LOCAL_AI_TOOLS_DEEP_PROBE_TIMEOUT_SECONDS = 15.0
+LOCAL_AI_TOOLS_CHILD_ENDPOINT_TIMEOUT_SECONDS = {
+    "profit_prediction": PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
+    "time_series_prediction": LOCAL_AI_TOOLS_DEEP_PROBE_TIMEOUT_SECONDS,
+    "sentiment_analysis": 8.0,
+    "exit_advice": 8.0,
+}
 PLATFORM_SERVICE_NAMES = (
     "bb-dashboard.service",
     "bb-paper-trading.service",
@@ -49,7 +57,28 @@ PLATFORM_SERVICE_NAMES = (
     "redis-server.service",
     "redis.service",
 )
-ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE = "http://127.0.0.1:18001"
+ONLINE_PHASE3_QUANT_API_PLATFORM_BASE = "http://127.0.0.1:18001"
+ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE = ONLINE_PHASE3_QUANT_API_PLATFORM_BASE
+ONLINE_PHASE3_DEFAULT_AI_MODELS = (
+    {
+        "name": "phase3_decision_maker",
+        "label": "Phase 3 decision maker",
+        "api_base": "http://127.0.0.1:18000/v1",
+        "model": "qwen3-32b-trade",
+    },
+    {
+        "name": "phase3_high_risk_review",
+        "label": "Phase 3 high-risk review",
+        "api_base": "http://127.0.0.1:18002/v1",
+        "model": "deepseek-r1-14b-risk",
+    },
+    {
+        "name": "phase3_finquant_expert",
+        "label": "Phase 3 FinQuant expert",
+        "api_base": "http://127.0.0.1:18003/v1",
+        "model": "BB-FinQuant-Expert-14B",
+    },
+)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 InfoLoader = Callable[[Path], Any]
@@ -61,7 +90,17 @@ ModelIdProvider = Callable[[], str]
 
 def primary_provider_model_id() -> str:
     """Return the configured primary provider model id for monitor probes."""
-    for cfg in settings.get_fixed_ai_models(include_empty=True):
+    rows = [
+        cfg for cfg in settings.get_fixed_ai_models(include_empty=True) if isinstance(cfg, dict)
+    ]
+    for cfg in rows:
+        name = str(cfg.get("name") or "").strip()
+        if name != "decision_maker" or cfg.get("enabled") is False:
+            continue
+        model = str(cfg.get("model") or "").strip()
+        if model:
+            return model
+    for cfg in rows:
         if not isinstance(cfg, dict) or not cfg.get("enabled", True):
             continue
         model = str(cfg.get("model") or "").strip()
@@ -472,6 +511,87 @@ def get_server_monitor_status_sync() -> dict[str, Any]:
     return _default_service.get_status_sync()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value or "").strip())
+    except Exception:
+        return default
+
+
+def _parse_phase3_gpu_row(row: Any) -> dict[str, Any] | None:
+    """Parse readiness-report GPU rows into the dashboard GPU contract."""
+
+    parts = [part.strip() for part in str(row or "").split(",")]
+    if len(parts) < 6:
+        return None
+    index = parts[0]
+    name = parts[1]
+    memory_used_mb = _safe_float(parts[2])
+    memory_total_mb = _safe_float(parts[3])
+    if memory_total_mb <= 0:
+        return None
+    utilization_pct = _safe_float(parts[4])
+    temperature_c = _safe_float(parts[5])
+    return {
+        "index": index,
+        "name": name,
+        "memory_used_mb": memory_used_mb,
+        "memory_total_mb": memory_total_mb,
+        "memory_used_pct": round(memory_used_mb / memory_total_mb * 100, 1),
+        "utilization_pct": utilization_pct,
+        "temperature_c": temperature_c,
+        "power_w": 0.0,
+        "source": "phase3_model_server_readiness",
+    }
+
+
+def phase3_model_server_gpu_status_from_latest_report() -> dict[str, Any]:
+    """Return the latest audited model-server GPU summary for UI consistency."""
+
+    report_path = settings.data_dir / "phase3_model_server_readiness_reports" / "latest.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "available": False,
+            "source": "phase3_model_server_readiness",
+            "report_path": str(report_path),
+            "error": "phase3 model-server readiness report is missing",
+            "gpus": [],
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "source": "phase3_model_server_readiness",
+            "report_path": str(report_path),
+            "error": safe_error_text(exc, limit=180),
+            "gpus": [],
+        }
+
+    rows = report.get("gpu_rows") if isinstance(report, dict) else []
+    gpus = [
+        parsed
+        for parsed in (_parse_phase3_gpu_row(row) for row in rows if str(row or "").strip())
+        if parsed is not None
+    ]
+    return {
+        "available": bool(gpus),
+        "source": "phase3_model_server_readiness",
+        "report_path": str(report_path),
+        "checked_at": report.get("checked_at") if isinstance(report, dict) else None,
+        "readiness_status": report.get("status") if isinstance(report, dict) else None,
+        "runtime_ready": bool(report.get("runtime_ready")) if isinstance(report, dict) else False,
+        "gpu_count": int(report.get("gpu_count") or len(gpus)) if isinstance(report, dict) else len(gpus),
+        "gpus": gpus,
+        "error": "" if gpus else "phase3 model-server readiness report has no GPU rows",
+    }
+
+
+def _with_phase3_model_server_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["phase3_model_server_gpu"] = phase3_model_server_gpu_status_from_latest_report()
+    return payload
+
+
 def _safe_run_platform_command(args: list[str], *, timeout: float = 2.0) -> tuple[int, str, str]:
     try:
         result = subprocess.run(  # noqa: S603 - args come from fixed platform probe allowlists.
@@ -628,13 +748,22 @@ async def _probe_platform_json(
     api_key: str = "",
     method: str = "GET",
     payload: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     started = monotonic()
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        response = await client.request(method, url, headers=headers, json=payload)
+        request_kwargs: dict[str, Any] = {"headers": headers, "json": payload}
+        if timeout_seconds is not None:
+            request_kwargs["timeout"] = timeout_seconds
+        try:
+            response = await client.request(method, url, **request_kwargs)
+        except TypeError:
+            # Some tests use minimal fake clients without the httpx timeout kwarg.
+            request_kwargs.pop("timeout", None)
+            response = await client.request(method, url, **request_kwargs)
         latency_ms = round((monotonic() - started) * 1000, 1)
         data: Any = None
         try:
@@ -671,6 +800,136 @@ def _model_ids_from_models_response(payload: dict[str, Any] | None) -> list[str]
         if value:
             model_ids.append(value)
     return model_ids
+
+
+def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict[str, Any]:
+    """Build a UI-compatible model runtime view from platform endpoint probes."""
+
+    rows = platform_runtime.get("ai_models") if isinstance(platform_runtime, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    endpoint_rows: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        if not model:
+            continue
+        api_base = str(item.get("api_base") or "").strip().rstrip("/")
+        endpoint = api_base
+        if endpoint.endswith("/v1"):
+            endpoint = endpoint[:-3]
+        endpoint_rows.append(
+            {
+                "label": str(item.get("label") or item.get("name") or model),
+                "provider_model": model,
+                "api_base": api_base,
+                "endpoint": endpoint,
+                "available": bool(item.get("available")),
+                "endpoint_available": bool(item.get("endpoint_ok")),
+                "model_available": bool(item.get("model_available")),
+                "model_mismatch": bool(item.get("endpoint_ok") and not item.get("model_available")),
+                "status": "ok"
+                if item.get("available")
+                else (
+                    "model_mismatch"
+                    if item.get("endpoint_ok") and not item.get("model_available")
+                    else str(item.get("status_category") or "unavailable")
+                ),
+                "status_code": item.get("status_code"),
+                "latency_ms": item.get("latency_ms"),
+                "models": list(item.get("models") or []),
+                "error": str(item.get("error") or ""),
+                "source": "platform_runtime_probe",
+                "health": {
+                    "ok": bool(item.get("endpoint_ok")),
+                    "status_code": item.get("status_code"),
+                    "latency_ms": item.get("latency_ms"),
+                    "status_category": item.get("status_category"),
+                    "error": str(item.get("error") or ""),
+                },
+            }
+        )
+    local_tools = (
+        platform_runtime.get("local_ai_tools")
+        if isinstance(platform_runtime.get("local_ai_tools"), dict)
+        else {}
+    )
+    primary = next(
+        (row for row in endpoint_rows if row.get("provider_model") == "qwen3-32b-trade"),
+        endpoint_rows[0] if endpoint_rows else {},
+    )
+    return {
+        "vllm": dict(primary),
+        "vllm_endpoints": endpoint_rows,
+        "local_ai_tools": {
+            "available": bool(local_tools.get("available")),
+            "endpoint": str(local_tools.get("api_base") or "").replace("http://", "").replace(
+                "https://", ""
+            ),
+            "service_role": local_tools.get("service_role") or "phase3_quant_api",
+            "model_bundle_available": bool(local_tools.get("model_bundle_available")),
+            "trained_models_available": bool(local_tools.get("trained_models_available")),
+            "trained_at": local_tools.get("trained_at") or "",
+            "training_mode": local_tools.get("training_mode"),
+            "model_stage": local_tools.get("model_stage"),
+            "models": local_tools.get("models") if isinstance(local_tools.get("models"), dict) else {},
+            "shadow_sample_count": int(local_tools.get("shadow_sample_count") or 0),
+            "trade_sample_count": int(local_tools.get("trade_sample_count") or 0),
+            "completed_shadow_sample_count": int(
+                local_tools.get("completed_shadow_sample_count") or 0
+            ),
+            "completed_trade_sample_count": int(local_tools.get("completed_trade_sample_count") or 0),
+            "health": local_tools.get("health") if isinstance(local_tools.get("health"), dict) else {},
+            "status_health": local_tools.get("status")
+            if isinstance(local_tools.get("status"), dict)
+            else {},
+            "child_endpoints": local_tools.get("child_endpoints")
+            if isinstance(local_tools.get("child_endpoints"), dict)
+            else {},
+            "source": "platform_runtime_probe",
+        },
+    }
+
+
+def _platform_runtime_available(platform_runtime: dict[str, Any]) -> bool:
+    if not isinstance(platform_runtime, dict):
+        return False
+    models = platform_runtime.get("ai_models") if isinstance(platform_runtime.get("ai_models"), list) else []
+    has_model = any(isinstance(row, dict) and row.get("available") for row in models)
+    local_tools = (
+        platform_runtime.get("local_ai_tools")
+        if isinstance(platform_runtime.get("local_ai_tools"), dict)
+        else {}
+    )
+    return bool(has_model or local_tools.get("available") or local_tools.get("child_available"))
+
+
+def _remote_monitor_unavailable_payload(
+    *,
+    status: str,
+    message: str,
+    checked_at: str,
+    platform_server: dict[str, Any],
+    platform_runtime: dict[str, Any],
+) -> dict[str, Any]:
+    platform_available = _platform_runtime_available(platform_runtime)
+    return _with_phase3_model_server_gpu_status(
+        {
+            "available": platform_available,
+            "status": "platform_runtime_ok_remote_monitor_unavailable"
+            if platform_available
+            else status,
+            "remote_monitor_status": status,
+            "message": message,
+            "checked_at": checked_at,
+            "platform_server": platform_server,
+            "platform_runtime": platform_runtime,
+            "model_runtime": _platform_runtime_to_model_runtime(platform_runtime),
+            "remote_monitor_available": False,
+            "monitor_source": "platform_runtime_probe",
+        }
+    )
 
 
 def _local_ai_tools_probe_payload() -> dict[str, Any]:
@@ -723,12 +982,17 @@ async def _probe_local_ai_tools_child_endpoints(
     payload = _local_ai_tools_probe_payload()
 
     async def probe(name: str, path: str) -> tuple[str, dict[str, Any]]:
+        timeout_seconds = LOCAL_AI_TOOLS_CHILD_ENDPOINT_TIMEOUT_SECONDS.get(
+            name,
+            PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        )
         result = await _probe_platform_json(
             client,
             f"{local_base}{path}",
             api_key=api_key,
             method="POST",
             payload=payload,
+            timeout_seconds=timeout_seconds,
         )
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         payload_available = bool(data.get("available", True)) if isinstance(data, dict) else True
@@ -738,6 +1002,7 @@ async def _probe_local_ai_tools_child_endpoints(
             "path": path,
             "status_code": result.get("status_code"),
             "latency_ms": result.get("latency_ms"),
+            "timeout_seconds": timeout_seconds,
             "status_category": result.get("status_category"),
             "error": result.get("error", ""),
         }
@@ -759,8 +1024,19 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
     """Probe the endpoints the platform actually calls, without returning secrets."""
     ai_rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    async with httpx.AsyncClient(timeout=3.5) as client:
-        for cfg in settings.get_fixed_ai_models(include_empty=False):
+    async with httpx.AsyncClient(timeout=PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS) as client:
+        fixed_model_rows = [
+            cfg for cfg in settings.get_fixed_ai_models(include_empty=False) if isinstance(cfg, dict)
+        ]
+        default_models_enabled = not any(
+            str(cfg.get("api_base") or "").strip() and str(cfg.get("model") or "").strip()
+            for cfg in fixed_model_rows
+        )
+        model_configs = list(fixed_model_rows)
+        if default_models_enabled:
+            model_configs.extend(dict(item, default_phase3_tunnel=True) for item in ONLINE_PHASE3_DEFAULT_AI_MODELS)
+
+        for cfg in model_configs:
             if not isinstance(cfg, dict) or cfg.get("enabled") is False:
                 continue
             api_base = str(cfg.get("api_base") or "").strip().rstrip("/")
@@ -798,47 +1074,67 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     "latency_ms": result.get("latency_ms"),
                     "models": models,
                     "error": result.get("error", ""),
+                    "default_phase3_tunnel": bool(cfg.get("default_phase3_tunnel")),
                 }
             )
 
-        local_tools: dict[str, Any] = {"configured": bool(settings.local_ai_tools_api_base)}
-        local_base = str(settings.local_ai_tools_api_base or "").strip().rstrip("/")
+        configured_local_base = str(settings.local_ai_tools_api_base or "").strip().rstrip("/")
+        local_base = configured_local_base or ONLINE_PHASE3_QUANT_API_PLATFORM_BASE
+        local_tools: dict[str, Any] = {
+            "configured": bool(configured_local_base),
+            "using_default_phase3_tunnel": not bool(configured_local_base),
+        }
         if local_base:
-            local_tools_api_key = _local_ai_tools_api_key_for_platform_probe()
             tunnel_contract = _platform_tunnel_contract(
                 local_base,
-                ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE,
+                ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
             )
+            api_key = _local_ai_tools_api_key_for_platform_probe()
             health = await _probe_platform_json(
                 client,
                 f"{local_base}/health",
-                api_key=local_tools_api_key,
+                api_key=api_key,
             )
-            status = await _probe_platform_json(
+            status_probe = await _probe_platform_json(
                 client,
                 f"{local_base}/models/status",
-                api_key=local_tools_api_key,
+                api_key=api_key,
+            )
+            metadata = health.get("data") if isinstance(health.get("data"), dict) else {}
+            status_metadata = (
+                status_probe.get("data") if isinstance(status_probe.get("data"), dict) else {}
+            )
+            is_phase3_quant_api = metadata.get("service") == "phase3_quant_api"
+            service_available = bool(
+                tunnel_contract.get("ok") and health.get("ok") and is_phase3_quant_api
+            )
+            model_bundle_available = bool(
+                status_metadata.get("available") or metadata.get("trained_models_available")
             )
             child_endpoints = await _probe_local_ai_tools_child_endpoints(
                 client,
                 local_base,
-                local_tools_api_key,
+                api_key,
             )
             child_available = any(
                 bool(item.get("available") or item.get("ok"))
                 for item in child_endpoints.values()
                 if isinstance(item, dict)
             )
-            metadata = status.get("data") if isinstance(status.get("data"), dict) else {}
+            platform_call_available = bool(
+                tunnel_contract.get("ok") and (service_available or child_available)
+            )
             local_tools.update(
                 {
                     "api_base": local_base,
-                    "expected_platform_api_base": ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE,
+                    "configured_api_base": configured_local_base,
+                    "expected_platform_api_base": ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
+                    "service_role": "phase3_quant_api",
+                    "legacy_local_ai_tools": False,
                     "tunnel_contract": tunnel_contract,
-                    "available": bool(
-                        tunnel_contract.get("ok")
-                        and (health.get("ok") or status.get("ok") or child_available)
-                    ),
+                    "available": platform_call_available,
+                    "service_available": service_available,
+                    "child_available": child_available,
                     "config_issue": (
                         "" if tunnel_contract.get("ok") else tunnel_contract.get("message", "")
                     ),
@@ -848,17 +1144,64 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         "latency_ms": health.get("latency_ms"),
                         "status_category": health.get("status_category"),
                         "error": health.get("error", ""),
+                        "service": metadata.get("service"),
+                        "root": metadata.get("root"),
+                        "validation_all_ok": metadata.get("validation_all_ok"),
+                        "downloaded_model_count": metadata.get("downloaded_model_count"),
+                        "validated_model_count": metadata.get("validated_model_count"),
                     },
                     "status": {
-                        "ok": bool(status.get("ok")),
-                        "status_code": status.get("status_code"),
-                        "latency_ms": status.get("latency_ms"),
-                        "status_category": status.get("status_category"),
-                        "error": status.get("error", ""),
+                        "ok": bool(status_probe.get("ok")),
+                        "status_code": status_probe.get("status_code"),
+                        "latency_ms": status_probe.get("latency_ms"),
+                        "status_category": status_probe.get("status_category"),
+                        "error": status_probe.get("error", ""),
                     },
-                    "model_bundle_available": bool(metadata.get("available")),
-                    "trained_at": metadata.get("trained_at"),
-                    "models": metadata.get("models") if isinstance(metadata, dict) else {},
+                    "model_bundle_available": model_bundle_available,
+                    "trained_models_available": model_bundle_available,
+                    "trained_at": status_metadata.get("trained_at")
+                    or metadata.get("trained_at")
+                    or "",
+                    "training_mode": status_metadata.get("training_mode")
+                    or metadata.get("training_mode"),
+                    "model_stage": status_metadata.get("model_stage") or metadata.get("model_stage"),
+                    "models": (
+                        status_metadata.get("models")
+                        if isinstance(status_metadata.get("models"), dict)
+                        else metadata.get("model_status")
+                        if isinstance(metadata, dict)
+                        else {}
+                    ),
+                    "shadow_sample_count": int(
+                        status_metadata.get("shadow_sample_count")
+                        or metadata.get("shadow_sample_count")
+                        or 0
+                    ),
+                    "trade_sample_count": int(
+                        status_metadata.get("trade_sample_count")
+                        or metadata.get("trade_sample_count")
+                        or 0
+                    ),
+                    "sequence_sample_count": int(
+                        status_metadata.get("sequence_sample_count")
+                        or metadata.get("sequence_sample_count")
+                        or 0
+                    ),
+                    "text_sentiment_sample_count": int(
+                        status_metadata.get("text_sentiment_sample_count")
+                        or metadata.get("text_sentiment_sample_count")
+                        or 0
+                    ),
+                    "completed_shadow_sample_count": int(
+                        status_metadata.get("completed_shadow_sample_count")
+                        or metadata.get("completed_shadow_sample_count")
+                        or 0
+                    ),
+                    "completed_trade_sample_count": int(
+                        status_metadata.get("completed_trade_sample_count")
+                        or metadata.get("completed_trade_sample_count")
+                        or 0
+                    ),
                     "child_endpoints": child_endpoints,
                 }
             )
@@ -915,31 +1258,21 @@ async def get_server_monitor_status_async() -> dict[str, Any]:
     try:
         info = await load_model_server_info_from_secure_settings()
     except ModelServerConfigNotConfigured as exc:
-        return {
-            "available": bool(
-                platform_runtime.get("ai_models")
-                or platform_runtime.get("local_ai_tools", {}).get("configured")
-            ),
-            "status": "model_server_not_configured",
-            "message": safe_error_text(exc),
-            "checked_at": checked_at,
-            "platform_server": platform_server,
-            "platform_runtime": platform_runtime,
-            "remote_monitor_available": False,
-        }
+        return _remote_monitor_unavailable_payload(
+            status="model_server_not_configured",
+            message=safe_error_text(exc),
+            checked_at=checked_at,
+            platform_server=platform_server,
+            platform_runtime=platform_runtime,
+        )
     except ModelServerConfigError as exc:
-        return {
-            "available": bool(
-                platform_runtime.get("ai_models")
-                or platform_runtime.get("local_ai_tools", {}).get("configured")
-            ),
-            "status": "model_server_config_error",
-            "message": safe_error_text(exc),
-            "checked_at": checked_at,
-            "platform_server": platform_server,
-            "platform_runtime": platform_runtime,
-            "remote_monitor_available": False,
-        }
+        return _remote_monitor_unavailable_payload(
+            status="model_server_config_error",
+            message=safe_error_text(exc),
+            checked_at=checked_at,
+            platform_server=platform_server,
+            platform_runtime=platform_runtime,
+        )
     payload = await asyncio.to_thread(_default_service.get_status_sync, info)
     payload["platform_runtime"] = platform_runtime
     payload["platform_server"] = platform_server
@@ -947,4 +1280,4 @@ async def get_server_monitor_status_async() -> dict[str, Any]:
     platform_access_host = _model_access_host_from_platform_runtime(platform_runtime)
     if platform_access_host:
         payload["model_access_host"] = platform_access_host
-    return payload
+    return _with_phase3_model_server_gpu_status(payload)

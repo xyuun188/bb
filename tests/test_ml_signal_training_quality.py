@@ -18,10 +18,17 @@ from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
     build_training_frame,
+    count_shadow_training_rows,
     load_shadow_training_rows,
     select_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
+)
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.artifact_retirement_audit import (
+    PHASE3_ARTIFACT_POLICY_ID,
+    PHASE3_REQUIRED_PROMOTION_FLOW,
+    PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.training_data_quality import DATA_QUALITY_VERSION
 
@@ -38,6 +45,39 @@ async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db_path = tmp_path / "ml-signal-training.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
     await init_db()
+
+
+@pytest.mark.asyncio
+async def test_local_ml_training_counts_only_phase3_clean_shadow_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                _db_shadow_row(1, PHASE3_CLEAN_START_UTC - timedelta(minutes=5)),
+                _db_shadow_row(2, PHASE3_CLEAN_START_UTC + timedelta(minutes=5)),
+                _db_shadow_row(
+                    3,
+                    PHASE3_CLEAN_START_UTC + timedelta(minutes=10),
+                    action="long",
+                    best_action="long",
+                ),
+            ]
+        )
+        await session.flush()
+
+    try:
+        selected = await load_shadow_training_rows(limit=10)
+        count = await count_shadow_training_rows()
+    finally:
+        await close_db()
+
+    assert count == 2
+    assert {row.id for row in selected}.issubset({2, 3})
+    assert {row.id for row in selected}
+    assert 1 not in {row.id for row in selected}
 
 
 def _db_shadow_row(
@@ -201,6 +241,14 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
 
     assert metadata["artifact_persisted"] is False
     assert metadata["training_run_mode"] == "dry_run"
+    assert metadata["artifact_policy_id"] == PHASE3_ARTIFACT_POLICY_ID
+    assert metadata["phase"] == "phase3_model_factory"
+    assert metadata["training_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
+    assert metadata["trade_sample_cursor_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
+    assert metadata["training_mode"] == "walk_forward"
+    assert metadata["model_stage"] == "shadow"
+    assert metadata["evaluation_policy"]["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
+    assert metadata["evaluation_policy"]["live_mutation"] is False
     assert not model_path.exists()
     assert not metadata_path.exists()
 
@@ -265,7 +313,7 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_train_ml_signal_script_dry_run_does_not_quarantine_or_persist(
+async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -303,15 +351,111 @@ async def test_train_ml_signal_script_dry_run_does_not_quarantine_or_persist(
         limit=20,
         min_samples=10,
         skip_quarantine=False,
-        dry_run=True,
     )
 
     assert result["training_quarantine"] == {
         "skipped": True,
-        "reason": "dry_run_no_quarantine_writes",
+        "reason": "phase3_preflight_no_quarantine_writes",
     }
+    assert result["dry_run"] is True
+    assert result["preflight_only"] is True
+    assert result["persist_artifact_requested"] is False
     assert calls[0]["persist_artifact"] is False
     assert result["metadata"] == {"artifact_persisted": False}
+
+
+@pytest.mark.asyncio
+async def test_train_ml_signal_script_requires_confirmation_to_persist() -> None:
+    with pytest.raises(ValueError, match="confirm_phase3_rebuild"):
+        await train_ml_signal_script.run_training(
+            limit=20,
+            min_samples=10,
+            persist_artifact=True,
+            confirm_phase3_rebuild=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_train_ml_signal_script_blocks_persist_when_okx_gate_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        train_ml_signal_script,
+        "okx_training_refresh_gate",
+        lambda: {
+            "allowed": False,
+            "reason": "okx_daily_reconciliation_training_blocked",
+            "can_refresh_training": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="OKX daily reconciliation blocks"):
+        await train_ml_signal_script.run_training(
+            limit=100,
+            min_samples=10,
+            persist_artifact=True,
+            confirm_phase3_rebuild=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    quarantine_calls: list[dict[str, object]] = []
+
+    async def quarantine(**kwargs: object) -> dict[str, object]:
+        quarantine_calls.append(kwargs)
+        return {"skipped": False, "quarantined": 0}
+
+    async def load_rows(*, limit: int) -> list[object]:
+        assert limit == 20
+        return [object()]
+
+    def quality_report(_rows: list[object]) -> dict[str, object]:
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[object]) -> pd.DataFrame:
+        return _training_frame()
+
+    async def count_rows() -> int:
+        return 80
+
+    def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"artifact_persisted": kwargs["persist_artifact"]}
+
+    monkeypatch.setattr(
+        train_ml_signal_script,
+        "okx_training_refresh_gate",
+        lambda: {
+            "allowed": True,
+            "reason": "okx_daily_reconciliation_allows_training_refresh",
+            "can_refresh_training": True,
+        },
+    )
+    monkeypatch.setattr(train_ml_signal_script, "quarantine_dirty_shadow_samples", quarantine)
+    monkeypatch.setattr(train_ml_signal_script, "load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
+    monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
+    monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
+    monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
+
+    result = await train_ml_signal_script.run_training(
+        limit=20,
+        min_samples=10,
+        persist_artifact=True,
+        confirm_phase3_rebuild=True,
+    )
+
+    assert quarantine_calls == [{"batch_size": 20, "max_batches": 1}]
+    assert calls[0]["persist_artifact"] is True
+    assert result["dry_run"] is False
+    assert result["preflight_only"] is False
+    assert result["persist_artifact_requested"] is True
+    assert result["confirm_phase3_rebuild"] is True
+    assert result["metadata"] == {"artifact_persisted": True}
 
 
 @pytest.mark.asyncio
@@ -601,7 +745,7 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
     tmp_path: Path,
 ) -> None:
     await _use_temp_db(monkeypatch, tmp_path)
-    base_time = datetime(2026, 6, 23, 3, 0, tzinfo=UTC)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
     recent_holds = [
         _db_shadow_row(10_000 + idx, base_time - timedelta(minutes=idx)) for idx in range(40)
     ]
@@ -650,7 +794,7 @@ async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
     tmp_path: Path,
 ) -> None:
     await _use_temp_db(monkeypatch, tmp_path)
-    base_time = datetime(2026, 6, 23, 3, 0, tzinfo=UTC)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
     recent_holds = [
         _db_shadow_row(20_000 + idx, base_time - timedelta(minutes=idx)) for idx in range(80)
     ]

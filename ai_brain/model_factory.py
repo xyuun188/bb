@@ -38,10 +38,6 @@ def create_models_from_config() -> list[AbstractAIModel]:
             agent = LLMAgent(name=name, api_config=api_config)
             models.append(agent)
 
-            # Register balance into model_initial_balances if specified
-            if "balance" in cfg and name not in settings.model_initial_balances:
-                settings.model_initial_balances[name] = float(cfg["balance"])
-
         return models
 
     # Legacy fallback: only create model when legacy api_key is configured

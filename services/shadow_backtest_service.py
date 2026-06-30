@@ -28,6 +28,54 @@ FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
 RepositoryFactory = Callable[[Any], Any]
 
+_SHADOW_TOOL_NAMES = (
+    "profit_prediction",
+    "time_series_prediction",
+    "sentiment_analysis",
+    "exit_advice",
+)
+_SHADOW_TOOL_KEYS = (
+    "available",
+    "status",
+    "model",
+    "primary_model",
+    "challenger_model",
+    "model_version",
+    "route_mode",
+    "fallback_reason",
+    "best_side",
+    "side",
+    "direction",
+    "expected_return_pct",
+    "expected_move_pct",
+    "adjusted_expected_return_pct",
+    "loss_probability",
+    "profit_quality_score",
+    "confidence",
+    "specialist_inference_active",
+    "specialist_primary_model",
+    "specialist_challenger_model",
+    "timesfm_shadow_expected_return_pct",
+    "timesfm_shadow_expected_move_pct",
+    "timesfm_shadow_side",
+    "timesfm_shadow_confidence",
+    "chronos_shadow_expected_return_pct",
+    "chronos_shadow_expected_move_pct",
+    "chronos_shadow_side",
+    "chronos_shadow_confidence",
+)
+_SHADOW_PROFESSIONAL_KEYS = (
+    "kind",
+    "primary_model",
+    "challenger_model",
+    "artifacts_ready",
+    "actual_inference",
+    "baseline_response",
+    "activation_blocker",
+    "promotion_flow",
+    "live_mutation",
+)
+
 
 def side_label(side: str) -> str:
     side_value = str(side).lower()
@@ -36,6 +84,96 @@ def side_label(side: str) -> str:
     if side_value == "short":
         return "做空"
     return str(side)
+
+
+def _safe_shadow_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+        return number if number == number and abs(number) != float("inf") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_shadow_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        number = _safe_shadow_number(value)
+        return round(number, 8) if number is not None else None
+    if isinstance(value, str):
+        return value.strip()[:160]
+    return None
+
+
+def _compact_professional_shadow(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {}
+    for key in _SHADOW_PROFESSIONAL_KEYS:
+        if key not in value:
+            continue
+        item = _compact_shadow_value(value.get(key))
+        if item is not None:
+            compact[key] = item
+    def compact_result_payload(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return {}
+        compact_result = {}
+        for key in (
+            "model",
+            "actual_inference",
+            "expected_return_pct",
+            "expected_move_pct",
+            "best_side",
+            "direction",
+            "confidence",
+            "horizon_step",
+            "sequence_length",
+            "prediction_count",
+        ):
+            item = _compact_shadow_value(result.get(key))
+            if item is not None:
+                compact_result[key] = item
+        return compact_result
+
+    shadow_result = compact_result_payload(value.get("shadow_result"))
+    if shadow_result:
+        compact["shadow_result"] = shadow_result
+    primary_shadow_result = compact_result_payload(value.get("primary_shadow_result"))
+    if primary_shadow_result:
+        compact["primary_shadow_result"] = primary_shadow_result
+    challenger_shadow_result = compact_result_payload(value.get("challenger_shadow_result"))
+    if challenger_shadow_result:
+        compact["challenger_shadow_result"] = challenger_shadow_result
+    return compact
+
+
+def compact_local_ai_tools_shadow(local_ai_tools_context: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep only auditable shadow evidence needed for later walk-forward scoring."""
+
+    if not isinstance(local_ai_tools_context, dict):
+        return {}
+    compact: dict[str, Any] = {
+        "status": str(local_ai_tools_context.get("status") or "")[:60],
+        "captured_at": datetime.now(UTC).isoformat(),
+    }
+    for tool_name in _SHADOW_TOOL_NAMES:
+        tool = local_ai_tools_context.get(tool_name)
+        if not isinstance(tool, dict):
+            continue
+        item = {}
+        for key in _SHADOW_TOOL_KEYS:
+            if key not in tool:
+                continue
+            value = _compact_shadow_value(tool.get(key))
+            if value is not None:
+                item[key] = value
+        professional = _compact_professional_shadow(tool.get("professional_model_shadow"))
+        if professional:
+            item["professional_model_shadow"] = professional
+        if item:
+            compact[tool_name] = item
+    return compact if any(key in compact for key in _SHADOW_TOOL_NAMES) else {}
 
 
 @dataclass(slots=True)
@@ -60,6 +198,7 @@ class ShadowBacktestService:
         feature_vector: Any,
         execution_mode: str,
         analysis_type: str = "market",
+        local_ai_tools_context: dict[str, Any] | None = None,
     ) -> None:
         """Record pending shadow samples for market-analysis decisions."""
         if analysis_type != "market":
@@ -77,6 +216,16 @@ class ShadowBacktestService:
         try:
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
+                feature_snapshot = (
+                    decision.feature_snapshot or getattr(feature_vector, "to_dict", lambda: {})()
+                )
+                if not isinstance(feature_snapshot, dict):
+                    feature_snapshot = {}
+                else:
+                    feature_snapshot = dict(feature_snapshot)
+                local_ai_shadow = compact_local_ai_tools_shadow(local_ai_tools_context)
+                if local_ai_shadow:
+                    feature_snapshot["local_ai_tools_shadow"] = local_ai_shadow
                 for horizon in self.horizons_minutes:
                     await repo.create_shadow_backtest(
                         {
@@ -88,8 +237,7 @@ class ShadowBacktestService:
                             "decision_action": decision.action.value,
                             "decision_confidence": float(decision.confidence or 0.0),
                             "entry_price": entry_price,
-                            "feature_snapshot": decision.feature_snapshot
-                            or getattr(feature_vector, "to_dict", lambda: {})(),
+                            "feature_snapshot": feature_snapshot,
                             "raw_llm_response": (
                                 decision.raw_response
                                 if isinstance(decision.raw_response, dict)

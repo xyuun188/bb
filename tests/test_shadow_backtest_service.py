@@ -89,6 +89,76 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence() -> None:
+    repo = _FakeRepo()
+    feature_vector = SimpleNamespace(current_price=100.0, close=99.0)
+    local_ai_tools_context = {
+        "status": "completed",
+        "time_series_prediction": {
+            "available": True,
+            "model": "local-timeseries-ensemble-v1",
+            "expected_return_pct": 0.11,
+            "timesfm_shadow_expected_return_pct": 0.42,
+            "timesfm_shadow_side": "long",
+            "specialist_inference_active": True,
+            "professional_model_shadow": {
+                "kind": "timeseries",
+                "actual_inference": True,
+                "baseline_response": True,
+                "live_mutation": False,
+                "shadow_result": {
+                    "model": "timesfm-2.5-shadow-challenger",
+                    "actual_inference": True,
+                    "expected_return_pct": 0.42,
+                    "best_side": "long",
+                    "confidence": 0.73,
+                    "raw_predictions": list(range(200)),
+                },
+            },
+            "raw_huge_payload": list(range(1000)),
+        },
+        "sentiment_analysis": {
+            "available": True,
+            "model": "finbert-shadow-ensemble-v1",
+            "specialist_inference_active": True,
+            "professional_model_shadow": {
+                "kind": "sentiment",
+                "actual_inference": True,
+                "baseline_response": False,
+                "live_mutation": False,
+            },
+        },
+    }
+
+    await _service(repo).create(
+        123,
+        _decision(),
+        feature_vector,
+        "paper",
+        local_ai_tools_context=local_ai_tools_context,
+    )
+
+    snapshot = repo.created[0]["feature_snapshot"]
+    shadow = snapshot["local_ai_tools_shadow"]
+    timeseries = shadow["time_series_prediction"]
+    sentiment = shadow["sentiment_analysis"]
+
+    assert shadow["status"] == "completed"
+    assert timeseries["timesfm_shadow_expected_return_pct"] == 0.42
+    assert timeseries["timesfm_shadow_side"] == "long"
+    assert timeseries["professional_model_shadow"]["shadow_result"] == {
+        "model": "timesfm-2.5-shadow-challenger",
+        "actual_inference": True,
+        "expected_return_pct": 0.42,
+        "best_side": "long",
+        "confidence": 0.73,
+    }
+    assert sentiment["professional_model_shadow"]["kind"] == "sentiment"
+    assert "raw_huge_payload" not in timeseries
+    assert "raw_predictions" not in timeseries["professional_model_shadow"]["shadow_result"]
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

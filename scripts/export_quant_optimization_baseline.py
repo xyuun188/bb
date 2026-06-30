@@ -31,6 +31,7 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _load_trade_reflection_samples,
     _merge_trade_samples,
 )
+from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason  # noqa: E402
 from services.trading_params import DEFAULT_TRADING_PARAMS  # noqa: E402
 from services.training_data_quality import annotate_training_payload  # noqa: E402
 
@@ -208,22 +209,38 @@ async def _position_metrics(since: datetime) -> dict[str, Any]:
             .all()
         )
     notional_values = [abs(_as_float(row.quantity) * _as_float(row.entry_price)) for row in rows]
+    closed_rows = [row for row in rows if not bool(row.is_open)]
+    untrusted_reasons = Counter(
+        reason
+        for row in closed_rows
+        if (reason := closed_position_trade_fact_untrusted_reason(row)) is not None
+    )
+    trusted_closed_rows = [
+        row for row in closed_rows if closed_position_trade_fact_untrusted_reason(row) is None
+    ]
     fast_loss_count = 0
-    for row in rows:
-        if bool(row.is_open) or not row.closed_at or not row.created_at:
+    for row in trusted_closed_rows:
+        if not row.closed_at or not row.created_at:
             continue
         hold_minutes = max((row.closed_at - row.created_at).total_seconds() / 60.0, 0.0)
         if hold_minutes < 10 and _as_float(row.realized_pnl) < 0:
             fast_loss_count += 1
+    trusted_realized_values = [_as_float(row.realized_pnl) for row in trusted_closed_rows]
+    raw_realized_values = [_as_float(row.realized_pnl) for row in closed_rows]
     return {
         "total_recent_positions": len(rows),
         "open_count": sum(1 for row in rows if bool(row.is_open)),
-        "closed_count": sum(1 for row in rows if not bool(row.is_open)),
+        "closed_count": len(trusted_closed_rows),
+        "raw_closed_count": len(closed_rows),
+        "trade_fact_quarantined_closed_position_count": len(closed_rows) - len(trusted_closed_rows),
+        "trade_fact_quarantine_reasons": dict(untrusted_reasons),
         "side_counts": dict(Counter(str(row.side or "unknown") for row in rows)),
         "notional_distribution": _distribution(notional_values),
         "small_notional_under_10_count": sum(1 for value in notional_values if 0 < value < 10),
         "fast_loss_close_under_10m_count": fast_loss_count,
-        "realized_pnl_distribution": _distribution([_as_float(row.realized_pnl) for row in rows]),
+        "realized_pnl_distribution": _distribution(trusted_realized_values),
+        "raw_realized_pnl_distribution": _distribution(raw_realized_values),
+        "realized_pnl_policy": "trusted_closed_positions_only",
     }
 
 

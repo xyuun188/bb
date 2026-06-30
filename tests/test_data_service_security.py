@@ -234,6 +234,11 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
     assert features["volatility_20"] == pytest.approx(0.033)
     assert features["price_vs_sma20"] == pytest.approx(0.21)
     assert features["price_vs_sma50"] == pytest.approx(0.34)
+    assert features["sequence_timeframe"] == "1m"
+    assert features["sequence_length"] == data_service_module.KLINE_FEATURE_SEQUENCE_LIMIT
+    assert len(features["close_sequence"]) == data_service_module.KLINE_FEATURE_SEQUENCE_LIMIT
+    assert len(features["volume_sequence"]) == data_service_module.KLINE_FEATURE_SEQUENCE_LIMIT
+    assert features["close_sequence"][-1] == pytest.approx(11.19)
 
 
 @pytest.mark.asyncio
@@ -396,6 +401,9 @@ def test_feature_vector_keeps_market_feature_source_timeframes() -> None:
             "volume_ratio_timeframe": "1h",
             "entry_activity_volume_ratio": 1.4,
             "entry_activity_volume_timeframe": "1m",
+            "close_sequence": [100.0 + index for index in range(60)],
+            "volume_sequence": [10.0 + index for index in range(60)],
+            "sequence_timeframe": "1m",
         },
     )
 
@@ -404,6 +412,10 @@ def test_feature_vector_keeps_market_feature_source_timeframes() -> None:
     assert vector.volume_ratio_timeframe == "1h"
     assert vector.indicator_snapshot_available is True
     assert vector.entry_activity_volume_ratio == pytest.approx(1.4)
+    assert vector.sequence_length == 60
+    assert vector.close_sequence[-1] == pytest.approx(159.0)
+    assert vector.volume_sequence[-1] == pytest.approx(69.0)
+    assert vector.to_dict()["close_sequence"][-1] == pytest.approx(159.0)
     assert "short_returns=1m" in vector.to_llm_context()
     assert "trend=1h" in vector.to_llm_context()
     assert "activity_volume=1m" in vector.to_llm_context()
@@ -432,6 +444,26 @@ def test_feature_vector_keeps_fresh_ticker_when_indicator_close_diverges() -> No
     assert vector.price_reconciliation_warning == (
         "ticker_current_price_kept_indicator_close_diverged"
     )
+
+
+def test_feature_vector_drops_sequence_when_indicator_price_diverges() -> None:
+    from data_feed.feature_vector import build_feature_vector
+
+    vector = build_feature_vector(
+        "PROS/USDT",
+        ticker={"last_price": 0.5666, "bid": 0.5665, "ask": 0.5667},
+        indicators={
+            "close": 0.3902,
+            "close_sequence": [0.39 + index * 0.0001 for index in range(60)],
+            "volume_sequence": [100.0 for _ in range(60)],
+            "sequence_timeframe": "1m",
+        },
+    )
+
+    assert vector.close_sequence == []
+    assert vector.volume_sequence == []
+    assert vector.sequence_length == 0
+    assert vector.sequence_quality_warning == "indicator_sequence_dropped_due_to_ticker_gap"
 
 
 def test_feature_vector_keeps_okx_swap_volume_units_separate() -> None:

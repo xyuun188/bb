@@ -177,6 +177,8 @@ class HighRiskReviewService:
                     "max_tokens": max_tokens,
                     "finish_reason": metadata.get("finish_reason"),
                     "content_present": bool(content),
+                    "raw_has_think_tag": bool(metadata.get("raw_has_think_tag")),
+                    "reasoning_stripped": bool(metadata.get("reasoning_stripped")),
                     "usage": metadata.get("usage"),
                 }
             )
@@ -215,6 +217,7 @@ class HighRiskReviewService:
             "high_risk_review",
             max_tokens,
             floor=HIGH_RISK_REVIEW_TOKEN_FLOOR,
+            model=model,
         )
         request_body: dict[str, Any] = {
             "model": model,
@@ -275,6 +278,8 @@ class HighRiskReviewService:
         metadata = {
             "finish_reason": choice_payload.get("finish_reason"),
             "usage": payload.get("usage") if isinstance(payload, dict) else None,
+            "raw_has_think_tag": False,
+            "reasoning_stripped": False,
         }
         candidates: list[str] = []
 
@@ -298,9 +303,14 @@ class HighRiskReviewService:
         add_text(message.get("output_text"))
         add_text(payload.get("output_text") if isinstance(payload, dict) else None)
 
+        metadata["raw_has_think_tag"] = any(_has_thinking_tag(text) for text in candidates)
+
         for text in candidates:
             cleaned = self.extract_json_object_text(text)
             if cleaned:
+                metadata["reasoning_stripped"] = bool(
+                    _has_thinking_tag(text) or cleaned != str(text or "").strip()
+                )
                 return cleaned, metadata
         return "", metadata
 
@@ -438,3 +448,8 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _has_thinking_tag(value: Any) -> bool:
+    text = str(value or "").lower()
+    return "<think>" in text or "</think>" in text

@@ -149,7 +149,40 @@ def parse_exchange_position_snapshot(
         return None
     info = position.get("info") or {}
     symbol = symbol_normalizer(info.get("instId") or position.get("symbol"))
-    side = str(position.get("side") or info.get("posSide") or "").lower()
+    raw_pos_value = (
+        info.get("pos")
+        if info.get("pos") not in (None, "")
+        else position.get("positionAmt")
+        if position.get("positionAmt") not in (None, "")
+        else position.get("size")
+        if position.get("size") not in (None, "")
+        else info.get("qty")
+        if info.get("qty") not in (None, "")
+        else position.get("contracts")
+    )
+    signed_position_size = _first_nonzero_float(raw_pos_value, default=0.0)
+    raw_size = _first_nonzero_float(
+        position.get("contracts"),
+        position.get("size"),
+        position.get("positionAmt"),
+        info.get("pos"),
+        info.get("qty"),
+        default=0.0,
+    )
+    ccxt_side = str(position.get("side") or "").lower()
+    okx_pos_side = str(info.get("posSide") or "").lower()
+    if (okx_pos_side == "net" or ccxt_side == "net") and signed_position_size:
+        side = "short" if signed_position_size < 0 else "long"
+        side_inference = "okx_net_signed_pos"
+    elif ccxt_side in {"long", "short"}:
+        side = ccxt_side
+        side_inference = "ccxt_side"
+    elif okx_pos_side in {"long", "short"}:
+        side = okx_pos_side
+        side_inference = "okx_pos_side"
+    else:
+        side = ccxt_side or okx_pos_side
+        side_inference = "unresolved"
     if not symbol or side not in {"long", "short"}:
         return None
 
@@ -180,14 +213,7 @@ def parse_exchange_position_snapshot(
         return None
 
     contracts = abs(
-        _first_nonzero_float(
-            position.get("contracts"),
-            position.get("size"),
-            position.get("positionAmt"),
-            info.get("pos"),
-            info.get("qty"),
-            default=0.0,
-        )
+        raw_size
         or 0.0
     )
     explicit_contract_size = abs(
@@ -248,6 +274,11 @@ def parse_exchange_position_snapshot(
         "margin_used": margin_used,
         "raw_symbol": info.get("instId") or position.get("symbol"),
         "ccxt_symbol": position.get("symbol"),
+        "raw_pos_side": okx_pos_side or ccxt_side,
+        "raw_ccxt_side": ccxt_side,
+        "raw_pos": raw_pos_value,
+        "signed_position_size": signed_position_size,
+        "side_inference": side_inference,
     }
 
 

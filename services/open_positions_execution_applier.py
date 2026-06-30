@@ -58,11 +58,28 @@ class OpenPositionsExecutionApplier:
     ) -> None:
         if execution_result.status != OrderStatus.FILLED:
             return
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        trade_plan = (
+            raw.get("profit_first_trade_plan")
+            if isinstance(raw.get("profit_first_trade_plan"), dict)
+            else {}
+        )
+        exit_plan = (
+            raw.get("profit_first_exit_plan")
+            if isinstance(raw.get("profit_first_exit_plan"), dict)
+            else {}
+        )
+        side = "long" if decision.action == Action.LONG else "short"
+        existing = self._matching_entry_position(open_positions, model_name, decision, side)
+        if existing is not None:
+            self._merge_entry(existing, decision, execution_result, trade_plan, exit_plan)
+            return
+
         open_positions.append(
             {
                 "model_name": model_name,
                 "symbol": decision.symbol,
-                "side": "long" if decision.action == Action.LONG else "short",
+                "side": side,
                 "entry_price": execution_result.price,
                 "current_price": execution_result.price,
                 "quantity": execution_result.quantity,
@@ -78,8 +95,86 @@ class OpenPositionsExecutionApplier:
                     else execution_result.price * (1 - decision.take_profit_pct)
                 ),
                 "is_open": True,
+                "profit_first_trade_plan": trade_plan,
+                "profit_first_exit_plan": exit_plan,
+                "profit_first_exit_plan_id": (
+                    exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
+                ),
             }
         )
+
+    def _matching_entry_position(
+        self,
+        open_positions: list[dict[str, Any]],
+        model_name: str,
+        decision: DecisionOutput,
+        side: str,
+    ) -> dict[str, Any] | None:
+        for position in open_positions:
+            if self._matches_position(position, model_name, decision, side):
+                return position
+        return None
+
+    def _merge_entry(
+        self,
+        position: dict[str, Any],
+        decision: DecisionOutput,
+        execution_result: ExecutionResult,
+        trade_plan: dict[str, Any],
+        exit_plan: dict[str, Any],
+    ) -> None:
+        old_qty = max(float(position.get("quantity") or 0.0), 0.0)
+        add_qty = max(float(execution_result.quantity or 0.0), 0.0)
+        if add_qty <= 0:
+            return
+        old_entry = float(position.get("entry_price") or execution_result.price or 0.0)
+        add_entry = float(execution_result.price or old_entry or 0.0)
+        total_qty = old_qty + add_qty
+        entry_price = (
+            ((old_entry * old_qty) + (add_entry * add_qty)) / total_qty
+            if total_qty > 0
+            else add_entry
+        )
+        side = "long" if decision.action == Action.LONG else "short"
+        position["symbol"] = decision.symbol
+        position["side"] = side
+        position["quantity"] = total_qty
+        position["entry_price"] = entry_price
+        position["current_price"] = execution_result.price
+        position["stop_loss"] = (
+            entry_price * (1 - decision.stop_loss_pct)
+            if side == "long"
+            else entry_price * (1 + decision.stop_loss_pct)
+        )
+        position["take_profit"] = (
+            entry_price * (1 + decision.take_profit_pct)
+            if side == "long"
+            else entry_price * (1 - decision.take_profit_pct)
+        )
+        position["unrealized_pnl"] = (
+            (execution_result.price - entry_price) * total_qty
+            if side == "long"
+            else (entry_price - execution_result.price) * total_qty
+        )
+        position["is_open"] = True
+        position["profit_first_trade_plan"] = trade_plan
+        position["profit_first_exit_plan"] = exit_plan
+        position["profit_first_exit_plan_id"] = (
+            exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
+        )
+        history = position.get("entry_legs")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "quantity": add_qty,
+                "price": execution_result.price,
+                "exchange_order_id": execution_result.exchange_order_id,
+                "profit_first_exit_plan_id": position.get("profit_first_exit_plan_id") or "",
+            }
+        )
+        position["entry_legs"] = history[-20:]
+        position["merged_entry_count"] = int(position.get("merged_entry_count") or 1) + 1
 
     def _apply_exit(
         self,

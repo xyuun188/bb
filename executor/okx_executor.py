@@ -24,9 +24,16 @@ from core.exceptions import (
     RateLimitError,
 )
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_symbol,
+    symbol_from_okx_market,
+    symbol_from_okx_payload,
+)
 from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
+from services.exchange_position_state import parse_exchange_position_snapshot
+from services.okx_native_facts import OkxNativeFactsClient
 
 logger = structlog.get_logger(__name__)
 
@@ -220,8 +227,11 @@ class OKXExecutor(AbstractExecutor):
     def _position_matches_symbol(self, position: dict[str, Any], symbol: str) -> bool:
         info = position.get("info") or {}
         requested = normalize_trading_symbol(symbol)
-        actual = normalize_trading_symbol(position.get("symbol") or info.get("instId"))
+        actual = normalize_trading_symbol(info.get("instId") or position.get("symbol"))
         return bool(requested and actual and requested == actual)
+
+    def _native_facts_client(self) -> OkxNativeFactsClient:
+        return OkxNativeFactsClient(self)
 
     def _synthetic_exit_market_from_position(
         self,
@@ -448,20 +458,41 @@ class OKXExecutor(AbstractExecutor):
                     balance = await self.get_balance()
                 position_value = balance * decision.position_size_pct * decision.suggested_leverage
 
-            # Get current ticker for quantity calculation. Some OKX demo/pre-quote
-            # positions are returned by fetch_positions but are absent from CCXT's
-            # market cache; exits can still use the position mark price and native
-            # close-position API in that case.
+            exit_position_snapshot: list[dict[str, Any]] | None = None
+
+            # Use OKX-native instId ticker for quantity calculation. If ticker is
+            # unavailable, entries fail closed; exits can still use position marks.
             ticker: dict[str, Any] = {}
             try:
-                ticker = await self._with_retry(ccxt.fetch_ticker, okx_symbol)
+                ticker = await self._fetch_native_ticker(decision.symbol)
             except Exception as exc:
-                if not decision.is_exit or not self._is_missing_market_symbol_error(
-                    safe_error_text(exc)
-                ):
-                    raise
+                if not decision.is_exit:
+                    error_text = safe_error_text(exc)
+                    logger.warning(
+                        "OKX native ticker unavailable for entry; rejecting before submit",
+                        symbol=decision.symbol,
+                        okx_symbol=okx_symbol,
+                        error=error_text,
+                    )
+                    return ExecutionResult(
+                        order_id="ticker_unavailable",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0,
+                        price=0,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": "OKX 原生行情不可用，系统已在提交前拦截，未向 OKX 发送开仓订单。",
+                            "execution_blocker": "okx_native_ticker_unavailable",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "okx_symbol": okx_symbol,
+                            "raw_error": error_text,
+                        },
+                    )
                 logger.warning(
-                    "OKX ticker missing from market cache for exit; using position snapshot price",
+                    "OKX native ticker unavailable for exit; using position snapshot price",
                     symbol=decision.symbol,
                     okx_symbol=okx_symbol,
                     error=safe_error_text(exc),
@@ -470,7 +501,8 @@ class OKXExecutor(AbstractExecutor):
             market = await self._market_for_symbol(okx_symbol, app_symbol=decision.symbol)
             if price <= 0 and decision.is_exit:
                 target_price_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-                for position in await self.get_positions_strict(decision.symbol):
+                exit_position_snapshot = await self.get_positions_strict(decision.symbol)
+                for position in exit_position_snapshot:
                     if position.get("side") != target_price_side:
                         continue
                     info = position.get("info") or {}
@@ -599,12 +631,19 @@ class OKXExecutor(AbstractExecutor):
 
             # For closing positions, get the actual position size
             if decision.is_exit:
-                positions = await self.get_positions_strict(decision.symbol)
+                positions = exit_position_snapshot or await self.get_positions_strict(
+                    decision.symbol
+                )
+                exit_position_snapshot = positions
                 target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
                 matching = [
                     p
                     for p in positions
-                    if p.get("side") == target_side and self._position_contracts(p) > 0
+                    if self._position_matches_exit_side(
+                        p,
+                        target_side,
+                        decision_symbol=decision.symbol,
+                    )
                 ]
                 if matching:
                     pre_exit_contracts = self._position_contracts(matching[0])
@@ -639,6 +678,14 @@ class OKXExecutor(AbstractExecutor):
                     base_quantity = order_quantity * contract_size
                     position_side = self._okx_position_side(matching[0], target_side)
                 else:
+                    diagnostics = self._exit_position_mismatch_diagnostics(
+                        positions,
+                        decision_symbol=decision.symbol,
+                        okx_symbol=okx_symbol,
+                        target_side=target_side,
+                        exit_side=side,
+                        source="pre_submit_position_lookup",
+                    )
                     return ExecutionResult(
                         order_id="no_position",
                         symbol=decision.symbol,
@@ -648,6 +695,7 @@ class OKXExecutor(AbstractExecutor):
                         price=price,
                         status=OrderStatus.REJECTED,
                         raw_response={
+                            "okx_exit_position_mismatch": diagnostics,
                             "error": "OKX 当前没有对应方向的可平仓位，本轮未提交平仓订单。"
                         },
                     )
@@ -727,7 +775,11 @@ class OKXExecutor(AbstractExecutor):
                         matching = [
                             p
                             for p in positions
-                            if p.get("side") == target_side and self._position_contracts(p) > 0
+                            if self._position_matches_exit_side(
+                                p,
+                                target_side,
+                                decision_symbol=decision.symbol,
+                            )
                         ]
                         if not matching:
                             return ExecutionResult(
@@ -1026,6 +1078,7 @@ class OKXExecutor(AbstractExecutor):
                     pre_exit_contracts=pre_exit_contracts,
                     target_side=target_side,
                     position_side=position_side,
+                    position_snapshot=exit_position_snapshot or [],
                     requested_exit_fraction=requested_exit_fraction,
                     requested_exit_contracts=requested_exit_contracts,
                     order_quantity=order_quantity,
@@ -1163,8 +1216,8 @@ class OKXExecutor(AbstractExecutor):
                 for _ in range(5):
                     await asyncio.sleep(1.0)
                     try:
-                        refreshed = await self._with_retry(
-                            ccxt.fetch_order,
+                        refreshed = await self._fetch_native_order_detail(
+                            ccxt,
                             order.get("id"),
                             okx_symbol,
                         )
@@ -1338,8 +1391,14 @@ class OKXExecutor(AbstractExecutor):
                 )
                 status = OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL
 
+            final_order_id = str(
+                order.get("id")
+                or (order.get("info") or {}).get("ordId")
+                or (order.get("info") or {}).get("clOrdId")
+                or ""
+            ).strip()
             return ExecutionResult(
-                order_id=order.get("id", ""),
+                order_id=final_order_id,
                 symbol=result_symbol,
                 side=side,
                 order_type="market",
@@ -1353,7 +1412,7 @@ class OKXExecutor(AbstractExecutor):
                 fee=(
                     order.get("fee", {}).get("cost", 0) if isinstance(order.get("fee"), dict) else 0
                 ),
-                exchange_order_id=order.get("id"),
+                exchange_order_id=final_order_id or None,
                 timestamp=datetime.now(UTC),
                 raw_response={
                     **order,
@@ -1432,6 +1491,14 @@ class OKXExecutor(AbstractExecutor):
         except ExchangeAPIError as e:
             error_text = safe_error_text(e)
             if decision.is_exit and self._is_no_position_error(error_text):
+                diagnostics = self._exit_position_mismatch_diagnostics(
+                    exit_position_snapshot or [],
+                    decision_symbol=decision.symbol,
+                    okx_symbol=okx_symbol,
+                    target_side=target_side or "",
+                    exit_side=side,
+                    source="exchange_no_position_rejection",
+                )
                 return ExecutionResult(
                     order_id="no_position",
                     symbol=decision.symbol,
@@ -1442,6 +1509,7 @@ class OKXExecutor(AbstractExecutor):
                     status=OrderStatus.REJECTED,
                     raw_response={
                         "error": "OKX 提示当前没有对应方向的可平仓位，可能已被 OKX 止盈/止损、手动平仓或刚刚同步延迟；本轮未重复提交。",
+                        "okx_exit_position_mismatch": diagnostics,
                         "raw_error": error_text,
                     },
                 )
@@ -1616,6 +1684,31 @@ class OKXExecutor(AbstractExecutor):
                     or "OKX native full close was submitted but position is not flat yet.",
                 },
             )
+        if not order_id:
+            return ExecutionResult(
+                order_id=client_order_id or "okx_native_full_close_fill_pending",
+                symbol=decision.symbol,
+                side=side,
+                order_type="market",
+                quantity=closed_contracts * contract_size,
+                price=price,
+                status=OrderStatus.PARTIAL,
+                fee=0.0,
+                pnl=0.0,
+                exchange_order_id=None,
+                timestamp=datetime.now(UTC),
+                raw_response={
+                    **raw_response,
+                    "requires_okx_fill_backfill": True,
+                    "error": (
+                        "OKX native full close flattened the exchange position, but OKX "
+                        "fills-history did not expose the real ordId yet. Local ledger "
+                        "will wait for authoritative OKX fill sync instead of closing with "
+                        "a synthetic order id."
+                    ),
+                },
+            )
+
         return ExecutionResult(
             order_id=order_id or client_order_id or "okx_native_full_close",
             symbol=decision.symbol,
@@ -1965,6 +2058,7 @@ class OKXExecutor(AbstractExecutor):
         pre_exit_contracts: float,
         target_side: str,
         position_side: str | None,
+        position_snapshot: list[dict[str, Any]] | None,
         requested_exit_fraction: float,
         requested_exit_contracts: float,
         order_quantity: float,
@@ -2018,6 +2112,14 @@ class OKXExecutor(AbstractExecutor):
         except ExchangeAPIError as exc:
             error_text = safe_error_text(exc)
             if self._is_no_position_error(error_text):
+                diagnostics = self._exit_position_mismatch_diagnostics(
+                    position_snapshot or [],
+                    decision_symbol=decision.symbol,
+                    okx_symbol=okx_symbol,
+                    target_side=target_side,
+                    exit_side=side,
+                    source="native_reduce_no_position_rejection",
+                )
                 return ExecutionResult(
                     order_id="no_position",
                     symbol=decision.symbol,
@@ -2030,6 +2132,7 @@ class OKXExecutor(AbstractExecutor):
                     raw_response={
                         "error": error_text,
                         "okx_native_reduce_market_order": True,
+                        "okx_exit_position_mismatch": diagnostics,
                         "request_params": request_params,
                         "fallback_market_order_params": params,
                         "okx_symbol": okx_symbol,
@@ -2172,26 +2275,97 @@ class OKXExecutor(AbstractExecutor):
         )
 
     async def _confirm_market_order(self, ccxt, order: dict, symbol: str) -> dict:
-        """Fetch the final OKX order state after market order submission."""
-        order_id = order.get("id")
+        """Fetch the final OKX-native order state after market order submission."""
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        order_id = order.get("id") or info.get("ordId") or info.get("clOrdId")
         if not order_id:
-            return order
-        if order.get("status") in {"closed", "canceled", "cancelled", "rejected"}:
             return order
 
         await asyncio.sleep(0.5)
         try:
-            confirmed = await self._with_retry(ccxt.fetch_order, order_id, symbol)
+            confirmed = await self._fetch_native_order_detail(ccxt, order_id, symbol)
             if confirmed:
                 return {**order, **confirmed}
         except Exception as e:
             logger.warning(
-                "order confirmation failed; keeping initial order status",
+                "OKX native order confirmation failed; keeping initial order status",
                 order_id=order_id,
                 symbol=symbol,
                 error=safe_error_text(e),
             )
+            if str(order.get("status") or "").lower() in {
+                "closed",
+                "filled",
+                "partially_filled",
+                "partial",
+            }:
+                return {
+                    **order,
+                    "status": "open",
+                    "filled": 0.0,
+                    "okx_native_order_detail_unavailable": True,
+                }
         return order
+
+    async def _fetch_native_order_detail(
+        self,
+        ccxt: Any,
+        order_id: Any,
+        symbol: str,
+    ) -> dict[str, Any] | None:
+        """Read one order through OKX native instId/ordId instead of CCXT symbol aliases."""
+
+        native_fetch = getattr(ccxt, "privateGetTradeOrder", None)
+        if not callable(native_fetch):
+            raise ExchangeAPIError("OKX native order detail API is unavailable")
+        ord_id = str(order_id or "").strip()
+        inst_id = okx_inst_id_from_symbol(symbol)
+        if not ord_id or not inst_id:
+            raise ExchangeAPIError(
+                f"Cannot fetch OKX native order detail: instId={inst_id!r}, ordId={ord_id!r}"
+            )
+        response = await self._with_retry(
+            native_fetch,
+            {
+                "instId": inst_id,
+                "ordId": ord_id,
+            },
+        )
+        rows = response.get("data") if isinstance(response, dict) else None
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        if not isinstance(row, dict):
+            return None
+        return self._native_order_detail_to_execution_order(row, symbol=symbol)
+
+    def _native_order_detail_to_execution_order(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> dict[str, Any]:
+        inst_id = str(row.get("instId") or okx_inst_id_from_symbol(symbol) or "").strip()
+        ord_id = str(row.get("ordId") or row.get("clOrdId") or "").strip()
+        side = str(row.get("side") or "").lower()
+        order_type = str(row.get("ordType") or "").lower() or "market"
+        state = str(row.get("state") or "").lower()
+        avg_px = self._safe_float(row.get("avgPx"), 0.0)
+        px = self._safe_float(row.get("px"), 0.0)
+        fee = abs(self._safe_float(row.get("fee"), 0.0))
+        return {
+            "id": ord_id,
+            "symbol": inst_id or symbol,
+            "side": side,
+            "type": order_type,
+            "status": state,
+            "amount": self._safe_float(row.get("sz"), 0.0),
+            "filled": self._safe_float(row.get("accFillSz") or row.get("fillSz"), 0.0),
+            "price": px or avg_px,
+            "average": avg_px or px,
+            "fee": {"cost": fee} if fee else {},
+            "info": dict(row),
+            "okx_native_order_detail": True,
+            "canonical_exchange_symbol": normalize_trading_symbol(inst_id or symbol),
+        }
 
     def _order_status_from_ccxt(self, status: str | None) -> OrderStatus:
         status_map = {
@@ -2221,6 +2395,34 @@ class OKXExecutor(AbstractExecutor):
             return inst_id
         return str(okx_symbol or "").replace("/", "-").replace(":USDT", "-SWAP")
 
+    async def _fetch_native_ticker(self, symbol: str) -> dict[str, Any]:
+        """Fetch OKX public ticker by native instId for execution sizing."""
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        if not inst_id:
+            raise ExchangeAPIError(f"Cannot resolve OKX instId for ticker: {symbol}")
+        ccxt = await self._get_ccxt()
+        fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
+        if not callable(fetch_ticker):
+            raise ExchangeAPIError("OKX native market ticker API is unavailable")
+        response = await self._with_retry(fetch_ticker, {"instId": inst_id})
+        rows = response.get("data") if isinstance(response, dict) else None
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        if not isinstance(row, dict):
+            row = {}
+        last = self._safe_float(row.get("last") or row.get("lastPx"), 0.0)
+        if last <= 0:
+            raise ExchangeAPIError(f"OKX native ticker has no positive last price: {inst_id}")
+        return {
+            "symbol": normalize_trading_symbol(inst_id),
+            "id": inst_id,
+            "last": last,
+            "bid": self._safe_float(row.get("bidPx"), 0.0),
+            "ask": self._safe_float(row.get("askPx"), 0.0),
+            "timestamp": int(self._safe_float(row.get("ts"), 0.0)),
+            "info": dict(row),
+        }
+
     @staticmethod
     def _format_okx_number(value: float) -> str:
         try:
@@ -2236,6 +2438,126 @@ class OKXExecutor(AbstractExecutor):
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    def _exit_position_mismatch_diagnostics(
+        self,
+        positions: list[dict[str, Any]] | None,
+        *,
+        decision_symbol: str,
+        okx_symbol: str,
+        target_side: str,
+        exit_side: str,
+        source: str,
+    ) -> dict[str, Any]:
+        expected_symbol = normalize_trading_symbol(decision_symbol)
+        expected_inst_id = okx_inst_id_from_symbol(decision_symbol)
+        rows = [
+            self._exit_position_candidate_diagnostic(
+                position,
+                expected_symbol=expected_symbol,
+                target_side=target_side,
+            )
+            for position in positions or []
+            if isinstance(position, dict)
+        ]
+        matching_contracts = [
+            self._safe_float(row.get("contracts"), 0.0)
+            for row in rows
+            if row.get("matches_expected_symbol")
+            and row.get("matches_target_side")
+            and self._safe_float(row.get("contracts"), 0.0) > 0
+        ]
+        nonzero_same_symbol_sides = sorted(
+            {
+                str(row.get("side") or "")
+                for row in rows
+                if row.get("matches_expected_symbol")
+                and self._safe_float(row.get("contracts"), 0.0) > 0
+            }
+        )
+        return {
+            "source": source,
+            "decision_symbol": decision_symbol,
+            "normalized_decision_symbol": expected_symbol,
+            "expected_okx_inst_id": expected_inst_id,
+            "okx_symbol": okx_symbol,
+            "target_position_side": target_side,
+            "exit_order_side": exit_side,
+            "positions_returned": len(rows),
+            "matching_position_count": len(matching_contracts),
+            "matching_contracts_total": round(sum(matching_contracts), 12),
+            "nonzero_same_symbol_sides": nonzero_same_symbol_sides,
+            "candidates": rows[:20],
+            "candidate_limit_applied": len(rows) > 20,
+        }
+
+    def _exit_position_candidate_diagnostic(
+        self,
+        position: dict[str, Any],
+        *,
+        expected_symbol: str,
+        target_side: str,
+    ) -> dict[str, Any]:
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        snapshot = parse_exchange_position_snapshot(
+            position,
+            symbol_normalizer=normalize_trading_symbol,
+        )
+        symbol = normalize_trading_symbol(
+            (snapshot or {}).get("symbol")
+            or info.get("instId")
+            or position.get("symbol")
+            or ""
+        )
+        raw_symbol = str(
+            (snapshot or {}).get("raw_symbol")
+            or info.get("instId")
+            or position.get("symbol")
+            or ""
+        ).strip()
+        side = str(
+            (snapshot or {}).get("side")
+            or position.get("side")
+            or info.get("posSide")
+            or ""
+        ).lower()
+        contracts = abs(
+            self._safe_float((snapshot or {}).get("contracts"), 0.0)
+            or self._position_contracts(position)
+        )
+        quantity = abs(self._safe_float((snapshot or {}).get("quantity"), 0.0))
+        contract_size = abs(
+            self._safe_float((snapshot or {}).get("contract_size"), 0.0)
+            or self._safe_float(position.get("contractSize"), 0.0)
+            or self._safe_float(info.get("ctVal"), 0.0)
+        )
+        matches_symbol = bool(symbol and expected_symbol and symbol == expected_symbol)
+        matches_side = bool(side and target_side and side == target_side)
+        reasons: list[str] = []
+        if not matches_symbol:
+            reasons.append("symbol_mismatch")
+        if not matches_side:
+            reasons.append("side_mismatch")
+        if contracts <= 0 and quantity <= 0:
+            reasons.append("zero_contracts")
+        if not reasons:
+            reasons.append("matches")
+        return {
+            "raw_symbol": raw_symbol,
+            "symbol": symbol,
+            "expected_symbol": expected_symbol,
+            "matches_expected_symbol": matches_symbol,
+            "side": side,
+            "target_side": target_side,
+            "matches_target_side": matches_side,
+            "contracts": contracts,
+            "quantity": quantity,
+            "contract_size": contract_size,
+            "entry_price": self._safe_float((snapshot or {}).get("entry_price"), 0.0),
+            "mark_price": self._safe_float((snapshot or {}).get("mark_price"), 0.0),
+            "upl": self._safe_float((snapshot or {}).get("upl"), 0.0),
+            "reason": ",".join(reasons),
+        }
 
     def _is_contract_delivery_error(self, message: Any) -> bool:
         text = str(message or "").lower()
@@ -2308,6 +2630,33 @@ class OKXExecutor(AbstractExecutor):
         except (TypeError, ValueError):
             return 0.0
 
+    def _position_matches_exit_side(
+        self,
+        position: dict[str, Any],
+        target_side: str,
+        *,
+        decision_symbol: str | None = None,
+    ) -> bool:
+        expected_symbol = normalize_trading_symbol(decision_symbol)
+        snapshot = parse_exchange_position_snapshot(
+            position,
+            symbol_normalizer=normalize_trading_symbol,
+        )
+        if snapshot:
+            if expected_symbol and snapshot.get("symbol") != expected_symbol:
+                return False
+            side = str(snapshot.get("side") or "").lower()
+            contracts = self._safe_float(snapshot.get("contracts"), 0.0)
+            quantity = self._safe_float(snapshot.get("quantity"), 0.0)
+            return side == target_side and max(abs(contracts), abs(quantity)) > 0
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        if expected_symbol:
+            symbol = normalize_trading_symbol(info.get("instId") or position.get("symbol"))
+            if not symbol or symbol != expected_symbol:
+                return False
+        side = str(position.get("side") or info.get("posSide") or "").lower()
+        return side == target_side and self._position_contracts(position) > 0
+
     def _okx_position_side(self, position: dict[str, Any], target_side: str) -> str:
         """Return the OKX position side to submit for a close order."""
         info = position.get("info") or {}
@@ -2319,22 +2668,22 @@ class OKXExecutor(AbstractExecutor):
     async def _position_contracts_for_side(self, symbol: str, side: str) -> float:
         positions = await self.get_positions_strict(symbol)
         for position in positions or []:
-            if position.get("side") == side:
+            if self._position_matches_exit_side(position, side, decision_symbol=symbol):
                 return self._position_contracts(position)
         return 0.0
 
     async def _find_active_exit_order(self, ccxt, okx_symbol: str, side: str) -> dict | None:
         """Return an active reduce-only close order for the same symbol and side."""
         try:
-            orders = await self._with_retry(ccxt.fetch_open_orders, okx_symbol)
+            orders = await self.get_open_orders_strict(okx_symbol)
         except Exception as e:
             logger.warning(
-                "fetch open exit orders failed",
+                "fetch native open exit orders failed",
                 symbol=okx_symbol,
                 side=side,
                 error=safe_error_text(e),
             )
-            return None
+            raise
 
         for order in orders or []:
             info = order.get("info") or {}
@@ -2356,15 +2705,15 @@ class OKXExecutor(AbstractExecutor):
     async def _find_active_entry_order(self, ccxt, okx_symbol: str, side: str) -> dict | None:
         """Return an active non-reduce-only entry order for the same symbol/side."""
         try:
-            orders = await self._with_retry(ccxt.fetch_open_orders, okx_symbol)
+            orders = await self.get_open_orders_strict(okx_symbol)
         except Exception as e:
             logger.warning(
-                "fetch open entry orders failed",
+                "fetch native open entry orders failed",
                 symbol=okx_symbol,
                 side=side,
                 error=safe_error_text(e),
             )
-            return None
+            raise
 
         for order in orders or []:
             info = order.get("info") or {}
@@ -2434,7 +2783,7 @@ class OKXExecutor(AbstractExecutor):
     ) -> dict[str, Any]:
         """Cancel a stale close order before submitting a fresher reduce-only close."""
         try:
-            await self._with_retry(ccxt.cancel_order, order_id, okx_symbol)
+            await self._cancel_order_native(ccxt, order_id, okx_symbol)
             logger.warning(
                 "stale OKX exit order cancelled for replace",
                 symbol=okx_symbol,
@@ -2898,11 +3247,54 @@ class OKXExecutor(AbstractExecutor):
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         ccxt = await self._get_ccxt()
         try:
-            await self._with_retry(ccxt.cancel_order, order_id, symbol)
+            await self._cancel_order_native(ccxt, order_id, symbol)
             return True
         except Exception as e:
             logger.error("cancel order failed", order_id=order_id, error=safe_error_text(e))
             return False
+
+    async def _cancel_order_native(
+        self,
+        ccxt: Any,
+        order_id: Any,
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Cancel an OKX order by native instId/ordId, not CCXT symbol aliases."""
+
+        cancel = getattr(ccxt, "privatePostTradeCancelOrder", None)
+        if not callable(cancel):
+            raise ExchangeAPIError("OKX native cancel-order API is unavailable")
+        inst_id = okx_inst_id_from_symbol(symbol)
+        ord_id = str(order_id or "").strip()
+        if not inst_id or not ord_id:
+            raise ExchangeAPIError(
+                f"Cannot cancel OKX native order: instId={inst_id!r}, ordId={ord_id!r}"
+            )
+        params = {"instId": inst_id, "ordId": ord_id}
+        response = await self._with_retry(cancel, params)
+        self._raise_if_native_cancel_failed(response, order_id=ord_id, symbol=inst_id)
+        return response if isinstance(response, dict) else {"response": response}
+
+    def _raise_if_native_cancel_failed(
+        self,
+        response: Any,
+        *,
+        order_id: str,
+        symbol: str,
+    ) -> None:
+        payload = response if isinstance(response, dict) else {}
+        rows = payload.get("data") if isinstance(payload.get("data"), list) else []
+        first = rows[0] if rows and isinstance(rows[0], dict) else {}
+        code = str(payload.get("code") or "")
+        s_code = str(first.get("sCode") or "")
+        if code in {"", "0"} and s_code in {"", "0"}:
+            return
+        message = (
+            first.get("sMsg")
+            or payload.get("msg")
+            or f"OKX native cancel failed for {symbol} {order_id}"
+        )
+        raise ExchangeAPIError(str(message))
 
     def _leverage_cache_key(self, okx_symbol: str, params: dict[str, Any]) -> tuple[str, str]:
         return (okx_symbol, str(params.get("mgnMode") or params.get("tdMode") or "cross"))
@@ -2959,7 +3351,7 @@ class OKXExecutor(AbstractExecutor):
     async def _reduce_open_orders_for_leverage_retry(self, ccxt, okx_symbol: str) -> dict[str, Any]:
         """Cancel stale non-reduce-only entry orders only when OKX blocks leverage changes."""
         try:
-            orders = await self._with_retry(ccxt.fetch_open_orders, okx_symbol)
+            orders = await self.get_open_orders_strict(okx_symbol)
         except Exception as e:
             return {
                 "checked": False,
@@ -2985,7 +3377,7 @@ class OKXExecutor(AbstractExecutor):
             if not order_id:
                 continue
             try:
-                await self._with_retry(ccxt.cancel_order, order_id, okx_symbol)
+                await self._cancel_order_native(ccxt, order_id, okx_symbol)
                 cancelled += 1
             except Exception as e:
                 errors.append(safe_error_text(e, limit=160))
@@ -3406,20 +3798,19 @@ class OKXExecutor(AbstractExecutor):
         """Return the CCXT symbol for an app symbol, honoring OKX native instIds."""
 
         candidate = self._to_swap_symbol(symbol)
+        requested_symbol = normalize_trading_symbol(symbol)
         try:
             await self._ensure_markets_loaded()
             ccxt = await self._get_ccxt()
             try:
-                ccxt.market(candidate)
                 market = ccxt.market(candidate)
-                native_symbol = symbol_from_okx_payload(market, fallback=symbol)
-                requested_symbol = normalize_trading_symbol(symbol)
+                native_symbol = symbol_from_okx_market(market, fallback=symbol)
                 if native_symbol and requested_symbol and native_symbol != requested_symbol:
                     raise ExchangeAPIError(
                         "OKX market symbol mismatch: "
                         f"requested {requested_symbol}, exchange instrument is {native_symbol}"
                     )
-                return candidate
+                return str(market.get("symbol") or candidate)
             except Exception as exc:
                 if isinstance(exc, ExchangeAPIError):
                     raise
@@ -3434,15 +3825,51 @@ class OKXExecutor(AbstractExecutor):
             by_id = (getattr(ccxt, "markets_by_id", None) or {}).get(market_id)
             markets = by_id if isinstance(by_id, list) else [by_id] if by_id else []
             for market in markets:
-                if isinstance(market, dict) and market.get("symbol"):
-                    return str(market["symbol"])
+                if not isinstance(market, dict) or not market.get("symbol"):
+                    continue
+                info = market.get("info") if isinstance(market.get("info"), dict) else {}
+                native_inst_id = str(info.get("instId") or market.get("id") or "").strip()
+                native_symbol = symbol_from_okx_market(market, fallback=symbol)
+                if native_symbol and requested_symbol and native_symbol != requested_symbol:
+                    logger.warning(
+                        "OKX markets_by_id returned mismatched instrument; ignoring candidate",
+                        requested_symbol=requested_symbol,
+                        market_id=market_id,
+                        market_symbol=market.get("symbol"),
+                        native_symbol=native_symbol,
+                    )
+                    continue
+                market_symbol = normalize_trading_symbol(market.get("symbol"))
+                if (
+                    native_inst_id
+                    and requested_symbol
+                    and market_symbol
+                    and market_symbol != requested_symbol
+                ):
+                    logger.warning(
+                        "OKX markets_by_id symbol is an alias; using native instId",
+                        requested_symbol=requested_symbol,
+                        market_id=market_id,
+                        market_symbol=market.get("symbol"),
+                        native_inst_id=native_inst_id,
+                    )
+                    return native_inst_id
+                return str(market["symbol"])
             positions = await self.get_positions_strict(symbol)
             for position in positions or []:
                 info = position.get("info") or {}
                 native_position_symbol = str(
-                    position.get("symbol") or info.get("instId") or ""
+                    info.get("instId") or position.get("symbol") or ""
                 ).strip()
-                if native_position_symbol:
+                native_symbol = symbol_from_okx_payload(
+                    {"symbol": native_position_symbol, "info": info},
+                    fallback=symbol,
+                )
+                if (
+                    native_position_symbol
+                    and requested_symbol
+                    and native_symbol == requested_symbol
+                ):
                     logger.warning(
                         "OKX swap symbol resolved from existing position snapshot",
                         symbol=symbol,
@@ -3729,40 +4156,20 @@ class OKXExecutor(AbstractExecutor):
         }
 
     async def get_positions(self, symbol: str | None = None) -> list[dict]:
-        await self._ensure_markets_loaded()
-        ccxt = await self._get_ccxt()
         try:
-            symbols = [self._to_swap_symbol(symbol)] if symbol else None
-            positions = await self._with_retry(ccxt.fetch_positions, symbols)
-            return positions
+            return await self.get_positions_strict(symbol)
         except Exception as e:
-            logger.error("fetch positions failed", error=safe_error_text(e))
+            logger.error(
+                "fetch OKX-native positions failed",
+                symbol=symbol,
+                error=safe_error_text(e),
+            )
             return []
 
     async def get_positions_strict(self, symbol: str | None = None) -> list[dict]:
-        """Fetch positions and let errors propagate so reconciliation can trust an empty result."""
-        await self._ensure_markets_loaded()
-        ccxt = await self._get_ccxt()
-        symbols = [self._to_swap_symbol(symbol)] if symbol else None
-        try:
-            return await self._with_retry(ccxt.fetch_positions, symbols)
-        except Exception as exc:
-            if not symbol or not self._is_missing_market_symbol_error(safe_error_text(exc)):
-                raise
-            positions = await self._with_retry(ccxt.fetch_positions, None)
-            matched = [
-                position
-                for position in positions or []
-                if isinstance(position, dict) and self._position_matches_symbol(position, symbol)
-            ]
-            if matched:
-                logger.warning(
-                    "OKX symbol-specific position lookup missing from market cache; using account-wide position match",
-                    symbol=symbol,
-                    matched=len(matched),
-                )
-                return matched
-            return []
+        """Fetch authoritative OKX-native positions and propagate failures."""
+        inst_ids = [okx_inst_id_from_symbol(symbol)] if symbol else None
+        return await self._native_facts_client().fetch_positions(inst_ids=inst_ids)
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None
@@ -3777,91 +4184,16 @@ class OKXExecutor(AbstractExecutor):
             return []
 
     async def get_open_orders_strict(self, symbol: str | None = None) -> list[dict]:
-        """Fetch open orders and let errors propagate for reconciliation safety."""
-        await self._ensure_markets_loaded()
-        ccxt = await self._get_ccxt()
-        return await self._with_retry(
-            ccxt.fetch_open_orders,
-            self._to_swap_symbol(symbol) if symbol else None,
-        )
+        """Fetch authoritative OKX-native pending orders and propagate failures."""
+        inst_ids = [okx_inst_id_from_symbol(symbol)] if symbol else None
+        return await self._native_facts_client().fetch_open_orders(inst_ids=inst_ids)
 
     async def get_position_protection_orders(self, symbol: str | None = None) -> list[dict]:
-        """Fetch active OKX TP/SL algo orders that protect open positions."""
-        await self._ensure_markets_loaded()
-        ccxt = await self._get_ccxt()
-        okx_symbol = self._to_swap_symbol(symbol) if symbol else None
-        protection_orders: list[dict] = []
-
-        for ord_type in ("oco", "conditional", "trigger"):
-            try:
-                orders = await self._with_retry(
-                    ccxt.fetch_open_orders,
-                    okx_symbol,
-                    None,
-                    100,
-                    {"ordType": ord_type},
-                )
-            except Exception as e:
-                logger.warning(
-                    "fetch OKX protection orders failed",
-                    symbol=okx_symbol,
-                    ord_type=ord_type,
-                    error=safe_error_text(e),
-                )
-                continue
-
-            for order in orders or []:
-                info = order.get("info") or {}
-                state = str(order.get("status") or info.get("state") or "").lower()
-                if state and state not in {"open", "live", "pending"}:
-                    continue
-
-                reduce_only = order.get("reduceOnly")
-                if reduce_only in (None, ""):
-                    reduce_only = info.get("reduceOnly")
-                if str(reduce_only).lower() != "true":
-                    continue
-
-                take_profit = self._safe_float(
-                    order.get("takeProfitPrice") or info.get("tpTriggerPx"),
-                    0.0,
-                )
-                stop_loss = self._safe_float(
-                    order.get("stopLossPrice") or info.get("slTriggerPx"),
-                    0.0,
-                )
-                trigger_price = self._safe_float(
-                    order.get("triggerPrice") or info.get("triggerPx"),
-                    0.0,
-                )
-                if take_profit <= 0 and stop_loss <= 0 and trigger_price <= 0:
-                    continue
-
-                close_side = str(order.get("side") or info.get("side") or "").lower()
-                pos_side = str(info.get("posSide") or "").lower()
-                if pos_side not in {"long", "short"}:
-                    pos_side = "short" if close_side == "buy" else "long"
-
-                protection_orders.append(
-                    {
-                        "symbol": self._from_swap_symbol(
-                            order.get("symbol") or info.get("instId") or symbol
-                        ),
-                        "position_side": pos_side,
-                        "close_side": close_side,
-                        "order_type": info.get("ordType") or order.get("type") or ord_type,
-                        "take_profit_price": take_profit if take_profit > 0 else None,
-                        "stop_loss_price": stop_loss if stop_loss > 0 else None,
-                        "trigger_price": trigger_price if trigger_price > 0 else None,
-                        "algo_id": info.get("algoId") or order.get("id"),
-                        "updated_at_ms": self._safe_float(
-                            info.get("uTime") or info.get("cTime"), 0.0
-                        ),
-                        "raw": order,
-                    }
-                )
-
-        return protection_orders
+        """Fetch active OKX-native TP/SL algo orders that protect open positions."""
+        inst_ids = [okx_inst_id_from_symbol(symbol)] if symbol else None
+        return await self._native_facts_client().fetch_position_protection_orders(
+            inst_ids=inst_ids,
+        )
 
     async def _get_ccxt(self):
         if self._exchange is None:

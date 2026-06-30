@@ -11,7 +11,7 @@ FAKE_BEARER_ERROR = "Authorization: Bearer " + "dashboard-balance-secret failed"
 
 
 class FailingExecutor:
-    async def get_positions(self) -> list[dict[str, Any]]:
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
         raise RuntimeError("exchange unavailable")
 
 
@@ -91,7 +91,7 @@ class PositionExecutor:
     def __init__(self, positions: list[dict[str, Any]]) -> None:
         self.positions = positions
 
-    async def get_positions(self) -> list[dict[str, Any]]:
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
         return self.positions
 
 
@@ -169,7 +169,7 @@ async def test_exchange_open_symbols_fallback_logs_and_uses_stale_cache(
     assert result == {"BTC/USDT"}
     assert dashboard_fallback_events == [
         {
-            "event": "exchange open position symbols fallback",
+            "event": "exchange open position symbols strict read unavailable",
             "error": "exchange unavailable",
             "mode": "paper",
             "has_cached": True,
@@ -195,7 +195,7 @@ async def test_exchange_mark_map_fallback_logs_and_uses_stale_cache(
     assert result == cached_mark
     assert dashboard_fallback_events == [
         {
-            "event": "exchange mark map fallback",
+            "event": "exchange mark map strict read unavailable",
             "error": "exchange unavailable",
             "mode": "paper",
             "has_cached": True,
@@ -229,8 +229,8 @@ async def test_exchange_mark_map_uses_short_timeout(
     result = await dashboard._get_exchange_position_mark_map("paper")
 
     assert result == cached_mark
-    assert waits == [1.2]
-    assert dashboard_fallback_events[0]["event"] == "exchange mark map fallback"
+    assert waits == [dashboard._DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS]
+    assert dashboard_fallback_events[0]["event"] == "exchange mark map strict read unavailable"
     assert dashboard_fallback_events[0]["has_cached"] is True
 
 
@@ -282,6 +282,42 @@ async def test_exchange_mark_map_uses_okx_info_markpx_upl_and_contract_size(
     assert valuation["current_price"] == pytest.approx(0.4059)
     assert valuation["unrealized_pnl"] == pytest.approx(-0.82)
     assert valuation["pnl_source"] == "okx_position_upl"
+
+
+async def test_open_position_symbols_do_not_use_paper_executor_memory_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PaperExecutor:
+        async def get_positions(self) -> list[dict[str, Any]]:
+            raise AssertionError("dashboard open symbols must use OKX strict snapshots")
+
+    class TradingService:
+        paper_executor = PaperExecutor()
+
+        def okx_executor_for_dashboard(self, mode: str) -> Any | None:
+            return PositionExecutor(
+                [
+                    {
+                        "symbol": "OKX/USDT:USDT",
+                        "side": "long",
+                        "contracts": 1,
+                        "info": {
+                            "instId": "OKX-USDT-SWAP",
+                            "pos": "1",
+                            "ctVal": "1",
+                            "avgPx": "1",
+                            "markPx": "1.1",
+                        },
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(dashboard, "_trading_service", TradingService())
+    monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+
+    result = await dashboard._get_open_position_symbols("paper")
+
+    assert result == {"OKX/USDT"}
 
 
 async def test_open_position_ticker_prefers_okx_mark_price(

@@ -31,6 +31,10 @@ def test_dynamic_route_shadow_only_reduces_noncore_experts_without_baseline() ->
     assert route["skipped_experts"] == ["sentiment_expert", "position_expert"]
     assert "competition_baseline_missing" in route["blocking_reasons"]
     assert "ml_readiness_blocks_live_route" in route["blocking_reasons"]
+    assert route["canary_ready"] is False
+    assert route["live_ready"] is False
+    assert "walk_forward_required" in route["live_blocking_reasons"]
+    assert "live_mutation_not_enabled" in route["live_blocking_reasons"]
     assert route["estimated_call_reduction"] == 2
     assert route["expert_reasons"]["risk_expert"] == ["mandatory_safety_expert"]
 
@@ -58,6 +62,14 @@ def test_dynamic_route_keeps_sentiment_for_news_events_even_if_health_is_weak() 
     assert "health_weak_but_event_required" in route["expert_reasons"]["sentiment_expert"]
     assert "sentiment_expert" not in route["skipped_experts"]
     assert route["applied_to_live_calls"] is False
+    assert route["mode"] == "canary_ready"
+    assert route["canary_ready"] is True
+    assert route["live_ready"] is False
+    assert route["live_blocking_reasons"] == [
+        "model_stage_not_live",
+        "walk_forward_required",
+        "live_mutation_not_enabled",
+    ]
 
 
 def test_dynamic_route_keeps_risk_expert_for_high_risk_market() -> None:
@@ -80,6 +92,59 @@ def test_dynamic_route_keeps_risk_expert_for_high_risk_market() -> None:
     assert "high_risk_market" in route["expert_reasons"]["risk_expert"]
     assert "mandatory_safety_kept_despite_health" in route["expert_reasons"]["risk_expert"]
     assert route["mandatory_safety_experts"] == ["risk_expert"]
+
+
+def test_dynamic_route_live_requested_requires_walk_forward_and_explicit_enablement() -> None:
+    features = FeatureVector(symbol="BTC/USDT")
+
+    blocked = plan_dynamic_model_route(
+        features,
+        {"candidate_quality": "high"},
+        competition={"baseline": {"sample_count": 20}, "blocking_reasons": []},
+        feature_coverage={"status": "ok", "missing_features": []},
+        requested_stage="live",
+        training_governance={
+            "training_mode": "shadow",
+            "model_stage": "canary",
+            "evaluation_policy": {
+                "promotion_flow": "shadow_to_canary_to_live",
+                "live_mutation": False,
+                "requires_walk_forward": True,
+            },
+        },
+    )
+
+    assert blocked["mode"] == "live_blocked"
+    assert blocked["canary_ready"] is True
+    assert blocked["live_ready"] is False
+    assert blocked["blocking_reasons"] == [
+        "model_stage_not_live",
+        "walk_forward_required",
+        "live_mutation_not_enabled",
+    ]
+
+    ready = plan_dynamic_model_route(
+        features,
+        {"candidate_quality": "high"},
+        competition={"baseline": {"sample_count": 20}, "blocking_reasons": []},
+        feature_coverage={"status": "ok", "missing_features": []},
+        requested_stage="live",
+        training_governance={
+            "training_mode": "walk_forward",
+            "model_stage": "live",
+            "evaluation_policy": {
+                "promotion_flow": "shadow_to_canary_to_live",
+                "live_mutation": True,
+                "requires_walk_forward": True,
+            },
+        },
+    )
+
+    assert ready["mode"] == "live_ready"
+    assert ready["live_ready"] is True
+    assert ready["blocking_reasons"] == []
+    assert ready["live_route_mutation"] is False
+    assert ready["can_apply_live_route"] is False
 
 
 def test_ensemble_coordinator_attaches_shadow_routing_without_live_mutation() -> None:
@@ -123,6 +188,10 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "skipped_experts": ["sentiment_expert", "position_expert"],
                     "estimated_call_reduction": 2,
                     "blocking_reasons": ["competition_baseline_missing"],
+                    "live_blocking_reasons": [
+                        "competition_baseline_missing",
+                        "model_stage_not_live",
+                    ],
                     "applied_to_live_calls": False,
                     "live_route_mutation": False,
                 },
@@ -141,6 +210,8 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "skipped_experts": ["sentiment_expert", "position_expert"],
                     "estimated_call_reduction": 2,
                     "blocking_reasons": ["feature_coverage_missing"],
+                    "live_ready": False,
+                    "live_blocking_reasons": ["feature_coverage_missing"],
                     "applied_to_live_calls": True,
                     "live_route_mutation": True,
                 },
@@ -158,6 +229,8 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
     assert report["summary"]["shadow_only_count"] == 2
     assert report["summary"]["estimated_call_reduction"] == 4
     assert report["summary"]["unsafe_live_mutation_attempts"] == 1
+    assert report["summary"]["live_ready_count"] == 0
+    assert report["summary"]["live_blocked_count"] == 2
     assert report["safety_observations"]["weak_evidence_executed_count"] == 1
     assert report["blocking_reason_counts"]["competition_baseline_missing"] == 1
     assert report["blocking_reason_counts"]["feature_coverage_missing"] == 1

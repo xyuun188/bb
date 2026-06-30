@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from config.settings import settings
+from data_feed.feature_vector import FeatureVector
 from services.local_ai_tools_client import LocalAIToolsClient
 
 
@@ -109,6 +110,38 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
     assert result["sentiment_analysis"]["duration_sec"] > 0
 
 
+def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> None:
+    client = LocalAIToolsClient()
+    features = FeatureVector(
+        symbol="BTC/USDT",
+        close_sequence=[float(index) for index in range(120)],
+        volume_sequence=[float(index * 10) for index in range(120)],
+        sequence_timeframe="1m",
+    )
+
+    payload = client._feature_payload(features)
+    snapshot = payload["features"]
+
+    assert payload["symbol"] == "BTC/USDT"
+    assert snapshot["close_sequence"] == [float(index) for index in range(40, 120)]
+    assert snapshot["volume_sequence"] == [float(index * 10) for index in range(40, 120)]
+    assert snapshot["sequence_timeframe"] == "1m"
+    assert snapshot["sequence_length"] == 80
+
+
+def _healthy_paper_observation() -> dict[str, object]:
+    return {
+        "status": "healthy",
+        "paper_active": True,
+        "can_use_for_promotion": True,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "changes_model_routing": False,
+        "blockers": [],
+        "warnings": [],
+    }
+
+
 @pytest.mark.asyncio
 async def test_local_ai_tools_train_sends_training_cursors(
     local_tools_settings: None,
@@ -134,13 +167,103 @@ async def test_local_ai_tools_train_sends_training_cursors(
         [{"id": 2}],
         completed_shadow_sample_count=1234,
         completed_trade_sample_count=56,
+        raw_trade_sample_count=80,
+        trainable_trade_sample_count=56,
+        quarantined_trade_sample_count=24,
+        trade_sample_cursor_policy="clean_training_view_only",
+        promotion_recommendation={
+            "policy": "phase3_shadow_to_canary_to_live",
+            "recommended_stage": "shadow",
+        },
     )
 
     assert result["trained"] is True
     assert captured["path"] == "/train"
     assert captured["payload"]["completed_shadow_sample_count"] == 1234
     assert captured["payload"]["completed_trade_sample_count"] == 56
+    assert captured["payload"]["raw_trade_sample_count"] == 80
+    assert captured["payload"]["trainable_trade_sample_count"] == 56
+    assert captured["payload"]["quarantined_trade_sample_count"] == 24
+    assert captured["payload"]["trade_sample_cursor_policy"] == "clean_training_view_only"
+    assert captured["payload"]["training_mode"] == "shadow"
+    assert captured["payload"]["model_stage"] == "shadow"
+    assert captured["payload"]["evaluation_policy"]["promotion_flow"] == "shadow_to_canary_to_live"
+    assert captured["payload"]["evaluation_policy"]["live_mutation"] is False
+    assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
+    assert captured["payload"]["persist_artifact"] is False
+    assert captured["payload"]["confirm_phase3_rebuild"] is False
+    assert captured["payload"]["promotion_recommendation"]["recommended_stage"] == "shadow"
     assert captured["request_timeout"] == 180.0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_train_can_explicitly_request_confirmed_rebuild(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    captured: dict[str, Any] = {}
+
+    async def succeed(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"trained": True, "artifact_persisted": True}
+
+    monkeypatch.setattr(client, "_post", succeed)
+
+    result = await client.train(
+        [{"id": 1}],
+        [{"id": 2}],
+        persist_artifact=True,
+        confirm_phase3_rebuild=True,
+    )
+
+    assert result == {"trained": True, "artifact_persisted": True}
+    assert captured["path"] == "/train"
+    assert captured["payload"]["persist_artifact"] is True
+    assert captured["payload"]["confirm_phase3_rebuild"] is True
+    assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
+    assert captured["payload"]["evaluation_policy"]["live_mutation"] is False
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_train_builds_default_promotion_recommendation(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    captured: dict[str, Any] = {}
+
+    async def succeed(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        captured["payload"] = payload
+        return {"trained": True}
+
+    monkeypatch.setattr(client, "_post", succeed)
+
+    await client.train(
+        [{"id": 1}],
+        [{"id": 2}],
+        completed_shadow_sample_count=150,
+        completed_trade_sample_count=30,
+        quality_report={"totals": {"total": 180, "excluded": 0, "effective_weight_ratio": 0.9}},
+        governance_report={"trainable_sample_count": 180, "contamination_risk": "low"},
+        paper_observation_report=_healthy_paper_observation(),
+    )
+
+    recommendation = captured["payload"]["promotion_recommendation"]
+    assert recommendation["policy"] == "phase3_shadow_to_canary_to_live"
+    assert recommendation["canary_ready"] is True
+    assert recommendation["live_ready"] is False
+    assert "walk_forward_required" in recommendation["live_blocking_reasons"]
+    assert captured["payload"]["paper_observation_report"]["status"] == "healthy"
 
 
 @pytest.mark.asyncio
@@ -252,6 +375,39 @@ def test_local_ai_tools_normalizes_wrapped_prediction_payloads(
     assert timeseries["expected_return_pct"] == 0.16
     assert sentiment["side"] == "short"
     assert sentiment["available"] is True
+    assert profit["primary_model"] == "profit_v1_baseline"
+    assert profit["model_version"] == "local_ai_tools.v1"
+    assert profit["route_mode"] == "shadow_observation"
+    assert profit["feature_coverage"] == {"ratio": None, "status": "not_reported"}
+    assert timeseries["primary_model"] == "timeseries_v1_baseline"
+    assert sentiment["primary_model"] == "sentiment_v1_baseline"
+
+
+def test_local_ai_tools_preserves_server_reported_model_metadata(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "best_side": "long",
+            "expected_long_return_pct": 0.5,
+            "primary_model": "catboost_lgbm_profit_v2",
+            "challenger_model": "xgboost_profit_shadow",
+            "model_version": "profit-v2.20260626",
+            "route_mode": "shadow",
+            "fallback_reason": "baseline_live_only",
+            "feature_coverage": 0.75,
+        },
+    )
+
+    assert profit["primary_model"] == "catboost_lgbm_profit_v2"
+    assert profit["challenger_model"] == "xgboost_profit_shadow"
+    assert profit["model_version"] == "profit-v2.20260626"
+    assert profit["route_mode"] == "shadow"
+    assert profit["fallback_reason"] == "baseline_live_only"
+    assert profit["feature_coverage"] == {"ratio": 0.75, "status": "reported"}
 
 
 def test_local_ai_tools_exit_advice_uses_clean_chinese_labels(
@@ -372,6 +528,8 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         get_calls.append(path)
         assert request_timeout == 0.5
+        if path == "/health":
+            return {"ok": True, "service": "phase3_quant_api", "trained_models_available": False}
         return {"available": False, "message": "No trained local quant bundle found"}
 
     async def post_probe(
@@ -387,7 +545,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
 
     result = await client.status()
 
-    assert get_calls == ["/models/status"]
+    assert get_calls == ["/models/status", "/health"]
     assert set(post_calls) == {
         "/profit/predict",
         "/timeseries/deep/predict",
@@ -398,8 +556,41 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert result["model_bundle_available"] is False
     assert result["service_available"] is True
     assert result["api_base"] == "http://local-ai-tools.test"
+    assert result["enabled_for_trading"] is True
     assert result["status"] == "heuristic_fallback_available"
     assert result["child_endpoints"]["profit_prediction"]["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_probes_service_when_trading_influence_disabled(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_enabled", False)
+    client = LocalAIToolsClient()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/health":
+            return {"ok": True, "service": "phase3_quant_api"}
+        return {"available": False, "message": "No trained local quant bundle found"}
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return {"available": True, "path": path}
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert result["available"] is True
+    assert result["service_available"] is True
+    assert result["enabled_for_trading"] is False
+    assert result["status"] == "connected_trading_disabled"
+    assert client.enabled() is False
 
 
 @pytest.mark.asyncio
@@ -410,6 +601,8 @@ async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
     client = LocalAIToolsClient()
 
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/health":
+            return {"ok": True, "service": "phase3_quant_api"}
         assert path == "/models/status"
         return {
             "available": True,
@@ -434,6 +627,7 @@ async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
     assert result["service_available"] is True
     assert result["status"] == "ready"
     assert result["trained_at"] == "2026-06-23T16:58:10+00:00"
+    assert result["health_available"] is True
 
 
 @pytest.mark.asyncio
@@ -445,6 +639,8 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
 
     async def fail_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         assert request_timeout == 0.5
+        if path == "/health":
+            return {"ok": True, "service": "phase3_quant_api"}
         raise RuntimeError("models status endpoint unavailable")
 
     async def post_probe(
@@ -466,7 +662,49 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
     assert result["model_bundle_available"] is False
     assert result["status"] == "heuristic_fallback_available"
     assert result["status_error"] == "models status endpoint unavailable"
+    assert result["health_available"] is True
     assert result["child_endpoints"]["profit_prediction"]["available"] is True
+    assert result["failure_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_uses_health_when_status_and_bundle_missing(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    get_calls: list[str] = []
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        get_calls.append(path)
+        if path == "/models/status":
+            raise RuntimeError("models status endpoint unavailable")
+        return {
+            "ok": True,
+            "service": "phase3_quant_api",
+            "trained_models_available": False,
+            "shadow_sample_count": 0,
+            "completed_shadow_sample_count": 0,
+        }
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        raise RuntimeError(f"{path} unavailable")
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert get_calls == ["/models/status", "/health"]
+    assert result["available"] is True
+    assert result["service_available"] is True
+    assert result["model_bundle_available"] is False
+    assert result["status"] == "heuristic_fallback_available"
+    assert result["health_available"] is True
     assert result["failure_count"] == 0
 
 
@@ -482,6 +720,8 @@ async def test_local_ai_tools_status_uses_short_cache(
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         get_calls.append(path)
         assert request_timeout == 0.5
+        if path == "/health":
+            return {"ok": True, "service": "phase3_quant_api"}
         return {"available": False, "message": "No trained local quant bundle found"}
 
     async def post_probe(
@@ -499,7 +739,7 @@ async def test_local_ai_tools_status_uses_short_cache(
     first["child_endpoints"]["profit_prediction"]["available"] = False
     second = await client.status()
 
-    assert len(get_calls) == 1
+    assert get_calls == ["/models/status", "/health"]
     assert set(post_calls) == {
         "/profit/predict",
         "/timeseries/deep/predict",

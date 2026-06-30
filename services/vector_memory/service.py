@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -18,12 +21,14 @@ from services.vector_memory.store import VectorMemoryStore, build_vector_memory_
 from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
 logger = structlog.get_logger(__name__)
+PHASE3_VECTOR_MEMORY_RESET_MARKER = "phase3_vector_memory_reset_marker.json"
 
 
 class VectorMemoryService:
     """Index and search historical cases without blocking trading decisions."""
 
-    def __init__(self) -> None:
+    def __init__(self, data_dir: Path | None = None) -> None:
+        self._data_dir = data_dir
         self._store: VectorMemoryStore | None = None
         self._lock = asyncio.Lock()
         self._last_reindex_at: datetime | None = None
@@ -32,13 +37,17 @@ class VectorMemoryService:
         self._auto_reindex_started_at: datetime | None = None
 
     @property
+    def _base_data_dir(self) -> Path:
+        return self._data_dir or settings.data_dir
+
+    @property
     def enabled(self) -> bool:
         return bool(settings.vector_memory_enabled)
 
     def _get_store(self) -> VectorMemoryStore:
         if self._store is None:
             self._store = build_vector_memory_store(
-                settings.data_dir / "vector_memory",
+                self._base_data_dir / "vector_memory",
                 backend=settings.vector_memory_backend,
                 dimension=int(settings.vector_memory_dimension),
                 max_documents=int(settings.vector_memory_max_documents),
@@ -46,13 +55,101 @@ class VectorMemoryService:
             )
         return self._store
 
+    @staticmethod
+    def _is_recoverable_store_path_error(exc: BaseException) -> bool:
+        text = safe_error_text(exc, limit=240).lower()
+        return "path validate failed" in text
+
+    def _discard_store_after_recoverable_error(self, exc: BaseException) -> bool:
+        if not self._is_recoverable_store_path_error(exc):
+            return False
+        self._store = None
+        self._last_error = "旧向量索引目录校验失败，已隔离并准备重建。"
+        logger.warning(
+            "vector memory store reset after recoverable path validation error",
+            error=safe_error_text(exc),
+        )
+        return True
+
+    @property
+    def _reset_marker_path(self) -> Path:
+        return self._base_data_dir / "vector_memory" / PHASE3_VECTOR_MEMORY_RESET_MARKER
+
+    def _load_reset_at(self) -> datetime | None:
+        path = self._reset_marker_path
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = payload.get("reset_at") if isinstance(payload, dict) else None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    def _write_reset_marker(self, *, reason: str, reset_at: datetime) -> None:
+        path = self._reset_marker_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "reset_at": reset_at.isoformat(),
+                    "reason": reason,
+                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
     async def reset_store(self) -> None:
         """Reload the configured backend after settings change."""
 
+        await self._cancel_auto_reindex()
         async with self._lock:
             self._store = None
             self._last_error = ""
             self._last_reindex_at = None
+
+    async def clear_index(self, *, reason: str = "phase3_cold_start_reset") -> dict[str, Any]:
+        """Clear old vector-memory documents before a Phase 3 clean rebuild."""
+
+        await self._cancel_auto_reindex()
+        async with self._lock:
+            try:
+                removed = self._get_store().clear()
+                reset_at = datetime.now(UTC)
+                self._write_reset_marker(reason=reason, reset_at=reset_at)
+                self._last_error = ""
+                self._last_reindex_at = None
+                return {
+                    "enabled": self.enabled,
+                    "status": "cleared",
+                    "reason": reason,
+                    "reset_at": reset_at.isoformat(),
+                    "removed": removed,
+                    "document_count": 0,
+                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                    "store": self._get_store().stats(),
+                }
+            except Exception as exc:
+                self._last_error = safe_error_text(exc, limit=240)
+                logger.warning("vector memory clear failed", error=self._last_error)
+                return {
+                    "enabled": self.enabled,
+                    "status": "error",
+                    "reason": reason,
+                    "removed": 0,
+                    "error": self._last_error,
+                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                }
 
     async def status(self) -> dict[str, Any]:
         """Return current vector memory status."""
@@ -67,6 +164,9 @@ class VectorMemoryService:
                 "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "clean_rebuild_required": True,
+                "reset_at": _iso(self._load_reset_at()),
                 "auto_reindex_enabled": False,
                 "auto_reindex_due": False,
                 "auto_reindex_running": False,
@@ -86,9 +186,36 @@ class VectorMemoryService:
                 "path": stats.get("path"),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "clean_rebuild_required": document_count <= 0,
+                "reset_at": _iso(self._load_reset_at()),
                 **auto_state,
             }
         except Exception as exc:
+            if self._discard_store_after_recoverable_error(exc):
+                try:
+                    stats = self._get_store().stats()
+                    document_count = int(stats.get("document_count") or 0)
+                    auto_state = self._auto_reindex_state(document_count)
+                    self._last_error = ""
+                    return {
+                        "enabled": True,
+                        "backend": stats.get("backend", "unknown"),
+                        "status": "ready",
+                        "document_count": document_count,
+                        "configured_backend": settings.vector_memory_backend,
+                        "min_score": float(settings.vector_memory_min_score),
+                        "path": stats.get("path"),
+                        "last_reindex_at": _iso(self._last_reindex_at),
+                        "last_error": "",
+                        "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                        "clean_rebuild_required": document_count <= 0,
+                        "reset_at": _iso(self._load_reset_at()),
+                        "store_recovered": True,
+                        **auto_state,
+                    }
+                except Exception as retry_exc:
+                    exc = retry_exc
             self._last_error = safe_error_text(exc, limit=180)
             return {
                 "enabled": True,
@@ -99,6 +226,9 @@ class VectorMemoryService:
                 "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
+                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "clean_rebuild_required": True,
+                "reset_at": _iso(self._load_reset_at()),
                 "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
                 "auto_reindex_due": False,
                 "auto_reindex_running": self._auto_reindex_running(),
@@ -111,7 +241,8 @@ class VectorMemoryService:
             return {"enabled": False, "status": "disabled", "indexed": 0}
         async with self._lock:
             try:
-                documents = await self._load_recent_documents()
+                reset_at = self._load_reset_at()
+                documents = await self._load_recent_documents(since=reset_at)
                 indexed = self._get_store().upsert(documents)
                 self._last_reindex_at = datetime.now(UTC)
                 self._last_error = ""
@@ -119,6 +250,8 @@ class VectorMemoryService:
                     "enabled": True,
                     "status": "ok",
                     "indexed": indexed,
+                    "reset_at": _iso(reset_at),
+                    "source_filter": "phase3_reset_at_or_later" if reset_at else "current_recent",
                     "last_reindex_at": _iso(self._last_reindex_at),
                     "store": self._get_store().stats(),
                     "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
@@ -126,6 +259,32 @@ class VectorMemoryService:
                     "auto_reindex_running": False,
                 }
             except Exception as exc:
+                if self._discard_store_after_recoverable_error(exc):
+                    try:
+                        reset_at = self._load_reset_at()
+                        documents = await self._load_recent_documents(since=reset_at)
+                        indexed = self._get_store().upsert(documents)
+                        self._last_reindex_at = datetime.now(UTC)
+                        self._last_error = ""
+                        return {
+                            "enabled": True,
+                            "status": "ok",
+                            "indexed": indexed,
+                            "reset_at": _iso(reset_at),
+                            "source_filter": (
+                                "phase3_reset_at_or_later" if reset_at else "current_recent"
+                            ),
+                            "last_reindex_at": _iso(self._last_reindex_at),
+                            "store": self._get_store().stats(),
+                            "auto_reindex_enabled": bool(
+                                settings.vector_memory_auto_reindex_enabled
+                            ),
+                            "auto_reindex_due": False,
+                            "auto_reindex_running": False,
+                            "store_recovered": True,
+                        }
+                    except Exception as retry_exc:
+                        exc = retry_exc
                 self._last_error = safe_error_text(exc, limit=240)
                 logger.warning("vector memory reindex failed", error=self._last_error)
                 return {
@@ -163,6 +322,30 @@ class VectorMemoryService:
         try:
             hits = self._get_store().search(text, top_k=top_k, filters=filters)
         except Exception as exc:
+            if self._discard_store_after_recoverable_error(exc):
+                try:
+                    hits = self._get_store().search(text, top_k=top_k, filters=filters)
+                except Exception as retry_exc:
+                    exc = retry_exc
+                else:
+                    self._last_error = ""
+                    threshold = (
+                        float(settings.vector_memory_min_score)
+                        if min_score is None
+                        else float(min_score)
+                    )
+                    filtered = [hit for hit in hits if hit.score >= threshold]
+                    return {
+                        "enabled": True,
+                        "status": "ok",
+                        "backend": self._get_store().backend_name,
+                        "hits": [
+                            _hit_payload(hit)
+                            for hit in filtered[: max(int(top_k or 8), 1)]
+                        ],
+                        "min_score": threshold,
+                        "store_recovered": True,
+                    }
             self._last_error = safe_error_text(exc, limit=180)
             logger.warning("vector memory search failed", error=self._last_error)
             return {"enabled": True, "status": "error", "error": self._last_error, "hits": []}
@@ -210,8 +393,34 @@ class VectorMemoryService:
                     reason=reason,
                     indexed=result.get("indexed"),
                 )
+        except asyncio.CancelledError:
+            logger.info("vector memory auto reindex cancelled", reason=reason)
+            raise
+        except Exception as exc:
+            self._last_error = safe_error_text(exc, limit=180)
+            logger.warning("vector memory auto reindex failed", reason=reason, error=self._last_error)
         finally:
             self._auto_reindex_started_at = None
+
+    async def _cancel_auto_reindex(self) -> None:
+        task = self._auto_reindex_task
+        if task is None:
+            self._auto_reindex_started_at = None
+            return
+        if task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            self._auto_reindex_task = None
+            self._auto_reindex_started_at = None
+            return
+        if task is asyncio.current_task():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        if self._auto_reindex_task is task:
+            self._auto_reindex_task = None
+        self._auto_reindex_started_at = None
 
     def _auto_reindex_state(self, document_count: int) -> dict[str, Any]:
         interval = self._auto_reindex_interval()
@@ -235,7 +444,7 @@ class VectorMemoryService:
         if self._auto_reindex_running():
             return False
         if document_count <= 0:
-            return True
+            return self._load_reset_at() is None
         if self._last_reindex_at is None:
             return True
         return datetime.now(UTC) - self._last_reindex_at >= timedelta(
@@ -270,25 +479,32 @@ class VectorMemoryService:
         )
         return result
 
-    async def _load_recent_documents(self) -> list[VectorMemoryDocument]:
+    async def _load_recent_documents(
+        self,
+        *,
+        since: datetime | None = None,
+    ) -> list[VectorMemoryDocument]:
         async with get_session_ctx() as session:
+            decision_query = select(AIDecision)
+            news_query = select(NewsArticle)
+            if since is not None:
+                decision_query = decision_query.where(AIDecision.created_at >= since)
+                news_query = news_query.where(NewsArticle.fetched_at >= since)
             decision_rows = list(
                 (
                     await session.execute(
-                        select(AIDecision)
-                        .order_by(AIDecision.id.desc())
-                        .limit(int(settings.vector_memory_decision_index_limit))
+                        decision_query.order_by(AIDecision.id.desc()).limit(
+                            int(settings.vector_memory_decision_index_limit)
+                        )
                     )
-                )
-                .scalars()
-                .all()
+                ).scalars().all()
             )
             news_rows = list(
                 (
                     await session.execute(
-                        select(NewsArticle)
-                        .order_by(NewsArticle.id.desc())
-                        .limit(int(settings.vector_memory_news_index_limit))
+                        news_query.order_by(NewsArticle.id.desc()).limit(
+                            int(settings.vector_memory_news_index_limit)
+                        )
                     )
                 )
                 .scalars()
@@ -447,14 +663,14 @@ def _hit_payload(hit: VectorMemoryHit) -> dict[str, Any]:
 
 
 def _influence_payload(hits: list[dict[str, Any]], *, action: str) -> dict[str, Any]:
-    """Explain how similar historical cases should influence this decision."""
+    """Explain how Phase 3 similar samples should influence this decision."""
 
     if not hits:
         return {
             "score_delta": 0.0,
             "level": "neutral",
-            "label": "未命中相似历史",
-            "reason": "没有足够相似的历史案例，本次不调整策略评分。",
+            "label": "未命中三期相似样本",
+            "reason": "没有足够相似的三期新样本，本次不调整策略评分。",
             "matched_count": 0,
             "loss_count": 0,
             "profit_count": 0,
@@ -489,16 +705,16 @@ def _influence_payload(hits: list[dict[str, Any]], *, action: str) -> dict[str, 
     score_delta = round(max(min(ratio * 8.0, 6.0), -6.0), 2)
     if same_action_loss_count >= 2 or score_delta <= -2.5:
         level = "negative"
-        label = "相似历史偏负向"
-        reason = "过去相似案例亏损较多，建议降低仓位或要求更强证据，不作为硬拦截。"
+        label = "三期相似样本偏负向"
+        reason = "三期相似样本亏损较多，建议降低仓位或要求更强证据，不作为硬拦截。"
     elif score_delta >= 2.5:
         level = "positive"
-        label = "相似历史偏正向"
-        reason = "过去相似案例盈利占优，可作为轻量加分，但仍需服从实时风控和收益评估。"
+        label = "三期相似样本偏正向"
+        reason = "三期相似样本盈利占优，可作为轻量加分，但仍需服从实时风控和收益评估。"
     else:
         level = "neutral"
-        label = "相似历史中性"
-        reason = "相似历史结果分化，本次仅作解释参考，不明显调整评分。"
+        label = "三期相似样本中性"
+        reason = "三期相似样本结果分化，本次仅作解释参考，不明显调整评分。"
     return {
         "score_delta": score_delta,
         "level": level,

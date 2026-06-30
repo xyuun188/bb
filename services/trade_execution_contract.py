@@ -5,11 +5,46 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from services.profit_first_trade_plan import build_profit_first_trade_plan
+
 WEAK_EVIDENCE_TIERS = {"weak_conflict_probe", "degraded_missing_probe"}
 HIGH_QUALITY_EVIDENCE_TIERS = {"exploration", "small", "medium", "normal"}
 STRONG_EXIT_INTENTS = {"hard_risk", "trend_failure", "predictive_downside", "profit_drawdown"}
 FAST_LOSS_MINUTES = 15.0
+FAST_LOSS_DUST_NOTIONAL_USDT = 0.01
+FAST_LOSS_DUST_ABS_PNL_USDT = 0.0001
 SMALL_SIZE_REASON_THRESHOLD = 0.015
+LOW_PAYOFF_MAX_SIZE_PCT = 0.02
+PROFIT_FIRST_LANE_MAX_SIZE_PCT = {
+    "tiny_probe": 0.02,
+    "validated_probe": 0.05,
+    "meaningful_entry": 0.08,
+    "high_conviction": 0.12,
+}
+HISTORICAL_RECOVERY_EXCLUDED_TRAINING_POLICIES = {
+    "exclude_until_manual_trust",
+    "exclude_from_clean_training_view_until_manual_trust",
+}
+HISTORICAL_RECOVERY_QUARANTINABLE_ENTRY_VIOLATIONS = {
+    "missing_entry_execution_reason",
+    "missing_profit_risk_sizing",
+    "missing_profit_first_trade_plan",
+    "incomplete_profit_first_trade_plan",
+    "shadow_lane_executed",
+    "missing_profit_first_position_ladder",
+    "low_payoff_meaningful_size",
+    "profit_first_lane_size_above_max",
+    "meaningful_lane_tiny_without_budget_reason",
+    "weak_evidence_executed",
+    "non_positive_expected_net_executed",
+    "small_size_without_reason",
+    "reentry_without_strong_unlock",
+    "profit_first_probe_loss_brake_bypassed",
+}
+HISTORICAL_RECOVERY_QUARANTINABLE_EXIT_VIOLATIONS = {
+    "missing_profit_first_exit_plan_reference",
+    "missing_profit_first_exit_plan_failure_reason",
+}
 FRESH_LOSS_REENTRY_HOURS = 2.0
 DEFAULT_REPORT_WINDOW_HOURS = 24
 DEFAULT_REPORT_LIMIT = 500
@@ -233,23 +268,64 @@ def summarize_trade_execution_contract(
     exit_decisions = [row for row in decisions if _is_exit(row)]
     entry_rows = [row for row in decisions if _is_entry(row)]
     executed_entries = [row for row in entry_rows if _entry_executed(row, orders_by_decision)]
+    executed_exits = [row for row in exit_decisions if _entry_executed(row, orders_by_decision)]
 
     entry_explanations: list[dict[str, Any]] = []
+    exit_explanations: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
+    quarantined_violations: list[dict[str, Any]] = []
     reason_counts: Counter[str] = Counter()
+    quarantined_reason_counts: Counter[str] = Counter()
+    profit_first_plan_derived_count = 0
 
     for row in executed_entries:
         explanation = _entry_explanation(row)
         entry_explanations.append(explanation)
+        if explanation.get("profit_first_plan_source") == "derived_legacy_audit":
+            profit_first_plan_derived_count += 1
+        historical_quarantine = _is_profit_first_historical_recovery_quarantined(row)
         for reason in explanation["violations"]:
+            violation = _violation(row, reason, explanation)
+            if historical_quarantine and reason in HISTORICAL_RECOVERY_QUARANTINABLE_ENTRY_VIOLATIONS:
+                quarantined_reason_counts[reason] += 1
+                violation["historical_recovery_quarantined"] = True
+                quarantined_violations.append(violation)
+                continue
             reason_counts[reason] += 1
-            violations.append(_violation(row, reason, explanation))
+            violations.append(violation)
+
+    for row in executed_exits:
+        explanation = _exit_explanation(row)
+        exit_explanations.append(explanation)
+        historical_quarantine = _is_profit_first_historical_recovery_quarantined(row)
+        for reason in explanation["violations"]:
+            violation = _violation(row, reason, explanation)
+            if historical_quarantine and reason in HISTORICAL_RECOVERY_QUARANTINABLE_EXIT_VIOLATIONS:
+                quarantined_reason_counts[reason] += 1
+                violation["historical_recovery_quarantined"] = True
+                quarantined_violations.append(violation)
+                continue
+            reason_counts[reason] += 1
+            violations.append(violation)
 
     fast_loss_rows: list[dict[str, Any]] = []
+    dust_fast_loss_rows: list[dict[str, Any]] = []
     exchange_sync_estimated_reductions: list[dict[str, Any]] = []
     for position in positions or []:
         fast_loss = _fast_loss_summary(position)
         if fast_loss is None:
+            continue
+        if _is_dust_fast_loss(fast_loss):
+            dust_fast_loss_rows.append(
+                {
+                    **fast_loss,
+                    "reason": "dust_or_rounding_fast_loss",
+                    "thresholds": {
+                        "max_notional_usdt": FAST_LOSS_DUST_NOTIONAL_USDT,
+                        "max_abs_pnl_usdt": FAST_LOSS_DUST_ABS_PNL_USDT,
+                    },
+                }
+            )
             continue
         matching_exit = _matching_exit_decision(exit_decisions, position, fast_loss["closed_at"])
         if _is_estimated_exchange_quantity_reduction(matching_exit):
@@ -277,17 +353,49 @@ def summarize_trade_execution_contract(
     summary = {
         "decision_count": len(decisions),
         "executed_entry_count": len(executed_entries),
+        "executed_exit_count": len(executed_exits),
         "missing_entry_explanation_count": reason_counts["missing_entry_execution_reason"],
+        "exit_plan_reference_missing_count": reason_counts[
+            "missing_profit_first_exit_plan_reference"
+        ],
+        "exit_plan_failure_reason_missing_count": reason_counts[
+            "missing_profit_first_exit_plan_failure_reason"
+        ],
         "missing_sizing_explanation_count": reason_counts["missing_profit_risk_sizing"],
+        "profit_first_plan_missing_count": reason_counts["missing_profit_first_trade_plan"],
+        "profit_first_plan_incomplete_count": reason_counts[
+            "incomplete_profit_first_trade_plan"
+        ],
+        "shadow_lane_executed_count": reason_counts["shadow_lane_executed"],
+        "profit_first_plan_derived_count": profit_first_plan_derived_count,
+        "profit_first_position_ladder_missing_count": reason_counts[
+            "missing_profit_first_position_ladder"
+        ],
+        "low_payoff_meaningful_size_count": reason_counts["low_payoff_meaningful_size"],
+        "profit_first_lane_size_above_max_count": reason_counts[
+            "profit_first_lane_size_above_max"
+        ],
+        "probe_loss_brake_bypassed_count": reason_counts[
+            "profit_first_probe_loss_brake_bypassed"
+        ],
+        "meaningful_lane_tiny_without_budget_reason_count": reason_counts[
+            "meaningful_lane_tiny_without_budget_reason"
+        ],
         "small_size_without_reason_count": reason_counts["small_size_without_reason"],
         "weak_evidence_executed_count": reason_counts["weak_evidence_executed"],
         "negative_expected_executed_count": reason_counts["non_positive_expected_net_executed"],
         "fast_loss_count": len(fast_loss_rows),
+        "dust_or_rounding_fast_loss_count": len(dust_fast_loss_rows),
         "exchange_sync_estimated_reduction_count": len(exchange_sync_estimated_reductions),
         "fast_loss_without_strong_exit_count": reason_counts["fast_loss_without_strong_exit"],
         "reentry_without_strong_unlock_count": reason_counts["reentry_without_strong_unlock"],
         "contract_violation_count": sum(reason_counts.values()),
+        "historical_recovery_quarantined_violation_count": sum(
+            quarantined_reason_counts.values()
+        ),
+        "historical_recovery_quarantine_unresolved_count": sum(reason_counts.values()),
     }
+    _add_historical_recovery_quarantine_summary_counts(summary, quarantined_reason_counts)
     return {
         "audit_only": True,
         "live_entry_mutation": False,
@@ -295,15 +403,31 @@ def summarize_trade_execution_contract(
         "can_bypass_risk_controls": False,
         "summary": summary,
         "violation_reason_counts": dict(reason_counts),
+        "historical_recovery_quarantine_reason_counts": dict(quarantined_reason_counts),
         "entry_explanations": entry_explanations[:20],
+        "exit_explanations": exit_explanations[:20],
         "fast_loss_samples": fast_loss_rows[:20],
+        "dust_or_rounding_fast_loss_samples": dust_fast_loss_rows[:20],
         "exchange_sync_estimated_reductions": exchange_sync_estimated_reductions[:20],
         "violations": violations[:30],
+        "historical_recovery_quarantined_violations": quarantined_violations[:30],
         "policy": {
             "entry_requires_positive_expected_net": True,
             "entry_requires_structured_evidence": True,
+            "entry_requires_profit_first_trade_plan": True,
+            "entry_requires_profit_first_position_ladder": True,
+            "exit_requires_profit_first_exit_plan_reference": True,
+            "exit_outside_plan_requires_failure_reason": True,
+            "profit_first_missing_plan_is_hard_violation": True,
+            "profit_first_shadow_lane_cannot_execute": True,
+            "profit_first_low_payoff_cannot_receive_meaningful_size": True,
+            "profit_first_lane_size_caps": PROFIT_FIRST_LANE_MAX_SIZE_PCT,
+            "profit_first_probe_loss_brake_must_block_execution": True,
             "position_size_requires_profit_risk_sizing": True,
             "fast_loss_exit_requires_strong_exit_evidence": True,
+            "dust_fast_loss_requires_tiny_notional_and_tiny_abs_pnl": True,
+            "dust_fast_loss_max_notional_usdt": FAST_LOSS_DUST_NOTIONAL_USDT,
+            "dust_fast_loss_max_abs_pnl_usdt": FAST_LOSS_DUST_ABS_PNL_USDT,
             "recent_loss_reentry_requires_strong_unlock": True,
         },
     }
@@ -313,6 +437,14 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
     raw = _safe_dict(_row_get(row, "raw_llm_response"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    position_ladder = _safe_dict(sizing.get("profit_first_position_ladder"))
+    persisted_plan = _safe_dict(raw.get("profit_first_trade_plan"))
+    if persisted_plan:
+        plan = persisted_plan
+        plan_source = "persisted"
+    else:
+        plan = build_profit_first_trade_plan(row, analysis_type=_row_get(row, "analysis_type")).to_dict()
+        plan_source = "derived_legacy_audit"
     evidence = _safe_dict(opportunity.get("evidence_score"))
     expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
     evidence_tier = str(evidence.get("tier") or "missing")
@@ -328,6 +460,32 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         violations.append("missing_entry_execution_reason")
     if not sizing:
         violations.append("missing_profit_risk_sizing")
+    if not persisted_plan:
+        violations.append("missing_profit_first_trade_plan")
+    if plan.get("is_complete_for_real_trade") is not True:
+        violations.append("incomplete_profit_first_trade_plan")
+    if str(plan.get("decision_lane") or "") == "shadow_only":
+        violations.append("shadow_lane_executed")
+    if sizing and not position_ladder:
+        violations.append("missing_profit_first_position_ladder")
+    if bool(sizing.get("low_payoff_quality")) and size > LOW_PAYOFF_MAX_SIZE_PCT:
+        violations.append("low_payoff_meaningful_size")
+    lane_for_size = str(
+        plan.get("decision_lane") or position_ladder.get("lane") or ""
+    ).lower()
+    lane_max_size = _safe_float(
+        position_ladder.get("target_max_pct"),
+        PROFIT_FIRST_LANE_MAX_SIZE_PCT.get(lane_for_size, 0.0),
+    )
+    if lane_for_size in PROFIT_FIRST_LANE_MAX_SIZE_PCT and lane_max_size > 0:
+        if size > lane_max_size + 1e-9:
+            violations.append("profit_first_lane_size_above_max")
+    if (
+        lane_for_size in {"meaningful_entry", "high_conviction"}
+        and 0 < size <= SMALL_SIZE_REASON_THRESHOLD
+        and not bool(position_ladder.get("capped_by_stop_loss_budget"))
+    ):
+        violations.append("meaningful_lane_tiny_without_budget_reason")
     if evidence_tier in WEAK_EVIDENCE_TIERS:
         violations.append("weak_evidence_executed")
     if expected_net <= 0:
@@ -336,6 +494,8 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         violations.append("small_size_without_reason")
     if _fresh_loss_reentry_active(opportunity) and not _has_reentry_unlock(raw, opportunity):
         violations.append("reentry_without_strong_unlock")
+    if _probe_loss_brake_active(raw, plan, sizing):
+        violations.append("profit_first_probe_loss_brake_bypassed")
 
     return {
         "decision_id": _row_get(row, "id"),
@@ -347,6 +507,20 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
             _safe_float(opportunity.get("server_profit_loss_probability"), 1.0), 6
         ),
         "tail_risk_score": round(_safe_float(opportunity.get("tail_risk_score")), 6),
+        "profit_first_plan_source": plan_source,
+        "profit_first_decision_lane": plan.get("decision_lane") or "",
+        "profit_first_score": plan.get("profit_first_score"),
+        "profit_first_is_complete": bool(plan.get("is_complete_for_real_trade")),
+        "profit_first_missing_required_fields": _safe_list(
+            plan.get("missing_required_fields")
+        )[:20],
+        "profit_first_shadow_only_reason": plan.get("shadow_only_reason") or "",
+        "profit_first_no_entry_reason": plan.get("no_entry_reason") or "",
+        "profit_first_probe_loss_brake": _probe_loss_brake_evidence(raw, plan, sizing),
+        "profit_first_expected_profit_usdt": plan.get("expected_profit_usdt"),
+        "profit_first_exit_plan_id": plan.get("exit_plan_id"),
+        "profit_first_model_sources": _safe_list(plan.get("model_sources"))[:12],
+        "profit_first_position_ladder": position_ladder,
         "evidence_tier": evidence_tier,
         "evidence_effective_score": evidence.get("effective_score"),
         "position_size_pct": round(size, 8),
@@ -359,6 +533,55 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         "loss_cooldown_unlock": _safe_dict(
             raw.get("loss_cooldown_override") or opportunity.get("loss_cooldown_override")
         ),
+        "violations": violations,
+    }
+
+
+def _exit_explanation(row: Any) -> dict[str, Any]:
+    raw = _safe_dict(_row_get(row, "raw_llm_response"))
+    close_evidence = _safe_dict(raw.get("close_evidence"))
+    reference = _safe_dict(raw.get("profit_first_exit_reference"))
+    exit_plan_id = str(
+        reference.get("exit_plan_id")
+        or close_evidence.get("profit_first_exit_plan_id")
+        or raw.get("profit_first_exit_plan_id")
+        or raw.get("exit_plan_id")
+        or ""
+    ).strip()
+    plan_failure_reason = str(
+        reference.get("plan_failure_reason")
+        or close_evidence.get("profit_first_plan_failure_reason")
+        or raw.get("profit_first_plan_failure_reason")
+        or raw.get("plan_failure_reason")
+        or ""
+    ).strip()
+    outside_original_plan = bool(
+        reference.get("outside_original_plan")
+        or raw.get("outside_original_plan")
+        or close_evidence.get("outside_original_plan")
+    )
+    violations: list[str] = []
+    exchange_confirmed_system_close = _has_exchange_confirmed_close_fill(raw)
+    system_sync_exit = bool(raw.get("system_sync") and raw.get("source") == "okx_position_reconcile")
+    if (
+        not exit_plan_id
+        and not plan_failure_reason
+        and not exchange_confirmed_system_close
+        and not system_sync_exit
+    ):
+        violations.append("missing_profit_first_exit_plan_reference")
+    if outside_original_plan and not plan_failure_reason:
+        violations.append("missing_profit_first_exit_plan_failure_reason")
+    return {
+        "decision_id": _row_get(row, "id"),
+        "symbol": _row_get(row, "symbol"),
+        "action": _side(_row_get(row, "action")),
+        "profit_first_exit_plan_id": exit_plan_id,
+        "profit_first_exit_reference": reference,
+        "profit_first_plan_failure_reason": plan_failure_reason,
+        "outside_original_plan": outside_original_plan,
+        "exchange_confirmed_system_close": exchange_confirmed_system_close,
+        "system_sync_exit": system_sync_exit,
         "violations": violations,
     }
 
@@ -467,6 +690,62 @@ def _has_reentry_unlock(raw: dict[str, Any], opportunity: dict[str, Any]) -> boo
     return True
 
 
+def _probe_loss_brake_evidence(
+    raw: dict[str, Any],
+    plan: dict[str, Any],
+    sizing: dict[str, Any],
+) -> dict[str, Any]:
+    candidates = (
+        raw.get("profit_first_probe_loss_brake"),
+        raw.get("probe_loss_brake"),
+        raw.get("probe_loss_brake_decision"),
+        plan.get("profit_first_probe_loss_brake"),
+        sizing.get("profit_first_probe_loss_brake"),
+    )
+    structured = next((item for item in candidates if isinstance(item, dict)), {})
+    skip_kind = str(raw.get("skip_kind") or plan.get("skip_kind") or sizing.get("skip_kind") or "")
+    shadow_only = bool(
+        raw.get("shadow_only")
+        or plan.get("shadow_only")
+        or sizing.get("shadow_only")
+        or structured.get("shadow_only")
+    )
+    active = bool(
+        skip_kind == "profit_first_probe_loss_brake"
+        or raw.get("profit_first_probe_loss_brake") is True
+        or plan.get("profit_first_probe_loss_brake") is True
+        or sizing.get("profit_first_probe_loss_brake") is True
+        or str(structured.get("skip_kind") or "") == "profit_first_probe_loss_brake"
+    )
+    return {
+        "active": active,
+        "skip_kind": skip_kind or structured.get("skip_kind") or "",
+        "shadow_only": shadow_only,
+        "lane": (
+            plan.get("decision_lane")
+            or sizing.get("lane")
+            or _safe_dict(sizing.get("profit_first_position_ladder")).get("lane")
+            or structured.get("lane")
+            or ""
+        ),
+        "probe_loop_health": _safe_dict(
+            structured.get("probe_loop_health")
+            or raw.get("probe_loop_health")
+            or raw.get("recent_probe_pnl_health")
+            or raw.get("profit_first_probe_loop_health")
+        ),
+    }
+
+
+def _probe_loss_brake_active(
+    raw: dict[str, Any],
+    plan: dict[str, Any],
+    sizing: dict[str, Any],
+) -> bool:
+    evidence = _probe_loss_brake_evidence(raw, plan, sizing)
+    return bool(evidence.get("active") or evidence.get("skip_kind") == "profit_first_probe_loss_brake")
+
+
 def _fast_loss_summary(position: Any) -> dict[str, Any] | None:
     opened = _parse_datetime(_row_get(position, "created_at"))
     closed = _parse_datetime(_row_get(position, "closed_at"))
@@ -488,6 +767,13 @@ def _fast_loss_summary(position: Any) -> dict[str, Any] | None:
         "closed_at": closed,
         "closed_at_iso": closed.isoformat(),
     }
+
+
+def _is_dust_fast_loss(fast_loss: dict[str, Any]) -> bool:
+    return (
+        abs(_safe_float(fast_loss.get("realized_pnl"), 0.0)) <= FAST_LOSS_DUST_ABS_PNL_USDT
+        and _safe_float(fast_loss.get("notional_usdt"), 0.0) <= FAST_LOSS_DUST_NOTIONAL_USDT
+    )
 
 
 def _matching_exit_decision(
@@ -555,6 +841,23 @@ def _has_exchange_confirmed_close_fill(raw: dict[str, Any]) -> bool:
     )
 
 
+def _is_profit_first_historical_recovery_quarantined(row: Any) -> bool:
+    raw = _safe_dict(_row_get(row, "raw_llm_response"))
+    recovery = _safe_dict(raw.get("profit_first_historical_recovery"))
+    if not recovery:
+        return False
+    if bool(recovery.get("trusted_for_live_resume")):
+        return False
+    policy = str(
+        recovery.get("training_policy")
+        or _safe_dict(raw.get("profit_first_trade_plan")).get("training_policy")
+        or _safe_dict(raw.get("profit_first_exit_plan")).get("training_policy")
+        or _safe_dict(raw.get("profit_first_entry_exit_binding")).get("training_policy")
+        or ""
+    ).strip()
+    return policy in HISTORICAL_RECOVERY_EXCLUDED_TRAINING_POLICIES
+
+
 def _is_estimated_exchange_quantity_reduction(decision: Any | None) -> bool:
     if decision is None:
         return False
@@ -575,8 +878,37 @@ def _violation(row: Any, reason: str, explanation: dict[str, Any]) -> dict[str, 
     }
 
 
+def _add_historical_recovery_quarantine_summary_counts(
+    summary: dict[str, Any],
+    quarantined_reason_counts: Counter[str],
+) -> None:
+    mapping = {
+        "missing_profit_first_trade_plan": "profit_first_plan_missing_count",
+        "incomplete_profit_first_trade_plan": "profit_first_plan_incomplete_count",
+        "shadow_lane_executed": "shadow_lane_executed_count",
+        "missing_profit_first_position_ladder": "profit_first_position_ladder_missing_count",
+        "missing_profit_first_exit_plan_reference": "exit_plan_reference_missing_count",
+        "missing_profit_first_exit_plan_failure_reason": "exit_plan_failure_reason_missing_count",
+        "low_payoff_meaningful_size": "low_payoff_meaningful_size_count",
+        "profit_first_lane_size_above_max": "profit_first_lane_size_above_max_count",
+        "profit_first_probe_loss_brake_bypassed": "probe_loss_brake_bypassed_count",
+        "meaningful_lane_tiny_without_budget_reason": (
+            "meaningful_lane_tiny_without_budget_reason_count"
+        ),
+    }
+    for reason, count_key in mapping.items():
+        unresolved_count = _safe_int(summary.get(count_key), 0)
+        quarantined_count = int(quarantined_reason_counts.get(reason, 0))
+        summary[f"{count_key}_unresolved"] = unresolved_count
+        summary[f"historical_recovery_quarantined_{count_key}"] = quarantined_count
+
+
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:

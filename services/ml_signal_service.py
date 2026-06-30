@@ -30,7 +30,13 @@ from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 from core.safe_output import safe_error_text
 from db.session import get_read_session_ctx
 from models.learning import ShadowBacktest
+from services.artifact_retirement_audit import (
+    PHASE3_ARTIFACT_POLICY_ID,
+    PHASE3_REQUIRED_PROMOTION_FLOW,
+    PHASE3_REQUIRED_TRAINING_POLICY,
+)
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
@@ -737,6 +743,8 @@ def train_from_frame(
         }
     )
     metadata = {
+        "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "phase": "phase3_model_factory",
         "version": now,
         "trained_at": now,
         "sample_count": int(len(frame)),
@@ -795,6 +803,16 @@ def train_from_frame(
         ),
         "feature_keys": FEATURE_KEYS,
         "mode": "entry_profit_filter",
+        "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "training_mode": "walk_forward",
+        "model_stage": "shadow",
+        "evaluation_policy": {
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+            "requires_walk_forward": True,
+            "phase": "phase3_model_factory",
+        },
         "training_run_mode": "persist" if persist_artifact else "dry_run",
         "artifact_persisted": bool(persist_artifact),
         "note": "本地 ML 以预期盈亏和收益质量为主，胜率仅作为辅助过滤；用于开仓门槛/否决，不直接决定交易方向。",
@@ -978,7 +996,7 @@ class MLSignalService:
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
                         "training_policy": training_policy,
-                        "message": f"本地 ML 自动训练样本不足：{completed_count} < {MIN_TRAINING_SAMPLES}。继续累计影子复盘样本。",
+                        "message": f"本地 ML 自动训练三期干净样本不足：{completed_count} < {MIN_TRAINING_SAMPLES}。等待三期新影子复盘样本形成。",
                     }
                     self._last_train_result = result
                     return result
@@ -1415,6 +1433,7 @@ async def load_shadow_training_rows(limit: int = TRAINING_SHADOW_SAMPLE_LIMIT) -
         )
         base_filters = (
             ShadowBacktest.status == "completed",
+            ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
             ShadowBacktest.long_return_pct.is_not(None),
             ShadowBacktest.short_return_pct.is_not(None),
         )
@@ -1459,6 +1478,7 @@ async def count_shadow_training_rows() -> int:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
                 ShadowBacktest.status == "completed",
+                ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
             )

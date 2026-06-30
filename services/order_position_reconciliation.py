@@ -9,7 +9,13 @@ from typing import Any
 from sqlalchemy import select
 
 from ai_brain.base_model import Action, DecisionOutput
-from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, trading_symbol_variants
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_payload,
+    okx_inst_id_from_symbol,
+    symbol_from_okx_inst_id,
+    trading_symbol_variants,
+)
 from models.decision import AIDecision
 from models.trade import Order, Position
 
@@ -93,7 +99,17 @@ async def plan_missing_closed_position(
     if created_at > closed_at:
         return None
 
-    symbol = normalize_trading_symbol(close_order.symbol or entry_order.symbol)
+    entry_decision = await _decision_for_order(session, entry_order)
+    entry_okx_inst_id = _order_okx_inst_id(entry_order, entry_decision)
+    close_okx_inst_id = _order_okx_inst_id(close_order, close_decision)
+    okx_inst_id = close_okx_inst_id or entry_okx_inst_id
+    if entry_okx_inst_id and close_okx_inst_id and entry_okx_inst_id != close_okx_inst_id:
+        return None
+
+    symbol = (
+        symbol_from_okx_inst_id(okx_inst_id)
+        or normalize_trading_symbol(close_order.symbol or entry_order.symbol)
+    )
     quantity = min(close_quantity, _safe_float(entry_order.quantity))
     if quantity <= 0:
         return None
@@ -113,7 +129,6 @@ async def plan_missing_closed_position(
     if duplicate:
         return None
 
-    entry_decision = await _decision_for_order(session, entry_order)
     leverage = _safe_float(getattr(entry_decision, "suggested_leverage", None), 1.0) or 1.0
     stop_loss_pct = _safe_float(getattr(entry_decision, "stop_loss_pct", None), 0.0)
     take_profit_pct = _safe_float(getattr(entry_decision, "take_profit_pct", None), 0.0)
@@ -148,7 +163,7 @@ async def plan_missing_closed_position(
         closed_at=closed_at,
         entry_order_id=int(entry_order.id),
         close_order_id=int(close_order.id),
-        okx_inst_id=okx_inst_id_from_symbol(symbol) or None,
+        okx_inst_id=okx_inst_id or okx_inst_id_from_symbol(symbol) or None,
         okx_pos_id=None,
         entry_exchange_order_id=entry_order.exchange_order_id,
         close_exchange_order_id=close_order.exchange_order_id,
@@ -343,6 +358,21 @@ async def _decision_for_order(session: Any, order: Order) -> AIDecision | None:
     if not decision_id:
         return None
     return await session.get(AIDecision, int(decision_id))
+
+
+def _order_okx_inst_id(order: Order, decision: AIDecision | None) -> str:
+    payloads: list[dict[str, Any]] = []
+    raw = getattr(decision, "raw_llm_response", None) if decision is not None else None
+    if isinstance(raw, dict):
+        payloads.append(raw)
+        execution_result = raw.get("execution_result")
+        if isinstance(execution_result, dict):
+            payloads.append(execution_result)
+    for payload in payloads:
+        inst_id = okx_inst_id_from_payload(payload, include_fallback=False)
+        if inst_id:
+            return inst_id
+    return okx_inst_id_from_symbol(getattr(order, "symbol", None))
 
 
 def _decision_action(decision: AIDecision | None) -> Action | None:

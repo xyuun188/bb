@@ -1706,6 +1706,7 @@ class EnsembleCoordinator:
             for opinion in opinions
             if opinion.get("model_name") and isinstance(opinion.get("weight_policy"), dict)
         }
+        source_policy = self._expert_source_policy_from_opinions(opinions)
         modes = {
             str(policy.get("mode"))
             for policy in policies.values()
@@ -1724,6 +1725,187 @@ class EnsembleCoordinator:
                 for opinion in opinions
                 if self._safe_float(opinion.get("effective_weight"), 0.0) > 0
             ],
+            "source_policy": source_policy,
+        }
+
+    @staticmethod
+    def _normalize_provider_model(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _decision_provider_model(self, name: str, decision: DecisionOutput | None) -> str:
+        if isinstance(decision, DecisionOutput) and isinstance(decision.raw_response, dict):
+            provider = self._normalize_provider_model(decision.raw_response.get("provider_model"))
+            if provider:
+                return provider
+        return self._normalize_provider_model(
+            self._slot_meta.get(name, {}).get("model")
+            or getattr(self.registry.get(name), "_model_name", "")
+            or name
+        )
+
+    def _expert_source_group(self, name: str, decision: DecisionOutput | None) -> str:
+        provider = self._decision_provider_model(name, decision)
+        if provider in {"local_fast_prefilter", "local_rules", ""}:
+            return f"local:{name}"
+        if name == "risk_expert" and "deepseek" in provider.lower():
+            return "llm:risk_review"
+        if name in MARKET_DIRECTION_EXCLUDED_EXPERTS:
+            return f"llm:{provider}:{name}"
+        return f"llm:{provider}"
+
+    def _support_source_groups(
+        self,
+        decisions: dict[str, DecisionOutput],
+        action: Action,
+        *,
+        min_confidence: float = 0.55,
+        eligible_names: set[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for name, decision in decisions.items():
+            if eligible_names is not None and name not in eligible_names:
+                continue
+            if name in MARKET_DIRECTION_EXCLUDED_EXPERTS:
+                continue
+            if (
+                not isinstance(decision, DecisionOutput)
+                or decision.action != action
+                or float(decision.confidence or 0.0) < min_confidence
+            ):
+                continue
+            group = self._expert_source_group(name, decision)
+            current = groups.get(group)
+            row = {
+                "experts": [name],
+                "provider_model": self._decision_provider_model(name, decision),
+                "max_confidence": round(float(decision.confidence or 0.0), 4),
+            }
+            if current is None:
+                groups[group] = row
+                continue
+            current["experts"].append(name)
+            current["max_confidence"] = round(
+                max(
+                    self._safe_float(current.get("max_confidence"), 0.0),
+                    float(decision.confidence or 0.0),
+                ),
+                4,
+            )
+        return groups
+
+    def _independent_quant_supports(
+        self,
+        context: dict[str, Any] | None,
+        action_side: str,
+        ml_profit_hint: dict[str, Any] | None = None,
+    ) -> list[str]:
+        supports: list[str] = []
+        if self._local_profit_aligned(context, action_side):
+            supports.append("server_profit_model")
+        if self._time_series_aligned(context, action_side):
+            supports.append("time_series_model")
+        if (
+            isinstance(ml_profit_hint, dict)
+            and ml_profit_hint.get("strong")
+            and ml_profit_hint.get("side") == action_side
+        ):
+            supports.append("local_ml_shadow")
+        direction_competition = self._safe_dict(
+            context.get("direction_competition") if isinstance(context, dict) else {}
+        )
+        direction_side = str(direction_competition.get("preferred_side") or "").lower()
+        direction_gap = self._safe_float(direction_competition.get("score_gap"), 0.0)
+        if direction_side == action_side and direction_gap >= 0.08:
+            supports.append("direction_competition")
+        return supports
+
+    def _expert_source_policy_from_decisions(
+        self,
+        decisions: dict[str, DecisionOutput],
+        action: Action | None = None,
+        *,
+        context: dict[str, Any] | None = None,
+        ml_profit_hint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        all_groups: dict[str, dict[str, Any]] = {}
+        for name, decision in decisions.items():
+            if not isinstance(decision, DecisionOutput):
+                continue
+            group = self._expert_source_group(name, decision)
+            row = all_groups.setdefault(
+                group,
+                {
+                    "experts": [],
+                    "provider_model": self._decision_provider_model(name, decision),
+                    "source_type": "llm" if group.startswith("llm:") else "local",
+                },
+            )
+            row["experts"].append(name)
+        payload: dict[str, Any] = {
+            "mode": "source_deduplicated",
+            "all_source_groups": all_groups,
+            "same_provider_roles_are_not_independent_votes": True,
+            "policy": (
+                "LLM roles sharing the same provider model are treated as one evidence source; "
+                "new entries need independent quant evidence before the LLM group can raise risk."
+            ),
+        }
+        if action in (Action.LONG, Action.SHORT):
+            side = "long" if action == Action.LONG else "short"
+            directional_groups = self._support_source_groups(decisions, action)
+            technical_groups = self._support_source_groups(
+                decisions,
+                action,
+                eligible_names=ENTRY_DIRECTION_SUPPORT_EXPERTS,
+            )
+            quant_supports = self._independent_quant_supports(context, side, ml_profit_hint)
+            payload.update(
+                {
+                    "side": side,
+                    "directional_source_groups": directional_groups,
+                    "technical_source_groups": technical_groups,
+                    "directional_independent_source_count": len(directional_groups),
+                    "technical_independent_source_count": len(technical_groups),
+                    "independent_quant_supports": quant_supports,
+                    "independent_quant_support_count": len(quant_supports),
+                }
+            )
+        return payload
+
+    def _expert_source_policy_from_opinions(
+        self, opinions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        groups: dict[str, dict[str, Any]] = {}
+        for opinion in opinions:
+            if not isinstance(opinion, dict):
+                continue
+            name = str(opinion.get("model_name") or "")
+            if not name:
+                continue
+            provider = self._normalize_provider_model(opinion.get("provider_model"))
+            if not provider:
+                provider = self._normalize_provider_model(
+                    self._slot_meta.get(name, {}).get("model")
+                    or getattr(self.registry.get(name), "_model_name", "")
+                    or name
+                )
+            if provider in {"local_fast_prefilter", "local_rules", ""}:
+                group = f"local:{name}"
+            elif name == "risk_expert" and "deepseek" in provider.lower():
+                group = "llm:risk_review"
+            elif name in MARKET_DIRECTION_EXCLUDED_EXPERTS:
+                group = f"llm:{provider}:{name}"
+            else:
+                group = f"llm:{provider}"
+            row = groups.setdefault(
+                group,
+                {"experts": [], "provider_model": provider, "source_type": "llm"},
+            )
+            row["experts"].append(name)
+        return {
+            "mode": "source_deduplicated",
+            "all_source_groups": groups,
+            "same_provider_roles_are_not_independent_votes": True,
         }
 
     def _risk_policy_from_opinions(self, opinions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1773,6 +1955,12 @@ class EnsembleCoordinator:
                 and decision.action == action
                 and float(decision.confidence or 0.0) >= 0.55
             ],
+            "source_policy": self._expert_source_policy_from_decisions(
+                decisions,
+                action,
+                context=context,
+                ml_profit_hint=ml_profit_hint,
+            ),
             "aligned_validations": sum(
                 1
                 for validation in cross_validations
@@ -3572,19 +3760,32 @@ class EnsembleCoordinator:
         )
         ml_hint = self._ml_profit_first_direction_hint(context or {})
         action_side = "long" if action == Action.LONG else "short"
+        source_policy = self._expert_source_policy_from_decisions(
+            decisions,
+            action,
+            context=context,
+            ml_profit_hint=ml_hint,
+        )
+        directional_source_count = int(
+            source_policy.get("directional_independent_source_count") or 0
+        )
+        technical_source_count = int(source_policy.get("technical_independent_source_count") or 0)
+        quant_support_count = int(source_policy.get("independent_quant_support_count") or 0)
         if (
             ml_hint.get("strong")
             and ml_hint.get("side") == action_side
             and self._local_profit_aligned(context, action_side)
             and validation_adjustment >= 0.0
-            and len(technical_support) >= 1
+            and technical_source_count >= 1
+            and quant_support_count >= 1
         ):
             return True
         if (
             self._local_profit_aligned(context, action_side)
-            and len(technical_support) >= 1
+            and technical_source_count >= 1
             and validation_adjustment >= -0.05
             and disagreement < 0.45
+            and quant_support_count >= 1
             and not any(
                 isinstance(d, DecisionOutput)
                 and d.action.is_entry()
@@ -3597,7 +3798,7 @@ class EnsembleCoordinator:
         if (
             validation_adjustment >= 0.20
             and aligned_validations >= 2
-            and len(technical_support) >= 2
+            and technical_source_count >= 2
         ):
             return True
         strategy = context.get("strategy_mode") if isinstance(context, dict) else {}
@@ -3606,12 +3807,20 @@ class EnsembleCoordinator:
             and strategy.get("strategy") == "recovery_attack"
             and validation_adjustment >= 0.10
             and aligned_validations >= 1
-            and len(technical_support) >= 1
-            and len(directional_support) >= 2
+            and technical_source_count >= 1
+            and directional_source_count >= 2
             and disagreement < 0.45
         ):
             return True
-        return len(directional_support) >= 2 and bool(technical_support)
+        if directional_source_count >= 2 and technical_source_count >= 1:
+            return True
+        return (
+            directional_source_count >= 1
+            and technical_source_count >= 1
+            and quant_support_count >= 1
+            and validation_adjustment >= 0.0
+            and disagreement < 0.45
+        )
 
     def _profit_first_probe_allowed(
         self,
@@ -3651,7 +3860,15 @@ class EnsembleCoordinator:
                 and d.confidence >= 0.60
             )
         ]
-        if not same_technical:
+        source_policy = self._expert_source_policy_from_decisions(
+            decisions,
+            action,
+            context=context,
+            ml_profit_hint=ml_hint,
+        )
+        if not same_technical or int(source_policy.get("technical_independent_source_count") or 0) < 1:
+            return False
+        if int(source_policy.get("independent_quant_support_count") or 0) < 1:
             return False
 
         opposite = Action.SHORT if action == Action.LONG else Action.LONG
@@ -3737,14 +3954,25 @@ class EnsembleCoordinator:
                 and float(decision.confidence or 0.0) >= 0.60
             )
         ]
-        if not same_technical_support:
+        source_policy = self._expert_source_policy_from_decisions(
+            decisions,
+            action,
+            context=context,
+            ml_profit_hint=ml_hint,
+        )
+        if (
+            not same_technical_support
+            or int(source_policy.get("technical_independent_source_count") or 0) < 1
+        ):
             result.update(
                 {
                     "status": "blocked_no_expert_support",
                     "reason": "量化模型不能单独发起开仓；本轮没有行情方向/短线时序专家同向强支持。",
+                    "source_policy": source_policy,
                 }
             )
             return result
+        result["source_policy"] = source_policy
 
         profit = self._local_profit_signal(context)
         if not profit or not signal_available(profit):
@@ -3928,15 +4156,26 @@ class EnsembleCoordinator:
                 and float(decision.confidence or 0.0) >= 0.60
             )
         ]
-        if not same_technical_support:
+        source_policy = self._expert_source_policy_from_decisions(
+            decisions,
+            reverse_action,
+            context=context,
+            ml_profit_hint=ml_hint,
+        )
+        if (
+            not same_technical_support
+            or int(source_policy.get("technical_independent_source_count") or 0) < 1
+        ):
             result.update(
                 {
                     "status": "blocked_no_expert_support",
                     "reverse_side": reverse_side,
                     "reason": "量化模型不能单独反向开仓；本轮没有行情方向/短线时序专家同向强支持。",
+                    "source_policy": source_policy,
                 }
             )
             return result
+        result["source_policy"] = source_policy
         if (
             not isinstance(ml_hint, dict)
             or ml_hint.get("side") != reverse_side
@@ -4102,14 +4341,28 @@ class EnsembleCoordinator:
         ]
         technical_names = ENTRY_DIRECTION_SUPPORT_EXPERTS
         technical_same = [(name, d) for name, d in same_direction if name in technical_names]
-        if len(technical_same) >= 2:
+        source_policy = self._expert_source_policy_from_decisions(
+            decisions,
+            action,
+            context=getattr(self, "_current_strategy_context", {}),
+        )
+        technical_source_count = int(source_policy.get("technical_independent_source_count") or 0)
+        directional_source_count = int(
+            source_policy.get("directional_independent_source_count") or 0
+        )
+        quant_support_count = int(source_policy.get("independent_quant_support_count") or 0)
+        if technical_source_count >= 2:
             return True
         if validation_adjustment >= 0.05 and any(
             name in technical_names and d.confidence >= 0.60 for name, d in same_direction
-        ):
+        ) and quant_support_count >= 1:
             return True
-        return len(same_direction) >= 2 and any(
-            name in technical_names for name, _d in same_direction
+        return (
+            directional_source_count >= 2 and technical_source_count >= 1
+        ) or (
+            directional_source_count >= 1
+            and technical_source_count >= 1
+            and quant_support_count >= 1
         )
 
     def _recovery_attack_probe_allowed(

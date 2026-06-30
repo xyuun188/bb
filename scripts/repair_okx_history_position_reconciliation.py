@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ MIN_QUANTITY_COVERAGE = 0.80
 PNL_TOLERANCE = 0.000001
 PRICE_TOLERANCE_RATIO = 0.0005
 TIME_REPAIR_THRESHOLD_SECONDS = 15
+BACKUP_DIR = Path("/data/bb/app/data/codex_backups/okx-history-position-reconciliation")
 
 
 @dataclass(frozen=True)
@@ -186,26 +188,55 @@ def _select_positions_for_order(
     return selected
 
 
-async def collect_repairs(*, days: int, window_seconds: int) -> list[RepairItem]:
+def _allowed_filter_ids(values: tuple[str, ...]) -> set[str]:
+    return {str(value or "").strip() for value in values if str(value or "").strip()}
+
+
+def _repair_matches_filters(
+    item: RepairItem,
+    *,
+    position_ids: set[int],
+    exchange_order_ids: set[str],
+) -> bool:
+    if position_ids and int(item.position.id or 0) not in position_ids:
+        return False
+    if exchange_order_ids and str(item.order.exchange_order_id or "") not in exchange_order_ids:
+        return False
+    return True
+
+
+async def collect_repairs(
+    *,
+    days: int,
+    window_seconds: int,
+    position_ids: set[int] | None = None,
+    exchange_order_ids: set[str] | None = None,
+) -> list[RepairItem]:
     since = datetime.now(UTC) - timedelta(days=max(int(days), 1))
     window = timedelta(seconds=max(int(window_seconds), 30))
+    position_ids = position_ids or set()
+    exchange_order_ids = exchange_order_ids or set()
     async with get_session_ctx() as session:
-        position_result = await session.execute(
-            select(Position).where(
-                Position.is_open.is_(False),
-                Position.closed_at.is_not(None),
-                Position.closed_at >= since,
-            )
+        position_conditions = [
+            Position.is_open.is_(False),
+            Position.closed_at.is_not(None),
+            Position.closed_at >= since,
+        ]
+        if position_ids:
+            position_conditions.append(Position.id.in_(position_ids))
+        position_result = await session.execute(select(Position).where(*position_conditions))
+        order_conditions = [
+            Order.status == "filled",
+            Order.exchange_order_id.is_not(None),
+            Order.exchange_order_id != "",
+            Order.filled_at >= since - window,
+        ]
+        if exchange_order_ids:
+            order_conditions.append(Order.exchange_order_id.in_(exchange_order_ids))
+        order_result = await session.execute(
+            select(Order).where(*order_conditions)
         )
         positions = list(position_result.scalars().all())
-        order_result = await session.execute(
-            select(Order).where(
-                Order.status == "filled",
-                Order.exchange_order_id.is_not(None),
-                Order.exchange_order_id != "",
-                Order.filled_at >= since - window,
-            )
-        )
         orders = list(order_result.scalars().all())
 
     positions_by_key: dict[tuple[str, str, str], list[Position]] = {}
@@ -228,9 +259,70 @@ async def collect_repairs(*, days: int, window_seconds: int) -> list[RepairItem]
             item = _build_repair_item(position, order)
             if item is None:
                 continue
+            if not _repair_matches_filters(
+                item,
+                position_ids=position_ids,
+                exchange_order_ids=exchange_order_ids,
+            ):
+                continue
             repairs.append(item)
             selected_ids.add(position.id)
     return repairs
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+async def backup_repairs(repairs: list[RepairItem], backup_dir: Path = BACKUP_DIR) -> Path | None:
+    if not repairs:
+        return None
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = backup_dir / f"positions-before-okx-history-repair-{timestamp}.jsonl"
+    rows = []
+    async with get_session_ctx() as session:
+        for item in repairs:
+            position = await session.get(Position, item.position.id)
+            order = await session.get(Order, item.order.id)
+            rows.append(
+                {
+                    "position": {
+                        "id": getattr(position, "id", None),
+                        "symbol": getattr(position, "symbol", None),
+                        "side": getattr(position, "side", None),
+                        "execution_mode": getattr(position, "execution_mode", None),
+                        "quantity": getattr(position, "quantity", None),
+                        "entry_price": getattr(position, "entry_price", None),
+                        "current_price": getattr(position, "current_price", None),
+                        "realized_pnl": getattr(position, "realized_pnl", None),
+                        "unrealized_pnl": getattr(position, "unrealized_pnl", None),
+                        "closed_at": getattr(position, "closed_at", None),
+                    },
+                    "order": {
+                        "id": getattr(order, "id", None),
+                        "symbol": getattr(order, "symbol", None),
+                        "side": getattr(order, "side", None),
+                        "quantity": getattr(order, "quantity", None),
+                        "price": getattr(order, "price", None),
+                        "fee": getattr(order, "fee", None),
+                        "exchange_order_id": getattr(order, "exchange_order_id", None),
+                        "filled_at": getattr(order, "filled_at", None),
+                    },
+                    "planned_repair": _report_item(item),
+                }
+            )
+    path.write_text(
+        "\n".join(json.dumps(_json_safe(row), ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 async def apply_repairs(repairs: list[RepairItem]) -> None:
@@ -270,18 +362,38 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--window-seconds", type=int, default=DEFAULT_WINDOW_SECONDS)
+    parser.add_argument("--position-id", action="append", type=int, default=[])
+    parser.add_argument("--exchange-order-id", action="append", default=[])
     parser.add_argument("--apply", action="store_true", help="write repairs to the database")
     args = parser.parse_args()
+    position_ids = {int(value) for value in args.position_id or [] if int(value) > 0}
+    exchange_order_ids = _allowed_filter_ids(tuple(args.exchange_order_id or ()))
+    if args.apply and not position_ids and not exchange_order_ids:
+        parser.error("--apply requires --position-id or --exchange-order-id after dry-run audit")
 
-    repairs = await collect_repairs(days=args.days, window_seconds=args.window_seconds)
-    print({"repairs": len(repairs), "apply": bool(args.apply)})
+    repairs = await collect_repairs(
+        days=args.days,
+        window_seconds=args.window_seconds,
+        position_ids=position_ids,
+        exchange_order_ids=exchange_order_ids,
+    )
+    print(
+        {
+            "repairs": len(repairs),
+            "apply": bool(args.apply),
+            "position_ids": sorted(position_ids),
+            "exchange_order_ids": sorted(exchange_order_ids),
+            "apply_policy": "apply_requires_position_id_or_exchange_order_id",
+        }
+    )
     for item in repairs[:50]:
         print(_report_item(item))
     if len(repairs) > 50:
         print({"truncated": len(repairs) - 50})
     if args.apply:
+        backup_path = await backup_repairs(repairs)
         await apply_repairs(repairs)
-        print({"applied": len(repairs)})
+        print({"applied": len(repairs), "backup": str(backup_path) if backup_path else None})
     return 0
 
 

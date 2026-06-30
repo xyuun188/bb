@@ -23,9 +23,15 @@ from core.symbols import (
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.manual_close_marker import (
+    ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX,
+    is_local_non_exchange_close_marker,
+    is_manual_close_order,
+)
 
 DEFAULT_LOOKBACK_HOURS = 72
 DEFAULT_LIMIT = 500
+OKX_AUTHORITATIVE_POSITION_MODEL = "okx_authoritative_sync"
 SYMBOL_MISMATCH_SEVERITY = "critical"
 POSITION_SYMBOL_MISMATCH_SEVERITY = "critical"
 QUANTITY_MISMATCH_SEVERITY = "critical"
@@ -34,7 +40,9 @@ NOTIONAL_MISMATCH_SEVERITY = "warning"
 ORDER_POSITION_MISSING_SEVERITY = "warning"
 POSITION_LINK_MISSING_SEVERITY = "critical"
 POSITION_LINK_MISMATCH_SEVERITY = "critical"
+ORPHAN_QUARANTINE_SEVERITY = "info"
 POSITION_LINK_ORDER_MISSING_SEVERITY = "warning"
+HISTORICAL_LINK_ORDER_MISSING_OBSERVATION_DAYS = 3
 QUANTITY_TOLERANCE_RATIO = 0.02
 PRICE_TOLERANCE_RATIO = 0.01
 NOTIONAL_TOLERANCE_RATIO = 0.05
@@ -132,7 +140,7 @@ class OkxTradeFactIntegrityService:
         for order in orders:
             decision = decisions.get(int(order.decision_id or 0))
             execution_result = _execution_result_payload(decision)
-            raw = _execution_raw_response(execution_result)
+            raw = _order_execution_raw(order, execution_result)
             if raw:
                 issues.extend(
                     self._audit_order_against_raw(
@@ -199,7 +207,18 @@ class OkxTradeFactIntegrityService:
             default=0.0,
         )
         local_quantity = _safe_float(order.quantity)
-        expected_base_quantity = raw_contracts * contract_size if raw_contracts > 0 else 0.0
+        raw_base_quantity = _first_positive(
+            raw.get("base_quantity"),
+            raw.get("baseQuantity"),
+            raw.get("filled_base_quantity"),
+            raw.get("filledBaseQuantity"),
+            default=0.0,
+        )
+        expected_base_quantity = (
+            raw_base_quantity
+            if raw_base_quantity > 0
+            else raw_contracts * contract_size if raw_contracts > 0 else 0.0
+        )
         if (
             local_quantity > 0
             and expected_base_quantity > 0
@@ -291,7 +310,7 @@ class OkxTradeFactIntegrityService:
         side = _position_side_for_action(action)
         if side is None:
             return []
-        local_symbol = normalize_trading_symbol(order.symbol)
+        local_symbol = _order_authoritative_symbol(order, raw)
         related_positions = _related_positions_for_order(
             order,
             decision,
@@ -320,7 +339,7 @@ class OkxTradeFactIntegrityService:
             return issues
 
         for position in related_positions:
-            position_symbol = normalize_trading_symbol(position.symbol)
+            position_symbol = _position_authoritative_symbol(position)
             if position_symbol and local_symbol and position_symbol != local_symbol:
                 issues.append(
                     TradeFactIssue(
@@ -331,7 +350,10 @@ class OkxTradeFactIntegrityService:
                         position_id=int(position.id),
                         symbol=position_symbol,
                         expected_symbol=local_symbol,
-                        reason="Position created/closed by the decision uses a different symbol than the filled order.",
+                        reason=(
+                            "Position created/closed by the decision uses a different "
+                            "OKX-native instrument than the filled order."
+                        ),
                     )
                 )
         return issues
@@ -346,6 +368,8 @@ class OkxTradeFactIntegrityService:
         issues: list[TradeFactIssue] = []
         exchange_orders_by_id: dict[str, list[Order]] = {}
         for order in orders:
+            if is_manual_close_order(order):
+                continue
             for exchange_order_id in _split_exchange_order_ids(order.exchange_order_id):
                 exchange_orders_by_id.setdefault(exchange_order_id, []).append(order)
 
@@ -369,12 +393,65 @@ class OkxTradeFactIntegrityService:
                         )
                     )
 
-            entry_ids = _split_exchange_order_ids(
+            raw_entry_ids = _split_exchange_order_ids(
                 getattr(position, "entry_exchange_order_id", None)
             )
-            close_ids = _split_exchange_order_ids(
+            raw_close_ids = _split_exchange_order_ids(
                 getattr(position, "close_exchange_order_id", None)
             )
+            local_marker_ids = {
+                item for item in raw_close_ids if is_local_non_exchange_close_marker(item)
+            }
+            entry_ids = {
+                item for item in raw_entry_ids if not is_local_non_exchange_close_marker(item)
+            }
+            close_ids = raw_close_ids - local_marker_ids
+            if _is_superseded_position_residual(position, positions):
+                if not entry_ids or (
+                    not bool(position.is_open)
+                    and _safe_float(getattr(position, "realized_pnl", None), 0.0) != 0.0
+                    and not close_ids
+                    and not local_marker_ids
+                ):
+                    issues.append(
+                        TradeFactIssue(
+                            kind="superseded_position_residual",
+                            severity="info",
+                            position_id=int(position.id),
+                            symbol=position_symbol,
+                            expected_symbol=position_symbol,
+                            reason=(
+                                "A more complete OKX-authoritative lifecycle row covers this "
+                                "legacy split/residual position; keep it excluded from training "
+                                "and dashboard truth instead of treating it as an active blocker."
+                            ),
+                        )
+                    )
+                    continue
+            for local_marker_id in sorted(local_marker_ids):
+                is_orphan = local_marker_id.startswith(ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX)
+                issues.append(
+                    TradeFactIssue(
+                        kind=(
+                            "orphan_position_quarantine_not_exchange_backed"
+                            if is_orphan
+                            else "manual_close_position_fact_not_exchange_backed"
+                        ),
+                        severity=(
+                            ORPHAN_QUARANTINE_SEVERITY
+                            if is_orphan
+                            else POSITION_LINK_MISMATCH_SEVERITY
+                        ),
+                        position_id=int(position.id),
+                        symbol=position_symbol,
+                        expected_symbol=position_symbol,
+                        reason=(
+                            "Position close_exchange_order_id uses local synthetic marker "
+                            f"{local_marker_id}; it is valid for audit display but not an "
+                            "OKX-backed training or reconciliation fact."
+                        ),
+                    )
+                )
             if _position_has_exchange_order_match(position, orders, entry=True) and not entry_ids:
                 issues.append(
                     TradeFactIssue(
@@ -393,6 +470,7 @@ class OkxTradeFactIntegrityService:
                 not bool(position.is_open)
                 and _safe_float(getattr(position, "realized_pnl", None), 0.0) != 0.0
                 and not close_ids
+                and not local_marker_ids
             ):
                 issues.append(
                     TradeFactIssue(
@@ -412,12 +490,22 @@ class OkxTradeFactIntegrityService:
             for linked_order_id in (entry_ids if recent_entry else ()):
                 if linked_order_id not in exchange_orders_by_id:
                     issues.append(
-                        _linked_order_missing_issue(position, position_symbol, linked_order_id)
+                        _linked_order_missing_issue(
+                            position,
+                            position_symbol,
+                            linked_order_id,
+                            since=since,
+                        )
                     )
             for linked_order_id in (close_ids if recent_close else ()):
                 if linked_order_id not in exchange_orders_by_id:
                     issues.append(
-                        _linked_order_missing_issue(position, position_symbol, linked_order_id)
+                        _linked_order_missing_issue(
+                            position,
+                            position_symbol,
+                            linked_order_id,
+                            since=since,
+                        )
                     )
         return issues
 
@@ -434,6 +522,62 @@ def _execution_raw_response(execution_result: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_response, dict):
         return raw_response
     return {}
+
+
+def _order_execution_raw(
+    order: Order,
+    execution_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the most authoritative OKX execution fact for a local order."""
+    okx_raw_fills = getattr(order, "okx_raw_fills", None)
+    if (
+        isinstance(okx_raw_fills, dict)
+        and okx_raw_fills.get("position_snapshot_confirmed") is True
+        and okx_raw_fills.get("fills_history_confirmed") is False
+    ):
+        return {}
+    if isinstance(okx_raw_fills, dict) and okx_raw_fills:
+        return _raw_from_order_fills(order, okx_raw_fills)
+    return _execution_raw_response(execution_result or {})
+
+
+def _raw_from_order_fills(order: Order, okx_raw_fills: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(okx_raw_fills)
+    rows = raw.get("rows") if isinstance(raw.get("rows"), list) else []
+    first_row = next((row for row in rows if isinstance(row, dict)), {})
+    inst_id = (
+        raw.get("inst_id")
+        or raw.get("instId")
+        or getattr(order, "okx_inst_id", None)
+        or first_row.get("instId")
+    )
+    info = dict(raw.get("info") if isinstance(raw.get("info"), dict) else {})
+    if inst_id and not info.get("instId"):
+        info["instId"] = inst_id
+    if not info.get("avgPx"):
+        avg_price = raw.get("avg_price") or raw.get("avgPx") or first_row.get("fillPx")
+        if avg_price is not None:
+            info["avgPx"] = avg_price
+    if not info.get("fillPx") and first_row.get("fillPx") is not None:
+        info["fillPx"] = first_row.get("fillPx")
+    if not info.get("accFillSz"):
+        contracts = raw.get("contracts") or raw.get("filled_contracts") or first_row.get("fillSz")
+        if contracts is not None:
+            info["accFillSz"] = contracts
+    if not info.get("ctVal"):
+        contract_size = raw.get("contract_size") or raw.get("contractSize")
+        if contract_size is not None:
+            info["ctVal"] = contract_size
+
+    raw["info"] = info
+    raw.setdefault("okx_inst_id", inst_id)
+    raw.setdefault("contract_size", raw.get("contractSize") or raw.get("ctVal"))
+    raw.setdefault("filled_contracts", raw.get("contracts") or raw.get("filled") or raw.get("amount"))
+    raw.setdefault("average", raw.get("avg_price") or raw.get("avgPx"))
+    raw.setdefault("avgPx", raw.get("avg_price") or raw.get("average"))
+    raw.setdefault("price", raw.get("avg_price") or raw.get("average") or first_row.get("fillPx"))
+    raw.setdefault("base_quantity", raw.get("filled_base_quantity") or raw.get("quantity"))
+    return raw
 
 
 def _execution_fact_price(
@@ -487,6 +631,21 @@ def _weighted_split_exit_price(chunks: Any) -> float:
 def _raw_exchange_symbol(raw: dict[str, Any], *, fallback: Any = "") -> str:
     data = raw if isinstance(raw, dict) else {}
     info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    native_symbol = _native_exchange_symbol(data)
+    if native_symbol:
+        return native_symbol
+    explicit = normalize_trading_symbol(data.get("canonical_exchange_symbol"))
+    if explicit:
+        return explicit
+    symbol = normalize_trading_symbol(data.get("symbol"))
+    if symbol:
+        return symbol
+    return normalize_trading_symbol(fallback)
+
+
+def _native_exchange_symbol(raw: dict[str, Any]) -> str:
+    data = raw if isinstance(raw, dict) else {}
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
     for candidate in (
         info.get("instId"),
         data.get("instId"),
@@ -496,13 +655,18 @@ def _raw_exchange_symbol(raw: dict[str, Any], *, fallback: Any = "") -> str:
         symbol = symbol_from_okx_inst_id(candidate)
         if symbol:
             return symbol
-    explicit = normalize_trading_symbol(data.get("canonical_exchange_symbol"))
-    if explicit:
-        return explicit
-    symbol = normalize_trading_symbol(data.get("symbol"))
-    if symbol:
-        return symbol
-    return normalize_trading_symbol(fallback)
+    return ""
+
+
+def _order_authoritative_symbol(order: Order, raw: dict[str, Any]) -> str:
+    return _native_exchange_symbol(raw) or normalize_trading_symbol(order.symbol)
+
+
+def _position_authoritative_symbol(position: Position) -> str:
+    okx_symbol = symbol_from_okx_inst_id(getattr(position, "okx_inst_id", None))
+    if okx_symbol:
+        return okx_symbol
+    return normalize_trading_symbol(position.symbol)
 
 
 def _related_positions_for_order(
@@ -519,8 +683,10 @@ def _related_positions_for_order(
         return []
     entry_action = action in {"long", "short"}
     local_symbol = normalize_trading_symbol(order.symbol)
+    authoritative_order_symbol = _order_authoritative_symbol(order, raw)
     expected_symbols = set()
     for symbol in (
+        authoritative_order_symbol,
         local_symbol,
         normalize_trading_symbol(getattr(decision, "symbol", "")),
         _raw_exchange_symbol(raw, fallback=local_symbol),
@@ -538,13 +704,13 @@ def _related_positions_for_order(
 
     matches: list[tuple[float, Position]] = []
     for position in positions:
-        if str(position.model_name or "") != str(order.model_name or ""):
+        if not _position_model_matches_order(position, order):
             continue
         if str(position.execution_mode or "") != str(order.execution_mode or ""):
             continue
         if str(position.side or "").lower() != side:
             continue
-        position_symbol = normalize_trading_symbol(position.symbol)
+        position_symbol = _position_authoritative_symbol(position)
         symbol_matches = bool(position_symbol and position_symbol in expected_symbols)
         lifecycle_match = (
             entry_action
@@ -594,11 +760,100 @@ def _directly_linked_positions_for_order(
     matches = [
         position
         for position in positions
-        if str(position.model_name or "") == str(order.model_name or "")
+        if _position_model_matches_order(position, order)
         and str(position.execution_mode or "") == str(order.execution_mode or "")
         and order_ids.intersection(_split_exchange_order_ids(getattr(position, field_name, None)))
     ]
     return sorted(matches, key=lambda position: getattr(position, "id", 0) or 0)[:5]
+
+
+def _position_model_matches_order(position: Position, order: Order) -> bool:
+    position_model = str(getattr(position, "model_name", "") or "")
+    order_model = str(getattr(order, "model_name", "") or "")
+    return position_model == order_model or position_model == OKX_AUTHORITATIVE_POSITION_MODEL
+
+
+def _is_superseded_position_residual(position: Position, positions: list[Position]) -> bool:
+    return any(
+        other is not position and _position_supersedes_for_integrity(other, position)
+        for other in positions
+    )
+
+
+def _position_supersedes_for_integrity(candidate: Position, other: Position) -> bool:
+    if _position_integrity_base_key(candidate) != _position_integrity_base_key(other):
+        return False
+    candidate_pos_id = str(getattr(candidate, "okx_pos_id", "") or "").strip()
+    other_pos_id = str(getattr(other, "okx_pos_id", "") or "").strip()
+    if candidate_pos_id and other_pos_id and candidate_pos_id != other_pos_id:
+        return False
+    candidate_entry_ids = _split_exchange_order_ids(getattr(candidate, "entry_exchange_order_id", None))
+    candidate_close_ids = _split_exchange_order_ids(getattr(candidate, "close_exchange_order_id", None))
+    other_entry_ids = _split_exchange_order_ids(getattr(other, "entry_exchange_order_id", None))
+    other_close_ids = _split_exchange_order_ids(getattr(other, "close_exchange_order_id", None))
+    if not (candidate_entry_ids or candidate_close_ids):
+        return False
+    if not (candidate_entry_ids and candidate_close_ids):
+        return False
+    if other_close_ids and candidate_close_ids and not candidate_close_ids.issuperset(other_close_ids):
+        return False
+    if other_entry_ids and candidate_entry_ids and not candidate_entry_ids.issuperset(other_entry_ids):
+        return False
+    if _is_zero_quantity_unlinked_residual(other):
+        return _position_open_times_align(candidate, other)
+    if not _position_times_align(candidate, other):
+        return False
+    return _position_integrity_score(candidate) > _position_integrity_score(other)
+
+
+def _position_integrity_base_key(position: Position) -> tuple[str, str, str]:
+    return (
+        str(getattr(position, "execution_mode", "") or ""),
+        _position_authoritative_symbol(position),
+        str(getattr(position, "side", "") or "").lower(),
+    )
+
+
+def _position_times_align(left: Position, right: Position) -> bool:
+    if not _position_open_times_align(left, right):
+        return False
+    left_closed = _ensure_aware(getattr(left, "closed_at", None))
+    right_closed = _ensure_aware(getattr(right, "closed_at", None))
+    if left_closed and right_closed and abs((left_closed - right_closed).total_seconds()) > 3:
+        return False
+    return True
+
+
+def _position_open_times_align(left: Position, right: Position) -> bool:
+    left_opened = _ensure_aware(getattr(left, "created_at", None))
+    right_opened = _ensure_aware(getattr(right, "created_at", None))
+    if left_opened and right_opened and abs((left_opened - right_opened).total_seconds()) > 3:
+        return False
+    return True
+
+
+def _is_zero_quantity_unlinked_residual(position: Position) -> bool:
+    return (
+        not bool(getattr(position, "is_open", False))
+        and abs(_safe_float(getattr(position, "quantity", None))) <= 1e-12
+        and abs(_safe_float(getattr(position, "realized_pnl", None))) <= 1e-12
+        and not _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+        and not _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+    )
+
+
+def _position_integrity_score(position: Position) -> tuple[int, int, int, int, int]:
+    entry_ids = _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+    close_ids = _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+    quantity = abs(_safe_float(getattr(position, "quantity", None)))
+    realized = abs(_safe_float(getattr(position, "realized_pnl", None)))
+    return (
+        len(entry_ids),
+        len(close_ids),
+        1 if quantity > 1e-12 else 0,
+        1 if realized > 1e-12 else 0,
+        int(getattr(position, "id", 0) or 0),
+    )
 
 
 def _position_has_exchange_order_match(
@@ -609,11 +864,15 @@ def _position_has_exchange_order_match(
 ) -> bool:
     position_symbol = normalize_trading_symbol(position.symbol)
     side = str(position.side or "").lower()
-    expected_order_side = "buy" if (entry and side == "long") or (not entry and side == "short") else "sell"
+    expected_order_side = (
+        "buy" if (entry and side == "long") or (not entry and side == "short") else "sell"
+    )
     position_time = _ensure_aware(position.created_at if entry else position.closed_at)
     if position_time is None:
         return False
     for order in orders:
+        if is_manual_close_order(order):
+            continue
         if not str(getattr(order, "exchange_order_id", "") or "").strip():
             continue
         if str(order.execution_mode or "") != str(position.execution_mode or ""):
@@ -625,7 +884,10 @@ def _position_has_exchange_order_match(
         order_time = _order_time(order)
         if order_time is None:
             continue
-        if abs((order_time - position_time).total_seconds()) <= POSITION_MATCH_WINDOW.total_seconds():
+        if (
+            abs((order_time - position_time).total_seconds())
+            <= POSITION_MATCH_WINDOW.total_seconds()
+        ):
             return True
     return False
 
@@ -634,10 +896,25 @@ def _linked_order_missing_issue(
     position: Position,
     position_symbol: str,
     linked_order_id: str,
+    *,
+    since: datetime,
 ) -> TradeFactIssue:
+    reference_time = _ensure_aware(getattr(position, "closed_at", None)) or _ensure_aware(
+        getattr(position, "created_at", None)
+    )
+    age_days = (
+        max((datetime.now(UTC) - reference_time).total_seconds() / 86400.0, 0.0)
+        if reference_time is not None
+        else 0.0
+    )
+    severity = (
+        "info"
+        if age_days > HISTORICAL_LINK_ORDER_MISSING_OBSERVATION_DAYS
+        else POSITION_LINK_ORDER_MISSING_SEVERITY
+    )
     return TradeFactIssue(
         kind="position_order_link_missing_local_order",
-        severity=POSITION_LINK_ORDER_MISSING_SEVERITY,
+        severity=severity,
         position_id=int(position.id),
         symbol=position_symbol,
         expected_symbol=position_symbol,

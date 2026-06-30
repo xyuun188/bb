@@ -31,8 +31,21 @@ def test_balance_snapshot_parsers_prefer_tradeable_free_then_equity() -> None:
     assert tradeable_balance_from_snapshot(None) == 0.0
 
 
+def test_account_equity_prefers_okx_equity_over_cash_when_unrealized_loss() -> None:
+    snapshot = {
+        "free": 4965.95,
+        "used": 24.74,
+        "total": 4990.70,
+        "cash": 4991.26,
+        "equity": 4990.70,
+        "allocatable": 4990.70,
+    }
+
+    assert balance_from_snapshot(snapshot) == 4990.70
+
+
 @pytest.mark.asyncio
-async def test_account_balance_prefers_exchange_snapshot_then_allocation() -> None:
+async def test_account_balance_uses_exchange_snapshot() -> None:
     async def snapshot(_mode: str) -> dict[str, Any] | None:
         return {"equity": 250.0, "free": 100.0}
 
@@ -50,7 +63,7 @@ async def test_account_balance_prefers_exchange_snapshot_then_allocation() -> No
 
 
 @pytest.mark.asyncio
-async def test_account_balance_falls_back_to_persisted_allocation() -> None:
+async def test_account_balance_returns_zero_without_exchange_snapshot() -> None:
     async def snapshot(_mode: str) -> dict[str, Any] | None:
         return None
 
@@ -63,12 +76,14 @@ async def test_account_balance_falls_back_to_persisted_allocation() -> None:
         model_execution_mode_provider=lambda _model_name: "live",
     )
 
-    assert await service.account_balance("ensemble_trader") == 500.0
+    assert await service.account_balance("ensemble_trader") == 0.0
     assert await service.allocated_order_balance("live") == 0.0
 
 
 @pytest.mark.asyncio
-async def test_persist_accounting_updates_use_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_accounting_does_not_persist_synthetic_balance_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     updates: list[tuple[str, float, float]] = []
     trade_results: list[tuple[str, bool]] = []
     unrealized_updates: list[tuple[str, float]] = []
@@ -117,12 +132,9 @@ async def test_persist_accounting_updates_use_repository(monkeypatch: pytest.Mon
     await service.persist_account_update("ensemble_trader", "ensemble_trader", result)
     await service.record_unrealized_pnl("ensemble_trader", 4.567)
 
-    assert updates == [
-        ("ensemble_trader", 3.0, 2.0),
-        ("ensemble_trader", 12.5, 12.5),
-    ]
+    assert updates == []
     assert trade_results == [("ensemble_trader", True)]
-    assert unrealized_updates == [("ensemble_trader", 4.57)]
+    assert unrealized_updates == []
 
 
 @pytest.mark.asyncio

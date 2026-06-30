@@ -51,6 +51,13 @@ async def vector_memory_reindex(
     return await get_vector_memory_service().reindex_recent()
 
 
+@router.post("/vector-memory/clear")
+async def vector_memory_clear(
+    _access: None = Depends(require_dashboard_write_access),
+) -> dict[str, Any]:
+    return await get_vector_memory_service().clear_index(reason="phase3_dashboard_clear_old_index")
+
+
 @router.post("/vector-memory/settings")
 async def vector_memory_settings(
     req: VectorMemorySettingsRequest,

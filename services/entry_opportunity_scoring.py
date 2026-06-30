@@ -230,7 +230,7 @@ class EntryOpportunityScoringPolicy:
                 "level": "neutral",
                 "matched_count": int(vector.get("matched_count") or 0) if vector else 0,
                 "is_hard_gate": False,
-                "reason": "相似历史没有足够命中，不调整评分。",
+                "reason": "三期相似样本没有足够命中，不调整评分。",
             }
         same_side_loss_count = 0
         same_side_profit_count = 0
@@ -270,7 +270,7 @@ class EntryOpportunityScoringPolicy:
             "same_side_loss_count": same_side_loss_count,
             "same_side_profit_count": same_side_profit_count,
             "is_hard_gate": False,
-            "reason": "zvec/向量相似历史只做软调分和解释，不作为开仓硬拦截。",
+            "reason": "zvec/向量三期相似样本只做软调分和解释，不作为开仓硬拦截。",
         }
 
     def _side_quality_adjustment(

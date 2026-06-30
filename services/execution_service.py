@@ -20,12 +20,155 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
+from services.profit_first_position_ladder import ProfitFirstPositionLadderPolicy
+from services.profit_first_trade_plan import attach_profit_first_trade_plan
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
 
 logger = structlog.get_logger(__name__)
 
 AGENT_SKILLS_TRADING_EFFECTS_ENABLED = True
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
+    """Ensure an entry cannot reach OKX without the Profit-First v3 contract."""
+
+    if not decision.is_entry:
+        return PolicyGateResult.allow({"profit_first_contract": "not_entry"})
+
+    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+    analysis_type = str(raw.get("analysis_type") or "market").strip() or "market"
+    raw = attach_profit_first_trade_plan(decision, analysis_type=analysis_type)
+    plan = _safe_dict(raw.get("profit_first_trade_plan"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    missing_fields = [
+        str(item)
+        for item in (plan.get("missing_required_fields") or [])
+        if str(item or "").strip()
+    ]
+    lane = str(plan.get("decision_lane") or "").lower().strip()
+    complete = bool(plan.get("is_complete_for_real_trade"))
+
+    base_data = {
+        "profit_first_trade_plan": plan,
+        "profit_first_contract_required": True,
+        "profit_first_contract_source": "execution_service_pre_submit",
+    }
+    if not complete or lane == "shadow_only":
+        return PolicyGateResult.block(
+            "profit_first_trade_plan_incomplete",
+            "Profit-First trade plan is incomplete or shadow-only; entry stayed in shadow before OKX submit.",
+            {
+                **base_data,
+                "stage_status": "skipped",
+                "skip_kind": "profit_first_trade_plan_incomplete",
+                "shadow_only": True,
+                "missing_required_fields": missing_fields,
+                "decision_lane": lane,
+            },
+        )
+
+    if not sizing:
+        return PolicyGateResult.block(
+            "missing_profit_risk_sizing",
+            "Profit-First entry has no profit_risk_sizing snapshot; entry blocked before OKX submit.",
+            {
+                **base_data,
+                "stage_status": "blocked",
+                "missing_required_fields": ["profit_risk_sizing"],
+                "decision_lane": lane,
+            },
+        )
+
+    ladder = _safe_dict(sizing.get("profit_first_position_ladder"))
+    if not ladder:
+        current_size = _safe_float(
+            sizing.get("position_size_pct"),
+            _safe_float(plan.get("position_size_pct"), _safe_float(decision.position_size_pct)),
+        )
+        ladder_decision = ProfitFirstPositionLadderPolicy().apply(
+            lane=lane,
+            current_size_pct=current_size,
+            low_payoff_quality=bool(sizing.get("low_payoff_quality")),
+            high_risk_review=_safe_dict(raw.get("high_risk_review")),
+        )
+        adjusted_size = float(ladder_decision.adjusted_size_pct or 0.0)
+        if abs(adjusted_size - current_size) > 1e-9:
+            return PolicyGateResult.block(
+                "profit_first_position_ladder_missing_before_sizing",
+                (
+                    "Profit-First position ladder was missing and late reconstruction would "
+                    "change size; entry blocked before OKX submit."
+                ),
+                {
+                    **base_data,
+                    "stage_status": "blocked",
+                    "decision_lane": lane,
+                    "current_size_pct": current_size,
+                    "required_ladder_size_pct": adjusted_size,
+                    "missing_required_fields": ["profit_first_position_ladder"],
+                },
+            )
+        ladder = {
+            **ladder_decision.to_dict(),
+            "classifier": {
+                "lane": lane,
+                "source": "execution_service_late_contract_reconstruction",
+            },
+            "pre_stop_budget_size_pct": round(current_size, 6),
+            "post_stop_budget_size_pct": round(current_size, 6),
+            "capped_by_stop_loss_budget": False,
+            "late_attached_at": "execution_pre_submit",
+        }
+        sizing["profit_first_position_ladder"] = ladder
+        raw["profit_risk_sizing"] = sizing
+        decision.raw_response = raw
+
+    if str(ladder.get("lane") or "").lower().strip() == "shadow_only":
+        return PolicyGateResult.block(
+            "profit_first_position_ladder_shadow_only",
+            "Profit-First position ladder is shadow-only; entry stayed in shadow before OKX submit.",
+            {
+                **base_data,
+                "stage_status": "skipped",
+                "skip_kind": "profit_first_position_ladder_shadow_only",
+                "shadow_only": True,
+                "profit_first_position_ladder": ladder,
+            },
+        )
+
+    if _safe_float(ladder.get("adjusted_size_pct")) <= 0.0:
+        return PolicyGateResult.block(
+            "profit_first_position_ladder_zero_size",
+            "Profit-First position ladder produced zero real size; entry blocked before OKX submit.",
+            {
+                **base_data,
+                "stage_status": "blocked",
+                "profit_first_position_ladder": ladder,
+            },
+        )
+
+    return PolicyGateResult.allow(
+        {
+            "profit_first_contract": "passed",
+            "profit_first_trade_plan": plan,
+            "profit_first_position_ladder": ladder,
+            "decision_lane": lane,
+        }
+    )
 
 
 class ExecutionService:
@@ -576,6 +719,39 @@ class ExecutionService:
                 return [compact_execution_value(child, depth + 1) for child in value[:25]]
             return safe_error_text(value, limit=300)
 
+        def okx_exit_mismatch_summary(raw: Any) -> dict[str, Any] | None:
+            if not isinstance(raw, dict):
+                return None
+            mismatch = raw.get("okx_exit_position_mismatch")
+            if not isinstance(mismatch, dict):
+                return None
+            candidates = mismatch.get("candidates")
+            if not isinstance(candidates, list):
+                candidates = []
+            return {
+                "source": mismatch.get("source"),
+                "decision_symbol": mismatch.get("decision_symbol"),
+                "expected_okx_inst_id": mismatch.get("expected_okx_inst_id"),
+                "okx_symbol": mismatch.get("okx_symbol"),
+                "target_position_side": mismatch.get("target_position_side"),
+                "exit_order_side": mismatch.get("exit_order_side"),
+                "positions_returned": mismatch.get("positions_returned"),
+                "matching_position_count": mismatch.get("matching_position_count"),
+                "matching_contracts_total": mismatch.get("matching_contracts_total"),
+                "nonzero_same_symbol_sides": mismatch.get("nonzero_same_symbol_sides"),
+                "candidate_reasons": [
+                    {
+                        "symbol": item.get("symbol"),
+                        "raw_symbol": item.get("raw_symbol"),
+                        "side": item.get("side"),
+                        "contracts": item.get("contracts"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in candidates[:5]
+                    if isinstance(item, dict)
+                ],
+            }
+
         def attach_execution_result_snapshot(
             source: str,
             *,
@@ -585,6 +761,7 @@ class ExecutionService:
             if execution_result is None:
                 return
             status = getattr(execution_result, "status", None)
+            execution_raw = getattr(execution_result, "raw_response", None)
             raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             raw_response = dict(raw_response)
             raw_response["execution_result"] = {
@@ -598,9 +775,10 @@ class ExecutionService:
                 "pnl": float(getattr(execution_result, "pnl", 0.0) or 0.0),
                 "exchange_confirmed": bool(exchange_confirmed),
                 "exit_progress": bool(exit_progress),
-                "raw_response": compact_execution_value(
-                    getattr(execution_result, "raw_response", None)
+                "okx_exit_position_mismatch_summary": okx_exit_mismatch_summary(
+                    execution_raw
                 ),
+                "raw_response": compact_execution_value(execution_raw),
             }
             decision.raw_response = raw_response
 
@@ -798,6 +976,9 @@ class ExecutionService:
             )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
+            profit_first_contract_result = _profit_first_entry_contract_result(decision)
+            if not profit_first_contract_result.passed:
+                return await block_before_submit(profit_first_contract_result)
             if decision_db_id is not None:
                 attach_execution_parameters("entry_policy_passed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)

@@ -17,12 +17,16 @@ from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
-from models.trade import Position
+from models.trade import Order, Position
 from services.decision_execution_trace import build_execution_trace
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY
+from services.okx_position_ledger_view import build_okx_position_ledger_groups
 from services.position_open_time import parse_position_time
+from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
+from web_dashboard.api import dashboard as dashboard_api
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
 
@@ -328,6 +332,17 @@ def _execution_status_label(status: str | None, reason: str | None) -> str:
 
 
 CORRUPTED_HISTORY_REASON = "该笔历史记录的原始说明已损坏，无法准确还原"
+
+
+def _order_okx_confirmed(order: Any) -> bool:
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").lower().strip()
+    return sync_status in {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
+
+
+def _order_success(order: Any) -> bool:
+    return str(getattr(order, "status", "") or "").lower() == "filled" and _order_okx_confirmed(
+        order
+    )
 
 
 def _text_is_unusable(text: str | None) -> bool:
@@ -942,8 +957,21 @@ async def get_trades(
             "detail": reason,
             "execution_failure_kind": failure_kind,
             "execution_status_label": execution_status_label,
-            "success": order.status == "filled",
+            "success": _order_success(order),
+            "okx_confirmed": _order_okx_confirmed(order),
             "exchange_order_id": sanitize_text(order.exchange_order_id),
+            "okx_inst_id": sanitize_text(getattr(order, "okx_inst_id", None)),
+            "okx_trade_ids": sanitize_text(getattr(order, "okx_trade_ids", None)),
+            "okx_fill_contracts": getattr(order, "okx_fill_contracts", None),
+            "okx_fill_pnl": getattr(order, "okx_fill_pnl", None),
+            "okx_state": sanitize_text(getattr(order, "okx_state", None)),
+            "okx_sync_status": sanitize_text(getattr(order, "okx_sync_status", None)),
+            "okx_synced_at": (
+                order.okx_synced_at.isoformat()
+                if getattr(order, "okx_synced_at", None)
+                else None
+            ),
+            "okx_last_error": sanitize_text(getattr(order, "okx_last_error", None)),
             "filled_at": order.filled_at.isoformat() if order.filled_at else None,
             "created_at": order.created_at.isoformat() if order.created_at else None,
         }
@@ -1065,7 +1093,20 @@ async def get_trade_detail(trade_id: int):
             ],
             "execution_failure_kind": failure_kind,
             "execution_status_label": execution_status_label,
-            "success": order.status == "filled",
+            "success": _order_success(order),
+            "okx_confirmed": _order_okx_confirmed(order),
+            "okx_inst_id": sanitize_text(getattr(order, "okx_inst_id", None)),
+            "okx_trade_ids": sanitize_text(getattr(order, "okx_trade_ids", None)),
+            "okx_fill_contracts": getattr(order, "okx_fill_contracts", None),
+            "okx_fill_pnl": getattr(order, "okx_fill_pnl", None),
+            "okx_state": sanitize_text(getattr(order, "okx_state", None)),
+            "okx_sync_status": sanitize_text(getattr(order, "okx_sync_status", None)),
+            "okx_synced_at": (
+                order.okx_synced_at.isoformat()
+                if getattr(order, "okx_synced_at", None)
+                else None
+            ),
+            "okx_last_error": sanitize_text(getattr(order, "okx_last_error", None)),
             "decision": (
                 {
                     "action": getattr(decision, "action", None),
@@ -1091,35 +1132,89 @@ async def get_trade_detail(trade_id: int):
 
 @router.get("/positions")
 async def get_positions(mode: str | None = None):
-    """Get persisted position records, including closed positions."""
+    """Get positions with OKX-native grouped history for closed lifecycles."""
+    selected_mode = mode or None
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
-        positions = await repo.get_position_records(execution_mode=mode, limit=500)
+        positions = await repo.get_position_records(execution_mode=selected_mode, limit=500)
+        closed_positions = [p for p in positions if not p.is_open]
+        linked_order_ids = {
+            token
+            for position in closed_positions
+            for value in (
+                getattr(position, "entry_exchange_order_id", None),
+                getattr(position, "close_exchange_order_id", None),
+            )
+            for token in _split_exchange_order_ids(value)
+        }
+        order_stmt = select(Order).where(Order.status == "filled")
+        if mode:
+            order_stmt = order_stmt.where(Order.execution_mode == mode)
+        if linked_order_ids:
+            order_stmt = order_stmt.where(Order.exchange_order_id.in_(sorted(linked_order_ids)))
+        else:
+            order_stmt = order_stmt.where(Order.id == -1)
+        order_rows = list((await session.execute(order_stmt.limit(10000))).scalars().all())
+
+    closed_ledger_rows = [
+        group.as_dict(include_fills=True)
+        for group in build_okx_position_ledger_groups(closed_positions, order_rows)
+    ]
+    try:
+        open_rows = await dashboard_api._get_display_open_positions_snapshot(selected_mode)
+    except Exception:
+        open_rows = [_serialize_open_position_row(p) for p in positions if p.is_open]
 
     return {
-        "count": len(positions),
-        "positions": [
-            {
-                "id": p.id,
-                "model_name": p.model_name,
-                "mode": p.execution_mode,
-                "symbol": p.symbol,
-                "side": p.side,
-                "quantity": p.quantity,
-                "entry_price": p.entry_price,
-                "current_price": p.current_price,
-                "unrealized_pnl": p.unrealized_pnl,
-                "realized_pnl": p.realized_pnl,
-                "leverage": p.leverage,
-                "stop_loss": p.stop_loss_price,
-                "take_profit": p.take_profit_price,
-                "is_open": p.is_open,
-                "opened_at": p.created_at.isoformat() if p.created_at else None,
-                "closed_at": p.closed_at.isoformat() if p.closed_at else None,
-            }
-            for p in positions
-        ],
+        "count": len(open_rows) + len(closed_ledger_rows),
+        "open_count": len(open_rows),
+        "closed_count": len(closed_ledger_rows),
+        "positions": [*open_rows, *closed_ledger_rows],
+        "ledger_source": "okx_current_positions_plus_grouped_closed_cache",
     }
+
+
+def _serialize_open_position_row(p: Position) -> dict[str, Any]:
+    return {
+        "id": p.id,
+        "model_name": p.model_name,
+        "mode": p.execution_mode,
+        "symbol": p.symbol,
+        "side": p.side,
+        "quantity": p.quantity,
+        "entry_price": p.entry_price,
+        "current_price": p.current_price,
+        "unrealized_pnl": p.unrealized_pnl,
+        "realized_pnl": p.realized_pnl,
+        "leverage": p.leverage,
+        "stop_loss": p.stop_loss_price,
+        "take_profit": p.take_profit_price,
+        "is_open": True,
+        "close_status": "open",
+        "close_status_label": "持有中",
+        "trade_fact_trusted": True,
+        "trade_fact_untrusted_reason": None,
+        "okx_inst_id": p.okx_inst_id,
+        "okx_pos_id": p.okx_pos_id,
+        "entry_exchange_order_id": p.entry_exchange_order_id,
+        "close_exchange_order_id": p.close_exchange_order_id,
+        "opened_at": p.created_at.isoformat() if p.created_at else None,
+        "closed_at": None,
+        "ledger_source": "okx_current_position_cache",
+    }
+
+
+def _split_exchange_order_ids(value: Any) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    tokens = {text}
+    for separator in (",", ";", "|", "\n", "\t", " "):
+        pieces: set[str] = set()
+        for token in tokens:
+            pieces.update(part.strip() for part in token.split(separator) if part.strip())
+        tokens = pieces
+    return {token for token in tokens if token}
 
 
 @router.delete(

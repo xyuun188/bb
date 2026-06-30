@@ -14,9 +14,12 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 from config.settings import settings
+from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from services.entry_sizing import apply_evidence_sizing_policy
+from services.profit_first_position_ladder import ProfitFirstPositionLadderPolicy
+from services.profit_first_trade_plan import classify_decision_lane
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 EntryProfitRiskSizingEvaluator = Callable[
@@ -134,6 +137,8 @@ class EntryProfitRiskSizingPolicy:
     entry_stop_loss_budget: Any | None = None
     entry_stress_stop: Any | None = None
     entry_existing_winner_context: Any | None = None
+    profit_first_position_ladder: Any | None = None
+    dynamic_leverage_allocator: Any | None = None
     max_leverage_provider: Callable[[], float] = _settings_max_leverage
     probe_max_loss_usdt: float = ENTRY_BALANCED_PROBE_MAX_LOSS_USDT
     strong_probe_max_loss_usdt: float = ENTRY_STRONG_PROBE_MAX_LOSS_USDT
@@ -141,6 +146,10 @@ class EntryProfitRiskSizingPolicy:
     @staticmethod
     def _safe_dict(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _safe_list(value: Any) -> list[Any]:
+        return value if isinstance(value, list) else []
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -547,6 +556,112 @@ class EntryProfitRiskSizingPolicy:
             ENTRY_RECOVERY_PROBE_MAX_CAP_PCT,
         )
 
+    @classmethod
+    def _profit_first_lane_for_sizing(
+        cls,
+        *,
+        raw: dict[str, Any],
+        decision: DecisionOutput,
+        expected_net_return_pct: float,
+        expected_profit_usdt: float,
+        profit_quality_ratio: float,
+        reward_risk_ratio: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        aligned_source_count: int,
+    ) -> dict[str, Any]:
+        persisted_plan = cls._safe_dict(raw.get("profit_first_trade_plan"))
+        existing_lane = str(persisted_plan.get("decision_lane") or "").lower().strip()
+        if existing_lane in {
+            "shadow_only",
+            "tiny_probe",
+            "validated_probe",
+            "meaningful_entry",
+            "high_conviction",
+        }:
+            return {
+                "lane": existing_lane,
+                "promotion_reasons": persisted_plan.get("promotion_reasons") or [],
+                "downgrade_reasons": persisted_plan.get("block_or_downgrade_reasons") or [],
+                "independent_source_count": int(
+                    cls._safe_float(persisted_plan.get("independent_source_count"), 0.0)
+                ),
+                "source": "persisted_profit_first_plan",
+            }
+
+        opportunity = cls._safe_dict(raw.get("opportunity_score"))
+        evidence = cls._safe_dict(opportunity.get("evidence_score"))
+        component_sources = {
+            str(component.get("source") or "").strip()
+            for component in cls._safe_list(evidence.get("components"))
+            if isinstance(component, dict)
+            and str(component.get("status") or "").lower() == "aligned"
+            and str(component.get("source") or "").strip()
+        }
+        independent_source_count = max(1 + int(aligned_source_count or 0), 1 + len(component_sources))
+        if cls._safe_dict(raw.get("high_risk_review")).get("approved") is True:
+            independent_source_count += 1
+        lane, promotion, downgrade = classify_decision_lane(
+            expected_net_return_pct=expected_net_return_pct,
+            expected_profit_usdt=expected_profit_usdt,
+            profit_quality_ratio=profit_quality_ratio,
+            reward_risk_ratio=reward_risk_ratio,
+            loss_probability=loss_probability,
+            tail_loss_probability=tail_risk_score,
+            independent_source_count=independent_source_count,
+            missing_required_fields=[],
+            high_risk_review=cls._safe_dict(raw.get("high_risk_review")),
+            recent_realized_edge=cls._safe_float(
+                opportunity.get(
+                    "recent_realized_edge",
+                    opportunity.get("side_realized_pnl_usdt", 0.0),
+                ),
+                0.0,
+            ),
+            is_entry=decision.is_entry,
+        )
+        return {
+            "lane": lane,
+            "promotion_reasons": promotion,
+            "downgrade_reasons": downgrade,
+            "independent_source_count": independent_source_count,
+            "source": "sizing_profit_first_classifier",
+        }
+
+    @classmethod
+    def _portfolio_leverage_context(cls, open_positions: list[dict] | None) -> dict[str, Any]:
+        positions = [position for position in open_positions or [] if isinstance(position, dict)]
+        exposure = 0.0
+        for position in positions:
+            exposure += max(
+                cls._safe_float(
+                    position.get("position_size_pct")
+                    or position.get("margin_pct")
+                    or position.get("size_pct")
+                    or position.get("margin_ratio")
+                    or position.get("notional_pct"),
+                    0.0,
+                ),
+                0.0,
+            )
+        return {
+            "open_positions_count": len(positions),
+            "portfolio_exposure_pct": exposure,
+        }
+
+    @classmethod
+    def _execution_cost_context(cls, raw: dict[str, Any], opportunity: dict[str, Any]) -> dict[str, Any]:
+        contexts = (
+            opportunity.get("execution_cost"),
+            opportunity.get("cost_snapshot"),
+            raw.get("execution_cost"),
+            raw.get("market_cost"),
+        )
+        for context in contexts:
+            if isinstance(context, dict):
+                return context
+        return {}
+
     def _missing_dependencies(self) -> list[str]:
         required = {
             "allocated_order_balance": self.allocated_order_balance,
@@ -687,11 +802,6 @@ class EntryProfitRiskSizingPolicy:
                 if high_quality_entry
                 else ENTRY_WEAK_HISTORY_MAX_SIZE
             )
-            weak_history_max_leverage = (
-                ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_LEVERAGE
-                if high_quality_entry
-                else ENTRY_WEAK_HISTORY_MAX_LEVERAGE
-            )
             if current_size > weak_history_max_size:
                 current_size = weak_history_max_size
                 decision.position_size_pct = current_size
@@ -700,23 +810,12 @@ class EntryProfitRiskSizingPolicy:
                     if high_quality_entry
                     else "近期该币种/方向真实盈亏偏弱，仓位降为小仓验证"
                 )
-            if leverage > weak_history_max_leverage:
-                leverage = weak_history_max_leverage
-                decision.suggested_leverage = leverage
-                caps.append(
-                    "近期亏损方向当前证据改善，杠杆放宽但仍限制上限"
-                    if high_quality_entry
-                    else "近期亏损方向限制杠杆，避免单笔亏损继续放大"
-                )
-        if local_expected < 0 and not (local_aligned or ml_aligned):
+        negative_local_expected = bool(local_expected < 0 and not (local_aligned or ml_aligned))
+        if negative_local_expected:
             if current_size > ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE:
                 current_size = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE
                 decision.position_size_pct = current_size
                 caps.append("服务器盈利模型反向或预期为负，仅允许极小仓")
-            if leverage > ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE:
-                leverage = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_LEVERAGE
-                decision.suggested_leverage = leverage
-                caps.append("服务器盈利模型未支持该方向，降低杠杆")
         low_payoff_reasons = self.entry_low_payoff_quality.reasons(
             score=score,
             min_score_required=min_score_required,
@@ -735,10 +834,6 @@ class EntryProfitRiskSizingPolicy:
                 current_size = ENTRY_LOW_QUALITY_MAX_SIZE
                 decision.position_size_pct = current_size
                 caps.append("收益质量不足或存在小盈大亏风险，仓位降为小仓验证")
-            if leverage > ENTRY_LOW_QUALITY_MAX_LEVERAGE:
-                leverage = ENTRY_LOW_QUALITY_MAX_LEVERAGE
-                decision.suggested_leverage = leverage
-                caps.append("收益质量不足或存在小盈大亏风险，杠杆降到低档")
         if symbol_profit_tier == "side_loser" and not high_quality_entry:
             loser_size_cap = max(
                 ENTRY_LOW_QUALITY_MAX_SIZE, current_size * ENTRY_SYMBOL_LOSER_SIZE_MULTIPLIER
@@ -978,18 +1073,6 @@ class EntryProfitRiskSizingPolicy:
             notional_floor_ratio = max(
                 notional_floor_ratio, ENTRY_HIGH_PROFIT_MIN_NOTIONAL_BALANCE_RATIO
             )
-            target_leverage_floor = (
-                ENTRY_HIGH_PROFIT_ELITE_MIN_LEVERAGE
-                if expected_net >= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_expected_net
-                and profit_quality_ratio
-                >= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_profit_quality
-                and loss_probability
-                <= _ENTRY_RISK_SIZING_PARAMS.high_profit_elite_max_loss_probability
-                else ENTRY_HIGH_PROFIT_MIN_LEVERAGE
-            )
-            if leverage < target_leverage_floor:
-                leverage = min(target_leverage_floor, self.max_leverage_provider())
-                decision.suggested_leverage = leverage
             meaningful_size_reason = (
                 "盈利可能性较大：预期净收益、盈亏质量、亏损概率和尾部风险同时达标，"
                 "允许适当提高交易数量和杠杆，把高质量机会转成更大的实际收益。"
@@ -1189,16 +1272,96 @@ class EntryProfitRiskSizingPolicy:
                     current_size = raised_size
                     decision.position_size_pct = current_size
 
+        profit_first_lane = self._profit_first_lane_for_sizing(
+            raw=raw,
+            decision=decision,
+            expected_net_return_pct=expected_net,
+            expected_profit_usdt=expected_profit_usdt,
+            profit_quality_ratio=profit_quality_ratio,
+            reward_risk_ratio=self._safe_float(opportunity.get("reward_risk_ratio"), 0.0),
+            loss_probability=loss_probability,
+            tail_risk_score=tail_risk,
+            aligned_source_count=aligned_source_count,
+        )
+        position_ladder_policy = self.profit_first_position_ladder or ProfitFirstPositionLadderPolicy()
+        position_ladder_decision = position_ladder_policy.apply(
+            lane=str(profit_first_lane.get("lane") or ""),
+            current_size_pct=current_size,
+            low_payoff_quality=low_payoff_quality,
+            high_risk_review=self._safe_dict(raw.get("high_risk_review")),
+        )
+        profit_first_position_ladder = {
+            **position_ladder_decision.to_dict(),
+            "classifier": profit_first_lane,
+            "pre_stop_budget_size_pct": round(current_size, 6),
+            "low_payoff_quality": bool(low_payoff_quality),
+        }
+        if abs(position_ladder_decision.adjusted_size_pct - current_size) > 1e-9:
+            current_size = position_ladder_decision.adjusted_size_pct
+            decision.position_size_pct = current_size
+            caps.append("profit-first position ladder applied")
+
+        portfolio_leverage_context = self._portfolio_leverage_context(open_positions or [])
+        dynamic_leverage_policy = self.dynamic_leverage_allocator or DynamicLeverageAllocator()
+        dynamic_leverage_decision = dynamic_leverage_policy.allocate(
+            DynamicLeverageInput(
+                symbol=decision.symbol,
+                requested_leverage=leverage,
+                system_max_leverage=self.max_leverage_provider(),
+                balance=balance,
+                position_size_pct=current_size,
+                stress_stop_loss_pct=stress_stop_loss_pct,
+                max_loss_usdt=max_loss,
+                expected_net_return_pct=expected_net,
+                profit_quality_ratio=profit_quality_ratio,
+                loss_probability=loss_probability,
+                tail_risk_score=tail_risk,
+                score=score,
+                min_score_required=min_score_required,
+                confidence=float(decision.confidence or 0.0),
+                aligned_source_count=aligned_source_count,
+                evidence_tier=evidence_sizing.tier,
+                evidence_effective_score=evidence_effective_score,
+                low_payoff_quality=low_payoff_quality,
+                weak_history=weak_history,
+                negative_local_expected=negative_local_expected,
+                symbol_profit_tier=symbol_profit_tier,
+                quality_tier=quality_tier,
+                high_quality_entry=high_quality_entry,
+                atr_pct=atr_pct,
+                execution_cost=self._execution_cost_context(raw, opportunity),
+                open_positions_count=int(
+                    portfolio_leverage_context.get("open_positions_count") or 0
+                ),
+                portfolio_exposure_pct=self._safe_float(
+                    portfolio_leverage_context.get("portfolio_exposure_pct"), 0.0
+                ),
+            )
+        )
+        leverage = float(dynamic_leverage_decision.final_integer_leverage)
+        decision.suggested_leverage = leverage
+        dynamic_leverage_payload = dynamic_leverage_decision.to_dict()
+        caps.append(
+            "dynamic leverage allocator applied: "
+            f"{dynamic_leverage_payload['final_integer_leverage']}x "
+            f"({dynamic_leverage_payload['limiting_factor']})"
+        )
+
         planned_loss = balance * current_size * leverage * stress_stop_loss_pct
         max_size_pct = max_loss / max(balance * leverage * stress_stop_loss_pct, 1e-12)
         max_size_pct = max(min(max_size_pct, current_size), 0.001)
+        final_size_pct = max_size_pct if planned_loss > max_loss else current_size
+        if planned_loss > max_loss:
+            profit_first_position_ladder["capped_by_stop_loss_budget"] = True
+            profit_first_position_ladder["post_stop_budget_size_pct"] = round(max_size_pct, 6)
+        else:
+            profit_first_position_ladder["capped_by_stop_loss_budget"] = False
+            profit_first_position_ladder["post_stop_budget_size_pct"] = round(current_size, 6)
         raw["profit_risk_sizing"] = {
             "applied": planned_loss > max_loss,
             "risk_mode": risk_mode,
             "original_position_size_pct": round(original_size_before_floor, 6),
-            "position_size_pct": round(
-                max_size_pct if planned_loss > max_loss else current_size, 6
-            ),
+            "position_size_pct": round(final_size_pct, 6),
             "planned_stop_loss_usdt": round(planned_loss, 6),
             "max_stop_loss_usdt": round(max_loss, 6),
             "declared_stop_loss_pct": round(stop_loss_pct, 6),
@@ -1216,6 +1379,8 @@ class EntryProfitRiskSizingPolicy:
             "same_side_existing_winner": existing_winner,
             "risk_budget_boost": risk_budget_boost,
             "probe_budget_guard": probe_budget_guard,
+            "profit_first_position_ladder": profit_first_position_ladder,
+            "dynamic_leverage_decision": dynamic_leverage_payload,
             "pnl_structure_guard": pnl_structure_guard,
             "strategy_learning_sizing": strategy_sizing_applied,
             "strategy_quality_override": bool(strategy_quality_override),
@@ -1227,8 +1392,13 @@ class EntryProfitRiskSizingPolicy:
             "target_min_notional_balance_ratio": round(notional_floor_ratio, 6),
             "notional_floor_reason": notional_floor_reason,
             "notional_floor_blocked": notional_floor_blocked,
-            "final_notional_usdt": round(balance * current_size * leverage, 6),
+            "final_notional_usdt": round(balance * final_size_pct * leverage, 6),
+            "expected_profit_usdt": round(
+                balance * final_size_pct * leverage * max(expected_net, 0.0) / 100.0,
+                6,
+            ),
         }
+        raw["dynamic_leverage_decision"] = dynamic_leverage_payload
         if planned_loss > max_loss:
             decision.position_size_pct = max_size_pct
             if strategy_sizing_applied.get("applied"):

@@ -52,6 +52,12 @@ class ReconciliationScanReport:
     truncated: bool
     max_close_orders: int | None
     duration_seconds: float
+    plan_classifications: list[dict[str, Any]]
+    classification_counts: dict[str, int]
+    repairable_count: int
+    manual_review_count: int
+    skipped_candidate_count: int
+    unscanned_candidate_count: int
 
 
 async def collect_missing_closed_position_plans(
@@ -102,6 +108,12 @@ async def collect_missing_closed_position_scan(
             plan = await plan_missing_closed_position(session, order)
             if plan is not None and _matches_filters(plan, active_filters):
                 plans.append(plan)
+    classifications = [_classify_plan(plan) for plan in plans]
+    classification_counts = _classification_counts(
+        classifications,
+        skipped_candidate_count=max(len(orders) - len(plans), 0),
+        unscanned_candidate_count=max(candidate_count - len(orders), 0),
+    )
     return ReconciliationScanReport(
         plans=plans,
         lookback_days=max(int(active_filters.days), 1),
@@ -110,6 +122,12 @@ async def collect_missing_closed_position_scan(
         truncated=max_orders is not None and candidate_count > len(orders),
         max_close_orders=max_orders,
         duration_seconds=round(max(perf_counter() - started, 0.0), 6),
+        plan_classifications=classifications,
+        classification_counts=classification_counts,
+        repairable_count=int(classification_counts.get("repairable", 0)),
+        manual_review_count=int(classification_counts.get("manual_review", 0)),
+        skipped_candidate_count=int(classification_counts.get("skipped_or_not_repairable", 0)),
+        unscanned_candidate_count=int(classification_counts.get("unscanned", 0)),
     )
 
 
@@ -157,6 +175,8 @@ async def apply_plans(
             plan = await plan_missing_closed_position(session, close_order)
             if plan is None or not _matches_filters(plan, active_filters):
                 continue
+            if _classify_plan(plan)["status"] != "repairable":
+                continue
             position = await apply_missing_closed_position_plan(session, plan)
             session.add(
                 TradeReflection(
@@ -180,9 +200,17 @@ async def apply_plans(
                         if plan.realized_pnl > 0
                         else "loss" if plan.realized_pnl < 0 else "flat"
                     ),
-                    mistake_summary="OKX 成交订单已存在，本地持仓历史曾缺失；已自动补齐用于对账和训练。",
-                    improvement_summary="执行链需保持订单与持仓原子对账，避免漏账影响仓位判断。",
-                    expert_lessons={"source": "missing_closed_position_repair"},
+                    mistake_summary=(
+                        "OKX 成交订单已存在，本地持仓历史曾缺失；已自动补齐用于对账与审计，"
+                        "该修复样本默认隔离出训练视图。"
+                    ),
+                    improvement_summary=(
+                        "执行链需保持订单与持仓原子对账，避免漏账影响仓位判断与训练标签可信度。"
+                    ),
+                    expert_lessons={
+                        "source": "missing_closed_position_repair",
+                        "training_policy": "exclude_from_training",
+                    },
                     source="okx_order_pair_repair",
                 )
             )
@@ -217,6 +245,55 @@ def _matches_filters(plan: Any, filters: ReconciliationFilters) -> bool:
     if filters.max_realized_pnl is not None and plan.realized_pnl > filters.max_realized_pnl:
         return False
     return True
+
+
+def _classify_plan(plan: Any) -> dict[str, Any]:
+    reasons: list[str] = []
+    if not str(getattr(plan, "entry_exchange_order_id", "") or "").strip():
+        reasons.append("missing_entry_exchange_order_id")
+    if not str(getattr(plan, "close_exchange_order_id", "") or "").strip():
+        reasons.append("missing_close_exchange_order_id")
+    if float(getattr(plan, "quantity", 0.0) or 0.0) <= 0:
+        reasons.append("non_positive_quantity")
+    if float(getattr(plan, "entry_price", 0.0) or 0.0) <= 0:
+        reasons.append("non_positive_entry_price")
+    if float(getattr(plan, "exit_price", 0.0) or 0.0) <= 0:
+        reasons.append("non_positive_exit_price")
+    created_at = getattr(plan, "created_at", None)
+    closed_at = getattr(plan, "closed_at", None)
+    if created_at is not None and closed_at is not None and created_at > closed_at:
+        reasons.append("entry_after_close")
+    status = "manual_review" if reasons else "repairable"
+    return {
+        "status": status,
+        "reason": ";".join(reasons) if reasons else "deterministic_order_pair",
+        "symbol": getattr(plan, "symbol", ""),
+        "side": getattr(plan, "side", ""),
+        "quantity": float(getattr(plan, "quantity", 0.0) or 0.0),
+        "realized_pnl": round(float(getattr(plan, "realized_pnl", 0.0) or 0.0), 8),
+        "entry_order_id": int(getattr(plan, "entry_order_id", 0) or 0),
+        "close_order_id": int(getattr(plan, "close_order_id", 0) or 0),
+        "entry_exchange_order_id": getattr(plan, "entry_exchange_order_id", None),
+        "close_exchange_order_id": getattr(plan, "close_exchange_order_id", None),
+    }
+
+
+def _classification_counts(
+    classifications: list[dict[str, Any]],
+    *,
+    skipped_candidate_count: int,
+    unscanned_candidate_count: int,
+) -> dict[str, int]:
+    counts: dict[str, int] = {
+        "repairable": 0,
+        "manual_review": 0,
+        "skipped_or_not_repairable": max(int(skipped_candidate_count), 0),
+        "unscanned": max(int(unscanned_candidate_count), 0),
+    }
+    for item in classifications:
+        status = str(item.get("status") or "manual_review")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def _report_plan(plan: Any, position_id: int | None = None) -> dict[str, Any]:
@@ -279,16 +356,29 @@ async def main() -> int:
         max_realized_pnl=args.max_realized_pnl,
     )
 
-    plans = await collect_missing_closed_position_plans(filters=filters)
+    report = await collect_missing_closed_position_scan(filters=filters)
+    plans = report.plans
     print(
         {
             "missing_closed_positions": len(plans),
             "apply": bool(args.apply),
             "filters": asdict(filters),
+            "classification_counts": report.classification_counts,
+            "repairable_count": report.repairable_count,
+            "manual_review_count": report.manual_review_count,
+            "skipped_candidate_count": report.skipped_candidate_count,
+            "unscanned_candidate_count": report.unscanned_candidate_count,
         }
     )
+    classifications_by_close_order_id = {
+        int(item.get("close_order_id") or 0): item for item in report.plan_classifications
+    }
     for plan in plans[:50]:
-        print(_report_plan(plan))
+        payload = _report_plan(plan)
+        payload["classification"] = classifications_by_close_order_id.get(
+            int(plan.close_order_id), {}
+        )
+        print(payload)
     if len(plans) > 50:
         print({"truncated": len(plans) - 50})
     if args.apply:

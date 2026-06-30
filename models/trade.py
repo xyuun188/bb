@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -22,6 +22,17 @@ class Order(Base, TimestampMixin):
     decision_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    okx_inst_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    okx_trade_ids: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    okx_fill_contracts: Mapped[float | None] = mapped_column(Float, nullable=True)
+    okx_fill_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    okx_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    okx_sync_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    okx_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    okx_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    okx_raw_fills: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Position(Base, TimestampMixin):

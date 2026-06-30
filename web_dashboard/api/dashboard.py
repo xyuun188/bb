@@ -63,6 +63,7 @@ from services.exchange_position_state import (
     parse_exchange_position_snapshot,
 )
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.runtime_entry_filters import entry_filters_from_context
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -73,6 +74,8 @@ from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 BEIJING_TZ = timezone(timedelta(hours=8))
+OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
+EXECUTION_LEDGER_MODEL_NAMES = (ENSEMBLE_TRADER_NAME, OKX_AUTHORITATIVE_LEDGER_MODEL)
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
 
@@ -86,6 +89,8 @@ _ml_signal_status_service = None
 _EXCHANGE_MARK_CACHE_TTL_SECONDS = 15.0
 _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 15.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
+_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 6.0
+_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
@@ -187,6 +192,19 @@ def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
 def _safe_float_value(value: Any, default: float = 0.0) -> float:
     result = _safe_float(value, default)
     return default if result is None else result
+
+
+def _weighted_average(items: list[tuple[float, float]]) -> float:
+    total_weight = sum(max(float(weight or 0.0), 0.0) for weight, _value in items)
+    if total_weight <= 0:
+        return 0.0
+    return (
+        sum(
+            max(float(weight or 0.0), 0.0) * float(value or 0.0)
+            for weight, value in items
+        )
+        / total_weight
+    )
 
 
 def _dashboard_position_key(symbol: Any, side: Any) -> tuple[str, str]:
@@ -917,6 +935,7 @@ async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any
         "last_position_round_started_at": runtime_status.get("last_position_round_started_at"),
         "last_position_round_finished_at": runtime_status.get("last_position_round_finished_at"),
         "last_round_error": runtime_status.get("last_round_error"),
+        "okx_authoritative_sync": runtime_status.get("okx_authoritative_sync"),
         "live_model": ENSEMBLE_TRADER_NAME,
         "models": [ENSEMBLE_TRADER_NAME],
         "risk": {},
@@ -950,6 +969,7 @@ async def _trading_stats_with_runtime_heartbeat(mode: str | None = None) -> dict
             "last_market_round_finished_at",
             "last_position_round_started_at",
             "last_position_round_finished_at",
+            "okx_authoritative_sync",
         ):
             if stats.get(key) is None and runtime_stats.get(key) is not None:
                 stats[key] = runtime_stats[key]
@@ -995,32 +1015,98 @@ def _cooldown_pause_reason_from_summary(pnl_summary: dict, cfg: dict, source: st
     )
 
 
+def _okx_equity_pnl_from_snapshot(
+    *,
+    current_equity: float | None,
+    pnl_summary: dict | None,
+) -> dict[str, Any]:
+    summary = pnl_summary or {}
+    equity = _safe_float(current_equity, None)
+    baseline = _safe_float(summary.get("today_equity_baseline"), None)
+    if equity is None or equity <= 0 or baseline is None or baseline <= 0:
+        return {
+            "today_total_pnl": None,
+            "today_equity_pnl": None,
+            "cumulative_total_pnl": None,
+            "total_pnl": None,
+            "total_pnl_pct": None,
+        }
+    today_pnl = equity - baseline
+    return {
+        "today_total_pnl": today_pnl,
+        "today_equity_pnl": today_pnl,
+        "cumulative_total_pnl": None,
+        "total_pnl": None,
+        "total_pnl_pct": None,
+    }
+
+
+async def _phase3_equity_pnl_for_mode(
+    mode: str,
+    *,
+    current_equity: float | None,
+) -> dict[str, Any]:
+    try:
+        from db.session import get_session_ctx
+        from services.equity_baseline import phase3_equity_change_from_snapshots
+
+        async with get_session_ctx() as session:
+            return await phase3_equity_change_from_snapshots(
+                session,
+                mode=mode,
+                model_name=ENSEMBLE_TRADER_NAME,
+                current_equity=current_equity,
+            )
+    except Exception as exc:
+        _log_dashboard_fallback("phase3 equity pnl fallback", exc, mode=mode)
+        return {
+            "phase3_equity_pnl": None,
+            "phase3_equity_pnl_pct": None,
+            "phase3_equity_baseline": None,
+            "phase3_equity_baseline_at": None,
+            "phase3_equity_baseline_source": "okx_unavailable",
+            "phase3_equity_start_date": PHASE3_FIRST_CLEAN_DAY,
+        }
+
+
 async def _get_execution_pnl_summary(mode: str) -> dict:
-    """Return allocation-scoped PnL and budget usage for the execution account."""
+    """Return local trade diagnostics plus OKX-backed margin usage.
+
+    This summary is intentionally not an account-profit source. Account equity
+    and displayed account PnL must come from OKX snapshots only.
+    """
     from sqlalchemy import case, func, select
 
     from db.session import get_session_ctx
-    from models.trade import Position
+    from models.trade import Order, Position
+    from services.trade_fact_trust import (
+        closed_position_trade_fact_trusted_with_orders,
+        orders_by_exchange_id,
+        split_exchange_order_ids,
+    )
 
     selected_mode = "live" if mode == "live" else "paper"
-    cfg = settings.get_execution_account_config(selected_mode)
-    allocated = float(cfg.get("allocated_balance") or 0.0)
-    if _trading_service:
-        try:
-            snapshot = await _dashboard_okx_balance_snapshot_for_mode(selected_mode)
-            allocated = float(
-                (snapshot or {}).get("allocatable")
-                or (snapshot or {}).get("equity")
-                or (snapshot or {}).get("total")
-                or allocated
-                or 0.0
-            )
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "dashboard balance snapshot fallback",
-                exc,
-                mode=selected_mode,
-            )
+    allocated = 0.0
+    okx_current_equity: float | None = None
+    try:
+        snapshot = await _dashboard_okx_balance_snapshot_for_mode(selected_mode)
+        okx_current_equity = _safe_float(
+            (snapshot or {}).get("equity") or (snapshot or {}).get("total"),
+            None,
+        )
+        allocated = _safe_float(
+            (snapshot or {}).get("allocatable")
+            or (snapshot or {}).get("equity")
+            or (snapshot or {}).get("total")
+            or (snapshot or {}).get("free"),
+            0.0,
+        ) or 0.0
+    except Exception as exc:
+        _log_dashboard_fallback(
+            "dashboard balance snapshot fallback",
+            exc,
+            mode=selected_mode,
+        )
     realized_profit = 0.0
     realized_loss = 0.0
     today_realized_profit = 0.0
@@ -1056,7 +1142,7 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         async with get_session_ctx() as session:
             filters = (
                 Position.execution_mode == selected_mode,
-                Position.model_name == ENSEMBLE_TRADER_NAME,
+                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
             )
             all_result = await session.execute(
                 select(Position)
@@ -1118,31 +1204,70 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
             today_realized_profit, today_realized_loss = [
                 float(value or 0.0) for value in today_result.one()
             ]
+            linked_order_ids = {
+                order_id
+                for pos in position_rows
+                if not pos.is_open
+                for value in (
+                    getattr(pos, "entry_exchange_order_id", None),
+                    getattr(pos, "close_exchange_order_id", None),
+                )
+                for order_id in split_exchange_order_ids(value)
+            }
+            linked_orders = []
+            if linked_order_ids:
+                linked_orders = list(
+                    (
+                        await session.execute(
+                            select(Order).where(
+                                Order.execution_mode == selected_mode,
+                                Order.exchange_order_id.in_(sorted(linked_order_ids)),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            linked_orders_by_id = orders_by_exchange_id(linked_orders)
+            trusted_closed_rows = [
+                pos
+                for pos in position_rows
+                if not pos.is_open
+                and closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
+            ]
+            realized_profit = sum(
+                max(float(pos.realized_pnl or 0.0), 0.0) for pos in trusted_closed_rows
+            )
+            realized_loss = sum(
+                abs(min(float(pos.realized_pnl or 0.0), 0.0)) for pos in trusted_closed_rows
+            )
+            today_trusted_closed_rows = [
+                pos
+                for pos in trusted_closed_rows
+                if (closed_at := _as_utc_datetime(pos.closed_at)) is not None
+                and closed_at >= start_utc
+            ]
+            today_realized_profit = sum(
+                max(float(pos.realized_pnl or 0.0), 0.0) for pos in today_trusted_closed_rows
+            )
+            today_realized_loss = sum(
+                abs(min(float(pos.realized_pnl or 0.0), 0.0)) for pos in today_trusted_closed_rows
+            )
             fallback_margin_by_key: dict[tuple[str, str], float] = {}
-            fallback_unrealized_by_key: dict[tuple[str, str], float] = {}
-            local_open_keys: set[tuple[str, str]] = set()
             for pos in position_rows:
                 if not pos.is_open:
                     continue
                 key = _dashboard_position_key(pos.symbol, pos.side)
-                if exchange_symbols and key[0] not in exchange_symbols:
+                if exchange_symbols is None or key[0] not in exchange_symbols:
                     continue
-                local_open_keys.add(key)
                 fallback_margin_by_key[key] = fallback_margin_by_key.get(
                     key, 0.0
                 ) + _local_position_margin(pos)
-                fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(key, 0.0) + float(
-                    pos.unrealized_pnl or 0.0
-                )
             if exchange_marks:
                 exchange_totals = _exchange_position_totals(exchange_marks, fallback_margin_by_key)
                 open_count = int(exchange_totals["open_count"])
                 unrealized_pnl = float(exchange_totals["unrealized_pnl"])
                 used_margin = float(exchange_totals["used_margin"])
-            else:
-                open_count = len(local_open_keys)
-                unrealized_pnl = sum(fallback_unrealized_by_key.values())
-                used_margin = sum(fallback_margin_by_key.values())
     except Exception as exc:
         _log_dashboard_fallback(
             "execution pnl database summary fallback",
@@ -1153,9 +1278,10 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     realized_pnl = realized_profit - realized_loss
     today_realized_pnl = today_realized_profit - today_realized_loss
     total_pnl = realized_pnl + unrealized_pnl
-    today_total_pnl = today_realized_pnl + unrealized_pnl
-    today_risk_pnl = today_realized_pnl + min(unrealized_pnl, 0.0)
+    today_total_pnl = None
+    today_risk_pnl = None
     equity_baseline = {}
+    phase3_equity = {}
     try:
         from services.equity_baseline import apply_daily_equity_baseline
 
@@ -1169,8 +1295,9 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                 realized_pnl=realized_pnl,
                 unrealized_pnl=unrealized_pnl,
                 total_pnl=total_pnl,
+                current_equity=okx_current_equity,
             )
-        today_total_pnl = float(equity_baseline.get("today_equity_pnl") or 0.0)
+        today_total_pnl = _safe_float(equity_baseline.get("today_equity_pnl"), None)
         today_risk_pnl = today_total_pnl
     except Exception as exc:
         _log_dashboard_fallback(
@@ -1179,8 +1306,10 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
             mode=selected_mode,
         )
         equity_baseline = {}
-    pnl_adjusted_budget = max(allocated + total_pnl, 0.0)
-    remaining_allocation = max(pnl_adjusted_budget - used_margin, 0.0)
+    phase3_equity = await _phase3_equity_pnl_for_mode(
+        selected_mode,
+        current_equity=okx_current_equity,
+    )
     return {
         "allocated_balance": allocated,
         "realized_profit": realized_profit,
@@ -1201,6 +1330,12 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         "today_equity_baseline_at": equity_baseline.get("today_equity_baseline_at"),
         "today_equity_baseline_source": equity_baseline.get("today_equity_baseline_source"),
         "today_snapshot_date": equity_baseline.get("today_snapshot_date"),
+        "phase3_equity_pnl": phase3_equity.get("phase3_equity_pnl"),
+        "phase3_equity_pnl_pct": phase3_equity.get("phase3_equity_pnl_pct"),
+        "phase3_equity_baseline": phase3_equity.get("phase3_equity_baseline"),
+        "phase3_equity_baseline_at": phase3_equity.get("phase3_equity_baseline_at"),
+        "phase3_equity_baseline_source": phase3_equity.get("phase3_equity_baseline_source"),
+        "phase3_equity_start_date": phase3_equity.get("phase3_equity_start_date"),
         "today_total_pnl": today_total_pnl,
         "today_risk_pnl": today_risk_pnl,
         "unrealized_pnl": unrealized_pnl,
@@ -1209,7 +1344,7 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         "cumulative_unrealized_pnl": unrealized_pnl,
         "cumulative_total_pnl": total_pnl,
         "used_margin": used_margin,
-        "remaining_allocation": remaining_allocation,
+        "remaining_allocation": None,
         "open_positions": open_count,
     }
 
@@ -1267,7 +1402,6 @@ def _build_execution_account_status(
     mode = "live" if mode == "live" else "paper"
     cfg = settings.get_execution_account_config(mode)
     pnl_summary = pnl_summary or {}
-    legacy_allocated = float(cfg.get("allocated_balance") or 0.0)
     max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
     okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
     okx_available = (
@@ -1315,25 +1449,28 @@ def _build_execution_account_status(
     parsed_account_equity = balance_from_snapshot(okx_snapshot_for_balance)
     parsed_allocatable = allocatable_balance_from_snapshot(okx_snapshot_for_balance)
     parsed_tradeable = tradeable_balance_from_snapshot(okx_snapshot_for_balance)
-    live_balance_unavailable = mode == "live" and (not okx_account or bool(okx_error))
-    account_equity = (
-        0.0 if live_balance_unavailable else (parsed_account_equity or legacy_allocated)
+    okx_balance_available = bool(okx_snapshot_for_balance and parsed_account_equity > 0)
+    account_equity = parsed_account_equity if okx_balance_available else 0.0
+    okx_pnl = _okx_equity_pnl_from_snapshot(
+        current_equity=account_equity if okx_balance_available else None,
+        pnl_summary=pnl_summary,
     )
     max_loss_usdt = (
         account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
     )
     risk_floor = _execution_risk_floor(account_equity, max_loss_pct, max_loss_usdt)
-    allocated = legacy_allocated
     pause_reason = None
     if _trading_service:
         pause_reason = getattr(_trading_service, "_new_pair_pause_reasons", {}).get(
             ENSEMBLE_TRADER_NAME
         )
     pause_reason = _translate_pause_reason(pause_reason)
+    if not okx_error and not okx_balance_available:
+        okx_error = "OKX balance unavailable"
     if okx_error and not pause_reason:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
-    total_pnl_for_risk = _safe_float(pnl_summary.get("total_pnl"), 0.0) or 0.0
+    total_pnl_for_risk = 0.0
     if (
         account_equity > 0
         and max_loss_usdt > 0
@@ -1345,10 +1482,14 @@ def _build_execution_account_status(
             f"{source} AI 执行账户累计盈亏 {total_pnl_for_risk:.2f} USDT 已达到最高亏损限制 "
             f"{max_loss_pct * 100:.1f}%（{max_loss_usdt:.2f} USDT），系统不会分析新的交易对。"
         )
-    if not pause_reason:
+    if not pause_reason and okx_pnl["today_equity_pnl"] is not None:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = _cooldown_pause_reason_from_summary(
-            pnl_summary,
+            {
+                "today_risk_pnl": okx_pnl["today_equity_pnl"],
+                "today_equity_pnl": okx_pnl["today_equity_pnl"],
+                "today_total_pnl": okx_pnl["today_total_pnl"],
+            },
             {**cfg, "max_loss_usdt": max_loss_usdt},
             source,
         )
@@ -1356,7 +1497,7 @@ def _build_execution_account_status(
     payload = {
         **cfg,
         "model_name": ENSEMBLE_TRADER_NAME,
-        "allocated_balance": legacy_allocated,
+        "allocated_balance": None,
         "account_balance_source_value": account_equity,
         "account_equity": account_equity,
         "max_loss_usdt": max_loss_usdt,
@@ -1371,6 +1512,12 @@ def _build_execution_account_status(
         "okx_equity_balance": okx_equity,
         "max_allocatable_balance": parsed_allocatable,
         "allocation_exceeds_balance": False,
+        "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
+        "local_trade_total_pnl": _safe_float(
+            pnl_summary.get("cumulative_total_pnl"),
+            _safe_float(pnl_summary.get("total_pnl"), 0.0),
+        ),
+        "local_trade_today_pnl": _safe_float(pnl_summary.get("today_closed_realized_pnl"), 0.0),
         "positions": [],
         "open_positions": int(pnl_summary.get("open_positions") or 0),
         "realized_profit": _safe_float(pnl_summary.get("realized_profit"), 0.0),
@@ -1386,7 +1533,7 @@ def _build_execution_account_status(
             pnl_summary.get("today_closed_realized_loss"), 0.0
         ),
         "today_closed_realized_pnl": _safe_float(pnl_summary.get("today_closed_realized_pnl"), 0.0),
-        "today_equity_pnl": _safe_float(pnl_summary.get("today_equity_pnl"), 0.0),
+        "today_equity_pnl": okx_pnl["today_equity_pnl"],
         "today_equity_baseline": _safe_float(pnl_summary.get("today_equity_baseline"), None),
         "today_equity_baseline_total_pnl": _safe_float(
             pnl_summary.get("today_equity_baseline_total_pnl"),
@@ -1395,13 +1542,22 @@ def _build_execution_account_status(
         "today_equity_baseline_at": pnl_summary.get("today_equity_baseline_at"),
         "today_equity_baseline_source": pnl_summary.get("today_equity_baseline_source"),
         "today_snapshot_date": pnl_summary.get("today_snapshot_date"),
-        "today_total_pnl": _safe_float(pnl_summary.get("today_total_pnl"), 0.0),
-        "today_risk_pnl": _safe_float(pnl_summary.get("today_risk_pnl"), 0.0),
+        "phase3_equity_pnl": _safe_float(pnl_summary.get("phase3_equity_pnl"), None),
+        "phase3_equity_pnl_pct": _safe_float(pnl_summary.get("phase3_equity_pnl_pct"), None),
+        "phase3_equity_baseline": _safe_float(pnl_summary.get("phase3_equity_baseline"), None),
+        "phase3_equity_baseline_at": pnl_summary.get("phase3_equity_baseline_at"),
+        "phase3_equity_baseline_source": pnl_summary.get("phase3_equity_baseline_source"),
+        "phase3_equity_start_date": pnl_summary.get("phase3_equity_start_date")
+        or PHASE3_FIRST_CLEAN_DAY,
+        "today_total_pnl": okx_pnl["today_total_pnl"],
+        "today_risk_pnl": _safe_float(pnl_summary.get("today_risk_pnl"), None),
         "cumulative_profit": _safe_float(pnl_summary.get("realized_profit"), 0.0),
         "cumulative_loss": _safe_float(pnl_summary.get("realized_loss"), 0.0),
         "cumulative_realized_pnl": _safe_float(pnl_summary.get("cumulative_realized_pnl"), 0.0),
         "cumulative_unrealized_pnl": _safe_float(pnl_summary.get("cumulative_unrealized_pnl"), 0.0),
-        "cumulative_total_pnl": _safe_float(pnl_summary.get("cumulative_total_pnl"), 0.0),
+        "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
+        "total_pnl": okx_pnl["total_pnl"],
+        "total_pnl_pct": okx_pnl["total_pnl_pct"],
         "remaining_allocation": _execution_tradeable_balance(
             okx_available=okx_available,
             okx_allocatable=okx_allocatable,
@@ -1415,26 +1571,22 @@ def _build_execution_account_status(
 
     if mode == "paper":
         summary = paper_summary or {}
-        local_available = _safe_float(summary.get("available_balance"), allocated)
-        local_used_margin = _safe_float(pnl_summary.get("used_margin"), 0.0) or 0.0
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0) or 0.0
         available = _execution_tradeable_balance(
             okx_available=okx_available,
             okx_allocatable=okx_allocatable,
             okx_equity=okx_equity,
             okx_total=okx_total,
-            fallback_available=local_available,
+            fallback_available=None,
         )
-        if available is None:
-            available = local_available
-        used_margin = okx_used if okx_used is not None else local_used_margin
+        used_margin = okx_used
         wallet = (
             okx_cash
             if okx_cash is not None
             else (
                 okx_total
                 if okx_total is not None
-                else _safe_float(summary.get("wallet_balance"), (available or 0.0) + used_margin)
+                else None
             )
         )
         equity = (
@@ -1443,11 +1595,9 @@ def _build_execution_account_status(
             else (
                 okx_total
                 if okx_total is not None
-                else _safe_float(summary.get("equity"), (wallet or 0.0) + unrealized)
+                else None
             )
         )
-        total_pnl = _safe_float(pnl_summary.get("total_pnl"), 0.0)
-        cumulative_total_pnl = _safe_float(pnl_summary.get("cumulative_total_pnl"), total_pnl)
         payload.update(
             {
                 "available_balance": available,
@@ -1457,25 +1607,17 @@ def _build_execution_account_status(
                 "wallet_balance": wallet,
                 "equity": equity,
                 "used_margin": used_margin,
-                "position_margin_used": (
-                    used_margin if used_margin is not None else local_used_margin
-                ),
+                "position_margin_used": used_margin,
                 "unrealized_pnl": unrealized,
-                "total_pnl": cumulative_total_pnl,
-                "cumulative_total_pnl": cumulative_total_pnl,
-                "total_pnl_pct": (
-                    ((cumulative_total_pnl or 0.0) / account_equity * 100)
-                    if account_equity > 0
-                    else _safe_float(summary.get("total_pnl_pct"), 0.0)
-                ),
-                "initial_balance": account_equity,
+                "total_pnl": okx_pnl["total_pnl"],
+                "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
+                "total_pnl_pct": okx_pnl["total_pnl_pct"],
+                "initial_balance": None,
                 "paper_execution_available_balance": _safe_float(
                     available,
-                    local_available,
+                    None,
                 ),
-                "paper_execution_used_margin": (
-                    used_margin if used_margin is not None else local_used_margin
-                ),
+                "paper_execution_used_margin": used_margin,
                 "positions": summary.get("positions", []),
                 "open_positions": int(pnl_summary.get("open_positions") or 0),
                 "balance_snapshot_stale": bool(okx_account and okx_account.get("stale") is True),
@@ -1500,8 +1642,6 @@ def _build_execution_account_status(
         )
         total = okx_total
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0)
-        total_pnl = _safe_float(pnl_summary.get("total_pnl"), 0.0)
-        cumulative_total_pnl = _safe_float(pnl_summary.get("cumulative_total_pnl"), total_pnl)
         payload.update(
             {
                 "available_balance": available,
@@ -1513,14 +1653,10 @@ def _build_execution_account_status(
                 "used_margin": used_margin,
                 "position_margin_used": used_margin,
                 "unrealized_pnl": unrealized,
-                "total_pnl": cumulative_total_pnl,
-                "cumulative_total_pnl": cumulative_total_pnl,
-                "total_pnl_pct": (
-                    ((cumulative_total_pnl or 0.0) / account_equity * 100)
-                    if account_equity > 0
-                    else 0.0
-                ),
-                "initial_balance": account_equity,
+                "total_pnl": okx_pnl["total_pnl"],
+                "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
+                "total_pnl_pct": okx_pnl["total_pnl_pct"],
+                "initial_balance": None,
                 "balance_source": "OKX 实盘账户",
                 "balance_snapshot_stale": bool(okx_account.get("stale")),
                 "balance_snapshot_age_seconds": _safe_float(
@@ -1746,13 +1882,50 @@ def _dashboard_okx_executor_for_mode(mode: str) -> Any | None:
     return getter("live" if mode == "live" else "paper")
 
 
+async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, Any]]:
+    """Fetch current OKX positions in both inline and split-dashboard processes."""
+
+    executor = _dashboard_okx_executor_for_mode(selected_mode)
+    if executor:
+        fetch_strict = getattr(executor, "get_positions_strict", None)
+        if callable(fetch_strict):
+            return await asyncio.wait_for(
+                fetch_strict(),
+                timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+            )
+
+    fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
+    try:
+        await asyncio.wait_for(
+            fallback_executor.initialize(),
+            timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
+        )
+        return await asyncio.wait_for(
+            fallback_executor.get_positions_strict(),
+            timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+        )
+    finally:
+        try:
+            await fallback_executor.shutdown()
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "dashboard okx position fallback shutdown failed",
+                exc,
+                mode=selected_mode,
+            )
+
+
 async def _dashboard_okx_balance_snapshot_for_mode(mode: str) -> dict[str, Any] | None:
-    if not _trading_service:
-        return None
     getter = getattr(_trading_service, "get_okx_balance_snapshot_for_mode", None)
     if not callable(getter):
-        return None
-    return await getter("live" if mode == "live" else "paper")
+        return await _get_dashboard_okx_account_snapshot(mode)
+    try:
+        snapshot = await getter("live" if mode == "live" else "paper")
+    except Exception:
+        snapshot = None
+    if snapshot:
+        return snapshot
+    return await _get_dashboard_okx_account_snapshot(mode)
 
 
 def _trading_service_is_running() -> bool:
@@ -1793,6 +1966,14 @@ def _dashboard_local_ai_tools_client() -> Any | None:
 
 
 async def _completed_ml_shadow_sample_count() -> int:
+    try:
+        from services.ml_signal_service import count_shadow_training_rows
+
+        db_count = int(await count_shadow_training_rows())
+        if db_count >= 0:
+            return db_count
+    except Exception as exc:
+        _log_dashboard_fallback("ml signal phase3 sample count fallback", exc)
     ml_signal_service = _dashboard_ml_signal_service()
     if not ml_signal_service:
         return 0
@@ -1802,9 +1983,32 @@ async def _completed_ml_shadow_sample_count() -> int:
     return int(await counter())
 
 
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _explicit_phase3_count(status: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if key not in status:
+            continue
+        value = _safe_int_value(status.get(key), 0)
+        if value >= 0:
+            return value
+    return None
+
+
 async def _completed_local_ai_shadow_backtest_total() -> int:
     if not _trading_service:
-        return 0
+        try:
+            from services.ml_signal_service import count_shadow_training_rows
+
+            return int(await count_shadow_training_rows())
+        except Exception as exc:
+            _log_dashboard_fallback("local ai tools phase3 sample count fallback", exc)
+            return 0
     counter = getattr(_trading_service, "completed_shadow_backtest_total", None)
     if not callable(counter):
         return 0
@@ -1827,6 +2031,91 @@ def _normalize_dashboard_symbol(symbol: str | None) -> str:
 def _dashboard_symbol_query_variants(symbols: set[str]) -> set[str]:
     """Return historical symbol spellings used across orders, decisions, and shadows."""
     return symbol_query_variants(symbols)
+
+
+def _dashboard_split_exchange_order_ids(value: Any) -> set[str]:
+    tokens = {str(value or "").strip()}
+    if not next(iter(tokens), ""):
+        return set()
+    for separator in (",", ";", "|", "\n", "\t", " "):
+        pieces: set[str] = set()
+        for token in tokens:
+            pieces.update(part.strip() for part in token.split(separator) if part.strip())
+        tokens = pieces
+    return {token for token in tokens if token}
+
+
+async def _dashboard_closed_position_ledger_rows(
+    session: Any,
+    repo: Any,
+    *,
+    mode: str | None,
+    page: int = 1,
+    page_size: int = 20,
+    paginate: bool = True,
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    from sqlalchemy import select
+
+    from models.trade import Order
+    from services.okx_position_ledger_view import build_okx_position_ledger_groups
+
+    closed_rows = await repo.get_position_records(
+        execution_mode=mode,
+        limit=5000,
+        offset=0,
+        is_open=False,
+    )
+    linked_order_ids = {
+        token
+        for position in closed_rows
+        for value in (
+            getattr(position, "entry_exchange_order_id", None),
+            getattr(position, "close_exchange_order_id", None),
+        )
+        for token in _dashboard_split_exchange_order_ids(value)
+    }
+    symbol_variants = _dashboard_symbol_query_variants(
+        {
+            _normalize_dashboard_symbol(str(getattr(position, "symbol", "") or ""))
+            for position in closed_rows
+            if getattr(position, "symbol", None)
+        }
+    )
+    order_stmt = select(Order).where(Order.status == "filled")
+    if mode:
+        order_stmt = order_stmt.where(Order.execution_mode == mode)
+    if symbol_variants:
+        order_stmt = order_stmt.where(Order.symbol.in_(symbol_variants))
+    else:
+        order_stmt = order_stmt.where(Order.id == -1)
+    order_rows = list(
+        (
+            await session.execute(
+                order_stmt.order_by(
+                    Order.filled_at.desc().nullslast(),
+                    Order.created_at.desc(),
+                ).limit(10000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if linked_order_ids:
+        order_rows = [
+            order
+            for order in order_rows
+            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+            & linked_order_ids
+        ]
+    ledger_groups = build_okx_position_ledger_groups(closed_rows, order_rows)
+    total = len(ledger_groups)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    page = min(max(int(page or 1), 1), total_pages)
+    selected_groups = ledger_groups
+    if paginate:
+        start = (page - 1) * page_size
+        selected_groups = ledger_groups[start : start + page_size]
+    return [group.as_dict(include_fills=True) for group in selected_groups], total, page, total_pages
 
 
 def _is_live_position_open(position: dict) -> bool:
@@ -1858,11 +2147,11 @@ async def _get_open_position_symbols(mode: str | None = None) -> set[str]:
         async with get_session_ctx() as session:
             result = await session.execute(
                 select(Position.symbol)
-                .where(
-                    Position.execution_mode == selected_mode,
-                    Position.model_name == ENSEMBLE_TRADER_NAME,
-                    Position.is_open.is_(True),
-                )
+                  .where(
+                      Position.execution_mode == selected_mode,
+                      Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                      Position.is_open.is_(True),
+                  )
                 .distinct()
             )
             symbols.update(_normalize_dashboard_symbol(row[0]) for row in result.all())
@@ -1873,21 +2162,10 @@ async def _get_open_position_symbols(mode: str | None = None) -> set[str]:
             mode=selected_mode,
         )
 
-    if selected_mode == "paper" and _trading_service and _trading_service.paper_executor:
-        try:
-            positions = await _trading_service.paper_executor.get_positions()
-            symbols.update(_normalize_dashboard_symbol(p.get("symbol")) for p in positions)
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "paper executor open symbol fallback",
-                exc,
-                mode=selected_mode,
-            )
-
-    if selected_mode == "live" and _dashboard_okx_executor_for_mode(selected_mode):
+    if _dashboard_okx_executor_for_mode(selected_mode):
         exchange_symbols = await _get_exchange_open_position_symbols(selected_mode)
         if exchange_symbols:
-            symbols.update(exchange_symbols)
+            return {s for s in exchange_symbols if s}
 
     return {s for s in symbols if s}
 
@@ -1902,16 +2180,11 @@ async def _get_exchange_open_position_symbols(mode: str | None = None) -> set[st
         if (now - cached_at).total_seconds() <= _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS:
             return set(cached_value)
 
-    executor = _dashboard_okx_executor_for_mode(selected_mode)
-
-    if not executor:
-        return None
-
     try:
-        positions = await asyncio.wait_for(executor.get_positions(), timeout=1.2)
+        positions = await _fetch_dashboard_okx_positions(selected_mode)
     except Exception as exc:
         _log_dashboard_fallback(
-            "exchange open position symbols fallback",
+            "exchange open position symbols strict read unavailable",
             exc,
             mode=selected_mode,
             has_cached=bool(cached),
@@ -1939,16 +2212,11 @@ async def _get_exchange_position_mark_map(
         if (now - cached_at).total_seconds() <= _EXCHANGE_MARK_CACHE_TTL_SECONDS:
             return cached_value
 
-    executor = _dashboard_okx_executor_for_mode(selected_mode)
-
-    if not executor:
-        return {}
-
     try:
-        positions = await asyncio.wait_for(executor.get_positions(), timeout=1.2)
+        positions = await _fetch_dashboard_okx_positions(selected_mode)
     except Exception as exc:
         _log_dashboard_fallback(
-            "exchange mark map fallback",
+            "exchange mark map strict read unavailable",
             exc,
             mode=selected_mode,
             has_cached=bool(cached),
@@ -2086,12 +2354,11 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
 
 
 async def _get_display_open_position_symbols(mode: str | None = None) -> set[str]:
-    """Return symbols that should be shown as currently held on the dashboard."""
-    local_symbols = await _get_open_position_symbols(mode)
+    """Return OKX symbols that should be shown as currently held on the dashboard."""
     exchange_symbols = await _get_exchange_open_position_symbols(mode)
-    if not exchange_symbols:
-        return local_symbols
-    return local_symbols & exchange_symbols
+    if exchange_symbols is None:
+        return set()
+    return {symbol for symbol in exchange_symbols if symbol}
 
 
 async def _get_open_position_prices(mode: str | None = None) -> dict[str, float]:
@@ -2272,6 +2539,7 @@ async def _get_display_open_positions_snapshot(
     market_tickers: dict[str, dict[str, Any]] = {}
     if _data_service:
         market_tickers = (_data_service.get_market_state() or {}).get("tickers", {}) or {}
+    local_by_key: dict[tuple[str, str], Any] = {}
     positions: list[dict[str, Any]] = []
     try:
         async with get_session_ctx() as session:
@@ -2282,20 +2550,46 @@ async def _get_display_open_positions_snapshot(
                 offset=0,
                 is_open=True,
             )
-            for p in rows:
-                symbol = _normalize_dashboard_symbol(p.symbol)
-                side = str(p.side or "").lower()
+            rows_by_key: dict[tuple[str, str], list[Any]] = {}
+            for row in rows:
+                symbol = _normalize_dashboard_symbol(row.symbol)
+                side = str(row.side or "").lower()
+                if not symbol or not side:
+                    continue
                 exchange_key = (symbol, side)
-                exchange_synced = True
-                if exchange_symbols is not None:
-                    exchange_synced = exchange_key in exchange_mark_map
+                rows_by_key.setdefault(exchange_key, []).append(row)
+                local_by_key.setdefault(exchange_key, row)
+
+            for exchange_key, group_rows in rows_by_key.items():
+                symbol, side = exchange_key
+                p = group_rows[0]
+                exchange_synced = bool(
+                    exchange_symbols is not None and exchange_key in exchange_mark_map
+                )
                 if not exchange_synced:
                     continue
 
+                local_quantity = sum(
+                    _safe_float(getattr(row, "quantity", None), 0.0) or 0.0
+                    for row in group_rows
+                )
+                local_entry_price = _weighted_average(
+                    [
+                        (
+                            _safe_float(getattr(row, "quantity", None), 0.0) or 0.0,
+                            _safe_float(getattr(row, "entry_price", None), 0.0) or 0.0,
+                        )
+                        for row in group_rows
+                    ]
+                )
+                local_unrealized_pnl = sum(
+                    _safe_float(getattr(row, "unrealized_pnl", None), 0.0) or 0.0
+                    for row in group_rows
+                )
                 current_price = p.current_price
-                unrealized_pnl = p.unrealized_pnl
-                entry_price = p.entry_price
-                quantity = p.quantity
+                unrealized_pnl = local_unrealized_pnl
+                entry_price = local_entry_price or p.entry_price
+                quantity = local_quantity or p.quantity
                 pnl_source = "local_db"
                 snapshot = exchange_mark_map.get(exchange_key)
                 market_ticker = dict(market_tickers.get(symbol, {}) or {})
@@ -2323,17 +2617,6 @@ async def _get_display_open_positions_snapshot(
                     entry_price = valuation["entry_price"]
                     quantity = valuation["quantity"]
                     pnl_source = valuation["pnl_source"]
-                elif display_ticker:
-                    latest_price = float(
-                        display_ticker.get("price") or display_ticker.get("last_price") or 0.0
-                    )
-                    if latest_price > 0:
-                        current_price = latest_price
-                        if side == "short":
-                            unrealized_pnl = (entry_price - latest_price) * quantity
-                        else:
-                            unrealized_pnl = (latest_price - entry_price) * quantity
-                        pnl_source = "market_ticker_recomputed"
 
                 positions.append(
                     {
@@ -2348,15 +2631,24 @@ async def _get_display_open_positions_snapshot(
                         "change_24h": change_24h,
                         "unrealized_pnl": unrealized_pnl,
                         "pnl_source": pnl_source,
-                        "local_quantity": p.quantity,
-                        "local_entry_price": p.entry_price,
-                        "local_unrealized_pnl": p.unrealized_pnl,
-                        "realized_pnl": p.realized_pnl,
+                        "local_quantity": local_quantity,
+                        "local_entry_price": local_entry_price or p.entry_price,
+                        "local_unrealized_pnl": local_unrealized_pnl,
+                        "realized_pnl": sum(
+                            _safe_float(getattr(row, "realized_pnl", None), 0.0) or 0.0
+                            for row in group_rows
+                        ),
                         "leverage": p.leverage,
                         "stop_loss": p.stop_loss_price,
                         "take_profit": p.take_profit_price,
                         "is_open": True,
                         "db_is_open": p.is_open,
+                        "local_position_ids": [
+                            getattr(row, "id", None)
+                            for row in group_rows
+                            if getattr(row, "id", None) is not None
+                        ],
+                        "merged_local_position_count": len(group_rows),
                         "exchange_synced": exchange_synced,
                         "close_status": "open",
                         "close_status_label": "持有中",
@@ -2372,6 +2664,82 @@ async def _get_display_open_positions_snapshot(
             exc,
             mode=selected_mode,
         )
+
+    if exchange_mark_map:
+        seen_keys = {
+            (
+                _normalize_dashboard_symbol(str(position.get("symbol") or "")),
+                str(position.get("side") or "").lower(),
+            )
+            for position in positions
+            if isinstance(position, dict)
+        }
+        for (symbol, side), snapshot in sorted(exchange_mark_map.items()):
+            if (symbol, side) in seen_keys:
+                continue
+            local_position = local_by_key.get((symbol, side))
+            market_ticker = dict(market_tickers.get(symbol, {}) or {})
+            override_ticker = (
+                dict(ticker_overrides.get(symbol, {}) or {})
+                if isinstance(ticker_overrides, dict)
+                else {}
+            )
+            display_ticker = _merge_market_and_public_ticker(
+                market_ticker,
+                override_ticker,
+            )
+            change_24h = _ticker_change_24h(display_ticker, 0.0) or 0.0
+            valuation = _exchange_position_display_valuation(
+                snapshot,
+                side,
+                fallback_current_price=getattr(local_position, "current_price", None),
+                fallback_unrealized_pnl=getattr(local_position, "unrealized_pnl", None),
+                fallback_entry_price=getattr(local_position, "entry_price", None),
+                fallback_quantity=getattr(local_position, "quantity", None),
+            )
+            info = snapshot.get("info") if isinstance(snapshot.get("info"), dict) else {}
+            opened_at = getattr(local_position, "created_at", None)
+            positions.append(
+                {
+                    "id": getattr(local_position, "id", None),
+                    "model_name": getattr(local_position, "model_name", None)
+                    or "okx_native_position",
+                    "mode": selected_mode,
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": valuation["quantity"],
+                    "contracts": snapshot.get("contracts"),
+                    "contract_size": snapshot.get("contract_size"),
+                    "entry_price": valuation["entry_price"],
+                    "current_price": valuation["current_price"],
+                    "change_24h": change_24h,
+                    "unrealized_pnl": valuation["unrealized_pnl"],
+                    "pnl_source": valuation["pnl_source"],
+                    "local_quantity": getattr(local_position, "quantity", None),
+                    "local_entry_price": getattr(local_position, "entry_price", None),
+                    "local_unrealized_pnl": getattr(local_position, "unrealized_pnl", None),
+                    "realized_pnl": getattr(local_position, "realized_pnl", 0.0)
+                    if local_position is not None
+                    else 0.0,
+                    "leverage": getattr(local_position, "leverage", None)
+                    or snapshot.get("leverage"),
+                    "stop_loss": getattr(local_position, "stop_loss_price", None),
+                    "take_profit": getattr(local_position, "take_profit_price", None),
+                    "is_open": True,
+                    "db_is_open": bool(getattr(local_position, "is_open", False))
+                    if local_position is not None
+                    else False,
+                    "exchange_synced": True,
+                    "close_status": "open",
+                    "close_status_label": "持有中",
+                    "close_status_source": "okx_current_position",
+                    "position_status": "持有中",
+                    "okx_inst_id": info.get("instId") or snapshot.get("okx_inst_id"),
+                    "okx_pos_id": info.get("posId") or snapshot.get("okx_pos_id"),
+                    "opened_at": opened_at.isoformat() if opened_at else None,
+                    "closed_at": None,
+                }
+            )
 
     return _group_open_dashboard_positions(
         positions,
@@ -2666,8 +3034,21 @@ async def get_ml_signal_status():
     if not isinstance(status, dict):
         return status
 
-    training_count = int(status.get("sample_count") or status.get("trained_sample_count") or 0)
-    status.setdefault("training_shadow_sample_count", training_count)
+    raw_training_count = _safe_int_value(
+        status.get("sample_count") or status.get("trained_sample_count"), 0
+    )
+    explicit_training_count = _explicit_phase3_count(
+        status,
+        "phase3_clean_trainable_shadow_sample_count",
+        "phase3_clean_completed_shadow_sample_count",
+    )
+    if explicit_training_count is None:
+        explicit_training_count = await _completed_ml_shadow_sample_count()
+    training_count = int(explicit_training_count or 0)
+    status["phase3_clean_trainable_shadow_sample_count"] = training_count
+    status["training_shadow_sample_count"] = training_count
+    status["raw_shadow_sample_count"] = raw_training_count
+    status["legacy_shadow_sample_count"] = max(raw_training_count - training_count, 0)
     status.setdefault(
         "training_shadow_sample_limit",
         LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
@@ -2678,24 +3059,40 @@ async def get_ml_signal_status():
     )
 
     try:
-        completed_total = await _completed_ml_shadow_sample_count()
-        status.setdefault("completed_shadow_sample_count", completed_total)
-        status.setdefault("total_shadow_sample_count", completed_total)
+        completed_total = _explicit_phase3_count(
+            status,
+            "phase3_clean_completed_shadow_sample_count",
+            "phase3_clean_trainable_shadow_sample_count",
+        )
+        if completed_total is None:
+            completed_total = await _completed_ml_shadow_sample_count()
+        completed_total = int(completed_total or 0)
+        completed_total = max(completed_total, training_count)
+        status["phase3_clean_completed_shadow_sample_count"] = completed_total
+        status["completed_shadow_sample_count"] = completed_total
+        status["total_shadow_sample_count"] = completed_total
 
         auto_last = (
             status.get("auto_train_last_result")
             if isinstance(status.get("auto_train_last_result"), dict)
             else {}
         )
-        auto_new = auto_last.get("new_sample_count") if isinstance(auto_last, dict) else None
+        auto_new = (
+            auto_last.get("phase3_new_shadow_sample_count")
+            if isinstance(auto_last, dict)
+            else None
+        )
         if auto_new is None:
             auto_new = max(int(completed_total) - training_count, 0)
-        status.setdefault("new_shadow_sample_count", int(auto_new or 0))
+        status["phase3_new_shadow_sample_count"] = int(auto_new or 0)
+        status["new_shadow_sample_count"] = int(auto_new or 0)
     except Exception as exc:
         _log_dashboard_fallback("ml signal sample count fallback", exc)
-        status.setdefault("completed_shadow_sample_count", training_count)
-        status.setdefault("total_shadow_sample_count", training_count)
-        status.setdefault("new_shadow_sample_count", 0)
+        status["phase3_clean_completed_shadow_sample_count"] = training_count
+        status["completed_shadow_sample_count"] = training_count
+        status["total_shadow_sample_count"] = training_count
+        status["phase3_new_shadow_sample_count"] = 0
+        status["new_shadow_sample_count"] = 0
 
     return status
 
@@ -2726,8 +3123,32 @@ async def get_local_ai_tools_status():
     if isinstance(status, dict):
         try:
             completed_total = await _completed_local_ai_shadow_backtest_total()
-            status.setdefault("completed_shadow_sample_count", completed_total)
-            status.setdefault("training_shadow_sample_count", status.get("shadow_sample_count"))
+            service_shadow_count = _safe_int_value(
+                status.get("shadow_sample_count") or status.get("training_shadow_sample_count"),
+                0,
+            )
+            service_trade_count = _safe_int_value(status.get("trade_sample_count"), 0)
+            explicit_phase3_count = _explicit_phase3_count(
+                status,
+                "phase3_clean_trainable_shadow_sample_count",
+                "phase3_clean_completed_shadow_sample_count",
+            )
+            phase3_count = int(
+                explicit_phase3_count
+                if explicit_phase3_count is not None
+                else completed_total
+            )
+            status["phase3_clean_trainable_shadow_sample_count"] = phase3_count
+            status["phase3_clean_completed_shadow_sample_count"] = phase3_count
+            status["shadow_sample_count"] = phase3_count
+            status["completed_shadow_sample_count"] = phase3_count
+            status["training_shadow_sample_count"] = phase3_count
+            status["total_shadow_sample_count"] = phase3_count
+            status["raw_shadow_sample_count"] = phase3_count
+            status["legacy_shadow_sample_count"] = 0
+            status["service_model_window_shadow_sample_count"] = service_shadow_count
+            status["service_model_window_trade_sample_count"] = service_trade_count
+            status["training_sample_source"] = "phase3_clean_completed_shadow_backtests"
             status.setdefault(
                 "training_shadow_sample_limit",
                 LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
@@ -2747,64 +3168,12 @@ async def get_dashboard_summary():
     """Aggregate dashboard data."""
     market_state = await _build_open_position_market_snapshot(mode_manager.mode.value)
 
-    account_summaries = []
-    if mode_manager.mode.value == "paper" and _trading_service and _trading_service.paper_executor:
-        all_summaries = await _trading_service.paper_executor.get_all_summaries()
-        account_summaries = [
-            item for item in all_summaries if item.get("model_name") == ENSEMBLE_TRADER_NAME
-        ]
-        if not account_summaries:
-            account_summaries = [
-                await _trading_service.paper_executor.get_account_summary(ENSEMBLE_TRADER_NAME)
-            ]
-        exchange_symbols = await _get_exchange_open_position_symbols("paper")
-        exchange_mark_map = await _get_exchange_position_mark_map("paper")
-        if exchange_symbols:
-            for account in account_summaries:
-                fallback_margin_by_key: dict[tuple[str, str], float] = {}
-                for position in account.get("positions", []):
-                    key = _dashboard_position_key(position.get("symbol"), position.get("side"))
-                    if key[0] not in exchange_symbols:
-                        continue
-                    leverage = max(_safe_float(position.get("leverage"), 1.0) or 1.0, 1.0)
-                    fallback_margin_by_key[key] = (
-                        fallback_margin_by_key.get(key, 0.0)
-                        + (
-                            (_safe_float(position.get("quantity"), 0.0) or 0.0)
-                            * (_safe_float(position.get("entry_price"), 0.0) or 0.0)
-                        )
-                        / leverage
-                    )
-                exchange_totals = _exchange_position_totals(
-                    exchange_mark_map,
-                    fallback_margin_by_key,
-                )
-                display_unrealized = float(exchange_totals["unrealized_pnl"])
-                display_used_margin = float(exchange_totals["used_margin"])
-                account["positions"] = []
-                account["open_positions"] = int(exchange_totals["open_count"])
-                account["used_margin"] = round(display_used_margin, 8)
-                account["position_margin_used"] = round(display_used_margin, 8)
-                account["wallet_balance"] = (
-                    float(account.get("current_balance") or account.get("balance") or 0.0)
-                    + display_used_margin
-                )
-                account["unrealized_pnl"] = round(display_unrealized, 8)
-                account["display_unrealized_pnl"] = round(display_unrealized, 8)
-                account["equity"] = account["wallet_balance"] + account["unrealized_pnl"]
-                initial_balance = float(account.get("initial_balance") or 0.0)
-                account["total_pnl"] = account["equity"] - initial_balance
-                account["total_pnl_pct"] = (
-                    ((account["total_pnl"] / initial_balance) * 100) if initial_balance > 0 else 0.0
-                )
-
     okx_account = await _get_dashboard_okx_account_snapshot(mode_manager.mode.value)
 
-    paper_summary = account_summaries[0] if account_summaries else None
     pnl_summary = await _get_execution_pnl_summary(mode_manager.mode.value)
     execution_account = _build_execution_account_status(
         mode_manager.mode.value,
-        paper_summary=paper_summary,
+        paper_summary=None,
         okx_account=okx_account,
         pnl_summary=pnl_summary,
     )
@@ -2850,6 +3219,7 @@ async def get_positions(
     from db.session import get_session_ctx
     from models.decision import AIDecision
     from models.trade import Order
+    from services.okx_position_ledger_view import build_okx_position_ledger_groups
 
     page = max(int(page or 1), 1)
     page_size = max(1, min(int(page_size or 20), 100))
@@ -2865,9 +3235,141 @@ async def get_positions(
     if open_only and not closed_only:
         open_symbols = await _get_display_open_position_symbols(mode)
         public_tickers = await _get_public_ticker_map(open_symbols)
+    if not open_only and not closed_only:
+        try:
+            open_rows = await _get_display_open_positions_snapshot(mode)
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "combined positions open snapshot fallback",
+                exc,
+                mode=mode,
+            )
+            open_rows = []
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            closed_rows, closed_total, _closed_page, _closed_pages = (
+                await _dashboard_closed_position_ledger_rows(
+                    session,
+                    repo,
+                    mode=mode,
+                    page=1,
+                    page_size=5000,
+                    paginate=False,
+                )
+            )
+        combined_positions = [*open_rows, *closed_rows]
+        display_total = len(combined_positions)
+        display_total_pages = (
+            max(1, (display_total + page_size - 1) // page_size) if display_total else 1
+        )
+        page = min(page, display_total_pages)
+        start = (page - 1) * page_size
+        return {
+            "positions": combined_positions[start : start + page_size],
+            "count": len(combined_positions[start : start + page_size]),
+            "open_count": len(open_rows),
+            "closed_count": closed_total,
+            "total": display_total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": display_total_pages,
+            "ledger_source": "okx_current_positions_plus_grouped_closed_cache",
+        }
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
+        if closed_only:
+            positions, display_total, page, display_total_pages = (
+                await _dashboard_closed_position_ledger_rows(
+                    session,
+                    repo,
+                    mode=mode,
+                    page=page,
+                    page_size=page_size,
+                    paginate=True,
+                )
+            )
+            return {
+                "positions": positions,
+                "count": display_total,
+                "total": display_total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": display_total_pages,
+                "ledger_source": "okx_native_grouped_cache",
+            }
+            closed_rows = await repo.get_position_records(
+                execution_mode=mode,
+                limit=5000,
+                offset=0,
+                is_open=False,
+            )
+            linked_order_ids = {
+                token
+                for position in closed_rows
+                for value in (
+                    getattr(position, "entry_exchange_order_id", None),
+                    getattr(position, "close_exchange_order_id", None),
+                )
+                for token in _dashboard_split_exchange_order_ids(value)
+            }
+            symbol_variants = _dashboard_symbol_query_variants(
+                {
+                    _normalize_dashboard_symbol(str(getattr(position, "symbol", "") or ""))
+                    for position in closed_rows
+                    if getattr(position, "symbol", None)
+                }
+            )
+            order_stmt = select(Order).where(Order.status == "filled")
+            if mode:
+                order_stmt = order_stmt.where(Order.execution_mode == mode)
+            if symbol_variants:
+                order_stmt = order_stmt.where(Order.symbol.in_(symbol_variants))
+            else:
+                order_stmt = order_stmt.where(Order.id == -1)
+            order_rows = list(
+                (
+                    await session.execute(
+                        order_stmt.order_by(
+                            Order.filled_at.desc().nullslast(),
+                            Order.created_at.desc(),
+                        ).limit(10000)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if linked_order_ids:
+                order_rows = [
+                    order
+                    for order in order_rows
+                    if _dashboard_split_exchange_order_ids(
+                        getattr(order, "exchange_order_id", None)
+                    )
+                    & linked_order_ids
+                ]
+            ledger_groups = build_okx_position_ledger_groups(closed_rows, order_rows)
+            display_total = len(ledger_groups)
+            display_total_pages = (
+                max(1, (display_total + page_size - 1) // page_size)
+                if display_total
+                else 1
+            )
+            page = min(page, display_total_pages)
+            start = (page - 1) * page_size
+            positions = [
+                group.as_dict(include_fills=True)
+                for group in ledger_groups[start : start + page_size]
+            ]
+            return {
+                "positions": positions,
+                "count": display_total,
+                "total": display_total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": display_total_pages,
+                "ledger_source": "okx_native_grouped_cache",
+            }
         total = await repo.count_positions(execution_mode=mode, is_open=is_open_filter)
         open_count = await repo.count_positions(execution_mode=mode, is_open=True)
         # When showing current open positions, exchange reconciliation happens
@@ -3153,22 +3655,13 @@ async def get_positions(
                     entry_price = valuation["entry_price"]
                     quantity = valuation["quantity"]
                     pnl_source = valuation["pnl_source"]
-                elif display_ticker:
-                    latest_price = float(
-                        display_ticker.get("price") or display_ticker.get("last_price") or 0.0
-                    )
-                    if latest_price > 0:
-                        current_price = latest_price
-                        if p.side == "short":
-                            unrealized_pnl = (entry_price - latest_price) * quantity
-                        else:
-                            unrealized_pnl = (latest_price - entry_price) * quantity
-                        pnl_source = "market_ticker_recomputed"
 
             exchange_key = _dashboard_position_key(p.symbol, p.side)
             exchange_synced = True
-            if p.is_open and exchange_symbols is not None:
-                exchange_synced = exchange_key in exchange_mark_map
+            if p.is_open:
+                exchange_synced = bool(
+                    exchange_symbols is not None and exchange_key in exchange_mark_map
+                )
             display_is_open = bool(p.is_open and exchange_synced)
             if open_only and not display_is_open:
                 continue
@@ -3653,7 +4146,7 @@ async def _build_opening_funnel_payload(
     is_paper = selected_mode == "paper"
     capped_hours = max(1, min(int(hours or 24), 24 * 30))
     capped_limit = max(50, min(int(limit or 500), 2000))
-    since = datetime.now(UTC) - timedelta(hours=capped_hours)
+    since = max(datetime.now(UTC) - timedelta(hours=capped_hours), PHASE3_CLEAN_START_UTC)
 
     async with get_session_ctx() as session:
         stmt = (
@@ -3662,6 +4155,7 @@ async def _build_opening_funnel_payload(
                 AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                 AIDecision.is_paper == is_paper,
                 AIDecision.created_at >= since,
+                AIDecision.analysis_type.in_(("market", "entry_candidate")),
             )
             .order_by(AIDecision.created_at.desc())
             .limit(capped_limit)
@@ -3947,8 +4441,8 @@ async def get_analysis_records(
         position_stmt = select(
             Position.execution_mode,
             Position.symbol,
-        ).where(
-            Position.model_name == ENSEMBLE_TRADER_NAME,
+          ).where(
+            Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
             Position.is_open.is_(True),
         )
         if is_paper is not None:
@@ -4384,11 +4878,11 @@ async def get_profit_attribution(
 
     async with get_session_ctx() as session:
         position_result = await session.execute(
-            select(Position)
-            .where(
-                Position.model_name == ENSEMBLE_TRADER_NAME,
-                Position.execution_mode == selected_mode,
-                Position.is_open.is_(False),
+              select(Position)
+              .where(
+                  Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                  Position.execution_mode == selected_mode,
+                  Position.is_open.is_(False),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )
@@ -4429,7 +4923,7 @@ async def get_profit_attribution(
         order_result = await session.execute(
             select(Order)
             .where(
-                Order.model_name == ENSEMBLE_TRADER_NAME,
+                Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Order.execution_mode == selected_mode,
                 Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1,
                 Order.created_at >= order_since,
@@ -4546,6 +5040,7 @@ async def get_model_contribution_stats(
     from db.session import get_session_ctx
     from models.decision import AIDecision
     from models.trade import Order, Position
+    from services.model_contribution_performance import ModelContributionPerformanceService
 
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
     since = datetime.now(UTC) - timedelta(days=max(1, min(int(days or 7), 90)))
@@ -4587,11 +5082,11 @@ async def get_model_contribution_stats(
 
     async with get_session_ctx() as session:
         position_result = await session.execute(
-            select(Position)
-            .where(
-                Position.model_name == ENSEMBLE_TRADER_NAME,
-                Position.execution_mode == selected_mode,
-                Position.is_open.is_(False),
+              select(Position)
+              .where(
+                  Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                  Position.execution_mode == selected_mode,
+                  Position.is_open.is_(False),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )
@@ -4604,31 +5099,45 @@ async def get_model_contribution_stats(
                 "mode": selected_mode,
                 "days": days,
                 "total_positions": 0,
+                "lineage": {
+                    "total_closed_positions": 0,
+                    "filled_order_count": 0,
+                    "orders_with_decision_id": 0,
+                    "orders_with_loaded_decision": 0,
+                    "matched_position_count": 0,
+                    "unmatched_position_count": 0,
+                    "match_rate": 0.0,
+                    "reason": "no_closed_positions",
+                    "ready_for_profit_learning": False,
+                },
                 "stats": list(stats.values()),
                 "summary": "暂无已平仓样本，等新交易完成后会自动统计。",
             }
 
         symbols = {p.symbol for p in positions if p.symbol}
+        symbol_variants = _dashboard_symbol_query_variants(symbols)
         order_result = await session.execute(
             select(Order)
             .where(
-                Order.model_name == ENSEMBLE_TRADER_NAME,
+                Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Order.execution_mode == selected_mode,
                 Order.status == "filled",
-                Order.decision_id.is_not(None),
-                Order.symbol.in_(symbols) if symbols else Order.id == -1,
+                Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1,
             )
             .order_by(Order.filled_at.desc(), Order.created_at.desc())
             .limit(max_rows * 3)
         )
         orders = list(order_result.scalars().all())
-        decision_ids = [o.decision_id for o in orders if o.decision_id]
+        decision_ids = list({int(o.decision_id) for o in orders if o.decision_id})
         decisions: dict[int, AIDecision] = {}
         if decision_ids:
             decision_result = await session.execute(
                 select(AIDecision).where(AIDecision.id.in_(decision_ids))
             )
             decisions = {d.id: d for d in decision_result.scalars().all()}
+
+    contribution_service = ModelContributionPerformanceService()
+    lineage = contribution_service.build_lineage_diagnostics(positions, orders, decisions)
 
     def aware(value):
         if value and value.tzinfo is None:
@@ -4637,9 +5146,10 @@ async def get_model_contribution_stats(
 
     for pos in positions:
         pos_created = aware(pos.created_at)
+        pos_symbol = _normalize_dashboard_symbol(pos.symbol)
         candidates = []
         for order in orders:
-            if order.symbol != pos.symbol:
+            if _normalize_dashboard_symbol(order.symbol) != pos_symbol:
                 continue
             if order.decision_id not in decisions:
                 continue
@@ -4705,6 +5215,7 @@ async def get_model_contribution_stats(
         "mode": selected_mode,
         "days": days,
         "total_positions": len(positions),
+        "lineage": lineage,
         "stats": result,
         "summary": "按已平仓真实盈亏回看各模型同向信号贡献，用于后续自动降权/加权。",
     }
@@ -4982,86 +5493,59 @@ async def clear_decisions():
 
 @router.get("/dashboard/account")
 async def get_account_balance():
-    """Account balances (virtual for paper, real for live)."""
-    selected_mode = mode_manager.mode.value
-    summaries = []
-    if selected_mode == "paper" and _trading_service and _trading_service.paper_executor:
-        summaries = await _trading_service.paper_executor.get_all_summaries()
+    """Account balances backed by OKX snapshots only.
 
-    live_balance = 0.0
-    live_executor = _dashboard_okx_executor_for_mode(selected_mode)
-    if selected_mode == "live" and live_executor:
-        try:
-            live_balance = await live_executor.get_balance()
-        except Exception as exc:
-            _log_dashboard_fallback("live balance fallback", exc)
+    This legacy endpoint keeps the old response shape for clients, but Phase 3
+    paper/live account truth must not come from virtual-account balances.
+    """
+    selected_mode = mode_manager.mode.value
+    okx_account = await _get_dashboard_okx_account_snapshot(selected_mode)
+    okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
+    okx_equity = None if okx_error else _safe_float((okx_account or {}).get("equity") or (okx_account or {}).get("total"), None)
+    okx_available = None if okx_error else _safe_float((okx_account or {}).get("free"), None)
 
     return {
         "mode": selected_mode,
-        "virtual_accounts": summaries,
-        "live_balance": live_balance,
+        "virtual_accounts": [],
+        "live_balance": okx_equity if selected_mode == "live" else None,
+        "okx_account": okx_account,
+        "account_equity": okx_equity,
+        "available_balance": okx_available,
+        "balance_source": "okx_authoritative" if okx_account and not okx_error else "okx_unavailable",
+        "balance_error": okx_error,
     }
 
 
 @router.get("/dashboard/pnl-history")
 async def get_pnl_history(mode: str | None = None):
     """PnL equity curve history for each model."""
-    selected_mode = "live" if mode == "live" else mode_manager.mode.value
-    db_history = await _build_execution_pnl_history_from_db(selected_mode)
-    if db_history:
-        return {"history": await _format_pnl_history(db_history)}
-
-    if _trading_service:
-        history = _trading_service.get_pnl_history()
-        if not history:
-            try:
-                await _trading_service.record_equity_snapshot()
-                history = _trading_service.get_pnl_history()
-            except Exception as exc:
-                _log_dashboard_fallback(
-                    "pnl history snapshot fallback",
-                    exc,
-                    mode=selected_mode,
-                )
-                history = {}
-
-        if not history and _trading_service.paper_executor and _trading_service.models:
-            now = datetime.now(UTC).isoformat()
-            history = {}
-            for model_name in [ENSEMBLE_TRADER_NAME]:
-                try:
-                    summary = await _trading_service.paper_executor.get_account_summary(model_name)
-                    equity = summary.get("equity", summary.get("balance", 0))
-                    history[model_name] = [{"time": now, "equity": round(equity, 2)}]
-                except Exception as exc:
-                    _log_dashboard_fallback(
-                        "paper pnl summary fallback",
-                        exc,
-                        mode=selected_mode,
-                        model_name=model_name,
-                    )
-
-        # Convert to frontend-friendly format: {model: {pnl_curve: [...], labels: [...]}}
-        return {"history": await _format_pnl_history(history)}
-
-    return {"history": await _format_pnl_history(db_history)}
+    selected_mode = "live" if mode == "live" else "paper" if mode == "paper" else mode_manager.mode.value
+    okx_history = await _build_okx_equity_pnl_history(selected_mode)
+    return {"history": _format_okx_equity_pnl_history(okx_history)}
 
 
 @router.get("/dashboard/daily-pnl")
 async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     """Daily execution PnL grouped by Beijing calendar day."""
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
 
     from db.session import get_session_ctx
-    from models.trade import Position
+    from models.trade import Order, Position
+    from services.trade_fact_trust import (
+        closed_position_trade_fact_trusted_with_orders,
+        orders_by_exchange_id,
+        split_exchange_order_ids,
+    )
 
     selected_mode = "live" if mode == "live" else "paper"
     days = min(max(int(days or 30), 1), 180)
     today_local = datetime.now(BEIJING_TZ).date()
-    start_day = today_local - timedelta(days=days - 1)
+    phase3_start_day = datetime.fromisoformat(PHASE3_FIRST_CLEAN_DAY).date()
+    start_day = max(today_local - timedelta(days=days - 1), phase3_start_day)
     start_local = datetime.combine(start_day, datetime.min.time(), tzinfo=BEIJING_TZ)
     start_utc = start_local.astimezone(UTC)
 
+    record_count = max((today_local - start_day).days + 1, 1)
     records: dict[str, dict[str, Any]] = {
         (start_day + timedelta(days=offset)).isoformat(): {
             "date": (start_day + timedelta(days=offset)).isoformat(),
@@ -5080,11 +5564,10 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "cumulative_realized_pnl": 0.0,
             "cumulative_total_pnl": 0.0,
         }
-        for offset in range(days)
+        for offset in range(record_count)
     }
     cumulative_before = 0.0
     open_unrealized = 0.0
-    fallback_open_unrealized_by_key: dict[tuple[str, str], float] = {}
 
     try:
         exchange_marks = await _get_exchange_position_mark_map(selected_mode)
@@ -5095,26 +5578,82 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             mode=selected_mode,
         )
         exchange_marks = {}
-    try:
-        exchange_symbols = await _get_exchange_open_position_symbols(selected_mode)
-    except Exception as exc:
-        _log_dashboard_fallback(
-            "daily pnl exchange open symbol fallback",
-            exc,
-            mode=selected_mode,
-        )
-        exchange_symbols = None
-
     async with get_session_ctx() as session:
         result = await session.execute(
-            select(Position)
-            .where(
-                Position.model_name == ENSEMBLE_TRADER_NAME,
-                Position.execution_mode == selected_mode,
-            )
+              select(Position)
+              .where(
+                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                  Position.execution_mode == selected_mode,
+                  or_(
+                      Position.created_at >= PHASE3_CLEAN_START_UTC,
+                      Position.closed_at >= PHASE3_CLEAN_START_UTC,
+                  ),
+              )
             .order_by(Position.closed_at.asc(), Position.created_at.asc())
         )
         positions = list(result.scalars().all())
+        linked_order_ids = {
+            order_id
+            for pos in positions
+            if not pos.is_open
+            for value in (
+                getattr(pos, "entry_exchange_order_id", None),
+                getattr(pos, "close_exchange_order_id", None),
+            )
+            for order_id in split_exchange_order_ids(value)
+        }
+        linked_orders = []
+        if linked_order_ids:
+            linked_orders = list(
+                (
+                    await session.execute(
+                        select(Order).where(
+                            Order.execution_mode == selected_mode,
+                            Order.exchange_order_id.in_(sorted(linked_order_ids)),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        linked_orders_by_id = orders_by_exchange_id(linked_orders)
+        positions = [
+            pos
+            for pos in positions
+            if pos.is_open or closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
+        ]
+        from models.account import ExecutionEquitySnapshot
+
+        snapshot_result = await session.execute(
+            select(ExecutionEquitySnapshot)
+            .where(
+                ExecutionEquitySnapshot.model_name == ENSEMBLE_TRADER_NAME,
+                ExecutionEquitySnapshot.mode == selected_mode,
+                ExecutionEquitySnapshot.source == "okx_snapshot",
+                ExecutionEquitySnapshot.snapshot_date >= start_day.isoformat(),
+                ExecutionEquitySnapshot.snapshot_date >= PHASE3_FIRST_CLEAN_DAY,
+            )
+            .order_by(
+                ExecutionEquitySnapshot.snapshot_date.asc(),
+                ExecutionEquitySnapshot.snapshot_at.asc(),
+                ExecutionEquitySnapshot.id.asc(),
+            )
+        )
+        equity_snapshots = list(snapshot_result.scalars().all())
+
+    equity_by_date: dict[str, dict[str, Any]] = {}
+    for snapshot in equity_snapshots:
+        day = str(snapshot.snapshot_date or "")
+        if not day or day not in records or day in equity_by_date:
+            continue
+        equity = _safe_float(snapshot.equity, None)
+        if equity is None or equity <= 0:
+            continue
+        equity_by_date[day] = {
+            "equity": equity,
+            "snapshot_at": snapshot.snapshot_at.isoformat() if snapshot.snapshot_at else None,
+            "source": snapshot.source or "okx_snapshot",
+        }
 
     for pos in positions:
         pnl = float(pos.realized_pnl or 0.0)
@@ -5165,35 +5704,110 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
                 symbol_row["trade_count"] += 1
             continue
 
-        if pos.is_open:
-            normalized = _normalize_dashboard_symbol(pos.symbol)
-            side = str(pos.side or "").lower()
-            if exchange_symbols and normalized not in exchange_symbols:
-                continue
-            key = (normalized, side)
-            fallback_open_unrealized_by_key[key] = fallback_open_unrealized_by_key.get(
-                key, 0.0
-            ) + float(pos.unrealized_pnl or 0.0)
-
     if exchange_marks:
         open_unrealized = float(_exchange_position_totals(exchange_marks)["unrealized_pnl"])
-    else:
-        open_unrealized = sum(fallback_open_unrealized_by_key.values())
+
+    current_okx_equity: float | None = None
+    current_okx_equity_at: str | None = None
+    try:
+        okx_account = await _get_dashboard_okx_account_snapshot(selected_mode)
+        okx_error = (
+            str(okx_account.get("error"))
+            if isinstance(okx_account, dict) and okx_account.get("error")
+            else None
+        )
+        if not okx_error and isinstance(okx_account, dict):
+            current_okx_equity = _safe_float(
+                okx_account.get("equity") or okx_account.get("total"),
+                None,
+            )
+            current_okx_equity_at = (
+                str(okx_account.get("timestamp") or okx_account.get("snapshot_at") or "")
+                or None
+            )
+    except Exception as exc:
+        _log_dashboard_fallback(
+            "daily pnl current OKX equity unavailable",
+            exc,
+            mode=selected_mode,
+        )
 
     cumulative = cumulative_before
+    first_okx_equity = None
+    previous_okx_equity = None
     for date_key in sorted(records):
         row = records[date_key]
         cumulative += row["realized_pnl"]
         row["realized_profit"] = round(row["realized_profit"], 8)
         row["realized_loss"] = round(row["realized_loss"], 8)
         row["realized_pnl"] = round(row["realized_pnl"], 8)
-        if date_key == today_local.isoformat():
-            row["unrealized_pnl"] = round(open_unrealized, 8)
-            row["total_pnl"] = round(row["realized_pnl"] + open_unrealized, 8)
-            row["cumulative_total_pnl"] = round(cumulative + open_unrealized, 8)
+        equity_row = equity_by_date.get(date_key)
+        if equity_row:
+            equity = float(equity_row["equity"])
+            if first_okx_equity is None:
+                first_okx_equity = equity
+            day_equity_pnl = 0.0 if previous_okx_equity is None else equity - previous_okx_equity
+            previous_okx_equity = equity
+            row["okx_equity"] = round(equity, 8)
+            row["okx_equity_snapshot_at"] = equity_row.get("snapshot_at")
+            row["okx_equity_source"] = equity_row.get("source") or "okx_snapshot"
+            row["okx_equity_pnl"] = round(day_equity_pnl, 8)
+            row["okx_equity_change"] = row["okx_equity_pnl"]
+            row["okx_cumulative_equity_pnl"] = round(equity - first_okx_equity, 8)
+            row["okx_cumulative_equity_change"] = row["okx_cumulative_equity_pnl"]
         else:
-            row["total_pnl"] = round(row["realized_pnl"], 8)
-            row["cumulative_total_pnl"] = round(cumulative, 8)
+            row["okx_equity"] = None
+            row["okx_equity_snapshot_at"] = None
+            row["okx_equity_source"] = "okx_snapshot_missing"
+            row["okx_equity_pnl"] = None
+            row["okx_equity_change"] = None
+            row["okx_cumulative_equity_pnl"] = None
+            row["okx_cumulative_equity_change"] = None
+        row["trade_realized_pnl"] = row["realized_pnl"]
+        row["trade_cumulative_realized_pnl"] = round(cumulative, 8)
+        if date_key == today_local.isoformat():
+            if (
+                current_okx_equity is not None
+                and current_okx_equity > 0
+                and first_okx_equity is not None
+            ):
+                latest_equity = float(current_okx_equity)
+                today_baseline_row = equity_by_date.get(date_key)
+                baseline_for_today = (
+                    float(today_baseline_row["equity"])
+                    if today_baseline_row and today_baseline_row.get("equity") is not None
+                    else None
+                )
+                row["okx_equity"] = round(latest_equity, 8)
+                row["okx_equity_snapshot_at"] = current_okx_equity_at or datetime.now(UTC).isoformat()
+                row["okx_equity_source"] = "okx_current_balance"
+                row["okx_today_baseline_equity"] = (
+                    round(baseline_for_today, 8) if baseline_for_today is not None else None
+                )
+                row["okx_today_baseline_at"] = (
+                    today_baseline_row.get("snapshot_at") if today_baseline_row else None
+                )
+                row["okx_current_equity"] = round(latest_equity, 8)
+                row["okx_current_equity_at"] = row["okx_equity_snapshot_at"]
+                row["okx_equity_pnl_source"] = (
+                    "current_equity_minus_today_baseline"
+                    if baseline_for_today is not None
+                    else "today_baseline_missing"
+                )
+                row["okx_equity_pnl"] = (
+                    round(latest_equity - baseline_for_today, 8)
+                    if baseline_for_today is not None
+                    else None
+                )
+                row["okx_equity_change"] = row["okx_equity_pnl"]
+                row["okx_cumulative_equity_pnl"] = round(latest_equity - first_okx_equity, 8)
+                row["okx_cumulative_equity_change"] = row["okx_cumulative_equity_pnl"]
+            row["unrealized_pnl"] = round(open_unrealized, 8)
+            row["total_pnl"] = row["okx_equity_pnl"]
+            row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
+        else:
+            row["total_pnl"] = row["okx_equity_pnl"]
+            row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
         row["cumulative_realized_pnl"] = round(cumulative, 8)
         row["symbols"] = sorted(row["symbols"])
         row["position_details"] = sorted(
@@ -5218,6 +5832,8 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     return {
         "mode": selected_mode,
         "timezone": "Asia/Shanghai",
+        "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+        "pnl_source": "okx_equity_snapshots",
         "start_date": start_day.isoformat(),
         "end_date": today_local.isoformat(),
         "records": [records[key] for key in sorted(records.keys(), reverse=True)],
@@ -5251,123 +5867,57 @@ def _daily_pnl_position_detail(
     }
 
 
-async def _build_execution_pnl_history_from_db(mode: str) -> dict[str, list[dict]]:
-    """Rebuild the execution account curve from closed/open position records.
-
-    The in-memory snapshot list is lost on process restart. The dashboard still
-    needs a useful curve, so we reconstruct one from realized PnL events and add
-    the current unrealized PnL as the latest point.
-    """
+async def _build_okx_equity_pnl_history(mode: str) -> dict[str, list[dict]]:
+    """Return persisted OKX equity snapshots for the account curve."""
     from sqlalchemy import select
 
     from db.session import get_session_ctx
-    from models.trade import Position
+    from models.account import ExecutionEquitySnapshot
 
     selected_mode = "live" if mode == "live" else "paper"
-    cfg = settings.get_execution_account_config(selected_mode)
-    allocated = _safe_float(cfg.get("allocated_balance"), 0.0) or 0.0
-    if _trading_service:
-        try:
-            snapshot = await _dashboard_okx_balance_snapshot_for_mode(selected_mode)
-            allocated = (
-                _safe_float(
-                    (snapshot or {}).get("allocatable")
-                    or (snapshot or {}).get("equity")
-                    or (snapshot or {}).get("total"),
-                    allocated,
-                )
-                or allocated
-            )
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "pnl history allocation snapshot fallback",
-                exc,
-                mode=selected_mode,
-            )
-    if allocated <= 0:
-        allocated = settings.get_initial_balance(ENSEMBLE_TRADER_NAME)
-
     try:
         async with get_session_ctx() as session:
             result = await session.execute(
-                select(Position)
+                select(ExecutionEquitySnapshot)
                 .where(
-                    Position.model_name == ENSEMBLE_TRADER_NAME,
-                    Position.execution_mode == selected_mode,
+                    ExecutionEquitySnapshot.model_name == ENSEMBLE_TRADER_NAME,
+                    ExecutionEquitySnapshot.mode == selected_mode,
+                    ExecutionEquitySnapshot.source == "okx_snapshot",
+                    ExecutionEquitySnapshot.snapshot_date >= PHASE3_FIRST_CLEAN_DAY,
                 )
-                .order_by(Position.created_at.asc())
+                .order_by(ExecutionEquitySnapshot.snapshot_at.asc(), ExecutionEquitySnapshot.id.asc())
+                .limit(500)
             )
-            positions = list(result.scalars().all())
+            rows = list(result.scalars().all())
     except Exception as exc:
         _log_dashboard_fallback(
-            "pnl history database fallback",
+            "OKX equity history database fallback",
             exc,
             mode=selected_mode,
         )
         return {}
 
-    if not positions or allocated <= 0:
+    if not rows:
         return {}
-
-    def normalize_dt(dt: datetime | None) -> datetime:
-        if not dt:
-            return datetime.now(UTC)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
-
-    def iso(dt: datetime | None) -> str:
-        return normalize_dt(dt).isoformat()
-
-    event_times = [
-        normalize_dt(dt) for p in positions for dt in (p.created_at, p.closed_at) if dt is not None
-    ]
-    first_time = min(event_times) if event_times else datetime.now(UTC)
-    snapshots: list[dict] = [{"time": iso(first_time), "equity": round(allocated, 8)}]
-
-    cumulative_realized = 0.0
-    closed_positions = sorted(
-        [p for p in positions if not p.is_open and p.closed_at],
-        key=lambda p: p.closed_at or datetime.max,
-    )
-    for pos in closed_positions:
-        cumulative_realized += _safe_float(pos.realized_pnl, 0.0) or 0.0
-        snapshots.append(
+    return {
+        ENSEMBLE_TRADER_NAME: [
             {
-                "time": iso(pos.closed_at),
-                "equity": round(allocated + cumulative_realized, 8),
+                "time": row.snapshot_at.isoformat() if row.snapshot_at else None,
+                "equity": round(float(row.equity or 0.0), 8),
+                "source": row.source,
             }
-        )
-
-    open_unrealized = sum(_safe_float(p.unrealized_pnl, 0.0) or 0.0 for p in positions if p.is_open)
-    current_equity = round(allocated + cumulative_realized + open_unrealized, 8)
-    if len(snapshots) < 2 or abs(float(snapshots[-1]["equity"]) - current_equity) > 1e-8:
-        snapshots.append(
-            {
-                "time": datetime.now(UTC).isoformat(),
-                "equity": current_equity,
-            }
-        )
-
-    return {ENSEMBLE_TRADER_NAME: snapshots[-500:]}
+            for row in rows
+            if _safe_float(row.equity, 0.0) and _safe_float(row.equity, 0.0) > 0
+        ][-500:]
+    }
 
 
-async def _format_pnl_history(history: dict[str, list[dict]]) -> dict:
+def _format_okx_equity_pnl_history(history: dict[str, list[dict]]) -> dict:
     result = {}
     for model_name, snapshots in (history or {}).items():
         if not snapshots:
             continue
         initial = _safe_float(snapshots[0].get("equity"), 0.0) or 0.0
-        if _trading_service and _trading_service.paper_executor:
-            try:
-                summary = await _trading_service.paper_executor.get_account_summary(model_name)
-                initial = _safe_float(summary.get("initial_balance"), initial) or initial
-            except Exception as exc:
-                _log_dashboard_fallback(
-                    "pnl history initial balance fallback",
-                    exc,
-                    model_name=model_name,
-                )
         result[model_name] = {
             "pnl_curve": [
                 (
@@ -5383,5 +5933,6 @@ async def _format_pnl_history(history: dict[str, list[dict]]) -> dict:
                 for s in snapshots
             ],
             "labels": [s.get("time") for s in snapshots],
+            "source": "okx_equity_snapshots",
         }
     return result

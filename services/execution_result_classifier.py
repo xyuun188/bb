@@ -33,7 +33,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def is_confirmed_native_full_close_result(result: ExecutionResult | None) -> bool:
-    """OKX close-position may not return a normal order id; flat snapshot is confirmation."""
+    """OKX close-position is confirmed only after the real close fill ordId is known."""
 
     if result is None or result.status != OrderStatus.FILLED:
         return False
@@ -41,6 +41,12 @@ def is_confirmed_native_full_close_result(result: ExecutionResult | None) -> boo
         return False
     raw = result.raw_response if isinstance(result.raw_response, dict) else {}
     if not raw.get("okx_native_close_position"):
+        return False
+    native_fill = raw.get("native_close_fill") if isinstance(raw.get("native_close_fill"), dict) else {}
+    close_order_id = str(
+        result.exchange_order_id or native_fill.get("order_id") or ""
+    ).strip()
+    if not close_order_id:
         return False
 
     before = _safe_float(raw.get("position_contracts_before"), 0.0)

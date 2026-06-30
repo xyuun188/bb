@@ -4,11 +4,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 MANUAL_CLOSE_EXCHANGE_ID_PREFIX = "manual_close:"
+ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX = "okx_orphan_quarantine:"
 MANUAL_CLOSE_LABEL = "手动平仓"
 
 
 def is_manual_close_exchange_order_id(value: Any) -> bool:
     return str(value or "").startswith(MANUAL_CLOSE_EXCHANGE_ID_PREFIX)
+
+
+def is_local_non_exchange_close_marker(value: Any) -> bool:
+    text = str(value or "")
+    return text.startswith(MANUAL_CLOSE_EXCHANGE_ID_PREFIX) or text.startswith(
+        ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
+    )
 
 
 def is_manual_close_order(order: Any) -> bool:

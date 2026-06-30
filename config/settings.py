@@ -267,6 +267,35 @@ def parse_external_event_scraper_sources_value(v: Any) -> list[dict[str, Any]]:
     return []
 
 
+_OKX_PLACEHOLDER_SECRET_VALUES = {
+    "1",
+    "0",
+    "test",
+    "demo",
+    "placeholder",
+    "changeme",
+    "change-me",
+    "replace-me",
+    "todo",
+    "none",
+    "null",
+}
+
+
+def _normalise_okx_secret(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if is_masked_secret(text):
+        return ""
+    lowered = text.lower()
+    if lowered in _OKX_PLACEHOLDER_SECRET_VALUES:
+        return ""
+    if len(text) == 1:
+        return ""
+    return text
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -471,6 +500,9 @@ class Settings(BaseSettings):
             key = self.okx_live_api_key
             secret = self.okx_live_api_secret
             passphrase = self.okx_live_passphrase
+        key = _normalise_okx_secret(key)
+        secret = _normalise_okx_secret(secret)
+        passphrase = _normalise_okx_secret(passphrase)
         result = {"api_key": key, "api_secret": secret}
         if passphrase:
             result["passphrase"] = passphrase
@@ -666,30 +698,18 @@ class Settings(BaseSettings):
 
         Looks up model_initial_balances dict first, falls back to global default.
         """
-        if model_name == ENSEMBLE_TRADER_NAME:
-            return self.execution_account_balances.get(
-                "paper",
-                self.model_initial_balances.get(model_name, self.initial_virtual_balance),
-            )
         return self.model_initial_balances.get(model_name, self.initial_virtual_balance)
 
     def get_execution_account_config(self, mode: str = "paper") -> dict[str, Any]:
         """Return the mode-specific execution account quota and risk settings."""
         mode = "live" if mode == "live" else "paper"
-        allocated = self.execution_account_balances.get(
-            mode,
-            self.initial_virtual_balance if mode == "paper" else 0.0,
-        )
         max_loss_pct = self.execution_account_max_loss_pct.get(mode, self.max_daily_loss_pct)
-        max_loss_usdt = self.execution_account_max_loss_usdt.get(
-            mode,
-            allocated * max_loss_pct if allocated > 0 else 0.0,
-        )
+        max_loss_usdt = self.execution_account_max_loss_usdt.get(mode, 0.0)
         return {
             "mode": mode,
             "account_name": self.execution_account_name,
             "internal_model_name": ENSEMBLE_TRADER_NAME,
-            "allocated_balance": allocated,
+            "allocated_balance": None,
             "max_loss_pct": max_loss_pct,
             "max_loss_usdt": max_loss_usdt,
             "cooldown_loss_pct": self.execution_account_cooldown_loss_pct.get(mode, 0.5),

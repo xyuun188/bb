@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from config.settings import ENSEMBLE_TRADER_NAME, settings
 from db.session import close_db, get_session_ctx, init_db
+from models.learning import ShadowBacktest
 from models.trade import Position
 from services import server_monitor_status
 from services.model_server_config import (
@@ -138,8 +140,11 @@ async def test_server_monitor_keeps_platform_runtime_when_remote_config_fails(
 
     assert result["available"] is True
     assert result["remote_monitor_available"] is False
-    assert result["status"] == "model_server_config_error"
+    assert result["status"] == "platform_runtime_ok_remote_monitor_unavailable"
+    assert result["remote_monitor_status"] == "model_server_config_error"
     assert result["platform_runtime"]["ai_models"][0]["model"] == "qwen3-14b-trade"
+    assert result["model_runtime"]["vllm_endpoints"][0]["provider_model"] == "qwen3-14b-trade"
+    assert result["model_runtime"]["local_ai_tools"]["available"] is True
 
 
 @pytest.mark.asyncio
@@ -180,30 +185,60 @@ async def test_dashboard_ticker_fallback_reads_open_position_prices_from_db(
 @pytest.mark.asyncio
 async def test_local_ai_tools_status_uses_client_when_dashboard_is_split(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+
     class FakeLocalAIToolsClient:
         async def status(self) -> dict:
             return {
                 "available": True,
                 "status": "ok",
                 "models": {"profit": "trained"},
-                "completed_shadow_sample_count": 123,
+                "shadow_sample_count": 42,
+                "trade_sample_count": 7,
             }
 
     monkeypatch.setattr(dashboard, "_trading_service", None)
     monkeypatch.setattr(dashboard, "_local_ai_tools_status_client", FakeLocalAIToolsClient())
 
-    result = await dashboard.get_local_ai_tools_status()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                ShadowBacktest(
+                    model_name="ensemble",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    decision_action="long",
+                    status="completed",
+                    created_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
+                    due_at=datetime(2026, 6, 28, 1, 30, tzinfo=UTC),
+                    horizon_minutes=30,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.1,
+                    best_action="long",
+                )
+            )
+        result = await dashboard.get_local_ai_tools_status()
+    finally:
+        await close_db()
 
     assert result["available"] is True
     assert result["models"]["profit"] == "trained"
-    assert result["completed_shadow_sample_count"] == 123
+    assert result["completed_shadow_sample_count"] == 1
+    assert result["raw_shadow_sample_count"] == 1
+    assert result["legacy_shadow_sample_count"] == 0
+    assert result["service_model_window_shadow_sample_count"] == 42
+    assert result["service_model_window_trade_sample_count"] == 7
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_status_uses_local_service_when_dashboard_is_split(
+async def test_ml_signal_status_uses_phase3_completed_count_when_dashboard_is_split(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+
     class FakeMLSignalService:
         def status(self) -> dict:
             return {
@@ -219,11 +254,70 @@ async def test_ml_signal_status_uses_local_service_when_dashboard_is_split(
     monkeypatch.setattr(dashboard, "_trading_service", None)
     monkeypatch.setattr(dashboard, "_ml_signal_status_service", FakeMLSignalService())
 
-    result = await dashboard.get_ml_signal_status()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                ShadowBacktest(
+                    model_name="ensemble",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    decision_action="long",
+                    status="completed",
+                    created_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
+                    due_at=datetime(2026, 6, 28, 1, 30, tzinfo=UTC),
+                    horizon_minutes=30,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.1,
+                    best_action="long",
+                )
+            )
+        result = await dashboard.get_ml_signal_status()
+    finally:
+        await close_db()
 
     assert result["available"] is True
     assert result["status"] == "learning_only"
     assert result["auto_train_enabled"] is True
-    assert result["training_shadow_sample_count"] == 42
-    assert result["completed_shadow_sample_count"] == 321
-    assert result["new_shadow_sample_count"] == 279
+    assert result["training_shadow_sample_count"] == 1
+    assert result["completed_shadow_sample_count"] == 1
+    assert result["raw_shadow_sample_count"] == 42
+    assert result["legacy_shadow_sample_count"] == 41
+    assert result["new_shadow_sample_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_status_does_not_promote_legacy_sample_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+
+    class FakeMLSignalService:
+        def status(self) -> dict:
+            return {
+                "available": True,
+                "status": "ready",
+                "sample_count": 150810,
+                "training_shadow_sample_count": 144870,
+                "auto_train_last_result": {
+                    "new_sample_count": 144870,
+                    "new_shadow_sample_count": 144870,
+                },
+            }
+
+        async def completed_shadow_sample_count(self) -> int:
+            return 0
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_ml_signal_status_service", FakeMLSignalService())
+
+    try:
+        result = await dashboard.get_ml_signal_status()
+    finally:
+        await close_db()
+
+    assert result["training_shadow_sample_count"] == 0
+    assert result["completed_shadow_sample_count"] == 0
+    assert result["phase3_new_shadow_sample_count"] == 0
+    assert result["raw_shadow_sample_count"] == 150810
+    assert result["legacy_shadow_sample_count"] == 150810

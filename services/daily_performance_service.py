@@ -9,6 +9,7 @@ from typing import Any
 from config.settings import ENSEMBLE_TRADER_NAME
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 SessionFactory = Callable[[], Any]
 TradeRepositoryFactory = Callable[[Any], TradeRepository]
@@ -64,6 +65,8 @@ class DailyPerformanceService:
                 if closed_at.tzinfo is None:
                     closed_at = closed_at.replace(tzinfo=UTC)
                 if closed_at < start_utc:
+                    continue
+                if not closed_position_trade_fact_trusted(pos):
                     continue
                 closed_today.append(pos)
 

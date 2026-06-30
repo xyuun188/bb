@@ -221,6 +221,20 @@ def load_model_server_info_for_monitor(project_root: Path) -> RemoteServerInfo:
         raise
 
 
+async def load_model_server_info_for_monitor_async(project_root: Path) -> RemoteServerInfo:
+    """Async variant for Dashboard audit paths that already run in an event loop."""
+
+    try:
+        return await load_model_server_info_from_secure_settings()
+    except ModelServerConfigNotConfigured as secure_exc:
+        try:
+            return load_model_server_info(project_root)
+        except FileNotFoundError:
+            raise secure_exc from None
+    except ModelServerConfigError:
+        raise
+
+
 def _safe_port_or_none(value: str) -> int | None:
     try:
         port = int(str(value or "").strip())

@@ -30,6 +30,8 @@ def _position(**kwargs: Any) -> SimpleNamespace:
         "realized_pnl": 0.0,
         "closed_at": None,
         "created_at": datetime(2026, 6, 8, tzinfo=UTC),
+        "entry_exchange_order_id": "entry-ok",
+        "close_exchange_order_id": "close-ok",
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -97,8 +99,19 @@ async def test_execution_allocation_filters_open_positions_by_exchange_snapshot(
             return positions
 
     class FakeExecutor:
+        def __init__(self) -> None:
+            self.soft_calls = 0
+            self.strict_calls = 0
+
         async def get_positions(self) -> list[dict[str, Any]]:
+            self.soft_calls += 1
+            raise AssertionError("allocation must prefer strict OKX-native positions")
+
+        async def get_positions_strict(self) -> list[dict[str, Any]]:
+            self.strict_calls += 1
             return [{"symbol": "BTC/USDT", "side": "long", "is_open": True}]
+
+    fake_executor = FakeExecutor()
 
     @asynccontextmanager
     async def session_factory():
@@ -121,7 +134,7 @@ async def test_execution_allocation_filters_open_positions_by_exchange_snapshot(
     monkeypatch.setattr(allocation_module, "TradeRepository", FakeTradeRepository)
     service = ExecutionAllocationService(
         balance_snapshot_provider=balance_snapshot,
-        active_executor_provider=lambda _mode: FakeExecutor(),
+        active_executor_provider=lambda _mode: fake_executor,
         exchange_position_open_checker=lambda payload: bool(payload.get("is_open")),
         symbol_normalizer=lambda symbol: str(symbol or "").upper(),
         session_factory=session_factory,
@@ -144,12 +157,15 @@ async def test_execution_allocation_filters_open_positions_by_exchange_snapshot(
     assert state["today_equity_pnl"] == 8.0
     assert state["today_risk_pnl"] == 8.0
     assert state["today_equity_baseline"] == 101.0
+    assert baseline_calls[0]["current_equity"] == 100.0
     assert baseline_calls[0]["total_pnl"] == 12.0
     assert baseline_calls[0]["positions"] == positions
+    assert fake_executor.strict_calls == 1
+    assert fake_executor.soft_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_execution_allocation_counts_open_positions_when_exchange_snapshot_unavailable(
+async def test_execution_allocation_excludes_open_positions_when_exchange_snapshot_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     positions = [
@@ -191,9 +207,76 @@ async def test_execution_allocation_counts_open_positions_when_exchange_snapshot
 
     state = await service.calculate("paper")
 
-    assert state["used_margin"] == 100.0
-    assert state["unrealized_pnl"] == -4.0
+    assert state["used_margin"] == 0.0
+    assert state["unrealized_pnl"] == 0.0
     assert state["realized_pnl"] == 2.0
-    assert state["total_pnl"] == -2.0
-    assert state["today_equity_pnl"] == -2.0
-    assert state["today_risk_pnl"] == -2.0
+    assert state["total_pnl"] == 2.0
+    assert state["today_equity_pnl"] is None
+    assert state["today_total_pnl"] is None
+    assert state["today_risk_pnl"] is None
+
+
+@pytest.mark.asyncio
+async def test_execution_allocation_excludes_untrusted_closed_trade_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = [
+        _position(
+            is_open=False,
+            realized_pnl=10.0,
+            closed_at=datetime(2026, 6, 8, 2, 0, tzinfo=UTC),
+            entry_exchange_order_id="entry-ok",
+            close_exchange_order_id="close-ok",
+        ),
+        _position(
+            is_open=False,
+            realized_pnl=99.0,
+            closed_at=datetime(2026, 6, 8, 3, 0, tzinfo=UTC),
+            entry_exchange_order_id="",
+            close_exchange_order_id="",
+        ),
+        _position(
+            is_open=False,
+            realized_pnl=-25.0,
+            closed_at=datetime(2026, 6, 8, 4, 0, tzinfo=UTC),
+            entry_exchange_order_id="entry-dirty",
+            close_exchange_order_id="manual_close:1",
+        ),
+    ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_position_records(self, **_kwargs: Any) -> list[Any]:
+            return positions
+
+    @asynccontextmanager
+    async def session_factory():
+        yield object()
+
+    async def baseline_provider(_session: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"today_equity_pnl": kwargs["total_pnl"]}
+
+    async def balance_snapshot(_mode: str) -> dict[str, Any]:
+        return {"free": 50.0, "allocatable": 100.0}
+
+    monkeypatch.setattr(allocation_module, "TradeRepository", FakeTradeRepository)
+    service = ExecutionAllocationService(
+        balance_snapshot_provider=balance_snapshot,
+        active_executor_provider=lambda _mode: None,
+        exchange_position_open_checker=lambda _payload: True,
+        symbol_normalizer=lambda symbol: str(symbol or ""),
+        session_factory=session_factory,
+        equity_baseline_provider=baseline_provider,
+        now_provider=lambda: datetime(2026, 6, 8, 9, 30, tzinfo=UTC),
+    )
+
+    state = await service.calculate("paper")
+
+    assert state["realized_profit"] == 10.0
+    assert state["realized_loss"] == 0.0
+    assert state["today_realized_profit"] == 10.0
+    assert state["today_realized_loss"] == 0.0
+    assert state["realized_pnl"] == 10.0
+    assert state["total_pnl"] == 10.0

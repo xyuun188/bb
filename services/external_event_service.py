@@ -16,7 +16,10 @@ from sqlalchemy import select
 from config.settings import parse_external_event_scraper_sources_value, settings
 from core.safe_output import safe_error_text
 from core.url_safety import normalize_external_http_url
-from data_feed.external_event_scraper import ExternalEventScraper
+from data_feed.external_event_scraper import (
+    EXTERNAL_EVENT_MAX_SOURCES_LIMIT,
+    ExternalEventScraper,
+)
 from db.session import get_session_ctx
 from models.news import NewsArticle
 from services.secure_runtime_config import load_secure_settings_into_runtime
@@ -102,7 +105,7 @@ def load_external_event_settings_from_env() -> dict[str, Any]:
         values.get("EXTERNAL_EVENT_SCRAPER_MAX_SOURCES"),
         int(settings.external_event_scraper_max_sources),
         minimum=1,
-        maximum=20,
+        maximum=EXTERNAL_EVENT_MAX_SOURCES_LIMIT,
     )
     settings.external_event_scraper_max_items_per_source = _int_env(
         values.get("EXTERNAL_EVENT_SCRAPER_MAX_ITEMS_PER_SOURCE"),

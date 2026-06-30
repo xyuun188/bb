@@ -5,6 +5,7 @@ from datetime import UTC
 from typing import Any
 
 from core.symbols import normalize_trading_symbol
+from services.okx_native_facts import OkxNativeFactsClient
 
 
 def _default_float_parser(value: Any, default: float = 0.0) -> float:
@@ -15,7 +16,7 @@ def _default_float_parser(value: Any, default: float = 0.0) -> float:
 
 
 class ExchangeCloseFillFinder:
-    """Find an OKX close fill for a local position that disappeared from exchange state."""
+    """Find OKX-native close fills for a local position missing from exchange state."""
 
     def __init__(
         self,
@@ -33,45 +34,22 @@ class ExchangeCloseFillFinder:
         if not paper_okx:
             return {}
 
-        ccxt = await paper_okx._get_ccxt()
-        okx_symbol = paper_okx._to_swap_symbol(position.symbol)
-        contract_size = self._contract_size(ccxt, okx_symbol)
+        contract_size, contract_size_source = self._contract_size_from_position(position)
         since = self._opened_since_ms(position)
         close_side = "buy" if position.side == "short" else "sell"
         target_quantity = abs(self.float_parser(getattr(position, "quantity", 0.0), 0.0))
+        okx_inst_id = self._okx_inst_id_for_position(position)
 
         candidates = []
         candidates.extend(
-            await self._closed_order_candidates(
-                paper_okx,
-                ccxt,
-                okx_symbol=okx_symbol,
-                since=since,
-                close_side=close_side,
-                target_quantity=target_quantity,
-                contract_size=contract_size,
-            )
-        )
-        candidates.extend(
-            await self._trade_candidates(
-                paper_okx,
-                ccxt,
-                okx_symbol=okx_symbol,
-                since=since,
-                close_side=close_side,
-                target_quantity=target_quantity,
-                contract_size=contract_size,
-            )
-        )
-        candidates.extend(
             await self._okx_fill_history_candidates(
                 paper_okx,
-                ccxt,
-                okx_inst_id=self._okx_inst_id_for_position(position),
+                okx_inst_id=okx_inst_id,
                 since=since,
                 close_side=close_side,
                 target_quantity=target_quantity,
                 contract_size=contract_size,
+                contract_size_source=contract_size_source,
             )
         )
 
@@ -103,12 +81,86 @@ class ExchangeCloseFillFinder:
                 )[0]
         return sorted(candidates, key=lambda candidate: candidate.get("timestamp_ms") or 0)[-1]
 
-    def _contract_size(self, ccxt: Any, okx_symbol: str) -> float:
+    def _contract_size_from_position(self, position: Any) -> tuple[float, str]:
+        raw_info = getattr(position, "info", None)
+        info = raw_info if isinstance(raw_info, dict) else {}
+        for value, source in (
+            (getattr(position, "contract_size", None), "local_position_contract_size"),
+            (getattr(position, "contractSize", None), "local_position_contractSize"),
+            (info.get("ctVal"), "local_position_info_ctVal"),
+            (info.get("contractSize"), "local_position_info_contractSize"),
+        ):
+            parsed = self.float_parser(value, 0.0)
+            if parsed > 0:
+                return parsed, source
+        return 1.0, "default_contract_size_1"
+
+    def _contract_size(self, position: Any) -> float:
+        contract_size, _source = self._contract_size_from_position(position)
+        return contract_size
+
+    @staticmethod
+    def _is_default_contract_size_source(source: str) -> bool:
+        return source == "default_contract_size_1"
+
+    @staticmethod
+    def _should_infer_contract_size(
+        *,
+        target_quantity: float,
+        contracts: float,
+        quantity: float,
+        contract_size_source: str,
+    ) -> bool:
+        if target_quantity <= 0 or contracts <= 0:
+            return False
+        if contract_size_source != "default_contract_size_1":
+            return False
+        # Only infer smaller contract sizes from an overlarge raw contract count.
+        # Large ctVal instruments must come from OKX public instruments, otherwise
+        # a tiny partial fill can be mistaken for a full close.
+        return quantity > target_quantity * 1.2
+
+    async def _contract_size_from_okx_instruments(
+        self,
+        client: OkxNativeFactsClient,
+        *,
+        okx_inst_id: str,
+    ) -> tuple[float, str]:
+        if not okx_inst_id:
+            return 0.0, ""
         try:
-            market = ccxt.market(okx_symbol)
-            return self.float_parser(market.get("contractSize"), 1.0) or 1.0
+            contract_sizes = await client.fetch_contract_sizes(inst_ids=[okx_inst_id])
         except Exception:
-            return 1.0
+            return 0.0, ""
+        value = self.float_parser(contract_sizes.get(okx_inst_id), 0.0)
+        if value > 0:
+            return value, "okx_public_instruments_ctVal"
+        return 0.0, ""
+
+    def _resolve_fill_contract_size(
+        self,
+        *,
+        contracts: float,
+        target_quantity: float,
+        position_contract_size: float,
+        position_contract_size_source: str,
+        okx_contract_size: float,
+        okx_contract_size_source: str,
+    ) -> tuple[float, str, bool]:
+        if okx_contract_size > 0:
+            return okx_contract_size, okx_contract_size_source, False
+        contract_size = position_contract_size if position_contract_size > 0 else 1.0
+        quantity = contracts * contract_size
+        if self._should_infer_contract_size(
+            target_quantity=target_quantity,
+            contracts=contracts,
+            quantity=quantity,
+            contract_size_source=position_contract_size_source,
+        ):
+            inferred = target_quantity / contracts
+            if inferred > 0:
+                return inferred, "inferred_from_local_quantity_and_fill_contracts", True
+        return contract_size, position_contract_size_source, False
 
     @staticmethod
     def _okx_inst_id_for_position(position: Any) -> str:
@@ -130,275 +182,72 @@ class ExchangeCloseFillFinder:
             opened_at = opened_at.replace(tzinfo=UTC)
         return int(opened_at.timestamp() * 1000)
 
-    async def _closed_order_candidates(
-        self,
-        paper_okx: Any,
-        ccxt: Any,
-        *,
-        okx_symbol: str,
-        since: int | None,
-        close_side: str,
-        target_quantity: float,
-        contract_size: float,
-    ) -> list[dict[str, Any]]:
-        try:
-            orders = await paper_okx._with_retry(ccxt.fetch_closed_orders, okx_symbol, since, 50)
-        except Exception:
-            orders = []
-
-        min_timestamp = (since or 0) - 1000
-        candidates: list[dict[str, Any]] = []
-        for order in orders or []:
-            info = order.get("info") or {}
-            if order.get("side") != close_side:
-                continue
-            timestamp = self.float_parser(
-                order.get("timestamp") or info.get("uTime") or info.get("cTime"),
-                0.0,
-            )
-            if timestamp and timestamp < min_timestamp:
-                continue
-            reduce_raw = order.get("reduceOnly")
-            if reduce_raw in (None, ""):
-                reduce_raw = info.get("reduceOnly")
-            is_reduce_only = str(reduce_raw).lower() == "true"
-            order_type = info.get("ordType") or order.get("type")
-            algo_id = info.get("algoId") or info.get("algoClOrdId")
-            pnl = self.float_parser(info.get("pnl") or info.get("fillPnl"), 0.0)
-            has_close_pnl = abs(pnl) > 1e-12
-            if not is_reduce_only and not has_close_pnl:
-                continue
-            contracts = self.float_parser(
-                order.get("filled")
-                or order.get("amount")
-                or info.get("fillSz")
-                or info.get("accFillSz"),
-                0.0,
-            )
-            quantity = contracts * contract_size
-            if target_quantity > 0 and quantity > 0 and quantity < target_quantity * 0.2:
-                continue
-            candidates.append(
-                {
-                    "price": self.float_parser(
-                        order.get("average") or order.get("price") or info.get("fillPx"), 0.0
-                    ),
-                    "fee": order_fee_cost(order),
-                    "order_id": info.get("ordId") or order.get("id"),
-                    "timestamp_ms": timestamp,
-                    "timestamp": self._datetime_from_ms(timestamp),
-                    "quantity": quantity,
-                    "contracts": contracts,
-                    "contract_size": contract_size,
-                    "pnl": pnl,
-                    "source": "closed_orders",
-                    "reduce_only": is_reduce_only,
-                    "order_type": order_type,
-                    "algo_id": algo_id,
-                    "order_info": info,
-                }
-            )
-        return candidates
-
-    async def _trade_candidates(
-        self,
-        paper_okx: Any,
-        ccxt: Any,
-        *,
-        okx_symbol: str,
-        since: int | None,
-        close_side: str,
-        target_quantity: float,
-        contract_size: float,
-    ) -> list[dict[str, Any]]:
-        try:
-            trades = await paper_okx._with_retry(ccxt.fetch_my_trades, okx_symbol, since, 100)
-        except Exception:
-            trades = []
-
-        min_timestamp = (since or 0) - 1000
-        trade_groups: dict[str, dict[str, Any]] = {}
-        for trade in trades or []:
-            info = trade.get("info") or {}
-            if trade.get("side") != close_side:
-                continue
-            timestamp = self.float_parser(
-                trade.get("timestamp") or info.get("ts") or info.get("fillTime"), 0.0
-            )
-            if timestamp and timestamp < min_timestamp:
-                continue
-            fill_pnl = self.float_parser(info.get("fillPnl") or info.get("pnl"), 0.0)
-            contracts = self.float_parser(trade.get("amount") or info.get("fillSz"), 0.0)
-            quantity = contracts * contract_size
-            if abs(fill_pnl) <= 1e-12 and not (
-                target_quantity > 0 and quantity >= target_quantity * 0.8
-            ):
-                continue
-            price = self.float_parser(trade.get("price") or info.get("fillPx"), 0.0)
-            if price <= 0:
-                continue
-            order_id = info.get("ordId") or trade.get("order") or trade.get("id")
-            group = trade_groups.setdefault(
-                order_id,
-                {
-                    "price_value": 0.0,
-                    "quantity": 0.0,
-                    "fee": 0.0,
-                    "pnl": 0.0,
-                    "timestamp_ms": timestamp,
-                    "order_id": order_id,
-                    "source": "my_trades",
-                    "order_info": info,
-                },
-            )
-            group.setdefault("order_type", info.get("ordType") or trade.get("type"))
-            group.setdefault("algo_id", info.get("algoId") or info.get("algoClOrdId"))
-            group["price_value"] += price * quantity
-            group["quantity"] += quantity
-            group["contracts"] = group.get("contracts", 0.0) + contracts
-            group["contract_size"] = contract_size
-            group["fee"] += order_fee_cost(trade)
-            group["pnl"] += fill_pnl
-            group["timestamp_ms"] = max(group["timestamp_ms"] or 0, timestamp or 0)
-
-        candidates: list[dict[str, Any]] = []
-        for group in trade_groups.values():
-            quantity = group.get("quantity") or 0.0
-            if target_quantity > 0 and quantity > 0 and quantity < target_quantity * 0.2:
-                continue
-            timestamp = group.get("timestamp_ms") or 0
-            candidates.append(
-                {
-                    "price": group["price_value"] / quantity if quantity > 0 else 0.0,
-                    "fee": group.get("fee") or 0.0,
-                    "order_id": group.get("order_id"),
-                    "timestamp_ms": timestamp,
-                    "timestamp": self._datetime_from_ms(timestamp),
-                    "quantity": quantity,
-                    "pnl": group.get("pnl") or 0.0,
-                    "source": "my_trades",
-                    "order_type": group.get("order_type"),
-                    "algo_id": group.get("algo_id"),
-                    "order_info": group.get("order_info"),
-                }
-            )
-        return candidates
-
     async def _okx_fill_history_candidates(
         self,
         paper_okx: Any,
-        ccxt: Any,
         *,
         okx_inst_id: str,
         since: int | None,
         close_side: str,
         target_quantity: float,
         contract_size: float,
+        contract_size_source: str,
     ) -> list[dict[str, Any]]:
-        fetch_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
-        if not okx_inst_id or not callable(fetch_fills):
+        if not okx_inst_id:
             return []
 
-        params = {
-            "instType": "SWAP",
-            "instId": okx_inst_id,
-            "limit": "100",
-        }
+        client = OkxNativeFactsClient(paper_okx)
+        okx_contract_size, okx_contract_size_source = await self._contract_size_from_okx_instruments(
+            client,
+            okx_inst_id=okx_inst_id,
+        )
         try:
-            response = await paper_okx._with_retry(fetch_fills, params)
-        except Exception:
-            try:
-                response = await paper_okx._with_retry(
-                    fetch_fills,
-                    {
-                        "instType": "SWAP",
-                        "limit": "100",
-                    },
-                )
-            except Exception:
-                return []
-
-        rows = response.get("data", []) if isinstance(response, dict) else []
-        min_timestamp = (since or 0) - 1000
-        groups: dict[str, dict[str, Any]] = {}
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            row_inst_id = str(row.get("instId") or "").strip().upper()
-            if (
-                row_inst_id
-                and row_inst_id != okx_inst_id
-                and not row_inst_id.startswith(f"{okx_inst_id}-OFF")
-            ):
-                continue
-            if str(row.get("side") or "").lower() != close_side:
-                continue
-            timestamp = self.float_parser(row.get("ts") or row.get("fillTime"), 0.0)
-            if timestamp and timestamp < min_timestamp:
-                continue
-            price = self.float_parser(row.get("fillPx") or row.get("price"), 0.0)
-            if price <= 0:
-                continue
-            contracts = self.float_parser(row.get("fillSz") or row.get("sz"), 0.0)
-            if contracts <= 0:
-                continue
-            order_id = str(row.get("ordId") or row.get("order") or "").strip()
-            if not order_id:
-                continue
-            group = groups.setdefault(
-                order_id,
-                {
-                    "price_value": 0.0,
-                    "contracts": 0.0,
-                    "fee": 0.0,
-                    "pnl": 0.0,
-                    "timestamp_ms": timestamp,
-                    "order_id": order_id,
-                    "source": "okx_fills_history",
-                    "order_info": row,
-                },
+            groups = await client.fetch_fill_groups(
+                inst_ids=[okx_inst_id],
+                since=(since or 0) - 1000,
+                side=close_side,
+                limit=100,
+                strict=True,
             )
-            group["price_value"] += price * contracts
-            group["contracts"] += contracts
-            group["fee"] += abs(self.float_parser(row.get("fee"), 0.0))
-            group["pnl"] += self.float_parser(row.get("fillPnl") or row.get("pnl"), 0.0)
-            group["timestamp_ms"] = max(group["timestamp_ms"] or 0, timestamp or 0)
-            if timestamp >= group["timestamp_ms"]:
-                group["order_info"] = row
+        except Exception:
+            raise
 
         candidates: list[dict[str, Any]] = []
-        for group in groups.values():
-            contracts = float(group.get("contracts") or 0.0)
+        for group in groups:
+            contracts = float(group.contracts or 0.0)
             if contracts <= 0:
                 continue
-            quantity_contract_size = contract_size
+            (
+                quantity_contract_size,
+                quantity_contract_size_source,
+                inferred_contract_size,
+            ) = self._resolve_fill_contract_size(
+                contracts=contracts,
+                target_quantity=target_quantity,
+                position_contract_size=contract_size,
+                position_contract_size_source=contract_size_source,
+                okx_contract_size=okx_contract_size,
+                okx_contract_size_source=okx_contract_size_source,
+            )
             quantity = contracts * quantity_contract_size
-            inferred_contract_size = False
-            if (
-                target_quantity > 0
-                and quantity_contract_size == 1.0
-                and quantity > target_quantity * 1.2
-            ):
-                quantity_contract_size = target_quantity / contracts
-                quantity = target_quantity
-                inferred_contract_size = True
             if target_quantity > 0 and quantity > 0 and quantity < target_quantity * 0.2:
                 continue
-            timestamp = group.get("timestamp_ms") or 0
+            timestamp = group.timestamp_ms or 0
             candidates.append(
                 {
-                    "price": group["price_value"] / contracts,
-                    "fee": group.get("fee") or 0.0,
-                    "order_id": group.get("order_id"),
+                    "price": group.avg_price,
+                    "fee": group.fee_abs,
+                    "order_id": group.order_id,
                     "timestamp_ms": timestamp,
                     "timestamp": self._datetime_from_ms(timestamp),
                     "quantity": quantity,
                     "contracts": contracts,
                     "contract_size": quantity_contract_size,
+                    "contract_size_source": quantity_contract_size_source,
                     "contract_size_inferred_from_target": inferred_contract_size,
-                    "pnl": group.get("pnl") or 0.0,
+                    "pnl": group.fill_pnl,
                     "source": "okx_fills_history",
-                    "order_info": group.get("order_info"),
+                    "order_info": group.latest_row,
                 }
             )
         return candidates

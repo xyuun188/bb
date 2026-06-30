@@ -37,20 +37,18 @@ class AccountAccountingService:
         return await self.account_equity_for_risk(model_mode)
 
     async def account_equity_for_risk(self, mode: str) -> float:
-        """Prefer exchange equity, then persisted allocation, then order balance."""
+        """Return exchange equity used by risk controls.
+
+        OKX-backed paper/live accounts must not fall back to local virtual
+        allocations. If OKX is unavailable, upstream guards pause new entries.
+        """
 
         selected_mode = normalize_mode(mode)
         snapshot = await self.balance_snapshot_provider(selected_mode)
         balance = balance_from_snapshot(snapshot)
         if balance > 0:
             return balance
-
-        allocation_state = await self.allocation_state_provider(selected_mode)
-        allocated = float(allocation_state.get("allocated") or 0.0)
-        if allocated > 0:
-            return allocated
-
-        return await self.allocated_order_balance(selected_mode)
+        return 0.0
 
     async def okx_available_balance_for_mode(self, mode: str) -> float | None:
         """Return exchange tradeable balance or None when no snapshot exists."""
@@ -78,16 +76,9 @@ class AccountAccountingService:
         balance_delta: float,
         realized_pnl_delta: float = 0.0,
     ) -> None:
-        """Persist paper-account balance and realized-PnL deltas."""
+        """Do not persist synthetic balance deltas for OKX-backed accounts."""
 
-        if abs(balance_delta) < 1e-12 and abs(realized_pnl_delta) < 1e-12:
-            return
-        try:
-            async with self.session_factory() as session:
-                repo = AccountRepository(session)
-                await repo.update_balance(model_name, balance_delta, realized_pnl_delta)
-        except Exception as exc:
-            logger.error("failed to persist paper balance delta", error=safe_error_text(exc))
+        return
 
     async def persist_account_update(
         self,
@@ -95,29 +86,19 @@ class AccountAccountingService:
         _execution_model_name: str,
         result: ExecutionResult,
     ) -> None:
-        """Persist realized PnL and win/loss counters after an execution."""
+        """Record win/loss counters without mutating synthetic account balances."""
 
         try:
             async with self.session_factory() as session:
                 repo = AccountRepository(session)
-                await repo.update_balance(model_name, result.pnl, result.pnl)
                 await repo.record_trade_result(model_name, result.pnl > 0)
         except Exception as exc:
             logger.error("failed to persist account update", error=safe_error_text(exc))
 
     async def record_unrealized_pnl(self, model_name: str, unrealized_pnl: float) -> None:
-        """Persist unrealized PnL for dashboard and competition rankings."""
+        """Do not persist exchange-derived unrealized PnL into virtual accounts."""
 
-        try:
-            async with self.session_factory() as session:
-                repo = AccountRepository(session)
-                await repo.update_unrealized_pnl(model_name, round(unrealized_pnl, 2))
-        except Exception as exc:
-            logger.debug(
-                "failed to persist unrealized PnL snapshot",
-                model=model_name,
-                error=safe_error_text(exc),
-            )
+        return
 
 
 def normalize_mode(mode: str | None) -> str:
@@ -149,13 +130,11 @@ def tradeable_balance_from_snapshot(snapshot: dict[str, Any] | None) -> float:
 def balance_from_snapshot(snapshot: dict[str, Any] | None) -> float:
     if not isinstance(snapshot, dict):
         return 0.0
-    return max(
-        _safe_float(snapshot.get("equity"), 0.0),
-        _safe_float(snapshot.get("cash"), 0.0),
-        _safe_float(snapshot.get("total"), 0.0),
-        _safe_float(snapshot.get("allocatable"), 0.0),
-        _safe_float(snapshot.get("free"), 0.0),
-    )
+    for key in ("equity", "total", "allocatable", "cash", "free"):
+        value = _safe_float(snapshot.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

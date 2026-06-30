@@ -100,6 +100,18 @@ def test_parallel_market_position_runtime_state_is_isolated(
     service._last_market_round_finished_at = None
     service._last_position_round_started_at = None
     service._last_position_round_finished_at = None
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_started_at = None
+    service._okx_authoritative_sync_last_success_at = None
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_duration_seconds = None
+    service._okx_authoritative_sync_last_result_count = None
+    service._okx_authoritative_sync_last_result_kinds = {}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 0
+    service._okx_authoritative_sync_failure_count = 0
     service._analysis_runtime = {
         "market": _AnalysisRuntimeState(),
         "position": _AnalysisRuntimeState(),
@@ -129,7 +141,227 @@ def test_parallel_market_position_runtime_state_is_isolated(
     assert payload["position_current_stage"] == "idle"
     assert payload["round_active"] is True
     assert payload["current_stage"] == "fetch_features"
+    assert payload["okx_authoritative_sync"]["status"] == "pending"
+    assert payload["okx_authoritative_sync"]["source"] == "okx_private_api_current_positions"
+    assert payload["okx_authoritative_sync"]["last_result_kinds"] == {}
+    assert payload["okx_authoritative_sync"]["last_requires_attention_count"] == 0
+    assert payload["okx_authoritative_sync"]["last_samples"] == []
     assert TradingService._is_policy_skipped_execution_result(None) is False
+
+
+@pytest.mark.asyncio
+async def test_stop_writes_inactive_runtime_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._start_time = datetime.now(UTC) - timedelta(minutes=5)
+    service._current_stage = "idle"
+    service._last_round_started_at = None
+    service._last_round_finished_at = None
+    service._last_round_error = None
+    service._last_market_round_started_at = None
+    service._last_market_round_finished_at = None
+    service._last_position_round_started_at = None
+    service._last_position_round_finished_at = None
+    service._analysis_runtime = {
+        "market": _AnalysisRuntimeState(),
+        "position": _AnalysisRuntimeState(),
+        "full": _AnalysisRuntimeState(),
+    }
+    service._position_analysis_task = None
+    service._market_analysis_task = None
+    service._runtime_heartbeat_task = None
+    service._okx_authoritative_sync_task = None
+    service._ml_auto_train_task = None
+    service.paper_executor = None
+    service.okx_executor = None
+    service._okx_paper = None
+    service._okx_live = None
+    service._okx_authoritative_sync_started_at = None
+    service._okx_authoritative_sync_last_success_at = None
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_duration_seconds = None
+    service._okx_authoritative_sync_last_result_count = None
+    service._okx_authoritative_sync_last_result_kinds = {}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 0
+    service._okx_authoritative_sync_failure_count = 0
+
+    class FakeModelRegistry:
+        async def shutdown_all(self) -> None:
+            return None
+
+    service.models = FakeModelRegistry()
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+
+    await service.stop()
+
+    payload = json.loads((data_dir / "trading_runtime_status.json").read_text(encoding="utf-8"))
+    assert payload["running"] is False
+    assert payload["round_active"] is False
+    assert payload["current_stage"] == "idle"
+    assert payload["okx_authoritative_sync"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_loop_reconciles_current_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    calls: list[dict[str, Any]] = []
+
+    class FakeOkxSyncService:
+        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+            calls.append(
+                {
+                    "reason": reason,
+                    "timeout_seconds": timeout_seconds,
+                    "lock_wait_seconds": lock_wait_seconds,
+                }
+            )
+            return [
+                {
+                    "kind": "snapshot_update",
+                    "symbol": "BTC/USDT",
+                    "side": "long",
+                    "exchange_order_id": None,
+                    "note": "updated from OKX",
+                },
+                {
+                    "kind": "missing_exchange_position_without_close_fill",
+                    "symbol": "SPK/USDT",
+                    "side": "short",
+                    "exchange_order_id": None,
+                    "requires_attention": True,
+                    "note": "waiting for authoritative close fill",
+                },
+            ]
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+    service.okx_sync_service = FakeOkxSyncService()
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_started_at = None
+    service._okx_authoritative_sync_last_success_at = None
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_duration_seconds = None
+    service._okx_authoritative_sync_last_result_count = None
+    service._okx_authoritative_sync_last_result_kinds = {}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 0
+    service._okx_authoritative_sync_failure_count = 0
+
+    await service._okx_authoritative_sync_loop()
+
+    assert calls == [
+        {
+            "reason": "auto okx authoritative sync",
+            "timeout_seconds": 8.0,
+            "lock_wait_seconds": 0.1,
+        }
+    ]
+    status = service._okx_authoritative_sync_status_payload()
+    assert status["status"] == "ok"
+    assert status["success_count"] == 1
+    assert status["failure_count"] == 0
+    assert status["last_success_at"]
+    assert status["last_error"] is None
+    assert status["last_result_count"] == 2
+    assert status["last_result_kinds"] == {
+        "snapshot_update": 1,
+        "missing_exchange_position_without_close_fill": 1,
+    }
+    assert status["last_requires_attention_count"] == 1
+    assert status["last_samples"][1]["symbol"] == "SPK/USDT"
+    assert status["last_samples"][1]["requires_attention"] is True
+
+
+@pytest.mark.asyncio
+async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gate() -> None:
+    service = TradingService.__new__(TradingService)
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+
+    class FakeOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "okx_pull_available": True,
+                "confirmed_count": 96,
+                "position_confirmed_count": 1,
+                "unverified_count": 0,
+                "backfilled_count": 0,
+                "position_history_backfilled_count": 2,
+                "position_history_updated_count": 3,
+            }
+
+    def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
+        return FakeOrderFactSyncService()
+
+    service.okx_order_fact_sync_factory = factory
+
+    row = await service._sync_okx_order_facts_for_loop()
+
+    assert row["kind"] == "order_fact_sync"
+    assert row["requires_attention"] is False
+    assert "position_confirmed=1" in row["note"]
+    assert "position_history=2+3" in row["note"]
+    assert row["order_fact_sync"]["unverified_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_loop_records_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+
+    class FakeOkxSyncService:
+        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+            raise RuntimeError("OKX timeout")
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+    service.okx_sync_service = FakeOkxSyncService()
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_started_at = None
+    service._okx_authoritative_sync_last_success_at = None
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_duration_seconds = None
+    service._okx_authoritative_sync_last_result_count = None
+    service._okx_authoritative_sync_last_result_kinds = {}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 0
+    service._okx_authoritative_sync_failure_count = 0
+
+    await service._okx_authoritative_sync_loop()
+
+    status = service._okx_authoritative_sync_status_payload()
+    assert status["status"] == "warning"
+    assert status["success_count"] == 0
+    assert status["failure_count"] == 1
+    assert status["last_failure_at"]
+    assert "OKX timeout" in status["last_error"]
 
 
 def test_successful_runtime_round_clears_recovered_scope_error(
@@ -796,6 +1028,133 @@ async def test_new_pair_loss_cooldown_is_advisory_not_global_scan_pause():
     reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
 
     assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "warning",
+        "last_error": "OKX timeout",
+        "last_requires_attention_count": 0,
+    }
+
+    reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
+
+    assert "OKX auto reconciliation is unhealthy" in reason
+    assert "OKX timeout" in reason
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_attention_pauses_new_pair_analysis() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "ok",
+        "last_error": None,
+        "last_requires_attention_count": 2,
+    }
+
+    reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
+
+    assert "found 2 current-state differences" in reason
+    assert "pause new entries" in reason
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_auto_train_blocks_when_okx_daily_training_gate_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[str] = []
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            calls.append("status")
+            return {"available": True}
+
+        async def train(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            calls.append("train")
+            return {"trained": True}
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {
+            "allowed": False,
+            "reason": "okx_daily_reconciliation_training_blocked",
+            "can_refresh_training": False,
+            "read_only": True,
+            "mutates_database": False,
+        },
+    )
+    service.local_ai_tools = FakeLocalAITools()
+
+    result = await service._maybe_train_local_ai_tools(force=True)
+
+    assert result["trained"] is False
+    assert result["reason"] == "okx_daily_reconciliation_training_blocked"
+    assert result["okx_daily_reconciliation_gate"]["allowed"] is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_entry_execution_policy_blocks_entries_when_okx_sync_is_unhealthy() -> None:
+    service = TradingService.__new__(TradingService)
+    service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "stale",
+        "last_error": None,
+        "last_requires_attention_count": 0,
+        "source": "okx_private_api_current_positions",
+    }
+
+    result = await service.evaluate_entry_execution_policy(
+        _decision(Action.LONG),
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "okx_authoritative_sync_unhealthy"
+    assert result.data["stage_status"] == "blocked"
+    assert result.data["execution_blocker"] == "okx_authoritative_sync_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_entry_execution_policy_does_not_block_exit_on_okx_sync_warning() -> None:
+    service = TradingService.__new__(TradingService)
+    service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "warning",
+        "last_error": "OKX timeout",
+        "last_requires_attention_count": 0,
+    }
+
+    class FakeEntryExecutionPipeline:
+        async def evaluate(self, decision, model_name, model_mode, open_positions):
+            assert decision.is_exit
+            return PolicyGateResult.allow({"intent": "exit-passthrough"})
+
+    service.entry_execution_pipeline = FakeEntryExecutionPipeline()
+
+    result = await service.evaluate_entry_execution_policy(
+        _decision(Action.CLOSE_LONG),
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is True
+    assert result.data["intent"] == "exit-passthrough"
 
 
 def test_shadow_backtest_service_is_not_a_trading_service_private_rule():
@@ -1543,6 +1902,72 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_blocks_tiny_probe_after_recent_probe_loss_loop():
+    class FakeSizing:
+        async def apply(self, decision, _model_mode, open_positions):
+            assert open_positions == []
+            decision.raw_response["profit_risk_sizing"] = {
+                "quality_tier": "probe",
+                "position_size_pct": decision.position_size_pct,
+                "final_notional_usdt": 20.0,
+                "planned_stop_loss_usdt": 0.8,
+                "max_stop_loss_usdt": 1.5,
+                "expected_profit_usdt": 0.04,
+            }
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.01
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.feature_snapshot = {"close": 100.0}
+    decision.raw_response = {
+        "analysis_type": "entry_candidate",
+        "current_price": 100.0,
+        "strategy_learning_context": {"strategy_profile_id": "balanced_probe"},
+        "probe_loop_health": {
+            "all_recent_probes_losing": True,
+            "probe_closed_count": 3,
+            "probe_loss_count": 3,
+        },
+        "opportunity_score": {
+            "score": 1.2,
+            "min_score_required": 0.95,
+            "side": "long",
+            "expected_return_pct": 0.31,
+            "expected_net_return_pct": 0.2,
+            "fee_pct": 0.04,
+            "slippage_pct": 0.05,
+            "expected_loss_pct": 0.18,
+            "profit_quality_ratio": 0.3,
+            "reward_risk_ratio": 0.7,
+            "server_profit_loss_probability": 0.55,
+            "tail_risk_score": 0.82,
+            "side_realized_pnl_usdt": 0.0,
+            "ml_aligned": True,
+            "local_profit_aligned": False,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "small",
+                "effective_score": 70.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    result = await EntryPolicy(entry_profit_risk_sizing=FakeSizing()).evaluate(
+        decision,
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "profit_first_probe_loss_brake"
+    assert result.data["skip_kind"] == "profit_first_probe_loss_brake"
+    assert decision.raw_response["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
+
+
+@pytest.mark.asyncio
 async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_private_callback():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0
@@ -1586,6 +2011,113 @@ async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_priva
     assert sizing["risk_mode"] == "normal"
     assert sizing["quality_tier"] == "base"
     assert sizing["planned_stop_loss_usdt"] > 0
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_uses_dynamic_integer_leverage_without_tier_cap():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.02
+    decision.suggested_leverage = 3.0
+    decision.stop_loss_pct = 0.02
+    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 0.6}
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 3.0,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 1.2,
+            "expected_loss_pct": 0.08,
+            "tail_risk_score": 0.30,
+            "raw_expected_return_pct": 1.2,
+            "profit_quality_ratio": 1.2,
+            "reward_risk_ratio": 2.8,
+            "server_profit_loss_probability": 0.38,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": True,
+            "evidence_score": {
+                "tier": "exploration",
+                "effective_score": 62.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        }
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 20.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    dynamic = sizing["dynamic_leverage_decision"]
+    assert dynamic["version"] == "dynamic_leverage_allocator_v1"
+    assert dynamic["final_integer_leverage"] > 3
+    assert decision.suggested_leverage == dynamic["final_integer_leverage"]
+    assert isinstance(dynamic["final_integer_leverage"], int)
+    assert not any("杠杆上限降到" in cap for cap in sizing["quality_caps"])
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_applies_profit_first_meaningful_ladder():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.02
+    decision.suggested_leverage = 3.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.08
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 3.4,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 6.0,
+            "expected_loss_pct": 0.08,
+            "tail_risk_score": 0.62,
+            "raw_expected_return_pct": 6.2,
+            "profit_quality_ratio": 1.25,
+            "reward_risk_ratio": 2.4,
+            "server_profit_loss_probability": 0.38,
+            "side_realized_pnl_usdt": 1.0,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": True,
+            "expert_aligned": True,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 88.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        }
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    ladder = sizing["profit_first_position_ladder"]
+    assert ladder["lane"] == "meaningful_entry"
+    assert ladder["target_min_pct"] == pytest.approx(0.05)
+    assert ladder["target_max_pct"] == pytest.approx(0.08)
+    assert sizing["position_size_pct"] >= 0.05
+    assert decision.position_size_pct >= 0.05
+    assert sizing["final_notional_usdt"] >= 150.0
 
 
 @pytest.mark.asyncio
@@ -2029,7 +2561,7 @@ async def test_entry_profit_risk_sizing_does_not_trap_strong_quality_in_release_
     assert strategy_sizing["quality_override"] is True
     assert strategy_sizing["probe_cap_applied"] is False
     assert decision.position_size_pct > 0.012
-    assert sizing["final_notional_usdt"] > 60.0
+    assert sizing["final_notional_usdt"] >= 60.0
 
 
 @pytest.mark.asyncio
@@ -2281,6 +2813,16 @@ def test_trading_service_dashboard_runtime_boundaries_expose_public_state():
     assert service._recent_decisions == []
 
 
+def test_okx_backed_paper_sync_does_not_mutate_virtual_balances() -> None:
+    import inspect
+
+    source = inspect.getsource(TradingService._sync_paper_after_okx)
+
+    assert "settings.get_initial_balance" not in source
+    assert "pe._balances[" not in source
+    assert "persist_balance_delta" not in source
+
+
 @pytest.mark.asyncio
 async def test_trading_service_dashboard_async_boundaries_call_internal_owners():
     service = TradingService.__new__(TradingService)
@@ -2303,7 +2845,7 @@ async def test_trading_service_dashboard_async_boundaries_call_internal_owners()
 
 
 @pytest.mark.asyncio
-async def test_paper_balance_snapshot_uses_virtual_account_without_okx() -> None:
+async def test_paper_balance_snapshot_refuses_virtual_account_without_okx() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._okx_paper = None
@@ -2322,24 +2864,18 @@ async def test_paper_balance_snapshot_uses_virtual_account_without_okx() -> None
 
     service.paper_executor = FakePaperExecutor()
 
+    async def raise_okx_down(_mode: str):
+        raise RuntimeError("OKX down")
+
+    service._get_okx_executor_for_mode = raise_okx_down
+
     snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
 
-    assert snapshot == {
-        "free": 1234.5,
-        "used": 100.0,
-        "total": 1334.5,
-        "cash": 1334.5,
-        "equity": 1334.5,
-        "allocatable": 1234.5,
-        "source": "paper_virtual_account",
-        "exchange_required": False,
-        "degraded": False,
-        "analysis_only_balance": True,
-    }
+    assert snapshot is None
 
 
 @pytest.mark.asyncio
-async def test_paper_new_pair_pause_does_not_depend_on_okx_balance_timeout() -> None:
+async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._get_model_execution_mode = lambda _model_name: "paper"
@@ -2363,10 +2899,8 @@ async def test_paper_new_pair_pause_does_not_depend_on_okx_balance_timeout() -> 
         open_positions=[],
     )
 
-    assert snapshot is not None
-    assert snapshot["source"] == "paper_configured_budget"
-    assert snapshot["analysis_only_balance"] is True
-    assert reason is None
+    assert snapshot is None
+    assert reason
 
 
 @pytest.mark.asyncio
@@ -3162,8 +3696,22 @@ async def test_trading_service_execution_boundaries_call_internal_owners():
             return "skill-block"
 
     class FakeOkxSyncService:
-        async def reconcile_positions(self, reason):
-            calls.append(("reconcile", reason))
+        async def reconcile_positions(
+            self,
+            reason,
+            timeout_seconds=None,
+            lock_wait_seconds=None,
+            record_timeout_error=True,
+        ):
+            calls.append(
+                (
+                    "reconcile",
+                    reason,
+                    timeout_seconds,
+                    lock_wait_seconds,
+                    record_timeout_error,
+                )
+            )
 
         async def get_open_positions_context(self):
             calls.append(("open_positions_context",))
@@ -3204,6 +3752,7 @@ async def test_trading_service_execution_boundaries_call_internal_owners():
     service.account_accounting_service = FakeAccounting()
     service.risk_engine = SimpleNamespace(circuit_breaker=FakeCircuitBreaker())
     service.position_review_risk_alert_policy = FakePositionReviewRiskAlertPolicy()
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
 
     service._get_model_execution_mode = model_mode  # type: ignore[method-assign]
     service._log_risk_event = log_risk  # type: ignore[method-assign]
@@ -3370,7 +3919,14 @@ async def test_trading_service_execution_boundaries_call_internal_owners():
         ("agent_skills", "BTC/USDT", "paper", 123.0),
         ("attach_agent_skills", "BTC/USDT", "execution_precheck", ["guard"], "note"),
         ("agent_skill_block", ["guard"], True),
-        ("reconcile", "manual"),
+        ("reconcile", "manual", None, None, True),
+        (
+            "reconcile",
+            "execution open positions context refresh",
+            8.0,
+            0.1,
+            False,
+        ),
         ("open_positions_context",),
         ("local_exit_position", "BTC/USDT", "ensemble_trader", 1),
         ("exchange_exit_position", "BTC/USDT", "ensemble_trader"),
@@ -3820,8 +4376,46 @@ async def test_execution_service_serializes_candidate_execution():
 
     async def evaluate_entry_policy(decision, model_name, model_mode, open_positions):
         calls.append(("entry_policy", model_name, model_mode, len(open_positions or [])))
-        decision.position_size_pct = 0.004
+        decision.position_size_pct = 0.01
         decision.suggested_leverage = 2.0
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["analysis_type"] = "entry_candidate"
+        raw["current_price"] = 100.0
+        raw["strategy_learning_context"] = {"strategy_profile_id": "balanced_probe"}
+        raw["opportunity_score"] = {
+            "score": 2.2,
+            "side": "long" if decision.action == Action.LONG else "short",
+            "expected_return_pct": 0.55,
+            "expected_net_return_pct": 0.32,
+            "fee_pct": 0.05,
+            "slippage_pct": 0.04,
+            "expected_loss_pct": 0.18,
+            "profit_quality_ratio": 0.85,
+            "reward_risk_ratio": 1.6,
+            "server_profit_loss_probability": 0.42,
+            "tail_risk_score": 0.55,
+            "side_realized_pnl_usdt": 0.4,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 74.0,
+                "components": [
+                    {"source": "local_ml", "status": "aligned"},
+                    {"source": "server_profit", "status": "aligned"},
+                ],
+            },
+        }
+        raw["profit_risk_sizing"] = {
+            "quality_tier": "base",
+            "position_size_pct": decision.position_size_pct,
+            "final_notional_usdt": 20.0,
+            "planned_stop_loss_usdt": 0.4,
+            "max_stop_loss_usdt": 1.0,
+            "expected_profit_usdt": 0.064,
+        }
+        decision.raw_response = raw
         return PolicyGateResult.allow({"intent": "entry"})
 
     async def evaluate_exit_policy(
@@ -3945,7 +4539,7 @@ async def test_execution_service_serializes_candidate_execution():
     assert ("clear_symbol", "BTC/USDT") in calls
     assert ("record_trade", 200.0) in calls
     assert raw_updates[-1] is not None
-    assert raw_updates[-1]["execution_parameters"]["position_size_pct"] == 0.004
+    assert raw_updates[-1]["execution_parameters"]["position_size_pct"] == 0.01
     assert raw_updates[-1]["execution_parameters"]["suggested_leverage"] == 2.0
     assert results["executions"][0]["order_id"] == "order-1"
     assert results["decisions"][0]["executed"] is True
@@ -4046,6 +4640,27 @@ async def test_execution_service_serializes_candidate_execution():
                     "okx_rejection": True,
                     "system_pre_submit_rejection": False,
                     "okx_order_rules": {"final_contracts": 1.0},
+                    "okx_exit_position_mismatch": {
+                        "source": "pre_submit_position_lookup",
+                        "decision_symbol": decision.symbol,
+                        "expected_okx_inst_id": "BTC-USDT-SWAP",
+                        "okx_symbol": "BTC/USDT:USDT",
+                        "target_position_side": "long",
+                        "exit_order_side": "sell",
+                        "positions_returned": 2,
+                        "matching_position_count": 0,
+                        "matching_contracts_total": 0.0,
+                        "nonzero_same_symbol_sides": ["short"],
+                        "candidates": [
+                            {
+                                "symbol": "BTC/USDT",
+                                "raw_symbol": "BTC-USDT-SWAP",
+                                "side": "short",
+                                "contracts": 3.0,
+                                "reason": "side_mismatch",
+                            }
+                        ],
+                    },
                 },
             )
 
@@ -4077,6 +4692,19 @@ async def test_execution_service_serializes_candidate_execution():
     assert execution_result["exchange_confirmed"] is False
     assert execution_result["raw_response"]["raw_error"] == "51008 Insufficient USDT margin"
     assert execution_result["raw_response"]["execution_blocker"] == "okx_exchange_rejection"
+    mismatch_summary = execution_result["okx_exit_position_mismatch_summary"]
+    assert mismatch_summary["source"] == "pre_submit_position_lookup"
+    assert mismatch_summary["expected_okx_inst_id"] == "BTC-USDT-SWAP"
+    assert mismatch_summary["matching_position_count"] == 0
+    assert mismatch_summary["candidate_reasons"] == [
+        {
+            "symbol": "BTC/USDT",
+            "raw_symbol": "BTC-USDT-SWAP",
+            "side": "short",
+            "contracts": 3.0,
+            "reason": "side_mismatch",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -4559,7 +5187,6 @@ async def test_sync_service_missing_exchange_position_keeps_snapshot_open_withou
         return SimpleNamespace(current_price=3.333)
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
@@ -4588,6 +5215,8 @@ async def test_sync_service_missing_exchange_position_keeps_snapshot_open_withou
     assert local_position.closed_at is None
     assert created_orders == []
     assert decision_logs == []
+    assert result[0]["kind"] == "missing_exchange_position_without_close_fill"
+    assert result[0]["source"] == "okx_authoritative_current_position"
     assert result[0]["requires_attention"] is True
     assert "no matching close fill" in result[0]["note"]
 
@@ -4652,7 +5281,6 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
         return True
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
@@ -4669,6 +5297,8 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
 
     assert result == [
         {
+            "kind": "snapshot_update",
+            "source": "okx_authoritative_current_position",
             "model_name": "ensemble_trader",
             "symbol": "BTC/USDT",
             "side": "long",
@@ -4691,6 +5321,110 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_reconcile_exchange_positions_matches_okx_net_mode_position(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    local_position = SimpleNamespace(
+        id=1706,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="SPK/USDT",
+        side="short",
+        is_open=True,
+        quantity=100.0,
+        entry_price=0.0179,
+        current_price=0.01769,
+        unrealized_pnl=0.0,
+        stop_loss_price=None,
+        take_profit_price=None,
+    )
+    sync_calls: list[dict[str, Any]] = []
+    close_fill_calls: list[Any] = []
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "info": {
+                        "instId": "SPK-USDT-SWAP",
+                        "posSide": "net",
+                        "pos": "-200",
+                        "ctVal": "1",
+                        "avgPx": "0.01785",
+                        "markPx": "0.0177",
+                        "last": "0.01762",
+                        "upl": "0.0300000000000002",
+                        "posId": "3688338318498172929",
+                    }
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [local_position]
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    async def protection_map(_paper_okx, _exchange_positions):
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    def sync_snapshot(positions, **kwargs):
+        sync_calls.append({"positions": positions, "kwargs": kwargs})
+        positions[0].quantity = kwargs["exchange_quantity"]
+        return True
+
+    async def close_fill(pos):
+        close_fill_calls.append(pos)
+        return {}
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(
+            (position.get("info") or {}).get("pos")
+        ),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=sync_snapshot,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        exchange_close_fill_finder=close_fill,
+        fresh_feature_vector_provider=lambda _symbol: None,
+        market_value_reader=lambda source, key: getattr(source, key, None),
+        entry_fee_provider=lambda *_args: 0.0,
+        exchange_sync_close_decision_logger=lambda **_kwargs: None,
+        trade_reflection_recorder=lambda *_args, **_kwargs: None,
+        position_margin_calculator=lambda notional, leverage: notional / float(leverage or 1.0),
+        memory_position_remover=lambda _model_name, _symbol, _side: None,
+    ).reconcile_exchange_positions()
+
+    assert close_fill_calls == []
+    assert local_position.quantity == pytest.approx(200.0)
+    assert sync_calls[0]["kwargs"]["exchange_quantity"] == pytest.approx(200.0)
+    assert sync_calls[0]["kwargs"]["current_price"] == pytest.approx(0.0177)
+    assert sync_calls[0]["kwargs"]["entry_price"] == pytest.approx(0.01785)
+    assert result[0]["kind"] == "snapshot_update"
+    assert result[0]["symbol"] == "SPK/USDT"
+    assert result[0]["side"] == "short"
+    assert result[0]["quantity"] == pytest.approx(200.0)
 
 
 @pytest.mark.asyncio
@@ -4812,7 +5546,6 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
         return notional / leverage
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
@@ -4867,11 +5600,91 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
             "filled_at": closed_at,
         }
     ]
-    assert balance_updates == [("ensemble_trader", pytest.approx(19.22), pytest.approx(15.37))]
-    assert trade_results == [("ensemble_trader", True)]
+    assert balance_updates == []
+    assert trade_results == []
+    assert result[0]["kind"] == "quantity_reduction_closed_slice"
+    assert result[0]["source"] == "okx_authoritative_current_position"
     assert result[0]["quantity"] == 10.0
     assert result[0]["remaining_quantity"] == 6.0
     assert result[0]["exchange_order_id"] == "usar-close-10"
+
+
+@pytest.mark.asyncio
+async def test_sync_service_quantity_reduction_uses_close_fill_inst_id_over_local_alias():
+    created_at = datetime(2026, 6, 24, 5, 20, tzinfo=UTC)
+    local_position = SimpleNamespace(
+        id=41,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="SAHARA/USDT",
+        side="long",
+        is_open=True,
+        entry_price=0.012,
+        current_price=0.013,
+        quantity=6.0,
+        leverage=3.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.0,
+        stop_loss_price=0.01,
+        take_profit_price=0.02,
+        created_at=created_at,
+        closed_at=None,
+    )
+    closed_positions: list[Any] = []
+    created_orders: list[dict[str, Any]] = []
+
+    class FakeScalarResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeScalarResult()
+
+    class FakeTradeRepository:
+        async def open_position(self, payload):
+            closed_position = SimpleNamespace(id=199, **payload)
+            closed_positions.append(closed_position)
+            return closed_position
+
+        async def create_order(self, payload):
+            created_orders.append(payload)
+
+    async def log_close_decision(**_kwargs):
+        return 991
+
+    async def record_reflection(*_args, **_kwargs):
+        return None
+
+    async def entry_fee(*_args):
+        return 0.0
+
+    result = await OkxSyncService()._record_exchange_quantity_reduction(
+        session=FakeSession(),
+        trade_repo=FakeTradeRepository(),
+        positions=[local_position],
+        quantity_before_by_id={41: 10.0},
+        exchange_quantity=6.0,
+        exit_price=0.013,
+        close_fill={
+            "order_id": "spk-close-4",
+            "price": 0.013,
+            "fee": 0.001,
+            "quantity": 4.0,
+            "timestamp": datetime(2026, 6, 24, 5, 26, tzinfo=UTC),
+            "order_info": {"instId": "SPK-USDT-SWAP", "ordId": "spk-close-4"},
+        },
+        entry_fee_for_position=entry_fee,
+        log_exchange_sync_close_decision=log_close_decision,
+        record_trade_reflection=record_reflection,
+        calculate_position_margin=lambda notional, leverage: notional / float(leverage or 1.0),
+    )
+
+    assert closed_positions[0].symbol == "SPK/USDT"
+    assert closed_positions[0].okx_inst_id == "SPK-USDT-SWAP"
+    assert created_orders[0]["symbol"] == "SPK/USDT"
+    assert created_orders[0]["exchange_order_id"] == "spk-close-4"
+    assert result[0]["symbol"] == "SPK/USDT"
 
 
 @pytest.mark.asyncio
@@ -4894,7 +5707,6 @@ async def test_sync_service_does_not_record_quantity_reduction_without_close_fil
     )
     opened_positions: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
-    balance_updates: list[Any] = []
 
     class FakeTradeRepository:
         async def open_position(self, payload):
@@ -4904,17 +5716,9 @@ async def test_sync_service_does_not_record_quantity_reduction_without_close_fil
         async def create_order(self, payload):
             orders.append(payload)
 
-    class FakeAccountRepository:
-        async def update_balance(self, *args):
-            balance_updates.append(args)
-
-        async def record_trade_result(self, *args):
-            balance_updates.append(args)
-
     result = await OkxSyncService()._record_exchange_quantity_reduction(
         session=object(),
         trade_repo=FakeTradeRepository(),
-        account_repo=FakeAccountRepository(),
         positions=[pos],
         quantity_before_by_id={1700: 9.0},
         exchange_quantity=0.9,
@@ -4929,7 +5733,6 @@ async def test_sync_service_does_not_record_quantity_reduction_without_close_fil
     assert result == []
     assert opened_positions == []
     assert orders == []
-    assert balance_updates == []
 
 
 @pytest.mark.asyncio
@@ -5010,7 +5813,6 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_
         return parsed_at
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
@@ -5050,6 +5852,8 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_
     ]
     assert result == [
         {
+            "kind": "created_missing_local_position",
+            "source": "okx_authoritative_current_position",
             "model_name": "ensemble_trader",
             "symbol": "BTC/USDT",
             "side": "long",
@@ -5058,6 +5862,96 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_
             "note": "OKX 已有持仓但本地缺失，已按执行订单补回持仓记录。",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_created_missing_position_uses_okx_inst_id_over_alias(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    opened_positions: list[dict[str, Any]] = []
+    order = SimpleNamespace(
+        model_name="ensemble_trader",
+        exchange_order_id="spk-entry-1",
+        status=OrderStatus.OPEN.value,
+        quantity=None,
+        price=None,
+        filled_at=None,
+    )
+
+    class FakeScalarResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    class FakeSession:
+        def __init__(self):
+            self.results = [None, order]
+
+        async def execute(self, _stmt):
+            return FakeScalarResult(self.results.pop(0))
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "SAHARA/USDT:USDT",
+                    "info": {
+                        "instId": "SPK-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "10",
+                        "ctVal": "1",
+                        "avgPx": "0.012",
+                        "markPx": "0.013",
+                        "upl": "0.01",
+                        "cTime": "1770379200000",
+                    },
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return []
+
+        async def open_position(self, payload):
+            opened_positions.append(payload)
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(_paper_okx, _positions):
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool((position.get("info") or {}).get("pos")),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        **_noop_reconcile_close_boundaries(),
+    ).reconcile_exchange_positions()
+
+    assert opened_positions[0]["symbol"] == "SPK/USDT"
+    assert opened_positions[0]["okx_inst_id"] == "SPK-USDT-SWAP"
+    assert result[0]["symbol"] == "SPK/USDT"
 
 
 @pytest.mark.asyncio
@@ -5164,7 +6058,6 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_close_bou
         removed_positions.append((model_name, symbol, side))
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
@@ -5192,8 +6085,8 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_close_bou
     assert decision_logs[0]["realized_pnl"] == 22.0
     assert reflection_calls[0]["kwargs"]["source"] == "okx_reconcile"
     assert margin_calls == [(200.0, 4.0)]
-    assert balance_updates == [("ensemble_trader", 72.0, 22.0)]
-    assert trade_results == [("ensemble_trader", True)]
+    assert balance_updates == []
+    assert trade_results == []
     assert removed_positions == [("ensemble_trader", "BTC/USDT", "long")]
     assert position.is_open is False
     assert position.current_price == 112.0
@@ -5202,6 +6095,8 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_close_bou
     assert created_orders[0]["fee"] == 0.5
     assert result == [
         {
+            "kind": "closed_from_okx_close_fill",
+            "source": "okx_authoritative_current_position",
             "model_name": "ensemble_trader",
             "symbol": "BTC/USDT",
             "side": "long",
@@ -5293,7 +6188,6 @@ async def test_sync_service_reconcile_exchange_positions_does_not_estimate_missi
         return None
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     service = OkxSyncService(
@@ -5328,6 +6222,8 @@ async def test_sync_service_reconcile_exchange_positions_does_not_estimate_missi
     assert position.is_open is True
     assert position.current_price == 104.0
     assert position.realized_pnl == 0.0
+    assert result[0]["kind"] == "missing_exchange_position_without_close_fill"
+    assert result[0]["source"] == "okx_authoritative_current_position"
     assert result[0]["requires_attention"] is True
     assert result[0]["exchange_order_id"] is None
 
@@ -5382,7 +6278,6 @@ async def test_refresh_position_prices_uses_injected_profit_peak_boundaries(
         yield object()
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     service = OkxSyncService(
@@ -5394,7 +6289,7 @@ async def test_refresh_position_prices_uses_injected_profit_peak_boundaries(
     await service.refresh_position_prices({"BTC/USDT": SimpleNamespace(current_price=110.0)})
 
     assert updated_prices == [(7, 110.0, 5.0)]
-    assert account_updates == [("ensemble_trader", 5.0)]
+    assert account_updates == []
     assert peak_calls[0]["symbol"] == "BTC/USDT"
     assert peak_calls[0]["unrealized_pnl"] == 5.0
     assert peak_calls[0]["hold_minutes"] == 12.5
@@ -5462,7 +6357,6 @@ async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
         yield object()
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "AccountRepository", FakeAccountRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     service = OkxSyncService(
@@ -5478,6 +6372,119 @@ async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
     assert updated_prices == [(17, pytest.approx(18.192), pytest.approx(1.1938))]
     assert peak_calls[0]["current_price"] == pytest.approx(18.192)
     assert peak_calls[0]["unrealized_pnl"] == pytest.approx(1.1938)
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_uses_current_mode_okx_without_cross_mode_pollution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    updated_prices: list[tuple[int, float, float]] = []
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [
+                SimpleNamespace(
+                    id=21,
+                    model_name="ensemble_trader",
+                    execution_mode="live",
+                    symbol="ETH/USDT",
+                    side="short",
+                    entry_price=100.0,
+                    current_price=99.0,
+                    quantity=2.0,
+                    created_at="created-live",
+                ),
+                SimpleNamespace(
+                    id=22,
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ETH/USDT",
+                    side="short",
+                    entry_price=100.0,
+                    current_price=99.0,
+                    quantity=2.0,
+                    created_at="created-paper",
+                ),
+            ]
+
+        async def update_position_price(self, position_id, current_price, unrealized_pnl):
+            updated_prices.append((position_id, current_price, unrealized_pnl))
+
+    class FakeAccountRepository:
+        def __init__(self, _session):
+            pass
+
+        async def update_unrealized_pnl(self, _model_name, _unrealized_pnl):
+            pass
+
+    class FakeLiveOkx:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "ETH-USDT-SWAP",
+                    "side": "short",
+                    "contracts": 2.0,
+                    "info": {
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "short",
+                        "pos": "-2",
+                        "ctVal": "1",
+                        "avgPx": "100",
+                        "markPx": "90",
+                        "upl": "20",
+                    },
+                }
+            ]
+
+    class FakePaperOkx:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "ETH-USDT-SWAP",
+                    "side": "short",
+                    "contracts": 2.0,
+                    "info": {
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "short",
+                        "pos": "-2",
+                        "ctVal": "1",
+                        "avgPx": "100",
+                        "markPx": "95",
+                        "upl": "10",
+                    },
+                }
+            ]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(mode_manager, "_state_path", tmp_path / "trading-control-state.json")
+    monkeypatch.setattr(mode_manager, "_last_state_mtime", 0.0)
+    monkeypatch.setattr(mode_manager, "_last_state_size", -1)
+    await mode_manager.switch_to_live("ensemble_trader")
+
+    service = OkxSyncService(
+        active_okx_provider=lambda: FakeLiveOkx(),
+        paper_okx_provider=lambda: FakePaperOkx(),
+        symbol_normalizer=normalize_trading_symbol,
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    await service.refresh_position_prices({"ETH/USDT": SimpleNamespace(current_price=80.0)})
+
+    assert updated_prices == [
+        (21, pytest.approx(90.0), pytest.approx(20.0)),
+        (22, pytest.approx(95.0), pytest.approx(10.0)),
+    ]
 
 
 @pytest.mark.asyncio
@@ -5589,6 +6596,59 @@ async def test_sync_service_exit_position_lookup_failure_returns_unknown(
 
 
 @pytest.mark.asyncio
+async def test_sync_service_exit_position_lookup_uses_okx_inst_id_when_symbol_is_missing():
+    class FakeExecutor:
+        async def get_positions_strict(self, symbol):
+            assert symbol == "SPK/USDT"
+            return [
+                {
+                    "symbol": "",
+                    "side": "",
+                    "contracts": None,
+                    "info": {
+                        "instId": "SPK-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "18",
+                        "ctVal": "1",
+                        "avgPx": "0.012",
+                        "markPx": "0.013",
+                    },
+                }
+            ]
+
+    def parse_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def okx_executor(mode):
+        assert mode == "paper"
+        return FakeExecutor()
+
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="SPK/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.8,
+        reasoning="close spk",
+        position_size_pct=1.0,
+        suggested_leverage=3.0,
+        raw_response={},
+        feature_snapshot={"current_price": 0.013},
+    )
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        model_execution_mode_provider=lambda _model_name: "paper",
+        okx_executor_provider=okx_executor,
+        float_parser=parse_float,
+    ).has_matching_exchange_exit_position("ensemble_trader", decision)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
 async def test_sync_service_exit_position_lookup_fails_fast_without_boundaries():
     service = OkxSyncService()
 
@@ -5600,7 +6660,7 @@ async def test_sync_service_exit_position_lookup_fails_fast_without_boundaries()
 
 
 @pytest.mark.asyncio
-async def test_open_positions_context_keeps_local_positions_when_okx_lookup_fails(
+async def test_open_positions_context_returns_empty_when_okx_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):
     token = "abcdefghi" + "jklmnopqrst" + "uvwxyz123456"
@@ -5642,9 +6702,6 @@ async def test_open_positions_context_keeps_local_positions_when_okx_lookup_fail
     async def fake_session_ctx():
         yield object()
 
-    async def paper_positions():
-        return []
-
     def parse_float(value, default=0.0):
         try:
             return float(value)
@@ -5658,19 +6715,84 @@ async def test_open_positions_context_keeps_local_positions_when_okx_lookup_fail
     result = await OkxSyncService(
         symbol_normalizer=lambda symbol: symbol,
         float_parser=parse_float,
-        paper_positions_provider=paper_positions,
         active_okx_provider=lambda: FakeOKX(),
         exchange_position_open_checker=lambda position: bool(position),
     ).get_open_positions_context()
 
-    assert len(result) == 1
-    assert result[0]["symbol"] == "BTC/USDT"
-    assert result[0]["side"] == "long"
+    assert result == []
     rendered = str(warnings)
     assert token not in rendered
     assert hidden_value not in rendered
     assert "Authorization: ***" in rendered
     assert "password=***" in rendered
+
+
+@pytest.mark.asyncio
+async def test_open_positions_context_matches_okx_net_mode_position(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeOKX:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "info": {
+                        "instId": "SPK-USDT-SWAP",
+                        "posSide": "net",
+                        "pos": "-200",
+                        "ctVal": "1",
+                        "avgPx": "0.01785",
+                        "markPx": "0.0177",
+                        "upl": "0.03",
+                    }
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_position_records(self, **_kwargs):
+            return [
+                SimpleNamespace(
+                    model_name="ensemble_trader",
+                    symbol="SPK/USDT",
+                    side="short",
+                    entry_price=0.0179,
+                    current_price=0.01769,
+                    quantity=100.0,
+                    leverage=2.0,
+                    unrealized_pnl=0.021,
+                    stop_loss_price=None,
+                    take_profit_price=None,
+                    is_open=True,
+                    created_at=None,
+                    okx_inst_id="SPK-USDT-SWAP",
+                    okx_pos_id="3688338318498172929",
+                )
+            ]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        paper_positions_provider=lambda: [],
+        active_okx_provider=lambda: FakeOKX(),
+        exchange_position_open_checker=lambda position: bool((position.get("info") or {}).get("pos")),
+    ).get_open_positions_context()
+
+    assert len(result) == 1
+    assert result[0]["symbol"] == "SPK/USDT"
+    assert result[0]["side"] == "short"
+    assert result[0]["quantity"] == pytest.approx(200.0)
+    assert result[0]["entry_price"] == pytest.approx(0.01785)
+    assert result[0]["current_price"] == pytest.approx(0.0177)
+    assert result[0]["unrealized_pnl"] == pytest.approx(0.03)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from services.decision_state import (
     summarize_decision_stages,
 )
 from services.entry_signal_extraction import extract_entry_signal_sides
+from services.trade_fact_trust import filter_trusted_closed_positions
 from web_dashboard.api.text_sanitize import sanitize_text
 
 ACTION_LABELS = {
@@ -529,6 +530,7 @@ def build_profit_attribution(
     decisions: list[AIDecision],
     shadows: list[ShadowBacktest],
 ) -> dict[str, Any]:
+    positions, trade_fact_quarantine = filter_trusted_closed_positions(list(positions))
     decisions_by_id = {
         int(decision.id): decision for decision in decisions if decision.id is not None
     }
@@ -678,6 +680,7 @@ def build_profit_attribution(
         "summary": summary,
         "buckets": bucket_rows,
         "records": records,
+        "trade_fact_quarantine": trade_fact_quarantine,
     }
 
 
@@ -687,6 +690,7 @@ def match_entry_decisions_for_positions(
     decisions: list[AIDecision],
 ) -> list[AIDecision]:
     """Return entry decisions used by the attribution builder."""
+    positions, _trade_fact_quarantine = filter_trusted_closed_positions(list(positions))
     decisions_by_id = {
         int(decision.id): decision for decision in decisions if decision.id is not None
     }

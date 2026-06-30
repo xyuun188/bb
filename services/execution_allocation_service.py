@@ -13,6 +13,7 @@ from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.equity_baseline import apply_daily_equity_baseline
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
 
@@ -55,6 +56,7 @@ class ExecutionAllocationService:
         okx_snapshot = await self.balance_snapshot_provider(selected_mode)
         okx_available = snapshot_free_balance(okx_snapshot)
         allocated = snapshot_execution_equity(okx_snapshot, okx_available)
+        current_equity = snapshot_account_equity(okx_snapshot)
         exchange_keys = await self._exchange_position_keys(selected_mode)
         start_utc = beijing_start_utc(self.now_provider())
         position_rows: list[Any] = []
@@ -79,8 +81,8 @@ class ExecutionAllocationService:
         realized_pnl = metrics.realized_profit - metrics.realized_loss
         today_realized_pnl = metrics.today_realized_profit - metrics.today_realized_loss
         total_pnl = realized_pnl + metrics.unrealized_pnl
-        today_total_pnl = today_realized_pnl + metrics.unrealized_pnl
-        today_risk_pnl = today_realized_pnl + min(metrics.unrealized_pnl, 0.0)
+        today_total_pnl: float | None = None
+        today_risk_pnl: float | None = None
         equity_baseline: dict[str, Any] = {}
         try:
             async with self.session_factory() as session:
@@ -93,8 +95,9 @@ class ExecutionAllocationService:
                     realized_pnl=realized_pnl,
                     unrealized_pnl=metrics.unrealized_pnl,
                     total_pnl=total_pnl,
+                    current_equity=current_equity,
                 )
-            today_total_pnl = float(equity_baseline.get("today_equity_pnl") or 0.0)
+            today_total_pnl = _safe_float(equity_baseline.get("today_equity_pnl"), None)
             today_risk_pnl = today_total_pnl
         except Exception as exc:
             logger.warning(
@@ -133,14 +136,20 @@ class ExecutionAllocationService:
     async def _exchange_position_keys(self, mode: str) -> set[tuple[str, str]] | None:
         executor = self.active_executor_provider(mode)
         if executor is None:
-            return None
+            logger.warning("execution allocation OKX executor unavailable", mode=mode)
+            return set()
         try:
             okx_positions = await asyncio.wait_for(
-                executor.get_positions(),
+                self._fetch_exchange_positions(executor),
                 timeout=self.exchange_positions_timeout_seconds,
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            logger.warning(
+                "execution allocation strict OKX position snapshot unavailable",
+                mode=mode,
+                error=safe_error_text(exc),
+            )
+            return set()
         return {
             (
                 self.symbol_normalizer(position.get("symbol")),
@@ -153,13 +162,13 @@ class ExecutionAllocationService:
     def _position_metrics(
         self,
         positions: list[Any],
-        exchange_keys: set[tuple[str, str]] | None,
+        exchange_keys: set[tuple[str, str]],
         start_utc: datetime,
     ) -> AllocationMetrics:
         metrics = AllocationMetrics()
         for pos in positions:
             if getattr(pos, "is_open", False):
-                if exchange_keys and not self._position_exists_on_exchange(pos, exchange_keys):
+                if not self._position_exists_on_exchange(pos, exchange_keys):
                     continue
                 leverage = max(float(getattr(pos, "leverage", 1.0) or 1.0), 1.0)
                 metrics.used_margin += (
@@ -167,6 +176,8 @@ class ExecutionAllocationService:
                     * float(getattr(pos, "entry_price", 0.0) or 0.0)
                 ) / leverage
                 metrics.unrealized_pnl += float(getattr(pos, "unrealized_pnl", 0.0) or 0.0)
+                continue
+            if not closed_position_trade_fact_trusted(pos):
                 continue
 
             pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)
@@ -191,6 +202,12 @@ class ExecutionAllocationService:
             self.symbol_normalizer(getattr(pos, "symbol", None)),
             str(getattr(pos, "side", "") or "").lower(),
         ) in exchange_keys
+
+    async def _fetch_exchange_positions(self, executor: Any) -> list[dict[str, Any]]:
+        fetch_strict = getattr(executor, "get_positions_strict", None)
+        if not callable(fetch_strict):
+            raise RuntimeError("execution allocation requires get_positions_strict")
+        return await fetch_strict()
 
 
 class AllocationMetrics:
@@ -224,6 +241,19 @@ def snapshot_execution_equity(
         or snapshot.get("equity")
         or snapshot.get("total")
         or fallback_free,
+        0.0,
+    )
+
+
+def snapshot_account_equity(snapshot: dict[str, Any] | None) -> float:
+    if not isinstance(snapshot, dict):
+        return 0.0
+    return _safe_float(
+        snapshot.get("equity")
+        or snapshot.get("total")
+        or snapshot.get("allocatable")
+        or snapshot.get("cash")
+        or snapshot.get("free"),
         0.0,
     )
 

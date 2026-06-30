@@ -372,6 +372,28 @@ def test_high_risk_review_extracts_json_from_reasoning_and_list_content() -> Non
     assert list_content == '{"approved": true, "reason": "ok"}'
 
 
+def test_high_risk_review_records_reasoning_strip_metadata() -> None:
+    reviewer = HighRiskReviewService()
+
+    content, metadata = reviewer.extract_content(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '<think>hidden</think>{"approved": false, "reason": "risk"}'
+                    },
+                }
+            ],
+            "usage": {"completion_tokens": 128},
+        }
+    )
+
+    assert content == '{"approved": false, "reason": "risk"}'
+    assert metadata["raw_has_think_tag"] is True
+    assert metadata["reasoning_stripped"] is True
+
+
 def test_high_risk_review_auth_failure_is_redacted() -> None:
     leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
     response = httpx.Response(

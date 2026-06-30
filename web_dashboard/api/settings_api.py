@@ -69,7 +69,7 @@ class AIModelRequest(BaseModel):
     api_base: str | None = None
     api_key: str | None = None
     model: str | None = None
-    balance: float | None = None
+    balance: float | None = None  # legacy clients may send it; ignored for Phase 3 OKX truth
     execution_mode: str = "paper"  # "paper" or "live"
 
 
@@ -221,70 +221,44 @@ async def _get_okx_usdt_balance(mode: str, force: bool = False) -> float | None:
 
 
 async def _paper_execution_account_summary() -> dict:
-    """Return current paper execution account balance without requiring OKX."""
-    if _dash._trading_service and _dash._trading_service.paper_executor:
-        try:
-            return await _dash._trading_service.paper_executor.get_account_summary(
-                ENSEMBLE_TRADER_NAME
-            )
-        except Exception as exc:
-            logger.debug(
-                "paper execution account summary unavailable",
-                account=ENSEMBLE_TRADER_NAME,
-                error=_connection_error_text(exc),
-            )
-
-    from db.repositories.account_repo import AccountRepository
-    from db.session import get_session_ctx
-
-    allocated = settings.get_execution_account_config("paper")["allocated_balance"]
-    async with get_session_ctx() as session:
-        repo = AccountRepository(session)
-        account = await repo.get_account(ENSEMBLE_TRADER_NAME)
-        if account:
-            return {
-                "available_balance": account.current_balance,
-                "current_balance": account.current_balance,
-                "wallet_balance": account.current_balance,
-                "equity": account.current_balance + account.unrealized_pnl,
-                "initial_balance": account.initial_balance,
-                "used_margin": 0.0,
-                "unrealized_pnl": account.unrealized_pnl,
-                "total_pnl": account.current_balance
-                + account.unrealized_pnl
-                - account.initial_balance,
-                "total_pnl_pct": account.total_pnl_pct * 100,
-            }
-
+    """Return no synthetic account balance for OKX-backed paper mode."""
     return {
-        "available_balance": allocated,
-        "current_balance": allocated,
-        "wallet_balance": allocated,
-        "equity": allocated,
-        "initial_balance": allocated,
+        "available_balance": None,
+        "current_balance": None,
+        "wallet_balance": None,
+        "equity": None,
+        "initial_balance": None,
         "used_margin": 0.0,
         "unrealized_pnl": 0.0,
-        "total_pnl": 0.0,
-        "total_pnl_pct": 0.0,
+        "total_pnl": None,
+        "total_pnl_pct": None,
     }
 
 
 async def _execution_account_status(mode: str) -> dict:
     mode = "live" if mode == "live" else "paper"
     cfg = settings.get_execution_account_config(mode)
-    legacy_allocated = float(cfg.get("allocated_balance") or 0.0)
     max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
     pnl_summary = await _dash._get_execution_pnl_summary(mode)
     okx_snapshot = await _get_okx_usdt_snapshot(mode)
     okx_available = okx_snapshot.get("available_balance")
     okx_allocatable = okx_snapshot.get("allocatable_balance")
+    okx_balance_available = not okx_snapshot.get("balance_error") and bool(
+        okx_snapshot.get("equity_balance")
+        or okx_snapshot.get("total_balance")
+        or okx_allocatable
+        or okx_available
+    )
     account_equity = float(
         okx_snapshot.get("equity_balance")
         or okx_snapshot.get("total_balance")
         or okx_allocatable
         or okx_available
-        or legacy_allocated
         or 0.0
+    ) if okx_balance_available else 0.0
+    okx_pnl = _dash._okx_equity_pnl_from_snapshot(
+        current_equity=account_equity if okx_balance_available else None,
+        pnl_summary=pnl_summary,
     )
     max_loss_usdt = (
         account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
@@ -299,7 +273,7 @@ async def _execution_account_status(mode: str) -> dict:
         pause_reason = (
             f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
         )
-    total_pnl_for_risk = float(pnl_summary.get("total_pnl") or 0.0)
+    total_pnl_for_risk = 0.0
     if (
         account_equity > 0
         and max_loss_usdt > 0
@@ -310,16 +284,20 @@ async def _execution_account_status(mode: str) -> dict:
             f"{okx_snapshot.get('balance_source')} AI 执行账户累计盈亏 {total_pnl_for_risk:.2f} USDT "
             f"已达到最高亏损限制 {max_loss_pct * 100:.1f}%（{max_loss_usdt:.2f} USDT），暂停分析新的交易对。"
         )
-    if not pause_reason:
+    if not pause_reason and okx_pnl["today_equity_pnl"] is not None:
         pause_reason = _dash._cooldown_pause_reason_from_summary(
-            pnl_summary,
+            {
+                "today_risk_pnl": okx_pnl["today_equity_pnl"],
+                "today_equity_pnl": okx_pnl["today_equity_pnl"],
+                "today_total_pnl": okx_pnl["today_total_pnl"],
+            },
             {**cfg, "max_loss_usdt": max_loss_usdt},
             okx_snapshot.get("balance_source") or "执行账户",
         )
     status = dict(cfg)
     status.update(
         {
-            "allocated_balance": legacy_allocated,
+            "allocated_balance": None,
             "account_balance_source_value": account_equity,
             "account_equity": account_equity,
             "max_loss_usdt": max_loss_usdt,
@@ -336,17 +314,22 @@ async def _execution_account_status(mode: str) -> dict:
             "today_closed_realized_profit": pnl_summary.get("today_closed_realized_profit", 0.0),
             "today_closed_realized_loss": pnl_summary.get("today_closed_realized_loss", 0.0),
             "today_closed_realized_pnl": pnl_summary.get("today_closed_realized_pnl", 0.0),
-            "today_equity_pnl": pnl_summary.get("today_equity_pnl", 0.0),
+            "today_equity_pnl": okx_pnl["today_equity_pnl"],
             "today_equity_baseline": pnl_summary.get("today_equity_baseline"),
             "today_equity_baseline_total_pnl": pnl_summary.get("today_equity_baseline_total_pnl"),
             "today_equity_baseline_at": pnl_summary.get("today_equity_baseline_at"),
             "today_equity_baseline_source": pnl_summary.get("today_equity_baseline_source"),
             "today_snapshot_date": pnl_summary.get("today_snapshot_date"),
-            "today_total_pnl": pnl_summary.get("today_total_pnl", 0.0),
+            "today_total_pnl": okx_pnl["today_total_pnl"],
             "today_risk_pnl": pnl_summary.get("today_risk_pnl", 0.0),
             "cumulative_profit": pnl_summary.get("realized_profit", 0.0),
             "cumulative_loss": pnl_summary.get("realized_loss", 0.0),
-            "total_pnl": pnl_summary.get("total_pnl", 0.0),
+            "total_pnl": okx_pnl["total_pnl"],
+            "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
+            "total_pnl_pct": okx_pnl["total_pnl_pct"],
+            "local_trade_total_pnl": pnl_summary.get("total_pnl", 0.0),
+            "local_trade_today_pnl": pnl_summary.get("today_total_pnl", 0.0),
+            "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
             "remaining_allocation": okx_available,
             "balance_error": okx_snapshot.get("balance_error"),
             "balance_source": okx_snapshot.get("balance_source"),
@@ -370,7 +353,7 @@ async def _execution_account_status(mode: str) -> dict:
                 "paper_execution_equity": summary.get("equity"),
                 "paper_execution_used_margin": summary.get("used_margin"),
                 "paper_execution_unrealized_pnl": pnl_summary.get("unrealized_pnl"),
-                "initial_balance": account_equity,
+                "initial_balance": None,
             }
         )
         return status
@@ -379,28 +362,8 @@ async def _execution_account_status(mode: str) -> dict:
 
 
 async def _sync_execution_account_to_paper_account() -> None:
-    """Apply paper allocation to the unified paper execution account when safe."""
-    from db.repositories.account_repo import AccountRepository
-    from db.repositories.trade_repo import TradeRepository
-    from db.session import get_session_ctx
-
-    allocated = float(settings.get_execution_account_config("paper")["allocated_balance"])
-    settings.model_initial_balances[ENSEMBLE_TRADER_NAME] = allocated
-    async with get_session_ctx() as session:
-        account_repo = AccountRepository(session)
-        trade_repo = TradeRepository(session)
-        account = await account_repo.get_or_create_account(ENSEMBLE_TRADER_NAME, allocated)
-        open_count = await trade_repo.count_positions(model_name=ENSEMBLE_TRADER_NAME, is_open=True)
-        account.initial_balance = allocated
-        if open_count == 0 and int(account.total_trades or 0) == 0:
-            account.current_balance = allocated
-            account.realized_pnl = 0.0
-            account.unrealized_pnl = 0.0
-        await session.flush()
-        if _dash._trading_service and _dash._trading_service.paper_executor:
-            _dash._trading_service.paper_executor._balances[ENSEMBLE_TRADER_NAME] = (
-                account.current_balance
-            )
+    """No-op: OKX-backed paper accounts must not sync fixed local balances."""
+    return
 
 
 async def _sync_models_to_running_services() -> None:
@@ -412,23 +375,13 @@ async def _sync_models_to_running_services() -> None:
 
     log = structlog.get_logger(__name__)
 
-    from db.repositories.account_repo import AccountRepository
-    from db.session import get_session_ctx
-
     registry = _dash._trading_service.models
     old_names, new_names = await registry.sync_from_config()
     log.info("models synced from config", old=list(old_names), new=list(new_names))
 
-    # Sync paper executor account. Expert models analyze only; execution and PnL
-    # belong to the unified ensemble_trader account.
+    # Expert models analyze only; OKX-backed execution balances come from OKX.
     executor = _dash._trading_service.paper_executor
     if executor:
-        async with get_session_ctx() as session:
-            repo = AccountRepository(session)
-            initial_bal = settings.get_initial_balance(ENSEMBLE_TRADER_NAME)
-            account = await repo.get_or_create_account(ENSEMBLE_TRADER_NAME, initial_bal)
-            executor._balances.setdefault(ENSEMBLE_TRADER_NAME, account.current_balance)
-            executor._positions.setdefault(ENSEMBLE_TRADER_NAME, [])
         executor._model_names = [ENSEMBLE_TRADER_NAME]
 
     # Update competition service active models and trigger evaluation
@@ -526,16 +479,18 @@ async def test_model_server_settings(req: ModelServerSettingsRequest | None = No
 @router.get("/settings/okx")
 async def get_okx_settings():
     """Return both paper and live OKX config with secrets masked."""
+    paper_creds = settings.get_okx_credentials("paper")
+    live_creds = settings.get_okx_credentials("live")
     return {
         "paper": {
-            "api_key": mask_secret(settings.okx_paper_api_key or settings.okx_api_key),
-            "has_secret": bool(settings.okx_paper_api_secret or settings.okx_api_secret),
-            "has_passphrase": bool(settings.okx_paper_passphrase or settings.okx_passphrase),
+            "api_key": mask_secret(paper_creds.get("api_key", "")),
+            "has_secret": bool(paper_creds.get("api_secret")),
+            "has_passphrase": bool(paper_creds.get("passphrase")),
         },
         "live": {
-            "api_key": mask_secret(settings.okx_live_api_key),
-            "has_secret": bool(settings.okx_live_api_secret),
-            "has_passphrase": bool(settings.okx_live_passphrase),
+            "api_key": mask_secret(live_creds.get("api_key", "")),
+            "has_secret": bool(live_creds.get("api_secret")),
+            "has_passphrase": bool(live_creds.get("passphrase")),
         },
     }
 
@@ -847,29 +802,6 @@ async def add_ai_model(req: AIModelRequest):
 
     mode = req.execution_mode or "paper"
 
-    # Validate balance against OKX account
-    if req.balance is not None and req.balance > 0:
-        okx_balance = await _get_okx_usdt_balance(mode)
-        if okx_balance is not None:
-            same_mode_models = [
-                m for m in settings.ai_models if m.get("execution_mode", "paper") == mode
-            ]
-            current_total = sum(
-                float(m.get("balance", 0))
-                for m in same_mode_models
-                if isinstance(m.get("balance"), (int, float))
-            )
-            if current_total + req.balance > okx_balance:
-                mode_label = "模拟盘" if mode == "paper" else "实盘"
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"配额总和 ({current_total + req.balance:.2f} USDT) "
-                        f"超过 OKX {mode_label}账户余额 ({okx_balance:.2f} USDT)。"
-                        f"当前已分配: {current_total:.2f} USDT"
-                    ),
-                )
-
     new_model: dict[str, Any] = {
         "name": req.name.strip(),
         "api_base": _normalize_api_base_or_400(
@@ -880,9 +812,6 @@ async def add_ai_model(req: AIModelRequest):
         "model": (req.model or "gpt-4").strip(),
         "execution_mode": mode,
     }
-    if req.balance is not None:
-        new_model["balance"] = req.balance
-        settings.model_initial_balances[req.name.strip()] = req.balance
     if new_model["api_key"]:
         await set_runtime_secret(secure_ai_model_key(new_model["name"]), new_model["api_key"])
 
@@ -890,8 +819,6 @@ async def add_ai_model(req: AIModelRequest):
     env_updates = {
         "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
     }
-    if req.balance is not None:
-        env_updates["MODEL_INITIAL_BALANCES"] = json.dumps(settings.model_initial_balances)
     env_updates = strip_secret_env_updates(env_updates)
     settings.update_env_file(env_updates)
 
@@ -926,37 +853,11 @@ async def update_ai_model(name: str, req: AIModelRequest):
                 updated["model"] = req.model.strip()
             if req.execution_mode:
                 updated["execution_mode"] = req.execution_mode
-            mode = updated.get("execution_mode", "paper")
-            if req.balance is not None:
-                if req.balance > 0:
-                    okx_balance = await _get_okx_usdt_balance(mode)
-                    if okx_balance is not None:
-                        others_total = sum(
-                            float(m2.get("balance", 0))
-                            for m2 in settings.ai_models
-                            if isinstance(m2.get("balance"), (int, float))
-                            and m2.get("name") != name
-                            and m2.get("execution_mode", "paper") == mode
-                        )
-                        if others_total + req.balance > okx_balance:
-                            mode_label = "模拟盘" if mode == "paper" else "实盘"
-                            raise HTTPException(
-                                status_code=400,
-                                detail=(
-                                    f"配额总和 ({others_total + req.balance:.2f} USDT) "
-                                    f"超过 OKX {mode_label}账户余额 ({okx_balance:.2f} USDT)。"
-                                    f"其他模型已分配: {others_total:.2f} USDT"
-                                ),
-                            )
-                updated["balance"] = req.balance
-                target_name = updated.get("name", name)
-                settings.model_initial_balances[target_name] = req.balance
+            updated.pop("balance", None)
             settings.ai_models[i] = updated
             env_updates = {
                 "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
             }
-            if req.balance is not None:
-                env_updates["MODEL_INITIAL_BALANCES"] = json.dumps(settings.model_initial_balances)
             env_updates = strip_secret_env_updates(env_updates)
             settings.update_env_file(env_updates)
             await _sync_models_to_running_services()

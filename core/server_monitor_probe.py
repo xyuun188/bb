@@ -50,7 +50,9 @@ def render_server_monitor_probe(
         PRIMARY_MODEL_ID = {json.dumps(primary_model_id, ensure_ascii=False)}
         PRIMARY_MODEL_LABEL = {json.dumps(primary_model_label, ensure_ascii=False)}
         LOCAL_AI_TOOLS_API_KEY = {json.dumps(local_ai_tools_api_key, ensure_ascii=False)}
+        DECISION_MODEL_ID = "qwen3-32b-trade"
         DEEPSEEK_R1_MODEL_ID = "deepseek-r1-14b-risk"
+        QWEN3_EXPERT_POOL_MODEL_ID = "BB-FinQuant-Expert-14B"
         ERROR_TEXT_LIMIT = 240
         HTTP_BODY_READ_LIMIT = 512 * 1024
         MAX_MODEL_ROWS = 24
@@ -352,7 +354,7 @@ def render_server_monitor_probe(
 
 
         def primary_model_available(model_ids):
-            return target_model_available(model_ids, PRIMARY_MODEL_ID)
+            return target_model_available(model_ids, DECISION_MODEL_ID)
 
 
         def target_model_available(model_ids, target_model_id):
@@ -379,30 +381,6 @@ def render_server_monitor_probe(
             )
 
 
-        def read_env_value_file(path):
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        clean = line.strip()
-                        if not clean or clean.startswith("#") or "=" not in clean:
-                            continue
-                        key, value = clean.split("=", 1)
-                        if key.strip() != "LOCAL_AI_TOOLS_API_KEY":
-                            continue
-                        return value.strip().strip('"').strip("'")
-            except OSError:
-                return ""
-            return ""
-
-
-        def local_ai_tools_api_key():
-            return (
-                os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
-                or read_env_value_file("/data/trade_ai/local_ai_tools.env")
-                or (LOCAL_AI_TOOLS_API_KEY or "").strip()
-            )
-
-
         def vllm_endpoint_runtime(port, label, target_model_id=None):
             endpoint = f"127.0.0.1:{{port}}/v1"
             response = http_json(f"http://127.0.0.1:{{port}}/v1/models", timeout=4)
@@ -410,10 +388,12 @@ def render_server_monitor_probe(
             target_model = target_model_id or PRIMARY_MODEL_ID
             target_ok = target_model_available(model_ids, target_model)
             endpoint_ok = bool(response.get("ok"))
+            model_mismatch = bool(endpoint_ok and model_ids and target_model and not target_ok)
             return {{
                 "available": bool(endpoint_ok and target_ok),
                 "endpoint_available": endpoint_ok,
                 "model_available": bool(target_ok),
+                "model_mismatch": model_mismatch,
                 "discovered_model_available": bool(model_ids),
                 "primary_model_available": bool(primary_model_available(model_ids)),
                 "target_model_available": bool(target_ok),
@@ -425,50 +405,121 @@ def render_server_monitor_probe(
                 "status": (
                     "active"
                     if endpoint_ok and target_ok
+                    else "model_mismatch"
+                    if model_mismatch
                     else "model_not_available"
                     if endpoint_ok
                     else "endpoint_unavailable"
                 ),
-                "error": response.get("error", ""),
+                "error": (
+                    f"target model {{target_model}} not served on this endpoint; returned {{', '.join(model_ids)}}"
+                    if model_mismatch
+                    else response.get("error", "")
+                ),
+            }}
+
+
+        def local_ai_tools_status_runtime():
+            headers = {{}}
+            if LOCAL_AI_TOOLS_API_KEY:
+                headers["Authorization"] = "Bearer " + LOCAL_AI_TOOLS_API_KEY
+            local_status = http_json(
+                "http://127.0.0.1:8101/models/status",
+                timeout=3,
+                extra_headers=headers,
+            )
+            local_health = http_json(
+                "http://127.0.0.1:8101/health",
+                timeout=3,
+                extra_headers=headers,
+            )
+            status_data = (
+                local_status.get("data") if isinstance(local_status.get("data"), dict) else {{}}
+            )
+            health_data = (
+                local_health.get("data") if isinstance(local_health.get("data"), dict) else {{}}
+            )
+            is_phase3_quant_api = (
+                status_data.get("service") == "phase3_quant_api"
+                or health_data.get("service") == "phase3_quant_api"
+            )
+            child_data = status_data if status_data else health_data
+            service_available = bool(
+                is_phase3_quant_api and (local_status.get("ok") or local_health.get("ok"))
+            )
+            trained_models_available = bool(
+                status_data.get("available")
+                or health_data.get("trained_models_available")
+                or child_data.get("trained_models_available")
+            )
+            model_status = (
+                child_data.get("models")
+                or child_data.get("model_status")
+                or health_data.get("model_status")
+                or {{}}
+            )
+            return {{
+                "available": bool(service_available),
+                "endpoint": "127.0.0.1:8101",
+                "service_role": "phase3_quant_api",
+                "legacy_local_ai_tools": False,
+                "status": (
+                    "active"
+                    if service_available and trained_models_available
+                    else "heuristic_fallback_available"
+                    if service_available
+                    else "endpoint_unavailable"
+                ),
+                "status_health": endpoint_health(local_status),
+                "health": endpoint_health(local_health),
+                "service_available": service_available,
+                "model_bundle_available": trained_models_available,
+                "trained_models_available": trained_models_available,
+                "trained_at": child_data.get("trained_at"),
+                "training_mode": child_data.get("training_mode"),
+                "model_stage": child_data.get("model_stage"),
+                "shadow_sample_count": int(child_data.get("shadow_sample_count") or 0),
+                "trade_sample_count": int(child_data.get("trade_sample_count") or 0),
+                "sequence_sample_count": int(child_data.get("sequence_sample_count") or 0),
+                "text_sentiment_sample_count": int(child_data.get("text_sentiment_sample_count") or 0),
+                "completed_shadow_sample_count": int(
+                    child_data.get("completed_shadow_sample_count") or 0
+                ),
+                "completed_trade_sample_count": int(
+                    child_data.get("completed_trade_sample_count") or 0
+                ),
+                "models": safe_model_map(model_status if isinstance(model_status, dict) else {{}}),
+                "inventory": safe_model_map({{
+                    "service": health_data.get("service") or status_data.get("service"),
+                    "root": health_data.get("root") or status_data.get("root"),
+                    "validation_all_ok": health_data.get("validation_all_ok"),
+                    "downloaded_model_count": health_data.get("downloaded_model_count"),
+                    "validated_model_count": health_data.get("validated_model_count"),
+                }}),
+                "error": local_status.get("error") or local_health.get("error") or "",
             }}
 
 
         def model_runtime():
             vllm_endpoints = [
-                vllm_endpoint_runtime(8000, PRIMARY_MODEL_LABEL or PRIMARY_MODEL_ID or "vLLM"),
+                vllm_endpoint_runtime(8000, PRIMARY_MODEL_LABEL or "Qwen3 32B decision", DECISION_MODEL_ID),
                 vllm_endpoint_runtime(8002, "DeepSeek R1 14B", DEEPSEEK_R1_MODEL_ID),
+                vllm_endpoint_runtime(8003, "BB-FinQuant Expert 14B", QWEN3_EXPERT_POOL_MODEL_ID),
             ]
             vllm = next(
                 (
                     item
                     for item in vllm_endpoints
-                    if item.get("primary_model_available") or item.get("available")
+                    if item.get("primary_model_available")
+                    or str(item.get("provider_model") or "").lower()
+                    == str(DECISION_MODEL_ID or "").lower()
                 ),
                 vllm_endpoints[0],
             )
-            _local_ai_key = local_ai_tools_api_key()
-            _auth_h = {{"Authorization": f"Bearer {{_local_ai_key}}"}} if _local_ai_key else {{}}
-            local_status = http_json("http://127.0.0.1:8001/models/status", timeout=4, extra_headers=_auth_h)
-            local_health = http_json("http://127.0.0.1:8001/health", timeout=3, extra_headers=_auth_h)
-            tools = local_status.get("data") if isinstance(local_status.get("data"), dict) else {{}}
-            local_available = bool(local_status.get("ok") or local_health.get("ok"))
             return {{
                 "vllm": vllm,
                 "vllm_endpoints": vllm_endpoints,
-                "local_ai_tools": {{
-                    "available": local_available,
-                    "endpoint": "127.0.0.1:8001",
-                    "status": "active" if local_available else "endpoint_unavailable",
-                    "status_health": endpoint_health(local_status),
-                    "health": endpoint_health(local_health),
-                    "trained_at": tools.get("trained_at"),
-                    "shadow_sample_count": tools.get("shadow_sample_count"),
-                    "trade_sample_count": tools.get("trade_sample_count"),
-                    "sequence_sample_count": tools.get("sequence_sample_count"),
-                    "text_sentiment_sample_count": tools.get("text_sentiment_sample_count"),
-                    "models": safe_model_map(tools.get("models")),
-                    "error": local_status.get("error") or local_health.get("error") or "",
-                }},
+                "local_ai_tools": local_ai_tools_status_runtime(),
             }}
 
 
@@ -493,7 +544,6 @@ def render_server_monitor_probe(
                     for item in runtime.get("vllm_endpoints", [])
                     if isinstance(item, dict)
                 ],
-                service_status("local-ai-tools.service"),
             ],
             "model_runtime": runtime,
         }}

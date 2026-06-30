@@ -116,6 +116,41 @@ def _component_key(item: dict[str, Any]) -> str:
     return str(item.get("key") or item.get("source") or "unknown")
 
 
+def _counter_dict(counter: Counter[str], limit: int = 12) -> dict[str, int]:
+    return {key: count for key, count in counter.most_common(max(1, limit))}
+
+
+def _short_text(value: Any, limit: int = 220) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
+
+
+def _safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "active", "enabled"}
+    return bool(value)
+
+
+def _strategy_mode(decision: AIDecision) -> dict[str, Any]:
+    return _safe_dict(_decision_raw(decision).get("strategy_mode"))
+
+
+def _strategy_learning_context(decision: AIDecision) -> dict[str, Any]:
+    return _safe_dict(_decision_raw(decision).get("strategy_learning_context"))
+
+
+def _first_non_empty(*values: Any, default: str = "unknown") -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return default
+
+
 def _ml_readiness_summary(status: dict[str, Any]) -> dict[str, Any]:
     readiness = _safe_dict(status.get("readiness"))
     metrics = _safe_dict(readiness.get("metrics"))
@@ -257,6 +292,7 @@ class StrategySignalRootCauseAuditService:
         loss_probability_values: list[float] = []
         tail_risk_values: list[float] = []
         server_expected_values: list[float] = []
+        scheduler_summary = self._strategy_scheduler_summary(decisions)
 
         for row in entry_decisions:
             opportunity = _opportunity(row)
@@ -375,6 +411,7 @@ class StrategySignalRootCauseAuditService:
             weak_count=weak_count,
             score_gap_distribution=_distribution(score_gaps),
             ml_readiness=ml_readiness,
+            scheduler_summary=scheduler_summary,
         )
         status = "warning" if root_causes else "ok"
         return {
@@ -444,11 +481,261 @@ class StrategySignalRootCauseAuditService:
                 "missed_by_symbol": dict(missed_by_symbol.most_common(8)),
                 "tradeable_relief_count": shadow_tradeable_relief_count,
             },
+            "scheduler": scheduler_summary,
             "root_causes": root_causes,
             "next_actions": self._next_actions(root_causes),
             "diagnostic_boundary": (
                 "Read-only Stage 5 audit. This report can explain blockers, but it must not "
                 "open positions, change thresholds, change sizing, change leverage, or mark ML ready."
+            ),
+        }
+
+    def _strategy_scheduler_summary(self, decisions: list[AIDecision]) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        strategy_counts: Counter[str] = Counter()
+        posture_counts: Counter[str] = Counter()
+        risk_mode_counts: Counter[str] = Counter()
+        profile_counts: Counter[str] = Counter()
+        expert_integrity_counts: Counter[str] = Counter()
+        market_regime_counts: Counter[str] = Counter()
+        cache_status_counts: Counter[str] = Counter()
+        scheduler_reason_counts: Counter[str] = Counter()
+        capacity_reason_counts: Counter[str] = Counter()
+        entry_limit_values: list[float] = []
+        effective_limit_values: list[float] = []
+        target_limit_values: list[float] = []
+        open_group_values: list[float] = []
+        capacity_sample_count = 0
+        capacity_constrained_count = 0
+        entry_blocked_count = 0
+        flag_counts: Counter[str] = Counter()
+
+        for row in decisions:
+            strategy_mode = _strategy_mode(row)
+            learning_context = _strategy_learning_context(row)
+            if not strategy_mode and not learning_context:
+                continue
+
+            strategy = _first_non_empty(
+                strategy_mode.get("strategy"),
+                strategy_mode.get("mode"),
+                learning_context.get("strategy"),
+            )
+            posture = _first_non_empty(strategy_mode.get("posture"))
+            risk_mode = _first_non_empty(strategy_mode.get("risk_mode"))
+            profile_id = _first_non_empty(
+                strategy_mode.get("strategy_profile_id"),
+                learning_context.get("strategy_profile_id"),
+                default="unprofiled",
+            )
+            expert_integrity_mode = _first_non_empty(
+                strategy_mode.get("expert_integrity_mode"),
+                learning_context.get("expert_integrity_mode"),
+            )
+            market_regime = _safe_dict(strategy_mode.get("market_regime"))
+            market_regime_mode = _first_non_empty(market_regime.get("mode"))
+            cache_status = _first_non_empty(
+                strategy_mode.get("strategy_learning_cache_status"),
+                learning_context.get("strategy_learning_cache_status"),
+                default="fresh_or_not_recorded",
+            )
+            scheduler_reason = _first_non_empty(
+                strategy_mode.get("scheduler_reason"),
+                learning_context.get("scheduler_reason"),
+                strategy_mode.get("reason"),
+                default="",
+            )
+            reason = _first_non_empty(strategy_mode.get("reason"), scheduler_reason, default="")
+
+            strategy_counts[strategy] += 1
+            posture_counts[posture] += 1
+            risk_mode_counts[risk_mode] += 1
+            profile_counts[profile_id] += 1
+            expert_integrity_counts[expert_integrity_mode] += 1
+            market_regime_counts[market_regime_mode] += 1
+            cache_status_counts[cache_status] += 1
+            if scheduler_reason:
+                scheduler_reason_counts[_short_text(scheduler_reason, 180)] += 1
+
+            capacity = _safe_dict(strategy_mode.get("dynamic_position_capacity"))
+            capacity_view: dict[str, Any] = {}
+            reason_codes: list[str] = []
+            if capacity:
+                capacity_sample_count += 1
+                factors = _safe_dict(capacity.get("factors"))
+                reason_codes = [
+                    str(item)
+                    for item in _safe_list(factors.get("reason_codes"))
+                    if str(item or "").strip()
+                ]
+                for code in reason_codes:
+                    capacity_reason_counts[code] += 1
+                for target, key in (
+                    (entry_limit_values, "entry_limit"),
+                    (effective_limit_values, "effective_limit"),
+                    (target_limit_values, "target_limit"),
+                    (open_group_values, "open_group_count"),
+                ):
+                    value = _maybe_float(capacity.get(key))
+                    if value is not None:
+                        target.append(value)
+
+                entry_limit = _maybe_float(capacity.get("entry_limit"))
+                effective_limit = _maybe_float(capacity.get("effective_limit"))
+                target_limit = _maybe_float(capacity.get("target_limit"))
+                open_group_count = _maybe_float(capacity.get("open_group_count"))
+                constrained = (
+                    (effective_limit is not None and target_limit is not None and effective_limit < target_limit)
+                    or any(
+                        code
+                        in {
+                            "drawdown",
+                            "drawdown_watch",
+                            "low_quality_pressure",
+                            "low_quality_warn",
+                            "over_capacity_release_first",
+                            "release_rotation_slots",
+                        }
+                        for code in reason_codes
+                    )
+                )
+                if constrained:
+                    capacity_constrained_count += 1
+                if (
+                    entry_limit is not None
+                    and open_group_count is not None
+                    and open_group_count >= entry_limit
+                ):
+                    entry_blocked_count += 1
+                capacity_view = {
+                    "base_limit": capacity.get("base_limit"),
+                    "target_limit": capacity.get("target_limit"),
+                    "effective_limit": capacity.get("effective_limit"),
+                    "entry_limit": capacity.get("entry_limit"),
+                    "open_group_count": capacity.get("open_group_count"),
+                    "low_quality_count": capacity.get("low_quality_count"),
+                    "release_candidate_count": capacity.get("release_candidate_count"),
+                    "reason_codes": reason_codes,
+                    "reason": _short_text(capacity.get("reason"), 220),
+                    "constrained": constrained,
+                }
+
+            flags = {
+                "strategy_learning_context_timeout": "timeout" in cache_status.lower()
+                or strategy_mode.get("strategy_learning_runtime_timeout_seconds") is not None
+                or learning_context.get("strategy_learning_runtime_timeout_seconds") is not None,
+                "strategy_learning_entry_pause_active": _safe_bool(
+                    strategy_mode.get("strategy_learning_entry_pause")
+                )
+                or _safe_bool(learning_context.get("strategy_learning_entry_pause")),
+                "strategy_learning_execution_guard_active": _safe_bool(
+                    strategy_mode.get("strategy_learning_execution_guard_active")
+                )
+                or _safe_bool(learning_context.get("strategy_learning_execution_guard_active")),
+                "strategy_learning_release_pressure_active": _safe_bool(
+                    strategy_mode.get("strategy_learning_release_pressure_active")
+                )
+                or _safe_bool(
+                    learning_context.get("strategy_learning_release_pressure_active")
+                ),
+                "strategy_learning_health_guard_active": _safe_bool(
+                    strategy_mode.get("strategy_learning_health_guard_active")
+                )
+                or _safe_bool(learning_context.get("strategy_learning_health_guard_active")),
+                "drawdown_clamp_active": strategy in {"drawdown_clamp", "hard_recovery"}
+                or risk_mode in {"drawdown_recovery", "defensive_recovery", "hard_recovery"}
+                or any(code in {"drawdown", "drawdown_watch"} for code in reason_codes),
+                "market_regime_soft_bias_active": bool(
+                    _safe_list(strategy_mode.get("soft_avoided_directions"))
+                ),
+            }
+            for key, active in flags.items():
+                if active:
+                    flag_counts[key] += 1
+
+            rows.append(
+                {
+                    "decision_id": getattr(row, "id", None),
+                    "symbol": getattr(row, "symbol", None),
+                    "action": getattr(row, "action", None),
+                    "analysis_type": _analysis_type(row),
+                    "created_at": _iso(getattr(row, "created_at", None)),
+                    "strategy": strategy,
+                    "posture": posture,
+                    "risk_mode": risk_mode,
+                    "strategy_profile_id": profile_id,
+                    "strategy_profile_version": strategy_mode.get("strategy_profile_version")
+                    or learning_context.get("strategy_profile_version"),
+                    "expert_integrity_mode": expert_integrity_mode,
+                    "market_regime": {
+                        "mode": market_regime_mode,
+                        "confidence": _maybe_float(market_regime.get("confidence")),
+                        "soft_avoided_directions": _safe_list(
+                            strategy_mode.get("soft_avoided_directions")
+                        ),
+                    },
+                    "scheduler_reason": _short_text(scheduler_reason, 220),
+                    "reason": _short_text(reason, 260),
+                    "cache_status": cache_status,
+                    "dynamic_position_capacity": capacity_view,
+                    "flags": flags,
+                    "can_force_open": False,
+                    "can_override_thresholds": False,
+                    "can_bypass_risk_controls": False,
+                }
+            )
+
+        sample_count = len(rows)
+        return {
+            "available": sample_count > 0,
+            "sample_count": sample_count,
+            "decision_coverage_ratio": (
+                round(sample_count / len(decisions), 6) if decisions else 0.0
+            ),
+            "read_only": True,
+            "audit_only": True,
+            "live_entry_mutation": False,
+            "live_sizing_mutation": False,
+            "live_leverage_mutation": False,
+            "can_force_open": False,
+            "can_override_thresholds": False,
+            "can_bypass_risk_controls": False,
+            "decider_stack": [
+                "EntryStrategyModeContextPolicy",
+                "StrategyLearningService.apply_to_strategy_context",
+                "DynamicPositionCapacityPolicy",
+            ],
+            "strategy_counts": _counter_dict(strategy_counts),
+            "posture_counts": _counter_dict(posture_counts),
+            "risk_mode_counts": _counter_dict(risk_mode_counts),
+            "strategy_profile_counts": _counter_dict(profile_counts),
+            "expert_integrity_mode_counts": _counter_dict(expert_integrity_counts),
+            "market_regime_counts": _counter_dict(market_regime_counts),
+            "cache_status_counts": _counter_dict(cache_status_counts),
+            "flag_counts": _counter_dict(flag_counts),
+            "top_scheduler_reasons": [
+                {"reason": reason, "count": count}
+                for reason, count in scheduler_reason_counts.most_common(8)
+            ],
+            "dynamic_capacity": {
+                "sample_count": capacity_sample_count,
+                "constrained_count": capacity_constrained_count,
+                "constrained_ratio": (
+                    round(capacity_constrained_count / capacity_sample_count, 6)
+                    if capacity_sample_count
+                    else 0.0
+                ),
+                "entry_blocked_count": entry_blocked_count,
+                "reason_code_counts": _counter_dict(capacity_reason_counts),
+                "entry_limit_distribution": _distribution(entry_limit_values),
+                "effective_limit_distribution": _distribution(effective_limit_values),
+                "target_limit_distribution": _distribution(target_limit_values),
+                "open_group_distribution": _distribution(open_group_values),
+            },
+            "latest_samples": rows[:12],
+            "diagnostic_boundary": (
+                "Scheduler summary is read-only. It explains strategy posture, learning "
+                "guards, and capacity constraints without changing live routing or entries."
             ),
         }
 
@@ -471,6 +758,7 @@ class StrategySignalRootCauseAuditService:
         weak_count: int,
         score_gap_distribution: dict[str, Any],
         ml_readiness: dict[str, Any],
+        scheduler_summary: dict[str, Any],
     ) -> list[dict[str, Any]]:
         causes: list[dict[str, Any]] = []
         if entry_count == 0:
@@ -591,6 +879,61 @@ class StrategySignalRootCauseAuditService:
                     "count": weak_count,
                 }
             )
+        flag_counts = _safe_dict(scheduler_summary.get("flag_counts"))
+        capacity = _safe_dict(scheduler_summary.get("dynamic_capacity"))
+        scheduler_sample_count = int(_safe_float(scheduler_summary.get("sample_count"), 0.0))
+        if int(flag_counts.get("strategy_learning_context_timeout") or 0) > 0:
+            causes.append(
+                {
+                    "code": "strategy_learning_context_timeout",
+                    "severity": "warning",
+                    "message": "Strategy-learning context timed out and the scheduler used cache or baseline context.",
+                    "count": int(flag_counts.get("strategy_learning_context_timeout") or 0),
+                    "sample_count": scheduler_sample_count,
+                }
+            )
+        if int(flag_counts.get("strategy_learning_entry_pause_active") or 0) > 0:
+            causes.append(
+                {
+                    "code": "strategy_learning_entry_pause_active",
+                    "severity": "warning",
+                    "message": "Strategy-learning entry pause is active for recent scheduler decisions.",
+                    "count": int(flag_counts.get("strategy_learning_entry_pause_active") or 0),
+                    "sample_count": scheduler_sample_count,
+                }
+            )
+        constrained_count = int(capacity.get("constrained_count") or 0)
+        if constrained_count > 0:
+            causes.append(
+                {
+                    "code": "dynamic_capacity_constrained",
+                    "severity": "warning",
+                    "message": "Dynamic position capacity is constraining new entry slots.",
+                    "count": constrained_count,
+                    "constrained_ratio": _safe_float(capacity.get("constrained_ratio"), 0.0),
+                    "reason_code_counts": _safe_dict(capacity.get("reason_code_counts")),
+                }
+            )
+        if int(flag_counts.get("drawdown_clamp_active") or 0) > 0:
+            causes.append(
+                {
+                    "code": "drawdown_clamp_active",
+                    "severity": "warning",
+                    "message": "Drawdown clamp or hard-recovery posture is active.",
+                    "count": int(flag_counts.get("drawdown_clamp_active") or 0),
+                    "sample_count": scheduler_sample_count,
+                }
+            )
+        if int(flag_counts.get("market_regime_soft_bias_active") or 0) > 0:
+            causes.append(
+                {
+                    "code": "market_regime_soft_bias_active",
+                    "severity": "warning",
+                    "message": "Market regime is applying soft directional bias; symbol-level signals still decide direction.",
+                    "count": int(flag_counts.get("market_regime_soft_bias_active") or 0),
+                    "sample_count": scheduler_sample_count,
+                }
+            )
         return causes
 
     @staticmethod
@@ -632,5 +975,25 @@ class StrategySignalRootCauseAuditService:
         if "no_entry_candidates" in by_code:
             actions.append(
                 "Check market scan, analysis budget, feature coverage, and AI decision throughput before strategy tuning."
+            )
+        if "strategy_learning_context_timeout" in by_code:
+            actions.append(
+                "Reduce strategy-learning context latency or improve cache freshness; do not block trading rounds on slow learning diagnostics."
+            )
+        if "strategy_learning_entry_pause_active" in by_code:
+            actions.append(
+                "Inspect the active strategy-learning profile pause reason before assuming the entry model is broken."
+            )
+        if "dynamic_capacity_constrained" in by_code:
+            actions.append(
+                "Inspect dynamic capacity reason codes, low-quality positions, drawdown, and release candidates before raising position caps."
+            )
+        if "drawdown_clamp_active" in by_code:
+            actions.append(
+                "Treat reduced entries as a drawdown protection posture; improve evidence quality rather than relaxing risk limits."
+            )
+        if "market_regime_soft_bias_active" in by_code:
+            actions.append(
+                "Use the soft market-regime bias as context only; verify per-symbol long/short evidence before changing directional policy."
             )
         return actions

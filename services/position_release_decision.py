@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.profit_first_stage2 import ReleaseNetBenefitPolicy
 from services.trading_params import DEFAULT_TRADING_PARAMS, ExitPositionQualityParams
 
 
@@ -15,11 +16,17 @@ class PositionReleaseDecisionPolicy:
 
     min_release_exit_score: float = 90.0
     params: ExitPositionQualityParams = DEFAULT_TRADING_PARAMS.exit_position_quality
+    release_net_benefit_policy: ReleaseNetBenefitPolicy = ReleaseNetBenefitPolicy()
 
     def should_release(self, scan: dict[str, Any] | None) -> bool:
         if not isinstance(scan, dict):
             return False
         if self._fresh_low_quality_scan_is_protected(scan):
+            return False
+        net_benefit = self.release_net_benefit_policy.evaluate(scan)
+        if not net_benefit.allowed:
+            scan["profit_first_release_net_benefit_guard"] = net_benefit.data or {}
+            scan["profit_first_release_net_benefit_reason"] = net_benefit.reason
             return False
         if bool(scan.get("force_exit_candidate")):
             return True
@@ -42,6 +49,11 @@ class PositionReleaseDecisionPolicy:
         if action is None:
             return None
         if self._fresh_low_quality_scan_is_protected(scan):
+            return None
+        net_benefit = self.release_net_benefit_policy.evaluate(scan)
+        if not net_benefit.allowed:
+            scan["profit_first_release_net_benefit_guard"] = net_benefit.data or {}
+            scan["profit_first_release_net_benefit_reason"] = net_benefit.reason
             return None
 
         exit_score = self._safe_float(scan.get("exit_score"), 0.0)

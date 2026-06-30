@@ -4,16 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, okx_inst_id_from_payload, symbol_from_okx_payload
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_payload,
+    symbol_from_okx_inst_id,
+    symbol_from_okx_payload,
+)
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
 
 logger = structlog.get_logger(__name__)
@@ -54,6 +60,46 @@ def _quantity_is_dust(quantity: float, reference_quantity: float) -> bool:
         abs(float(reference_quantity or 0.0)) * POSITION_CLOSE_DUST_REL_TOLERANCE,
     )
     return abs(float(quantity or 0.0)) <= tolerance
+
+
+def _split_exchange_order_ids(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    tokens = {text}
+    for separator in (",", ";", "|", "\n", "\t", " "):
+        pieces: set[str] = set()
+        for token in tokens:
+            pieces.update(part.strip() for part in token.split(separator) if part.strip())
+        tokens = pieces
+    return [token for token in tokens if token]
+
+
+def _merge_exchange_order_ids(*values: Any, max_length: int = 100) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for token in _split_exchange_order_ids(value):
+            if token in seen:
+                continue
+            seen.add(token)
+            ordered.append(token)
+    merged: list[str] = []
+    for token in ordered:
+        candidate = ",".join([*merged, token]) if merged else token
+        if len(candidate) > max_length:
+            break
+        merged.append(token)
+    return ",".join(merged)
+
+
+def _created_sort_value(position: Any) -> float:
+    value = getattr(position, "created_at", None)
+    if not isinstance(value, datetime):
+        return 0.0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.timestamp()
 
 
 class PositionExecutionPersistenceService:
@@ -121,6 +167,9 @@ class PositionExecutionPersistenceService:
     def _result_symbol(result: Any, decision: DecisionOutput) -> str:
         raw = getattr(result, "raw_response", None)
         raw = raw if isinstance(raw, dict) else {}
+        okx_inst_id = okx_inst_id_from_payload(raw, include_fallback=False)
+        if okx_inst_id:
+            return symbol_from_okx_inst_id(okx_inst_id)
         explicit = normalize_trading_symbol(raw.get("canonical_exchange_symbol"))
         if explicit:
             return explicit
@@ -134,7 +183,14 @@ class PositionExecutionPersistenceService:
         value = str(
             getattr(result, "exchange_order_id", None) or getattr(result, "order_id", None) or ""
         ).strip()
-        return value if value not in {"hold", "rejected", "no_position"} else ""
+        synthetic_ids = {
+            "hold",
+            "rejected",
+            "no_position",
+            "okx_native_full_close",
+            "okx_native_full_close_not_confirmed",
+        }
+        return value if value not in synthetic_ids else ""
 
     @staticmethod
     def _result_okx_inst_id(result: Any, symbol: str) -> str:
@@ -206,6 +262,57 @@ class PositionExecutionPersistenceService:
             payload["okx_pos_id"] = okx_pos_id
         if entry_exchange_order_id:
             payload["entry_exchange_order_id"] = entry_exchange_order_id
+        existing_positions = await repo.get_matching_open_positions(
+            model_name=model_name,
+            symbol=symbol,
+            side=side,
+            execution_mode=execution_mode,
+        )
+        if existing_positions:
+            primary = sorted(
+                existing_positions,
+                key=_created_sort_value,
+            )[0]
+            old_qty = max(float(getattr(primary, "quantity", 0.0) or 0.0), 0.0)
+            add_qty = max(float(result.quantity or 0.0), 0.0)
+            total_qty = old_qty + add_qty
+            old_entry = float(getattr(primary, "entry_price", result.price) or result.price)
+            entry_price = (
+                ((old_entry * old_qty) + (float(result.price) * add_qty)) / total_qty
+                if total_qty > 0
+                else float(result.price)
+            )
+            primary.quantity = total_qty
+            primary.entry_price = entry_price
+            primary.current_price = result.price
+            primary.leverage = decision.suggested_leverage
+            primary.unrealized_pnl = (
+                (result.price - entry_price) * total_qty
+                if side == "long"
+                else (entry_price - result.price) * total_qty
+            )
+            primary.realized_pnl = float(getattr(primary, "realized_pnl", 0.0) or 0.0)
+            primary.stop_loss_price = (
+                entry_price * (1 - decision.stop_loss_pct)
+                if side == "long"
+                else entry_price * (1 + decision.stop_loss_pct)
+            )
+            primary.take_profit_price = (
+                entry_price * (1 + decision.take_profit_pct)
+                if side == "long"
+                else entry_price * (1 - decision.take_profit_pct)
+            )
+            primary.is_open = True
+            if okx_inst_id:
+                primary.okx_inst_id = okx_inst_id
+            if okx_pos_id:
+                primary.okx_pos_id = okx_pos_id
+            if entry_exchange_order_id:
+                primary.entry_exchange_order_id = _merge_exchange_order_ids(
+                    getattr(primary, "entry_exchange_order_id", None),
+                    entry_exchange_order_id,
+                )
+            return
         await repo.open_position(payload)
 
     async def _persist_exit(
@@ -285,10 +392,14 @@ class PositionExecutionPersistenceService:
                 close_qty = position.quantity
             close_fee = self._proportional_fee(result.fee, close_qty, result.quantity)
             entry_fee = await self._entry_fee_provider(session, position, close_qty)
-            if side == "long":
-                gross_pnl = (result.price - position.entry_price) * close_qty
-            else:
-                gross_pnl = (position.entry_price - result.price) * close_qty
+            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+                side=side,
+                entry_price=position.entry_price,
+                exit_price=result.price,
+                close_qty=close_qty,
+                okx_payload=getattr(result, "raw_response", None),
+                okx_total_qty=result.quantity,
+            )
             pnl = gross_pnl - entry_fee - close_fee
             total_pnl += pnl
             if not closes_position:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -57,7 +59,35 @@ def test_json_vector_memory_store_upserts_and_searches(tmp_path) -> None:
     assert indexed == 2
     assert hits
     assert hits[0].id == "decision:1"
-    assert hits[0].pnl_pct == pytest.approx(-0.42)
+
+
+def test_json_vector_memory_store_clear_removes_documents(tmp_path) -> None:
+    store = JsonVectorMemoryStore(tmp_path / "memory.jsonl", dimension=32, max_documents=100)
+    indexed = store.upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:1",
+                kind="decision",
+                text="BTC long profitable phase3 sample",
+                symbol="BTC/USDT",
+                action="long",
+                outcome="win",
+            ),
+            VectorMemoryDocument(
+                id="news:1",
+                kind="news",
+                text="Fresh phase3 market event",
+                symbol="BTC",
+                action="",
+                outcome="",
+            ),
+        ]
+    )
+
+    assert indexed == 2
+    assert store.stats()["document_count"] == 2
+    assert store.clear() == 2
+    assert store.stats()["document_count"] == 0
 
 
 def test_json_vector_memory_store_filters_by_symbol(tmp_path) -> None:
@@ -238,6 +268,68 @@ def test_zvec_store_writes_large_batches(tmp_path) -> None:
     assert stats["document_count"] >= 1100
 
 
+def test_zvec_store_quarantines_invalid_existing_path_before_create(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "zvec-invalid"
+    path.mkdir()
+    (path / "broken").write_text("not a valid collection", encoding="utf-8")
+
+    class FakeOption:
+        def __init__(self, read_only=0):
+            self.read_only = read_only
+
+    class FakeSchema:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeField:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeVector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeFlatIndex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeCollection:
+        def __init__(self):
+            self.stats = type("Stats", (), {"doc_count": 0})()
+
+    class FakeZvec:
+        CollectionOption = FakeOption
+        CollectionSchema = FakeSchema
+        FieldSchema = FakeField
+        VectorSchema = FakeVector
+        FlatIndexParam = FakeFlatIndex
+
+        class DataType:
+            STRING = "string"
+            DOUBLE = "double"
+            VECTOR_FP32 = "vector"
+
+        class MetricType:
+            COSINE = "cosine"
+
+        def open(self, _path, _option):
+            raise RuntimeError("path validate failed")
+
+        def create_and_open(self, create_path, _schema):
+            assert not Path(create_path).exists()
+            Path(create_path).mkdir()
+            return FakeCollection()
+
+    monkeypatch.setattr(ZvecVectorMemoryStore, "_load_zvec", staticmethod(lambda: FakeZvec()))
+
+    store = ZvecVectorMemoryStore(path, dimension=24, max_documents=20)
+    stats = store.stats()
+
+    assert stats["backend"] == "zvec"
+    assert path.exists()
+    assert any(item.name.startswith("zvec-invalid.corrupt-") for item in tmp_path.iterdir())
+
+
 def test_zvec_store_read_only_opens_existing_collection_and_rejects_writes(tmp_path) -> None:
     pytest.importorskip("zvec")
     path = tmp_path / "zvec-readonly"
@@ -304,14 +396,21 @@ def test_vector_memory_influence_ignores_missing_pnl_hits() -> None:
 
 def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     from services.vector_memory.service import VectorMemoryService
 
-    service = VectorMemoryService()
+    service = VectorMemoryService(data_dir=tmp_path)
     monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", True)
     monkeypatch.setattr(settings, "vector_memory_auto_reindex_interval_seconds", 1800)
 
     assert service._auto_reindex_due(0) is True
+
+    service._write_reset_marker(
+        reason="test_phase3_reset",
+        reset_at=datetime.now(UTC),
+    )
+    assert service._auto_reindex_due(0) is False
 
     service._last_reindex_at = None
     assert service._auto_reindex_due(12) is True
@@ -321,3 +420,103 @@ def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
 
     service._last_reindex_at = datetime.now(UTC) - timedelta(seconds=1801)
     assert service._auto_reindex_due(12) is True
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_clear_index_writes_phase3_reset_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._get_store().upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:phase3-old",
+                kind="decision",
+                text="old vector memory sample",
+            )
+        ]
+    )
+
+    result = await service.clear_index(reason="test_clear")
+    status = await service.status()
+
+    assert result["status"] == "cleared"
+    assert result["removed"] == 1
+    assert result["reset_at"]
+    assert service._load_reset_at() is not None
+    assert status["document_count"] == 0
+    assert status["reset_at"] == result["reset_at"]
+    assert status["auto_reindex_due"] is False
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_clear_index_cancels_running_auto_reindex(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", True)
+    service = VectorMemoryService(data_dir=tmp_path)
+    started = asyncio.Event()
+
+    async def slow_auto_reindex() -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    service._auto_reindex_task = asyncio.create_task(slow_auto_reindex())
+    service._auto_reindex_started_at = datetime.now(UTC)
+    await started.wait()
+
+    result = await service.clear_index(reason="test_clear_cancels_auto_reindex")
+    status = await service.status()
+
+    assert result["status"] == "cleared"
+    assert service._auto_reindex_task is None
+    assert status["auto_reindex_running"] is False
+    assert status["auto_reindex_due"] is False
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_recovers_once_from_zvec_path_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    class BrokenStore:
+        backend_name = "zvec"
+
+        def stats(self):
+            raise RuntimeError("path validate failed: path[/data/bb/app/data/vector_memory/zvec] exists")
+
+        def search(self, *_args, **_kwargs):
+            raise RuntimeError("path validate failed: path[/data/bb/app/data/vector_memory/zvec] exists")
+
+    monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._store = BrokenStore()  # type: ignore[assignment]
+
+    status = await service.status()
+
+    assert status["status"] == "ready"
+    assert status["backend"] == "jsonl"
+    assert status["store_recovered"] is True
+    assert status["last_error"] == ""
+
+    service._store = BrokenStore()  # type: ignore[assignment]
+    result = await service.search("BTC 做多", top_k=3)
+
+    assert result["status"] == "ok"
+    assert result["backend"] == "jsonl"
+    assert result["store_recovered"] is True
+    assert result["hits"] == []

@@ -18,6 +18,7 @@ from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryLossCooldownParams
 
 SessionFactory = Callable[[], Any]
@@ -132,6 +133,8 @@ class SymbolSidePerformanceService:
         for pos in rows:
             closed_at = _ensure_utc(getattr(pos, "closed_at", None))
             if closed_at is None or closed_at < window_start_utc:
+                continue
+            if not closed_position_trade_fact_trusted(pos):
                 continue
             symbol = self._normalize_symbol(getattr(pos, "symbol", None)) or str(
                 getattr(pos, "symbol", "") or ""

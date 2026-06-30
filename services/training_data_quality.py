@@ -11,6 +11,16 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
 DATA_QUALITY_VERSION = "2026-06-23.v3"
+PHASE3_TRAINING_POLICY = "clean_training_view_only"
+HIGH_CONTAMINATION_EXCLUDED_RATIO = 0.05
+HIGH_CONTAMINATION_BLOCKED_REASON_RATIO = 0.02
+MEDIUM_CONTAMINATION_EXCLUDED_RATIO = 0.005
+MIN_PROMOTION_SHADOW_SAMPLES = 30
+MIN_DIRECTION_HIT_RATE = 0.48
+MIN_AVG_REALIZED_RETURN_PCT = 0.02
+MAX_FALSE_SIGNAL_LOSS_PCT = -0.18
+MIN_TIMESERIES_SEQUENCE_LENGTH = 30
+MAX_WORST_SAMPLE_COUNT = 8
 QualityStatus = Literal["included", "downweighted", "excluded"]
 SampleKind = Literal["shadow", "trade", "sequence", "text_sentiment"]
 _RETRAIN_TARGETS = (
@@ -18,6 +28,14 @@ _RETRAIN_TARGETS = (
     "local_ai_tools",
     "vector_memory_reindex",
 )
+_TRADE_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
+_TRADE_REPAIR_SOURCES = {
+    "missing_closed_position_repair",
+    "okx_native_full_close_fill_correction",
+    "okx_order_pair_repair",
+    "okx_orphan_position_quarantine",
+    "okx_position_link_repair",
+}
 
 
 @dataclass(frozen=True)
@@ -89,6 +107,18 @@ def _sample_guard_reasons(sample: dict[str, Any], *text_values: Any) -> list[str
     if _has_future_leakage(sample, *text_values):
         reasons.append("future_leakage")
     return reasons
+
+
+def _repair_provenance_reason(sample: dict[str, Any]) -> str:
+    repair_source = _safe_str(sample.get("trade_fact_repair_source")).lower()
+    reflection_source = _safe_str(sample.get("reflection_source")).lower()
+    for candidate in (repair_source, reflection_source):
+        if candidate in _TRADE_REPAIR_SOURCES:
+            return candidate
+    for candidate in (repair_source, reflection_source):
+        if candidate and any(token in candidate for token in _TRADE_REPAIR_SOURCE_MARKERS):
+            return candidate
+    return ""
 
 
 def _is_duplicate_sample(sample: dict[str, Any]) -> bool:
@@ -287,6 +317,18 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if source in set(_QUALITY_PARAMS.manual_trade_sources) or "manual" in model_name:
         return _final_assessment(0.0, ["manual_or_test_trade"], exclude=True)
 
+    trust_reason = _safe_str(sample.get("trade_fact_trust_reason"))
+    if trust_reason:
+        return _final_assessment(0.0, [f"untrusted_trade_fact:{trust_reason}"], exclude=True)
+
+    repair_source = _repair_provenance_reason(sample)
+    if repair_source:
+        return _final_assessment(
+            0.0,
+            [f"historical_reconciliation_repair:{repair_source}"],
+            exclude=True,
+        )
+
     execution_mode = _safe_str(sample.get("execution_mode")).lower()
     if execution_mode and execution_mode not in {"paper", "live", "sim", "simulation"}:
         return _final_assessment(0.0, ["execution_mode_mismatch"], exclude=True)
@@ -433,6 +475,420 @@ def _sample_source(sample: dict[str, Any], kind: str) -> str:
     return source or platform
 
 
+def _sample_best_direction(sample: dict[str, Any]) -> str:
+    best = _safe_str(sample.get("best_action")).lower()
+    if best in {"long", "short"}:
+        return best
+    long_return = _safe_float(sample.get("long_return_pct"), None)
+    short_return = _safe_float(sample.get("short_return_pct"), None)
+    if long_return is None or short_return is None:
+        return ""
+    if long_return == short_return:
+        return "flat"
+    return "long" if long_return > short_return else "short"
+
+
+def _sample_symbol(sample: dict[str, Any]) -> str:
+    return _safe_str(sample.get("symbol")) or _safe_str(_features(sample).get("symbol"))
+
+
+def _actual_return_for_side(sample: dict[str, Any], side: str) -> float | None:
+    if side == "long":
+        return _safe_float(sample.get("long_return_pct"), None)
+    if side == "short":
+        return _safe_float(sample.get("short_return_pct"), None)
+    return None
+
+
+def _shadow_tool_direction(tool: dict[str, Any]) -> str:
+    side = _safe_str(
+        tool.get("timesfm_shadow_side")
+        or tool.get("chronos_shadow_side")
+        or tool.get("best_side")
+        or tool.get("side")
+    ).lower()
+    if side in {"long", "short"}:
+        return side
+    direction = _safe_str(tool.get("direction")).lower()
+    return "long" if direction == "up" else "short" if direction == "down" else ""
+
+
+def _professional_shadow_actual(tool: dict[str, Any]) -> bool:
+    professional = tool.get("professional_model_shadow")
+    if not isinstance(professional, dict):
+        return False
+    if bool(professional.get("actual_inference")):
+        return True
+    for key in ("primary_shadow_result", "challenger_shadow_result", "shadow_result"):
+        result = professional.get(key)
+        if isinstance(result, dict) and result.get("actual_inference"):
+            return True
+    return False
+
+
+def _baseline_only_shadow(tool: dict[str, Any]) -> bool:
+    professional = tool.get("professional_model_shadow")
+    if not isinstance(professional, dict):
+        return False
+    if bool(tool.get("specialist_inference_active")) or _professional_shadow_actual(tool):
+        return False
+    return bool(professional.get("baseline_response"))
+
+
+def _shadow_expected_return(tool: dict[str, Any]) -> float | None:
+    for key in (
+        "timesfm_shadow_expected_return_pct",
+        "timesfm_shadow_expected_move_pct",
+        "chronos_shadow_expected_return_pct",
+        "chronos_shadow_expected_move_pct",
+        "expected_return_pct",
+        "expected_move_pct",
+    ):
+        value = _safe_float(tool.get(key), None)
+        if value is not None:
+            return value
+    professional = tool.get("professional_model_shadow")
+    if isinstance(professional, dict):
+        result = professional.get("shadow_result")
+        if isinstance(result, dict):
+            for key in ("expected_return_pct", "expected_move_pct"):
+                value = _safe_float(result.get(key), None)
+                if value is not None:
+                    return value
+    return None
+
+
+def _shadow_result_direction(result: dict[str, Any]) -> str:
+    side = _safe_str(result.get("best_side") or result.get("side")).lower()
+    if side in {"long", "short"}:
+        return side
+    direction = _safe_str(result.get("direction")).lower()
+    return "long" if direction == "up" else "short" if direction == "down" else ""
+
+
+def _shadow_result_expected_return(result: dict[str, Any]) -> float | None:
+    for key in ("expected_return_pct", "expected_move_pct"):
+        value = _safe_float(result.get(key), None)
+        if value is not None:
+            return value
+    return None
+
+
+def _shadow_result_actual(result: Any) -> bool:
+    return bool(isinstance(result, dict) and result.get("actual_inference"))
+
+
+def _shadow_tool_model_name(tool_name: str, tool: dict[str, Any]) -> str:
+    professional = tool.get("professional_model_shadow")
+    if isinstance(professional, dict):
+        result = professional.get("shadow_result")
+        if isinstance(result, dict):
+            model = _safe_str(result.get("model"))
+            if model:
+                return model
+    if (
+        tool_name == "time_series_prediction"
+        and tool.get("timesfm_shadow_expected_return_pct") is not None
+    ):
+        return "timesfm_shadow_challenger"
+    if (
+        tool_name == "time_series_prediction"
+        and tool.get("chronos_shadow_expected_return_pct") is not None
+    ):
+        return "chronos_shadow_primary"
+    return _safe_str(tool.get("model")) or tool_name
+
+
+def _shadow_model_key(tool_name: str, model_name: str) -> str:
+    return tool_name if not model_name or model_name == tool_name else f"{tool_name}:{model_name}"
+
+
+def _time_series_shadow_candidates(tool: dict[str, Any]) -> list[dict[str, Any]]:
+    professional = tool.get("professional_model_shadow")
+    if not isinstance(professional, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for key in ("primary_shadow_result", "challenger_shadow_result"):
+        result = professional.get(key)
+        if not isinstance(result, dict) or not _shadow_result_actual(result):
+            continue
+        model = _safe_str(result.get("model"))
+        if not model:
+            continue
+        candidates.append(
+            {
+                "tool": "time_series_prediction",
+                "model": model,
+                "direction": _shadow_result_direction(result),
+                "expected_return_pct": _shadow_result_expected_return(result),
+                "actual_inference": True,
+                "specialist_inference_active": bool(tool.get("specialist_inference_active")),
+                "sequence_length": int(_safe_float(result.get("sequence_length"), 0.0) or 0),
+                "legacy_mixed_shadow": False,
+            }
+        )
+    if candidates:
+        return candidates
+
+    result = professional.get("shadow_result")
+    if not isinstance(result, dict) or not _shadow_result_actual(result):
+        return []
+    model = _safe_str(result.get("model"))
+    if not model:
+        return []
+    expected_return = _shadow_result_expected_return(result)
+    if expected_return is None:
+        expected_return = _shadow_expected_return(tool)
+    return [
+        {
+            "tool": "time_series_prediction",
+            "model": model,
+            "direction": _shadow_result_direction(result) or _shadow_tool_direction(tool),
+            "expected_return_pct": expected_return,
+            "actual_inference": True,
+            "specialist_inference_active": bool(tool.get("specialist_inference_active")),
+            "sequence_length": int(_safe_float(result.get("sequence_length"), 0.0) or 0),
+            "legacy_mixed_shadow": True,
+        }
+    ]
+
+
+def _shadow_tool_candidates(tool_name: str, tool: dict[str, Any]) -> list[dict[str, Any]]:
+    if tool_name == "time_series_prediction":
+        candidates = _time_series_shadow_candidates(tool)
+        if candidates:
+            return candidates
+    return [
+        {
+            "tool": tool_name,
+            "model": _shadow_tool_model_name(tool_name, tool),
+            "direction": _shadow_tool_direction(tool),
+            "expected_return_pct": _shadow_expected_return(tool),
+            "actual_inference": _professional_shadow_actual(tool)
+            or bool(tool.get("specialist_inference_active")),
+            "specialist_inference_active": bool(tool.get("specialist_inference_active")),
+            "sequence_length": 0,
+            "legacy_mixed_shadow": False,
+        }
+    ]
+
+
+def _finalize_shadow_model_row(row: dict[str, Any]) -> dict[str, Any]:
+    direction_count = int(row.get("direction_count") or 0)
+    expected_count = int(row.get("shadow_expected_return_count") or 0)
+    realized_sum = float(row.get("realized_return_sum_pct") or 0.0)
+    hit_rate = float(row.get("direction_hit_count") or 0) / max(direction_count, 1)
+    avg_realized = realized_sum / max(direction_count, 1)
+    avg_expected = float(row.get("shadow_expected_return_sum") or 0.0) / max(expected_count, 1)
+    blockers: list[str] = []
+    if int(row.get("actual_inference_count") or 0) < MIN_PROMOTION_SHADOW_SAMPLES:
+        blockers.append("specialist_shadow_sample_floor_not_met")
+    if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and hit_rate < MIN_DIRECTION_HIT_RATE:
+        blockers.append("direction_hit_rate_below_floor")
+    if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and avg_realized < MIN_AVG_REALIZED_RETURN_PCT:
+        blockers.append("avg_realized_return_below_floor")
+    worst = row.get("worst_realized_return_pct")
+    if worst is not None and float(worst) <= MAX_FALSE_SIGNAL_LOSS_PCT:
+        blockers.append("false_signal_loss_exceeds_floor")
+    if int(row.get("sequence_too_short_count") or 0) > 0:
+        blockers.append("timeseries_sequence_too_short_for_promotion")
+    blocker_counts = dict(Counter(blockers))
+    row["direction_hit_rate"] = round(hit_rate, 4)
+    row["avg_shadow_expected_return_pct"] = round(avg_expected, 6)
+    row["avg_expected_return_pct"] = round(avg_expected, 6)
+    row["avg_realized_return_pct"] = round(avg_realized, 6)
+    row["false_signal_count"] = int(row.get("false_signal_count") or 0)
+    row["tail_loss_count"] = int(row.get("tail_loss_count") or 0)
+    row["tail_loss_symbols"] = [
+        {"symbol": symbol, "count": count}
+        for symbol, count in row["tail_loss_symbols"].most_common(10)
+    ]
+    row["worst_samples"] = list(row.get("worst_samples") or [])[:MAX_WORST_SAMPLE_COUNT]
+    row["sequence_too_short_count"] = int(row.get("sequence_too_short_count") or 0)
+    row["legacy_mixed_shadow_count"] = int(row.get("legacy_mixed_shadow_count") or 0)
+    row["legacy_quarantined_count"] = int(row.get("legacy_quarantined_count") or 0)
+    row["legacy_sequence_too_short_count"] = int(
+        row.get("legacy_sequence_too_short_count") or 0
+    )
+    row["promotion_ready"] = not bool(blockers)
+    row["promotion_blockers"] = blockers
+    row["blockers"] = blockers
+    row["blocked_reasons"] = blockers
+    row["blocked_reason_counts"] = blocker_counts
+    row["promotion_gate"] = {
+        "minimum_actual_inference_samples": MIN_PROMOTION_SHADOW_SAMPLES,
+        "minimum_direction_hit_rate": MIN_DIRECTION_HIT_RATE,
+        "minimum_avg_realized_return_pct": MIN_AVG_REALIZED_RETURN_PCT,
+        "max_false_signal_loss_pct": MAX_FALSE_SIGNAL_LOSS_PCT,
+        "minimum_timeseries_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+        "actual_inference_count": int(row.get("actual_inference_count") or 0),
+        "direction_count": direction_count,
+        "direction_hit_rate": round(hit_rate, 4),
+        "avg_realized_return_pct": round(avg_realized, 6),
+        "worst_realized_return_pct": row.get("worst_realized_return_pct"),
+        "tail_loss_count": row["tail_loss_count"],
+        "sequence_too_short_count": row["sequence_too_short_count"],
+        "legacy_mixed_shadow_count": row["legacy_mixed_shadow_count"],
+        "legacy_quarantined_count": row["legacy_quarantined_count"],
+        "legacy_sequence_too_short_count": row["legacy_sequence_too_short_count"],
+    }
+    row.pop("realized_return_sum_pct", None)
+    row.pop("shadow_expected_return_sum", None)
+    return row
+
+
+def _compact_worst_shadow_sample(
+    sample: dict[str, Any],
+    *,
+    tool_name: str,
+    model_name: str,
+    predicted_side: str,
+    actual_side: str,
+    actual_return: float,
+    expected_return: float | None,
+    sequence_length: int,
+    legacy_mixed_shadow: bool,
+) -> dict[str, Any]:
+    return {
+        "shadow_backtest_id": sample.get("id"),
+        "symbol": _sample_symbol(sample),
+        "tool": tool_name,
+        "model": model_name,
+        "predicted_side": predicted_side,
+        "actual_best_side": actual_side,
+        "actual_return_pct": round(float(actual_return), 6),
+        "expected_return_pct": None if expected_return is None else round(float(expected_return), 6),
+        "long_return_pct": _safe_float(sample.get("long_return_pct"), None),
+        "short_return_pct": _safe_float(sample.get("short_return_pct"), None),
+        "sequence_length": sequence_length,
+        "legacy_mixed_shadow": bool(legacy_mixed_shadow),
+    }
+
+
+def _remember_worst_shadow_sample(row: dict[str, Any], sample: dict[str, Any]) -> None:
+    samples = row.setdefault("worst_samples", [])
+    samples.append(sample)
+    samples.sort(key=lambda item: float(item.get("actual_return_pct") or 0.0))
+    del samples[MAX_WORST_SAMPLE_COUNT:]
+
+
+def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    rows: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        features = _features(sample)
+        local_shadow = features.get("local_ai_tools_shadow")
+        if not isinstance(local_shadow, dict):
+            continue
+        actual_side = _sample_best_direction(sample)
+        for tool_name in ("profit_prediction", "time_series_prediction", "sentiment_analysis"):
+            tool = local_shadow.get(tool_name)
+            if not isinstance(tool, dict):
+                continue
+            if _baseline_only_shadow(tool):
+                continue
+            if not (bool(tool.get("specialist_inference_active")) or _professional_shadow_actual(tool)):
+                continue
+            for candidate in _shadow_tool_candidates(tool_name, tool):
+                if not candidate.get("actual_inference"):
+                    continue
+                model_name = _safe_str(candidate.get("model")) or _shadow_tool_model_name(tool_name, tool)
+                row_key = _shadow_model_key(tool_name, model_name)
+                row = rows.setdefault(
+                    row_key,
+                    {
+                        "tool": tool_name,
+                        "model": model_name,
+                        "model_key": row_key,
+                        "sample_count": 0,
+                        "actual_inference_count": 0,
+                        "direction_count": 0,
+                        "direction_hit_count": 0,
+                        "shadow_expected_return_sum": 0.0,
+                        "shadow_expected_return_count": 0,
+                        "realized_return_sum_pct": 0.0,
+                        "false_signal_count": 0,
+                        "worst_realized_return_pct": None,
+                        "best_realized_return_pct": None,
+                        "tail_loss_count": 0,
+                        "tail_loss_symbols": Counter(),
+                        "worst_samples": [],
+                        "specialist_inference_count": 0,
+                        "sequence_too_short_count": 0,
+                        "legacy_mixed_shadow_count": 0,
+                        "legacy_quarantined_count": 0,
+                        "legacy_sequence_too_short_count": 0,
+                    },
+                )
+                row["sample_count"] += 1
+                if bool(candidate.get("specialist_inference_active")):
+                    row["specialist_inference_count"] += 1
+                legacy_mixed_shadow = bool(candidate.get("legacy_mixed_shadow"))
+                if legacy_mixed_shadow:
+                    row["legacy_mixed_shadow_count"] += 1
+                sequence_length = int(candidate.get("sequence_length") or 0)
+                sequence_too_short = (
+                    tool_name == "time_series_prediction"
+                    and sequence_length < MIN_TIMESERIES_SEQUENCE_LENGTH
+                )
+                if sequence_too_short:
+                    row["legacy_sequence_too_short_count"] += 1
+                if legacy_mixed_shadow or sequence_too_short:
+                    row["legacy_quarantined_count"] += 1
+                    continue
+                row["actual_inference_count"] += 1
+                direction = _safe_str(candidate.get("direction")).lower()
+                if direction in {"long", "short"}:
+                    actual_return = _actual_return_for_side(sample, direction)
+                    if actual_return is not None:
+                        row["direction_count"] += 1
+                        row["realized_return_sum_pct"] += actual_return
+                        if actual_side == direction:
+                            row["direction_hit_count"] += 1
+                        elif actual_return < 0:
+                            row["false_signal_count"] += 1
+                        worst = row.get("worst_realized_return_pct")
+                        best = row.get("best_realized_return_pct")
+                        row["worst_realized_return_pct"] = (
+                            round(actual_return, 6)
+                            if worst is None
+                            else round(min(float(worst), actual_return), 6)
+                        )
+                        row["best_realized_return_pct"] = (
+                            round(actual_return, 6)
+                            if best is None
+                            else round(max(float(best), actual_return), 6)
+                        )
+                        symbol = _sample_symbol(sample)
+                        if actual_return <= MAX_FALSE_SIGNAL_LOSS_PCT:
+                            row["tail_loss_count"] += 1
+                            if symbol:
+                                row["tail_loss_symbols"][symbol] += 1
+                        _remember_worst_shadow_sample(
+                            row,
+                            _compact_worst_shadow_sample(
+                                sample,
+                                tool_name=tool_name,
+                                model_name=model_name,
+                                predicted_side=direction,
+                                actual_side=actual_side,
+                                actual_return=actual_return,
+                                expected_return=_safe_float(
+                                    candidate.get("expected_return_pct"),
+                                    None,
+                                ),
+                                sequence_length=sequence_length,
+                                legacy_mixed_shadow=legacy_mixed_shadow,
+                            ),
+                        )
+                expected = _safe_float(candidate.get("expected_return_pct"), None)
+                if expected is not None:
+                    row["shadow_expected_return_sum"] += expected
+                    row["shadow_expected_return_count"] += 1
+    for row in rows.values():
+        _finalize_shadow_model_row(row)
+    return rows
+
+
 def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     by_kind: dict[str, Any] = {}
     totals = Counter()
@@ -499,6 +955,7 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
         "data_quality_version": DATA_QUALITY_VERSION,
         "policy": asdict(DEFAULT_TRADING_PARAMS.training_data_quality),
         "by_kind": by_kind,
+        "specialist_shadow_models": _shadow_model_report(samples_by_kind.get("shadow", [])),
         "totals": {
             "total": total_count,
             "included": int(totals.get("included", 0)),
@@ -539,6 +996,7 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
     excluded = int(totals.get("excluded") or 0)
     trainable = included + downweighted
     effective_weight_ratio = float(totals.get("effective_weight_ratio") or 0.0)
+    excluded_ratio = excluded / max(total, 1)
     top_reasons = quality.get("top_reasons") if isinstance(quality.get("top_reasons"), list) else []
     has_contamination = bool(excluded or downweighted or top_reasons)
     blocked_reason_count = sum(
@@ -556,6 +1014,13 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
             )
         )
     )
+    blocked_reason_ratio = blocked_reason_count / max(total, 1)
+    contamination_risk = _contamination_risk(
+        has_contamination=has_contamination,
+        excluded_ratio=excluded_ratio,
+        blocked_reason_ratio=blocked_reason_ratio,
+        effective_weight_ratio=effective_weight_ratio,
+    )
     status = "clean"
     if excluded:
         status = "quarantined"
@@ -564,6 +1029,7 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": status,
         "data_quality_version": quality.get("data_quality_version") or DATA_QUALITY_VERSION,
+        "training_policy": PHASE3_TRAINING_POLICY,
         "raw_records_preserved": True,
         "cleanup_mode": "quarantine_not_delete",
         "quarantine_applied": bool(excluded),
@@ -572,9 +1038,9 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
         "excluded_sample_count": excluded,
         "downweighted_sample_count": downweighted,
         "effective_weight_ratio": round(effective_weight_ratio, 4),
-        "contamination_risk": (
-            "high" if blocked_reason_count else "medium" if has_contamination else "low"
-        ),
+        "excluded_ratio": round(excluded_ratio, 6),
+        "blocked_reason_ratio": round(blocked_reason_ratio, 6),
+        "contamination_risk": contamination_risk,
         "blocked_reason_count": blocked_reason_count,
         "requires_artifact_refresh": bool(has_contamination),
         "refresh_targets": list(_RETRAIN_TARGETS),
@@ -588,6 +1054,26 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
             "清洗策略变更后应重训本地 ML、服务器量化工具，并重建向量索引。",
         ],
     }
+
+
+def _contamination_risk(
+    *,
+    has_contamination: bool,
+    excluded_ratio: float,
+    blocked_reason_ratio: float,
+    effective_weight_ratio: float,
+) -> str:
+    if not has_contamination:
+        return "low"
+    if (
+        excluded_ratio >= HIGH_CONTAMINATION_EXCLUDED_RATIO
+        or blocked_reason_ratio >= HIGH_CONTAMINATION_BLOCKED_REASON_RATIO
+        or (effective_weight_ratio > 0 and effective_weight_ratio < 0.5)
+    ):
+        return "high"
+    if excluded_ratio >= MEDIUM_CONTAMINATION_EXCLUDED_RATIO or blocked_reason_ratio > 0:
+        return "medium"
+    return "low"
 
 
 def annotate_training_payload(

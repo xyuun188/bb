@@ -4,9 +4,10 @@ The online platform must not call the model server through fragile public port
 forwarding for high-volume POST traffic. This process runs on the platform
 server and forwards loopback-only ports to the model server's loopback services:
 
-- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (qwen3-14b-trade)
-- 127.0.0.1:18001 -> model server 127.0.0.1:8001 (local AI tools)
+- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (qwen3-32b-trade)
+- 127.0.0.1:18001 -> model server 127.0.0.1:8101 (phase3 quant API health)
 - 127.0.0.1:18002 -> model server 127.0.0.1:8002 (deepseek-r1-14b-risk)
+- 127.0.0.1:18003 -> model server 127.0.0.1:8003 (BB-FinQuant-Expert-14B)
 
 Model-server SSH credentials are loaded from encrypted secure settings on the
 platform. Secrets are never printed.
@@ -65,6 +66,21 @@ class ForwardServer(socketserver.ThreadingTCPServer):
 class ForwardHandler(socketserver.BaseRequestHandler):
     """Bidirectionally copy bytes between a local socket and an SSH channel."""
 
+    @staticmethod
+    def _recv_or_empty(sock: Any) -> bytes:
+        try:
+            return sock.recv(BUFFER_SIZE)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return b""
+
+    @staticmethod
+    def _sendall_or_closed(sock: Any, data: bytes) -> bool:
+        try:
+            sock.sendall(data)
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return False
+
     def handle(self) -> None:
         server = self.server
         assert isinstance(server, ForwardServer)
@@ -91,15 +107,17 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                     SELECT_TIMEOUT_SECONDS,
                 )
                 if self.request in readable:
-                    data = self.request.recv(BUFFER_SIZE)
+                    data = self._recv_or_empty(self.request)
                     if not data:
                         break
-                    channel.sendall(data)
+                    if not self._sendall_or_closed(channel, data):
+                        break
                 if channel in readable:
-                    data = channel.recv(BUFFER_SIZE)
+                    data = self._recv_or_empty(channel)
                     if not data:
                         break
-                    self.request.sendall(data)
+                    if not self._sendall_or_closed(self.request, data):
+                        break
         finally:
             channel.close()
             self.request.close()
@@ -110,18 +128,18 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
 
     return [
         TunnelSpec(
-            name="qwen3-14b-trade",
+            name="qwen3-32b-trade",
             local_host=local_host,
             local_port=18_000,
             remote_host="127.0.0.1",
             remote_port=8000,
         ),
         TunnelSpec(
-            name="local-ai-tools",
+            name="phase3-quant-api",
             local_host=local_host,
             local_port=18_001,
             remote_host="127.0.0.1",
-            remote_port=8001,
+            remote_port=8101,
         ),
         TunnelSpec(
             name="deepseek-r1-14b-risk",
@@ -129,6 +147,13 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
             local_port=18_002,
             remote_host="127.0.0.1",
             remote_port=8002,
+        ),
+        TunnelSpec(
+            name="BB-FinQuant-Expert-14B",
+            local_host=local_host,
+            local_port=18_003,
+            remote_host="127.0.0.1",
+            remote_port=8003,
         ),
     ]
 
@@ -189,8 +214,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local-host", default="127.0.0.1")
     parser.add_argument("--qwen-local-port", type=parse_port, default=18_000)
-    parser.add_argument("--tools-local-port", type=parse_port, default=18_001)
+    parser.add_argument("--quant-api-local-port", type=parse_port, default=18_001)
     parser.add_argument("--deepseek-local-port", type=parse_port, default=18_002)
+    parser.add_argument("--expert-local-port", type=parse_port, default=18_003)
     args = parser.parse_args(argv)
 
     specs = build_default_tunnels(local_host=args.local_host)
@@ -199,9 +225,10 @@ def main(argv: list[str] | None = None) -> None:
             name=spec.name,
             local_host=spec.local_host,
             local_port={
-                "qwen3-14b-trade": args.qwen_local_port,
-                "local-ai-tools": args.tools_local_port,
+                "qwen3-32b-trade": args.qwen_local_port,
+                "phase3-quant-api": args.quant_api_local_port,
                 "deepseek-r1-14b-risk": args.deepseek_local_port,
+                "BB-FinQuant-Expert-14B": args.expert_local_port,
             }[spec.name],
             remote_host=spec.remote_host,
             remote_port=spec.remote_port,

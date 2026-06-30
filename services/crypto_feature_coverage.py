@@ -97,10 +97,11 @@ def summarize_crypto_feature_coverage(
     core_blocked = any(
         row["key"] in CORE_MARKET_FEATURES for row in feature_rows if row["status"] == "missing"
     )
+    no_feature_snapshots = not snapshots
     status = "ok"
-    if core_blocked or not snapshots:
+    if core_blocked:
         status = "critical"
-    elif missing or stale or low_confidence:
+    elif no_feature_snapshots or missing or stale or low_confidence:
         status = "warning"
 
     return {
@@ -112,6 +113,7 @@ def summarize_crypto_feature_coverage(
         "generated_at": current.isoformat(),
         "decision_sample_count": len(decisions),
         "feature_snapshot_count": len(snapshots),
+        "waiting_for_decision_samples": bool(no_feature_snapshots and not core_blocked),
         "latest_feature_snapshot_at": _iso(latest_snapshot_at),
         "symbols_observed": symbols,
         "features": feature_rows,

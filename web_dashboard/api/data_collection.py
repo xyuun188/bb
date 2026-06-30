@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +19,7 @@ from config.settings import settings
 from core.safe_output import safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from data_feed.external_event_scraper import (
+    EXTERNAL_EVENT_MAX_SOURCES_LIMIT,
     RECOMMENDED_EXTERNAL_EVENT_SOURCES,
     SCRAPLING_SOURCE_PREFIX,
     _normalize_source,
@@ -30,6 +32,8 @@ from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Position
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
+from services.okx_training_gate import okx_training_refresh_gate
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
@@ -84,6 +88,18 @@ def _safe_status_section(
     return payload
 
 
+def _safe_int_count(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 0)
+
+
+def _max_count(*values: Any) -> int:
+    return max((_safe_int_count(value) for value in values), default=0)
+
+
 def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
     if isinstance(result, BaseException):
         logger.warning(
@@ -103,6 +119,14 @@ def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
     payload["live_signal_mutation"] = False
     payload["can_missing_features_drive_live_entry"] = False
     payload["feature_defaults_are_neutral"] = True
+    payload["phase3_policy"] = "missing_or_stale_features_are_neutral_blocked"
+    payload["cold_start_safe"] = bool(
+        payload.get("waiting_for_decision_samples")
+        or payload.get("decision_sample_count") in {0, "0", None}
+    )
+    payload["display_message"] = (
+        "三期冷启动期间缺失/过期特征会展示为待补齐，但默认中性阻断，不能直接驱动开仓。"
+    )
     policy = payload.get("feature_contribution_policy")
     if not isinstance(policy, dict):
         policy = {}
@@ -138,6 +162,20 @@ def _skipped_feature_coverage_status() -> dict[str, Any]:
     }
 
 
+async def _run_status_section(
+    factory: Callable[[], Awaitable[dict[str, Any]]],
+    *,
+    timeout: float | None = None,
+) -> dict[str, Any] | Exception:
+    try:
+        result = factory()
+        if timeout is not None:
+            return await asyncio.wait_for(result, timeout=timeout)
+        return await result
+    except Exception as exc:
+        return exc
+
+
 def _visible_local_ai_training_status(
     raw_status: str,
     *,
@@ -150,6 +188,11 @@ def _visible_local_ai_training_status(
     normalized = str(raw_status or "unknown").lower()
     if available and model_bundle_available and normalized in {"unknown", "learning_only"}:
         return "ready"
+    if available and normalized in {
+        "connected_trading_disabled",
+        "heuristic_fallback_available",
+    }:
+        return "learning_only"
     if normalized == "unknown" and available:
         return "learning_only" if shadow_count or trade_count or text_count else "ready"
     return normalized
@@ -479,6 +522,143 @@ async def _training_sample_quality() -> dict[str, Any]:
 
 
 async def _local_ai_training_status() -> dict[str, Any]:
+    normalized_status = await _dashboard_local_ai_tools_status()
+    if (
+        isinstance(normalized_status, dict)
+        and normalized_status.get("available") is not False
+        and _max_count(
+            normalized_status.get("phase3_clean_trainable_shadow_sample_count"),
+            normalized_status.get("phase3_clean_completed_shadow_sample_count"),
+            normalized_status.get("shadow_sample_count"),
+        )
+        > 0
+    ):
+        status = normalized_status
+    else:
+        status = await _raw_local_ai_tools_status()
+        if not isinstance(status, dict):
+            return status
+        status = await _merge_dashboard_local_ai_tools_status(status)
+    if not isinstance(status, dict):
+        return {"available": False, "status": "invalid_status"}
+    original_raw_shadow_count = _safe_int_count(
+        status.get("service_model_window_shadow_sample_count")
+        or status.get("raw_shadow_sample_count")
+        or status.get("shadow_sample_count")
+    )
+    original_raw_trade_count = _safe_int_count(
+        status.get("service_model_window_trade_sample_count")
+        or status.get("raw_trade_sample_count")
+        or status.get("trade_sample_count")
+    )
+    original_text_count = _safe_int_count(status.get("text_sentiment_sample_count"))
+    raw_shadow_count = _max_count(
+        original_raw_shadow_count,
+        status.get("raw_shadow_sample_count"),
+        status.get("shadow_sample_count"),
+    )
+    raw_trade_count = _max_count(
+        original_raw_trade_count,
+        status.get("raw_trade_sample_count"),
+        status.get("trade_sample_count"),
+    )
+    text_count = _max_count(original_text_count, status.get("text_sentiment_sample_count"))
+    raw_status = str(status.get("status") or "unknown")
+    service_available = bool(status.get("service_available", status.get("available")))
+    visible_status = _visible_local_ai_training_status(
+        raw_status,
+        available=service_available,
+        model_bundle_available=bool(status.get("model_bundle_available")),
+        shadow_count=raw_shadow_count,
+        trade_count=raw_trade_count,
+        text_count=text_count,
+    )
+    governance_report = (
+        status.get("governance_report")
+        if isinstance(status.get("governance_report"), dict)
+        else {}
+    )
+    db_completed_shadow_count = await _phase3_completed_shadow_count()
+    db_completed_trade_count = await _phase3_completed_trade_count()
+    explicit_shadow_counts = [
+        status.get("phase3_clean_trainable_shadow_sample_count"),
+        status.get("phase3_clean_completed_shadow_sample_count"),
+        governance_report.get("phase3_clean_trainable_shadow_sample_count"),
+        governance_report.get("trainable_shadow_sample_count"),
+        governance_report.get("shadow_sample_count"),
+    ]
+    explicit_trade_counts = [
+        status.get("phase3_clean_trainable_trade_sample_count"),
+        status.get("phase3_clean_completed_trade_sample_count"),
+        status.get("trainable_trade_sample_count"),
+    ]
+    phase3_shadow_count = _max_count(*explicit_shadow_counts)
+    if phase3_shadow_count <= 0 and not any(value is not None for value in explicit_shadow_counts):
+        phase3_shadow_count = db_completed_shadow_count
+    phase3_trade_count = _max_count(*explicit_trade_counts)
+    if phase3_trade_count <= 0 and not any(value is not None for value in explicit_trade_counts):
+        phase3_trade_count = raw_trade_count if raw_trade_count > 0 and phase3_shadow_count > 0 else db_completed_trade_count
+    raw_shadow_count = max(raw_shadow_count, phase3_shadow_count)
+    raw_trade_count = max(raw_trade_count, phase3_trade_count)
+    return {
+        "available": service_available,
+        "status": visible_status,
+        "raw_status": raw_status,
+        "phase3_training_policy": "clean_training_view_only",
+        "legacy_data_policy": "excluded_from_phase3_training",
+        "legacy_data_training_allowed": False,
+        "raw_records_preserved": False,
+        "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+        "model_bundle_available": bool(status.get("model_bundle_available")),
+        "service_available": service_available,
+        "trained_at": status.get("trained_at"),
+        "training_mode": status.get("training_mode"),
+        "model_stage": status.get("model_stage"),
+        "evaluation_policy": (
+            status.get("evaluation_policy") if isinstance(status.get("evaluation_policy"), dict) else {}
+        ),
+        "promotion_flow": (
+            status.get("promotion_flow")
+            or (
+                status.get("evaluation_policy", {}).get("promotion_flow")
+                if isinstance(status.get("evaluation_policy"), dict)
+                else None
+            )
+        ),
+        "live_mutation": bool(
+            status.get("live_mutation")
+            or (
+                status.get("evaluation_policy", {}).get("live_mutation")
+                if isinstance(status.get("evaluation_policy"), dict)
+                else False
+            )
+        ),
+        "promotion_recommendation": (
+            status.get("promotion_recommendation")
+            if isinstance(status.get("promotion_recommendation"), dict)
+            else {}
+        ),
+        "shadow_sample_count": phase3_shadow_count,
+        "training_shadow_sample_count": phase3_shadow_count,
+        "raw_shadow_sample_count": raw_shadow_count,
+        "legacy_shadow_sample_count": max(raw_shadow_count - phase3_shadow_count, 0),
+        "trade_sample_count": phase3_trade_count,
+        "training_trade_sample_count": phase3_trade_count,
+        "raw_trade_sample_count": raw_trade_count,
+        "legacy_trade_sample_count": max(raw_trade_count - phase3_trade_count, 0),
+        "sequence_sample_count": _safe_int_count(status.get("sequence_sample_count")),
+        "text_sentiment_sample_count": text_count,
+        "completed_shadow_sample_count": phase3_shadow_count,
+        "completed_trade_sample_count": phase3_trade_count,
+        "quality_report": (
+            status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
+        ),
+        "governance_report": governance_report,
+        "models": status.get("models") if isinstance(status.get("models"), dict) else {},
+    }
+
+
+async def _raw_local_ai_tools_status() -> dict[str, Any]:
     local_ai_tools = _dash._dashboard_local_ai_tools_client()
     if local_ai_tools is None:
         return {"available": False, "status": "client_not_ready"}
@@ -490,58 +670,132 @@ async def _local_ai_training_status() -> dict[str, Any]:
         return {"available": False, "status": "error", "error": safe_error_text(exc, limit=180)}
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
-    shadow_count = int(status.get("shadow_sample_count") or 0)
-    trade_count = int(status.get("trade_sample_count") or 0)
-    text_count = int(status.get("text_sentiment_sample_count") or 0)
-    raw_status = str(status.get("status") or "unknown")
-    visible_status = _visible_local_ai_training_status(
-        raw_status,
-        available=bool(status.get("available")),
-        model_bundle_available=bool(status.get("model_bundle_available")),
-        shadow_count=shadow_count,
-        trade_count=trade_count,
-        text_count=text_count,
-    )
-    return {
-        "available": bool(status.get("available")),
-        "status": visible_status,
-        "raw_status": raw_status,
-        "model_bundle_available": bool(status.get("model_bundle_available")),
-        "service_available": bool(status.get("service_available", status.get("available"))),
-        "trained_at": status.get("trained_at"),
-        "shadow_sample_count": shadow_count,
-        "trade_sample_count": trade_count,
-        "sequence_sample_count": int(status.get("sequence_sample_count") or 0),
-        "text_sentiment_sample_count": text_count,
-        "completed_shadow_sample_count": int(status.get("completed_shadow_sample_count") or 0),
-        "completed_trade_sample_count": int(status.get("completed_trade_sample_count") or 0),
-        "quality_report": (
-            status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
-        ),
-        "governance_report": (
-            status.get("governance_report")
-            if isinstance(status.get("governance_report"), dict)
-            else {}
-        ),
-        "models": status.get("models") if isinstance(status.get("models"), dict) else {},
+    return status
+
+
+async def _dashboard_local_ai_tools_status() -> dict[str, Any]:
+    normalizer = getattr(_dash, "get_local_ai_tools_status", None)
+    if not callable(normalizer):
+        return {"available": False, "status": "normalizer_missing"}
+    try:
+        status = await asyncio.wait_for(normalizer(), timeout=3.5)
+    except Exception as exc:
+        logger.warning(
+            "data collection dashboard local ai tools status fallback failed",
+            error=safe_error_text(exc),
+        )
+        return {"available": False, "status": "normalizer_error", "error": safe_error_text(exc, limit=180)}
+    return status if isinstance(status, dict) else {"available": False, "status": "invalid_status"}
+
+
+async def _merge_dashboard_local_ai_tools_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Reuse the Dashboard-normalized Local AI Tools counters when available."""
+
+    normalizer = getattr(_dash, "get_local_ai_tools_status", None)
+    if not callable(normalizer):
+        return status
+    try:
+        normalized = await asyncio.wait_for(normalizer(), timeout=3.5)
+    except Exception as exc:
+        logger.warning(
+            "data collection local ai tools normalized status fallback failed",
+            error=safe_error_text(exc),
+        )
+        return status
+    if not isinstance(normalized, dict):
+        return status
+
+    merged = dict(status)
+    numeric_keys = {
+        "phase3_clean_trainable_shadow_sample_count",
+        "phase3_clean_completed_shadow_sample_count",
+        "phase3_clean_trainable_trade_sample_count",
+        "phase3_clean_completed_trade_sample_count",
+        "shadow_sample_count",
+        "training_shadow_sample_count",
+        "completed_shadow_sample_count",
+        "total_shadow_sample_count",
+        "raw_shadow_sample_count",
+        "legacy_shadow_sample_count",
+        "trade_sample_count",
+        "training_trade_sample_count",
+        "completed_trade_sample_count",
+        "raw_trade_sample_count",
+        "legacy_trade_sample_count",
+        "service_model_window_shadow_sample_count",
+        "service_model_window_trade_sample_count",
     }
+    for key in numeric_keys:
+        if key in normalized and _safe_int_count(normalized.get(key)) > 0:
+            merged[key] = normalized.get(key)
+    for key in ("training_sample_source",):
+        if key in normalized:
+            merged[key] = normalized.get(key)
+    return merged
+
+
+async def _phase3_completed_shadow_count() -> int:
+    dashboard_counter = getattr(_dash, "_completed_local_ai_shadow_backtest_total", None)
+    if callable(dashboard_counter):
+        try:
+            return int(await dashboard_counter())
+        except Exception as exc:
+            logger.warning(
+                "data collection dashboard local-ai shadow count fallback failed",
+                error=safe_error_text(exc),
+            )
+    async with get_session_ctx() as session:
+        result = await session.execute(
+            select(func.count(ShadowBacktest.id)).where(
+                ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+                ShadowBacktest.status == "completed",
+                ShadowBacktest.long_return_pct.is_not(None),
+                ShadowBacktest.short_return_pct.is_not(None),
+            )
+        )
+        return int(result.scalar() or 0)
+
+
+async def _phase3_completed_trade_count() -> int:
+    async with get_session_ctx() as session:
+        trade_reflection_result = await session.execute(
+            select(func.count(TradeReflection.id)).where(
+                TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
+            )
+        )
+        closed_position_result = await session.execute(
+            select(func.count(Position.id)).where(
+                Position.is_open.is_(False),
+                Position.closed_at.is_not(None),
+                Position.created_at >= PHASE3_CLEAN_START_UTC,
+            )
+        )
+    return int(trade_reflection_result.scalar() or 0) + int(
+        closed_position_result.scalar() or 0
+    )
 
 
 async def _training_governance_snapshot() -> dict[str, Any]:
     try:
         sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
         async with get_session_ctx() as session:
+            phase3_filter = (ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,)
             completed_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(
+                    *phase3_filter,
                     ShadowBacktest.status == "completed",
                     ShadowBacktest.long_return_pct.is_not(None),
                     ShadowBacktest.short_return_pct.is_not(None),
                 )
             )
             quarantined_result = await session.execute(
-                select(func.count(ShadowBacktest.id)).where(ShadowBacktest.status == "quarantined")
+                select(func.count(ShadowBacktest.id)).where(
+                    *phase3_filter,
+                    ShadowBacktest.status == "quarantined",
+                )
             )
             shadow_window_filter = (
+                *phase3_filter,
                 ShadowBacktest.status.in_(("completed", "quarantined")),
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
@@ -567,6 +821,7 @@ async def _training_governance_snapshot() -> dict[str, Any]:
                     await session.execute(
                         select(ShadowBacktest.decision_action, func.count(ShadowBacktest.id))
                         .where(
+                            *phase3_filter,
                             ShadowBacktest.status == "completed",
                             ShadowBacktest.long_return_pct.is_not(None),
                             ShadowBacktest.short_return_pct.is_not(None),
@@ -584,11 +839,16 @@ async def _training_governance_snapshot() -> dict[str, Any]:
                     )
                 ).all()
             )
-            trade_reflection_result = await session.execute(select(func.count(TradeReflection.id)))
+            trade_reflection_result = await session.execute(
+                select(func.count(TradeReflection.id)).where(
+                    TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
+                )
+            )
             closed_position_result = await session.execute(
                 select(func.count(Position.id)).where(
                     Position.is_open.is_(False),
                     Position.closed_at.is_not(None),
+                    Position.created_at >= PHASE3_CLEAN_START_UTC,
                 )
             )
 
@@ -622,11 +882,19 @@ async def _training_governance_snapshot() -> dict[str, Any]:
         shadow_report = {
             "status": status,
             "summary": summary,
+            "phase3_training_policy": "clean_training_view_only",
+            "legacy_data_policy": "excluded_from_phase3_training",
+            "legacy_data_training_allowed": False,
+            "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
             "sampled": 0,
             "sample_limit": sample_limit,
             "sample_total_count": sample_total_count,
+            "raw_sample_count": sample_total_count,
+            "phase3_clean_trainable_sample_count": completed_count,
+            "trainable_sample_source": "phase3_clean_completed_shadow_backtests",
             "trainable_sample_count": completed_count,
             "quarantined_sample_count": quarantined_count,
+            "historical_audit_sample_count": 0,
             "total_trainable_count": completed_count,
             "quarantined_count": quarantined_count,
             "action_counts": action_counts,
@@ -639,8 +907,9 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             },
             "latest_sample_at": _iso(latest_sample_at),
             "data_freshness_minutes": _age_minutes(latest_sample_at),
-            "cleanup_mode": "quarantine_not_delete",
-            "raw_records_preserved": True,
+            "cleanup_mode": "phase3_clean_window_only",
+            "raw_records_preserved": False,
+            "raw_records_preserved_for_audit_only": False,
             "quarantine_applied": bool(quarantined_count),
             "requires_artifact_refresh": bool(quarantined_count),
             "refresh_targets": [
@@ -654,11 +923,19 @@ async def _training_governance_snapshot() -> dict[str, Any]:
         local_ai_report["trade_sample_count"] = trade_count
         return {
             "status": "ok",
+            "phase3_training_policy": "clean_training_view_only",
+            "legacy_data_policy": "excluded_from_phase3_training",
+            "legacy_data_training_allowed": False,
+            "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+            "raw_records_preserved": False,
             "local_ai_tools": local_ai_report,
             "local_ai_quality_report": shadow_report,
             "local_ml_signal": shadow_report,
             "local_ml_quality_report": shadow_report,
             "local_ml_trainable_shadow_sample_count": completed_count,
+            "phase3_clean_trainable_shadow_sample_count": completed_count,
+            "quarantined_shadow_sample_count": quarantined_count,
+            "historical_audit_shadow_sample_count": 0,
             "training_quarantine": {
                 "status": "not_run",
                 "message": "状态页只读取轻量治理快照；点击清洗刷新或等待自动训练时执行深度评估、隔离与重训。",
@@ -695,6 +972,10 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             _load_trade_reflection_samples,
             _merge_trade_samples,
         )
+        from services.model_promotion_policy import (
+            build_phase3_promotion_recommendation,
+            load_latest_paper_observation_report,
+        )
         from services.training_data_quality import annotate_training_payload
 
         shadow_samples = await _load_shadow_samples(
@@ -722,19 +1003,60 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
         trainer = getattr(local_ai_tools, "train", None)
         if not callable(trainer):
             return {"trained": False, "reason": "train_method_missing"}
+        completed_shadow_count = await _completed_shadow_sample_count()
+        completed_trade_count = await _completed_trade_sample_count()
+        raw_trade_sample_count = len(trade_samples)
+        trainable_trade_sample_count = len(payload["trade_samples"])
+        quarantined_trade_sample_count = max(
+            raw_trade_sample_count - trainable_trade_sample_count,
+            0,
+        )
+        evaluation_policy = {
+            "promotion_flow": "shadow_to_canary_to_live",
+            "live_mutation": False,
+            "requires_walk_forward": True,
+            "requires_paper_observation": True,
+            "phase": "phase3_model_factory",
+        }
+        paper_observation_report = load_latest_paper_observation_report()
+        promotion_recommendation = build_phase3_promotion_recommendation(
+            training_mode="shadow",
+            model_stage="shadow",
+            quality_report=payload["quality_report"],
+            governance_report=payload["governance_report"],
+            evaluation_policy=evaluation_policy,
+            paper_observation_report=paper_observation_report,
+            completed_shadow_sample_count=completed_shadow_count,
+            completed_trade_sample_count=completed_trade_count,
+        )
         result = await trainer(
             payload["shadow_samples"],
             payload["trade_samples"],
             payload["sequence_samples"],
             payload["text_sentiment_samples"],
             source="dashboard_training_governance_refresh",
-            completed_shadow_sample_count=await _completed_shadow_sample_count(),
-            completed_trade_sample_count=await _completed_trade_sample_count(),
+            completed_shadow_sample_count=completed_shadow_count,
+            completed_trade_sample_count=completed_trade_count,
+            raw_trade_sample_count=raw_trade_sample_count,
+            trainable_trade_sample_count=trainable_trade_sample_count,
+            quarantined_trade_sample_count=quarantined_trade_sample_count,
+            trade_sample_cursor_policy="clean_training_view_only",
             quality_report=payload["quality_report"],
             governance_report=payload["governance_report"],
+            training_mode="shadow",
+            model_stage="shadow",
+            evaluation_policy=evaluation_policy,
+            paper_observation_report=paper_observation_report,
+            promotion_recommendation=promotion_recommendation,
         )
         result.setdefault("quality_report", payload["quality_report"])
         result.setdefault("governance_report", payload["governance_report"])
+        result.setdefault("promotion_recommendation", promotion_recommendation)
+        result.setdefault("paper_observation_report", paper_observation_report)
+        result.setdefault("raw_trade_sample_count", raw_trade_sample_count)
+        result.setdefault("trainable_trade_sample_count", trainable_trade_sample_count)
+        result.setdefault("quarantined_trade_sample_count", quarantined_trade_sample_count)
+        result.setdefault("trade_sample_cursor_policy", "clean_training_view_only")
         return result
     except Exception as exc:
         return {
@@ -742,6 +1064,10 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             "reason": "error",
             "error": safe_error_text(exc, limit=180),
         }
+
+
+def _training_refresh_okx_gate() -> dict[str, Any]:
+    return okx_training_refresh_gate()
 
 
 def _configured_source_cards() -> list[dict[str, Any]]:
@@ -850,34 +1176,24 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
 ) -> dict[str, Any]:
-    tasks: list[Any] = [
-        _source_breakdown(),
-        _training_sample_quality(),
-        _local_ai_training_status(),
-        asyncio.wait_for(
-            _training_governance_snapshot(),
-            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-        ),
-    ]
-    if include_feature_coverage:
-        tasks.append(
-            asyncio.wait_for(
-                CryptoFeatureCoverageService().report(hours=24, limit=1000),
-                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-            )
-        )
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    (
-        source_stats_result,
-        quality_result,
-        local_ai_status_result,
-        governance_result,
-    ) = results[:4]
-    feature_coverage_result = (
-        results[4]
-        if include_feature_coverage and len(results) > 4
-        else _skipped_feature_coverage_status()
+    # asyncpg does not allow concurrent operations on the same connection.
+    # Keep status sections serial so dashboard audits report real data
+    # problems instead of connection scheduling noise from nested probes.
+    source_stats_result = await _run_status_section(_source_breakdown)
+    quality_result = await _run_status_section(_training_sample_quality)
+    local_ai_status_result = await _run_status_section(_local_ai_training_status)
+    governance_result = await _run_status_section(
+        _training_governance_snapshot,
+        timeout=STATUS_SECTION_TIMEOUT_SECONDS,
     )
+    feature_coverage_result: dict[str, Any] | Exception
+    if include_feature_coverage:
+        feature_coverage_result = await _run_status_section(
+            lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        )
+    else:
+        feature_coverage_result = _skipped_feature_coverage_status()
     source_stats = _safe_status_section(
         source_stats_result,
         section="source_breakdown",
@@ -970,6 +1286,25 @@ async def get_data_collection_status(
 async def refresh_training_governance(
     _access: None = Depends(require_dashboard_write_access),
 ) -> dict[str, Any]:
+    okx_gate = _training_refresh_okx_gate()
+    if not bool(okx_gate.get("allowed")):
+        payload = await get_data_collection_status()
+        payload["status"] = "blocked"
+        payload["message"] = (
+            "Training refresh is blocked until the latest OKX daily reconciliation "
+            "report allows clean-view training refresh."
+        )
+        payload["refresh_blocked"] = True
+        payload["okx_daily_reconciliation_gate"] = okx_gate
+        payload["refresh_result"] = {
+            "training_quarantine": {"status": "skipped", "reason": okx_gate["reason"]},
+            "local_ml_signal": {"trained": False, "reason": okx_gate["reason"]},
+            "local_ai_tools": {"trained": False, "reason": okx_gate["reason"]},
+            "vector_memory_clear": {"status": "skipped", "reason": okx_gate["reason"]},
+            "vector_memory": {"status": "skipped", "reason": okx_gate["reason"]},
+        }
+        return sanitize_payload(payload)
+
     quarantine_result: dict[str, Any]
     try:
         from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
@@ -984,6 +1319,10 @@ async def refresh_training_governance(
     ml_signal_service = _dash._dashboard_ml_signal_service()
     local_ai_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
     ml_result: dict[str, Any] = {"trained": False, "reason": "service_not_ready"}
+    vector_clear_result: dict[str, Any] = {
+        "status": "skipped",
+        "reason": "disabled_or_unavailable",
+    }
     vector_result: dict[str, Any] = {"status": "skipped", "reason": "disabled_or_unavailable"}
 
     if ml_signal_service is not None:
@@ -1000,17 +1339,25 @@ async def refresh_training_governance(
         local_ai_result = await _train_local_ai_tools_from_dashboard()
 
     try:
-        vector_result = await get_vector_memory_service().reindex_recent()
+        vector_service = get_vector_memory_service()
+        vector_clear_result = await vector_service.clear_index(
+            reason="phase3_training_governance_refresh"
+        )
+        vector_result = await vector_service.reindex_recent()
     except Exception as exc:
+        vector_clear_result = {"status": "error", "error": safe_error_text(exc, limit=180)}
         vector_result = {"status": "error", "error": safe_error_text(exc, limit=180)}
 
     payload = await get_data_collection_status()
     payload["status"] = "ok"
     payload["message"] = "训练数据治理刷新已执行：按清洗视图重训本地模型并刷新向量索引。"
+    payload["refresh_blocked"] = False
+    payload["okx_daily_reconciliation_gate"] = okx_gate
     payload["refresh_result"] = {
         "training_quarantine": quarantine_result,
         "local_ml_signal": ml_result,
         "local_ai_tools": local_ai_result,
+        "vector_memory_clear": vector_clear_result,
         "vector_memory": vector_result,
     }
     return sanitize_payload(payload)
@@ -1060,8 +1407,14 @@ async def update_data_collection_settings(req: DataCollectionSettingsRequest) ->
 
     if req.external_event_scraper_max_sources is not None:
         max_sources = int(req.external_event_scraper_max_sources)
-        if max_sources < 1 or max_sources > 20:
-            raise HTTPException(status_code=400, detail="每轮源数量必须在 1 到 20 之间。")
+        if max_sources < 1 or max_sources > EXTERNAL_EVENT_MAX_SOURCES_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "external event max sources must be between 1 and "
+                    f"{EXTERNAL_EVENT_MAX_SOURCES_LIMIT}."
+                ),
+            )
         settings.external_event_scraper_max_sources = max_sources
         updates["EXTERNAL_EVENT_SCRAPER_MAX_SOURCES"] = str(max_sources)
 

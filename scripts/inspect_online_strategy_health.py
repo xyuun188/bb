@@ -32,6 +32,7 @@ from models.trade import Order, Position
 from models.learning import ShadowBacktest, ExpertMemory, StrategyLearningEvent
 from services.decision_state import decision_state_from_raw
 from services.ml_signal_service import MLSignalService
+from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
 from services.trade_execution_contract import TradeExecutionContractService
 from services.entry_evidence import (
     ENTRY_EVIDENCE_SCORE_MEDIUM,
@@ -710,6 +711,16 @@ def _exit_trigger_from_decision(decision):
 
 
 def closed_position_pnl_diagnostics(closed_rows, orders, decision_by_id, decisions):
+    raw_closed_count = len(closed_rows)
+    trade_fact_quarantine_reasons = Counter()
+    trusted_closed_rows = []
+    for pos in closed_rows:
+        reason = closed_position_trade_fact_untrusted_reason(pos)
+        if reason:
+            trade_fact_quarantine_reasons[reason] += 1
+            continue
+        trusted_closed_rows.append(pos)
+    closed_rows = trusted_closed_rows
     pnl_values = []
     hold_minutes = []
     winning_pnls = []
@@ -801,6 +812,9 @@ def closed_position_pnl_diagnostics(closed_rows, orders, decision_by_id, decisio
     return {
         "read_only": True,
         "closed_count": closed_count,
+        "raw_closed_count": raw_closed_count,
+        "trade_fact_quarantined_count": raw_closed_count - closed_count,
+        "trade_fact_quarantine_reasons": dict(trade_fact_quarantine_reasons),
         "win_count": win_count,
         "loss_count": loss_count,
         "flat_count": flat_count,

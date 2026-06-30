@@ -18,6 +18,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
 from services.memory_feedback import MemoryFeedbackPolicy
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
 
@@ -173,6 +174,7 @@ class ExpertMemoryService:
                     pos
                     for pos in positions
                     if not position_has_manual_close_order(pos, manual_close_orders)
+                    and closed_position_trade_fact_trusted(pos)
                 ]
                 if not positions:
                     self._realized_weight_cache = {
@@ -282,6 +284,13 @@ class ExpertMemoryService:
 
         if not self.memory_enabled_provider():
             return
+        if not closed_position_trade_fact_trusted(pos):
+            logger.warning(
+                "skip trade reflection for untrusted closed position fact",
+                position_id=getattr(pos, "id", None),
+                symbol=getattr(pos, "symbol", None),
+            )
+            return
         try:
             realized_pnl = float(pos.realized_pnl or 0.0)
             entry_price = float(pos.entry_price or 0.0)
@@ -381,6 +390,8 @@ class ExpertMemoryService:
                     if not pos.closed_at:
                         continue
                     if position_has_manual_close_order(pos, manual_close_orders):
+                        continue
+                    if not closed_position_trade_fact_trusted(pos):
                         continue
                     await self.record_trade_reflection_in_session(
                         session,

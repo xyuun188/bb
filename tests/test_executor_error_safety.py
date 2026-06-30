@@ -8,6 +8,7 @@ import pytest
 import executor.okx_executor as okx_module
 from ai_brain.base_model import Action, DecisionOutput
 from core.exceptions import ExchangeAPIError, OrderPlacementError
+from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 
 
@@ -119,6 +120,84 @@ class _NativeBalanceOnlyCcxt:
         }
 
 
+def _native_position_row(
+    inst_id: str,
+    *,
+    pos: Any,
+    pos_side: str = "long",
+    ct_val: Any = "1",
+    avg_px: Any = "100",
+    mark_px: Any = "100",
+    upl: Any = "0",
+) -> dict[str, Any]:
+    return {
+        "instId": inst_id,
+        "posSide": pos_side,
+        "pos": str(pos),
+        "ctVal": str(ct_val),
+        "avgPx": str(avg_px),
+        "markPx": str(mark_px),
+        "upl": str(upl),
+    }
+
+
+def _filter_native_rows(rows: list[dict[str, Any]], params: dict[str, Any]) -> dict[str, Any]:
+    inst_id = str(params.get("instId") or "").strip().upper()
+    return {
+        "data": [
+            row
+            for row in rows
+            if not inst_id or str(row.get("instId") or "").strip().upper() == inst_id
+        ]
+    }
+
+
+async def _native_ticker(
+    params: dict[str, Any],
+    *,
+    last: Any,
+    bid: Any | None = None,
+    ask: Any | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": [
+            {
+                "instId": str(params.get("instId") or "").strip().upper(),
+                "last": str(last),
+                "bidPx": str(bid if bid is not None else last),
+                "askPx": str(ask if ask is not None else last),
+                "ts": "1780000000000",
+            }
+        ]
+    }
+
+
+def _native_order_detail_response(
+    order: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    default_inst_id: str,
+) -> dict[str, Any]:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    fee = order.get("fee") if isinstance(order.get("fee"), dict) else {}
+    return {
+        "data": [
+            {
+                "instId": str(info.get("instId") or default_inst_id).strip().upper(),
+                "ordId": order.get("id") or info.get("ordId") or params.get("ordId"),
+                "side": order.get("side") or info.get("side") or "buy",
+                "ordType": order.get("type") or info.get("ordType") or "market",
+                "state": info.get("state") or order.get("status") or "live",
+                "sz": str(order.get("amount") or info.get("sz") or "0"),
+                "accFillSz": str(order.get("filled") or info.get("accFillSz") or "0"),
+                "avgPx": str(order.get("average") or info.get("avgPx") or "0"),
+                "px": str(order.get("price") or info.get("px") or "0"),
+                "fee": str(fee.get("cost") or "0"),
+            }
+        ]
+    }
+
+
 class _FailingCancelCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -126,8 +205,11 @@ class _FailingCancelCcxt:
     def __init__(self, error_text: str) -> None:
         self.error_text = error_text
 
-    async def cancel_order(self, _order_id: str, _symbol: str) -> dict[str, Any]:
+    async def privatePostTradeCancelOrder(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(self.error_text)
+
+    async def cancel_order(self, _order_id: str, _symbol: str) -> dict[str, Any]:
+        raise AssertionError("order cancellation must use OKX native privatePostTradeCancelOrder")
 
 
 class _FailingOpenOrdersCcxt:
@@ -137,7 +219,7 @@ class _FailingOpenOrdersCcxt:
     def __init__(self, error_text: str) -> None:
         self.error_text = error_text
 
-    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(self.error_text)
 
 
@@ -203,10 +285,13 @@ class _FailingPositionsForExitCcxt:
             "limits": {"amount": {"min": 1.0}},
         }
 
-    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
-        return {"last": 100.0}
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(params, last=100.0)
 
-    async def fetch_positions(self, _symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        raise AssertionError("execution sizing must use OKX native ticker API")
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(self.error_text)
 
 
@@ -216,7 +301,7 @@ class _FailingPositionsAfterExitSubmitCcxt:
 
     def __init__(self, error_text: str) -> None:
         self.error_text = error_text
-        self.fetch_positions_calls = 0
+        self.position_calls = 0
 
     def market(self, symbol: str) -> dict[str, Any]:
         return {
@@ -228,22 +313,32 @@ class _FailingPositionsAfterExitSubmitCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(amount))
 
-    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
-        return {"last": 100.0}
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(params, last=100.0)
 
-    async def fetch_positions(self, _symbols: list[str] | None = None) -> list[dict[str, Any]]:
-        self.fetch_positions_calls += 1
-        if self.fetch_positions_calls == 1:
-            return [
-                {
-                    "symbol": "BTC/USDT:USDT",
-                    "side": "long",
-                    "contracts": 2.0,
-                    "contractSize": 1.0,
-                    "info": {"posSide": "long", "pos": "2"},
-                }
-            ]
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        raise AssertionError("execution sizing must use OKX native ticker API")
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.position_calls += 1
+        if self.position_calls == 1:
+            return _filter_native_rows(
+                [
+                    _native_position_row(
+                        "BTC-USDT-SWAP",
+                        pos="2",
+                        pos_side="long",
+                        ct_val="1",
+                        avg_px="100",
+                        mark_px="100",
+                    )
+                ],
+                params,
+            )
         raise RuntimeError(self.error_text)
+
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
 
     async def create_order(
         self,
@@ -267,14 +362,25 @@ class _FailingPositionsAfterExitSubmitCcxt:
             "info": {"state": "live", "ordId": "exit-1", "side": side},
         }
 
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _native_order_detail_response(
+            {
+                "id": "exit-1",
+                "symbol": "BTC-USDT-SWAP",
+                "side": "sell",
+                "type": "market",
+                "status": "live",
+                "amount": "2",
+                "filled": "0",
+                "average": "100",
+                "info": {"state": "live", "ordId": "exit-1", "instId": "BTC-USDT-SWAP"},
+            },
+            params,
+            default_inst_id="BTC-USDT-SWAP",
+        )
+
     async def fetch_order(self, _order_id: str, _symbol: str) -> dict[str, Any]:
-        return {
-            "id": "exit-1",
-            "filled": 0.0,
-            "average": 100.0,
-            "status": "open",
-            "info": {"state": "live", "ordId": "exit-1"},
-        }
+        raise AssertionError("order confirmation must use OKX native privateGetTradeOrder")
 
 
 class _LeverageUnknownAfterOpenOrderLimitCcxt:
@@ -316,10 +422,10 @@ class _LeverageUnknownAfterOpenOrderLimitCcxt:
     ) -> dict[str, Any]:
         raise RuntimeError(f"OKX 59670 open order limit: {self.error_text}")
 
-    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
-        return []
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
 
-    async def fetch_positions(self, _symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(self.error_text)
 
 
@@ -344,8 +450,16 @@ class _PrecisionEntryCcxt:
     def price_to_precision(self, _symbol: str, price: float) -> str:
         return f"{float(price):.9f}"
 
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(
+            params,
+            last=0.000008789,
+            bid=0.000008788,
+            ask=0.00000879,
+        )
+
     async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
-        return {"last": 0.000008789, "bid": 0.000008788, "ask": 0.00000879}
+        raise AssertionError("execution sizing must use OKX native ticker API")
 
     async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
         return []
@@ -373,14 +487,29 @@ class _PrecisionEntryCcxt:
             "info": {"state": "filled", "ordId": "entry-shib", "side": side},
         }
 
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _native_order_detail_response(
+            {
+                "id": "entry-shib",
+                "symbol": "SHIB-USDT-SWAP",
+                "side": "buy",
+                "type": "market",
+                "status": "filled",
+                "amount": "1",
+                "filled": "1",
+                "average": "0.000008789",
+                "info": {
+                    "state": "filled",
+                    "ordId": "entry-shib",
+                    "instId": "SHIB-USDT-SWAP",
+                },
+            },
+            params,
+            default_inst_id="SHIB-USDT-SWAP",
+        )
+
     async def fetch_order(self, _order_id: str, _symbol: str) -> dict[str, Any]:
-        return {
-            "id": "entry-shib",
-            "filled": 1.0,
-            "average": 0.000008789,
-            "status": "closed",
-            "info": {"state": "filled", "ordId": "entry-shib"},
-        }
+        raise AssertionError("order confirmation must use OKX native privateGetTradeOrder")
 
 
 class _EntryMaxMarketSizeCcxt:
@@ -405,11 +534,14 @@ class _EntryMaxMarketSizeCcxt:
     def price_to_precision(self, _symbol: str, price: float) -> str:
         return str(float(price))
 
-    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
-        return {"last": 1.0, "bid": 0.999, "ask": 1.001}
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(params, last=1.0, bid=0.999, ask=1.001)
 
-    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
-        return []
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        raise AssertionError("execution sizing must use OKX native ticker API")
+
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
 
     async def fetch_market_leverage_tiers(self, _symbol: str) -> list[dict[str, Any]]:
         return [{"maxLeverage": 20}]
@@ -460,8 +592,15 @@ class _EntryMaxMarketSizeCcxt:
         self.orders["entry-max-market"] = order
         return order
 
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _native_order_detail_response(
+            self.orders[str(params.get("ordId"))],
+            params,
+            default_inst_id="BTC-USDT-SWAP",
+        )
+
     async def fetch_order(self, order_id: str, _symbol: str) -> dict[str, Any]:
-        return self.orders[order_id]
+        raise AssertionError("order confirmation must use OKX native privateGetTradeOrder")
 
 
 class _ExitMaxMarketSizeCcxt:
@@ -491,24 +630,30 @@ class _ExitMaxMarketSizeCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(amount))
 
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(params, last=3.0, bid=3.0, ask=3.01)
+
     async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
-        return {"last": 3.0, "bid": 3.0, "ask": 3.01}
+        raise AssertionError("execution sizing must use OKX native ticker API")
 
-    async def fetch_positions(self, _symbols: list[str] | None = None) -> list[dict[str, Any]]:
-        return [
-            {
-                "symbol": "USAR/USDT:USDT",
-                "side": "long",
-                "contracts": self.position_contracts,
-                "contractSize": 1.0,
-                "entryPrice": 2.31,
-                "markPrice": 3.0,
-                "info": {"pos": str(self.position_contracts), "posSide": "long"},
-            }
-        ]
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _filter_native_rows(
+            [
+                _native_position_row(
+                    "USAR-USDT-SWAP",
+                    pos=self.position_contracts,
+                    pos_side="long",
+                    ct_val="1",
+                    avg_px="2.31",
+                    mark_px="3.0",
+                    upl="69",
+                )
+            ],
+            params,
+        )
 
-    async def fetch_open_orders(self, _symbol: str | None = None) -> list[dict[str, Any]]:
-        return []
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
 
     async def create_order(
         self,
@@ -545,6 +690,13 @@ class _ExitMaxMarketSizeCcxt:
         self.orders[order_id] = order
         return order
 
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _native_order_detail_response(
+            self.orders[str(params.get("ordId"))],
+            params,
+            default_inst_id="USAR-USDT-SWAP",
+        )
+
     async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
         self.close_position_calls.append(dict(params))
         if self.native_close_error:
@@ -561,6 +713,142 @@ class _ExitMaxMarketSizeCcxt:
                 }
             ],
         }
+
+
+class _MarketsByIdAliasMismatchCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.markets = {}
+        self.markets_by_id = {
+            "SPK-USDT-SWAP": {
+                "symbol": "SAHARA/USDT:USDT",
+                "id": "SAHARA-USDT-SWAP",
+                "info": {"instId": "SAHARA-USDT-SWAP"},
+            }
+        }
+
+    def market(self, _symbol: str) -> dict[str, Any]:
+        raise RuntimeError("okx does not have market symbol")
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+
+class _PositionAliasMismatchCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+    markets = {}
+    markets_by_id: dict[str, Any] = {}
+
+    def market(self, _symbol: str) -> dict[str, Any]:
+        raise RuntimeError("okx does not have market symbol")
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _filter_native_rows(
+            [
+                _native_position_row(
+                    "SPK-USDT-SWAP",
+                    pos="-200",
+                    pos_side="net",
+                    ct_val="1",
+                    avg_px="0.012",
+                    mark_px="0.011",
+                    upl="0.2",
+                )
+            ],
+            params,
+        )
+
+
+class _ExitPositionInstIdOnlyCcxt(_ExitMaxMarketSizeCcxt):
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "SPK-USDT-SWAP", "maxMktSz": "100", "lotSz": "1"},
+        }
+
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await _native_ticker(params, last=0.013, bid=0.013, ask=0.0131)
+
+    async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+        raise AssertionError("execution sizing must use OKX native ticker API")
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _filter_native_rows(
+            [
+                _native_position_row(
+                    "SPK-USDT-SWAP",
+                    pos=self.position_contracts,
+                    pos_side="long",
+                    ct_val="1",
+                    avg_px="0.012",
+                    mark_px="0.013",
+                    upl="0.018",
+                )
+            ],
+            params,
+        )
+
+
+class _ExitNoMatchingSideCcxt(_ExitPositionInstIdOnlyCcxt):
+    def __init__(self, position_contracts: float = 7.0) -> None:
+        super().__init__(position_contracts=position_contracts, native_close_error=True)
+
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        raise ExchangeAPIError("native close-position unavailable")
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _filter_native_rows(
+            [
+                _native_position_row(
+                    "SPK-USDT-SWAP",
+                    pos="7",
+                    pos_side="short",
+                    ct_val="1",
+                    avg_px="0.012",
+                    mark_px="0.013",
+                    upl="-0.007",
+                ),
+                _native_position_row(
+                    "HOME-USDT-SWAP",
+                    pos="3",
+                    pos_side="long",
+                    ct_val="1",
+                    avg_px="0.021",
+                    mark_px="0.022",
+                    upl="0.003",
+                ),
+            ],
+            params,
+        )
+
+
+class _NativeReduceNoPositionCcxt(_ExitMaxMarketSizeCcxt):
+    async def privateGetTradeOrdersPending(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "USAR-USDT-SWAP", "lotSz": "1"},
+            "synthetic_from_position": True,
+        }
+
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        raise ExchangeAPIError("native close-position unavailable")
+
+    async def privatePostTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        raise ExchangeAPIError(
+            "OKX 51169: You don't have any positions in this direction."
+        )
 
 
 class _NativeFullCloseFillsHistoryCcxt(_ExitMaxMarketSizeCcxt):
@@ -585,6 +873,13 @@ class _NativeFullCloseFillsHistoryCcxt(_ExitMaxMarketSizeCcxt):
                 }
             ]
         }
+
+
+class _NativeFullCloseFillPendingCcxt(_ExitMaxMarketSizeCcxt):
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        self.position_contracts = 0.0
+        return {"code": "0", "data": [{"clOrdId": "native-close-client", "sCode": "0"}]}
 
 
 class _NativeFullCloseAccountWideFillsCcxt(_NativeFullCloseFillsHistoryCcxt):
@@ -625,6 +920,20 @@ def _exit_decision() -> DecisionOutput:
         suggested_leverage=3.0,
         raw_response={},
         feature_snapshot={"current_price": 100.0},
+    )
+
+
+def _spk_exit_decision() -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="SPK/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.8,
+        reasoning="test spk exit",
+        position_size_pct=1.0,
+        suggested_leverage=3.0,
+        raw_response={},
+        feature_snapshot={"current_price": 0.013},
     )
 
 
@@ -695,6 +1004,29 @@ async def test_okx_resolve_swap_symbol_rejects_ccxt_alias_to_different_inst_id()
         ExchangeAPIError, match="requested WLFI/USDT, exchange instrument is H/USDT"
     ):
         await executor._resolve_swap_symbol("WLFI/USDT")
+
+
+@pytest.mark.asyncio
+async def test_okx_resolve_swap_symbol_ignores_mismatched_markets_by_id_alias() -> None:
+    executor = _executor(_MarketsByIdAliasMismatchCcxt())
+    executor._markets_loaded = True
+
+    resolved = await executor._resolve_swap_symbol("SPK/USDT")
+
+    assert resolved == "SPK/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_okx_position_symbol_matching_prefers_native_inst_id_over_ccxt_alias() -> None:
+    executor = _executor(_PositionAliasMismatchCcxt())
+    executor._markets_loaded = True
+
+    positions = await executor.get_positions_strict("SPK/USDT")
+    resolved = await executor._resolve_swap_symbol("SPK/USDT")
+
+    assert len(positions) == 1
+    assert positions[0]["info"]["instId"] == "SPK-USDT-SWAP"
+    assert resolved == "SPK-USDT-SWAP"
 
 
 @pytest.mark.asyncio
@@ -778,6 +1110,72 @@ async def test_okx_exit_position_lookup_failure_does_not_return_no_position() ->
     assert "Authorization: ***" in message
     assert "password=***" in message
     assert "no_position" not in message
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_uses_inst_id_position_snapshot_when_top_level_symbol_missing() -> None:
+    exchange = _ExitPositionInstIdOnlyCcxt(position_contracts=18.0)
+    result = await _executor(exchange).place_order(
+        _spk_exit_decision(),
+        account_id="ensemble_trader",
+    )
+
+    assert result.status == okx_module.OrderStatus.FILLED
+    assert result.order_id == "native-close-order"
+    assert result.symbol == "SPK/USDT"
+    assert exchange.close_position_calls == [
+        {"instId": "SPK-USDT-SWAP", "mgnMode": "cross", "autoCxl": True, "posSide": "long"}
+    ]
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_no_position_includes_position_mismatch_diagnostics() -> None:
+    exchange = _ExitNoMatchingSideCcxt(position_contracts=7.0)
+    result = await _executor(exchange).place_order(
+        _spk_exit_decision(),
+        account_id="ensemble_trader",
+    )
+
+    assert result.status == okx_module.OrderStatus.REJECTED
+    assert result.order_id == "no_position"
+    assert exchange.create_calls == []
+    diagnostics = result.raw_response["okx_exit_position_mismatch"]
+    assert diagnostics["source"] == "pre_submit_position_lookup"
+    assert diagnostics["decision_symbol"] == "SPK/USDT"
+    assert diagnostics["expected_okx_inst_id"] == "SPK-USDT-SWAP"
+    assert diagnostics["target_position_side"] == "long"
+    assert diagnostics["exit_order_side"] == "sell"
+    assert diagnostics["positions_returned"] == 1
+    assert diagnostics["matching_position_count"] == 0
+    assert diagnostics["nonzero_same_symbol_sides"] == ["short"]
+    spk_candidate = diagnostics["candidates"][0]
+    assert spk_candidate["raw_symbol"] == "SPK-USDT-SWAP"
+    assert spk_candidate["matches_expected_symbol"] is True
+    assert spk_candidate["matches_target_side"] is False
+    assert spk_candidate["reason"] == "side_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_okx_native_reduce_no_position_keeps_snapshot_diagnostics() -> None:
+    exchange = _NativeReduceNoPositionCcxt(position_contracts=18.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 0.5
+
+    result = await executor.place_order(decision, account_id="ensemble_trader")
+
+    assert result.status == okx_module.OrderStatus.REJECTED
+    assert result.order_id == "no_position"
+    assert result.raw_response["okx_native_reduce_market_order"] is True
+    diagnostics = result.raw_response["okx_exit_position_mismatch"]
+    assert diagnostics["source"] == "native_reduce_no_position_rejection"
+    assert diagnostics["decision_symbol"] == "USAR/USDT"
+    assert diagnostics["target_position_side"] == "long"
+    assert diagnostics["matching_position_count"] == 1
+    assert diagnostics["matching_contracts_total"] == 18.0
+    assert diagnostics["candidates"][0]["reason"] == "matches"
 
 
 @pytest.mark.asyncio
@@ -1047,6 +1445,24 @@ async def test_okx_native_full_close_uses_fills_history_when_response_has_no_ord
     assert result.raw_response["native_close_fill"]["source"] == (
         "okx_fills_history_after_native_close"
     )
+
+
+@pytest.mark.asyncio
+async def test_okx_native_full_close_without_fill_order_id_waits_for_backfill() -> None:
+    exchange = _NativeFullCloseFillPendingCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.PARTIAL
+    assert result.exchange_order_id is None
+    assert result.order_id == "native-close-client"
+    assert result.quantity == 100.0
+    assert result.raw_response["requires_okx_fill_backfill"] is True
+    assert result.raw_response["position_contracts_after"] == 0.0
 
 
 @pytest.mark.asyncio

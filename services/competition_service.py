@@ -144,11 +144,22 @@ class CompetitionService:
         return None
 
     async def auto_promote_best_model(self) -> str | None:
-        """Automatically promote the best model to live trading."""
+        """Return the best model recommendation without mutating live routing.
+
+        Phase 3 keeps model competition, shadow evaluation, and live routing
+        separated.  Legacy callers may still invoke this method name, but live
+        promotion must be performed by an explicit operator-controlled path
+        after the promotion policy gates pass.
+        """
         best = await self.select_best_model()
         if best and best != mode_manager.live_model_name:
-            await mode_manager.switch_to_live(best)
-            logger.info("auto-promoted best model to live", model=best)
+            logger.info(
+                "best model promotion recommendation recorded without live switch",
+                model=best,
+                current_live_model=mode_manager.live_model_name,
+                live_mutation=False,
+                policy="phase3_observe_only",
+            )
         return best
 
     async def _calculate_sharpe(

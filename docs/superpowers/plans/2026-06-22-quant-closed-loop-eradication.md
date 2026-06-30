@@ -1,4 +1,8 @@
-# Quant Closed-Loop Eradication Master Plan
+# [ARCHIVED] Quant Closed-Loop Eradication Master Plan
+
+> 已归档：这份文档保留为历史治理、修复、巡检与约束演进记录，不再作为当前执行主文档。
+> 当前唯一有效总控文档：`docs/superpowers/plans/2026-06-26-phase-3-quant-master-control-plan.md`
+> 后续开发、排期、执行、验收、服务器重置、迁移、对账、训练与主控优化，全部以三期总控文档为准。
 
 > **总控定位：** 这是根治方案主控文档，不是让 AI 自由发挥的开发清单。
 > AI 执行任何 batch 前，必须先确认本批范围、禁止事项、验收标准和是否影响真实交易。

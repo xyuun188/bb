@@ -14,15 +14,19 @@ from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
 APPROVED_SERVICES = (
-    "qwen3-14b-trade.service",
-    "deepseek-r1-14b-risk.service",
-    "local-ai-tools.service",
+    "bb-phase3-llm-decision.service",
+    "bb-phase3-llm-risk-review.service",
+    "bb-phase3-llm-expert.service",
 )
 APPROVED_SCRIPT_PATHS = (
-    "/data/trade_ai/scripts/start_qwen3_14b_trade.sh",
-    "/data/trade_ai/scripts/start_deepseek_r1_14b_risk.sh",
+    "/data/BB/scripts/start_bb-phase3-llm-decision.sh",
+    "/data/BB/scripts/start_bb-phase3-llm-risk-review.sh",
+    "/data/BB/scripts/start_bb-phase3-llm-expert.sh",
 )
 DEPRECATED_SERVICES = (
+    "local-ai-tools.service",
+    "qwen3-14b-trade.service",
+    "deepseek-r1-14b-risk.service",
     "qwen3-14b.service",
     "qwen3-32b-main.service",
     "qwen3-32b-review.service",
@@ -38,7 +42,7 @@ def main() -> None:
         cmd = "\n".join(
             [
                 "echo '--- python envs ---'",
-                "find /home /data /opt \\( -path '*/envs/trade_vllm/bin/python' -o -path '*/envs/trade_ml/bin/python' \\) 2>/dev/null || true",
+                "find /data/BB /home /opt \\( -path '*/envs/phase3-quant/bin/python' -o -path '*/envs/trade_vllm/bin/python' -o -path '*/envs/trade_ml/bin/python' \\) 2>/dev/null || true",
                 "echo '--- approved services ---'",
                 *[
                     f"echo '### {service}'; systemctl cat {service} --no-pager || true"
@@ -49,15 +53,17 @@ def main() -> None:
                     f"echo '### {service}'; systemctl cat {service} --no-pager || true"
                     for service in DEPRECATED_SERVICES
                 ],
-                "echo '--- scripts ---'",
-                "ls -lah /data/trade_ai/scripts || true",
+                "echo '--- phase3 scripts/manifests ---'",
+                "ls -lah /data/BB/scripts /data/BB/manifests 2>/dev/null || true",
+                "echo '--- phase3 quant API health ---'",
+                "curl -fsS --max-time 8 http://127.0.0.1:8101/health || true",
                 "echo '--- approved start scripts ---'",
                 *[
                     f"echo '### {path}'; sed -n '1,220p' {path} 2>/dev/null || true"
                     for path in APPROVED_SCRIPT_PATHS
                 ],
-                "echo '--- local tools api header ---'",
-                "sed -n '1,80p' /data/trade_ai/tools/local_ai_tools_api.py 2>/dev/null || true",
+                "echo '--- service manifest ---'",
+                "sed -n '1,220p' /data/BB/manifests/phase3_model_service_manifest.json 2>/dev/null || true",
             ]
         )
         safe_print(run_remote_text(ssh, cmd, timeout=120, check=False))

@@ -277,7 +277,7 @@ def test_entry_opportunity_scoring_uses_vector_memory_as_soft_adjustment() -> No
                 {"score": 0.72, "action": "long", "pnl_pct": -0.8},
                 {"score": 0.61, "action": "long", "pnl_pct": -0.3},
             ],
-            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+            "policy": "三期相似样本只作为软证据调节和解释，不作为硬拦截。",
         }
     }
 

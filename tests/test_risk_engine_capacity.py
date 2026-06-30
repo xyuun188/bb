@@ -69,6 +69,36 @@ def test_risk_engine_allows_same_symbol_add_when_capacity_snapshot_is_full() -> 
     assert result.approved is True
 
 
+def test_risk_engine_keeps_dynamic_integer_leverage_without_runtime_tier_cap() -> None:
+    engine = RiskEngine(
+        max_open_positions_provider=lambda: {
+            "entry_limit": 20,
+            "effective_limit": 20,
+            "open_group_count": 1,
+        }
+    )
+    decision = _decision("ETH/USDT")
+    decision.suggested_leverage = 12.0
+    decision.raw_response = {
+        "dynamic_leverage_decision": {
+            "version": "dynamic_leverage_allocator_v1",
+            "final_integer_leverage": 12,
+        }
+    }
+
+    result = engine.assess(
+        decision=decision,
+        current_positions=[],
+        account_balance=1000.0,
+        volume_ratio=0.2,
+        adx_14=0.0,
+    )
+
+    assert result.approved is True
+    assert result.decision.suggested_leverage == 12.0
+    assert any("dynamic leverage allocator" in warning for warning in result.warnings)
+
+
 def test_risk_engine_blocks_same_symbol_opposite_entry_in_net_position_mode() -> None:
     engine = RiskEngine(
         max_open_positions_provider=lambda: {

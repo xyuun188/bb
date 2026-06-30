@@ -38,15 +38,19 @@ from services.entry_strategy_mode import PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import is_manual_close_order, position_has_manual_close_order
 from services.okx_error_classifier import is_okx_temporary_service_error
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
 from services.runtime_entry_filters import RuntimeEntryFilters, default_entry_filters
 from services.shadow_missed_opportunity_closed_loop import summarize_shadow_missed_opportunities
 from services.text_integrity import sanitize_runtime_text
+from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
 logger = structlog.get_logger(__name__)
+OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
+EXECUTION_LEDGER_MODEL_NAMES = (ENSEMBLE_TRADER_NAME, OKX_AUTHORITATIVE_LEDGER_MODEL)
 
 UNTRUSTED_EXPERT_STATUSES = {
     "batch_fallback",
@@ -445,6 +449,7 @@ class StrategyFeedback:
     shadow_feedback: dict[str, Any]
     expert_memory: dict[str, Any]
     manual_intervention: dict[str, Any]
+    trade_fact_quarantine: dict[str, Any]
     reflection_feedback: dict[str, Any]
     event_feedback: dict[str, Any]
     problems: list[dict[str, Any]]
@@ -463,6 +468,7 @@ class StrategyFeedback:
             "shadow_feedback": self.shadow_feedback,
             "expert_memory": self.expert_memory,
             "manual_intervention": self.manual_intervention,
+            "trade_fact_quarantine": self.trade_fact_quarantine,
             "reflection_feedback": self.reflection_feedback,
             "event_feedback": self.event_feedback,
             "problems": self.problems,
@@ -653,10 +659,19 @@ class StrategyFeedbackCompiler:
     ) -> StrategyFeedback:
         manual_orders = [order for order in orders if is_manual_close_order(order)]
         manual_position_ids: set[int] = set()
+        untrusted_fact_position_ids: set[int] = set()
+        untrusted_fact_reasons: dict[str, int] = {}
         training_positions: list[Any] = []
         for position in positions:
             if position_has_manual_close_order(position, manual_orders):
                 manual_position_ids.add(_safe_int(getattr(position, "id", None), 0))
+                continue
+            untrusted_reason = closed_position_trade_fact_untrusted_reason(position)
+            if untrusted_reason is not None:
+                untrusted_fact_position_ids.add(_safe_int(getattr(position, "id", None), 0))
+                untrusted_fact_reasons[untrusted_reason] = (
+                    untrusted_fact_reasons.get(untrusted_reason, 0) + 1
+                )
                 continue
             training_positions.append(position)
 
@@ -667,13 +682,23 @@ class StrategyFeedbackCompiler:
         expert_memory = self._expert_memory(memories)
         event_feedback = self._event_feedback(strategy_events or [])
         reflection_feedback = self._reflection_feedback(
-            reflections or [], excluded_position_ids=manual_position_ids
+            reflections or [],
+            excluded_position_ids=manual_position_ids | untrusted_fact_position_ids,
         )
         manual_intervention = {
             "manual_close_orders": len(manual_orders),
             "manual_closed_positions": len(manual_position_ids),
             "excluded_from_training": len(manual_position_ids),
             "policy": "manual closes are attribution and intervention signals, not model training samples",
+        }
+        trade_fact_quarantine = {
+            "excluded_position_count": len(untrusted_fact_position_ids),
+            "reason_counts": untrusted_fact_reasons,
+            "position_ids": sorted(pid for pid in untrusted_fact_position_ids if pid > 0)[:50],
+            "policy": (
+                "closed positions missing authoritative OKX entry/close order links are kept for "
+                "audit, but excluded from strategy learning and reflection feedback"
+            ),
         }
 
         trade_count = len(training_positions)
@@ -750,6 +775,7 @@ class StrategyFeedbackCompiler:
             shadow_feedback=shadow_feedback,
             expert_memory=expert_memory,
             manual_intervention=manual_intervention,
+            trade_fact_quarantine=trade_fact_quarantine,
             reflection_feedback=reflection_feedback,
             event_feedback=event_feedback,
             problems=problems,
@@ -5353,12 +5379,12 @@ class StrategyLearningService:
             params.min_dashboard_limit,
             min(int(limit or params.dashboard_default_limit), params.dashboard_full_limit),
         )
-        since = datetime.now(UTC) - timedelta(hours=capped_hours)
+        since = max(datetime.now(UTC) - timedelta(hours=capped_hours), PHASE3_CLEAN_START_UTC)
         async with get_read_session_ctx() as session:
             closed_result = await session.execute(
                 select(Position)
                 .where(
-                    Position.model_name == ENSEMBLE_TRADER_NAME,
+                    Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                     Position.execution_mode == selected_mode,
                     Position.is_open.is_(False),
                     Position.closed_at.is_not(None),
@@ -5370,9 +5396,10 @@ class StrategyLearningService:
             open_result = await session.execute(
                 select(Position)
                 .where(
-                    Position.model_name == ENSEMBLE_TRADER_NAME,
+                    Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                     Position.execution_mode == selected_mode,
                     Position.is_open.is_(True),
+                    Position.created_at >= PHASE3_CLEAN_START_UTC,
                 )
                 .order_by(Position.created_at.desc())
                 .limit(capped_limit)

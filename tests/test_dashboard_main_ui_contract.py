@@ -51,6 +51,17 @@ def test_execution_account_settings_no_allocated_balance_control() -> None:
     assert "\u81ea\u52a8\u4f7f\u7528 OKX" in html
 
 
+def test_execution_account_ui_uses_okx_equity_pnl_not_local_trade_fallback() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "account.today_total_pnl ?? account.today_equity_pnl" not in script
+    assert "const todayTotalPnl = valueNumber(account.today_equity_pnl);" in script
+    assert "account.cumulative_total_pnl ?? account.total_pnl" not in script
+    assert "const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);" in script
+    assert "今日OKX权益变化" in script
+    assert "三期OKX权益变化" in script
+
+
 def test_dashboard_refreshes_auth_status_in_topbar() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
@@ -118,6 +129,12 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "market_current_stage" in script
     assert "position_current_stage" in script
     assert "strategy_context:" in script
+    assert 'id="status-okx-sync"' in html
+    assert "function okxAuthoritativeSyncLabel" in script
+    assert "okx_authoritative_sync" in script
+    assert "OKX权威事实同步正常" in script
+    assert "OKX权威事实同步异常" in script
+    assert "Missing real OKX equity snapshot" in script
 
 
 def test_live_mode_switch_requires_known_missing_okx_config() -> None:
@@ -147,6 +164,26 @@ def test_dashboard_internal_api_requests_handle_auth_expiry() -> None:
     assert "fetchWithAuth('/api/settings/okx/balance'" in script
     assert "fetchWithAuth('/api/control/mode'" in script
     assert "fetchWithAuth('/api/settings/okx'" in script
+
+
+def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert "关联订单" in html
+    assert 'id="position-linked-orders-modal-overlay"' in html
+    assert 'id="position-linked-orders-modal-body"' in html
+    assert 'colspan="11"' in html
+    assert "positionLinkedOrdersByGroup" in script
+    assert "linked_fills" in script
+    assert "linked_order_count" in script
+    assert "evidence_complete" in script
+    assert "function openPositionLinkedOrdersModal" in script
+    assert "function closePositionLinkedOrdersModal" in script
+    assert ".js-position-linked-orders" in script
+    assert ".position-ledger-summary" in style
+    assert ".position-linked-orders-table-wrap" in style
 
 
 def test_opportunity_score_ui_prefers_expected_net_return() -> None:
@@ -400,10 +437,12 @@ def test_system_audit_displays_issue_ledger() -> None:
     assert ".system-audit-ledger-item" in style
     assert ".server-monitor-self-check-actions" in style
     assert ".server-monitor-panel.active" in style
-    assert "const MODEL_PUBLIC_HOST = '103.85.84.147';" in script
-    assert "'qwen3-14b-trade': `http://${MODEL_PUBLIC_HOST}:21840/v1`" in script
-    assert "'deepseek-r1-14b-risk': `http://${MODEL_PUBLIC_HOST}:21842/v1`" in script
-    assert "local_ai_tools: `http://${MODEL_PUBLIC_HOST}:21841`" in script
+    assert "MODEL_PUBLIC_HOST" not in script
+    assert "'qwen3-32b-trade': 'platform loopback 18000'" in script
+    assert "'deepseek-r1-14b-risk': 'platform loopback 18002'" in script
+    assert "'BB-FinQuant-Expert-14B': 'platform loopback 18003'" in script
+    assert "phase3_quant_api: 'platform loopback 18001'" in script
+    assert "21840" not in script and "21841" not in script and "21842" not in script
     assert "data.model_access_host" not in script
 
 
@@ -419,6 +458,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     assert "Promise.allSettled([" in script
     assert "document.getElementById('server-monitor-model-runtime')" in script
     assert "document.getElementById('server-monitor-model-panel')" not in script
+    assert "模型路由不匹配" in script
     assert "刷新大模型服务器监控失败" in script
     assert "刷新系统自检失败" in script
 
@@ -673,9 +713,13 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-feature-row" in style
     assert "postJSON('/api/data-collection/settings', body)" in script
     assert "fetchJSON('/api/vector-memory/status')" in script
+    assert "postJSON('/api/vector-memory/clear', {})" in script
     assert "postJSON('/api/vector-memory/reindex', {})" in script
-    assert "后台会自动维护索引" in script
-    assert "手动重建只用于立即刷新" in script
+    assert "清空旧索引" in html
+    assert "三期新样本向量索引" in html
+    assert "三期新样本" in script
+    assert "启用前请先清空旧索引" in script
+    assert "等待三期新样本重新索引" in script
     assert "立即刷新索引" in vector_settings_html
     assert "renderAnalysisVectorMemory" in script
     assert "\u975e\u786c\u62e6\u622a" in script
@@ -752,6 +796,22 @@ def test_dashboard_market_uses_open_position_snapshot_contract() -> None:
     assert "buildTickersFromPositions(marketPositions)" in script
 
 
+@pytest.mark.asyncio
+async def test_display_open_position_symbols_never_falls_back_to_local_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def local_symbols(_mode: str | None = None) -> set[str]:
+        raise AssertionError("Phase 3 current-position display must not use local DB fallback")
+
+    async def exchange_symbols(_mode: str | None = None) -> set[str]:
+        return set()
+
+    monkeypatch.setattr(dashboard, "_get_open_position_symbols", local_symbols)
+    monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", exchange_symbols)
+
+    assert await dashboard._get_display_open_position_symbols("paper") == set()
+
+
 def test_opening_funnel_request_failure_uses_unavailable_fallback() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     fetch_block = script[
@@ -825,6 +885,114 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
     assert "dirty_sample_ratio" in overview_block
     assert "long_pr_auc" in overview_block
     assert "short_pr_auc" in overview_block
+
+
+def test_server_monitor_gpu_summary_uses_all_cards() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    block = script[
+        script.index("function serverMonitorGpuSummary") : script.index(
+            "function renderServerMonitor"
+        )
+    ]
+
+    assert "reduce((sum, gpu) => sum + Number(gpu.memory_used_mb || 0), 0)" in block
+    assert "reduce((sum, gpu) => sum + Number(gpu.memory_total_mb || 0), 0)" in block
+    assert "rows.length" in block
+    assert "8" not in block
+    assert "const gpu = (data.gpu?.gpus || [])[0] || {};" not in script
+    assert "gpuSummary.memory_total_mb" in script
+    assert "data.phase3_model_server_gpu || {}" in script
+    assert "liveGpuRows.length ? liveGpuPayload : phase3GpuPayload" in script
+    assert "卡汇总" in script
+
+
+def test_data_collection_ui_explains_phase3_clean_training_view() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "phase3CleanCount" in script
+    assert "旧数据参与训练" not in script
+    assert "只使用干净训练视图" in script
+    assert "冷启动待补齐，不驱动开仓" in script
+    assert "缺失/过期特征默认中性阻断" in script
+    assert "三期重新开始训练；旧数据禁止进入新模型训练" in script
+    assert "三期相似样本记忆" in script
+
+
+def test_system_audit_okx_details_renders_root_cause_and_training_policy() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    okx_block = script[
+        script.index("function systemAuditOkxDetailsV2") : script.index(
+            "function systemAuditCardDetailsHtml"
+        )
+    ]
+
+    assert "root_cause_summary" in okx_block
+    assert "training_data_policy" in okx_block
+    assert "OKX root causes" in okx_block
+    assert "Training data policy" in okx_block
+    assert "requires_training_rebuild" in okx_block
+    assert "systemAuditOkxDetailsV2(details)" in script
+
+
+def test_system_audit_okx_details_renders_runtime_entry_gate() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    okx_block = script[
+        script.index("function systemAuditOkxDetailsV2") : script.index(
+            "function systemAuditCardDetailsHtml"
+        )
+    ]
+
+    assert "runtime_okx_entry_gate" in okx_block
+    assert "Runtime OKX entry gate" in okx_block
+    assert "Runtime OKX sync result kinds" in okx_block
+    assert "Runtime OKX sync samples" in okx_block
+    assert "Entry gate" in okx_block
+    assert "runtimeGate.blocker" in okx_block
+    assert "Requires attention" in okx_block
+    assert "runtimeSampleRows" in okx_block
+    assert "last_samples" in okx_block
+
+
+def test_system_audit_position_price_details_render_mismatch_root_causes() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    position_block = script[
+        script.index("function systemAuditPositionPriceDetails") : script.index(
+            "function systemAuditStrategySignalRootCauseDetails"
+        )
+    ]
+
+    assert "root_cause_summary" in position_block
+    assert "local_only_positions" in position_block
+    assert "exchange_only_positions" in position_block
+    assert "Position mismatch root causes" in position_block
+    assert "OKX position mode counts" in position_block
+    assert "OKX side inference counts" in position_block
+    assert "Price/PnL split samples" in position_block
+    assert "Local-only open positions" in position_block
+    assert "OKX-only open positions" in position_block
+    assert "okx_pos_side" in position_block
+    assert "okx_raw_pos" in position_block
+    assert "okx_side_inference" in position_block
+    assert "Raw pos" in position_block
+    assert "systemAuditPositionPriceDetails(details)" in script
+
+
+def test_system_audit_strategy_signal_details_render_scheduler_diagnostics() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    signal_block = script[
+        script.index("function systemAuditStrategySignalRootCauseDetails") : script.index(
+            "function systemAuditCardDetailsHtml"
+        )
+    ]
+
+    assert "details.scheduler" in signal_block
+    assert "dynamic_capacity" in signal_block
+    assert "Scheduler strategy distribution" in signal_block
+    assert "Scheduler flags" in signal_block
+    assert "Dynamic capacity reason codes" in signal_block
+    assert "Latest scheduler samples" in signal_block
+    assert "strategy_learning_context_timeout" in signal_block
+    assert "systemAuditStrategySignalRootCauseDetails(details)" in script
 
 
 def test_ml_signal_dashboard_renders_controlled_degraded_as_observing() -> None:

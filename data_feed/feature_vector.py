@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import math
 from typing import Any
 
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
@@ -19,6 +20,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return result
+
+
+def _safe_float_sequence(value: Any, *, limit: int = 80) -> list[float]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[float] = []
+    for item in value[-limit:]:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            out.append(number)
+    return out
 
 
 @dataclass
@@ -45,6 +60,11 @@ class FeatureVector:
     notional_24h_usdt: float = 0.0
     volume_24h_source: str = ""
     volume: float = 0.0
+    close_sequence: list[float] = field(default_factory=list)
+    volume_sequence: list[float] = field(default_factory=list)
+    sequence_timeframe: str = ""
+    sequence_length: int = 0
+    sequence_quality_warning: str = ""
     change_24h_pct: float = 0.0
     spread_pct: float = 0.0
     price_source: str = ""
@@ -93,6 +113,8 @@ class FeatureVector:
     orderbook_bid_depth: float = 0.0
     orderbook_ask_depth: float = 0.0
     orderbook_imbalance: float = 0.0
+    liquidation_risk_score: float = 0.0
+    sector_relative_strength: float = 0.0
 
     # --- Sentiment data ---
     news_sentiment_avg: float = 0.0
@@ -246,6 +268,10 @@ def build_feature_vector(
         for key, value in indicators.items():
             if hasattr(fv, key):
                 setattr(fv, key, value)
+        fv.close_sequence = _safe_float_sequence(fv.close_sequence)
+        fv.volume_sequence = _safe_float_sequence(fv.volume_sequence)
+        if fv.close_sequence:
+            fv.sequence_length = len(fv.close_sequence)
         fv.indicator_close_price = _safe_float(indicators.get("close"), 0.0)
         if fv.current_price <= 0 and fv.close > 0:
             fv.current_price = fv.close
@@ -258,6 +284,12 @@ def build_feature_vector(
                 fv.indicator_price_gap_pct = price_gap * 100
                 fv.price_reconciliation_warning = (
                     "ticker_current_price_kept_indicator_close_diverged"
+                )
+                fv.close_sequence = []
+                fv.volume_sequence = []
+                fv.sequence_length = 0
+                fv.sequence_quality_warning = (
+                    "indicator_sequence_dropped_due_to_ticker_gap"
                 )
                 fv.close = fv.current_price
         if fv.bid <= 0 and fv.current_price > 0:
@@ -290,4 +322,48 @@ def build_feature_vector(
             if hasattr(fv, key):
                 setattr(fv, key, value)
 
+    fv.liquidation_risk_score = _derive_liquidation_risk_score(fv)
+    fv.sector_relative_strength = _derive_sector_relative_strength(fv)
+
     return fv
+
+
+def _derive_liquidation_risk_score(fv: FeatureVector) -> float:
+    """Estimate forced-liquidation risk from available market microstructure."""
+
+    if _safe_float(fv.liquidation_risk_score, 0.0) > 0:
+        return _safe_float(fv.liquidation_risk_score, 0.0)
+    volatility = abs(_safe_float(fv.volatility_20, 0.0))
+    intraday_move = abs(_safe_float(fv.change_24h_pct, 0.0)) / 100.0
+    wick = max(_safe_float(fv.abnormal_wick_max_pct, 0.0) / 100.0, 0.0)
+    spread = max(_safe_float(fv.spread_pct, 0.0) / 100.0, 0.0)
+    imbalance = abs(_safe_float(fv.orderbook_imbalance, 0.0))
+    funding = min(abs(_safe_float(fv.funding_rate, 0.0)) * 50.0, 0.25)
+    depth = max(
+        _safe_float(fv.orderbook_bid_depth, 0.0) + _safe_float(fv.orderbook_ask_depth, 0.0),
+        0.0,
+    )
+    depth_penalty = 0.10 if depth <= 0 else min(0.10, 10000.0 / max(depth, 1.0) * 0.02)
+    score = (
+        volatility * 1.8
+        + intraday_move * 0.8
+        + wick * 0.8
+        + spread * 1.5
+        + imbalance * 0.15
+        + funding
+        + depth_penalty
+    )
+    return max(min(score, 1.0), 0.0001)
+
+
+def _derive_sector_relative_strength(fv: FeatureVector) -> float:
+    """Build a neutral sector-strength proxy until external sector maps are online."""
+
+    existing = _safe_float(fv.sector_relative_strength, 0.0)
+    if abs(existing) > 1e-12:
+        return existing
+    change = _safe_float(fv.change_24h_pct, 0.0) / 100.0
+    momentum = _safe_float(fv.returns_20, 0.0)
+    volume_component = math.log1p(max(_safe_float(fv.volume_ratio, 1.0), 0.0)) / 10.0
+    strength = change * 0.6 + momentum * 0.3 + volume_component * 0.1
+    return max(min(strength, 1.0), -1.0)

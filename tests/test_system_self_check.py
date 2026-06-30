@@ -20,17 +20,24 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
         "ai_models",
         [
             {
-                "name": "trend_expert",
+                "name": "decision_maker",
                 "api_base": "http://127.0.0.1:8003/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-14b-trade",
+                "model": "qwen3-32b-trade",
+                "enabled": True,
+            },
+            {
+                "name": "trend_expert",
+                "api_base": "http://127.0.0.1:18003/v1",
+                "api_key": "unit-key",
+                "model": "BB-FinQuant-Expert-14B",
                 "enabled": True,
             },
             {
                 "name": "sentiment_expert",
-                "api_base": "http://127.0.0.1:18002/v1",
+                "api_base": "http://127.0.0.1:18003/v1",
                 "api_key": "unit-key",
-                "model": "deepseek-r1-14b-risk",
+                "model": "BB-FinQuant-Expert-14B",
                 "enabled": True,
             },
         ],
@@ -42,12 +49,13 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
     items = system_health._configured_endpoint_items()
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "critical"
-    assert by_key["endpoint_qwen3-14b-trade"]["details"]["expected_platform_endpoint"] == (
+    assert by_key["endpoint_qwen3-32b-trade"]["status"] == "critical"
+    assert by_key["endpoint_qwen3-32b-trade"]["details"]["expected_platform_endpoint"] == (
         "http://127.0.0.1:18000/v1"
     )
-    assert by_key["endpoint_local_ai_tools"]["status"] == "ok"
+    assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
+    assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
 
 
 def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
@@ -60,12 +68,16 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
         "platform_runtime": {
             "ai_models": [
                 {
-                    "model": "qwen3-14b-trade",
+                    "model": "qwen3-32b-trade",
                     "api_base": "http://127.0.0.1:18000/v1",
                 },
                 {
                     "model": "deepseek-r1-14b-risk",
                     "api_base": "http://127.0.0.1:18002/v1",
+                },
+                {
+                    "model": "BB-FinQuant-Expert-14B",
+                    "api_base": "http://127.0.0.1:18003/v1",
                 },
             ],
             "local_ai_tools": {"api_base": "http://127.0.0.1:18001"},
@@ -75,9 +87,10 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
     items = system_health._configured_endpoint_items(monitor_status)
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "ok"
-    assert by_key["endpoint_local_ai_tools"]["status"] == "ok"
+    assert by_key["endpoint_qwen3-32b-trade"]["status"] == "ok"
+    assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
+    assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
 
 
 def test_server_monitor_items_keep_runtime_models_when_remote_monitor_unavailable() -> None:
@@ -124,7 +137,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
                 "name": "trend_expert",
                 "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-14b-trade",
+                "model": "qwen3-32b-trade",
                 "enabled": True,
             }
         ],
@@ -146,7 +159,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
                         "model_available": False,
                     },
                     {
-                        "model": "qwen3-14b-trade",
+                        "model": "qwen3-32b-trade",
                         "api_base": "http://127.0.0.1:18000/v1",
                         "available": False,
                         "endpoint_ok": False,
@@ -161,8 +174,39 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
     by_key = {item["key"]: item for item in items}
     assert by_key["runtime_model_deepseek-v4-pro"]["status"] == "info"
     assert by_key["runtime_model_deepseek-v4-pro"]["details"]["required"] is False
-    assert by_key["runtime_model_qwen3-14b-trade"]["status"] == "critical"
-    assert by_key["runtime_model_qwen3-14b-trade"]["details"]["required"] is True
+    assert by_key["runtime_model_qwen3-32b-trade"]["status"] == "critical"
+    assert by_key["runtime_model_qwen3-32b-trade"]["details"]["required"] is True
+
+
+def test_expert_model_diversity_flags_shared_expert_provider() -> None:
+    monitor_status = {
+        "platform_runtime": {
+            "ai_models": [
+                {
+                    "name": name,
+                    "label": name,
+                    "api_base": "http://127.0.0.1:18003/v1",
+                    "model": "BB-FinQuant-Expert-14B",
+                }
+                for name in (
+                    "trend_expert",
+                    "momentum_expert",
+                    "sentiment_expert",
+                    "position_expert",
+                    "risk_expert",
+                )
+            ]
+        }
+    }
+
+    item = system_health._expert_model_diversity_item(monitor_status)
+
+    assert item["status"] == "warning"
+    assert item["key"] == "expert_model_diversity"
+    assert item["details"]["configured_expert_count"] == 5
+    assert item["details"]["unique_provider_count"] == 1
+    assert item["details"]["largest_shared_provider_count"] == 5
+    assert item["details"]["same_provider_risk"] is True
 
 
 @pytest.mark.asyncio
@@ -292,6 +336,8 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
                 )
             if self.calls == 3:
                 return FakeResult(one_row=(200, 3, now))
+            if self.calls == 4:
+                return FakeResult(one_row=(40, 8, now))
             return FakeResult(one_row=(0, 0, None))
 
     @asynccontextmanager
@@ -306,8 +352,10 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
     assert by_key["market_ticker_freshness"]["status"] == "ok"
     assert by_key["market_kline_coverage"]["status"] == "ok"
     assert by_key["news_source_freshness"]["status"] == "ok"
+    assert by_key["external_event_source_freshness"]["status"] == "ok"
     assert by_key["social_source_freshness"]["status"] == "warning"
     assert by_key["market_kline_coverage"]["details"]["missing_timeframes"] == []
+    assert by_key["external_event_source_freshness"]["details"]["source_count"] == 8
     assert by_key["social_source_freshness"]["details"]["platform_count"] == 0
 
 
@@ -355,6 +403,55 @@ async def test_recent_execution_self_check_flags_entry_without_opportunity_score
     assert by_key["entry_opportunity_score_coverage"]["status"] == "critical"
     assert by_key["entry_opportunity_score_coverage"]["details"]["sample_decision_ids"] == [101]
     assert by_key["entry_opportunity_score_coverage"]["details"]["latest_scored_entry_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_recent_execution_self_check_ignores_position_review_without_opportunity_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult([])
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=9230,
+                        action="short",
+                        analysis_type="position",
+                        raw_llm_response={
+                            "analysis_type": "position_review",
+                            "position_review_policy": {"result": "hold"},
+                            "decision_state_machine": {"stages": [{"status": "passed"}]},
+                        },
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert "entry_opportunity_score_coverage" not in by_key
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,7 @@ class FillGroup:
     timestamp: datetime | None
     timestamp_ms: float
     rows: list[dict[str, Any]]
+    inst_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -192,17 +193,19 @@ async def _fetch_okx_fill_groups(symbols: set[str]) -> dict[str, list[FillGroup]
     grouped: dict[str, dict[str, dict[str, Any]]] = {}
     for row in rows:
         order_id = str(row.get("ordId") or "").strip()
-        symbol = normalize_trading_symbol(row.get("instId"))
+        inst_id = str(row.get("instId") or "").strip().upper()
+        symbol = normalize_trading_symbol(inst_id)
         side = str(row.get("side") or "").lower().strip()
         contracts = _safe_float(row.get("fillSz") or row.get("sz"), 0.0)
         price = _safe_float(row.get("fillPx") or row.get("price"), 0.0)
-        if not order_id or not symbol or not side or contracts <= 0 or price <= 0:
+        if not order_id or not inst_id or not symbol or not side or contracts <= 0 or price <= 0:
             continue
         by_order = grouped.setdefault(symbol, {})
         group = by_order.setdefault(
             order_id,
             {
                 "order_id": order_id,
+                "inst_id": inst_id,
                 "symbol": symbol,
                 "side": side,
                 "contracts": 0.0,
@@ -243,6 +246,7 @@ async def _fetch_okx_fill_groups(symbols: set[str]) -> dict[str, list[FillGroup]
                     timestamp=_datetime_from_ms(timestamp_ms),
                     timestamp_ms=timestamp_ms,
                     rows=list(group.get("rows") or []),
+                    inst_id=str(group.get("inst_id") or ""),
                 )
             )
     return result

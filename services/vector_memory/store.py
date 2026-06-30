@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -36,6 +38,9 @@ class VectorMemoryStore(Protocol):
 
     def stats(self) -> dict[str, Any]:
         """Return store statistics."""
+
+    def clear(self) -> int:
+        """Delete indexed documents and return the previous document count."""
 
 
 def document_to_fields(document: VectorMemoryDocument) -> dict[str, Any]:
@@ -142,6 +147,12 @@ class JsonVectorMemoryStore:
         rows = self._read_rows()
         return {"backend": self.backend_name, "document_count": len(rows), "path": str(self.path)}
 
+    def clear(self) -> int:
+        rows = self._read_rows()
+        removed = len(rows)
+        self._write_rows([])
+        return removed
+
     def _read_rows(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
@@ -213,6 +224,7 @@ class ZvecVectorMemoryStore:
                 logger.warning("zvec collection open failed", error=safe_error_text(exc))
                 if self.read_only:
                     raise
+                self._quarantine_invalid_path(exc)
         if self.read_only:
             raise FileNotFoundError(f"zvec collection does not exist: {self.path}")
         schema = self._zvec.CollectionSchema(
@@ -237,7 +249,46 @@ class ZvecVectorMemoryStore:
                 )
             ],
         )
-        return self._zvec.create_and_open(str(self.path), schema)
+        try:
+            return self._zvec.create_and_open(str(self.path), schema)
+        except Exception as exc:
+            if self.path.exists() and "path validate failed" in safe_error_text(exc).lower():
+                self._quarantine_invalid_path(exc)
+                return self._zvec.create_and_open(str(self.path), schema)
+            raise
+
+    def _quarantine_invalid_path(self, exc: Exception) -> None:
+        if not self.path.exists():
+            return
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        target = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+        counter = 1
+        while target.exists():
+            target = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{counter}")
+            counter += 1
+        try:
+            self.path.rename(target)
+            logger.warning(
+                "zvec invalid collection quarantined before recreate",
+                path=str(self.path),
+                quarantine_path=str(target),
+                error=safe_error_text(exc),
+            )
+        except Exception:
+            self._remove_existing_path()
+            logger.warning(
+                "zvec invalid collection removed before recreate after quarantine failed",
+                path=str(self.path),
+                error=safe_error_text(exc),
+            )
+
+    def _remove_existing_path(self) -> None:
+        if not self.path.exists():
+            return
+        if self.path.is_dir():
+            shutil.rmtree(self.path)
+        else:
+            self.path.unlink()
 
     def upsert(self, documents: Iterable[VectorMemoryDocument]) -> int:
         if self.read_only:
@@ -310,6 +361,14 @@ class ZvecVectorMemoryStore:
             count = 0
         count = max(count, self._last_known_count)
         return {"backend": self.backend_name, "document_count": count, "path": str(self.path)}
+
+    def clear(self) -> int:
+        if self.read_only:
+            raise RuntimeError("zvec store is opened read-only and cannot clear documents")
+        before = int(self.stats().get("document_count") or 0)
+        self._remove_existing_path()
+        self._last_known_count = 0
+        return before
 
 
 def _zvec_score_to_similarity(score: float) -> float:

@@ -10,7 +10,12 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, symbol_from_okx_payload
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_payload,
+    symbol_from_okx_inst_id,
+    symbol_from_okx_payload,
+)
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
@@ -96,10 +101,7 @@ class TradeOrderLogService:
         }
         if status_text in exchange_confirmed_statuses:
             exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
-            native_full_close_confirmed = is_confirmed_native_full_close_result(result)
-            if not native_full_close_confirmed and (
-                not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}
-            ):
+            if not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}:
                 return True
         if quantity <= 0 and status_text in active_or_filled:
             return True
@@ -127,6 +129,9 @@ class TradeOrderLogService:
 
         raw = getattr(result, "raw_response", None)
         raw = raw if isinstance(raw, dict) else {}
+        okx_inst_id = okx_inst_id_from_payload(raw, include_fallback=False)
+        if okx_inst_id:
+            return symbol_from_okx_inst_id(okx_inst_id)
         explicit = normalize_trading_symbol(raw.get("canonical_exchange_symbol"))
         if explicit:
             return explicit

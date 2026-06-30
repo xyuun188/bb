@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import httpx
 import pytest
 
+from scripts import train_local_ai_tools_models as train_script
 from scripts.train_local_ai_tools_models import (
     _build_auth_headers,
+    _compact_local_ai_tools_features,
     _merge_trade_samples,
     _normalize_base_url,
     _post_training_payload,
@@ -51,6 +54,129 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
         "closed_position",
     ]
     assert [item["position_id"] for item in merged] == [7, 8, 9]
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_training_post_preserves_phase3_training_policy() -> None:
+    captured_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payload.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"trained": True}, request=request)
+
+    result = await _post_training_payload(
+        "https://local-ai-tools.test/",
+        {
+            "shadow_samples": [],
+            "training_mode": "walk_forward",
+            "model_stage": "shadow",
+            "evaluation_policy": {
+                "promotion_flow": "shadow_to_canary_to_live",
+                "live_mutation": False,
+                "requires_walk_forward": False,
+            },
+        },
+        request_timeout=3.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result == {"trained": True}
+    assert captured_payload["training_mode"] == "walk_forward"
+    assert captured_payload["model_stage"] == "shadow"
+    assert captured_payload["evaluation_policy"] == {
+        "promotion_flow": "shadow_to_canary_to_live",
+        "live_mutation": False,
+        "requires_walk_forward": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_training_post_preserves_promotion_recommendation() -> None:
+    captured_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payload.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"trained": True}, request=request)
+
+    promotion = {
+        "policy": "phase3_shadow_to_canary_to_live",
+        "recommended_stage": "canary",
+        "canary_ready": True,
+        "live_ready": False,
+    }
+    result = await _post_training_payload(
+        "https://local-ai-tools.test/",
+        {"shadow_samples": [], "promotion_recommendation": promotion},
+        request_timeout=3.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result == {"trained": True}
+    assert captured_payload["promotion_recommendation"] == promotion
+
+
+def test_local_ai_tools_shadow_features_are_compacted_for_training_payload() -> None:
+    features = {
+        "symbol": "BTC/USDT",
+        "current_price": "100.5",
+        "rsi_14": 55,
+        "returns_1": 0.12,
+        "volume_ratio": 1.8,
+        "decision_confidence": 0.73,
+        "horizon_minutes": 10,
+        "close_sequence": list(range(120)),
+        "recent_headlines": ["x" * 300 for _ in range(20)],
+        "local_ai_tools_shadow": {
+            "status": "completed",
+            "time_series_prediction": {
+                "model": "local-timeseries-ensemble-v1",
+                "expected_return_pct": 0.1,
+                "timesfm_shadow_expected_return_pct": 0.42,
+                "timesfm_shadow_side": "long",
+                "specialist_inference_active": True,
+                "professional_model_shadow": {
+                    "kind": "timeseries",
+                    "actual_inference": True,
+                    "baseline_response": True,
+                    "live_mutation": False,
+                    "shadow_result": {
+                        "model": "timesfm-2.5-shadow-challenger",
+                        "expected_return_pct": 0.42,
+                        "best_side": "long",
+                        "confidence": 0.73,
+                        "raw_predictions": list(range(100)),
+                    },
+                },
+                "raw_huge_payload": list(range(1000)),
+            },
+        },
+        "raw_llm_response": {"huge": ["unused"] * 1000},
+        "opinions": [{"unused": True}],
+        "nested_context": {"unused": True},
+    }
+
+    compact = _compact_local_ai_tools_features(features)
+
+    assert compact["symbol"] == "BTC/USDT"
+    assert compact["current_price"] == 100.5
+    assert compact["rsi_14"] == 55.0
+    assert compact["close_sequence"] == list(range(40, 120))
+    assert len(compact["recent_headlines"]) == 12
+    assert all(len(text) == 220 for text in compact["recent_headlines"])
+    shadow = compact["local_ai_tools_shadow"]["time_series_prediction"]
+    assert shadow["timesfm_shadow_expected_return_pct"] == 0.42
+    assert shadow["timesfm_shadow_side"] == "long"
+    assert shadow["professional_model_shadow"]["shadow_result"] == {
+        "model": "timesfm-2.5-shadow-challenger",
+        "expected_return_pct": 0.42,
+        "best_side": "long",
+        "confidence": 0.73,
+    }
+    assert "raw_huge_payload" not in shadow
+    assert "raw_predictions" not in shadow["professional_model_shadow"]["shadow_result"]
+    assert "raw_llm_response" not in compact
+    assert "opinions" not in compact
+    assert "nested_context" not in compact
 
 
 @pytest.mark.asyncio
@@ -116,6 +242,148 @@ async def test_local_ai_tools_training_post_preserves_governance_report() -> Non
 
     assert result == {"trained": True}
     assert captured_payload["governance_report"] == governance_report
+
+
+@pytest.mark.asyncio
+async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def load_shadow_samples(_limit: int) -> list[dict[str, object]]:
+        return [
+            {
+                "id": 1,
+                "symbol": "BTC/USDT",
+                "features": {
+                    "symbol": "BTC/USDT",
+                    "current_price": 100.0,
+                    "returns_1": 0.01,
+                    "returns_5": 0.02,
+                    "returns_20": 0.03,
+                },
+                "long_return_pct": 0.2,
+                "short_return_pct": -0.1,
+            }
+        ]
+
+    async def empty_samples(_limit: int | None = None) -> list[dict[str, object]]:
+        return []
+
+    async def completed_shadow_count() -> int:
+        return 1
+
+    async def completed_trade_count() -> int:
+        return 0
+
+    async def post_training_payload(
+        base_url: str,
+        payload: dict[str, object],
+        *,
+        request_timeout: float,
+    ) -> dict[str, object]:
+        captured["base_url"] = base_url
+        captured["payload"] = payload
+        captured["request_timeout"] = request_timeout
+        return {"trained": False, "reason": "phase3_preflight_no_artifact_write"}
+
+    async def fail_quarantine(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("default preflight must not quarantine training rows")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_local_ai_tools_models.py",
+            "--base-url",
+            "http://127.0.0.1:8001",
+            "--shadow-limit",
+            "1",
+            "--trade-limit",
+            "1",
+            "--sequence-limit",
+            "1",
+            "--text-limit",
+            "1",
+        ],
+    )
+    monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
+    monkeypatch.setattr(train_script, "_load_trade_reflection_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_load_closed_position_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_load_sequence_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_load_text_sentiment_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_completed_shadow_sample_count", completed_shadow_count)
+    monkeypatch.setattr(train_script, "_completed_trade_sample_count", completed_trade_count)
+    monkeypatch.setattr(
+        train_script,
+        "okx_training_refresh_gate",
+        lambda: {
+            "allowed": True,
+            "reason": "okx_daily_reconciliation_allows_training_refresh",
+            "can_refresh_training": True,
+        },
+    )
+    monkeypatch.setattr(train_script, "quarantine_dirty_shadow_samples", fail_quarantine)
+    monkeypatch.setattr(train_script, "_post_training_payload", post_training_payload)
+    monkeypatch.setattr(train_script, "safe_print", lambda *_args, **_kwargs: None)
+
+    await train_script._main()
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert captured["base_url"] == "http://127.0.0.1:8001"
+    assert captured["request_timeout"] == 180.0
+    assert payload["persist_artifact"] is False
+    assert payload["confirm_phase3_rebuild"] is False
+    assert payload["okx_daily_reconciliation_gate"]["allowed"] is True
+    assert payload["training_quarantine"] == {
+        "skipped": True,
+        "reason": "phase3_preflight_no_quarantine_writes",
+    }
+    assert payload["evaluation_policy"]["phase"] == "phase3_model_factory"
+    assert payload["evaluation_policy"]["live_mutation"] is False
+
+
+@pytest.mark.asyncio
+async def test_train_local_ai_tools_cli_rejects_unconfirmed_artifact_persist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_local_ai_tools_models.py", "--persist-artifact"],
+    )
+
+    with pytest.raises(SystemExit, match="--persist-artifact requires --confirm-phase3-rebuild"):
+        await train_script._main()
+
+
+@pytest.mark.asyncio
+async def test_train_local_ai_tools_cli_blocks_when_okx_gate_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_local_ai_tools_models.py", "--base-url", "http://127.0.0.1:8001"],
+    )
+    monkeypatch.setattr(
+        train_script,
+        "okx_training_refresh_gate",
+        lambda: {
+            "allowed": False,
+            "reason": "okx_daily_reconciliation_training_blocked",
+            "can_refresh_training": False,
+        },
+    )
+
+    async def post_training_payload(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("training payload must not be posted when OKX gate blocks")
+
+    monkeypatch.setattr(train_script, "_post_training_payload", post_training_payload)
+
+    with pytest.raises(SystemExit, match="OKX daily reconciliation blocks"):
+        await train_script._main()
 
 
 @pytest.mark.asyncio

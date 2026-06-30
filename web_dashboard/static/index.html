@@ -245,7 +245,7 @@
                             <div class="auto-status-item">
                                 <span class="auto-status-icon">&#x1F4CA;</span>
                                 <div class="auto-status-body">
-                                    <div class="auto-status-label">累计决策 / 持仓</div>
+                                    <div class="auto-status-label">模式累计决策 / 当前持仓</div>
                                     <div class="auto-status-value" id="status-decision-trade">0 / 0</div>
                                 </div>
                             </div>
@@ -275,6 +275,13 @@
                                 <div class="auto-status-body">
                                     <div class="auto-status-label">本轮耗时 / 上轮完成</div>
                                     <div class="auto-status-value" id="status-round-timing">-</div>
+                                </div>
+                            </div>
+                            <div class="auto-status-item auto-status-wide">
+                                <span class="auto-status-icon auto-status-icon-text">OKX</span>
+                                <div class="auto-status-body">
+                                    <div class="auto-status-label">OKX 权威同步</div>
+                                    <div class="auto-status-value" id="status-okx-sync">等待同步状态</div>
                                 </div>
                             </div>
                             <div class="auto-status-item auto-status-wide" id="status-loop-error-row" style="display:none;">
@@ -398,10 +405,11 @@
                                 <th>已实现盈亏</th>
                                 <th>开仓时间</th>
                                 <th>平仓时间</th>
+                                <th>关联订单</th>
                             </tr>
                         </thead>
                         <tbody id="position-history-tbody">
-                            <tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">加载历史持仓中...</td></tr>
+                            <tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">加载历史持仓中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -410,6 +418,16 @@
         </div>
 
         <!-- ═══════ PAGE: DAILY PNL ═══════ -->
+        <div class="modal-overlay" id="position-linked-orders-modal-overlay" style="display:none;">
+            <div class="modal modal-wide">
+                <div class="modal-header">
+                    <span id="position-linked-orders-modal-title">关联订单明细</span>
+                    <button class="modal-close" type="button" onclick="closePositionLinkedOrdersModal()">&times;</button>
+                </div>
+                <div class="modal-body" id="position-linked-orders-modal-body"></div>
+            </div>
+        </div>
+
         <div class="page-section" id="page-daily-pnl">
             <div class="card">
                 <div class="card-header">
@@ -425,7 +443,7 @@
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
-                    按北京时间自然日统计；列表展示已平仓盈亏、当日总盈亏和累计盈亏。
+                    按北京时间自然日统计；已平仓净盈亏来自 OKX 成交/仓位事实，OKX 权益变化来自账户权益快照。
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -435,8 +453,8 @@
                                 <th>亏损合计</th>
                                 <th>盈利合计</th>
                                 <th>已平仓净盈亏</th>
-                                <th>当日总盈亏</th>
-                                <th>累计盈亏</th>
+                                <th>OKX权益变化</th>
+                                <th>三期累计权益变化</th>
                                 <th>交易数</th>
                                 <th>详情</th>
                             </tr>
@@ -1646,7 +1664,7 @@
                         </label>
                         <label class="form-group">
                             <span>每轮最多源数量</span>
-                            <input type="number" class="form-input" id="data-external-max-sources" min="1" max="20" step="1">
+                            <input type="number" class="form-input" id="data-external-max-sources" min="1" max="32" step="1">
                         </label>
                         <label class="form-group">
                             <span>每源最多条数</span>
@@ -1690,10 +1708,11 @@
                 <div class="card-header">
                     <div>
                         <span class="card-title">向量记忆设置</span>
-                        <span class="card-subtitle">用于检索相似历史决策、新闻事件和复盘案例；默认关闭，不阻塞交易热路径</span>
+                        <span class="card-subtitle">三期新样本向量索引；旧索引必须清空后再由新 paper/新采集数据重建</span>
                     </div>
                     <div class="settings-actions compact">
                         <button class="btn btn-sm" type="button" onclick="refreshVectorMemoryStatus()">刷新状态</button>
+                        <button class="btn btn-sm" type="button" onclick="clearVectorMemoryIndex()">清空旧索引</button>
                         <button class="btn btn-sm" type="button" onclick="reindexVectorMemory()">立即刷新索引</button>
                         <button class="btn btn-sm btn-accent" type="button" onclick="saveVectorMemorySettings()">保存设置</button>
                     </div>
@@ -1702,7 +1721,7 @@
                     <label class="data-collection-toggle">
                         <input type="checkbox" id="vector-memory-enabled">
                         <span>
-                            <strong>启用相似历史记忆</strong>
+                            <strong>启用三期相似样本记忆</strong>
                             <em id="vector-memory-runtime-note">未读取运行状态</em>
                         </span>
                     </label>
@@ -1734,7 +1753,7 @@
                                 <button class="btn btn-sm" type="button" onclick="searchVectorMemory()">检索</button>
                                 <span class="settings-inline-status" id="vector-memory-search-status"></span>
                             </div>
-                            <div id="vector-memory-search-results" class="data-source-list"><div class="analysis-empty compact">输入关键词后可查看相似历史</div></div>
+                            <div id="vector-memory-search-results" class="data-source-list"><div class="analysis-empty compact">输入关键词后可查看三期新索引样本</div></div>
                         </div>
                     </div>
                     <div class="settings-inline-status" id="vector-memory-save-status"></div>

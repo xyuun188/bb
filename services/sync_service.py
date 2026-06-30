@@ -15,9 +15,12 @@ from sqlalchemy import select
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
-from core.symbols import okx_inst_id_from_payload, trading_symbol_variants
+from core.symbols import (
+    okx_inst_id_from_payload,
+    symbol_from_okx_inst_id,
+    trading_symbol_variants,
+)
 from core.trading_mode import mode_manager
-from db.repositories.account_repo import AccountRepository
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
@@ -104,6 +107,15 @@ def _okx_inst_id_from_close_fill(close_fill: dict[str, Any] | None, *, fallback:
     return okx_inst_id_from_payload({**fill, "info": info}, fallback=fallback)
 
 
+def _symbol_from_okx_inst_id_or_fallback(okx_inst_id: Any, fallback: Any) -> str:
+    value = str(okx_inst_id or "").strip().upper()
+    if value:
+        symbol = symbol_from_okx_inst_id(value)
+        if symbol:
+            return symbol
+    return str(fallback or "")
+
+
 def _okx_pos_id_from_close_fill(close_fill: dict[str, Any] | None) -> str:
     fill = _dict_value(close_fill)
     info = _close_fill_order_info(fill)
@@ -175,6 +187,28 @@ def _position_context_opened_at(position_payload: dict[str, Any], info: dict[str
         if parsed is not None:
             return serialize_position_time(parsed)
     return None
+
+
+def _exchange_position_key(
+    position_payload: dict[str, Any],
+    *,
+    symbol_normalizer: Callable[[Any], str],
+) -> tuple[str, str] | None:
+    snapshot = parse_exchange_position_snapshot(
+        position_payload,
+        symbol_normalizer=symbol_normalizer,
+    )
+    if snapshot:
+        return str(snapshot["symbol"]), str(snapshot["side"])
+    symbol = symbol_normalizer(position_payload.get("symbol"))
+    side = str(position_payload.get("side") or "").lower()
+    if not symbol or side not in {"long", "short"}:
+        return None
+    return symbol, side
+
+
+def _position_execution_mode(position: Any) -> str:
+    return "live" if str(getattr(position, "execution_mode", "") or "").lower() == "live" else "paper"
 
 
 def normalized_open_position_context(
@@ -457,13 +491,6 @@ class OkxSyncService:
             raise RuntimeError("OkxSyncService requires float_parser dependency")
         return self.float_parser
 
-    def _required_paper_positions_provider(
-        self,
-    ) -> Callable[[], Awaitable[list[dict[str, Any]]]]:
-        if self.paper_positions_provider is None:
-            raise RuntimeError("OkxSyncService requires paper_positions_provider dependency")
-        return self.paper_positions_provider
-
     def _required_active_okx_provider(self) -> Callable[[], Any | None]:
         if self.active_okx_provider is None:
             raise RuntimeError("OkxSyncService requires active_okx_provider dependency")
@@ -619,14 +646,30 @@ class OkxSyncService:
         prune_position_profit_peaks = self._required_position_profit_peak_pruner()
         normalize_symbol = self.symbol_normalizer or (lambda value: str(value or ""))
         parse_float = self.float_parser or _float_value
-        exchange_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+        exchange_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
         try:
+            candidates: list[tuple[str, Any]] = []
+            active_okx = self.active_okx_provider() if self.active_okx_provider else None
+            active_mode = "live" if mode_manager.mode.value == "live" else "paper"
+            if active_okx:
+                candidates.append((active_mode, active_okx))
             paper_okx = self.paper_okx_provider() if self.paper_okx_provider else None
-            if paper_okx:
-                exchange_positions = await asyncio.wait_for(
-                    paper_okx.get_positions_strict(),
-                    timeout=4.0,
-                )
+            if paper_okx and all(executor is not paper_okx for _mode, executor in candidates):
+                candidates.append(("paper", paper_okx))
+
+            for source_mode, executor in candidates:
+                try:
+                    exchange_positions = await asyncio.wait_for(
+                        executor.get_positions_strict(),
+                        timeout=4.0,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "OKX position snapshot source unavailable during price refresh",
+                        source_mode=source_mode,
+                        error=safe_error_text(exc),
+                    )
+                    continue
                 for exchange_pos in exchange_positions or []:
                     snapshot = parse_exchange_position_snapshot(
                         exchange_pos,
@@ -634,7 +677,7 @@ class OkxSyncService:
                     )
                     if not snapshot:
                         continue
-                    key = (str(snapshot["symbol"]), str(snapshot["side"]))
+                    key = (source_mode, str(snapshot["symbol"]), str(snapshot["side"]))
                     exchange_snapshots[key] = snapshot
         except Exception as exc:
             logger.debug(
@@ -644,13 +687,16 @@ class OkxSyncService:
         try:
             async with get_session_ctx() as session:
                 trade_repo = TradeRepository(session)
-                account_repo = AccountRepository(session)
                 positions = await trade_repo.get_open_positions()
                 open_context: list[dict[str, Any]] = []
-                pnl_by_model: dict[str, float] = {}
 
                 for pos in positions:
-                    key = (normalize_symbol(pos.symbol), str(pos.side or "").lower())
+                    execution_mode = _position_execution_mode(pos)
+                    key = (
+                        execution_mode,
+                        normalize_symbol(pos.symbol),
+                        str(pos.side or "").lower(),
+                    )
                     snapshot = exchange_snapshots.get(key)
                     if snapshot:
                         current_price = (
@@ -703,12 +749,6 @@ class OkxSyncService:
                         hold_minutes=position_age_minutes(pos.created_at),
                         quantity=float(pos.quantity or 0.0),
                     )
-                    pnl_by_model[pos.model_name] = pnl_by_model.get(pos.model_name, 0.0) + float(
-                        unrealized_pnl
-                    )
-
-                for model_name, unrealized_pnl in pnl_by_model.items():
-                    await account_repo.update_unrealized_pnl(model_name, round(unrealized_pnl, 8))
                 prune_position_profit_peaks(open_context)
         except Exception as e:
             logger.warning("failed to refresh DB position prices", error=safe_error_text(e))
@@ -754,19 +794,41 @@ class OkxSyncService:
 
         target_symbol = normalize_symbol(decision.symbol)
         for pos in positions or []:
-            if normalize_symbol(pos.get("symbol")) != target_symbol:
-                continue
-            if str(pos.get("side") or "").lower() != target_side:
-                continue
-            info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
-            quantity = parse_float(
-                pos.get("contracts")
-                or pos.get("size")
-                or pos.get("positionAmt")
-                or info.get("pos")
-                or info.get("qty"),
-                0.0,
+            snapshot = parse_exchange_position_snapshot(
+                pos,
+                symbol_normalizer=normalize_symbol,
             )
+            if snapshot:
+                position_symbol = str(snapshot.get("symbol") or "")
+                position_side = str(snapshot.get("side") or "").lower()
+                quantity = parse_float(snapshot.get("contracts"), 0.0) or parse_float(
+                    snapshot.get("quantity"),
+                    0.0,
+                )
+            else:
+                position_symbol = normalize_symbol(
+                    _first_value(
+                        _dict_value(pos.get("info")).get("instId"),
+                        pos.get("instId"),
+                        pos.get("symbol"),
+                    )
+                )
+                position_side = str(
+                    pos.get("side") or _dict_value(pos.get("info")).get("posSide") or ""
+                ).lower()
+                info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+                quantity = parse_float(
+                    pos.get("contracts")
+                    or pos.get("size")
+                    or pos.get("positionAmt")
+                    or info.get("pos")
+                    or info.get("qty"),
+                    0.0,
+                )
+            if position_symbol != target_symbol:
+                continue
+            if position_side != target_side:
+                continue
             if abs(quantity) > 0:
                 return True
         return False
@@ -998,20 +1060,19 @@ class OkxSyncService:
         )
 
         exchange_position_keys = {
-            (
-                normalize_symbol(p.get("symbol")),
-                str(p.get("side") or "").lower(),
+            key
+            for key in (
+                _exchange_position_key(p, symbol_normalizer=normalize_symbol)
+                for p in exchange_positions or []
+                if exchange_position_is_open(p)
             )
-            for p in exchange_positions or []
-            if exchange_position_is_open(p)
+            if key is not None
         }
-        exchange_position_keys.discard(("", ""))
         reconciled: list[dict] = []
 
         try:
             async with get_session_ctx() as session:
                 trade_repo = TradeRepository(session)
-                account_repo = AccountRepository(session)
                 positions = await trade_repo.get_open_positions()
                 local_open_keys = {
                     (
@@ -1154,7 +1215,6 @@ class OkxSyncService:
                                 closed_slices = await self._record_exchange_quantity_reduction(
                                     session=session,
                                     trade_repo=trade_repo,
-                                    account_repo=account_repo,
                                     positions=matching_local_positions,
                                     quantity_before_by_id=local_quantity_before_by_id,
                                     exchange_quantity=quantity,
@@ -1169,6 +1229,8 @@ class OkxSyncService:
                         if changed:
                             reconciled.append(
                                 {
+                                    "kind": "snapshot_update",
+                                    "source": "okx_authoritative_current_position",
                                     "model_name": matching_local_positions[0].model_name,
                                     "symbol": symbol,
                                     "side": side,
@@ -1209,6 +1271,8 @@ class OkxSyncService:
                         local_open_keys.add(key)
                         reconciled.append(
                             {
+                                "kind": "reopened_local_position",
+                                "source": "okx_authoritative_current_position",
                                 "model_name": closed_position.model_name,
                                 "symbol": symbol,
                                 "side": side,
@@ -1268,11 +1332,12 @@ class OkxSyncService:
                     order.quantity = order.quantity or quantity
                     order.price = order.price or entry_price
                     order.filled_at = order.filled_at or opened_at
+                    position_symbol = _symbol_from_okx_inst_id_or_fallback(okx_inst_id, symbol)
 
                     position_payload = {
                         "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
                         "execution_mode": "paper",
-                        "symbol": symbol,
+                        "symbol": position_symbol,
                         "side": side,
                         "quantity": quantity,
                         "entry_price": entry_price,
@@ -1293,6 +1358,8 @@ class OkxSyncService:
                     local_open_keys.add(key)
                     reconciled.append(
                         {
+                            "kind": "created_missing_local_position",
+                            "source": "okx_authoritative_current_position",
                             "model_name": order.model_name or ENSEMBLE_TRADER_NAME,
                             "symbol": symbol,
                             "side": side,
@@ -1344,10 +1411,13 @@ class OkxSyncService:
                     if close_fill.get("lookup_unavailable"):
                         reconciled.append(
                             {
+                                "kind": "close_fill_lookup_unavailable",
+                                "source": "okx_authoritative_current_position",
                                 "model_name": pos.model_name,
                                 "symbol": pos.symbol,
                                 "side": pos.side,
                                 "exchange_order_id": None,
+                                "requires_attention": True,
                                 "note": (
                                     "OKX close-fill lookup was unavailable; local position "
                                     "was left open until a real close fill or stable exchange "
@@ -1369,10 +1439,13 @@ class OkxSyncService:
                                 )
                                 reconciled.append(
                                     {
+                                        "kind": "active_order_snapshot_unavailable",
+                                        "source": "okx_authoritative_current_position",
                                         "model_name": pos.model_name,
                                         "symbol": pos.symbol,
                                         "side": pos.side,
                                         "exchange_order_id": None,
+                                        "requires_attention": True,
                                         "note": (
                                             "OKX 暂时没有返回对应持仓，且挂单状态查询失败或超时；"
                                             "为避免把查询失败误判为没有挂单，本地不估算平仓，等待下一轮同步确认。"
@@ -1391,10 +1464,14 @@ class OkxSyncService:
                             )
                             reconciled.append(
                                 {
+                                    "kind": "active_exchange_order_present",
+                                    "source": "okx_authoritative_current_position",
                                     "model_name": pos.model_name,
                                     "symbol": pos.symbol,
                                     "side": pos.side,
                                     "exchange_order_id": active_order.get("order_id"),
+                                    "active_order_kind": active_order.get("kind"),
+                                    "requires_attention": False,
                                     "note": (
                                         "OKX 暂时没有返回对应持仓，但仍存在挂单/追单中的"
                                         f"{'平仓' if active_order.get('kind') == 'exit' else '开仓'}委托；"
@@ -1420,6 +1497,8 @@ class OkxSyncService:
 
                         reconciled.append(
                             {
+                                "kind": "missing_exchange_position_without_close_fill",
+                                "source": "okx_authoritative_current_position",
                                 "model_name": pos.model_name,
                                 "symbol": pos.symbol,
                                 "side": pos.side,
@@ -1456,13 +1535,19 @@ class OkxSyncService:
                         fallback=pos.symbol,
                     )
                     close_okx_pos_id = _okx_pos_id_from_close_fill(close_fill)
-                    if pos.side == "short":
-                        gross_pnl = (pos.entry_price - exit_price) * pos.quantity
-                        close_side = "buy"
-                    else:
-                        gross_pnl = (exit_price - pos.entry_price) * pos.quantity
-                        close_side = "sell"
+                    from services.okx_realized_pnl import gross_pnl_with_okx_override
+
+                    gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+                        side=str(pos.side or "").lower(),
+                        entry_price=pos.entry_price,
+                        exit_price=exit_price,
+                        close_qty=pos.quantity,
+                        okx_payload=close_fill,
+                        okx_total_qty=close_fill.get("quantity") if close_fill else pos.quantity,
+                    )
+                    close_side = "buy" if pos.side == "short" else "sell"
                     entry_fee = await entry_fee_for_position(session, pos, pos.quantity)
+                    calculate_position_margin(pos.entry_price * pos.quantity, pos.leverage)
                     realized_pnl = gross_pnl - entry_fee - close_fee
 
                     reconcile_origin = _exchange_reconcile_close_origin(pos, close_fill)
@@ -1531,20 +1616,12 @@ class OkxSyncService:
                             }
                         )
 
-                    released_margin = calculate_position_margin(
-                        pos.quantity * pos.entry_price,
-                        pos.leverage,
-                    )
-                    await account_repo.update_balance(
-                        pos.model_name,
-                        released_margin + realized_pnl,
-                        realized_pnl,
-                    )
-                    await account_repo.record_trade_result(pos.model_name, realized_pnl > 0)
                     remove_memory_position(pos.model_name, pos.symbol, pos.side)
 
                     reconciled.append(
                         {
+                            "kind": "closed_from_okx_close_fill",
+                            "source": "okx_authoritative_current_position",
                             "model_name": pos.model_name,
                             "symbol": pos.symbol,
                             "side": pos.side,
@@ -1571,7 +1648,6 @@ class OkxSyncService:
         *,
         session: Any,
         trade_repo: TradeRepository,
-        account_repo: AccountRepository,
         positions: list[Position],
         quantity_before_by_id: dict[Any, float],
         exchange_quantity: float,
@@ -1629,23 +1705,29 @@ class OkxSyncService:
                 fallback=pos.symbol,
             )
             close_okx_pos_id = _okx_pos_id_from_close_fill(close_fill)
+            closed_symbol = _symbol_from_okx_inst_id_or_fallback(close_okx_inst_id, pos.symbol)
             closed_at = (
                 (close_fill or {}).get("timestamp")
                 if fill_matches_slice and (close_fill or {}).get("timestamp")
                 else datetime.now(UTC)
             )
             entry_fee = await entry_fee_for_position(session, pos, closed_qty)
-            if str(pos.side or "").lower() == "short":
-                gross_pnl = (pos.entry_price - close_price) * closed_qty
-                close_side = "buy"
-            else:
-                gross_pnl = (close_price - pos.entry_price) * closed_qty
-                close_side = "sell"
+            from services.okx_realized_pnl import gross_pnl_with_okx_override
+
+            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+                side=str(pos.side or "").lower(),
+                entry_price=pos.entry_price,
+                exit_price=close_price,
+                close_qty=closed_qty,
+                okx_payload=close_fill,
+                okx_total_qty=(close_fill or {}).get("quantity") if close_fill else closed_qty,
+            )
+            close_side = "buy" if str(pos.side or "").lower() == "short" else "sell"
             realized_pnl = gross_pnl - entry_fee - close_fee
             closed_position_payload = {
                 "model_name": pos.model_name,
                 "execution_mode": pos.execution_mode,
-                "symbol": pos.symbol,
+                "symbol": closed_symbol,
                 "side": pos.side,
                 "quantity": closed_qty,
                 "entry_price": pos.entry_price,
@@ -1754,7 +1836,7 @@ class OkxSyncService:
                     {
                         "model_name": pos.model_name,
                         "execution_mode": pos.execution_mode,
-                        "symbol": pos.symbol,
+                        "symbol": closed_symbol,
                         "side": close_side,
                         "order_type": "market",
                         "quantity": closed_qty,
@@ -1766,17 +1848,12 @@ class OkxSyncService:
                         "filled_at": closed_at,
                     }
                 )
-            released_margin = calculate_position_margin(closed_qty * pos.entry_price, pos.leverage)
-            await account_repo.update_balance(
-                pos.model_name,
-                released_margin + realized_pnl,
-                realized_pnl,
-            )
-            await account_repo.record_trade_result(pos.model_name, realized_pnl > 0)
             reconciled.append(
                 {
+                    "kind": "quantity_reduction_closed_slice",
+                    "source": "okx_authoritative_current_position",
                     "model_name": pos.model_name,
-                    "symbol": pos.symbol,
+                    "symbol": closed_symbol,
                     "side": pos.side,
                     "exit_price": close_price,
                     "quantity": closed_qty,
@@ -1791,7 +1868,7 @@ class OkxSyncService:
             logger.warning(
                 "recorded exchange quantity reduction as closed position slice",
                 position_id=getattr(pos, "id", None),
-                symbol=pos.symbol,
+                symbol=closed_symbol,
                 side=pos.side,
                 closed_qty=closed_qty,
                 remaining_qty=after_qty,
@@ -1799,13 +1876,12 @@ class OkxSyncService:
         return reconciled
 
     async def get_open_positions_context(self) -> list[dict]:
-        """Get open positions for LLM context (paper + live)."""
+        """Get open positions from the active OKX account for trading context."""
         normalize_symbol = self._required_symbol_normalizer()
         parse_float = self._required_float_parser()
-        paper_positions_provider = self._required_paper_positions_provider()
         active_okx_provider = self._required_active_okx_provider()
         exchange_position_is_open = self._required_exchange_position_open_checker()
-        positions: list[dict[str, Any]] = []
+        local_positions: list[dict[str, Any]] = []
 
         try:
             async with get_session_ctx() as session:
@@ -1817,7 +1893,7 @@ class OkxSyncService:
                 )
                 for p in db_positions:
                     if p.is_open:
-                        positions.append(
+                        local_positions.append(
                             {
                                 "model_name": p.model_name,
                                 "symbol": p.symbol,
@@ -1838,56 +1914,62 @@ class OkxSyncService:
         except Exception as e:
             logger.warning("failed to load DB positions for context", error=safe_error_text(e))
 
-        # Keep in-memory paper positions as a fallback for positions opened before
-        # persistence was introduced in this process.
-        if not positions:
-            positions.extend(await paper_positions_provider())
-
-        # OKX positions for the active execution account.
         active_okx = active_okx_provider()
-        if active_okx:
-            try:
-                okx_positions = await asyncio.wait_for(
-                    active_okx.get_positions_strict(),
-                    timeout=8.0,
+        if not active_okx:
+            logger.warning("active OKX executor unavailable; position context is fail-closed")
+            return []
+
+        try:
+            okx_positions = await asyncio.wait_for(
+                active_okx.get_positions_strict(),
+                timeout=8.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch authoritative OKX position context; returning no positions",
+                error=safe_error_text(exc),
+            )
+            return []
+
+        local_by_key = {
+            key: p
+            for p in local_positions
+            if (
+                key := (
+                    normalize_symbol(p.get("symbol")),
+                    str(p.get("side") or "").lower(),
                 )
-                exchange_keys = {
-                    (
-                        normalize_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    for p in (okx_positions or [])
-                    if exchange_position_is_open(p)
-                }
-                positions = [
-                    p
-                    for p in positions
-                    if (
-                        normalize_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    in exchange_keys
-                ]
-                existing_keys = {
-                    (
-                        normalize_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    for p in positions
-                }
-                for p in okx_positions or []:
-                    p["model_name"] = p.get("model_name") or ENSEMBLE_TRADER_NAME
-                    key = (
-                        normalize_symbol(p.get("symbol")),
-                        str(p.get("side") or "").lower(),
-                    )
-                    if key not in existing_keys:
-                        positions.append(p)
-            except Exception as exc:
-                logger.warning(
-                    "failed to merge OKX position context; keeping local positions",
-                    error=safe_error_text(exc),
-                )
+            )[0]
+            and key[1] in {"long", "short"}
+        }
+
+        positions: list[dict[str, Any]] = []
+        for exchange_position in okx_positions or []:
+            if not exchange_position_is_open(exchange_position):
+                continue
+            key = _exchange_position_key(exchange_position, symbol_normalizer=normalize_symbol)
+            if key is None:
+                continue
+            payload = dict(exchange_position)
+            raw_info = payload.get("info")
+            if isinstance(raw_info, dict):
+                payload["info"] = dict(raw_info)
+            local_position = local_by_key.get(key, {})
+            payload["model_name"] = (
+                payload.get("model_name")
+                or local_position.get("model_name")
+                or ENSEMBLE_TRADER_NAME
+            )
+            # Preserve local risk metadata only; quantity, price, side, and PnL stay OKX-native.
+            for source_key, target_key in (
+                ("stop_loss", "stop_loss"),
+                ("take_profit", "take_profit"),
+                ("created_at", "created_at"),
+            ):
+                value = local_position.get(source_key)
+                if value not in (None, "") and payload.get(target_key) in (None, ""):
+                    payload[target_key] = value
+            positions.append(payload)
 
         normalized: list[dict[str, Any]] = []
         for position_payload in positions or []:

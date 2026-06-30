@@ -13,6 +13,8 @@ class _MissingLabMarketExchange:
         self.markets = {"BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT"}}
         self.markets_by_id = {}
         self.fetch_position_calls: list[list[str] | None] = []
+        self.native_position_requests: list[dict] = []
+        self.native_pending_order_requests: list[dict] = []
         self.contracts = 9.0
         self.native_order_requests: list[dict] = []
         self.create_order_calls: list[tuple] = []
@@ -27,7 +29,7 @@ class _MissingLabMarketExchange:
         raise Exception(f"okx does not have market symbol {symbol}")
 
     async def fetch_open_orders(self, symbol=None, *args, **kwargs):
-        return []
+        raise AssertionError("strict OKX order reads must use native pending-orders API")
 
     async def create_order(self, *args, **kwargs):
         self.create_order_calls.append((args, kwargs))
@@ -41,26 +43,31 @@ class _MissingLabMarketExchange:
 
     async def fetch_positions(self, symbols=None):
         self.fetch_position_calls.append(symbols)
-        if symbols:
-            raise Exception(f"okx does not have market symbol {symbols[0]}")
-        return [
-            {
-                "symbol": "LAB-USDT-SWAP",
-                "side": "long",
-                "contracts": self.contracts,
-                "markPrice": 17.787,
-                "entryPrice": 16.865555555555556,
-                "unrealizedPnl": 0.8292999999999989,
-                "info": {
+        raise AssertionError("strict OKX position reads must use native positions API")
+
+    async def privateGetAccountPositions(self, params):
+        self.native_position_requests.append(dict(params))
+        rows = [
+            row
+            for row in [
+                {
                     "instId": "LAB-USDT-SWAP",
                     "pos": str(self.contracts),
                     "avgPx": "16.8655555555555556",
                     "markPx": "17.787",
                     "upl": "0.8292999999999989",
                     "posSide": "net",
+                    "ctVal": "0.1",
+                    "minSz": "1",
                 },
-            }
+            ]
+            if not params.get("instId") or row["instId"] == params["instId"]
         ]
+        return {"data": rows}
+
+    async def privateGetTradeOrdersPending(self, params):
+        self.native_pending_order_requests.append(dict(params))
+        return {"data": []}
 
     async def publicGetPublicInstruments(self, params):
         return {
@@ -95,7 +102,7 @@ class _ContractDeliveryLabExchange(_MissingLabMarketExchange):
 
 
 @pytest.mark.asyncio
-async def test_get_positions_strict_falls_back_to_account_wide_when_market_missing() -> None:
+async def test_get_positions_strict_uses_okx_native_positions_when_market_missing() -> None:
     executor = OKXExecutor("paper")
     exchange = _MissingLabMarketExchange()
     executor._exchange = exchange
@@ -106,8 +113,46 @@ async def test_get_positions_strict_falls_back_to_account_wide_when_market_missi
 
     assert len(positions) == 1
     assert positions[0]["symbol"] == "LAB-USDT-SWAP"
-    assert exchange.fetch_position_calls[0] == ["LAB/USDT:USDT"]
-    assert exchange.fetch_position_calls[1] is None
+    assert positions[0]["side"] == "long"
+    assert positions[0]["contracts"] == pytest.approx(9.0)
+    assert exchange.fetch_position_calls == []
+    assert exchange.native_position_requests == [
+        {"instType": "SWAP", "instId": "LAB-USDT-SWAP"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_positions_uses_okx_native_positions_not_ccxt_fetch_positions() -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingLabMarketExchange()
+    executor._exchange = exchange
+    executor._connected = True
+    executor._markets_loaded = True
+
+    positions = await executor.get_positions("LAB/USDT")
+
+    assert len(positions) == 1
+    assert positions[0]["info"]["instId"] == "LAB-USDT-SWAP"
+    assert exchange.fetch_position_calls == []
+    assert exchange.native_position_requests == [
+        {"instType": "SWAP", "instId": "LAB-USDT-SWAP"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_open_orders_strict_uses_okx_native_pending_orders() -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingLabMarketExchange()
+    executor._exchange = exchange
+    executor._connected = True
+    executor._markets_loaded = True
+
+    orders = await executor.get_open_orders_strict("LAB/USDT")
+
+    assert orders == []
+    assert exchange.native_pending_order_requests == [
+        {"instType": "SWAP", "instId": "LAB-USDT-SWAP", "limit": "100"}
+    ]
 
 
 @pytest.mark.asyncio

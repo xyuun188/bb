@@ -10,9 +10,10 @@ from typing import Any
 from fastapi import APIRouter
 from sqlalchemy import func, select
 
-from config.settings import settings
+from config.settings import DECISION_MAKER_NAME, FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from data_feed.external_event_scraper import SCRAPLING_SOURCE_PREFIX
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.market_data import Kline, Ticker
@@ -29,22 +30,31 @@ from web_dashboard.api.text_sanitize import sanitize_payload
 router = APIRouter()
 
 EXPECTED_PLATFORM_ENDPOINTS = {
-    "qwen3-14b-trade": "http://127.0.0.1:18000/v1",
-    "local_ai_tools": "http://127.0.0.1:18001",
+    "qwen3-32b-trade": "http://127.0.0.1:18000/v1",
+    "phase3_quant_api": "http://127.0.0.1:18001",
     "deepseek-r1-14b-risk": "http://127.0.0.1:18002/v1",
+    "BB-FinQuant-Expert-14B": "http://127.0.0.1:18003/v1",
 }
 MODEL_ACCESS_ENDPOINTS = {
-    "qwen3-14b-trade": "103.85.84.147:21840",
-    "local_ai_tools": "103.85.84.147:21841",
-    "deepseek-r1-14b-risk": "103.85.84.147:21842",
+    "qwen3-32b-trade": "platform loopback 18000 only",
+    "phase3_quant_api": "platform loopback 18001 only",
+    "deepseek-r1-14b-risk": "platform loopback 18002 only",
+    "BB-FinQuant-Expert-14B": "platform loopback 18003 only",
 }
+EXPERT_MODEL_SLOT_NAMES = tuple(
+    str(slot.get("name") or "")
+    for slot in FIXED_AI_MODEL_SLOTS
+    if str(slot.get("name") or "") != DECISION_MAKER_NAME
+)
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 TICKER_FRESH_SECONDS = 10 * 60
 KLINE_FRESH_SECONDS = 2 * 60 * 60
 NEWS_FRESH_SECONDS = 24 * 60 * 60
+EXTERNAL_EVENT_FRESH_SECONDS = 72 * 60 * 60
 SOCIAL_FRESH_SECONDS = 24 * 60 * 60
 ISSUE_ORDER = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SELF_CHECK_SECTION_TIMEOUT_SECONDS = 6.0
+SERVER_MONITOR_SELF_CHECK_TIMEOUT_SECONDS = 18.0
 UNRESOLVED_ORDER_STATUSES = {"open", "pending", "partial", "partially_filled"}
 TERMINAL_FAILED_ORDER_STATUSES = {
     "rejected",
@@ -191,6 +201,24 @@ def _finite_score(value: Any) -> bool:
         return False
 
 
+def _is_entry_opportunity_score_decision(decision: Any, raw: dict[str, Any], action: str) -> bool:
+    if action not in {"long", "short", "open_long", "open_short"}:
+        return False
+    analysis_type = str(
+        getattr(decision, "analysis_type", None) or raw.get("analysis_type") or ""
+    ).lower()
+    if analysis_type in {"position", "position_review", "holding", "holdings"}:
+        return False
+    model_name = str(getattr(decision, "model_name", "") or "").lower()
+    if model_name == "position_review":
+        return False
+    return not bool(
+        raw.get("position_review_policy")
+        or raw.get("position_review")
+        or raw.get("position_review_risk_alert")
+    )
+
+
 def _utc_datetime(value: Any) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -315,6 +343,13 @@ async def _trading_service_running_item() -> dict[str, Any]:
                 or runtime_status.get("position_last_error")
                 or ""
             ).strip()
+            okx_authoritative_sync = (
+                runtime_status.get("okx_authoritative_sync")
+                if isinstance(runtime_status.get("okx_authoritative_sync"), dict)
+                else {}
+            )
+            okx_sync_status = str(okx_authoritative_sync.get("status") or "").lower()
+            okx_sync_unhealthy = okx_sync_status in {"warning", "stale"}
             runtime_error = bool(last_round_error)
             status = (
                 "warning"
@@ -325,6 +360,7 @@ async def _trading_service_running_item() -> dict[str, Any]:
                     or market_round_stuck
                     or position_round_stuck
                     or runtime_error
+                    or okx_sync_unhealthy
                 )
                 else "ok"
             )
@@ -343,7 +379,11 @@ async def _trading_service_running_item() -> dict[str, Any]:
                             else (
                                 "独立交易进程心跳正常，但上一轮分析异常结束；请查看 last_round_error。"
                                 if runtime_error
-                                else "Dashboard 与交易引擎分离运行；独立交易进程心跳正常。"
+                                else (
+                                    "独立交易进程心跳正常，但 OKX 自动同步最近异常或过期；请查看 okx_authoritative_sync。"
+                                    if okx_sync_unhealthy
+                                    else "Dashboard 与交易引擎分离运行；独立交易进程心跳正常。"
+                                )
                             )
                         )
                     )
@@ -421,6 +461,7 @@ async def _trading_service_running_item() -> dict[str, Any]:
                     "position_last_error": runtime_status.get("position_last_error"),
                     "runtime_error": runtime_error,
                     "last_round_error": last_round_error,
+                    "okx_authoritative_sync": okx_authoritative_sync,
                 },
                 repairable=False,
             )
@@ -544,12 +585,14 @@ def _configured_endpoint_items(
         api_base = _mask_endpoint(item.get("api_base"))
         if model and api_base:
             configured_by_model[model] = api_base
-    configured_by_model["local_ai_tools"] = _mask_endpoint(settings.local_ai_tools_api_base)
+    configured_by_model["phase3_quant_api"] = _mask_endpoint(settings.local_ai_tools_api_base)
     runtime_local_tools = (
         runtime.get("local_ai_tools") if isinstance(runtime.get("local_ai_tools"), dict) else {}
     )
     if runtime_local_tools.get("api_base"):
-        configured_by_model["local_ai_tools"] = _mask_endpoint(runtime_local_tools.get("api_base"))
+        configured_by_model["phase3_quant_api"] = _mask_endpoint(
+            runtime_local_tools.get("api_base")
+        )
     high_risk_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
     high_risk_base = _mask_endpoint(getattr(settings, "high_risk_review_api_base", ""))
     if high_risk_model and high_risk_base:
@@ -590,7 +633,7 @@ def _configured_endpoint_items(
                     f"endpoint_{model}",
                     f"{model} 平台调用地址",
                     "ok",
-                    f"{model} 调用地址符合 18000/18001/18002 隧道契约。",
+                    f"{model} 调用地址符合 18000/18001/18002/18003 隧道契约。",
                     details={
                         "actual": actual,
                         "public_endpoint": MODEL_ACCESS_ENDPOINTS.get(model),
@@ -598,6 +641,86 @@ def _configured_endpoint_items(
                 )
             )
     return items
+
+
+def _expert_model_diversity_item(
+    monitor_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = (
+        monitor_status.get("platform_runtime")
+        if isinstance(monitor_status, dict)
+        and isinstance(monitor_status.get("platform_runtime"), dict)
+        else {}
+    )
+    runtime_models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
+    runtime_by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in runtime_models
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    configured_by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in settings.get_fixed_ai_models(include_empty=False)
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    expert_rows: list[dict[str, str]] = []
+    for slot_name in EXPERT_MODEL_SLOT_NAMES:
+        item = runtime_by_name.get(slot_name) or configured_by_name.get(slot_name)
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        api_base = _mask_endpoint(item.get("api_base"))
+        if not model and not api_base:
+            continue
+        expert_rows.append(
+            {
+                "name": slot_name,
+                "label": str(item.get("label") or slot_name),
+                "model": model,
+                "api_base": api_base,
+                "provider_key": f"{api_base.rstrip('/')}|{model}",
+            }
+        )
+    provider_counts: dict[str, int] = {}
+    for row in expert_rows:
+        provider_key = row["provider_key"]
+        provider_counts[provider_key] = provider_counts.get(provider_key, 0) + 1
+    unique_provider_count = len(provider_counts)
+    largest_shared_count = max(provider_counts.values(), default=0)
+    configured_count = len(expert_rows)
+    same_provider_risk = configured_count >= 3 and largest_shared_count >= 3
+    status = "warning" if same_provider_risk else "ok"
+    if not expert_rows:
+        status = "warning"
+        message = (
+            "No fixed expert model routing was found, so expert diversity cannot be audited."
+        )
+    elif same_provider_risk:
+        message = (
+            f"{largest_shared_count} expert slots share the same api_base/model; prompts still "
+            "separate roles, but judgment correlation risk is high. Keep live routing unchanged "
+            "until a shadow comparison proves a split model layout improves net PnL."
+        )
+    else:
+        message = (
+            f"Expert routing uses {unique_provider_count} distinct provider/model pairs across "
+            f"{configured_count} configured expert slots."
+        )
+    return _check_item(
+        "expert_model_diversity",
+        "Expert model diversity",
+        status,
+        message,
+        details={
+            "expert_slot_names": list(EXPERT_MODEL_SLOT_NAMES),
+            "configured_expert_count": configured_count,
+            "unique_provider_count": unique_provider_count,
+            "largest_shared_provider_count": largest_shared_count,
+            "same_provider_risk": same_provider_risk,
+            "experts": expert_rows,
+            "policy": "shadow_compare_before_live_routing_change",
+        },
+    )
 
 
 def _required_runtime_models() -> set[str]:
@@ -645,6 +768,15 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 )
             )
         ).one()
+        external_event_row = (
+            await session.execute(
+                select(
+                    func.count(NewsArticle.id),
+                    func.count(func.distinct(NewsArticle.source)),
+                    func.max(func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)),
+                ).where(NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%"))
+            )
+        ).one()
         social_row = (
             await session.execute(
                 select(
@@ -681,6 +813,10 @@ async def _data_source_items() -> list[dict[str, Any]]:
     news_source_count = int(news_row[1] or 0)
     news_latest = _utc_datetime(news_row[2])
     news_age = _age_seconds(news_latest)
+    external_event_count = int(external_event_row[0] or 0)
+    external_event_source_count = int(external_event_row[1] or 0)
+    external_event_latest = _utc_datetime(external_event_row[2])
+    external_event_age = _age_seconds(external_event_latest)
     social_count = int(social_row[0] or 0)
     social_platform_count = int(social_row[1] or 0)
     social_latest = _utc_datetime(social_row[2])
@@ -754,6 +890,41 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 "age_minutes": _age_minutes(news_latest),
                 "fresh_limit_hours": round(NEWS_FRESH_SECONDS / 3600, 1),
                 "source_diversity_ok": news_diverse,
+            },
+        )
+    )
+    external_event_ok = bool(
+        external_event_count
+        and external_event_age is not None
+        and external_event_age <= EXTERNAL_EVENT_FRESH_SECONDS
+    )
+    external_event_diverse = external_event_source_count >= 4
+    items.append(
+        _check_item(
+            "external_event_source_freshness",
+            "Scrapling external event sources",
+            "ok" if external_event_ok and external_event_diverse else "warning",
+            (
+                f"Scrapling events have {external_event_source_count} sources and "
+                f"{external_event_count} samples; latest about "
+                f"{_age_minutes(external_event_latest)} minutes ago."
+                if external_event_ok
+                else (
+                    "Scrapling external event samples are empty or stale; official "
+                    "announcements, project blogs, exchange listings, and regulatory "
+                    "events will be under-covered."
+                )
+            ),
+            details={
+                "event_count": external_event_count,
+                "source_count": external_event_source_count,
+                "latest_at": (
+                    external_event_latest.isoformat() if external_event_latest else None
+                ),
+                "age_minutes": _age_minutes(external_event_latest),
+                "fresh_limit_hours": round(EXTERNAL_EVENT_FRESH_SECONDS / 3600, 1),
+                "source_diversity_ok": external_event_diverse,
+                "source_prefix": SCRAPLING_SOURCE_PREFIX,
             },
         )
     )
@@ -942,7 +1113,7 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
         action = str(getattr(decision, "action", "") or "").lower()
         opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
         score = opportunity.get("score") if isinstance(opportunity, dict) else None
-        if action in {"long", "short", "open_long", "open_short"}:
+        if _is_entry_opportunity_score_decision(decision, raw, action):
             created_at = getattr(decision, "created_at", None)
             if _finite_score(score):
                 if isinstance(created_at, datetime) and (
@@ -1119,8 +1290,12 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
     return items
 
 
-async def _run_self_check_section(coro: Any) -> Any:
-    return await asyncio.wait_for(coro, timeout=SELF_CHECK_SECTION_TIMEOUT_SECONDS)
+async def _run_self_check_section(
+    coro: Any,
+    *,
+    timeout: float = SELF_CHECK_SECTION_TIMEOUT_SECONDS,
+) -> Any:
+    return await asyncio.wait_for(coro, timeout=timeout)
 
 
 @router.get("/system/self-check")
@@ -1128,7 +1303,10 @@ async def system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
     trading_result, monitor_result, data_result, recent_result = await asyncio.gather(
         _run_self_check_section(_trading_service_running_item()),
-        _run_self_check_section(get_server_monitor_status_async()),
+        _run_self_check_section(
+            get_server_monitor_status_async(),
+            timeout=SERVER_MONITOR_SELF_CHECK_TIMEOUT_SECONDS,
+        ),
         _run_self_check_section(_data_source_items()),
         _run_self_check_section(_recent_execution_items()),
         return_exceptions=True,
@@ -1153,6 +1331,7 @@ async def system_self_check() -> dict[str, Any]:
     except TypeError:
         endpoint_items = _configured_endpoint_items()
     items.extend(endpoint_items)
+    items.append(_expert_model_diversity_item(monitor_status))
 
     if isinstance(data_result, Exception):
         items.append(

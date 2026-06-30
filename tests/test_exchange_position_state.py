@@ -77,6 +77,60 @@ def test_parse_okx_position_snapshot_prefers_inst_id_over_ccxt_alias_symbol() ->
     assert snapshot["quantity"] == pytest.approx(100.0)
 
 
+def test_parse_okx_net_position_snapshot_infers_side_from_signed_pos() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "contracts": 200,
+            "info": {
+                "instId": "SPK-USDT-SWAP",
+                "posSide": "net",
+                "pos": "-200",
+                "ctVal": "1",
+                "avgPx": "0.01785",
+                "markPx": "0.0177",
+                "last": "0.01762",
+                "upl": "0.0300000000000002",
+                "posId": "3688338318498172929",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["symbol"] == "SPK/USDT"
+    assert snapshot["side"] == "short"
+    assert snapshot["contracts"] == pytest.approx(200.0)
+    assert snapshot["quantity"] == pytest.approx(200.0)
+    assert snapshot["entry_price"] == pytest.approx(0.01785)
+    assert snapshot["mark_price"] == pytest.approx(0.0177)
+    assert snapshot["upl"] == pytest.approx(0.0300000000000002)
+    assert snapshot["raw_pos_side"] == "net"
+    assert snapshot["raw_pos"] == "-200"
+    assert snapshot["signed_position_size"] == pytest.approx(-200.0)
+    assert snapshot["side_inference"] == "okx_net_signed_pos"
+
+
+def test_parse_okx_net_position_snapshot_infers_long_from_positive_pos() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "info": {
+                "instId": "ENA-USDT-SWAP",
+                "posSide": "net",
+                "pos": "45",
+                "ctVal": "1",
+                "avgPx": "0.0876",
+                "markPx": "0.0881",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["symbol"] == "ENA/USDT"
+    assert snapshot["side"] == "long"
+    assert snapshot["contracts"] == pytest.approx(45.0)
+
+
 def test_parse_okx_position_snapshot_treats_quantity_as_contracts_when_contracts_exist() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

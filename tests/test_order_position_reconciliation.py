@@ -129,6 +129,15 @@ async def test_missing_closed_position_scan_only_scans_close_orders(
         assert report.truncated is False
         assert len(report.plans) == 1
         assert report.plans[0].close_exchange_order_id == "close-1"
+        assert report.classification_counts == {
+            "repairable": 1,
+            "manual_review": 0,
+            "skipped_or_not_repairable": 0,
+            "unscanned": 0,
+        }
+        assert report.repairable_count == 1
+        assert report.manual_review_count == 0
+        assert report.plan_classifications[0]["status"] == "repairable"
     finally:
         await close_db()
 
@@ -485,6 +494,92 @@ async def test_does_not_pair_order_when_decision_action_conflicts(
         async with get_session_ctx() as session:
             order_result = await session.execute(select(Order).where(Order.side == "buy"))
             close_order = order_result.scalar_one()
+            plan = await plan_missing_closed_position(session, close_order)
+
+        assert plan is None
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_missing_closed_position_rejects_native_inst_id_conflict(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'trading.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        opened_at = datetime(2026, 6, 21, 10, 43, tzinfo=UTC)
+        closed_at = opened_at + timedelta(minutes=4)
+        async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SPK/USDT",
+                action="long",
+                confidence=0.88,
+                reasoning="entry",
+                is_paper=True,
+                was_executed=True,
+                raw_llm_response={
+                    "execution_result": {
+                        "info": {"instId": "SPK-USDT-SWAP"},
+                    }
+                },
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SAHARA/USDT",
+                action="close_long",
+                confidence=0.92,
+                reasoning="close",
+                is_paper=True,
+                was_executed=True,
+                raw_llm_response={
+                    "execution_result": {
+                        "info": {"instId": "SAHARA-USDT-SWAP"},
+                    }
+                },
+            )
+            session.add_all([entry_decision, close_decision])
+            await session.flush()
+            entry_order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="SPK/USDT",
+                side="buy",
+                order_type="market",
+                quantity=9.0,
+                price=0.7316,
+                status="filled",
+                fee=0.001,
+                decision_id=entry_decision.id,
+                exchange_order_id="entry-spk",
+                filled_at=opened_at,
+            )
+            close_order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="SPK/USDT",
+                side="sell",
+                order_type="market",
+                quantity=9.0,
+                price=0.7879,
+                status="filled",
+                fee=0.002,
+                decision_id=close_decision.id,
+                exchange_order_id="close-sahara",
+                filled_at=closed_at,
+            )
+            session.add_all([entry_order, close_order])
+            await session.flush()
+            close_id = close_order.id
+
+        async with get_session_ctx() as session:
+            close_order = await session.get(Order, close_id)
             plan = await plan_missing_closed_position(session, close_order)
 
         assert plan is None

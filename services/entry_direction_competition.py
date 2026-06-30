@@ -61,6 +61,66 @@ def _tool_signal(
     return first_tool_payload({"local_ai_tools": tools}, *keys)
 
 
+_LOCAL_AI_TOOL_ALIASES: dict[str, tuple[str, ...]] = {
+    "profit_prediction": (
+        "profit_prediction",
+        "profit_model",
+        "server_profit",
+        "server_profit_model",
+        "profit",
+    ),
+    "time_series_prediction": (
+        "time_series_prediction",
+        "timeseries_prediction",
+        "sequence_prediction",
+        "timeseries",
+        "time_series",
+    ),
+    "sentiment_analysis": (
+        "sentiment_analysis",
+        "sentiment_prediction",
+        "sentiment_model",
+        "sentiment",
+    ),
+    "exit_advice": (
+        "exit_advice",
+        "exit_model",
+        "position_exit",
+        "exit",
+    ),
+}
+
+
+def _normalize_feature_coverage(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (int, float)):
+        return {"ratio": float(value), "status": "reported"}
+    return {"ratio": None, "status": "not_reported"}
+
+
+def _tool_model_evidence(
+    local_ai_tools_context: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    evidence: dict[str, dict[str, Any]] = {}
+    for tool, aliases in _LOCAL_AI_TOOL_ALIASES.items():
+        payload = _tool_signal(local_ai_tools_context, *aliases)
+        if not payload:
+            continue
+        evidence[tool] = {
+            "tool": tool,
+            "available": signal_available(payload),
+            "status": payload.get("status"),
+            "primary_model": payload.get("primary_model") or payload.get("model"),
+            "challenger_model": payload.get("challenger_model"),
+            "model_version": payload.get("model_version"),
+            "route_mode": payload.get("route_mode"),
+            "fallback_reason": payload.get("fallback_reason"),
+            "feature_coverage": _normalize_feature_coverage(payload.get("feature_coverage")),
+        }
+    return evidence
+
+
 @dataclass(frozen=True, slots=True)
 class EntryDirectionCompetitionPolicy:
     """Build symbol-level long/short evidence without opening a trade by itself."""
@@ -105,6 +165,7 @@ class EntryDirectionCompetitionPolicy:
             "long": sides["long"],
             "short": sides["short"],
             "market_regime_mode": regime.get("mode"),
+            "local_ai_tools_model_evidence": _tool_model_evidence(local_ai_tools_context),
             "policy": (
                 "Compare long and short independently for the current symbol. "
                 "Portfolio exposure can discount sizing and risk, but it is not a "

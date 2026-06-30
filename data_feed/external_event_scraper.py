@@ -28,6 +28,7 @@ from core.url_safety import normalize_external_http_url
 logger = structlog.get_logger(__name__)
 
 SCRAPLING_SOURCE_PREFIX = "scrapling:"
+EXTERNAL_EVENT_MAX_SOURCES_LIMIT = 32
 _MAX_HTML_CHARS = 600_000
 _ANCHOR_SCAN_LIMIT = 250
 _BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
@@ -259,6 +260,62 @@ RECOMMENDED_EXTERNAL_EVENT_SOURCES: tuple[dict[str, Any], ...] = DEFAULT_EXTERNA
         "weight": 0.64,
         "category": "security",
         "description": "Chainalysis 博客，覆盖监管、犯罪资金流和重大风险事件。",
+    },
+    {
+        "name": "stellar_blog",
+        "url": "https://stellar.org/blog",
+        "symbols": ["XLM"],
+        "weight": 0.62,
+        "category": "project",
+        "description": "Stellar official blog for ecosystem, payment, and protocol events.",
+    },
+    {
+        "name": "filecoin_blog",
+        "url": "https://filecoin.io/blog/",
+        "symbols": ["FIL"],
+        "weight": 0.62,
+        "category": "project",
+        "description": "Filecoin official blog for storage, ecosystem, and protocol updates.",
+    },
+    {
+        "name": "aave_blog",
+        "url": "https://aave.com/blog",
+        "symbols": ["AAVE", "ETH"],
+        "weight": 0.64,
+        "category": "defi",
+        "description": "Aave official blog for DeFi, governance, and protocol updates.",
+    },
+    {
+        "name": "circle_blog",
+        "url": "https://www.circle.com/blog",
+        "symbols": ["USDC"],
+        "weight": 0.62,
+        "category": "stablecoin",
+        "description": "Circle blog for USDC, payments, institutional, and policy events.",
+    },
+    {
+        "name": "tether_news",
+        "url": "https://tether.io/en/news/",
+        "symbols": ["USDT"],
+        "weight": 0.62,
+        "category": "stablecoin",
+        "description": "Tether official news for USDT, reserves, chain support, and policy events.",
+    },
+    {
+        "name": "sec_press_releases",
+        "url": "https://www.sec.gov/newsroom/press-releases",
+        "symbols": ["BTC", "ETH"],
+        "weight": 0.70,
+        "category": "regulatory",
+        "description": "SEC public press releases for crypto asset enforcement and ETF events.",
+    },
+    {
+        "name": "cftc_press_releases",
+        "url": "https://www.cftc.gov/PressRoom/PressReleases",
+        "symbols": ["BTC", "ETH"],
+        "weight": 0.66,
+        "category": "regulatory",
+        "description": "CFTC public press releases for digital asset derivatives and enforcement.",
     },
 )
 

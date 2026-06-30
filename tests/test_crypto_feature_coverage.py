@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+from data_feed.feature_vector import build_feature_vector
 from services.crypto_feature_coverage import (
     CryptoFeatureCoverageService,
     summarize_crypto_feature_coverage,
@@ -103,6 +104,50 @@ def test_feature_coverage_accepts_open_1m_candle_with_collection_lag() -> None:
     assert "kline_1m" not in report["stale_features"]
 
 
+def test_feature_coverage_waits_for_decision_samples_after_market_warmup() -> None:
+    now = datetime(2026, 6, 23, 12, 2, 24, tzinfo=UTC)
+    report = summarize_crypto_feature_coverage(
+        decisions=[],
+        market_coverage={
+            "klines": {
+                "1m": {"rows": 120, "symbols": 3, "latest_at": now - timedelta(seconds=60)},
+                "5m": {"rows": 120, "symbols": 3, "latest_at": now - timedelta(minutes=5)},
+                "15m": {"rows": 120, "symbols": 3, "latest_at": now - timedelta(minutes=15)},
+                "1h": {"rows": 100, "symbols": 3, "latest_at": now - timedelta(hours=1)},
+            },
+            "ticker": {"count": 3, "latest_at": now - timedelta(minutes=1)},
+            "news": {"count": 0, "latest_at": None},
+            "social": {"count": 0, "latest_at": None},
+        },
+        now=now,
+    )
+
+    assert report["status"] == "warning"
+    assert report["waiting_for_decision_samples"] is True
+    assert report["feature_snapshot_count"] == 0
+    assert "kline_1m" not in report["missing_features"]
+    assert "ticker" not in report["missing_features"]
+
+
+def test_feature_coverage_still_blocks_missing_core_market_data_without_samples() -> None:
+    now = datetime(2026, 6, 23, 12, 2, 24, tzinfo=UTC)
+    report = summarize_crypto_feature_coverage(
+        decisions=[],
+        market_coverage={
+            "klines": {},
+            "ticker": {"count": 0, "latest_at": None},
+            "news": {"count": 0, "latest_at": None},
+            "social": {"count": 0, "latest_at": None},
+        },
+        now=now,
+    )
+
+    assert report["status"] == "critical"
+    assert report["waiting_for_decision_samples"] is False
+    assert "kline_1m" in report["missing_features"]
+    assert "ticker" in report["missing_features"]
+
+
 def test_feature_coverage_accepts_available_timestamped_crypto_features() -> None:
     now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
     snapshot_time = now - timedelta(minutes=4)
@@ -176,6 +221,59 @@ def test_feature_coverage_accepts_available_timestamped_crypto_features() -> Non
     assert report["symbols_observed"] == ["SOL/USDT"]
     assert "event_calendar" in report["missing_features"]
     assert "funding_rate" not in report["missing_features"]
+
+
+def test_feature_vector_derives_liquidation_and_sector_proxy_features() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    vector = build_feature_vector(
+        "SOL/USDT",
+        ticker={
+            "last_price": 140.0,
+            "change_24h_pct": 4.2,
+            "spread_pct": 0.03,
+            "bid": 139.9,
+            "ask": 140.1,
+        },
+        indicators={
+            "timestamp": now.isoformat(),
+            "returns_20": 0.018,
+            "volatility_20": 0.035,
+            "volume_ratio": 2.4,
+            "abnormal_wick_max_pct": 3.5,
+            "abnormal_wick_count_72h": 2,
+        },
+        derivatives={
+            "funding_rate": 0.0002,
+            "orderbook_bid_depth": 35000.0,
+            "orderbook_ask_depth": 28000.0,
+            "orderbook_imbalance": 0.11,
+        },
+    )
+    snapshot = vector.to_dict()
+    snapshot["timestamp"] = now.isoformat()
+    report = summarize_crypto_feature_coverage(
+        decisions=[_decision(symbol="SOL/USDT", feature_snapshot=snapshot)],
+        market_coverage={
+            "klines": {
+                "1m": {"rows": 10, "symbols": 1, "latest_at": now - timedelta(minutes=1)},
+                "5m": {"rows": 10, "symbols": 1, "latest_at": now - timedelta(minutes=5)},
+                "15m": {"rows": 10, "symbols": 1, "latest_at": now - timedelta(minutes=15)},
+                "1h": {"rows": 10, "symbols": 1, "latest_at": now - timedelta(hours=1)},
+            },
+            "ticker": {"count": 1, "latest_at": now - timedelta(minutes=1)},
+            "news": {"count": 0, "latest_at": None},
+            "social": {"count": 0, "latest_at": None},
+        },
+        now=now,
+    )
+    feature_states = {item["key"]: item for item in report["features"]}
+
+    assert snapshot["liquidation_risk_score"] > 0
+    assert snapshot["sector_relative_strength"] != 0
+    assert feature_states["liquidation_risk"]["status"] == "available"
+    assert feature_states["sector_correlation"]["status"] == "available"
+    assert "liquidation_risk" not in report["missing_features"]
+    assert "sector_correlation" not in report["missing_features"]
 
 
 def test_feature_coverage_uses_recent_available_snapshot_per_feature() -> None:

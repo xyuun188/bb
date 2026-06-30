@@ -76,3 +76,32 @@ def test_live_okx_credentials_do_not_fallback_to_legacy_unified_fields(
     assert credentials["api_key"] == ""
     assert credentials["api_secret"] == ""
     assert "passphrase" not in credentials
+
+
+def test_live_okx_credentials_treat_placeholder_values_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "okx_live_api_key", "1")
+    monkeypatch.setattr(settings, "okx_live_api_secret", "1")
+    monkeypatch.setattr(settings, "okx_live_passphrase", "1")
+
+    credentials = settings.get_okx_credentials("live")
+
+    assert credentials["api_key"] == ""
+    assert credentials["api_secret"] == ""
+    assert "passphrase" not in credentials
+
+
+@pytest.mark.asyncio
+async def test_okx_settings_live_placeholders_show_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "okx_live_api_key", "1")
+    monkeypatch.setattr(settings, "okx_live_api_secret", "1")
+    monkeypatch.setattr(settings, "okx_live_passphrase", "1")
+
+    response = await settings_api_module.get_okx_settings()
+
+    assert response["live"]["api_key"] == ""
+    assert response["live"]["has_secret"] is False
+    assert response["live"]["has_passphrase"] is False

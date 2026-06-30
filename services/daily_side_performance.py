@@ -16,6 +16,7 @@ from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 SessionFactory = Callable[[], Any]
 TradeRepositoryFactory = Callable[[Any], TradeRepository]
@@ -104,6 +105,8 @@ class DailySidePerformanceService:
             closed_at = _aware_utc(getattr(pos, "closed_at", None))
             if closed_at is None or closed_at < window_start_utc:
                 continue
+            if not closed_position_trade_fact_trusted(pos):
+                continue
             side = "short" if str(getattr(pos, "side", "") or "").lower() == "short" else "long"
             pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)
             bucket = result[side]
@@ -153,6 +156,8 @@ class DailySidePerformanceService:
         for pos in rows:
             closed_at = _aware_utc(getattr(pos, "closed_at", None))
             if closed_at is None or closed_at < start_utc:
+                continue
+            if not closed_position_trade_fact_trusted(pos):
                 continue
             side = "short" if str(getattr(pos, "side", "") or "").lower() == "short" else "long"
             pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)

@@ -195,16 +195,32 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
 
     if "sqlite" in settings.database_url:
         result = await conn.execute(text("PRAGMA table_info(positions)"))
-        columns = {row[1] for row in result.fetchall()}
-        sqlite_columns = {
+        position_columns = {row[1] for row in result.fetchall()}
+        sqlite_position_columns = {
             "okx_inst_id": "VARCHAR(64)",
             "okx_pos_id": "VARCHAR(100)",
             "entry_exchange_order_id": "VARCHAR(100)",
             "close_exchange_order_id": "VARCHAR(500)",
         }
-        for name, column_type in sqlite_columns.items():
-            if name not in columns:
+        for name, column_type in sqlite_position_columns.items():
+            if name not in position_columns:
                 await conn.execute(text(f"ALTER TABLE positions ADD COLUMN {name} {column_type}"))
+        result = await conn.execute(text("PRAGMA table_info(orders)"))
+        order_columns = {row[1] for row in result.fetchall()}
+        sqlite_order_columns = {
+            "okx_inst_id": "VARCHAR(64)",
+            "okx_trade_ids": "VARCHAR(500)",
+            "okx_fill_contracts": "FLOAT",
+            "okx_fill_pnl": "FLOAT",
+            "okx_state": "VARCHAR(40)",
+            "okx_sync_status": "VARCHAR(40)",
+            "okx_synced_at": "DATETIME",
+            "okx_last_error": "VARCHAR(500)",
+            "okx_raw_fills": "JSON",
+        }
+        for name, column_type in sqlite_order_columns.items():
+            if name not in order_columns:
+                await conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {column_type}"))
         return
 
     if "postgresql" in settings.database_url:
@@ -213,6 +229,15 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
             "ALTER TABLE positions ADD COLUMN IF NOT EXISTS okx_pos_id VARCHAR(100)",
             "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_exchange_order_id VARCHAR(100)",
             "ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_exchange_order_id VARCHAR(500)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_inst_id VARCHAR(64)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_trade_ids VARCHAR(500)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_fill_contracts DOUBLE PRECISION",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_fill_pnl DOUBLE PRECISION",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_state VARCHAR(40)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_sync_status VARCHAR(40)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_synced_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_last_error VARCHAR(500)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_raw_fills JSONB",
         ):
             await conn.execute(text(ddl))
 
@@ -222,6 +247,14 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_positions_okx_inst_side ON positions (okx_inst_id, side)",
         "CREATE INDEX IF NOT EXISTS idx_positions_entry_exchange_order ON positions (entry_exchange_order_id)",
         "CREATE INDEX IF NOT EXISTS idx_positions_close_exchange_order ON positions (close_exchange_order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_positions_closed_scan ON positions (is_open, closed_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_positions_created_scan ON positions (created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_positions_open_created_scan ON positions (is_open, created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_filled_exchange_scan ON orders (status, filled_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_decision_side_scan ON orders (decision_id, side, status, filled_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_okx_sync_status ON orders (okx_sync_status, okx_synced_at DESC)",
     ):
         await conn.execute(text(ddl))
 

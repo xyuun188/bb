@@ -251,6 +251,12 @@ def test_direction_competition_reads_wrapped_server_quant_payloads() -> None:
         tools={
             "profit_prediction": {
                 "ok": True,
+                "primary_model": "catboost_lgbm_profit_v2",
+                "challenger_model": "tabnet_profit_shadow_v1",
+                "model_version": "2026-06-26T08:00:00Z",
+                "route_mode": "shadow_compare",
+                "fallback_reason": None,
+                "feature_coverage": {"ratio": 0.92, "status": "ok"},
                 "data": {
                     "prediction": {
                         "best_side": "long",
@@ -275,3 +281,52 @@ def test_direction_competition_reads_wrapped_server_quant_payloads() -> None:
     assert any("Server profit long" in note for note in context["long"]["evidence"])
     assert any("Timeseries favors long" in note for note in context["long"]["evidence"])
     assert any("Sentiment favors long" in note for note in context["long"]["evidence"])
+    model_evidence = context["local_ai_tools_model_evidence"]["profit_prediction"]
+    assert model_evidence["available"] is True
+    assert model_evidence["primary_model"] == "catboost_lgbm_profit_v2"
+    assert model_evidence["challenger_model"] == "tabnet_profit_shadow_v1"
+    assert model_evidence["route_mode"] == "shadow_compare"
+    assert model_evidence["feature_coverage"] == {"ratio": 0.92, "status": "ok"}
+
+
+def test_direction_competition_model_evidence_is_observability_only() -> None:
+    tools = {
+        "profit_prediction": {
+            "adjusted_long_return_pct": 0.7,
+            "long_loss_probability": 0.25,
+            "adjusted_short_return_pct": -0.2,
+            "short_loss_probability": 0.66,
+            "profit_quality_score": 0.5,
+        },
+        "time_series_prediction": {
+            "best_side": "long",
+            "expected_return_pct": 0.45,
+        },
+    }
+    with_metadata = {
+        "profit_prediction": {
+            **tools["profit_prediction"],
+            "primary_model": "profit_v2",
+            "challenger_model": "profit_v3_shadow",
+            "model_version": "shadow-2026-06-26",
+            "route_mode": "canary",
+            "fallback_reason": "none",
+            "feature_coverage": 0.75,
+        },
+        "time_series_prediction": {
+            **tools["time_series_prediction"],
+            "primary_model": "chronos_2",
+            "route_mode": "live",
+        },
+    }
+
+    baseline = _context(tools=tools)
+    observed = _context(tools=with_metadata)
+
+    assert observed["preferred_side"] == baseline["preferred_side"]
+    assert observed["score_gap"] == baseline["score_gap"]
+    assert observed["long"] == baseline["long"]
+    assert observed["short"] == baseline["short"]
+    assert observed["local_ai_tools_model_evidence"]["profit_prediction"][
+        "feature_coverage"
+    ] == {"ratio": 0.75, "status": "reported"}

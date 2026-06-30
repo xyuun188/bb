@@ -8,6 +8,8 @@ from sqlalchemy import select
 
 from config.settings import Settings, settings
 from data_feed.external_event_scraper import (
+    EXTERNAL_EVENT_MAX_SOURCES_LIMIT,
+    RECOMMENDED_EXTERNAL_EVENT_SOURCES,
     ExternalEventScraper,
     ExternalEventSource,
     _normalize_source,
@@ -72,6 +74,21 @@ def test_external_event_source_rejects_non_public_or_non_https_urls() -> None:
 
     with pytest.raises(ValueError):
         _normalize_source({"name": "bad", "url": "https://127.0.0.1/news"})
+
+
+def test_recommended_external_event_sources_fit_runtime_limit() -> None:
+    names = {str(source.get("name") or "") for source in RECOMMENDED_EXTERNAL_EVENT_SOURCES}
+
+    assert len(RECOMMENDED_EXTERNAL_EVENT_SOURCES) <= EXTERNAL_EVENT_MAX_SOURCES_LIMIT
+    assert {
+        "stellar_blog",
+        "filecoin_blog",
+        "aave_blog",
+        "circle_blog",
+        "tether_news",
+        "sec_press_releases",
+        "cftc_press_releases",
+    }.issubset(names)
 
 
 def test_external_event_runtime_settings_reload_from_env(

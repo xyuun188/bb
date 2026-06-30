@@ -8,7 +8,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.execution_result_factory import ExecutionResultFactory
-from services.execution_service import ExecutionService
+from services.execution_service import ExecutionService, _profit_first_entry_contract_result
 from services.trading_policies import PolicyGateResult
 
 
@@ -27,6 +27,85 @@ def _entry_decision(symbol: str = "SPK/USDT") -> DecisionOutput:
         suggested_leverage=3.0,
         raw_response={},
     )
+
+
+def _profit_first_ready_position_review_decision() -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.84,
+        reasoning="position review add entry",
+        position_size_pct=0.06,
+        suggested_leverage=4.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.05,
+        feature_snapshot={"close": 100.0},
+        raw_response={
+            "analysis_type": "position_review",
+            "current_price": 100.0,
+            "strategy_learning_context": {"strategy_profile_id": "balanced_probe"},
+            "opportunity_score": {
+                "score": 3.4,
+                "side": "long",
+                "expected_return_pct": 1.05,
+                "expected_net_return_pct": 0.9,
+                "fee_pct": 0.05,
+                "slippage_pct": 0.04,
+                "expected_loss_pct": 0.20,
+                "profit_quality_ratio": 1.25,
+                "reward_risk_ratio": 2.5,
+                "server_profit_loss_probability": 0.38,
+                "tail_risk_score": 0.62,
+                "side_realized_pnl_usdt": 2.0,
+                "ml_aligned": True,
+                "local_profit_aligned": True,
+                "timeseries_aligned": True,
+                "expert_aligned": True,
+                "evidence_score": {
+                    "tier": "normal",
+                    "effective_score": 88,
+                    "components": [
+                        {"source": "sentiment", "status": "aligned"},
+                        {"source": "shadow_memory", "status": "aligned"},
+                    ],
+                },
+            },
+            "profit_risk_sizing": {
+                "quality_tier": "high_profit",
+                "position_size_pct": 0.06,
+                "final_notional_usdt": 120.0,
+                "planned_stop_loss_usdt": 2.8,
+                "max_stop_loss_usdt": 4.0,
+                "expected_profit_usdt": 1.08,
+            },
+        },
+    )
+
+
+def test_profit_first_entry_contract_late_attaches_position_review_plan_and_ladder() -> None:
+    decision = _profit_first_ready_position_review_decision()
+
+    result = _profit_first_entry_contract_result(decision)
+
+    assert result.passed is True
+    raw = decision.raw_response
+    assert raw["profit_first_trade_plan"]["analysis_type"] == "position_review"
+    assert raw["profit_first_trade_plan"]["is_complete_for_real_trade"] is True
+    ladder = raw["profit_risk_sizing"]["profit_first_position_ladder"]
+    assert ladder["lane"] == "meaningful_entry"
+    assert ladder["late_attached_at"] == "execution_pre_submit"
+
+
+def test_profit_first_entry_contract_blocks_incomplete_entry_before_submit() -> None:
+    decision = _entry_decision("BTC/USDT")
+
+    result = _profit_first_entry_contract_result(decision)
+
+    assert result.passed is False
+    assert result.blocker == "profit_first_trade_plan_incomplete"
+    assert result.data["shadow_only"] is True
+    assert result.data["profit_first_trade_plan"]["is_complete_for_real_trade"] is False
 
 
 @pytest.mark.asyncio

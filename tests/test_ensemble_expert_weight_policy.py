@@ -35,6 +35,7 @@ def _decision(
     confidence: float = 0.8,
     size: float = 0.08,
     reasoning: str = "test",
+    provider_model: str | None = None,
 ) -> DecisionOutput:
     return DecisionOutput(
         model_name=model_name,
@@ -46,6 +47,7 @@ def _decision(
         suggested_leverage=3.0,
         stop_loss_pct=0.035,
         take_profit_pct=0.08,
+        raw_response=({"provider_model": provider_model} if provider_model else None),
     )
 
 
@@ -175,6 +177,100 @@ def test_risk_expert_same_direction_does_not_unlock_entry_support_gate() -> None
     )
 
     assert allowed is False
+
+
+def test_same_provider_llm_roles_do_not_count_as_independent_entry_sources() -> None:
+    coordinator = _coordinator()
+    opinions = {
+        "trend_expert": _decision(
+            "trend_expert",
+            Action.LONG,
+            confidence=0.74,
+            provider_model="BB-FinQuant-Expert-14B",
+        ),
+        "momentum_expert": _decision(
+            "momentum_expert",
+            Action.LONG,
+            confidence=0.76,
+            provider_model="BB-FinQuant-Expert-14B",
+        ),
+        "sentiment_expert": _decision(
+            "sentiment_expert",
+            Action.LONG,
+            confidence=0.73,
+            provider_model="BB-FinQuant-Expert-14B",
+        ),
+    }
+
+    allowed = coordinator._entry_signal_allowed(
+        Action.LONG,
+        opinions,
+        [{"consistency": "aligned"}, {"consistency": "aligned"}],
+        validation_adjustment=0.20,
+        disagreement=0.0,
+        context={},
+    )
+
+    assert allowed is False
+    policy = coordinator._expert_source_policy_from_decisions(opinions, Action.LONG, context={})
+    assert policy["directional_independent_source_count"] == 1
+    assert policy["technical_independent_source_count"] == 1
+    assert policy["independent_quant_support_count"] == 0
+
+
+def test_same_provider_llm_roles_need_independent_quant_support_to_enter() -> None:
+    coordinator = _coordinator()
+    opinions = {
+        "trend_expert": _decision(
+            "trend_expert",
+            Action.LONG,
+            confidence=0.74,
+            provider_model="BB-FinQuant-Expert-14B",
+        ),
+        "momentum_expert": _decision(
+            "momentum_expert",
+            Action.LONG,
+            confidence=0.76,
+            provider_model="BB-FinQuant-Expert-14B",
+        ),
+    }
+    context = {
+        "local_ai_tools": {
+            "enabled": True,
+            "profit_prediction": {
+                "available": True,
+                "best_side": "long",
+                "adjusted_long_return_pct": 0.32,
+                "adjusted_short_return_pct": -0.08,
+                "long_loss_probability": 0.34,
+            },
+            "time_series_prediction": {
+                "available": True,
+                "best_side": "long",
+                "expected_return_pct": 0.10,
+                "confidence": 0.12,
+            },
+        }
+    }
+
+    allowed = coordinator._entry_signal_allowed(
+        Action.LONG,
+        opinions,
+        [{"consistency": "aligned"}],
+        validation_adjustment=0.05,
+        disagreement=0.0,
+        context=context,
+    )
+
+    assert allowed is True
+    policy = coordinator._expert_source_policy_from_decisions(
+        opinions,
+        Action.LONG,
+        context=context,
+    )
+    assert policy["directional_independent_source_count"] == 1
+    assert policy["technical_independent_source_count"] == 1
+    assert policy["independent_quant_supports"] == ["server_profit_model", "time_series_model"]
 
 
 def test_quant_only_probe_does_not_hard_block_long_when_timeseries_opposes() -> None:

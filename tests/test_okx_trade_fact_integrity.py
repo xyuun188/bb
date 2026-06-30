@@ -8,6 +8,7 @@ from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.manual_close_marker import ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 
 
@@ -111,6 +112,93 @@ async def test_contract_count_converts_to_base_quantity_without_false_issue(
 
 
 @pytest.mark.asyncio
+async def test_order_okx_raw_fills_win_over_stale_decision_execution_price(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=35)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="AAVE/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="AAVE-USDT-SWAP",
+                    contracts=2,
+                    contract_size=1,
+                    avg_price=93.57918032786885,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AAVE/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=2.0,
+                        price=97.54,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="3694561249469370368",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                        okx_inst_id="AAVE-USDT-SWAP",
+                        okx_fill_contracts=2.0,
+                        okx_sync_status="okx_confirmed",
+                        okx_raw_fills={
+                            "order_id": "3694561249469370368",
+                            "trade_ids": ["aave-fill-1"],
+                            "inst_id": "AAVE-USDT-SWAP",
+                            "contracts": 2.0,
+                            "contract_size": 1.0,
+                            "base_quantity": 2.0,
+                            "avg_price": 97.54,
+                            "rows": [
+                                {
+                                    "instId": "AAVE-USDT-SWAP",
+                                    "ordId": "3694561249469370368",
+                                    "tradeId": "aave-fill-1",
+                                    "fillSz": "2",
+                                    "fillPx": "97.54",
+                                }
+                            ],
+                        },
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AAVE/USDT",
+                        side="long",
+                        quantity=2.0,
+                        entry_price=97.54,
+                        current_price=97.54,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="AAVE-USDT-SWAP",
+                        entry_exchange_order_id="3694561249469370368",
+                        created_at=filled_at + timedelta(seconds=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["checked_orders"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_position_order_direct_link_wins_over_time_window(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -171,7 +259,7 @@ async def test_position_order_direct_link_wins_over_time_window(
 
 
 @pytest.mark.asyncio
-async def test_flags_symbol_quantity_price_notional_and_position_mismatch(
+async def test_flags_symbol_quantity_price_and_notional_mismatch(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _reset_db(tmp_path, monkeypatch)
@@ -224,17 +312,212 @@ async def test_flags_symbol_quantity_price_notional_and_position_mismatch(
         kinds = {issue["kind"] for issue in report["issues"]}
 
         assert report["status"] == "critical"
-        assert report["critical_count"] >= 3
+        assert report["critical_count"] >= 2
         assert "symbol_alias_mismatch" in kinds
         assert "contract_base_quantity_mismatch" in kinds
         assert "execution_price_mismatch" in kinds
         assert "notional_mismatch" in kinds
-        assert "order_position_symbol_mismatch" in kinds
+        assert "order_position_symbol_mismatch" not in kinds
         symbol_issue = next(
             issue for issue in report["issues"] if issue["kind"] == "symbol_alias_mismatch"
         )
         assert symbol_issue["symbol"] == "WLFI/USDT"
         assert symbol_issue["expected_symbol"] == "H/USDT"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_position_alignment_trusts_native_inst_id_over_dirty_display_symbols(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=30)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SAHARA/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="SPK-USDT-SWAP",
+                    contracts=10,
+                    contract_size=1,
+                    avg_price=0.111,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SAHARA/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=10.0,
+                        price=0.111,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="spk-entry",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SAHARA/USDT",
+                        side="long",
+                        quantity=10.0,
+                        entry_price=0.111,
+                        current_price=0.111,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="SPK-USDT-SWAP",
+                        entry_exchange_order_id="spk-entry",
+                        created_at=filled_at + timedelta(seconds=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert "symbol_alias_mismatch" in kinds
+        assert "position_okx_inst_id_symbol_mismatch" in kinds
+        assert "order_position_symbol_mismatch" not in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_orphan_quarantine_marker_is_not_required_as_okx_order_link(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=30)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ICP/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=6.02,
+                        price=2.15,
+                        status="filled",
+                        exchange_order_id="icp-entry",
+                        okx_inst_id="ICP-USDT-SWAP",
+                        okx_sync_status="okx_confirmed",
+                        filled_at=closed_at - timedelta(minutes=20),
+                        created_at=closed_at - timedelta(minutes=20),
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ICP/USDT",
+                        side="short",
+                        quantity=6.02,
+                        entry_price=2.15,
+                        current_price=2.15,
+                        realized_pnl=0.0,
+                        unrealized_pnl=0.0,
+                        leverage=3.0,
+                        is_open=False,
+                        okx_inst_id="ICP-USDT-SWAP",
+                        entry_exchange_order_id="icp-entry",
+                        close_exchange_order_id=f"{ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX}49",
+                        closed_at=closed_at,
+                        created_at=closed_at - timedelta(minutes=20),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert "orphan_position_quarantine_not_exchange_backed" in kinds
+        assert "position_order_link_missing_local_order" not in kinds
+        assert report["status"] == "ok"
+        assert report["critical_count"] == 0
+        assert report["warning_count"] == 0
+        assert {issue["severity"] for issue in report["issues"]} == {"info"}
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_position_alignment_flags_conflicting_native_inst_ids(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=30)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SPK/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="SPK-USDT-SWAP",
+                    contracts=10,
+                    contract_size=1,
+                    avg_price=0.111,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SPK/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=10.0,
+                        price=0.111,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="spk-entry",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SAHARA/USDT",
+                        side="long",
+                        quantity=10.0,
+                        entry_price=0.111,
+                        current_price=0.111,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="SAHARA-USDT-SWAP",
+                        entry_exchange_order_id="spk-entry",
+                        created_at=filled_at + timedelta(seconds=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        mismatch = next(
+            issue for issue in report["issues"] if issue["kind"] == "order_position_symbol_mismatch"
+        )
+
+        assert report["status"] == "critical"
+        assert mismatch["symbol"] == "SAHARA/USDT"
+        assert mismatch["expected_symbol"] == "SPK/USDT"
     finally:
         await close_db()
 
@@ -327,6 +610,86 @@ async def test_closed_position_with_realized_pnl_requires_close_order_link(
 
 
 @pytest.mark.asyncio
+async def test_manual_close_marker_is_not_treated_as_exchange_backed_fact(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="LAB/USDT",
+                    side="long",
+                    quantity=0.9,
+                    entry_price=16.86,
+                    current_price=17.44,
+                    realized_pnl=0.51,
+                    leverage=3.0,
+                    is_open=False,
+                    okx_inst_id="LAB-USDT-SWAP",
+                    entry_exchange_order_id="lab-entry",
+                    close_exchange_order_id="manual_close:local-only",
+                    closed_at=closed_at,
+                    created_at=closed_at - timedelta(minutes=15),
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert report["status"] == "critical"
+        assert "manual_close_position_fact_not_exchange_backed" in kinds
+        assert "closed_position_missing_close_order_link" not in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_old_linked_position_missing_local_order_is_info_observation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = datetime.now(UTC) - timedelta(days=10)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="PROS/USDT",
+                    side="long",
+                    quantity=1.0,
+                    entry_price=0.4983,
+                    current_price=0.3948,
+                    realized_pnl=-0.1035,
+                    leverage=3.0,
+                    is_open=False,
+                    okx_inst_id="PROS-USDT-SWAP",
+                    entry_exchange_order_id="entry-old",
+                    close_exchange_order_id="close-old-missing-local-order",
+                    closed_at=closed_at,
+                    created_at=closed_at - timedelta(hours=1),
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24 * 14).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 2
+        assert report["critical_count"] == 0
+        assert report["warning_count"] == 0
+        assert {issue["severity"] for issue in report["issues"]} == {"info"}
+        assert {issue["kind"] for issue in report["issues"]} == {
+            "position_order_link_missing_local_order"
+        }
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_entry_order_matches_existing_position_lifecycle_without_false_warning(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -388,6 +751,179 @@ async def test_entry_order_matches_existing_position_lifecycle_without_false_war
 
         assert report["status"] == "ok"
         assert report["issue_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_matches_okx_authoritative_position_without_model_name_false_warning(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=45)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="XPL/USDT",
+                action="short",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="XPL-USDT-SWAP",
+                    contracts=58,
+                    contract_size=10,
+                    avg_price=0.097,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="XPL/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=580.0,
+                        price=0.097,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="xpl-entry-add",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="XPL/USDT",
+                        side="short",
+                        quantity=580.0,
+                        entry_price=0.097,
+                        current_price=0.096,
+                        realized_pnl=0.0,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="XPL-USDT-SWAP",
+                        entry_exchange_order_id="xpl-entry-add",
+                        created_at=filled_at,
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_superseded_position_residual_is_info_not_critical(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        opened_at = _recent_filled_at(minutes_ago=120)
+        closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="BNB/USDT",
+                        side="short",
+                        quantity=0.45,
+                        entry_price=553.2911,
+                        current_price=554.0,
+                        realized_pnl=-0.5487,
+                        leverage=3.0,
+                        is_open=False,
+                        okx_inst_id="BNB-USDT-SWAP",
+                        okx_pos_id="bnb-pos-1",
+                        entry_exchange_order_id="bnb-entry-a,bnb-entry-b",
+                        close_exchange_order_id="bnb-close",
+                        created_at=opened_at,
+                        closed_at=closed_at,
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="BNB/USDT",
+                        side="short",
+                        quantity=0.0,
+                        entry_price=553.29,
+                        current_price=553.7,
+                        realized_pnl=0.0,
+                        leverage=3.0,
+                        is_open=False,
+                        okx_inst_id="BNB-USDT-SWAP",
+                        okx_pos_id="bnb-pos-1",
+                        entry_exchange_order_id=None,
+                        close_exchange_order_id=None,
+                        created_at=opened_at,
+                        closed_at=closed_at - timedelta(minutes=3),
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="BNB/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=0.1,
+                        price=553.0,
+                        status="filled",
+                        exchange_order_id="bnb-entry-a",
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                        okx_inst_id="BNB-USDT-SWAP",
+                        okx_sync_status="okx_confirmed",
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="BNB/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=0.35,
+                        price=553.4,
+                        status="filled",
+                        exchange_order_id="bnb-entry-b",
+                        filled_at=opened_at + timedelta(minutes=1),
+                        created_at=opened_at + timedelta(minutes=1),
+                        okx_inst_id="BNB-USDT-SWAP",
+                        okx_sync_status="okx_confirmed",
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="BNB/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=0.45,
+                        price=554.0,
+                        status="filled",
+                        exchange_order_id="bnb-close",
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                        okx_inst_id="BNB-USDT-SWAP",
+                        okx_sync_status="okx_confirmed",
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        issues = report["issues"]
+
+        assert report["critical_count"] == 0
+        assert report["warning_count"] == 0
+        assert report["status"] == "ok"
+        assert {issue["kind"] for issue in issues} == {"superseded_position_residual"}
+        assert {issue["severity"] for issue in issues} == {"info"}
     finally:
         await close_db()
 

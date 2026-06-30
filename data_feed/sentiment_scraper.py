@@ -34,6 +34,15 @@ DEFAULT_SYMBOL_ALIASES = {
     "ETH": ["ETH", "Ethereum"],
     "SOL": ["SOL", "Solana"],
 }
+HACKER_NEWS_QUERIES = (
+    "bitcoin",
+    "ethereum",
+    "solana",
+    "crypto",
+    "stablecoin",
+    "defi",
+    "blockchain",
+)
 
 
 class SentimentScraper:
@@ -242,9 +251,102 @@ class SentimentScraper:
         logger.info("reddit posts fetched", total=len(all_posts))
         return all_posts
 
+    async def fetch_hacker_news_mentions(self, limit: int = 40) -> list[dict]:
+        """Fetch public Hacker News discussions that mention tracked crypto symbols."""
+        posts: list[dict] = []
+        seen_ids: set[str] = set()
+        try:
+            client = await self._get_client()
+            per_query_limit = min(max(int(limit), 1), 100)
+            for query in HACKER_NEWS_QUERIES:
+                if len(posts) >= limit:
+                    break
+                resp = await client.get(
+                    "https://hn.algolia.com/api/v1/search_by_date",
+                    params={
+                        "query": query,
+                        "tags": "story",
+                        "hitsPerPage": per_query_limit,
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.debug(
+                        "hacker news fetch failed", query=query, status=resp.status_code
+                    )
+                    continue
+
+                data = resp.json()
+                for hit in data.get("hits", []):
+                    title = str(hit.get("title") or hit.get("story_title") or "").strip()
+                    url = str(hit.get("url") or hit.get("story_url") or "").strip()
+                    combined = f"{title} {url}"
+                    mentions = [
+                        base
+                        for base, aliases in self._symbol_aliases.items()
+                        if any(self._contains_alias(combined, alias) for alias in aliases)
+                    ]
+                    if not mentions:
+                        continue
+                    created_at = None
+                    raw_created = str(hit.get("created_at") or "").strip()
+                    if raw_created:
+                        try:
+                            created_at = datetime.fromisoformat(
+                                raw_created.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            created_at = None
+                    object_id = str(hit.get("objectID") or "").strip()
+                    post_id = f"hacker_news:{object_id or hash(combined)}"
+                    if post_id in seen_ids:
+                        continue
+                    seen_ids.add(post_id)
+                    points = int(hit.get("points") or 0)
+                    comments = int(hit.get("num_comments") or 0)
+                    posts.append(
+                        {
+                            "platform": "hacker_news",
+                            "post_id": post_id,
+                            "title": title,
+                            "content": title,
+                            "symbols": mentions,
+                            "score": points,
+                            "sentiment_score": self._lexicon_sentiment(combined),
+                            "num_comments": comments,
+                            "engagement_count": points + comments,
+                            "posted_at": created_at or datetime.now(UTC),
+                            "url": url or f"https://news.ycombinator.com/item?id={object_id}",
+                        }
+                    )
+                    if len(posts) >= limit:
+                        break
+        except Exception as e:
+            logger.debug("hacker news error", error=safe_error_text(e))
+        return posts
+
+    async def fetch_all_social(self) -> list[dict]:
+        """Fetch public social/discussion sources without API keys."""
+        import asyncio
+
+        results = await asyncio.gather(
+            self.fetch_all_reddit(),
+            self.fetch_hacker_news_mentions(),
+            return_exceptions=True,
+        )
+        all_posts: list[dict] = []
+        for result in results:
+            if isinstance(result, list):
+                all_posts.extend(result)
+        logger.info(
+            "social posts fetched",
+            total=len(all_posts),
+            platforms=sorted({str(item.get("platform") or "") for item in all_posts}),
+        )
+        return all_posts
+
     async def get_mention_stats(self, symbol: str) -> dict[str, Any]:
         """Get mention count and average score for a symbol across recent posts."""
-        posts = await self.fetch_all_reddit()
+        posts = await self.fetch_all_social()
         symbol_posts = [
             p for p in posts if symbol.upper() in [s.upper() for s in p.get("symbols", [])]
         ]

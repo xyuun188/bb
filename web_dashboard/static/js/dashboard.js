@@ -19,6 +19,7 @@ const state = {
     riskEvents: [],
     riskEventsPage: 1,
     tradeMode: 'paper',
+    modeDecisionsTotal: 0,
     decisionsTotal: 0,
     todayDecisionsTotal: 0,
     tradesTotal: 0,
@@ -125,6 +126,7 @@ const okxTickerCache = {};
 let positionsRequestToken = 0;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
+const positionLinkedOrdersByGroup = new Map();
 let serverMonitorRefreshInFlight = null;
 let systemAuditRefreshInFlight = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
@@ -499,7 +501,7 @@ function updateOpenPositionStat(total) {
 function updateDecisionPositionStatus() {
     const dtEl = document.getElementById('status-decision-trade');
     if (dtEl) {
-        dtEl.textContent = state.decisionsTotal + ' / ' + state.openPositionsTotal;
+        dtEl.textContent = state.modeDecisionsTotal + ' / ' + state.openPositionsTotal;
     }
 }
 
@@ -538,8 +540,8 @@ async function fetchModeCounts() {
     const decData = await fetchJSON(`/api/decisions?limit=1&is_paper=${isPaper}`);
 
     if (decData) {
-        state.decisionsTotal = decData.total ?? decData.count ?? 0;
-        updateDecisionBadge(state.decisionsTotal);
+        state.modeDecisionsTotal = Number(decData.total ?? decData.count ?? 0) || 0;
+        updateDecisionBadge(state.modeDecisionsTotal);
     }
 
     updateDecisionPositionStatus();
@@ -713,8 +715,43 @@ function fmtRatioPct(value) {
 }
 
 function signedMoney(value) {
-    const n = valueNumber(value) || 0;
+    const n = valueNumber(value);
+    if (n === null) return '--';
     return `${n >= 0 ? '+' : ''}${fmtMoney(n)}`;
+}
+
+function signedMoneyWithUnit(value, unit = 'USDT') {
+    const text = signedMoney(value);
+    return text === '--' ? '--' : `${text} ${unit}`;
+}
+
+function signedMoneyColor(value) {
+    const n = valueNumber(value);
+    if (n === null) return 'var(--text-muted)';
+    return n >= 0 ? 'var(--green)' : 'var(--red)';
+}
+
+function dailyPnlOkxSnapshotMissing(row) {
+    return row?.okx_equity_source === 'okx_snapshot_missing'
+        || (row?.okx_equity == null && row?.okx_equity_pnl == null);
+}
+
+function dailyPnlEquityDisplay(row, field) {
+    if (dailyPnlOkxSnapshotMissing(row)) {
+        return '<span style="color:var(--text-muted);">Missing OKX snapshot</span>';
+    }
+    const value = valueNumber(row?.[field]);
+    return `<span style="color:${signedMoneyColor(value)};">${signedMoneyWithUnit(value)}</span>`;
+}
+
+function dailyPnlMissingSnapshotNotice(row) {
+    if (!dailyPnlOkxSnapshotMissing(row)) return '';
+    return `
+        <div class="info-banner" style="margin:8px 0;">
+            Missing real OKX equity snapshot for this day. The system will not infer account PnL from fixed 4000/5000 balances,
+            local trade PnL, or OKX bill balance changes. Closed-trade details below are OKX-confirmed facts only.
+        </div>
+    `;
 }
 
 function updateModelRankings(rankings) {
@@ -743,19 +780,18 @@ function updateExecutionAccountPanel(account) {
 
     const modeLabel = account.mode === 'live' ? '实盘' : '模拟盘';
     const unrealizedPnl = valueNumber(account.unrealized_pnl) || 0;
-    const totalPnl = valueNumber(account.cumulative_total_pnl ?? account.total_pnl) || 0;
-    const todayRealizedPnl = valueNumber(account.today_closed_realized_pnl ?? account.today_realized_pnl) || 0;
-    const todayTotalPnl = todayRealizedPnl + unrealizedPnl;
+    const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);
+    const todayTotalPnl = valueNumber(account.today_equity_pnl);
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
     const positionMarginUsed = valueNumber(
         account.used_margin ?? account.okx_used_balance ?? account.position_margin_used ?? account.paper_execution_used_margin
     ) || 0;
-    const balanceSource = account.balance_source || (account.balance_snapshot_stale ? 'OKX 缓存快照' : '执行账户');
+    const balanceSource = account.balance_source || (account.balance_snapshot_stale ? 'OKX 缓存快照' : 'OKX 权威账户');
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     const pauseNote = account.risk_paused
         ? `<div class="exec-risk-note paused">已暂停分析新交易对：${escHtml(translatePauseReason(account.risk_pause_reason || '账户触发风险限制'))}</div>`
-        : '<div class="exec-risk-note">系统按 OKX 实际可用余额计算仓位；已有持仓仍会继续复盘和平仓。</div>';
+        : '<div class="exec-risk-note">账户余额、权益、订单和持仓只以 OKX 实时/快照事实为准；本地不再使用固定金额或虚拟余额算账。</div>';
 
     container.innerHTML = `
         <div class="exec-account-card">
@@ -768,11 +804,11 @@ function updateExecutionAccountPanel(account) {
             </div>
             <div class="exec-status-grid">
                 <div class="exec-status-cell"><span>${accountBalanceLabel}可交易余额</span><strong>${accountMoneyText(remainingAllocation, account)} USDT</strong></div>
-                <div class="exec-status-cell"><span>${accountBalanceLabel}账户权益</span><strong>${accountMoneyText(accountEquity, account)} USDT</strong></div>
+                <div class="exec-status-cell"><span>${accountBalanceLabel}当前账户权益</span><strong>${accountMoneyText(accountEquity, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>持仓保证金占用</span><strong>${accountMoneyText(positionMarginUsed, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>浮动盈亏</span><strong style="color:${unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(unrealizedPnl)} USDT</strong></div>
-                <div class="exec-status-cell"><span>今日总盈亏</span><strong style="color:${todayTotalPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(todayTotalPnl)} USDT</strong></div>
-                <div class="exec-status-cell"><span>累计盈亏</span><strong style="color:${totalPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(totalPnl)} USDT</strong></div>
+                <div class="exec-status-cell"><span>今日OKX权益变化</span><strong style="color:${signedMoneyColor(todayTotalPnl)};">${signedMoneyWithUnit(todayTotalPnl)}</strong></div>
+                <div class="exec-status-cell"><span>三期OKX权益变化</span><strong style="color:${signedMoneyColor(phase3TotalPnl)};">${signedMoneyWithUnit(phase3TotalPnl)}</strong></div>
             </div>
             ${account.balance_error ? `<div class="exec-risk-note paused">${escHtml(account.balance_error)}</div>` : pauseNote}
         </div>
@@ -799,23 +835,22 @@ function updateAccounts(accounts, executionAccount = null) {
 
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
-    const totalPnl = valueNumber(account.cumulative_total_pnl ?? account.total_pnl) || 0;
+    const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);
     const unrealizedPnl = valueNumber(account.unrealized_pnl) || 0;
-    const todayRealizedPnl = valueNumber(account.today_closed_realized_pnl ?? account.today_realized_pnl) || 0;
-    const todayTotalPnl = todayRealizedPnl + unrealizedPnl;
-    const pnlColor = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const todayTotalPnl = valueNumber(account.today_equity_pnl);
+    const pnlColor = signedMoneyColor(phase3TotalPnl);
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     container.innerHTML = `
         <div class="acct-row">
             <div class="acct-main">
                 <div class="acct-name">${escHtml(account.account_name || account.model_name || '多专家执行账户')}</div>
                 <div style="font-size:12px;color:var(--text);font-weight:700;">${accountBalanceLabel}可交易余额 ${accountMoneyText(remainingAllocation, account)} USDT</div>
-                <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${accountBalanceLabel}账户权益 ${accountMoneyText(accountEquity, account)} | 今日总盈亏（北京时间）${signedMoney(todayTotalPnl)}</div>
+                <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${accountBalanceLabel}当前账户权益 ${accountMoneyText(accountEquity, account)} | 今日OKX权益变化（北京时间）${signedMoney(todayTotalPnl)}</div>
                 ${account.balance_error ? `<div style="font-size:10px;color:var(--red);margin-top:4px;">${escHtml(account.balance_error)}</div>` : ''}
             </div>
             <div class="acct-side">
-                <div class="acct-side-label">累计盈亏</div>
-                <div class="acct-side-value" style="color:${pnlColor};">${signedMoney(totalPnl)} USDT</div>
+                <div class="acct-side-label">三期OKX权益变化</div>
+                <div class="acct-side-value" style="color:${pnlColor};">${signedMoneyWithUnit(phase3TotalPnl)}</div>
             </div>
         </div>
     `;
@@ -3396,14 +3431,14 @@ function showAnalysisReasonLoading(recordId) {
 
 function renderAnalysisVectorMemory(memory) {
     if (!memory || memory.enabled === false) {
-        return '<div class="analysis-empty">向量记忆未启用；启用后会检索相似历史决策、新闻和复盘案例。</div>';
+        return '<div class="analysis-empty">向量记忆未启用；启用后只检索三期新样本索引。</div>';
     }
     if (memory.status && memory.status !== 'ok') {
         return `<div class="analysis-empty">向量记忆状态：${escHtml(memory.status)}${memory.error ? `；${escHtml(memory.error)}` : ''}</div>`;
     }
     const hits = Array.isArray(memory.hits) ? memory.hits : [];
     if (!hits.length) {
-        return '<div class="analysis-empty">没有检索到足够相似的历史案例。</div>';
+        return '<div class="analysis-empty">没有检索到足够相似的三期新样本。</div>';
     }
     const influence = memory.influence || {};
     const influenceLevel = String(influence.level || 'neutral');
@@ -3414,7 +3449,7 @@ function renderAnalysisVectorMemory(memory) {
     const deltaLabel = delta > 0 ? `+${delta.toFixed(2)} 分` : `${delta.toFixed(2)} 分`;
     const rows = hits.map(hit => {
         const outcomeTone = Number(hit.pnl_pct || 0) > 0 ? 'good' : Number(hit.pnl_pct || 0) < 0 ? 'warn' : 'muted';
-        const kindLabel = hit.kind === 'news' ? '新闻/事件' : '历史决策';
+        const kindLabel = hit.kind === 'news' ? '新闻/事件' : '三期决策样本';
         const pnl = hit.pnl_pct !== null && hit.pnl_pct !== undefined
             ? `收益 ${signedPctValueLabel(hit.pnl_pct)}`
             : '无收益结果';
@@ -3434,7 +3469,7 @@ function renderAnalysisVectorMemory(memory) {
     return `
         <div class="analysis-card analysis-final-card">
             <div class="analysis-card-head">
-                <div class="analysis-card-title">相似历史记忆</div>
+                <div class="analysis-card-title">三期相似样本记忆</div>
                 <div class="analysis-card-tags">
                     ${analysisPill(memory.backend || 'vector', 'muted')}
                     ${analysisPill(`命中 ${hits.length} 条`, hits.length ? 'good' : 'muted')}
@@ -3444,12 +3479,12 @@ function renderAnalysisVectorMemory(memory) {
                 </div>
             </div>
             <div class="analysis-card-text">
-                <div class="analysis-note analysis-note-muted"><span>作用</span>${analysisText('用于提醒系统不要重复过去相似亏损模式，也帮助解释为什么降仓、观望或需要更强证据。')}</div>
+                <div class="analysis-note analysis-note-muted"><span>作用</span>${analysisText('只基于三期新索引样本提醒系统避免重复新阶段已验证的亏损模式，也帮助解释为什么降仓、观望或需要更强证据。')}</div>
                 <div class="analysis-note analysis-note-${influenceTone === 'good' ? 'positive' : influenceTone === 'warn' ? 'warning' : 'muted'}">
-                    <span>${escHtml(influence.label || '相似历史影响')}</span>
-                    ${analysisText(influence.reason || '相似历史仅作为轻量加减分因子，不直接拦截开仓。')}
+                    <span>${escHtml(influence.label || '三期相似样本影响')}</span>
+                    ${analysisText(influence.reason || '三期相似样本仅作为轻量加减分因子，不直接拦截开仓。')}
                     <br>
-                    ${analysisText(`命中 ${Number(influence.matched_count || hits.length)} 条，历史盈利 ${Number(influence.profit_count || 0)} 条，历史亏损 ${Number(influence.loss_count || 0)} 条，同方向亏损 ${Number(influence.same_action_loss_count || 0)} 条。`)}
+                    ${analysisText(`命中 ${Number(influence.matched_count || hits.length)} 条，三期盈利 ${Number(influence.profit_count || 0)} 条，三期亏损 ${Number(influence.loss_count || 0)} 条，同方向亏损 ${Number(influence.same_action_loss_count || 0)} 条。`)}
                 </div>
                 <div class="analysis-resolution-list">${rows}</div>
             </div>
@@ -3866,7 +3901,7 @@ function renderAnalysisReasonModal(record) {
             ${analysisSection('本地ML盈亏质量', renderAnalysisMlSignal(mlSignal))}
             ${analysisSection('服务器量化工具', renderAnalysisLocalAiTools(localAiTools, record.analysis_type))}
             ${analysisSection('新闻与事件', renderAnalysisNewsContext(newsContext))}
-            ${analysisSection('相似历史记忆', renderAnalysisVectorMemory(vectorMemory))}
+            ${analysisSection('三期相似样本记忆', renderAnalysisVectorMemory(vectorMemory))}
             ${analysisSection(preExpertSkip.skipped ? preExpertSkip.label : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
             ${missingHtml ? analysisSection('未返回专家', `<div class="analysis-grid">${missingHtml}</div>`) : ''}
             ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `请求 ${Number(record.cross_requested || 0)} 个，完成 ${completedCross} 个，无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
@@ -4268,25 +4303,28 @@ function mlSampleCounts() {
     const ml = state.mlSignalStatus || {};
     const local = state.localAIToolsStatus || {};
     const autoLast = ml.auto_train_last_result || {};
-    const trainingMl = Number(ml.training_shadow_sample_count || ml.sample_count || ml.trained_sample_count || 0);
+    const trainingMl = Number(ml.phase3_clean_trainable_shadow_sample_count || 0);
     const completedMl = Number(
-        ml.completed_shadow_sample_count
-        || ml.total_shadow_sample_count
-        || autoLast.completed_sample_count
-        || Math.max(trainingMl, Number(autoLast.previous_sample_count || 0) + Number(autoLast.new_sample_count || 0))
+        ml.phase3_clean_completed_shadow_sample_count
+        || ml.phase3_clean_trainable_shadow_sample_count
         || trainingMl
     );
-    const trainingLocal = Number(local.training_shadow_sample_count || local.shadow_sample_count || 0);
+    const trainingLocal = Number(
+        local.phase3_clean_trainable_shadow_sample_count || 0
+    );
     const completedLocal = Number(
-        local.completed_shadow_sample_count
-        || local.total_shadow_sample_count
-        || completedMl
+        local.phase3_clean_completed_shadow_sample_count
+        || local.phase3_clean_trainable_shadow_sample_count
         || trainingLocal
     );
-    const trainingLocalTrade = Number(local.trade_sample_count || 0);
+    const trainingLocalTrade = Number(
+        local.phase3_clean_trainable_trade_sample_count
+        || local.training_trade_sample_count
+        || 0
+    );
     const completedLocalTrade = Number(
-        local.completed_trade_sample_count
-        || local.total_trade_sample_count
+        local.phase3_clean_trainable_trade_sample_count
+        || local.completed_trade_sample_count
         || trainingLocalTrade
     );
     const defaultTrainingWindow = 20000;
@@ -4296,9 +4334,9 @@ function mlSampleCounts() {
         || defaultTrainingWindow
     );
     const newCount = Number(
-        ml.new_shadow_sample_count
-        || autoLast.new_sample_count
-        || Math.max(completedMl - Number(autoLast.previous_sample_count || trainingMl || 0), 0)
+        ml.phase3_new_shadow_sample_count
+        || local.phase3_new_shadow_sample_count
+        || Math.max(completedMl - Number(autoLast.previous_phase3_sample_count || trainingMl || 0), 0)
     );
     return {
         trainingMl,
@@ -4357,11 +4395,16 @@ function renderModelContributionStats() {
     if (!container) return;
     const data = state.modelContributionStats || {};
     const rows = Array.isArray(data.stats) ? data.stats : [];
+    const lineage = data.lineage || {};
+    const lineageHtml = renderModelContributionLineage(lineage);
     if (!rows.length) {
-        container.innerHTML = '<div class="analysis-empty">暂无实盘贡献样本。等有新的已平仓记录后，这里会显示每个模型到底帮你赚了还是亏了。</div>';
+        container.innerHTML = `
+            ${lineageHtml}
+            <div class="analysis-empty">暂无实盘贡献样本。等有新的已平仓记录后，这里会显示每个模型到底帮你赚了还是亏了。</div>`;
         return;
     }
     container.innerHTML = `
+        ${lineageHtml}
         <div class="table-wrap">
             <table>
                 <thead>
@@ -4393,6 +4436,38 @@ function renderModelContributionStats() {
         </div>
         <div class="analysis-note analysis-note-muted" style="margin:12px;">
             <span>说明</span>${escHtml(data.summary || '按真实已平仓盈亏统计，用于判断哪些模型应该加权，哪些应该降权。')}
+        </div>`;
+}
+
+function renderModelContributionLineage(lineage = {}) {
+    const total = Number(lineage.total_closed_positions || 0);
+    const matched = Number(lineage.matched_position_count || 0);
+    const orders = Number(lineage.filled_order_count || 0);
+    const linked = Number(lineage.orders_with_decision_id || 0);
+    const loaded = Number(lineage.orders_with_loaded_decision || 0);
+    const ready = Boolean(lineage.ready_for_profit_learning);
+    const tone = ready ? 'positive' : (total > 0 ? 'warning' : 'muted');
+    const reasonMap = {
+        ok: '归因链路正常，已平仓样本可以进入模型贡献学习。',
+        no_closed_positions: '最近窗口没有已平仓仓位，贡献统计等待新样本。',
+        no_filled_orders_for_symbols: '有已平仓仓位，但没有找到同币种成交订单，需检查 OKX 同步/订单留存。',
+        filled_orders_missing_decision_id: '有成交订单，但订单没有 decision_id，模型贡献无法回溯到当时决策。',
+        linked_decisions_missing: '订单带 decision_id，但没有加载到对应 AI 决策，需检查决策表/对账链路。',
+        position_order_time_or_side_mismatch: '订单和仓位存在币种、方向或时间窗口不匹配，暂不能归因。',
+        partial_lineage: '只有部分平仓能归因，贡献表可观察但不能直接用于自动加权。',
+    };
+    const reason = reasonMap[lineage.reason] || '贡献归因链路仍在收集样本。';
+    return `
+        <div class="analysis-note analysis-note-${tone} model-contribution-lineage">
+            <span>贡献归因链路</span>
+            <div class="model-contribution-lineage-grid">
+                <strong>平仓 ${total}</strong>
+                <strong>成交订单 ${orders}</strong>
+                <strong>带决策ID ${linked}</strong>
+                <strong>已加载决策 ${loaded}</strong>
+                <strong>可归因仓位 ${matched}</strong>
+            </div>
+            <em>${escHtml(reason)}</em>
         </div>`;
 }
 
@@ -4498,7 +4573,8 @@ function collectionStatusTone(status, enabled = true) {
     const value = String(status || '').toLowerCase();
     if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
     if (['active', 'ok', 'ready', 'running', 'unknown', 'learning_only'].includes(value)) return 'good';
-    if (['missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config'].includes(value)) return 'warn';
+    if (['heuristic_fallback_available', 'shadow_ready', 'shadow', 'empty'].includes(value)) return 'warn';
+    if (['missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config', 'quarantined', 'downweighted'].includes(value)) return 'warn';
     return 'bad';
 }
 
@@ -4516,6 +4592,12 @@ function collectionStatusLabel(status, enabled = true) {
         invalid_status: '状态异常',
         unknown: '已连接',
         learning_only: '学习中',
+        heuristic_fallback_available: '启发式可用',
+        shadow_ready: '影子可用',
+        shadow: '影子观察',
+        empty: '冷启动等待',
+        quarantined: '已隔离',
+        downweighted: '已降权',
         ready: '可用',
         running: '运行中',
     };
@@ -4553,6 +4635,25 @@ function collectionMetric(label, value, subtitle = '', tone = 'muted') {
             <span>${escHtml(label)}</span>
             <strong>${escHtml(value)}</strong>
             ${subtitle ? `<em>${escHtml(subtitle)}</em>` : ''}
+        </div>`;
+}
+
+function renderPhase3PromotionGate(promotion, localTools = {}) {
+    const gate = promotion && typeof promotion === 'object' ? promotion : {};
+    const canaryBlockers = Array.isArray(gate.canary_blocking_reasons)
+        ? gate.canary_blocking_reasons
+        : [];
+    const liveBlockers = Array.isArray(gate.live_blocking_reasons)
+        ? gate.live_blocking_reasons
+        : [];
+    return `
+        <div class="data-quality-panel">
+            <strong>Phase 3 promotion gate</strong>
+            <div class="data-collection-summary data-collection-summary-compact">
+                ${collectionMetric('Recommended stage', gate.recommended_stage || localTools.model_stage || 'shadow', `mode=${localTools.training_mode || 'shadow'}`, gate.live_ready ? 'good' : gate.canary_ready ? 'warn' : 'muted')}
+                ${collectionMetric('Canary ready', gate.canary_ready ? 'yes' : 'no', canaryBlockers.slice(0, 2).join(', ') || 'no blocker reported', gate.canary_ready ? 'good' : 'warn')}
+                ${collectionMetric('Live ready', gate.live_ready ? 'yes' : 'no', liveBlockers.slice(0, 3).join(', ') || 'live mutation remains disabled', gate.live_ready ? 'good' : 'warn')}
+            </div>
         </div>`;
 }
 
@@ -4696,6 +4797,9 @@ function renderDataCollectionFeatureCoverage(featureCoverage) {
     const missing = Array.isArray(report.missing_features) ? report.missing_features : [];
     const stale = Array.isArray(report.stale_features) ? report.stale_features : [];
     const neutralized = Array.isArray(report.neutralized_features) ? report.neutralized_features : [];
+    const waitingForSamples = Boolean(report.waiting_for_decision_samples || report.cold_start_safe);
+    const missingTone = missing.length ? (waitingForSamples ? 'warn' : 'bad') : 'good';
+    const policyText = report.display_message || '缺失/过期特征默认中性阻断，不能静默当作正常。';
     const problemFeatures = features.filter(item => {
         const status = String(item?.status || '').toLowerCase();
         return ['missing', 'stale', 'low_confidence'].includes(status);
@@ -4703,12 +4807,12 @@ function renderDataCollectionFeatureCoverage(featureCoverage) {
     container.innerHTML = `
         <div class="data-feature-coverage-grid">
             ${collectionMetric('覆盖状态', dataFeatureStatusLabel(report.status), report.audit_only ? '只读报告' : '状态来源异常', dataFeatureStatusTone(report.status))}
-            ${collectionMetric('缺失特征', `${monitorNumber(missing.length, 0)} 类`, missing.slice(0, 4).join(' / ') || '暂无', missing.length ? 'bad' : 'good')}
+            ${collectionMetric('缺失特征', `${monitorNumber(missing.length, 0)} 类`, waitingForSamples ? '冷启动待补齐，不驱动开仓' : (missing.slice(0, 4).join(' / ') || '暂无'), missingTone)}
             ${collectionMetric('过期特征', `${monitorNumber(stale.length, 0)} 类`, stale.slice(0, 4).join(' / ') || '暂无', stale.length ? 'warn' : 'good')}
             ${collectionMetric('中性阻断', `${monitorNumber(neutralized.length, 0)} 类`, '缺失/过期不驱动开仓', neutralized.length ? 'warn' : 'good')}
         </div>
         <div class="data-feature-policy">
-            <span>缺失特征默认中性，不能静默当作正常。</span>
+            <span>${escHtml(policyText)}</span>
             <span>低可信事件只允许影子观察，不直接驱动真实开仓。</span>
         </div>
         <div class="data-feature-table">
@@ -4807,26 +4911,47 @@ function renderDataCollectionTraining(training) {
     const governance = training.governance || {};
     const localGovernance = governance.local_ai_tools || localTools.governance_report || {};
     const mlGovernance = governance.local_ml_signal || {};
+    const phase3CleanCount = Number(
+        governance.phase3_clean_trainable_shadow_sample_count
+        ?? localGovernance.phase3_clean_trainable_sample_count
+        ?? governance.local_ml_trainable_shadow_sample_count
+        ?? 0
+    );
+    const quarantinedCount = Number(
+        governance.quarantined_shadow_sample_count
+        ?? localGovernance.quarantined_sample_count
+        ?? localGovernance.excluded_sample_count
+        ?? 0
+    );
     const reasons = Array.isArray(quality.top_reasons) ? quality.top_reasons : [];
     const qualitySources = Array.isArray(quality.top_sources) ? quality.top_sources : [];
     const models = localTools.models && typeof localTools.models === 'object'
         ? Object.entries(localTools.models)
         : [];
+    const promotion = localTools.promotion_recommendation && typeof localTools.promotion_recommendation === 'object'
+        ? localTools.promotion_recommendation
+        : {};
+    const canaryBlockers = Array.isArray(promotion.canary_blocking_reasons)
+        ? promotion.canary_blocking_reasons
+        : [];
+    const liveBlockers = Array.isArray(promotion.live_blocking_reasons)
+        ? promotion.live_blocking_reasons
+        : [];
     const completedShadowText = Number(localTools.completed_shadow_sample_count || 0) > 0
-        ? `复盘完成 ${monitorNumber(localTools.completed_shadow_sample_count, 0)}`
-        : '复盘完成口径暂未返回';
+        ? `三期完成 ${monitorNumber(localTools.completed_shadow_sample_count, 0)}`
+        : '三期干净样本暂未形成';
     const completedTradeText = Number(localTools.completed_trade_sample_count || 0) > 0
-        ? `复盘完成 ${monitorNumber(localTools.completed_trade_sample_count, 0)}`
-        : '复盘完成口径暂未返回';
+        ? `三期完成 ${monitorNumber(localTools.completed_trade_sample_count, 0)}`
+        : '三期干净交易样本暂未形成';
     container.innerHTML = `
         <div class="data-quality-grid">
             <div class="data-quality-panel data-governance-panel">
                 <strong>训练数据治理</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
                     ${collectionMetric('清洗状态', trainingGovernanceStatusLabel(localGovernance.status || governance.status), trainingGovernanceSummary(localGovernance), trainingGovernanceTone(localGovernance.status || governance.status))}
-                    ${collectionMetric('隔离样本', `${monitorNumber(localGovernance.excluded_sample_count, 0)} 条`, '保留原始记录，但不进训练', Number(localGovernance.excluded_sample_count || 0) ? 'warn' : 'good')}
-                    ${collectionMetric('降权样本', `${monitorNumber(localGovernance.downweighted_sample_count, 0)} 条`, '弱证据继续学习但降低权重', Number(localGovernance.downweighted_sample_count || 0) ? 'warn' : 'good')}
-                    ${collectionMetric('ML 可训练', `${monitorNumber(governance.local_ml_trainable_shadow_sample_count, 0)} 条`, trainingGovernanceSummary(mlGovernance), Number(governance.local_ml_trainable_shadow_sample_count || 0) > 0 ? 'good' : 'warn')}
+                    ${collectionMetric('三期可训练', `${monitorNumber(phase3CleanCount, 0)} 条`, '只使用干净训练视图', phase3CleanCount > 0 ? 'good' : 'warn')}
+                    ${collectionMetric('隔离样本', `${monitorNumber(quarantinedCount, 0)} 条`, '旧数据不参与三期训练', quarantinedCount ? 'warn' : 'good')}
+                    ${collectionMetric('降权样本', `${monitorNumber(localGovernance.downweighted_sample_count, 0)} 条`, '仅限三期干净窗口内弱证据', Number(localGovernance.downweighted_sample_count || 0) ? 'warn' : 'good')}
                 </div>
                 <div class="data-governance-notes">
                     ${trainingGovernanceNotes(localGovernance, mlGovernance)}
@@ -4851,14 +4976,15 @@ function renderDataCollectionTraining(training) {
                 <strong>本地量化工具训练样本</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
                     ${collectionMetric('服务状态', collectionStatusLabel(localTools.status, localTools.available), localTools.available ? '训练接口可用' : (localTools.error || '训练接口不可用'), collectionStatusTone(localTools.status, localTools.available))}
-                    ${collectionMetric('影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, completedShadowText, 'muted')}
-                    ${collectionMetric('交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, completedTradeText, 'muted')}
+                    ${collectionMetric('三期影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, completedShadowText, 'muted')}
+                    ${collectionMetric('三期交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, completedTradeText, 'muted')}
                     ${collectionMetric('文本样本', `${monitorNumber(localTools.text_sentiment_sample_count, 0)} 条`, '新闻/社媒训练输入', 'muted')}
                 </div>
                 <div class="data-chip-list">
                     ${models.length ? models.map(([name, ready]) => `<span>${escHtml(name)}：${ready ? '已就绪' : '学习中'}</span>`).join('') : '<span>模型状态未返回</span>'}
                 </div>
             </div>
+            ${renderPhase3PromotionGate(promotion, localTools)}
         </div>`;
 }
 
@@ -4887,8 +5013,17 @@ function trainingGovernanceSummary(report) {
 }
 
 function trainingGovernanceNotes(localReport, mlReport) {
-    const notes = [];
-    if (localReport?.raw_records_preserved) {
+    const notes = ['三期重新开始训练；旧数据禁止进入新模型训练。'];
+    if (localReport?.requires_artifact_refresh || mlReport?.requires_artifact_refresh) {
+        notes.push('清洗策略已生效，下一轮训练只使用三期干净训练窗口。');
+    }
+    const targets = localReport?.refresh_targets || mlReport?.refresh_targets || [];
+    if (Array.isArray(targets) && targets.length) {
+        notes.push(`刷新目标：${targets.join(' / ')}`);
+    }
+    return notes.map(note => `<span>${escHtml(note)}</span>`).join('');
+}
+/*
         notes.push('原始交易/分析记录保留，只隔离训练视图。');
     }
     if (localReport?.requires_artifact_refresh || mlReport?.requires_artifact_refresh) {
@@ -4901,6 +5036,8 @@ function trainingGovernanceNotes(localReport, mlReport) {
     if (!notes.length) notes.push('暂无脏样本风险信号。');
     return notes.map(note => `<span>${escHtml(note)}</span>`).join('');
 }
+
+*/
 
 async function refreshTrainingGovernance() {
     const container = document.getElementById('data-collection-training');
@@ -5003,7 +5140,7 @@ function applyRecommendedDataCollectionSources() {
     const maxSourcesInput = document.getElementById('data-external-max-sources');
     if (maxSourcesInput) {
         const currentMaxSources = Number(maxSourcesInput.value || 0);
-        maxSourcesInput.value = String(Math.min(20, Math.max(currentMaxSources, recommended.length)));
+        maxSourcesInput.value = String(Math.min(32, Math.max(currentMaxSources, recommended.length)));
     }
     if (status) {
         status.style.color = 'var(--accent-light)';
@@ -5087,9 +5224,9 @@ function renderVectorMemoryStatus(data) {
             <em>${escHtml(data.backend || '-')}</em>
         </div>
         <div class="data-source-line data-source-muted">
-            <span>索引文档</span>
+            <span>三期索引样本</span>
             <strong>${monitorNumber(data.document_count, 0)} 条</strong>
-            <em>${data.last_reindex_at ? `上次索引 ${toBeijingTime(data.last_reindex_at)}` : (data.auto_reindex_enabled ? '等待后台自动索引' : '尚未索引')}</em>
+            <em>${data.last_reindex_at ? `上次索引 ${toBeijingTime(data.last_reindex_at)}` : (data.auto_reindex_enabled ? '等待新样本自动索引' : '尚未索引')}</em>
         </div>
         <div class="data-source-line data-source-${data.auto_reindex_running ? 'warn' : (data.auto_reindex_enabled ? 'good' : 'muted')}">
             <span>自动维护</span>
@@ -5117,8 +5254,24 @@ async function saveVectorMemorySettings() {
         status.style.color = data?.status === 'error' ? 'var(--red)' : 'var(--green)';
         status.textContent = data?.status === 'error'
             ? `保存后状态异常：${data.last_error || '未知错误'}`
-            : '向量记忆设置已保存；启用后后台会自动维护索引，手动重建只用于立即刷新。';
+            : '向量记忆设置已保存；启用前请先清空旧索引，再等待三期新样本重建。';
     }
+}
+
+async function clearVectorMemoryIndex() {
+    const status = document.getElementById('vector-memory-save-status');
+    if (status) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = '正在清空旧向量索引...';
+    }
+    const data = await postJSON('/api/vector-memory/clear', {});
+    if (status) {
+        status.style.color = data?.status === 'cleared' ? 'var(--green)' : 'var(--red)';
+        status.textContent = data?.status === 'cleared'
+            ? `旧索引已清空，移除 ${monitorNumber(data.removed, 0)} 条；等待三期新样本重新索引。`
+            : `清空失败：${data?.error || data?.status || '未知错误'}`;
+    }
+    await refreshVectorMemoryStatus({ silent: true });
 }
 
 async function reindexVectorMemory() {
@@ -5131,7 +5284,7 @@ async function reindexVectorMemory() {
     if (status) {
         status.style.color = data?.status === 'ok' ? 'var(--green)' : 'var(--red)';
         status.textContent = data?.status === 'ok'
-            ? `已索引 ${monitorNumber(data.indexed, 0)} 条历史文档。`
+            ? `已索引 ${monitorNumber(data.indexed, 0)} 条三期新样本。`
             : `重建失败：${data?.error || data?.status || '未知错误'}`;
     }
     await refreshVectorMemoryStatus({ silent: true });
@@ -5161,7 +5314,7 @@ async function searchVectorMemory() {
     resultEl.innerHTML = hits.map(hit => `
         <div class="data-source-line data-source-${Number(hit.pnl_pct || 0) < 0 ? 'warn' : 'good'}">
             <span>${escHtml(hit.symbol || hit.kind || '-')}</span>
-            <strong>${escHtml(hit.kind === 'news' ? '新闻/事件' : '历史决策')}</strong>
+            <strong>${escHtml(hit.kind === 'news' ? '新闻/事件' : '三期决策样本')}</strong>
             <em>相似度 ${(Number(hit.score || 0) * 100).toFixed(0)}% · ${hit.action ? analysisDecisionLabel(hit.action) : '-'} · ${hit.pnl_pct !== null && hit.pnl_pct !== undefined ? signedPctValueLabel(hit.pnl_pct) : '无收益'}</em>
         </div>
     `).join('');
@@ -5468,6 +5621,66 @@ function systemAuditModelTrainingDetails(details) {
         ${systemAuditSection('模型服务异常', systemAuditTable(['项目', '状态', '说明'], criticalRows))}`;
 }
 
+function systemAuditPhase3ServerMigrationDetails(details) {
+    const blockers = Array.isArray(details.blockers) ? details.blockers : [];
+    const warnings = Array.isArray(details.warnings) ? details.warnings : [];
+    const legacyPaths = Array.isArray(details.legacy_data_paths) ? details.legacy_data_paths : [];
+    const forbiddenServices = Array.isArray(details.forbidden_services) ? details.forbidden_services : [];
+    const migration = details.migration_manifest || {};
+    const release = details.resource_release_marker || details.reset_marker || {};
+    const policy = details.migration_policy || {};
+    const blockerRows = blockers.slice(0, 10).map(item => [
+        item.code || '-',
+        item.severity || '-',
+        item.message || '-',
+        item.evidence || '-',
+    ]);
+    const warningRows = warnings.slice(0, 8).map(item => [
+        item.code || '-',
+        item.severity || '-',
+        item.message || '-',
+        item.evidence || '-',
+    ]);
+    const pathRows = legacyPaths.slice(0, 12).map(item => [
+        item.path || '-',
+        item.kind || '-',
+        item.size_bytes ?? '-',
+        Array.isArray(item.sample_children) ? item.sample_children.slice(0, 5).join(', ') : '-',
+    ]);
+    const serviceRows = forbiddenServices.slice(0, 12).map(item => [
+        item.name || '-',
+        item.unit_exists ?? '-',
+        item.active ?? '-',
+        item.enabled ?? '-',
+        item.active_state || '-',
+        item.enabled_state || '-',
+    ]);
+    const approvedRows = [
+        ['approved categories', Array.isArray(policy.approved_categories) ? policy.approved_categories.join(', ') : '-'],
+        ['approved sources', Array.isArray(policy.approved_sources) ? policy.approved_sources.join(', ') : '-'],
+        ['whole disk copy allowed', policy.whole_disk_copy_allowed ?? false],
+        ['old server role', policy.old_server_production_role_after_migration || '-'],
+    ];
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('Go-live blocked', details.phase3_go_live_blocked ? 'yes' : 'no', 'Phase 3 model-server gate')}
+            ${systemAuditMetric('Probe', details.remote_probe_available ? 'available' : 'unavailable', details.error || 'read-only')}
+            ${systemAuditMetric('Release marker', release.present ? 'present' : 'missing', details.resource_release_marker_path || details.reset_marker_path || '-')}
+            ${systemAuditMetric('Legacy released', release.legacy_resources_stopped ? 'yes' : 'no', release.policy_id || details.policy_id || '-')}
+            ${systemAuditMetric('Phase 3 root', details.phase3_root || '-', Array.isArray(details.missing_phase3_roots) && details.missing_phase3_roots.length ? 'missing roots' : 'isolated')}
+            ${systemAuditMetric('Migration manifest', migration.present ? 'present' : 'missing', details.migration_manifest_path || '-')}
+            ${systemAuditMetric('Migration items', migration.item_count ?? 0, migration.whitelist_only ? 'whitelist only' : 'not whitelist only')}
+            ${systemAuditMetric('Legacy data paths', details.legacy_data_path_count ?? 0, 'preserved, isolated')}
+            ${systemAuditMetric('Legacy services', details.forbidden_service_count ?? 0, 'must be 0')}
+            ${systemAuditMetric('Legacy processes', details.legacy_process_count ?? 0, 'must be 0')}
+        </div>
+        ${systemAuditSection('Phase 3 blockers', systemAuditTable(['Code', 'Severity', 'Message', 'Evidence'], blockerRows))}
+        ${systemAuditSection('Migration warnings', systemAuditTable(['Code', 'Severity', 'Message', 'Evidence'], warningRows))}
+        ${systemAuditSection('Preserved legacy data paths', systemAuditTable(['Path', 'Kind', 'Size', 'Children'], pathRows))}
+        ${systemAuditSection('Forbidden legacy services', systemAuditTable(['Service', 'Unit', 'Active', 'Enabled', 'Active state', 'Enabled state'], serviceRows))}
+        ${systemAuditSection('Whitelist migration policy', systemAuditTable(['Policy', 'Value'], approvedRows))}`;
+}
+
 function systemAuditGenericDetailsHtml(details) {
     if (!details || typeof details !== 'object') return '';
     const rows = Object.entries(details)
@@ -5514,14 +5727,265 @@ function systemAuditShadowMissedOpportunityDetails(details) {
         ${systemAuditSection('Blocked reason counts', systemAuditTable(['Reason', 'Count'], blockedReasonRows))}`;
 }
 
+function systemAuditOkxDetailsV2(details) {
+    const plans = Array.isArray(details.sample_plans) ? details.sample_plans : [];
+    const rootCause = details.root_cause_summary || {};
+    const trainingPolicy = details.training_data_policy || {};
+    const authoritative = details.okx_authoritative_sync || {};
+    const runtimeGate = details.runtime_okx_entry_gate || {};
+    const dailyReport = details.daily_reconciliation_report || {};
+    const rootCauseRows = Array.isArray(rootCause.root_causes)
+        ? rootCause.root_causes.slice(0, 6).map(item => [
+            item.code || '-',
+            item.count ?? 0,
+            item.training_policy || '-',
+            item.action || '-',
+        ])
+        : [];
+    const authoritativeIssueRows = (Array.isArray(authoritative.issues) ? authoritative.issues : [])
+        .slice(0, 8)
+        .map(item => [
+            item.kind || '-',
+            item.classification || '-',
+            item.severity || '-',
+            item.symbol || '-',
+            item.side || '-',
+            item.exchange_order_id || item.local_order_id || item.local_position_id || '-',
+            item.reason || '-',
+        ]);
+    const runtimeKindRows = Object.entries(runtimeGate.last_result_kinds || {})
+        .slice(0, 8)
+        .map(([kind, count]) => [kind, count]);
+    const runtimeSampleRows = (Array.isArray(runtimeGate.last_samples) ? runtimeGate.last_samples : [])
+        .slice(0, 8)
+        .map(item => [
+            item.kind || '-',
+            item.symbol || '-',
+            sideLabel(item.side || '-'),
+            item.requires_attention === true ? 'yes' : 'no',
+            item.exchange_order_id || '-',
+            item.note || '-',
+        ]);
+    const runtimeGateState = runtimeGate.entry_blocked === true
+        ? 'blocked'
+        : (runtimeGate.entry_blocked === false ? 'open' : 'unknown');
+    const dailyReportState = dailyReport.stale === true
+        ? 'stale'
+        : (dailyReport.status || (dailyReport.available === false ? 'missing' : 'unknown'));
+    const dailyLedger = dailyReport.issue_ledger_summary || {};
+    const dailyBuckets = dailyReport.attention_buckets || {};
+    const dailyEntryBlockerRows = (Array.isArray(dailyReport.entry_blockers) ? dailyReport.entry_blockers : [])
+        .slice(0, 8)
+        .map(item => [
+            item.code || '-',
+            item.card_key || '-',
+            item.status || '-',
+            item.requires_attention === true ? 'yes' : 'no',
+            item.summary || '-',
+        ]);
+    const dailyTrainingBlockerRows = (Array.isArray(dailyReport.training_blockers) ? dailyReport.training_blockers : [])
+        .slice(0, 8)
+        .map(item => [
+            item.code || '-',
+            item.card_key || '-',
+            item.status || '-',
+            item.summary || '-',
+        ]);
+    const rows = plans.slice(0, 5).map(item => [
+        item.symbol || '-',
+        sideLabel(item.side || '-'),
+        item.quantity ?? '-',
+        item.realized_pnl ?? '-',
+        item.closed_at ? toBeijingTime(item.closed_at) : '-',
+        item.exchange_order_id || '-',
+    ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('OKX window', `${details.window_days || 14} days`, 'read-only dry-run')}
+            ${systemAuditMetric('Missing closes', details.missing_closed_positions, 'affects PnL/training if >0')}
+            ${systemAuditMetric('Root cause', rootCause.status || '-', 'OKX/local mismatch class')}
+            ${systemAuditMetric('Repairable', rootCause.repairable_count ?? details.repairable_count ?? 0, 'dry-run only')}
+            ${systemAuditMetric('Manual review', rootCause.manual_review_count ?? details.manual_review_count ?? 0, 'needs OKX fact check')}
+            ${systemAuditMetric('Unscanned', rootCause.unscanned_candidate_count ?? details.unscanned_candidate_count ?? 0, 'run full scan if >0')}
+            ${systemAuditMetric('OKX API pull', authoritative.okx_pull_available === false ? 'unavailable' : 'available', 'private API facts')}
+            ${systemAuditMetric('OKX positions', authoritative.okx_position_count ?? 0, 'current exchange positions')}
+            ${systemAuditMetric('OKX fill orders', authoritative.okx_fill_order_count ?? 0, 'recent exchange fills')}
+            ${systemAuditMetric('OKX sync issues', authoritative.issue_count ?? 0, 'manual review/repairable/skipped')}
+            ${systemAuditMetric('Entry gate', runtimeGateState, runtimeGate.blocker || runtimeGate.status || 'runtime OKX sync')}
+            ${systemAuditMetric('Daily report', dailyReportState, dailyReport.generated_at ? toBeijingTime(dailyReport.generated_at) : 'latest timer artifact')}
+            ${systemAuditMetric('Can train', dailyReport.can_refresh_training === true ? 'yes' : 'no', dailyReport.training_blocked === true ? 'training blocked' : 'clean-view allowed')}
+        </div>
+        ${systemAuditSection('Latest OKX daily report gates', systemAuditTable(['Report status', 'Age seconds', 'Can open', 'Can train', 'Requires attention', 'Entry blockers', 'Training blockers', 'Unresolved'], [[
+            dailyReportState,
+            dailyReport.age_seconds ?? '-',
+            dailyReport.can_open_new_entries ?? '-',
+            dailyReport.can_refresh_training ?? '-',
+            dailyReport.requires_attention ?? '-',
+            dailyBuckets.entry ?? '-',
+            dailyBuckets.training ?? '-',
+            dailyLedger.unresolved ?? '-',
+        ]]))}
+        ${systemAuditSection('Daily entry blockers', systemAuditTable(['Code', 'Card', 'Status', 'Attention', 'Summary'], dailyEntryBlockerRows))}
+        ${systemAuditSection('Daily training blockers', systemAuditTable(['Code', 'Card', 'Status', 'Summary'], dailyTrainingBlockerRows))}
+        ${systemAuditSection('Runtime OKX entry gate', systemAuditTable(['Running', 'Runtime status', 'Sync status', 'Entry blocked', 'Heartbeat age', 'Fresh limit', 'Blocker', 'Reason'], [[
+            runtimeGate.running ?? '-',
+            runtimeGate.status || '-',
+            runtimeGate.sync_status || '-',
+            runtimeGate.entry_blocked,
+            runtimeGate.heartbeat_age_seconds ?? '-',
+            runtimeGate.heartbeat_fresh_limit_seconds ?? '-',
+            runtimeGate.blocker || '-',
+            runtimeGate.reason || '-',
+        ]]))}
+        ${systemAuditSection('Runtime OKX sync result kinds', systemAuditTable(['Kind', 'Count'], runtimeKindRows))}
+        ${systemAuditSection('Runtime OKX sync samples', systemAuditTable(['Kind', 'Symbol', 'Side', 'Requires attention', 'Exchange order', 'Note'], runtimeSampleRows))}
+        ${systemAuditSection('OKX authoritative sync policy', systemAuditTable(['Read-only', 'Can write DB', 'Backup required'], [[
+            authoritative.read_only ?? true,
+            authoritative.can_write_database ?? authoritative.apply_policy?.can_write_database ?? false,
+            authoritative.apply_policy?.requires_backup ?? true,
+        ]]))}
+        ${systemAuditSection('OKX authoritative sync issues', systemAuditTable(['Kind', 'Class', 'Severity', 'Symbol', 'Side', 'ID', 'Reason'], authoritativeIssueRows))}
+        ${systemAuditSection('Training data policy', systemAuditTable(['Policy', 'Cleanup', 'Rebuild'], [[
+            trainingPolicy.policy || rootCause.training_policy || '-',
+            trainingPolicy.cleanup_mode || rootCause.cleanup_mode || '-',
+            trainingPolicy.requires_training_rebuild ?? rootCause.requires_training_rebuild ?? false,
+        ]]))}
+        ${systemAuditSection('OKX root causes', systemAuditTable(['Code', 'Count', 'Training policy', 'Action'], rootCauseRows))}
+        ${systemAuditSection('Missing close samples', systemAuditTable(['Symbol', 'Side', 'Qty', 'PnL', 'Closed at', 'Exchange order'], rows))}`;
+}
+
+function systemAuditPositionPriceDetails(details) {
+    const root = details.root_cause_summary || {};
+    const rootRows = Object.entries(root.root_cause_counts || {})
+        .slice(0, 10)
+        .map(([code, count]) => [code, count]);
+    const posSideRows = Object.entries(details.okx_pos_side_counts || root.okx_pos_side_counts || {})
+        .slice(0, 10)
+        .map(([code, count]) => [code, count]);
+    const sideInferenceRows = Object.entries(details.okx_side_inference_counts || root.okx_side_inference_counts || {})
+        .slice(0, 10)
+        .map(([code, count]) => [code, count]);
+    const splitRows = (Array.isArray(details.splits) ? details.splits : [])
+        .slice(0, 8)
+        .map(item => [
+            item.mode || '-',
+            item.symbol || '-',
+            sideLabel(item.side || '-'),
+            item.local_price ?? '-',
+            item.okx_price ?? '-',
+            item.price_gap_pct ?? '-',
+            item.local_unrealized_pnl ?? '-',
+            item.okx_unrealized_pnl ?? '-',
+            item.okx_pos_side || '-',
+            item.okx_raw_pos ?? '-',
+            item.okx_side_inference || '-',
+            item.root_cause || '-',
+        ]);
+    const localOnlyRows = (Array.isArray(details.local_only_positions) ? details.local_only_positions : [])
+        .slice(0, 8)
+        .map(item => [
+            item.mode || '-',
+            item.position_id ?? '-',
+            item.symbol || '-',
+            sideLabel(item.side || '-'),
+            item.local_quantity ?? '-',
+            item.local_price ?? '-',
+            item.local_unrealized_pnl ?? '-',
+        ]);
+    const exchangeOnlyRows = (Array.isArray(details.exchange_only_positions) ? details.exchange_only_positions : [])
+        .slice(0, 8)
+        .map(item => [
+            item.mode || '-',
+            item.symbol || '-',
+            sideLabel(item.side || '-'),
+            item.okx_quantity ?? '-',
+            item.okx_price ?? '-',
+            item.okx_unrealized_pnl ?? '-',
+            item.okx_contracts ?? '-',
+            item.okx_contract_size ?? '-',
+            item.okx_raw_symbol || '-',
+            item.okx_pos_side || '-',
+            item.okx_raw_pos ?? '-',
+            item.okx_side_inference || '-',
+        ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('Mismatch status', root.status || '-', 'OKX/local position state')}
+            ${systemAuditMetric('Mismatch total', details.mismatch_count ?? root.mismatch_count ?? 0, 'all mismatch classes')}
+            ${systemAuditMetric('Price/PnL splits', details.split_count ?? root.split_count ?? 0, 'matched positions differ')}
+            ${systemAuditMetric('Local only', details.local_only_count ?? root.local_only_count ?? 0, 'local open but not OKX')}
+            ${systemAuditMetric('OKX only', details.exchange_only_count ?? root.exchange_only_count ?? 0, 'OKX open but not local')}
+            ${systemAuditMetric('Repair mutation', details.live_repair_mutation === false ? 'disabled' : '-', 'read-only audit')}
+        </div>
+        ${systemAuditSection('Position mismatch root causes', systemAuditTable(['Root cause', 'Count'], rootRows))}
+        ${systemAuditSection('OKX position mode counts', systemAuditTable(['posSide', 'Count'], posSideRows))}
+        ${systemAuditSection('OKX side inference counts', systemAuditTable(['Inference', 'Count'], sideInferenceRows))}
+        ${systemAuditSection('Price/PnL split samples', systemAuditTable(['Mode', 'Symbol', 'Side', 'Local price', 'OKX price', 'Gap %', 'Local UPL', 'OKX UPL', 'posSide', 'Raw pos', 'Inference', 'Root cause'], splitRows))}
+        ${systemAuditSection('Local-only open positions', systemAuditTable(['Mode', 'Position ID', 'Symbol', 'Side', 'Qty', 'Local price', 'Local UPL'], localOnlyRows))}
+        ${systemAuditSection('OKX-only open positions', systemAuditTable(['Mode', 'Symbol', 'Side', 'Qty', 'OKX price', 'OKX UPL', 'Contracts', 'ctVal', 'Raw symbol', 'posSide', 'Raw pos', 'Inference'], exchangeOnlyRows))}`;
+}
+
+function systemAuditStrategySignalRootCauseDetails(details) {
+    const scheduler = details.scheduler || {};
+    const capacity = scheduler.dynamic_capacity || {};
+    const rootCauses = Array.isArray(details.root_causes) ? details.root_causes : [];
+    const samples = Array.isArray(scheduler.latest_samples) ? scheduler.latest_samples : [];
+    const topReasons = Array.isArray(scheduler.top_scheduler_reasons) ? scheduler.top_scheduler_reasons : [];
+    const objectRows = (value) => Object.entries(value && typeof value === 'object' ? value : {})
+        .slice(0, 10)
+        .map(([key, count]) => [key, count]);
+    const rootCauseRows = rootCauses.slice(0, 8).map(item => [
+        item.code || '-',
+        item.severity || '-',
+        item.count ?? '-',
+        item.message || '-',
+    ]);
+    const sampleRows = samples.slice(0, 8).map(item => {
+        const capacityView = item.dynamic_position_capacity || {};
+        return [
+            item.symbol || '-',
+            sideLabel(item.action || '-'),
+            item.strategy || '-',
+            item.posture || '-',
+            item.risk_mode || '-',
+            item.cache_status || '-',
+            capacityView.entry_limit ?? '-',
+            capacityView.open_group_count ?? '-',
+            item.scheduler_reason || item.reason || '-',
+        ];
+    });
+    const reasonRows = topReasons.slice(0, 8).map(item => [
+        item.reason || '-',
+        item.count ?? 0,
+    ]);
+    return `
+        <div class="system-audit-detail-grid">
+            ${systemAuditMetric('Entry candidates', details.entry_decision_count || 0, 'long/short decisions')}
+            ${systemAuditMetric('High quality', details.high_quality_entry_count || 0, 'exploration/small/medium/normal')}
+            ${systemAuditMetric('Scheduler samples', scheduler.sample_count || 0, 'strategy_mode coverage')}
+            ${systemAuditMetric('Learning timeouts', (scheduler.flag_counts || {}).strategy_learning_context_timeout || 0, 'cache/baseline fallback')}
+            ${systemAuditMetric('Capacity constrained', capacity.constrained_count || 0, 'read-only diagnosis')}
+            ${systemAuditMetric('Root causes', rootCauses.length, 'no live mutation')}
+        </div>
+        ${systemAuditSection('Scheduler strategy distribution', systemAuditTable(['Strategy', 'Count'], objectRows(scheduler.strategy_counts)))}
+        ${systemAuditSection('Scheduler flags', systemAuditTable(['Flag', 'Count'], objectRows(scheduler.flag_counts)))}
+        ${systemAuditSection('Dynamic capacity reason codes', systemAuditTable(['Reason code', 'Count'], objectRows(capacity.reason_code_counts)))}
+        ${systemAuditSection('Top scheduler reasons', systemAuditTable(['Reason', 'Count'], reasonRows))}
+        ${systemAuditSection('Root causes', systemAuditTable(['Code', 'Severity', 'Count', 'Message'], rootCauseRows))}
+        ${systemAuditSection('Latest scheduler samples', systemAuditTable(['Symbol', 'Action', 'Strategy', 'Posture', 'Risk', 'Cache', 'Entry limit', 'Open groups', 'Reason'], sampleRows))}`;
+}
+
 function systemAuditCardDetailsHtml(card) {
     const details = card.details || {};
     const key = String(card.key || '');
     if (key === 'trade_loop') return systemAuditTradingDetails(details);
-    if (key === 'okx_reconciliation') return systemAuditOkxDetails(details);
+    if (key === 'okx_reconciliation') return systemAuditOkxDetailsV2(details);
+    if (key === 'position_price_integrity') return systemAuditPositionPriceDetails(details);
     if (key === 'market_data') return systemAuditMarketDataDetails(details);
     if (key === 'strategy_quality') return systemAuditStrategyDetails(details);
+    if (key === 'strategy_signal_root_cause') return systemAuditStrategySignalRootCauseDetails(details);
     if (key === 'model_training') return systemAuditModelTrainingDetails(details);
+    if (key === 'phase3_server_migration') return systemAuditPhase3ServerMigrationDetails(details);
     if (key === 'shadow_missed_opportunity') return systemAuditShadowMissedOpportunityDetails(details);
     return systemAuditGenericDetailsHtml(details);
 }
@@ -5921,6 +6385,46 @@ function monitorMetric(label, value, subtitle = '', pct = null) {
         </div>`;
 }
 
+function serverMonitorGpuSummary(gpuPayload) {
+    const gpus = Array.isArray(gpuPayload?.gpus) ? gpuPayload.gpus : [];
+    const rows = gpus.filter(gpu => Number(gpu?.memory_total_mb || 0) > 0);
+    if (!rows.length) {
+        return {
+            available: false,
+            count: 0,
+            name: '',
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            memory_used_pct: 0,
+            utilization_pct: null,
+            detail: gpuPayload?.error || 'nvidia-smi 未返回 GPU',
+        };
+    }
+    const memoryUsedMb = rows.reduce((sum, gpu) => sum + Number(gpu.memory_used_mb || 0), 0);
+    const memoryTotalMb = rows.reduce((sum, gpu) => sum + Number(gpu.memory_total_mb || 0), 0);
+    const utilizationValues = rows
+        .map(gpu => Number(gpu.utilization_pct))
+        .filter(value => Number.isFinite(value));
+    const utilizationPct = utilizationValues.length
+        ? utilizationValues.reduce((sum, value) => sum + value, 0) / utilizationValues.length
+        : null;
+    const hottest = rows.reduce((best, gpu) => (
+        Number(gpu.temperature_c || 0) > Number(best.temperature_c || 0) ? gpu : best
+    ), rows[0]);
+    const powerW = rows.reduce((sum, gpu) => sum + Number(gpu.power_w || 0), 0);
+    const names = Array.from(new Set(rows.map(gpu => String(gpu.name || '').trim()).filter(Boolean)));
+    return {
+        available: true,
+        count: rows.length,
+        name: names.length === 1 ? names[0] : `${names[0] || 'GPU'} 等 ${rows.length} 张`,
+        memory_used_mb: memoryUsedMb,
+        memory_total_mb: memoryTotalMb,
+        memory_used_pct: memoryTotalMb ? (memoryUsedMb / memoryTotalMb * 100) : 0,
+        utilization_pct: utilizationPct,
+        detail: `${rows.length} 张 GPU · 最高 ${monitorNumber(hottest.temperature_c, 0)}°C · 总功耗 ${monitorNumber(powerW, 0)}W`,
+    };
+}
+
 function renderServerMonitor() {
     const updated = document.getElementById('server-monitor-updated');
     const overview = document.getElementById('server-monitor-overview');
@@ -5954,15 +6458,18 @@ function renderServerMonitor() {
 
     const cpu = data.cpu || {};
     const memory = data.memory || {};
-    const gpu = (data.gpu?.gpus || [])[0] || {};
+    const liveGpuPayload = data.gpu || {};
+    const phase3GpuPayload = data.phase3_model_server_gpu || {};
+    const liveGpuRows = Array.isArray(liveGpuPayload?.gpus) ? liveGpuPayload.gpus : [];
+    const gpuSummary = serverMonitorGpuSummary(liveGpuRows.length ? liveGpuPayload : phase3GpuPayload);
     const disks = data.disks || [];
     const mainDisk = disks.find(d => d.path === '/data') || disks[0] || {};
-    const gpuMemPct = Number(gpu.memory_used_pct || 0);
+    const gpuMemPct = Number(gpuSummary.memory_used_pct || 0);
     overview.innerHTML = [
         monitorMetric('CPU 使用率', `${monitorNumber(cpu.usage_pct)}%`, `${Number(cpu.cores || 0)} 核 · 负载 ${monitorNumber(cpu.load_1m)}/${monitorNumber(cpu.load_5m)}/${monitorNumber(cpu.load_15m)}`, cpu.usage_pct),
         monitorMetric('内存使用', `${monitorNumber(memory.used_pct)}%`, `${monitorNumber(memory.used_mb / 1024)} / ${monitorNumber(memory.total_mb / 1024)} GB`, memory.used_pct),
-        monitorMetric('GPU 使用率', gpu.name ? `${monitorNumber(gpu.utilization_pct)}%` : '未检测到', gpu.name ? `${gpu.name} · ${monitorNumber(gpu.temperature_c, 0)}°C · ${monitorNumber(gpu.power_w, 0)}W` : (data.gpu?.error || 'nvidia-smi 未返回 GPU'), gpu.name ? gpu.utilization_pct : null),
-        monitorMetric('显存占用', gpu.name ? `${monitorNumber(gpuMemPct)}%` : '未检测到', gpu.name ? `${monitorNumber(gpu.memory_used_mb / 1024)} / ${monitorNumber(gpu.memory_total_mb / 1024)} GB` : '', gpu.name ? gpuMemPct : null),
+        monitorMetric('GPU 使用率', gpuSummary.available ? `${monitorNumber(gpuSummary.utilization_pct)}%` : '未检测到', gpuSummary.available ? `${gpuSummary.name} · ${gpuSummary.detail}` : gpuSummary.detail, gpuSummary.available ? gpuSummary.utilization_pct : null),
+        monitorMetric('显存占用', gpuSummary.available ? `${monitorNumber(gpuMemPct)}%` : '未检测到', gpuSummary.available ? `${monitorNumber(gpuSummary.memory_used_mb / 1024)} / ${monitorNumber(gpuSummary.memory_total_mb / 1024)} GB · ${gpuSummary.count} 卡汇总` : '', gpuSummary.available ? gpuMemPct : null),
         monitorMetric('磁盘使用', `${monitorNumber(mainDisk.used_pct)}%`, `${mainDisk.path || '-'} · ${monitorNumber(mainDisk.used_gb)} / ${monitorNumber(mainDisk.total_gb)} GB`, mainDisk.used_pct),
         monitorMetric('服务器', data.hostname || data.host || '-', data.host ? `公网 ${data.host}` : '', null),
     ].join('');
@@ -6101,6 +6608,7 @@ function runtimeStatusBadge(ok) {
 function runtimeEndpointStatusLabel(item, options = {}) {
     if (!item || typeof item !== 'object') return '未返回';
     if (item.available) return '正常';
+    if (options.model && item.model_mismatch) return '模型路由不匹配';
     const statusCode = Number(item.status_code || 0);
     const category = String(item.status_category || '').toLowerCase();
     if (category === 'auth_failed' || statusCode === 401) return '认证失败';
@@ -6143,22 +6651,22 @@ function renderServerModelRuntime(data, container) {
     const platformToolContract = platformTools.tunnel_contract || {};
     const platformToolContractOk = platformToolContract.ok !== false;
     const toolsAvailable = Boolean(
-        tools.available || (platformToolContractOk && (platformTools.available || platformToolChildAvailable > 0))
+        platformToolContractOk && (tools.available || platformTools.available || platformToolChildAvailable > 0)
     );
     const toolsModels = tools.models || platformTools.models || {};
     const toolsStatusLine = runtimeEndpointSummary(tools.status_health);
     const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
-    const MODEL_PUBLIC_HOST = '103.85.84.147';
     const MODEL_PUBLIC_ENDPOINTS = {
-        'qwen3-14b-trade': `http://${MODEL_PUBLIC_HOST}:21840/v1`,
-        'deepseek-r1-14b-risk': `http://${MODEL_PUBLIC_HOST}:21842/v1`,
-        local_ai_tools: `http://${MODEL_PUBLIC_HOST}:21841`,
+        'qwen3-32b-trade': 'platform loopback 18000',
+        'deepseek-r1-14b-risk': 'platform loopback 18002',
+        'BB-FinQuant-Expert-14B': 'platform loopback 18003',
+        phase3_quant_api: 'platform loopback 18001',
     };
-    const platformModelPublicUrl = (modelId, fallbackPort = '21840') => {
-        return MODEL_PUBLIC_ENDPOINTS[modelId] || `http://${MODEL_PUBLIC_HOST}:${fallbackPort}/v1`; 
+    const platformModelPublicUrl = (modelId, fallbackPort = '') => {
+        return MODEL_PUBLIC_ENDPOINTS[modelId] || fallbackPort || 'platform loopback only';
     };
-    const configuredOrPublicModelEndpoint = (modelId, configuredBaseValue = '', fallbackPort = '21840') => {
+    const configuredOrPublicModelEndpoint = (modelId, configuredBaseValue = '', fallbackPort = '') => {
         const configuredBase = String(configuredBaseValue || '').trim().replace(/\/$/, '');
         if (
             !configuredBase
@@ -6166,29 +6674,33 @@ function renderServerModelRuntime(data, container) {
             || configuredBase.includes('localhost')
             || configuredBase.includes(':18000')
             || configuredBase.includes(':18002')
+            || configuredBase.includes(':18003')
         ) {
             return platformModelPublicUrl(modelId, fallbackPort);
         }
         return configuredBase;
     };
     const localToolsPublicUrl = () => {
-        return MODEL_PUBLIC_ENDPOINTS.local_ai_tools; 
-    }; 
+        return MODEL_PUBLIC_ENDPOINTS.phase3_quant_api;
+    };
     const vllmRows = vllmEndpoints.length ? vllmEndpoints : [vllm];
     const vllmInstanceCards = vllmRows.map(item => {
         const label = item.label || item.provider_model || 'vLLM';
-        const targetModel = item.provider_model || (String(label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : 'qwen3-14b-trade');
-        const publicPort = targetModel === 'deepseek-r1-14b-risk' ? '21842' : '21840';
+        const targetModel = item.provider_model || (String(label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : 'qwen3-32b-trade');
         const healthLine = runtimeEndpointSummary(item.health);
         const modelNames = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
+        const mismatchLine = item.model_mismatch
+            ? `<div style="color:var(--red);">模型路由不匹配：目标 ${escHtml(targetModel || '-')}，实际返回 ${escHtml(modelNames)}</div>`
+            : '';
         return `
             <div class="server-monitor-runtime-card">
                 <strong>${escHtml(label)} / vLLM ${runtimeStatusBadge(item.available)}</strong>
                 <div>内网地址：${escHtml(item.endpoint || '-')}</div>
-                <div>外网地址：${escHtml(configuredOrPublicModelEndpoint(targetModel, item.api_base || item.endpoint, publicPort))}</div>
+                <div>外网地址：${escHtml(configuredOrPublicModelEndpoint(targetModel, item.api_base || item.endpoint))}</div>
                 <div>状态：${escHtml(item.status || '-')}${healthLine ? ` · ${escHtml(healthLine)}` : ''}</div>
                 <div>配置模型：${escHtml(targetModel || '-')}</div>
                 <div>模型：${escHtml(modelNames)}</div>
+                ${mismatchLine}
                 ${item.error ? `<div style="color:var(--red);">错误：${escHtml(item.error)}</div>` : ''}
             </div>`;
     }).join('');
@@ -6197,11 +6709,9 @@ function renderServerModelRuntime(data, container) {
             const endpointModels = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
             const healthLine = runtimeEndpointSummary(item.health);
             const targetModel = item.provider_model || (String(item.label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : '-');
-            const publicPort = targetModel === 'deepseek-r1-14b-risk' ? '21842' : '21840';
             const publicEndpoint = configuredOrPublicModelEndpoint(
                 targetModel,
-                item.api_base || item.endpoint,
-                publicPort
+                item.api_base || item.endpoint
             );
             const state = item.available ? '模型命中' : (item.endpoint_available ? '端点正常/模型不匹配' : '不可达');
             return `
@@ -6469,6 +6979,26 @@ function loopErrorScopeLabel(stats) {
     return lastErr;
 }
 
+function okxAuthoritativeSyncLabel(stats) {
+    const sync = stats?.okx_authoritative_sync || {};
+    const status = String(sync.status || 'pending').toLowerCase();
+    const lastSuccess = sync.last_success_at ? shortBeijingTime(sync.last_success_at) : '';
+    const lastFailure = sync.last_failure_at ? shortBeijingTime(sync.last_failure_at) : '';
+    const error = loopErrorLabel(sync.last_error);
+    const attention = Number(sync.last_requires_attention_count || 0);
+    if (status === 'ok') {
+        return `OKX权威事实同步正常 · 最近成功 ${lastSuccess || '-'}${attention > 0 ? ` · 待核对 ${attention}` : ''}`;
+    }
+    if (status === 'stale') {
+        const age = fmtSecondsLabel(sync.last_success_age_seconds);
+        return `OKX权威事实同步过期 · 最近成功 ${lastSuccess || '-'} · 已 ${age}，暂停新开仓`;
+    }
+    if (status === 'warning') {
+        return `OKX权威事实同步异常 · 最近失败 ${lastFailure || '-'}${error ? ' · ' + error : ''} · 暂停新开仓`;
+    }
+    return `等待OKX权威事实同步 · 间隔 ${fmtSecondsLabel(sync.interval_seconds)}`;
+}
+
 // ========== Auto Price Chart ==========
 
 function updateAutoPriceChartTitle(symbol) {
@@ -6661,6 +7191,11 @@ function updateAutoStatus(stats) {
             ? shortBeijingTime(stats.last_round_finished_at)
             : '\u8fdb\u884c\u4e2d';
         timingEl.textContent = `\u5f00\u59cb ${started} / \u5b8c\u6210 ${finished}`;
+    }
+
+    const okxSyncEl = document.getElementById('status-okx-sync');
+    if (okxSyncEl) {
+        okxSyncEl.textContent = okxAuthoritativeSyncLabel(stats);
     }
 
     const errRow = document.getElementById('status-loop-error-row');
@@ -7051,7 +7586,7 @@ function readNumberInput(id) {
 }
 
 function riskFloorFromAccount(account) {
-    const accountEquity = valueNumber(account?.account_equity ?? account?.okx_equity_balance ?? account?.equity ?? account?.allocated_balance) || 0;
+    const accountEquity = valueNumber(account?.account_equity ?? account?.okx_equity_balance ?? account?.equity) || 0;
     const maxLossUsdt = valueNumber(account?.max_loss_usdt) || 0;
     const maxLossPct = valueNumber(account?.max_loss_pct) || 0;
     if (valueNumber(account?.risk_floor) !== null) return valueNumber(account.risk_floor);
@@ -7452,16 +7987,25 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
     const tbody = document.getElementById('position-history-tbody');
     const pagination = document.getElementById('position-history-pagination');
     if (!tbody) return;
+    positionLinkedOrdersByGroup.clear();
     if (!positions.length) {
-        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;padding:24px;">\u6682\u65e0\u5386\u53f2\u6301\u4ed3\u6570\u636e</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">\u6682\u65e0\u5386\u53f2\u6301\u4ed3\u6570\u636e</td></tr>';
         if (pagination) pagination.style.display = 'none';
         return;
     }
-    tbody.innerHTML = positions.map(p => {
+    tbody.innerHTML = positions.map((p, index) => {
         const pnl = Number(p.realized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
         const statusLabel = p.close_status_label || p.position_status || (p.close_status === 'partial' ? '\u90e8\u5206\u5e73\u4ed3' : '\u5168\u90e8\u5e73\u4ed3');
         const statusColor = p.close_status === 'partial' ? 'var(--accent-light)' : 'var(--text-muted)';
+        const groupId = String(p.group_id || p.id || `row-${page}-${index}`);
+        const linkedFills = Array.isArray(p.linked_fills) ? p.linked_fills : [];
+        positionLinkedOrdersByGroup.set(groupId, { position: p, fills: linkedFills });
+        const linkedCount = Number(p.linked_order_count ?? linkedFills.length ?? 0);
+        const evidenceBadge = p.evidence_complete === true
+            ? '<div class="position-ledger-badge ok">OKX</div>'
+            : '<div class="position-ledger-badge warn">\u5f85\u5bf9\u8d26</div>';
+        const linkedButtonDisabled = linkedCount <= 0 ? 'disabled' : '';
         return `
         <tr>
             <td>${escHtml(p.symbol || '-')}</td>
@@ -7474,9 +8018,86 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
             <td style="color:${pnlColor};font-weight:600;">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.opened_at)}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.closed_at)}</td>
+            <td>
+                <button class="btn btn-sm js-position-linked-orders" data-group-id="${escHtml(groupId)}" ${linkedButtonDisabled}>\u5173\u8054\u8ba2\u5355 (${linkedCount})</button>
+                ${evidenceBadge}
+            </td>
         </tr>`;
     }).join('');
     renderPagination('position-history-pagination', page, totalPages, totalItems, 'changePositionHistoryPage');
+}
+
+function openPositionLinkedOrdersModal(groupId) {
+    const payload = positionLinkedOrdersByGroup.get(String(groupId));
+    if (!payload) return;
+    const position = payload.position || {};
+    const fills = Array.isArray(payload.fills) ? payload.fills : [];
+    const title = document.getElementById('position-linked-orders-modal-title');
+    const body = document.getElementById('position-linked-orders-modal-body');
+    const overlay = document.getElementById('position-linked-orders-modal-overlay');
+    if (!body || !overlay) return;
+    if (title) {
+        title.textContent = `${position.symbol || '-'} ${sideLabel(position.side)} \u5173\u8054\u8ba2\u5355`;
+    }
+    const gaps = Array.isArray(position.evidence_gaps) ? position.evidence_gaps : [];
+    const evidenceHtml = `
+        <div class="position-ledger-summary">
+            <div><strong>${escHtml(position.okx_inst_id || '-')}</strong><span>OKX instId</span></div>
+            <div><strong>${fmtNum(position.closed_quantity ?? position.quantity)}</strong><span>\u5df2\u5e73\u6570\u91cf</span></div>
+            <div><strong>${signedMoney(position.realized_pnl || 0)} USDT</strong><span>\u5df2\u5b9e\u73b0\u76c8\u4e8f</span></div>
+            <div><strong>${position.evidence_complete ? '\u5b8c\u6574' : '\u5f85\u5bf9\u8d26'}</strong><span>OKX \u8bc1\u636e</span></div>
+        </div>
+        ${gaps.length ? `<div class="position-ledger-gaps">\u8bc1\u636e\u7f3a\u53e3\uff1a${gaps.map(item => escHtml(item)).join(' / ')}</div>` : ''}`;
+    if (!fills.length) {
+        body.innerHTML = `${evidenceHtml}<div class="reason-block">\u6682\u65e0 OKX \u5173\u8054\u8ba2\u5355\u660e\u7ec6\uff0c\u8bf7\u5148\u6267\u884c\u4e09\u671f OKX \u8ba2\u5355/\u6210\u4ea4\u540c\u6b65\u3002</div>`;
+        overlay.style.display = 'flex';
+        return;
+    }
+    const rows = fills.map(fill => {
+        const pnl = Number(fill.pnl || 0);
+        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const okxBadge = fill.okx_confirmed
+            ? '<span class="position-ledger-mini-badge ok">OKX</span>'
+            : '<span class="position-ledger-mini-badge warn">\u672c\u5730</span>';
+        return `
+            <tr>
+                <td>${escHtml(sideLabel(fill.side))}</td>
+                <td>${fmtNum(fill.quantity)}</td>
+                <td>${fmtPrice(fill.price)}</td>
+                <td style="color:${pnlColor};font-weight:700;">${signedMoney(fill.pnl || 0)}</td>
+                <td>${fmtNum(fill.fee)}</td>
+                <td>${escHtml(fill.order_id || '-')}</td>
+                <td>${escHtml(fill.trade_id || '-')}</td>
+                <td>${toBeijingTime(fill.filled_at)}</td>
+                <td>${okxBadge}</td>
+            </tr>`;
+    }).join('');
+    body.innerHTML = `
+        ${evidenceHtml}
+        <div class="table-wrap position-linked-orders-table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>\u65b9\u5411</th>
+                        <th>\u6570\u91cf</th>
+                        <th>\u4ef7\u683c</th>
+                        <th>PnL</th>
+                        <th>\u624b\u7eed\u8d39</th>
+                        <th>\u8ba2\u5355 ID</th>
+                        <th>\u6210\u4ea4 ID</th>
+                        <th>\u65f6\u95f4</th>
+                        <th>\u6765\u6e90</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+    overlay.style.display = 'flex';
+}
+
+function closePositionLinkedOrdersModal() {
+    const overlay = document.getElementById('position-linked-orders-modal-overlay');
+    if (overlay) overlay.style.display = 'none';
 }
 
 function initPositionActions() {
@@ -7571,8 +8192,8 @@ function renderDailyPnlRecords(records) {
     }
     tbody.innerHTML = records.map(row => {
         const realized = Number(row.realized_pnl || 0);
-        const total = Number(row.total_pnl || 0);
-        const cumulative = Number(row.cumulative_total_pnl ?? row.cumulative_realized_pnl ?? 0);
+        const total = valueNumber(row.okx_equity_pnl ?? row.total_pnl);
+        const cumulative = valueNumber(row.okx_cumulative_equity_pnl ?? row.cumulative_total_pnl);
         const winLoss = `${Number(row.win_count || 0)}胜 / ${Number(row.loss_count || 0)}亏`;
         const symbolCount = Array.isArray(row.symbol_pnl)
             ? row.symbol_pnl.length
@@ -7584,8 +8205,8 @@ function renderDailyPnlRecords(records) {
             <td style="color:var(--red);">${fmtMoney(row.realized_loss || 0)} USDT</td>
             <td style="color:var(--green);">${fmtMoney(row.realized_profit || 0)} USDT</td>
             <td style="color:${realized >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700;">${signedMoney(realized)} USDT</td>
-            <td style="color:${total >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700;">${signedMoney(total)} USDT</td>
-            <td style="color:${cumulative >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(cumulative)} USDT</td>
+            <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'okx_equity_pnl')}</td>
+            <td>${dailyPnlEquityDisplay(row, 'okx_cumulative_equity_pnl')}</td>
             <td>${Number(row.trade_count || 0)} <span style="color:var(--text-muted);font-size:10px;">${winLoss}</span></td>
             <td>
                 <button class="btn btn-sm js-daily-pnl-detail" data-date="${escHtml(row.date || '')}">
@@ -7606,30 +8227,36 @@ function openDailyPnlModal(date) {
 
     const details = Array.isArray(row.symbol_pnl) ? row.symbol_pnl : [];
     const positionDetails = Array.isArray(row.position_details) ? row.position_details : [];
-    const total = Number(row.total_pnl || 0);
+    const total = valueNumber(row.okx_equity_pnl ?? row.total_pnl);
+    const totalColor = signedMoneyColor(total);
+    const snapshotNotice = dailyPnlMissingSnapshotNotice(row);
     title.textContent = `${date} 盈亏详情（北京时间）`;
     if (!details.length && !positionDetails.length) {
         const hasOverview = Number(row.trade_count || 0) > 0
             || Number(row.realized_pnl || 0) !== 0
             || Number(row.unrealized_pnl || 0) !== 0
-            || Number(row.total_pnl || 0) !== 0;
+            || valueNumber(row.okx_equity_pnl ?? row.total_pnl) !== null;
         body.innerHTML = hasOverview
             ? `<div style="color:var(--text-muted);font-size:12px;padding:8px;">当日有盈亏汇总，但没有按币种拆分明细。可能是历史记录未保存 symbol_pnl，或该日只保留了总览数据。</div>
                <div class="daily-pnl-modal-summary">
                    <div>已平仓净盈亏 <strong style="color:${Number(row.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.realized_pnl || 0)} USDT</strong></div>
-                   <div>当日总盈亏 <strong style="color:${total >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(total)} USDT</strong></div>
+                   <div>OKX权益变化 <strong style="color:${totalColor};">${signedMoneyWithUnit(total)}</strong></div>
                    <div>交易笔数 <strong>${Number(row.trade_count || 0)}</strong></div>
                </div>`
             : '<div style="color:var(--text-muted);font-size:12px;padding:8px;">当日没有已平仓交易。</div>';
+        if (snapshotNotice && hasOverview) {
+            body.innerHTML = snapshotNotice + body.innerHTML;
+        }
         overlay.style.display = 'flex';
         return;
     }
     body.innerHTML = `
         <div class="daily-pnl-modal-summary">
             <div>已平仓净盈亏 <strong style="color:${Number(row.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.realized_pnl || 0)} USDT</strong></div>
-            <div>当日总盈亏 <strong style="color:${total >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(total)} USDT</strong></div>
+            <div>OKX权益变化 <strong style="color:${totalColor};">${signedMoneyWithUnit(total)}</strong></div>
             <div>交易笔数 <strong>${Number(row.trade_count || 0)}</strong></div>
         </div>
+        ${snapshotNotice}
         ${positionDetails.length ? renderDailyPnlPositionDetails(positionDetails) : ''}
         <div class="table-wrap" style="margin-top:10px;">
             <table>
@@ -8147,11 +8774,20 @@ document.addEventListener('click', (e) => {
         openDailyPnlModal(dailyPnlButton.dataset.date || '');
         return;
     }
+    const positionLinkedOrdersButton = e.target?.closest?.('.js-position-linked-orders');
+    if (positionLinkedOrdersButton) {
+        e.preventDefault();
+        openPositionLinkedOrdersModal(positionLinkedOrdersButton.dataset.groupId || '');
+        return;
+    }
     if (e.target.id === 'decision-reason-modal-overlay') {
         closeDecisionReasonModal();
     }
     if (e.target.id === 'daily-pnl-modal-overlay') {
         closeDailyPnlModal();
+    }
+    if (e.target.id === 'position-linked-orders-modal-overlay') {
+        closePositionLinkedOrdersModal();
     }
     if (e.target.id === 'dashboard-user-modal-overlay') {
         closeDashboardUserModal();
@@ -8693,7 +9329,7 @@ function renderMLSignalOverview() {
 
     if (updatedEl) {
         updatedEl.textContent = ready
-            ? `累计完成 ${samples.completedMl} 条，训练窗口 ${samples.trainingMl} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
+            ? `三期完成 ${samples.completedMl} 条，训练窗口 ${samples.trainingMl} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
             : `模型不可用 · ${unavailableReason}`;
     }
 
@@ -8701,11 +9337,11 @@ function renderMLSignalOverview() {
         <div class="ml-flow">
             <div class="ml-flow-step">
                 <div class="ml-flow-index">1</div>
-                <div><strong>累计影子复盘样本</strong><span>${samples.completedMl} 条 completed 样本，数据仍在增长</span></div>
+                <div><strong>三期影子复盘样本</strong><span>${samples.completedMl} 条三期 completed 样本，旧数据不参与训练</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">2</div>
-                <div><strong>本次训练使用样本</strong><span>${samples.trainingMl} 条最新样本；窗口上限 ${samples.limit} 条，不等于累计总数</span></div>
+                <div><strong>本次训练使用样本</strong><span>${samples.trainingMl} 条三期样本；窗口上限 ${samples.limit} 条</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">3</div>
@@ -8720,16 +9356,16 @@ function renderMLSignalOverview() {
             ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
             ${mlMetricCard('Readiness', readinessDisplayState, readinessReasonText, readinessTone)}
             ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
-            ${mlMetricCard('累计完成样本', String(samples.completedMl), '数据库里已完成的影子复盘总数', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
+            ${mlMetricCard('三期完成样本', String(samples.completedMl), '只统计三期干净影子复盘', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
             ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, Number(readinessMetrics.dirty_sample_ratio || 0) > 0.08 ? 'bad' : 'good')}
             ${mlMetricCard('PR-AUC 多/空', prAucText, '缺失时必须重训后才能进入 ready', (Number(readinessMetrics.long_pr_auc || 0) > 0 && Number(readinessMetrics.short_pr_auc || 0) > 0) ? 'good' : 'warn')}
-            ${mlMetricCard('新增待消化样本', String(samples.newCount), '达到自动训练条件后会进入下一轮训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
+            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
             ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
             ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || '-', `要求 ${readinessMetrics.required_training_data_version || '-'}`, readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
-            ${mlMetricCard('显示说明', `${samples.limit} 是窗口`, '不是样本没增长，而是只拿最新窗口训练，避免老行情污染模型', 'warn')}
+            ${mlMetricCard('显示说明', `${samples.limit} 是窗口`, '页面只显示三期干净训练窗口，旧样本不再展示为训练来源', 'warn')}
         </div>`;
 }
 
@@ -8748,7 +9384,7 @@ function renderLocalAIToolsStatus() {
     const childTotalCount = Object.keys(childEndpoints).length;
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
-            ? `累计 ${samples.completedLocal} 条影子 / ${samples.completedLocalTrade} 条交易；训练窗口 ${samples.trainingLocal} / ${samples.trainingLocalTrade} 条；子接口 ${childAvailableCount}/${childTotalCount || 4}`
+            ? `三期完成 ${samples.completedLocal} 条影子 / ${samples.completedLocalTrade} 条交易；训练窗口 ${samples.trainingLocal} / ${samples.trainingLocalTrade} 条；子接口 ${childAvailableCount}/${childTotalCount || 4}`
             : '服务不可用';
     }
 
@@ -8766,21 +9402,21 @@ function renderLocalAIToolsStatus() {
             tone: childAvailableCount >= Math.max(childTotalCount, 1) ? 'good' : (childAvailableCount > 0 ? 'warn' : 'bad'),
         },
         {
-            label: '累计影子复盘样本',
+            label: '三期影子复盘样本',
             value: String(samples.completedLocal),
-            subtitle: '数据库里已完成的影子复盘总数，应该持续增长',
+            subtitle: '只统计三期干净窗口，旧数据不参与训练',
             tone: samples.completedLocal > 0 ? 'good' : 'warn',
         },
         {
             label: '本次训练使用样本',
-            value: String(samples.trainingLocal || Number(status.shadow_sample_count || 0)),
+            value: String(samples.trainingLocal),
             subtitle: `只取最新窗口训练，上限 ${Number(status.training_shadow_sample_limit || samples.limit)} 条`,
-            tone: (samples.trainingLocal || Number(status.shadow_sample_count || 0)) > 0 ? 'good' : 'warn',
+            tone: samples.trainingLocal > 0 ? 'good' : 'warn',
         },
         {
             label: '交易/平仓样本',
             value: `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}`,
-            subtitle: '训练窗口 / 累计；已按仓位去重，手动平仓不参与训练',
+            subtitle: '三期训练窗口 / 三期完成去重样本；已按仓位去重，手动平仓不参与训练',
             tone: samples.completedLocalTrade > 0 ? 'good' : 'warn',
         },
         {
@@ -8814,8 +9450,8 @@ function renderLocalAIToolsStatus() {
             </div>
             <div class="ml-purpose-card ml-purpose-muted">
                 <div class="ml-purpose-title">训练窗口说明</div>
-                <div class="ml-purpose-desc">页面里看到的窗口上限是最新样本窗口，不是累计样本停止增长。</div>
-                <div class="ml-purpose-tech">累计样本看“累计影子复盘样本”。最近训练：${escHtml(trainedAt)}</div>
+                <div class="ml-purpose-desc">页面只展示三期干净样本，旧数据不会进入新模型训练。</div>
+                <div class="ml-purpose-tech">最近训练：${escHtml(trainedAt)}</div>
             </div>
         </div>`;
 }
@@ -8834,9 +9470,10 @@ function renderTrainableModels() {
     const autoTrainText = ml.auto_train_enabled
         ? `自动训练已开启；下次检查 ${ml.auto_train_next_check_at ? toBeijingTime(ml.auto_train_next_check_at) : '-'}`
         : '自动训练未开启';
-    const windowText = `${samples.trainingMl} / ${samples.completedMl}（训练窗口/累计）`;
-    const localWindowText = `${samples.trainingLocal || Number(local.shadow_sample_count || 0)} / ${samples.completedLocal}（训练窗口/累计）`;
-    const localTradeWindowText = `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}（训练窗口/累计）`;
+    const windowText = `${samples.trainingMl} / ${samples.completedMl}（训练窗口/三期完成）`;
+    const localWindowText = `${samples.trainingLocal} / ${samples.completedLocal}（训练窗口/三期完成）`;
+    const localTradeWindowText = `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}（训练窗口/三期完成去重）`;
+    const phase3PolicyText = '三期重新开始训练；旧数据禁止进入新模型训练';
     const models = [
         {
             title: '本地 ML 盈亏质量',
@@ -8933,8 +9570,9 @@ function renderTrainableModels() {
         <div class="ml-train-summary">
             ${mlMetricCard('可训练模型', `${models.length} 个`, '覆盖开仓、亏损过滤、时序、情绪和平仓', 'good')}
             ${mlMetricCard('自动训练', ml.auto_train_enabled ? '已开启' : '未开启', autoTrainText, ml.auto_train_enabled ? 'good' : 'warn')}
-            ${mlMetricCard('新增待训练样本', String(samples.newCount), autoLast.message || '等待下一次训练检查', samples.newCount >= Number(ml.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
-            ${mlMetricCard('样本显示说明', '窗口/累计', `训练窗口上限 ${samples.limit} 条；累计完成 ${samples.completedMl} 条`, 'warn')}
+            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), autoLast.message || '只统计三期完成样本减去本次训练窗口', samples.newCount >= Number(ml.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
+            ${mlMetricCard('三期训练策略', '从新开始', phase3PolicyText, 'good')}
+            ${mlMetricCard('样本显示说明', '训练窗口/三期完成', `训练窗口上限 ${samples.limit} 条；三期完成 ${samples.completedMl} 条；旧累计样本不展示为训练来源`, 'warn')}
         </div>
         <div class="ml-train-model-list ml-train-model-list-clear">
             ${models.map(renderReadableTrainableModelCard).join('')}
@@ -9573,7 +10211,7 @@ async function fetchStrategyLearning() {
     }
 }
 
-function renderStrategyLearning(data) {
+function renderStrategyLearningFallback(data) {
     const summary = document.getElementById('strategy-learning-summary');
     if (!summary) return;
     const profile = data?.schedule?.active_profile || data?.active_profile || {};

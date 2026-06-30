@@ -50,7 +50,6 @@ def symbol_from_okx_payload(payload: dict[str, Any] | None, *, fallback: Any = "
     for candidate in (
         info.get("instId"),
         data.get("instId"),
-        data.get("id"),
         data.get("okx_inst_id"),
         data.get("okx_symbol"),
         data.get("symbol"),
@@ -70,7 +69,12 @@ def okx_inst_id_from_symbol(symbol: Any) -> str:
     return f"{normalized.replace('/', '-')}-SWAP".upper()
 
 
-def okx_inst_id_from_payload(payload: dict[str, Any] | None, *, fallback: Any = "") -> str:
+def okx_inst_id_from_payload(
+    payload: dict[str, Any] | None,
+    *,
+    fallback: Any = "",
+    include_fallback: bool = True,
+) -> str:
     """Extract an authoritative OKX instId, falling back to the app symbol."""
 
     data = payload if isinstance(payload, dict) else {}
@@ -108,7 +112,11 @@ def okx_inst_id_from_payload(payload: dict[str, Any] | None, *, fallback: Any = 
             inst_id = okx_inst_id_from_symbol(symbol)
             if inst_id:
                 return inst_id
-    return okx_inst_id_from_symbol(fallback or data.get("canonical_exchange_symbol") or data.get("symbol"))
+    if not include_fallback:
+        return ""
+    return okx_inst_id_from_symbol(
+        fallback or data.get("canonical_exchange_symbol") or data.get("symbol")
+    )
 
 
 def normalize_trading_symbol(symbol: Any) -> str:

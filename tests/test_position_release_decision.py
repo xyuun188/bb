@@ -100,6 +100,104 @@ def test_position_release_decision_protects_fresh_loss_even_without_reason_tags(
     )
 
 
+def test_position_release_decision_blocks_losing_release_without_net_benefit() -> None:
+    policy = PositionReleaseDecisionPolicy()
+    scan = {
+        "force_exit_candidate": True,
+        "release_action": "close_long",
+        "exit_score": 95.0,
+        "release_reason": "stale_probe_capital_inefficient; fee_drag_dominates",
+        "position_quality": {
+            "score": 24.0,
+            "bucket": "release_now",
+            "hold_hours": 9.0,
+            "pnl_ratio": -0.004,
+            "reasons": ["stale_probe_capital_inefficient", "fee_drag_dominates"],
+            "should_release": True,
+        },
+    }
+
+    assert policy.should_release(scan) is False
+    assert scan["profit_first_release_net_benefit_guard"]["skip_kind"] == (
+        "profit_first_release_net_benefit_guard"
+    )
+    assert (
+        policy.build(
+            model_name="ensemble_trader",
+            symbol="SOL/USDT",
+            positions=[{"side": "long"}],
+            scan=scan,
+            feature_vector={"current_price": 110.0},
+        )
+        is None
+    )
+
+
+def test_position_release_decision_allows_hard_risk_losing_release() -> None:
+    policy = PositionReleaseDecisionPolicy()
+    scan = {
+        "force_exit_candidate": True,
+        "release_action": "close_long",
+        "exit_score": 96.0,
+        "release_reason": "hard_loss_pressure",
+        "position_quality": {
+            "score": 15.0,
+            "bucket": "release_now",
+            "hold_hours": 8.0,
+            "pnl_ratio": -0.03,
+            "reasons": ["hard_loss_pressure"],
+            "should_release": True,
+        },
+    }
+
+    assert policy.should_release(scan) is True
+    decision = policy.build(
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        positions=[{"side": "long"}],
+        scan=scan,
+        feature_vector={"current_price": 3000.0},
+    )
+
+    assert decision is not None
+    assert decision.action == Action.CLOSE_LONG
+
+
+def test_position_release_decision_allows_stronger_replacement_after_losing_release() -> None:
+    policy = PositionReleaseDecisionPolicy()
+    scan = {
+        "force_exit_candidate": True,
+        "release_action": "close_short",
+        "exit_score": 93.0,
+        "release_reason": "fee_drag_dominates",
+        "position_quality": {
+            "score": 28.0,
+            "bucket": "release_now",
+            "hold_hours": 10.0,
+            "pnl_ratio": -0.004,
+            "reasons": ["fee_drag_dominates"],
+            "should_release": True,
+        },
+        "replacement_opportunity": {
+            "decision_lane": "validated_probe",
+            "expected_net_return_pct": 0.55,
+            "profit_quality_ratio": 0.7,
+        },
+    }
+
+    assert policy.should_release(scan) is True
+    decision = policy.build(
+        model_name="ensemble_trader",
+        symbol="OP/USDT",
+        positions=[{"side": "short"}],
+        scan=scan,
+        feature_vector={"current_price": 2.2},
+    )
+
+    assert decision is not None
+    assert decision.action == Action.CLOSE_SHORT
+
+
 def test_position_release_decision_ignores_non_release_scan() -> None:
     policy = PositionReleaseDecisionPolicy()
 

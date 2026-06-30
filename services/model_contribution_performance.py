@@ -17,16 +17,19 @@ from sqlalchemy import select
 
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol, symbol_query_variants
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 SessionFactory = Callable[[], Any]
 
 DEFAULT_CONTRIBUTION_LOOKBACK_DAYS = 7.0
 DEFAULT_POSITION_LIMIT = 800
 DEFAULT_ORDER_LIMIT = 3000
+OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +47,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         if value is None:
             return default
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = -1) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
     except (TypeError, ValueError):
         return default
 
@@ -77,12 +89,14 @@ def _empty_bucket(label: str) -> dict[str, Any]:
 
 def _default_stats() -> dict[str, dict[str, Any]]:
     return {
+        "decision_llm": _empty_bucket("决策大模型"),
         "ml_profit_model": _empty_bucket("本地 ML 盈利模型"),
         "server_profit_model": _empty_bucket("服务器盈利模型"),
         "timeseries_model": _empty_bucket("时序预测模型"),
         "sentiment_model": _empty_bucket("情绪模型"),
         "shadow_memory": _empty_bucket("影子/交易记忆"),
         "expert_alignment": _empty_bucket("专家一致信号"),
+        "high_risk_review": _empty_bucket("高风险复核模型"),
         "ai_only_without_quant": _empty_bucket("AI 单独支持但量化未同向"),
     }
 
@@ -95,6 +109,7 @@ class ModelContributionPerformanceService:
         *,
         session_factory: SessionFactory = get_session_ctx,
         model_name: str = ENSEMBLE_TRADER_NAME,
+        ledger_model_names: tuple[str, ...] | None = None,
         lookback_days: float = DEFAULT_CONTRIBUTION_LOOKBACK_DAYS,
         position_limit: int = DEFAULT_POSITION_LIMIT,
         order_limit: int = DEFAULT_ORDER_LIMIT,
@@ -102,6 +117,12 @@ class ModelContributionPerformanceService:
     ) -> None:
         self._session_factory = session_factory
         self._model_name = model_name
+        self._ledger_model_names = tuple(
+            dict.fromkeys(
+                ledger_model_names
+                or (model_name, OKX_AUTHORITATIVE_LEDGER_MODEL)
+            )
+        )
         self._lookback_days = float(lookback_days)
         self._position_limit = int(position_limit)
         self._order_limit = int(order_limit)
@@ -125,7 +146,7 @@ class ModelContributionPerformanceService:
                 positions_result = await session.execute(
                     select(Position)
                     .where(
-                        Position.model_name == self._model_name,
+                        Position.model_name.in_(self._ledger_model_names),
                         Position.execution_mode == selected_mode,
                         Position.is_open.is_(False),
                         Position.closed_at.is_not(None),
@@ -143,14 +164,15 @@ class ModelContributionPerformanceService:
                     return stats
 
                 symbols = {p.symbol for p in positions if p.symbol}
+                symbol_variants = symbol_query_variants(symbols)
                 manual_close_orders = []
-                if symbols:
+                if symbol_variants:
                     manual_close_result = await session.execute(
                         select(Order).where(
-                            Order.model_name == self._model_name,
+                            Order.model_name.in_(self._ledger_model_names),
                             Order.execution_mode == selected_mode,
                             Order.status == "filled",
-                            Order.symbol.in_(symbols),
+                            Order.symbol.in_(symbol_variants),
                             Order.exchange_order_id.like("manual_close:%"),
                         )
                     )
@@ -159,6 +181,7 @@ class ModelContributionPerformanceService:
                     pos
                     for pos in positions
                     if not position_has_manual_close_order(pos, manual_close_orders)
+                    and closed_position_trade_fact_trusted(pos)
                 ]
                 if not positions:
                     self._cache = {
@@ -167,11 +190,14 @@ class ModelContributionPerformanceService:
                     }
                     return stats
                 symbols = {p.symbol for p in positions if p.symbol}
-                symbol_filter = Order.symbol.in_(symbols) if symbols else Order.id == -1
+                symbol_variants = symbol_query_variants(symbols)
+                symbol_filter = (
+                    Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1
+                )
                 orders_result = await session.execute(
                     select(Order)
                     .where(
-                        Order.model_name == self._model_name,
+                        Order.model_name.in_(self._ledger_model_names),
                         Order.execution_mode == selected_mode,
                         Order.status == "filled",
                         Order.decision_id.is_not(None),
@@ -213,6 +239,8 @@ class ModelContributionPerformanceService:
         stats = _default_stats()
         order_list = list(orders)
         for pos in positions:
+            if not closed_position_trade_fact_trusted(pos):
+                continue
             matched_decision = self._match_entry_decision(pos, order_list, decisions)
             if matched_decision is None:
                 continue
@@ -226,6 +254,57 @@ class ModelContributionPerformanceService:
             self._finalize_bucket(bucket)
         return stats
 
+    def build_lineage_diagnostics(
+        self,
+        positions: Iterable[Any],
+        orders: Iterable[Any],
+        decisions: dict[int, Any],
+    ) -> dict[str, Any]:
+        """Explain whether realized positions can be linked back to entry decisions."""
+
+        position_list = [
+            pos for pos in positions if closed_position_trade_fact_trusted(pos)
+        ]
+        order_list = list(orders)
+        linked_orders = [order for order in order_list if getattr(order, "decision_id", None)]
+        orders_with_loaded_decisions = [
+            order
+            for order in linked_orders
+            if _safe_int(getattr(order, "decision_id", None)) in decisions
+        ]
+        matched_positions = [
+            pos
+            for pos in position_list
+            if self._match_entry_decision(pos, order_list, decisions) is not None
+        ]
+        total_positions = len(position_list)
+        matched_count = len(matched_positions)
+        match_rate = matched_count / total_positions if total_positions else 0.0
+        reason = "ok"
+        if total_positions <= 0:
+            reason = "no_closed_positions"
+        elif not order_list:
+            reason = "no_filled_orders_for_symbols"
+        elif not linked_orders:
+            reason = "filled_orders_missing_decision_id"
+        elif not orders_with_loaded_decisions:
+            reason = "linked_decisions_missing"
+        elif matched_count <= 0:
+            reason = "position_order_time_or_side_mismatch"
+        elif match_rate < 0.5:
+            reason = "partial_lineage"
+        return {
+            "total_closed_positions": total_positions,
+            "filled_order_count": len(order_list),
+            "orders_with_decision_id": len(linked_orders),
+            "orders_with_loaded_decision": len(orders_with_loaded_decisions),
+            "matched_position_count": matched_count,
+            "unmatched_position_count": max(total_positions - matched_count, 0),
+            "match_rate": round(match_rate, 6),
+            "reason": reason,
+            "ready_for_profit_learning": bool(total_positions and matched_count),
+        }
+
     def contribution_sources(
         self,
         opportunity: dict[str, Any],
@@ -233,6 +312,11 @@ class ModelContributionPerformanceService:
         side: str,
     ) -> list[str]:
         """Infer which evidence sources supported an entry decision."""
+
+        profit_first_plan = _safe_dict(raw.get("profit_first_trade_plan"))
+        plan_sources = self._profit_first_contribution_sources(profit_first_plan)
+        if plan_sources:
+            return plan_sources
 
         sources: list[str] = []
         if bool(opportunity.get("ml_aligned")):
@@ -259,6 +343,33 @@ class ModelContributionPerformanceService:
         if not has_quant and side in {"long", "short"}:
             sources.append("ai_only_without_quant")
         return sources
+
+    @staticmethod
+    def _profit_first_contribution_sources(plan: dict[str, Any]) -> list[str]:
+        source_map = {
+            "decision_llm": "decision_llm",
+            "local_ml": "ml_profit_model",
+            "server_profit": "server_profit_model",
+            "timeseries": "timeseries_model",
+            "sentiment": "sentiment_model",
+            "shadow_memory": "shadow_memory",
+            "expert_alignment": "expert_alignment",
+            "high_risk_review": "high_risk_review",
+        }
+        sources: list[str] = []
+        for contribution in _safe_list(plan.get("model_contributions")):
+            row = _safe_dict(contribution)
+            if row and row.get("valid") is False:
+                continue
+            mapped = source_map.get(str(row.get("source") or ""))
+            if mapped:
+                sources.append(mapped)
+        if not sources:
+            for source in _safe_list(plan.get("model_sources")):
+                mapped = source_map.get(str(source or ""))
+                if mapped:
+                    sources.append(mapped)
+        return list(dict.fromkeys(sources))
 
     def score_adjustment(
         self,
@@ -368,10 +479,12 @@ class ModelContributionPerformanceService:
     ) -> Any | None:
         pos_created = _aware(getattr(position, "created_at", None))
         pos_side = self._position_side(position)
+        pos_symbol = normalize_trading_symbol(getattr(position, "symbol", ""))
         matched_decision = None
         best_delta = None
         for order in orders:
-            if order.symbol != position.symbol or order.decision_id not in decisions:
+            order_symbol = normalize_trading_symbol(getattr(order, "symbol", ""))
+            if order_symbol != pos_symbol or order.decision_id not in decisions:
                 continue
             decision = decisions[order.decision_id]
             action = str(getattr(decision, "action", "") or "").lower()

@@ -73,6 +73,103 @@ def test_model_contribution_build_stats_tracks_realized_source_pnl() -> None:
     assert stats["ai_only_without_quant"]["count"] == 0
 
 
+def test_model_contribution_build_stats_prefers_profit_first_plan_sources() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    raw = {
+        "opportunity_score": {"ml_aligned": False, "local_profit_aligned": False},
+        "profit_first_trade_plan": {
+            "model_sources": ["decision_llm", "server_profit", "high_risk_review"],
+            "model_contributions": [
+                {"source": "decision_llm", "valid": True, "field_path": "decision.model_name"},
+                {
+                    "source": "server_profit",
+                    "valid": True,
+                    "field_path": "opportunity_score.expected_net_return_pct",
+                },
+                {"source": "high_risk_review", "valid": True, "field_path": "review.approved"},
+            ],
+        },
+    }
+    position = _position(1, 4.0, created_at=now)
+    position.entry_exchange_order_id = "entry-ok"
+    position.close_exchange_order_id = "close-ok"
+
+    stats = ModelContributionPerformanceService().build_stats(
+        [position],
+        [_order(1, 1, created_at=now)],
+        {1: _decision(1, raw)},
+    )
+
+    assert stats["decision_llm"]["count"] == 1
+    assert stats["server_profit_model"]["count"] == 1
+    assert stats["high_risk_review"]["count"] == 1
+    assert stats["ml_profit_model"]["count"] == 0
+
+
+def test_model_contribution_build_stats_excludes_untrusted_trade_facts() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    raw = {"opportunity_score": {"ml_aligned": True}}
+    trusted = _position(1, 3.0, created_at=now)
+    trusted.entry_exchange_order_id = "entry-ok"
+    trusted.close_exchange_order_id = "close-ok"
+    dirty = _position(2, 50.0, created_at=now)
+    dirty.entry_exchange_order_id = "entry-dirty"
+    dirty.close_exchange_order_id = ""
+    orders = [_order(1, 1, created_at=now), _order(2, 2, created_at=now)]
+    decisions = {1: _decision(1, raw), 2: _decision(2, raw)}
+
+    stats = ModelContributionPerformanceService().build_stats(
+        [trusted, dirty],
+        orders,
+        decisions,
+    )
+
+    assert stats["ml_profit_model"]["count"] == 1
+    assert stats["ml_profit_model"]["pnl"] == pytest.approx(3.0)
+
+
+def test_model_contribution_lineage_diagnoses_missing_order_decision_ids() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    position = _position(1, 3.0, created_at=now)
+    position.entry_exchange_order_id = "entry-ok"
+    position.close_exchange_order_id = "close-ok"
+    order = _order(1, 0, created_at=now)
+    order.decision_id = None
+
+    diagnostics = ModelContributionPerformanceService().build_lineage_diagnostics(
+        [position],
+        [order],
+        {},
+    )
+
+    assert diagnostics["total_closed_positions"] == 1
+    assert diagnostics["filled_order_count"] == 1
+    assert diagnostics["orders_with_decision_id"] == 0
+    assert diagnostics["matched_position_count"] == 0
+    assert diagnostics["reason"] == "filled_orders_missing_decision_id"
+    assert diagnostics["ready_for_profit_learning"] is False
+
+
+def test_model_contribution_matches_okx_symbol_variants() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    raw = {"opportunity_score": {"ml_aligned": True}}
+    position = _position(1, 3.0, created_at=now)
+    position.symbol = "BTC/USDT"
+    position.entry_exchange_order_id = "entry-ok"
+    position.close_exchange_order_id = "close-ok"
+    order = _order(1, 7, created_at=now)
+    order.symbol = "BTC-USDT-SWAP"
+    decision = _decision(7, raw)
+
+    service = ModelContributionPerformanceService()
+    diagnostics = service.build_lineage_diagnostics([position], [order], {7: decision})
+    stats = service.build_stats([position], [order], {7: decision})
+
+    assert diagnostics["matched_position_count"] == 1
+    assert diagnostics["reason"] == "ok"
+    assert stats["ml_profit_model"]["count"] == 1
+
+
 def test_model_contribution_sources_fall_back_to_ai_only_without_quant() -> None:
     service = ModelContributionPerformanceService()
 

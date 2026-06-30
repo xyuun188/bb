@@ -76,6 +76,39 @@ def test_strategy_learning_expert_integrity_reads_duration_sec() -> None:
     assert missing == []
 
 
+def test_strategy_learning_excludes_untrusted_closed_position_facts() -> None:
+    compiler = StrategyLearningEngine().compiler
+    now = datetime.now(UTC)
+    trusted = _position(side="long", pnl=3.0, position_id=101)
+    trusted.entry_exchange_order_id = "entry-ok"
+    trusted.close_exchange_order_id = "close-ok"
+    dirty = _position(side="short", pnl=12.0, position_id=102)
+    dirty.created_at = now - timedelta(minutes=30)
+    dirty.closed_at = now
+    dirty.entry_exchange_order_id = "entry-dirty"
+    dirty.close_exchange_order_id = ""
+
+    feedback = compiler.compile(
+        mode="paper",
+        window_hours=24,
+        positions=[trusted, dirty],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        reflections=[],
+    ).to_dict()
+
+    assert feedback["totals"]["closed_trade_count"] == 2
+    assert feedback["totals"]["training_trade_count"] == 1
+    assert feedback["totals"]["net_pnl"] == 3.0
+    assert feedback["trade_fact_quarantine"]["excluded_position_count"] == 1
+    assert feedback["trade_fact_quarantine"]["reason_counts"] == {
+        "missing_close_exchange_order_id": 1
+    }
+
+
 def _open_position(symbol: str, side: str, pnl: float) -> dict[str, Any]:
 
     return {

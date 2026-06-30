@@ -14,6 +14,7 @@ from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.equity_baseline import apply_daily_equity_baseline
+from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
 
@@ -77,10 +78,15 @@ class NewPairLossPausePolicy:
                 is_open=None,
                 limit=5000,
             )
+            trusted_rows = []
             for pos in rows:
                 if pos.is_open:
+                    trusted_rows.append(pos)
                     open_unrealized += float(pos.unrealized_pnl or 0.0)
                     continue
+                if not closed_position_trade_fact_trusted(pos):
+                    continue
+                trusted_rows.append(pos)
                 pnl = float(pos.realized_pnl or 0.0)
                 realized_pnl += pnl
                 closed_at = getattr(pos, "closed_at", None)
@@ -92,7 +98,7 @@ class NewPairLossPausePolicy:
             equity_baseline = await self._daily_equity_baseline(
                 selected_mode,
                 account_equity,
-                rows,
+                trusted_rows,
                 realized_pnl,
                 open_unrealized,
                 realized_pnl + open_unrealized,
@@ -141,7 +147,9 @@ class NewPairLossPausePolicy:
             logger.warning("failed to check recent loss streak", error=safe_error_text(exc))
             return None
 
-        recent = [p for p in rows if p.closed_at is not None]
+        recent = [
+            p for p in rows if p.closed_at is not None and closed_position_trade_fact_trusted(p)
+        ]
         if not recent:
             return None
 

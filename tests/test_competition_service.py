@@ -21,9 +21,13 @@ class _FailingTradeRepo:
 class _FakeLogger:
     def __init__(self) -> None:
         self.warning_events: list[dict[str, Any]] = []
+        self.info_events: list[dict[str, Any]] = []
 
     def warning(self, event: str, **fields: Any) -> None:
         self.warning_events.append({"event": event, **fields})
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.info_events.append({"event": event, **fields})
 
 
 @pytest.mark.asyncio
@@ -63,3 +67,39 @@ async def test_competition_metric_fallback_logs_redacted_errors(
     ]
     assert "sharpe-secret-value" not in str(fake_logger.warning_events)
     assert "max-drawdown-secret" not in str(fake_logger.warning_events)
+
+
+@pytest.mark.asyncio
+async def test_auto_promote_best_model_is_recommendation_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_logger = _FakeLogger()
+    service = CompetitionService()
+    switched: list[str] = []
+
+    class FakeModeManager:
+        live_model_name = "current-live-model"
+
+        async def switch_to_live(self, model_name: str) -> None:
+            switched.append(model_name)
+
+    async def fake_select_best_model() -> str:
+        return "candidate-model"
+
+    monkeypatch.setattr(competition_module, "logger", fake_logger)
+    monkeypatch.setattr(service, "select_best_model", fake_select_best_model)
+    monkeypatch.setattr(competition_module, "mode_manager", FakeModeManager())
+
+    best = await service.auto_promote_best_model()
+
+    assert best == "candidate-model"
+    assert switched == []
+    assert fake_logger.info_events == [
+        {
+            "event": "best model promotion recommendation recorded without live switch",
+            "model": "candidate-model",
+            "current_live_model": "current-live-model",
+            "live_mutation": False,
+            "policy": "phase3_observe_only",
+        }
+    ]

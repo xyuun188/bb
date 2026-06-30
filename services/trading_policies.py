@@ -14,6 +14,9 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.exit_arbitrator import ExitArbitrationResult, ExitArbitrator
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
+from services.profit_first_exit_binding import attach_profit_first_exit_reference
+from services.profit_first_stage2 import RecentProbePnLBrakePolicy
+from services.profit_first_trade_plan import attach_profit_first_trade_plan
 
 
 @dataclass(slots=True)
@@ -49,6 +52,7 @@ class EntryPolicy:
         entry_price_guard: Any | None = None,
         entry_opportunity_gate: Any | None = None,
         high_risk_review_gate: Any | None = None,
+        profit_first_probe_brake: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
         self.entry_priority = entry_priority
@@ -58,6 +62,7 @@ class EntryPolicy:
         self.entry_price_guard = entry_price_guard
         self.entry_opportunity_gate = entry_opportunity_gate
         self.high_risk_review_gate_policy = high_risk_review_gate
+        self.profit_first_probe_brake = profit_first_probe_brake or RecentProbePnLBrakePolicy()
 
     def score_candidate(
         self,
@@ -219,6 +224,27 @@ class EntryPolicy:
             model_mode,
             open_positions=open_positions or [],
         )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw = attach_profit_first_trade_plan(
+            decision,
+            analysis_type=str(raw.get("analysis_type") or "market"),
+        )
+        profit_first_plan = (
+            raw.get("profit_first_trade_plan")
+            if isinstance(raw.get("profit_first_trade_plan"), dict)
+            else {}
+        )
+        probe_brake = self.profit_first_probe_brake.evaluate(profit_first_plan, raw)
+        if not probe_brake.allowed:
+            return PolicyGateResult.block(
+                "profit_first_probe_loss_brake",
+                probe_brake.reason,
+                {
+                    "pipeline_context": context.public_data(),
+                    "stage_status": "skipped",
+                    **(probe_brake.data or {}),
+                },
+            )
         evidence_score = {}
         opportunity = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         opportunity_data = (
@@ -430,6 +456,11 @@ class ExitPolicy:
         if refresh_positions and self.exit_position_snapshot is not None:
             exit_positions = await self.exit_position_snapshot.refresh_positions(open_positions)
         context = context.with_refreshed_positions(exit_positions)
+        attach_profit_first_exit_reference(
+            decision,
+            exit_positions,
+            model_name=model_name,
+        )
 
         if not self.has_matching_position(exit_positions, model_name, decision):
             exchange_has_position = False

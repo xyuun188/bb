@@ -184,6 +184,49 @@ def test_extract_signal_sides_keeps_ml_prediction_visible_when_influence_disable
     assert signals["ml"]["expected_return_pct"] == 0.73
 
 
+def test_profit_attribution_excludes_untrusted_closed_position_facts():
+    now = datetime(2026, 6, 5, 8, 0, tzinfo=UTC)
+    trusted = Position(
+        id=901,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        quantity=1.0,
+        entry_price=100.0,
+        current_price=104.0,
+        realized_pnl=4.0,
+        is_open=False,
+        created_at=now,
+        closed_at=now + timedelta(minutes=20),
+        entry_exchange_order_id="entry-ok",
+        close_exchange_order_id="close-ok",
+    )
+    dirty = Position(
+        id=902,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="USAR/USDT",
+        side="long",
+        quantity=100.0,
+        entry_price=2.31,
+        current_price=4.05,
+        realized_pnl=174.0,
+        is_open=False,
+        created_at=now,
+        closed_at=now + timedelta(minutes=10),
+        entry_exchange_order_id="entry-dirty",
+        close_exchange_order_id="",
+    )
+
+    result = build_profit_attribution([trusted, dirty], [], [], [])
+
+    assert result["summary"]["trade_count"] == 1
+    assert result["summary"]["total_closed_pnl"] == 4.0
+    assert result["trade_fact_quarantine"]["quarantined"] == 1
+    assert [row["position_id"] for row in result["records"]] == [901]
+
+
 def test_profit_attribution_flags_direction_error_from_shadow_backtest():
     now = datetime(2026, 6, 5, 8, 0, tzinfo=UTC)
     position = Position(

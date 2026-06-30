@@ -148,7 +148,7 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
             "enabled": True,
             "status": "ok",
             "matched_count": 1,
-            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+            "policy": "三期相似样本只作为软证据调节和解释，不作为硬拦截。",
             "hits": [{"score": 0.72, "action": "long", "outcome": "loss", "pnl_pct": -0.8}],
         },
         "decision_habit": {

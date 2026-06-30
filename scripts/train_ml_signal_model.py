@@ -19,6 +19,7 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
+from services.okx_training_gate import okx_training_refresh_gate
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
 
@@ -27,16 +28,27 @@ async def run_training(
     limit: int,
     min_samples: int,
     skip_quarantine: bool = False,
-    dry_run: bool = False,
+    persist_artifact: bool = False,
+    confirm_phase3_rebuild: bool = False,
 ) -> dict[str, object]:
+    if persist_artifact and not confirm_phase3_rebuild:
+        raise ValueError(
+            "persist_artifact requires confirm_phase3_rebuild; run preflight first."
+        )
+    okx_gate = okx_training_refresh_gate()
+    if persist_artifact and not bool(okx_gate.get("allowed")):
+        raise ValueError(
+            "OKX daily reconciliation blocks local ML artifact persist: "
+            f"{okx_gate.get('reason')}"
+        )
     quarantine_result: dict[str, object] = {
         "skipped": True,
         "reason": "skip_quarantine flag enabled",
     }
-    if dry_run:
+    if not persist_artifact:
         quarantine_result = {
             "skipped": True,
-            "reason": "dry_run_no_quarantine_writes",
+            "reason": "phase3_preflight_no_quarantine_writes",
         }
     elif not skip_quarantine:
         quarantine_result = await quarantine_dirty_shadow_samples(
@@ -53,12 +65,16 @@ async def run_training(
         min_samples=min_samples,
         completed_sample_count=completed_count,
         training_quality_report=quality_state["quality_report"],
-        persist_artifact=not dry_run,
+        persist_artifact=persist_artifact,
     )
     return {
         "metadata": metadata,
         "training_quarantine": quarantine_result,
-        "dry_run": dry_run,
+        "dry_run": not persist_artifact,
+        "preflight_only": not persist_artifact,
+        "persist_artifact_requested": persist_artifact,
+        "confirm_phase3_rebuild": confirm_phase3_rebuild,
+        "okx_daily_reconciliation_gate": okx_gate,
         "frame_sample_count": int(len(frame)),
         "loaded_row_count": int(len(rows)),
         "completed_shadow_sample_count": int(completed_count),
@@ -78,7 +94,20 @@ async def _main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Evaluate training metrics without quarantining rows or writing model artifacts.",
+        help=(
+            "Deprecated alias for the default preflight mode. "
+            "Preflight never quarantines rows or writes model artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--persist-artifact",
+        action="store_true",
+        help="Write the model artifact after an explicit Phase 3 rebuild confirmation.",
+    )
+    parser.add_argument(
+        "--confirm-phase3-rebuild",
+        action="store_true",
+        help="Required together with --persist-artifact to replace the local ML artifact.",
     )
     args = parser.parse_args()
 
@@ -86,7 +115,8 @@ async def _main() -> None:
         limit=args.limit,
         min_samples=args.min_samples,
         skip_quarantine=bool(args.skip_quarantine),
-        dry_run=bool(args.dry_run),
+        persist_artifact=bool(args.persist_artifact),
+        confirm_phase3_rebuild=bool(args.confirm_phase3_rebuild),
     )
     print(json.dumps(result["metadata"], ensure_ascii=False, indent=2))
     print(

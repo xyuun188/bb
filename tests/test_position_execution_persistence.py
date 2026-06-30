@@ -206,6 +206,71 @@ async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_entry_merges_same_symbol_side_add_entry_and_links_order_ids() -> None:
+    session = FakeSession()
+    existing = _position(
+        id=1,
+        quantity=1.0,
+        entry_price=90.0,
+        current_price=95.0,
+        entry_exchange_order_id="old-entry",
+    )
+    repo = FakeTradeRepo([existing])
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.LONG),
+        result=_result(
+            price=100.0,
+            quantity=3.0,
+            exchange_order_id="new-entry",
+            raw_response={"info": {"instId": "BTC-USDT-SWAP", "posId": "btc-net"}},
+        ),
+        execution_mode="paper",
+    )
+
+    assert repo.opened == []
+    assert existing.quantity == 4.0
+    assert existing.entry_price == pytest.approx(97.5)
+    assert existing.current_price == 100.0
+    assert existing.unrealized_pnl == pytest.approx(10.0)
+    assert existing.stop_loss_price == pytest.approx(95.55)
+    assert existing.take_profit_price == pytest.approx(101.4)
+    assert existing.okx_inst_id == "BTC-USDT-SWAP"
+    assert existing.okx_pos_id == "btc-net"
+    assert existing.entry_exchange_order_id == "old-entry,new-entry"
+
+
+@pytest.mark.asyncio
+async def test_persist_entry_native_inst_id_overrides_wrong_canonical_alias() -> None:
+    session = FakeSession()
+    repo = FakeTradeRepo()
+    decision = _decision(Action.LONG)
+    decision.symbol = "SPK/USDT"
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=decision,
+        result=_result(
+            symbol="SAHARA/USDT",
+            price=0.012,
+            quantity=10.0,
+            exchange_order_id="spk-entry",
+            raw_response={
+                "symbol": "SAHARA/USDT:USDT",
+                "canonical_exchange_symbol": "SAHARA/USDT",
+                "info": {"instId": "SPK-USDT-SWAP", "ordId": "spk-entry"},
+            },
+        ),
+        execution_mode="paper",
+    )
+
+    assert repo.opened[0]["symbol"] == "SPK/USDT"
+    assert repo.opened[0]["okx_inst_id"] == "SPK-USDT-SWAP"
+    assert repo.opened[0]["entry_exchange_order_id"] == "spk-entry"
+
+
+@pytest.mark.asyncio
 async def test_persist_partial_exit_splits_closed_position_and_records_reflection() -> None:
     session = FakeSession()
     open_position = _position(quantity=5.0)
@@ -284,6 +349,73 @@ async def test_persist_full_exit_closes_positions_and_removes_profit_peaks() -> 
         ("ensemble_trader", "BTC/USDT", "long"),
     ]
     assert [item["position"].id for item in reflections] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_persist_exit_uses_okx_native_fill_pnl_over_local_formula() -> None:
+    session = FakeSession()
+    position = _position(id=1, quantity=2.0, entry_price=100.0)
+    repo = FakeTradeRepo([position])
+    reflections: list[dict[str, Any]] = []
+    result = _result(
+        quantity=2.0,
+        price=110.0,
+        fee=1.0,
+        raw_response={
+            "native_close_fill": {
+                "pnl": 6.0,
+                "quantity": 2.0,
+                "order_id": "okx-close-1",
+            }
+        },
+    )
+
+    await _service(
+        session=session,
+        repo=repo,
+        entry_fee=0.5,
+        reflections=reflections,
+    ).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        result=result,
+        execution_mode="paper",
+    )
+
+    assert position.is_open is False
+    assert position.realized_pnl == pytest.approx(4.5)
+    assert result.pnl == pytest.approx(4.5)
+    assert reflections[0]["gross_pnl"] == pytest.approx(6.0)
+
+
+@pytest.mark.asyncio
+async def test_persist_full_exit_does_not_close_on_synthetic_native_close_order_id() -> None:
+    session = FakeSession()
+    position = _position(id=1, quantity=2.0)
+    repo = FakeTradeRepo([position])
+    result = _result(
+        quantity=2.0,
+        price=110.0,
+        fee=1.0,
+        order_id="okx_native_full_close",
+        exchange_order_id=None,
+        raw_response={
+            "okx_native_close_position": True,
+            "info": {"instId": "BTC-USDT-SWAP"},
+        },
+    )
+
+    await _service(session=session, repo=repo, confirmed=False).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        result=result,
+        execution_mode="paper",
+    )
+
+    assert position.is_open is True
+    assert getattr(position, "close_exchange_order_id", None) in {None, ""}
+    assert getattr(position, "okx_inst_id", None) is None
+    assert session.flush_count == 0
 
 
 @pytest.mark.asyncio

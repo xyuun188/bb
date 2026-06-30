@@ -346,10 +346,15 @@ class RiskEngine:
             decision.position_size_pct = size_check.adjusted_size_pct
             warnings.append(size_check.reason)
 
-        leverage_cap = self._max_allowed_leverage(decision, volume_ratio, trend_adx)
-        if decision.suggested_leverage > leverage_cap:
-            decision.suggested_leverage = leverage_cap
-            warnings.append(f"杠杆已按动态运行时参考质量限制为 {leverage_cap:.1f}x。")
+        if self._has_dynamic_leverage_decision(decision):
+            warnings.append(
+                "dynamic leverage allocator supplied integer leverage; runtime tier cap skipped."
+            )
+        else:
+            leverage_cap = self._max_allowed_leverage(decision, volume_ratio, trend_adx)
+            if decision.suggested_leverage > leverage_cap:
+                decision.suggested_leverage = leverage_cap
+                warnings.append(f"杠杆已按动态运行时参考质量限制为 {leverage_cap:.1f}x。")
 
         leverage_check = self.position_checker.check_leverage(decision.suggested_leverage)
         if leverage_check.adjusted_size_pct:
@@ -504,6 +509,13 @@ class RiskEngine:
         if decision.confidence < 0.72:
             return min(10.0, settings.max_leverage)
         return min(20.0, settings.max_leverage)
+
+    @staticmethod
+    def _has_dynamic_leverage_decision(decision: DecisionOutput) -> bool:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing") if isinstance(raw.get("profit_risk_sizing"), dict) else {}
+        dynamic = raw.get("dynamic_leverage_decision") or sizing.get("dynamic_leverage_decision")
+        return isinstance(dynamic, dict) and dynamic.get("version") == "dynamic_leverage_allocator_v1"
 
     def _trend_aligned(self, decision: DecisionOutput) -> bool:
         snapshot = decision.feature_snapshot or {}

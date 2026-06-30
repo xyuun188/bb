@@ -202,7 +202,7 @@ def test_execution_confirmation_requires_real_exchange_order_id() -> None:
     assert policy.is_exchange_confirmed_execution(_result(OrderStatus.PARTIAL)) is False
 
 
-def test_execution_confirmation_accepts_native_full_close_flat_snapshot() -> None:
+def test_execution_confirmation_rejects_native_full_close_without_real_order_id() -> None:
     policy = ExecutionResultClassifier()
     result = _result(
         OrderStatus.FILLED,
@@ -215,6 +215,26 @@ def test_execution_confirmation_accepts_native_full_close_flat_snapshot() -> Non
             "position_contracts_after": 0.0,
             "remaining_contracts": 0.0,
             "filled_contracts": 36.6,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is False
+
+
+def test_execution_confirmation_accepts_native_full_close_with_real_fill_order_id() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.FILLED,
+        order_id="real-close-order",
+        exchange_order_id="real-close-order",
+        quantity=366.0,
+        raw_response={
+            "okx_native_close_position": True,
+            "position_contracts_before": 36.6,
+            "position_contracts_after": 0.0,
+            "remaining_contracts": 0.0,
+            "filled_contracts": 36.6,
+            "native_close_fill": {"order_id": "real-close-order"},
         },
     )
 

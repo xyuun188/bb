@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -148,8 +148,10 @@ from services.market_queued_entry_processor import MarketQueuedEntryProcessor
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import AUTO_TRAIN_CHECK_INTERVAL_SECONDS, MLSignalService
 from services.model_contribution_performance import ModelContributionPerformanceService
+from services.model_promotion_policy import load_latest_paper_observation_report
 from services.new_pair_loss_pause import NewPairLossPausePolicy
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
+from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -574,7 +576,6 @@ class TradingService:
             model_execution_mode_provider=self._get_model_execution_mode,
             okx_executor_provider=self._get_okx_executor_for_mode,
             float_parser=self._safe_float,
-            paper_positions_provider=self.paper_positions_for_context,
             active_okx_provider=self.active_okx_for_current_mode,
             paper_okx_provider=self.paper_okx_for_reconciliation,
             exchange_position_open_checker=self.exchange_position_state.is_open,
@@ -596,6 +597,7 @@ class TradingService:
             position_margin_calculator=self.position_margin_calculator.margin,
             memory_position_remover=self.memory_position_store.remove_open_position,
         )
+        self.okx_order_fact_sync_factory = OkxOrderFactSyncService
         self.exit_cooldown = ExitCooldownPolicy(self._normalize_position_symbol)
         self.exit_position_matcher = ExitPositionMatcher(self._normalize_position_symbol)
         self.exit_position_snapshot = ExitPositionSnapshotPolicy(self.okx_sync_service)
@@ -908,6 +910,18 @@ class TradingService:
         self._market_analysis_task: asyncio.Task | None = None
         self._position_analysis_task: asyncio.Task | None = None
         self._runtime_heartbeat_task: asyncio.Task | None = None
+        self._okx_authoritative_sync_task: asyncio.Task | None = None
+        self._okx_authoritative_sync_started_at: datetime | None = None
+        self._okx_authoritative_sync_last_success_at: datetime | None = None
+        self._okx_authoritative_sync_last_failure_at: datetime | None = None
+        self._okx_authoritative_sync_last_error: str | None = None
+        self._okx_authoritative_sync_last_duration_seconds: float | None = None
+        self._okx_authoritative_sync_last_result_count: int | None = None
+        self._okx_authoritative_sync_last_result_kinds: dict[str, int] = {}
+        self._okx_authoritative_sync_last_requires_attention_count: int = 0
+        self._okx_authoritative_sync_last_samples: list[dict[str, Any]] = []
+        self._okx_authoritative_sync_success_count = 0
+        self._okx_authoritative_sync_failure_count = 0
         self._ml_auto_train_task: asyncio.Task | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
@@ -992,6 +1006,209 @@ class TradingService:
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(8.0, min(14.0, interval * 0.35))
+
+    def okx_authoritative_sync_interval_seconds(self) -> float:
+        """Return the background cadence for current OKX position sync."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(20.0, min(60.0, interval * 0.5))
+
+    def _okx_authoritative_sync_status_payload(
+        self,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return runtime diagnostics for the current-position OKX sync loop."""
+
+        now = now or datetime.now(UTC)
+        interval_seconds = self.okx_authoritative_sync_interval_seconds()
+        stale_after_seconds = max(interval_seconds * 3.0, 180.0)
+        started_at = getattr(self, "_okx_authoritative_sync_started_at", None)
+        last_success_at = getattr(self, "_okx_authoritative_sync_last_success_at", None)
+        last_failure_at = getattr(self, "_okx_authoritative_sync_last_failure_at", None)
+        task = getattr(self, "_okx_authoritative_sync_task", None)
+        last_success_age_seconds = (
+            max((now - last_success_at).total_seconds(), 0.0)
+            if isinstance(last_success_at, datetime)
+            else None
+        )
+        last_failure_age_seconds = (
+            max((now - last_failure_at).total_seconds(), 0.0)
+            if isinstance(last_failure_at, datetime)
+            else None
+        )
+        status = "pending"
+        if isinstance(last_failure_at, datetime) and (
+            not isinstance(last_success_at, datetime) or last_failure_at > last_success_at
+        ):
+            status = "warning"
+        elif isinstance(last_success_at, datetime):
+            status = (
+                "stale"
+                if last_success_age_seconds is not None
+                and last_success_age_seconds > stale_after_seconds
+                else "ok"
+            )
+        return {
+            "enabled": True,
+            "status": status,
+            "task_running": bool(task is not None and not task.done()),
+            "interval_seconds": round(interval_seconds, 3),
+            "stale_after_seconds": round(stale_after_seconds, 3),
+            "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            "last_success_at": (
+                last_success_at.isoformat() if isinstance(last_success_at, datetime) else None
+            ),
+            "last_success_age_seconds": (
+                round(last_success_age_seconds, 3)
+                if last_success_age_seconds is not None
+                else None
+            ),
+            "last_failure_at": (
+                last_failure_at.isoformat() if isinstance(last_failure_at, datetime) else None
+            ),
+            "last_failure_age_seconds": (
+                round(last_failure_age_seconds, 3)
+                if last_failure_age_seconds is not None
+                else None
+            ),
+            "last_error": getattr(self, "_okx_authoritative_sync_last_error", None),
+            "last_duration_seconds": getattr(
+                self,
+                "_okx_authoritative_sync_last_duration_seconds",
+                None,
+            ),
+            "last_result_count": getattr(
+                self,
+                "_okx_authoritative_sync_last_result_count",
+                None,
+            ),
+            "last_result_kinds": dict(
+                getattr(self, "_okx_authoritative_sync_last_result_kinds", {}) or {}
+            ),
+            "last_requires_attention_count": int(
+                getattr(
+                    self,
+                    "_okx_authoritative_sync_last_requires_attention_count",
+                    0,
+                )
+                or 0
+            ),
+            "last_samples": list(
+                getattr(self, "_okx_authoritative_sync_last_samples", []) or []
+            ),
+            "success_count": int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0),
+            "failure_count": int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0),
+            "source": "okx_private_api_current_positions",
+        }
+
+    def _okx_authoritative_sync_entry_block_reason(
+        self,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Block new entries when OKX/local current-state truth is not healthy."""
+
+        payload = self._okx_authoritative_sync_status_payload(now)
+        status = str(payload.get("status") or "").lower()
+        requires_attention = int(payload.get("last_requires_attention_count") or 0)
+        last_error = str(payload.get("last_error") or "").strip()
+        if status in {"warning", "stale"}:
+            reason = "OKX auto reconciliation is unhealthy"
+            if status == "stale":
+                reason = "OKX auto reconciliation is stale"
+            if last_error:
+                reason = f"{reason}: {last_error}"
+            return f"{reason}; pause new entries until OKX/backend state is consistent."
+        if requires_attention > 0:
+            return (
+                f"OKX auto reconciliation found {requires_attention} current-state "
+                "differences requiring review; pause new entries until reconciled."
+            )
+        return None
+
+    @staticmethod
+    def _okx_authoritative_sync_result_summary(
+        result: Any,
+        *,
+        sample_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Summarize one OKX sync result without exposing large raw payloads."""
+
+        rows = result if isinstance(result, list) else []
+        kind_counts: Counter[str] = Counter()
+        samples: list[dict[str, Any]] = []
+        requires_attention_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                kind_counts["unknown"] += 1
+                continue
+            kind = str(row.get("kind") or "legacy_reconciled").strip() or "legacy_reconciled"
+            kind_counts[kind] += 1
+            if row.get("requires_attention") is True:
+                requires_attention_count += 1
+            if len(samples) >= sample_limit:
+                continue
+            samples.append(
+                {
+                    "kind": kind,
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "exchange_order_id": row.get("exchange_order_id"),
+                    "requires_attention": bool(row.get("requires_attention") is True),
+                    "note": safe_error_text(row.get("note"), limit=180)
+                    if row.get("note") is not None
+                    else None,
+                }
+            )
+        return {
+            "count": len(rows),
+            "kinds": dict(kind_counts),
+            "requires_attention_count": requires_attention_count,
+            "samples": samples,
+        }
+
+    async def _sync_okx_order_facts_for_loop(self) -> dict[str, Any]:
+        factory = getattr(self, "okx_order_fact_sync_factory", None)
+        if factory is None:
+            return {
+                "kind": "order_fact_sync",
+                "requires_attention": False,
+                "note": "OKX order fact sync factory is not configured in this test runtime",
+                "order_fact_sync": {"status": "skipped", "reason": "factory_not_configured"},
+            }
+        mode = "live" if mode_manager.mode.value == "live" else "paper"
+        report = await factory(
+            mode=mode,
+            lookback_hours=24,
+            timeout_seconds=max(4.0, self.round_start_reconcile_timeout_seconds() * 0.75),
+        ).sync()
+        status = str(report.get("status") or "unknown").lower()
+        unverified_count = int(report.get("unverified_count") or 0)
+        position_confirmed_count = int(report.get("position_confirmed_count") or 0)
+        okx_pull_available = bool(report.get("okx_pull_available") is not False)
+        requires_attention = (
+            status in {"critical", "error", "unavailable"}
+            or unverified_count > 0
+            or not okx_pull_available
+        )
+        return {
+            "kind": "order_fact_sync",
+            "symbol": None,
+            "side": None,
+            "exchange_order_id": None,
+            "requires_attention": requires_attention,
+            "note": (
+                f"OKX order facts sync status={status}, "
+                f"confirmed={int(report.get('confirmed_count') or 0)}, "
+                f"position_confirmed={position_confirmed_count}, "
+                f"unverified={unverified_count}, "
+                f"backfilled={int(report.get('backfilled_count') or 0)}, "
+                "position_history="
+                f"{int(report.get('position_history_backfilled_count') or 0)}+"
+                f"{int(report.get('position_history_updated_count') or 0)}"
+            ),
+            "order_fact_sync": report,
+        }
 
     def strategy_learning_context_timeout_seconds(self) -> float:
         """Return the hard budget for strategy-learning context in the trading loop."""
@@ -1127,6 +1344,64 @@ class TradingService:
             self._write_runtime_heartbeat()
             await asyncio.sleep(5.0)
 
+    async def _okx_authoritative_sync_loop(self) -> None:
+        """Continuously align current local open positions with OKX facts."""
+
+        while self._running:
+            interval = self.okx_authoritative_sync_interval_seconds()
+            started_at = datetime.now(UTC)
+            self._okx_authoritative_sync_started_at = started_at
+            try:
+                position_result = await asyncio.wait_for(
+                    self.okx_sync_service.reconcile_positions(
+                        "auto okx authoritative sync",
+                        timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+                        lock_wait_seconds=0.1,
+                    ),
+                    timeout=self.round_start_reconcile_timeout_seconds() + 2.0,
+                )
+                result = list(position_result) if isinstance(position_result, list) else []
+                if getattr(self, "okx_order_fact_sync_factory", None) is not None:
+                    order_fact_result = await self._sync_okx_order_facts_for_loop()
+                    result.append(order_fact_result)
+                finished_at = datetime.now(UTC)
+                self._okx_authoritative_sync_last_success_at = finished_at
+                self._okx_authoritative_sync_last_error = None
+                self._okx_authoritative_sync_last_duration_seconds = round(
+                    (finished_at - started_at).total_seconds(),
+                    6,
+                )
+                self._okx_authoritative_sync_last_result_count = (
+                    len(result) if isinstance(result, list) else None
+                )
+                result_summary = self._okx_authoritative_sync_result_summary(result)
+                self._okx_authoritative_sync_last_result_kinds = result_summary["kinds"]
+                self._okx_authoritative_sync_last_requires_attention_count = result_summary[
+                    "requires_attention_count"
+                ]
+                self._okx_authoritative_sync_last_samples = result_summary["samples"]
+                self._okx_authoritative_sync_success_count = (
+                    int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0) + 1
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                finished_at = datetime.now(UTC)
+                self._okx_authoritative_sync_last_failure_at = finished_at
+                self._okx_authoritative_sync_last_error = safe_error_text(exc, limit=180)
+                self._okx_authoritative_sync_last_duration_seconds = round(
+                    (finished_at - started_at).total_seconds(),
+                    6,
+                )
+                self._okx_authoritative_sync_failure_count = (
+                    int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0) + 1
+                )
+                logger.warning(
+                    "auto OKX authoritative sync failed",
+                    error=self._okx_authoritative_sync_last_error,
+                )
+            await asyncio.sleep(interval)
+
     async def enforce_sl_tp_for_position_review(
         self,
         feature_vectors: dict[str, Any],
@@ -1246,11 +1521,14 @@ class TradingService:
         return processor
 
     async def paper_positions_for_context(self) -> list[dict[str, Any]]:
-        """Return in-memory paper positions used as a DB context fallback."""
+        """Return no in-memory paper positions in Phase 3 OKX-backed mode.
 
-        if not self.paper_executor:
-            return []
-        return await self.paper_executor.get_positions()
+        OKX native positions are the only trading-context truth.  This method
+        stays as a compatibility boundary for older tests/callers, but it must
+        not read PaperExecutor memory or local synthetic positions.
+        """
+
+        return []
 
     def active_okx_for_current_mode(self) -> OKXExecutor | None:
         """Return the OKX executor for the currently selected trading mode."""
@@ -1551,6 +1829,18 @@ class TradingService:
         """Refresh persisted entry blocks before the execution-facing entry policy."""
 
         await self._refresh_entry_symbol_blocks_if_stale()
+        if decision.is_entry:
+            okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
+            if okx_sync_reason:
+                return PolicyGateResult.block(
+                    "okx_authoritative_sync_unhealthy",
+                    okx_sync_reason,
+                    {
+                        "stage_status": "blocked",
+                        "okx_authoritative_sync": self._okx_authoritative_sync_status_payload(),
+                        "execution_blocker": "okx_authoritative_sync_unhealthy",
+                    },
+                )
         return await self.entry_execution_pipeline.evaluate(
             decision,
             model_name,
@@ -1763,6 +2053,12 @@ class TradingService:
     async def open_positions_context_for_execution(self) -> list[dict[str, Any]]:
         """Return open-position context through an explicit execution boundary."""
 
+        await self.okx_sync_service.reconcile_positions(
+            "execution open positions context refresh",
+            timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+            lock_wait_seconds=0.1,
+            record_timeout_error=False,
+        )
         return await self.okx_sync_service.get_open_positions_context()
 
     def has_matching_local_exit_position(
@@ -1909,7 +2205,7 @@ class TradingService:
             return context
         try:
             vector_result = await get_vector_memory_service().search(
-                f"{symbol} {action} 开仓 亏损 盈利 复盘 相似历史",
+                f"{symbol} {action} 开仓 亏损 盈利 复盘 三期相似样本",
                 top_k=6,
                 symbol=symbol,
             )
@@ -1938,7 +2234,7 @@ class TradingService:
             "matched_count": len(hits) if isinstance(hits, list) else 0,
             "hits": hits[:3] if isinstance(hits, list) else [],
             "is_hard_gate": False,
-            "policy": "相似历史只作为软证据调节和解释，不作为硬拦截。",
+            "policy": "三期相似样本只作为软证据调节和解释，不作为硬拦截。",
         }
         context["memory_feedback"] = memory_feedback
         context["vector_memory_feedback"] = memory_feedback["vector_memory"]
@@ -2058,6 +2354,7 @@ class TradingService:
             last_round_error = (
                 market_state.last_error or position_state.last_error or self._last_round_error
             )
+            okx_authoritative_sync = self._okx_authoritative_sync_status_payload(now)
             payload = {
                 "running": bool(self._running),
                 "mode": mode_manager.mode.value,
@@ -2117,6 +2414,7 @@ class TradingService:
                     else None
                 ),
                 "last_round_error": last_round_error,
+                "okx_authoritative_sync": okx_authoritative_sync,
             }
             path = settings.data_dir / "trading_runtime_status.json"
             tmp_path = path.with_suffix(".json.tmp")
@@ -4421,6 +4719,7 @@ class TradingService:
                     fv,
                     model_mode,
                     analysis_type="market",
+                    local_ai_tools_context=local_ai_tools_context,
                 )
 
                 decision_key = (model_name, self._normalize_position_symbol(symbol))
@@ -4915,11 +5214,15 @@ class TradingService:
             self.market_analysis_service.loop(self.market_loop_interval_seconds)
         )
         self._runtime_heartbeat_task = asyncio.create_task(self._runtime_heartbeat_loop())
+        self._okx_authoritative_sync_task = asyncio.create_task(
+            self._okx_authoritative_sync_loop()
+        )
         try:
             await asyncio.gather(
                 self._position_analysis_task,
                 self._market_analysis_task,
                 self._runtime_heartbeat_task,
+                self._okx_authoritative_sync_task,
             )
         except asyncio.CancelledError:
             pass
@@ -4927,11 +5230,13 @@ class TradingService:
     async def stop(self) -> None:
         """Stop the trading loop gracefully."""
         self._running = False
+        self._write_runtime_heartbeat()
         await self._stop_ml_auto_train_loop()
         for task in (
             self._position_analysis_task,
             self._market_analysis_task,
             self._runtime_heartbeat_task,
+            self._okx_authoritative_sync_task,
         ):
             if task and not task.done():
                 task.cancel()
@@ -4942,6 +5247,7 @@ class TradingService:
         self._position_analysis_task = None
         self._market_analysis_task = None
         self._runtime_heartbeat_task = None
+        self._okx_authoritative_sync_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self.okx_executor, self._okx_paper, self._okx_live):
@@ -5002,6 +5308,17 @@ class TradingService:
         """Push fresh history to the server-side profit/time-series/exit models."""
         if not self.local_ai_tools.enabled():
             return {"trained": False, "reason": "disabled"}
+
+        from services.okx_training_gate import okx_training_refresh_gate
+
+        okx_gate = okx_training_refresh_gate()
+        if not bool(okx_gate.get("allowed")):
+            return {
+                "trained": False,
+                "reason": okx_gate.get("reason") or "okx_training_refresh_blocked",
+                "okx_daily_reconciliation_gate": okx_gate,
+                "trade_sample_cursor_policy": "clean_training_view_only",
+            }
 
         status = await self.local_ai_tools.status()
         now = datetime.now(UTC)
@@ -5069,7 +5386,9 @@ class TradingService:
         quality_report = training_payload["quality_report"]
         governance_report = training_payload["governance_report"]
         trainable_shadow_count = len(training_payload["shadow_samples"])
+        raw_trade_sample_count = len(trade_samples)
         trainable_trade_count = len(training_payload["trade_samples"])
+        quarantined_trade_count = max(raw_trade_sample_count - trainable_trade_count, 0)
         new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
         previous_completed_trade_total = int(
             (status or {}).get("last_trained_completed_trade_sample_count")
@@ -5110,6 +5429,7 @@ class TradingService:
             "training_text_sample_limit": LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
             "cursor_source": "last_trained_completed_shadow_sample_count",
             "trade_cursor_source": "last_trained_completed_trade_sample_count",
+            "trade_cursor_policy": "clean_training_view_only",
         }
         if completed_shadow_total < LOCAL_ML_TRAINING_PARAMS.min_training_samples:
             return {
@@ -5118,7 +5438,10 @@ class TradingService:
                 "server_shadow_sample_count": server_shadow_count,
                 "local_shadow_sample_count": training_shadow_count,
                 "trainable_shadow_sample_count": trainable_shadow_count,
+                "raw_trade_sample_count": raw_trade_sample_count,
                 "trainable_trade_sample_count": trainable_trade_count,
+                "quarantined_trade_sample_count": quarantined_trade_count,
+                "trade_sample_cursor_policy": "clean_training_view_only",
                 "quality_report": quality_report,
                 "governance_report": governance_report,
                 "completed_shadow_sample_count": completed_shadow_total,
@@ -5143,7 +5466,10 @@ class TradingService:
                 "local_shadow_sample_count": training_shadow_count,
                 "completed_shadow_sample_count": completed_shadow_total,
                 "trainable_shadow_sample_count": trainable_shadow_count,
+                "raw_trade_sample_count": raw_trade_sample_count,
                 "trainable_trade_sample_count": trainable_trade_count,
+                "quarantined_trade_sample_count": quarantined_trade_count,
+                "trade_sample_cursor_policy": "clean_training_view_only",
                 "quality_report": quality_report,
                 "governance_report": governance_report,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
@@ -5159,6 +5485,7 @@ class TradingService:
             }
 
         self._local_tools_last_train_started_at = now
+        paper_observation_report = load_latest_paper_observation_report()
         result = await self.local_ai_tools.train(
             training_payload["shadow_samples"],
             training_payload["trade_samples"],
@@ -5169,6 +5496,14 @@ class TradingService:
             completed_trade_sample_count=completed_trade_total,
             quality_report=quality_report,
             governance_report=governance_report,
+            evaluation_policy={
+                "promotion_flow": "shadow_to_canary_to_live",
+                "live_mutation": False,
+                "requires_walk_forward": True,
+                "requires_paper_observation": True,
+                "phase": "phase3_model_factory",
+            },
+            paper_observation_report=paper_observation_report,
         )
         if result.get("trained"):
             result["completed_shadow_sample_count"] = completed_shadow_total
@@ -5177,9 +5512,13 @@ class TradingService:
             result["last_trained_completed_trade_sample_count"] = completed_trade_total
             result["training_shadow_sample_count"] = training_shadow_count
             result["trainable_shadow_sample_count"] = trainable_shadow_count
+            result["raw_trade_sample_count"] = raw_trade_sample_count
             result["trainable_trade_sample_count"] = trainable_trade_count
+            result["quarantined_trade_sample_count"] = quarantined_trade_count
+            result["trade_sample_cursor_policy"] = "clean_training_view_only"
             result["quality_report"] = quality_report
             result["governance_report"] = governance_report
+            result["paper_observation_report"] = paper_observation_report
             result["training_shadow_sample_limit"] = (
                 LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
             )
@@ -5757,10 +6096,16 @@ class TradingService:
                 position,
                 close_qty,
             )
-            if str(position.side or "").lower() == "short":
-                gross_pnl = (position.entry_price - result.price) * close_qty
-            else:
-                gross_pnl = (result.price - position.entry_price) * close_qty
+            from services.okx_realized_pnl import gross_pnl_with_okx_override
+
+            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+                side=str(position.side or "").lower(),
+                entry_price=position.entry_price,
+                exit_price=result.price,
+                close_qty=close_qty,
+                okx_payload=getattr(result, "raw_response", None),
+                okx_total_qty=result.quantity,
+            )
             realized_pnl = gross_pnl - entry_fee - close_fee
             tolerance = max(position_qty * 1e-9, 1e-8)
             closes_position = position_qty - close_qty <= tolerance
@@ -5977,11 +6322,7 @@ class TradingService:
                 "rejection_reason": f"OKX 手动平仓失败：{safe_error_text(exc)}",
             }
 
-        execution_completed = (
-            execution_result.status == OrderStatus.FILLED
-            and self._safe_float(execution_result.quantity, 0.0) > 0
-            and self._safe_float(execution_result.price, 0.0) > 0
-        )
+        execution_completed = self._is_exchange_confirmed_execution(execution_result)
         if not execution_completed:
             await self._record_strategy_learning_event(
                 mode=execution_mode,
@@ -7188,6 +7529,10 @@ class TradingService:
             state = breaker.get_state()
             return f"风险熔断已开启，暂停分析新的交易对。原因：{state.get('tripped_reason') or '触发风险阈值'}"
 
+        okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
+        if okx_sync_reason:
+            return okx_sync_reason
+
         model_mode = self._get_model_execution_mode(model_name)
         account_cfg = settings.get_execution_account_config(model_mode)
         okx_snapshot = await self._get_okx_balance_snapshot_for_mode(model_mode)
@@ -7327,63 +7672,6 @@ class TradingService:
         """Return the actual OKX free USDT balance used to cap new entries."""
         return await self.account_accounting_service.okx_available_balance_for_mode(mode)
 
-    async def _paper_analysis_balance_snapshot(self) -> dict[str, Any] | None:
-        """Return the paper account's analysis budget snapshot.
-
-        Paper/demo mode may still submit orders through OKX demo and validate
-        exchange rules at execution time. New-opportunity analysis, however,
-        must not stop for hours just because the OKX balance REST endpoint is
-        slow. When no in-process paper executor exists, fall back to the
-        configured paper execution budget so the strategy loop can keep
-        producing decisions with a clear degraded source marker.
-        """
-
-        executor = getattr(self, "paper_executor", None)
-        summary: dict[str, Any] = {}
-        source = "paper_configured_budget"
-        degraded = True
-        if executor is not None:
-            try:
-                summary = await executor.get_account_summary(ENSEMBLE_TRADER_NAME)
-            except Exception as exc:
-                logger.warning(
-                    "failed to build paper virtual balance snapshot",
-                    error=safe_error_text(exc),
-                )
-            else:
-                source = "paper_virtual_account"
-                degraded = False
-
-        cfg = settings.get_execution_account_config("paper")
-        configured_budget = self._safe_float(cfg.get("allocated_balance"), 0.0)
-        if configured_budget <= 0:
-            configured_budget = self._safe_float(settings.initial_virtual_balance, 0.0)
-
-        available = self._safe_float(summary.get("available_balance"), configured_budget)
-        equity = self._safe_float(summary.get("equity"), available)
-        wallet = self._safe_float(summary.get("wallet_balance"), max(equity, available))
-        used = self._safe_float(summary.get("used_margin"), 0.0)
-        total = (
-            max(equity, wallet, available)
-            if source == "paper_virtual_account"
-            else max(equity, wallet, available, configured_budget)
-        )
-        if total <= 0 and available <= 0:
-            return None
-
-        return {
-            "free": max(available, 0.0),
-            "used": max(used, 0.0),
-            "total": max(total, 0.0),
-            "cash": max(wallet, available, 0.0),
-            "equity": max(equity, total, 0.0),
-            "allocatable": max(available, 0.0),
-            "source": source,
-            "exchange_required": False,
-            "degraded": degraded,
-            "analysis_only_balance": True,
-        }
-
     async def _get_okx_balance_snapshot_for_mode(self, mode: str) -> dict[str, Any] | None:
         """Return OKX USDT balance fields for allocation and order sizing."""
         selected_mode = "live" if mode == "live" else "paper"
@@ -7487,8 +7775,6 @@ class TradingService:
                 fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
                 if fallback_snapshot:
                     return fallback_snapshot
-                if selected_mode == "paper":
-                    return await self._paper_analysis_balance_snapshot()
                 return None
         try:
             snapshot = await asyncio.wait_for(
@@ -7500,8 +7786,6 @@ class TradingService:
                 fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
                 if fallback_snapshot:
                     return fallback_snapshot
-                if selected_mode == "paper":
-                    return await self._paper_analysis_balance_snapshot()
                 return None
             return remember_snapshot(snapshot)
         except TimeoutError:
@@ -7510,8 +7794,6 @@ class TradingService:
             fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
             if fallback_snapshot:
                 return fallback_snapshot
-            if selected_mode == "paper":
-                return await self._paper_analysis_balance_snapshot()
             return None
         except Exception as exc:
             logger.warning(
@@ -7523,8 +7805,6 @@ class TradingService:
             fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
             if fallback_snapshot:
                 return fallback_snapshot
-            if selected_mode == "paper":
-                return await self._paper_analysis_balance_snapshot()
             return None
 
     async def _sync_paper_after_okx(
@@ -7533,134 +7813,9 @@ class TradingService:
         decision: DecisionOutput,
         result: ExecutionResult,
     ) -> None:
-        """Update PaperExecutor tracking after a successful OKX execution."""
-        pe = self.paper_executor
-        if pe is None:
-            return
+        """Do not mirror OKX executions into PaperExecutor memory in Phase 3."""
 
-        price = result.price
-        quantity = result.quantity
-        fee = result.fee
-        order_value = quantity * price
-
-        if decision.action in (Action.LONG, Action.SHORT):
-            margin_used = self.position_margin_calculator.margin(
-                order_value, decision.suggested_leverage
-            )
-            old_balance = pe._balances.get(model_name, settings.get_initial_balance(model_name))
-            balance_delta = -(margin_used + fee)
-            pe._balances[model_name] = old_balance + balance_delta
-
-            # Record position
-            side = "long" if decision.action == Action.LONG else "short"
-            position = {
-                "id": result.order_id or str(uuid.uuid4())[:12],
-                "symbol": decision.symbol,
-                "side": side,
-                "quantity": quantity,
-                "entry_price": price,
-                "current_price": price,
-                "leverage": decision.suggested_leverage,
-                "margin_used": margin_used,
-                "stop_loss": (
-                    price * (1 - decision.stop_loss_pct)
-                    if side == "long"
-                    else price * (1 + decision.stop_loss_pct)
-                ),
-                "take_profit": (
-                    price * (1 + decision.take_profit_pct)
-                    if side == "long"
-                    else price * (1 - decision.take_profit_pct)
-                ),
-                "is_open": True,
-                "opened_at": datetime.now(UTC),
-                "unrealized_pnl": 0.0,
-            }
-            pe._positions.setdefault(model_name, []).append(position)
-            await self.account_accounting_service.persist_balance_delta(
-                model_name,
-                balance_delta,
-                0.0,
-            )
-
-        elif decision.action in (Action.CLOSE_LONG, Action.CLOSE_SHORT):
-            target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-            positions = pe._positions.get(model_name, [])
-            to_close = [
-                p
-                for p in positions
-                if p["symbol"] == decision.symbol and p["side"] == target_side and p["is_open"]
-            ]
-            total_pnl = 0.0
-            released_margin = 0.0
-            total_fee = fee
-            for pos in to_close:
-                pos["is_open"] = False
-                pos["current_price"] = price
-                if pos["side"] == "long":
-                    pnl = (price - pos["entry_price"]) * pos["quantity"]
-                else:
-                    pnl = (pos["entry_price"] - price) * pos["quantity"]
-                pos["unrealized_pnl"] = pnl
-                pos["closed_at"] = datetime.now(UTC)
-                total_pnl += pnl
-                released_margin += self.position_margin_calculator.margin(
-                    pos["quantity"] * pos["entry_price"],
-                    pos.get("leverage", 1.0),
-                )
-
-            if not to_close:
-                released_margin = await self._db_released_margin_for_close(
-                    model_name, decision, result
-                )
-            pe._balances[model_name] = (
-                pe._balances.get(model_name, settings.get_initial_balance(model_name))
-                + released_margin
-                + total_pnl
-                - total_fee
-            )
-            pe._positions[model_name] = [p for p in positions if p["is_open"]]
-            # Attach PnL to result for downstream logging
-            result.pnl = total_pnl - total_fee
-            await self.account_accounting_service.persist_balance_delta(
-                model_name,
-                released_margin + total_pnl - total_fee,
-                total_pnl - total_fee,
-            )
-
-    async def _db_released_margin_for_close(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-        result: ExecutionResult,
-    ) -> float:
-        # Fallback used when the in-memory paper executor was restarted and no
-        # longer has the matching position object. The DB close handler will
-        # still close the real persisted position later in the same flow.
-        target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-        remaining_qty = result.quantity
-        released_margin = 0.0
-        try:
-            async with get_session_ctx() as session:
-                repo = TradeRepository(session)
-                positions = await repo.get_matching_open_positions(
-                    model_name=model_name,
-                    symbol=result.symbol,
-                    side=target_side,
-                    execution_mode="paper",
-                )
-                for pos in positions:
-                    if remaining_qty <= 0:
-                        break
-                    close_qty = min(float(pos.quantity or 0.0), remaining_qty)
-                    released_margin += self.position_margin_calculator.margin(
-                        close_qty * float(pos.entry_price or 0.0),
-                        pos.leverage,
-                    )
-                    remaining_qty -= close_qty
-        except Exception as e:
-            logger.error("failed to calculate released paper margin", error=safe_error_text(e))
-        return released_margin
+        return
 
     async def _on_mode_changed(self, manager) -> None:
         """Reinitialize all LLM agent instances when trading mode changes."""
@@ -8092,7 +8247,7 @@ class TradingService:
                 logger.debug("dashboard redis publish failed", error=safe_error_text(exc))
 
     async def record_equity_snapshot(self) -> None:
-        """Record current equity for each model for PnL chart history, and persist unrealized PnL to DB."""
+        """Record OKX account equity for the in-memory PnL chart."""
         now = datetime.now(UTC).isoformat()
         active_names = {ENSEMBLE_TRADER_NAME}
         # Remove stale data from deleted models
@@ -8100,10 +8255,15 @@ class TradingService:
             if stale not in active_names:
                 del self._pnl_history[stale]
         for model_name in active_names:
-            state = await self.execution_allocation_state(mode_manager.mode.value)
-            allocated = float(state.get("allocated_balance") or 0.0)
-            equity = allocated
-            unrealized = state.get("unrealized_pnl", 0.0)
+            snapshot = await self._get_okx_balance_snapshot_for_mode(mode_manager.mode.value)
+            equity = balance_from_snapshot(snapshot)
+            if equity <= 0:
+                logger.warning(
+                    "skip equity snapshot because OKX equity is unavailable",
+                    model=model_name,
+                    mode=mode_manager.mode.value,
+                )
+                continue
             self._pnl_history.setdefault(model_name, []).append(
                 {
                     "time": now,
@@ -8113,12 +8273,6 @@ class TradingService:
             # Keep last 500 snapshots per model
             if len(self._pnl_history[model_name]) > 500:
                 self._pnl_history[model_name] = self._pnl_history[model_name][-500:]
-
-            # Persist unrealized PnL to DB so competition rankings see it
-            await self.account_accounting_service.record_unrealized_pnl(
-                model_name,
-                float(unrealized or 0.0),
-            )
 
     def get_pnl_history(self) -> dict[str, list[dict]]:
         """Return PnL equity history only for currently active models."""
@@ -8246,6 +8400,7 @@ class TradingService:
             "market_loop_interval_seconds": round(self.market_loop_interval_seconds(), 3),
             "position_loop_interval_seconds": round(self.position_loop_interval_seconds(), 3),
             "market_round_time_budget_seconds": round(self.market_round_time_budget_seconds(), 3),
+            "okx_authoritative_sync": self._okx_authoritative_sync_status_payload(now),
         }
         self._write_runtime_heartbeat()
         return stats

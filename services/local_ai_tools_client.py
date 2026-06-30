@@ -23,6 +23,10 @@ from services.entry_signal_extraction import (
     payload_side,
     unwrap_tool_payload,
 )
+from services.model_promotion_policy import (
+    build_phase3_promotion_recommendation,
+    load_latest_paper_observation_report,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +37,7 @@ _MAX_REQUEST_TIMEOUT_SECONDS = 15.0
 _MAX_CIRCUIT_BREAKER_FAILURES = 20
 _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
 _STATUS_CACHE_TTL_SECONDS = 8.0
+_MAX_TIMESERIES_SEQUENCE_LENGTH = 80
 
 
 class LocalAIToolsClient:
@@ -79,6 +84,10 @@ class LocalAIToolsClient:
     def enabled(self) -> bool:
         self._refresh_runtime_settings()
         return bool(settings.local_ai_tools_enabled and settings.local_ai_tools_api_base)
+
+    def service_configured(self) -> bool:
+        self._refresh_runtime_settings()
+        return bool(settings.local_ai_tools_api_base)
 
     async def enrich(
         self, features: Any, ml_signal: dict[str, Any] | None = None
@@ -260,7 +269,46 @@ class LocalAIToolsClient:
             reason = str(normalized.get("reason") or normalized.get("note") or "").strip()
             normalized["reason"] = self._humanize_exit_reason(reason, action)
             normalized["action_label"] = self._humanize_exit_action(action)
-        return normalized
+        return self._attach_model_metadata(name, normalized)
+
+    def _attach_model_metadata(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        defaults = {
+            "profit_prediction": {
+                "primary_model": "profit_v1_baseline",
+                "challenger_model": None,
+                "model_version": "local_ai_tools.v1",
+            },
+            "time_series_prediction": {
+                "primary_model": "timeseries_v1_baseline",
+                "challenger_model": None,
+                "model_version": "local_ai_tools.v1",
+            },
+            "sentiment_analysis": {
+                "primary_model": "sentiment_v1_baseline",
+                "challenger_model": None,
+                "model_version": "local_ai_tools.v1",
+            },
+            "exit_advice": {
+                "primary_model": "exit_v1_rules",
+                "challenger_model": None,
+                "model_version": "local_ai_tools.v1",
+            },
+        }.get(name, {})
+        for key, value in defaults.items():
+            payload.setdefault(key, value)
+        payload.setdefault("route_mode", "shadow_observation")
+        payload.setdefault("fallback_reason", "")
+        payload["feature_coverage"] = self._feature_coverage_payload(payload)
+        return payload
+
+    def _feature_coverage_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        raw = payload.get("feature_coverage")
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, (int, float)):
+            ratio = min(max(float(raw), 0.0), 1.0)
+            return {"ratio": round(ratio, 6), "status": "reported"}
+        return {"ratio": None, "status": "not_reported"}
 
     def _humanize_exit_action(self, action: str) -> str:
         return {
@@ -309,12 +357,19 @@ class LocalAIToolsClient:
             return default
 
     async def status(self) -> dict[str, Any]:
-        if not self.enabled():
-            return {"available": False, "status": "disabled"}
+        enabled_for_trading = self.enabled()
+        if not self.service_configured():
+            return {
+                "available": False,
+                "service_available": False,
+                "enabled_for_trading": False,
+                "status": "not_configured",
+            }
         circuit_open = self._circuit_open_payload()
         if circuit_open:
             return {
                 "available": False,
+                "enabled_for_trading": enabled_for_trading,
                 **circuit_open,
             }
         cached = self._read_status_cache()
@@ -333,6 +388,18 @@ class LocalAIToolsClient:
             status_ok = False
             status_error = safe_error_text(exc, limit=180)
 
+        try:
+            health = await self._get(
+                "/health",
+                request_timeout=self._request_timeout(),
+            )
+            health_ok = True
+            health_error = ""
+        except Exception as exc:
+            health = {}
+            health_ok = False
+            health_error = safe_error_text(exc, limit=180)
+
         child_endpoints = await self._probe_child_endpoints()
         child_available = any(
             bool(item.get("available") or item.get("ok"))
@@ -340,23 +407,59 @@ class LocalAIToolsClient:
             if isinstance(item, dict)
         )
         model_bundle_available = bool(status.get("available"))
-        service_available = bool(status_ok or child_available)
+        service_available = bool(status_ok or health_ok or child_available)
 
         status["model_bundle_available"] = model_bundle_available
         status["service_available"] = service_available
+        status["health_available"] = health_ok
+        status["enabled_for_trading"] = enabled_for_trading
+        status["health"] = health
         status["child_endpoints"] = child_endpoints
-        status["available"] = bool(model_bundle_available or child_available)
+        # Phase 3 separates service reachability from persisted model-bundle readiness.
+        # A reachable quant API with no persisted bundle is still connected and may run
+        # shadow/heuristic endpoints; promotion gates decide whether artifacts can be used.
+        status["available"] = bool(service_available)
         status.setdefault("api_base", self._public_api_base())
         if status_error:
             status["status_error"] = status_error
+        if health_error:
+            status["health_error"] = health_error
+        for key in (
+            "trained_at",
+            "shadow_sample_count",
+            "trade_sample_count",
+            "sequence_sample_count",
+            "text_sentiment_sample_count",
+            "completed_shadow_sample_count",
+            "completed_trade_sample_count",
+            "training_mode",
+            "model_stage",
+            "evaluation_policy",
+            "promotion_recommendation",
+            "governance_report",
+            "quality_report",
+        ):
+            if key not in status and key in health:
+                status[key] = health.get(key)
+        if "models" not in status:
+            if isinstance(health.get("models"), dict):
+                status["models"] = health["models"]
+            elif isinstance(health.get("model_status"), dict):
+                status["models"] = health["model_status"]
         if model_bundle_available and not str(status.get("status") or "").strip():
             status["status"] = "ready"
-        if child_available and not model_bundle_available:
+        if service_available and not model_bundle_available:
             status.setdefault(
                 "message",
                 "Local AI tools service is available; trained bundle is not ready yet.",
             )
             status["status"] = "heuristic_fallback_available"
+        if service_available and not enabled_for_trading:
+            status.setdefault(
+                "message",
+                "Local AI tools service is online; trading influence is disabled by configuration.",
+            )
+            status["status"] = "connected_trading_disabled"
         if service_available:
             self._record_success()
             status.update(self._breaker_fields())
@@ -372,6 +475,7 @@ class LocalAIToolsClient:
                 "api_base": self._public_api_base(),
                 "model_bundle_available": False,
                 "service_available": False,
+                "enabled_for_trading": enabled_for_trading,
                 "child_endpoints": child_endpoints,
                 **self._breaker_fields(),
             }
@@ -452,14 +556,45 @@ class LocalAIToolsClient:
         source: str = "local_trading_system_auto",
         completed_shadow_sample_count: int | None = None,
         completed_trade_sample_count: int | None = None,
+        raw_trade_sample_count: int | None = None,
+        trainable_trade_sample_count: int | None = None,
+        quarantined_trade_sample_count: int | None = None,
+        trade_sample_cursor_policy: str = "clean_training_view_only",
         quality_report: dict[str, Any] | None = None,
         governance_report: dict[str, Any] | None = None,
+        training_mode: str = "shadow",
+        model_stage: str = "shadow",
+        evaluation_policy: dict[str, Any] | None = None,
+        paper_observation_report: dict[str, Any] | None = None,
+        promotion_recommendation: dict[str, Any] | None = None,
+        persist_artifact: bool = False,
+        confirm_phase3_rebuild: bool = False,
     ) -> dict[str, Any]:
         if not self.enabled():
             return {"trained": False, "reason": "disabled"}
         circuit_open = self._circuit_open_payload()
         if circuit_open:
             return {"trained": False, "reason": "circuit_open", **circuit_open}
+        effective_evaluation_policy = evaluation_policy or {
+            "promotion_flow": "shadow_to_canary_to_live",
+            "live_mutation": False,
+            "requires_walk_forward": True,
+            "phase": "phase3_model_factory",
+            "requires_paper_observation": True,
+        }
+        effective_paper_observation = (
+            paper_observation_report or load_latest_paper_observation_report()
+        )
+        effective_promotion = promotion_recommendation or build_phase3_promotion_recommendation(
+            training_mode=training_mode,
+            model_stage=model_stage,
+            quality_report=quality_report or {},
+            governance_report=governance_report or {},
+            evaluation_policy=effective_evaluation_policy,
+            paper_observation_report=effective_paper_observation,
+            completed_shadow_sample_count=int(completed_shadow_sample_count or 0),
+            completed_trade_sample_count=int(completed_trade_sample_count or 0),
+        )
         payload = {
             "source": source,
             "shadow_samples": shadow_samples,
@@ -468,8 +603,19 @@ class LocalAIToolsClient:
             "text_sentiment_samples": text_sentiment_samples or [],
             "completed_shadow_sample_count": completed_shadow_sample_count,
             "completed_trade_sample_count": completed_trade_sample_count,
+            "raw_trade_sample_count": raw_trade_sample_count,
+            "trainable_trade_sample_count": trainable_trade_sample_count,
+            "quarantined_trade_sample_count": quarantined_trade_sample_count,
+            "trade_sample_cursor_policy": trade_sample_cursor_policy,
             "quality_report": quality_report or {},
             "governance_report": governance_report or {},
+            "training_mode": training_mode,
+            "model_stage": model_stage,
+            "evaluation_policy": effective_evaluation_policy,
+            "paper_observation_report": effective_paper_observation,
+            "promotion_recommendation": effective_promotion,
+            "persist_artifact": bool(persist_artifact),
+            "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),
         }
         payload = self._json_safe(payload)
         try:
@@ -661,11 +807,29 @@ class LocalAIToolsClient:
                 snapshot["recent_headlines"] = list(headlines)[:20]
         else:
             snapshot = dict(features or {})
+        for key in ("close_sequence", "volume_sequence", "recent_closes", "recent_volumes"):
+            if key in snapshot:
+                snapshot[key] = self._compact_numeric_sequence(
+                    snapshot.get(key),
+                    limit=_MAX_TIMESERIES_SEQUENCE_LENGTH,
+                )
+        if snapshot.get("close_sequence"):
+            snapshot["sequence_length"] = len(snapshot["close_sequence"])
         return {
             "symbol": snapshot.get("symbol") or getattr(features, "symbol", ""),
             "timestamp": datetime.now(UTC).isoformat(),
             "features": snapshot,
         }
+
+    def _compact_numeric_sequence(self, value: Any, *, limit: int) -> list[float]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        values: list[float] = []
+        for item in value[-limit:]:
+            number = self._to_float(item, default=float("nan"))
+            if number == number and abs(number) != float("inf"):
+                values.append(float(number))
+        return values
 
     def _position_payload(
         self,

@@ -36,7 +36,12 @@ class PositionTracker:
     ) -> None:
         """Load current positions from the executor."""
         try:
-            positions = await executor.get_positions()
+            fetch_strict = getattr(executor, "get_positions_strict", None)
+            if not callable(fetch_strict):
+                raise RuntimeError(
+                    f"{executor.__class__.__name__} does not provide strict positions"
+                )
+            positions = await fetch_strict()
             self._positions[model_name] = []
             for pos in positions:
                 self._positions[model_name].append(
@@ -54,10 +59,12 @@ class PositionTracker:
                 "positions synced", model=model_name, count=len(self._positions[model_name])
             )
         except Exception as e:
+            self._positions[model_name] = []
             logger.error(
                 "position sync failed",
                 model=model_name,
                 error=safe_error_text(e),
+                stale_positions_cleared=True,
             )
 
     def update_price(self, symbol: str, price: float) -> None:

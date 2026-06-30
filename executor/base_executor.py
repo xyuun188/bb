@@ -63,7 +63,9 @@ class AbstractExecutor(ABC):
 
     async def get_positions_strict(self, symbol: str | None = None) -> list[dict]:
         """Get positions and propagate failures for safety-critical callers."""
-        return await self.get_positions(symbol)
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not provide strict authoritative positions"
+        )
 
     @abstractmethod
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
@@ -71,7 +73,9 @@ class AbstractExecutor(ABC):
 
     async def get_open_orders_strict(self, symbol: str | None = None) -> list[dict]:
         """Get open orders and propagate failures for safety-critical callers."""
-        return await self.get_open_orders(symbol)
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not provide strict authoritative open orders"
+        )
 
     @abstractmethod
     async def initialize(self) -> None:

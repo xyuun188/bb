@@ -73,6 +73,7 @@ KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
     "15m": 120,
     "1h": 100,
 }
+KLINE_FEATURE_SEQUENCE_LIMIT = 80
 TICKER_PERSIST_THROTTLE_SECONDS = 30.0
 TICKER_CACHE_MAX_AGE_SECONDS = max(
     10.0,
@@ -282,8 +283,11 @@ class DataService:
             # Fetch news
             articles = await self.news_fetcher.fetch_all()
 
-            # Fetch social posts
-            social_posts = await self.sentiment_scraper.fetch_all_reddit()
+            # Fetch public social/discussion posts.
+            if hasattr(self.sentiment_scraper, "fetch_all_social"):
+                social_posts = await self.sentiment_scraper.fetch_all_social()
+            else:
+                social_posts = await self.sentiment_scraper.fetch_all_reddit()
 
             self._last_articles = articles
             self._last_social_posts = social_posts
@@ -1080,9 +1084,53 @@ class DataService:
         elif short_features:
             features["volume_ratio_timeframe"] = short_timeframe
         features["indicator_snapshot_available"] = True
+        sequence_df = short_df if not short_df.empty else trend_df
+        sequence_timeframe = short_timeframe or trend_timeframe
+        features.update(self._kline_sequence_snapshot(sequence_df, sequence_timeframe))
         anomaly_df = trend_df if not trend_df.empty else short_df
         features.update(self._kline_anomaly_snapshot(anomaly_df))
         return features
+
+    def _kline_sequence_snapshot(self, df: pd.DataFrame, timeframe: str) -> dict[str, Any]:
+        if df.empty:
+            return {}
+        close_sequence = self._numeric_sequence_from_series(
+            df.get("close"),
+            limit=KLINE_FEATURE_SEQUENCE_LIMIT,
+        )
+        if not close_sequence:
+            return {}
+        volume_sequence = self._numeric_sequence_from_series(
+            df.get("volume"),
+            limit=KLINE_FEATURE_SEQUENCE_LIMIT,
+        )
+        return {
+            "close_sequence": close_sequence,
+            "volume_sequence": volume_sequence,
+            "sequence_timeframe": timeframe,
+            "sequence_length": len(close_sequence),
+        }
+
+    @staticmethod
+    def _numeric_sequence_from_series(value: Any, *, limit: int) -> list[float]:
+        if value is None:
+            return []
+        try:
+            raw_values = list(value.tail(limit))
+        except AttributeError:
+            try:
+                raw_values = list(value)[-limit:]
+            except TypeError:
+                return []
+        out: list[float] = []
+        for item in raw_values:
+            try:
+                number = float(item)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                out.append(number)
+        return out
 
     def _select_indicator_features(
         self,

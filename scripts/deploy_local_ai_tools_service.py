@@ -1,10 +1,14 @@
-"""Deploy the lightweight local AI tools API to the configured server."""
+"""Deploy the Phase 3 quant API to the configured model server."""
 
 from __future__ import annotations
 
+import argparse
+import json
+import posixpath
 import sys
 import textwrap
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -13,6 +17,18 @@ if str(ROOT) not in sys.path:
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+
+PHASE3_ROOT = "/data/BB"
+PHASE3_API_PORT = 8101
+PHASE3_SERVICE_NAME = "bb-phase3-quant-api.service"
+PHASE3_APP_DIR = f"{PHASE3_ROOT}/services/phase3_quant_api"
+PHASE3_SYSTEMD_DIR = f"{PHASE3_ROOT}/services/systemd"
+PHASE3_LOG_DIR = f"{PHASE3_ROOT}/logs/services"
+PHASE3_MODEL_DIR = f"{PHASE3_ROOT}/models/local_ai_tools"
+PHASE3_RUNTIME_DIR = f"{PHASE3_ROOT}/runtime/phase3_quant_api"
+PHASE3_ENV_FILE = f"{PHASE3_ROOT}/env/phase3.env"
+PHASE3_PYTHON_BIN = f"{PHASE3_ROOT}/envs/phase3-quant/bin/python"
+PHASE3_POLICY_ID = "phase3_quant_api_shadow_contract_v2_2026_06_27"
 
 SERVICE_CODE = r'''
 from __future__ import annotations
@@ -38,9 +54,25 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
 
 
-MODEL_DIR = Path("/data/trade_ai/models")
+PHASE3_ROOT = Path(os.environ.get("BB_PHASE3_ROOT", "/data/BB"))
+PHASE3_API_PORT = int(os.environ.get("PHASE3_QUANT_API_PORT", "8101"))
+MODEL_DIR = Path(
+    os.environ.get(
+        "LOCAL_AI_TOOLS_MODEL_DIR",
+        str(PHASE3_ROOT / "models" / "local_ai_tools"),
+    )
+)
 BUNDLE_PATH = MODEL_DIR / "local_quant_models.joblib"
 METADATA_PATH = MODEL_DIR / "local_quant_models_metadata.json"
+PHASE3_VALIDATION_REPORT_PATH = (
+    PHASE3_ROOT / "reports" / "inventory" / "phase3_model_validation_latest.json"
+)
+PHASE3_DOWNLOAD_REPORT_PATH = (
+    PHASE3_ROOT / "reports" / "inventory" / "phase3_model_download_manifest_latest.json"
+)
+PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
+PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"
+PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"
 LOCAL_REVIEW_DISABLED_DETAIL = (
     "Local AI tools do not provide high-risk trade review. "
     "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
@@ -58,6 +90,9 @@ FEATURE_KEYS = [
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 ROUND_TRIP_COST_PCT = float(os.environ.get("LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT", "0.12"))
 TAIL_LOSS_THRESHOLD_PCT = float(os.environ.get("LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT", "0.18"))
+MIN_TIMESERIES_SEQUENCE_LENGTH = int(
+    os.environ.get("LOCAL_AI_TOOLS_MIN_TIMESERIES_SEQUENCE_LENGTH", "30")
+)
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
 SECRET_TEXT_RE = re.compile(
@@ -81,6 +116,7 @@ ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
 
 _BUNDLE_CACHE: dict[str, Any] | None = None
 _BUNDLE_MTIME: float | None = None
+_TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
 
 
 def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
@@ -101,6 +137,12 @@ def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
     if limit and len(redacted) > limit:
         return redacted[:limit] + "..."
     return redacted
+
+
+def _cache_get_or_load(key: str, loader):
+    if key not in _TRANSFORMER_MODEL_CACHE:
+        _TRANSFORMER_MODEL_CACHE[key] = loader()
+    return _TRANSFORMER_MODEL_CACHE[key]
 
 
 def _is_loopback_request(request: Request) -> bool:
@@ -156,6 +198,12 @@ class TrainRequest(BaseModel):
     completed_trade_sample_count: int | None = None
     quality_report: dict[str, Any] = {}
     governance_report: dict[str, Any] = {}
+    training_mode: str = "shadow"
+    model_stage: str = "shadow"
+    evaluation_policy: dict[str, Any] = {}
+    promotion_recommendation: dict[str, Any] = {}
+    persist_artifact: bool = False
+    confirm_phase3_rebuild: bool = False
 
 
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -597,6 +645,505 @@ def _predict_torch_patch_model(model_info: dict[str, Any], close_sequence: Any, 
         return None
 
 
+def _timeseries_close_sequence(features: dict[str, Any]) -> tuple[list[float], str, str]:
+    source = ""
+    raw: Any = []
+    for key in ("close_sequence", "recent_closes", "closes"):
+        candidate = features.get(key)
+        if candidate:
+            raw = candidate
+            source = key
+            break
+    closes = _safe_sequence(raw, limit=512)
+    if len(closes) < MIN_TIMESERIES_SEQUENCE_LENGTH:
+        return closes, "not_enough_real_close_sequence", source or "missing"
+    return closes, "", source
+
+
+def _load_timesfm_model(model_dir: str):
+    def loader():
+        from transformers import AutoModelForTimeSeriesPrediction
+
+        model = AutoModelForTimeSeriesPrediction.from_pretrained(
+            model_dir,
+            local_files_only=True,
+        )
+        model.eval()
+        return model
+
+    return _cache_get_or_load(f"timesfm::{model_dir}", loader)
+
+
+def _load_chronos2_pipeline(model_dir: str):
+    def loader():
+        from chronos import Chronos2Pipeline
+
+        return Chronos2Pipeline.from_pretrained(model_dir)
+
+    return _cache_get_or_load(f"chronos2::{model_dir}", loader)
+
+
+def _prediction_values(value: Any) -> list[float]:
+    if value is None:
+        return []
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "float"):
+            value = value.float()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+    except Exception:
+        pass
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return [number] if math.isfinite(number) else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    rows = list(value)
+    while rows and isinstance(rows[0], (list, tuple)):
+        if rows and all(isinstance(item, (int, float)) for item in rows):
+            break
+        rows = list(rows[0])
+    out = []
+    for item in rows:
+        try:
+            number = float(item)
+            if math.isfinite(number):
+                out.append(number)
+        except Exception:
+            continue
+    return out
+
+
+def _extract_timesfm_mean_predictions(output: Any) -> list[float]:
+    candidates = []
+    if isinstance(output, dict):
+        candidates.extend([
+            output.get("mean_predictions"),
+            output.get("prediction_outputs"),
+            output.get("predictions"),
+            output.get("full_predictions"),
+        ])
+    else:
+        candidates.extend([
+            getattr(output, "mean_predictions", None),
+            getattr(output, "prediction_outputs", None),
+            getattr(output, "predictions", None),
+            getattr(output, "full_predictions", None),
+        ])
+    for candidate in candidates:
+        values = _prediction_values(candidate)
+        if values:
+            return values
+    return []
+
+
+def _chronos_prediction_values(value: Any) -> list[float]:
+    if value is None:
+        return []
+    tensor_values = _chronos_tensor_prediction_values(value)
+    if tensor_values:
+        return tensor_values
+    if isinstance(value, dict):
+        for key in (
+            "median",
+            "mean",
+            "prediction",
+            "predictions",
+            "forecast",
+            "forecast_values",
+        ):
+            values = _prediction_values(value.get(key))
+            if values:
+                return values
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            for key in (
+                "median",
+                "mean",
+                "prediction",
+                "predictions",
+                "forecast",
+                "forecast_values",
+                "target",
+            ):
+                collected = []
+                for item in value:
+                    values = _prediction_values(item.get(key))
+                    if values:
+                        collected.extend(values)
+                if collected:
+                    return collected
+        for item in value:
+            values = _chronos_prediction_values(item)
+            if values:
+                return values
+    try:
+        if hasattr(value, "to_dict"):
+            records = value.to_dict("records")
+            values = _chronos_prediction_values(records)
+            if values:
+                return values
+        columns = list(getattr(value, "columns", []) or [])
+        for name in ("median", "mean", "prediction", "forecast", "target"):
+            if name in columns:
+                values = _prediction_values(value[name])
+                if values:
+                    return values
+    except Exception:
+        pass
+    return _prediction_values(value)
+
+
+def _chronos_tensor_prediction_values(value: Any) -> list[float]:
+    """Extract the median forecast path from Chronos tensor-style outputs."""
+    try:
+        item = value
+        if hasattr(item, "detach"):
+            item = item.detach()
+        if hasattr(item, "cpu"):
+            item = item.cpu()
+        if hasattr(item, "float"):
+            item = item.float()
+        if hasattr(item, "numpy"):
+            array = item.numpy()
+        else:
+            return []
+        arr = np.asarray(array, dtype=float)
+        if arr.ndim >= 3:
+            # Chronos direct predict returns (n_variates, n_quantiles, horizon).
+            arr = arr[0, arr.shape[1] // 2, :]
+        elif arr.ndim == 2:
+            arr = arr[arr.shape[0] // 2, :] if arr.shape[0] > 1 else arr[0, :]
+        elif arr.ndim != 1:
+            return []
+        return [float(item) for item in arr.ravel().tolist() if math.isfinite(float(item))]
+    except Exception:
+        return []
+
+
+def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    closes, reason, sequence_source = _timeseries_close_sequence(features)
+    if reason:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-primary",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": reason,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+    try:
+        import pandas as pd
+
+        model_dir = PHASE3_ROOT / "models" / "timeseries" / "amazon--chronos-2"
+        pipeline = _load_chronos2_pipeline(model_dir.as_posix())
+        horizon_step = int(
+            max(
+                1,
+                f(
+                    features,
+                    "horizon_steps",
+                    f(features, "forecast_horizon_steps", f(features, "horizon_minutes", 1.0)),
+                ),
+            )
+        )
+        end_timestamp = pd.Timestamp.utcnow()
+        try:
+            end_timestamp = end_timestamp.tz_localize(None)
+        except (AttributeError, TypeError):
+            pass
+        history = pd.DataFrame(
+            {
+                "id": [str(features.get("symbol") or "series")] * len(closes),
+                "timestamp": pd.date_range(
+                    end=end_timestamp,
+                    periods=len(closes),
+                    freq=str(features.get("chronos_freq") or "min"),
+                ),
+                "target": np.asarray(closes, dtype=np.float64),
+            }
+        )
+        try:
+            forecast = pipeline.predict_df(
+                history,
+                prediction_length=max(horizon_step, 1),
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column="id",
+                timestamp_column="timestamp",
+                target="target",
+                validate_inputs=False,
+                freq=str(features.get("chronos_freq") or "min"),
+            )
+            predictions = _chronos_prediction_values(forecast)
+        except Exception:
+            forecast = pipeline.predict(
+                [np.asarray(closes, dtype=np.float32)],
+                prediction_length=max(horizon_step, 1),
+                limit_prediction_length=False,
+            )
+            predictions = _chronos_prediction_values(forecast)
+        if not predictions:
+            return {
+                "available": False,
+                "kind": "timeseries",
+                "model": "chronos-2-shadow-primary",
+                "primary_model": chain.get("primary_model"),
+                "challenger_model": chain.get("challenger_model"),
+                "artifacts_ready": bool(chain.get("artifacts_ready")),
+                "actual_inference": False,
+                "reason": "chronos_empty_prediction",
+                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                "live_mutation": False,
+            }
+        horizon_index = min(horizon_step, len(predictions)) - 1
+        last_close = closes[-1]
+        forecast_price = float(predictions[horizon_index])
+        expected_move_pct = (
+            (forecast_price - last_close) / max(abs(last_close), 1e-9) * 100.0
+            if math.isfinite(forecast_price)
+            else 0.0
+        )
+        recent = np.array(closes[-80:], dtype=float)
+        diff = np.diff(recent)
+        realized_vol_pct = (
+            float(np.std(diff / max(abs(last_close), 1e-9)) * 100.0)
+            if len(diff)
+            else 0.0
+        )
+        confidence = clamp(abs(expected_move_pct) / max(realized_vol_pct * 2.5, 0.35), 0.0, 1.0)
+        direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
+        return {
+            "available": True,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-primary",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": True,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "horizon_step": horizon_step,
+            "forecast_price": round(forecast_price, 8),
+            "last_close": round(float(last_close), 8),
+            "expected_move_pct": round(expected_move_pct, 6),
+            "expected_return_pct": round(expected_move_pct, 6),
+            "direction": direction,
+            "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
+            "confidence": round(confidence, 6),
+            "realized_vol_pct": round(realized_vol_pct, 6),
+            "prediction_count": len(predictions),
+            "adapter": "chronos_2_pipeline_adapter",
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-primary",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": safe_error(exc, 220),
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+
+
+def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    closes, reason, sequence_source = _timeseries_close_sequence(features)
+    if reason:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": reason,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+    try:
+        import torch
+
+        model_dir = (
+            PHASE3_ROOT
+            / "models"
+            / "timeseries"
+            / "google--timesfm-2.5-200m-transformers"
+        )
+        model = _load_timesfm_model(model_dir.as_posix())
+        series = torch.tensor(closes, dtype=torch.float32)
+        output = None
+        errors = []
+        with torch.no_grad():
+            for past_values in ([series], getattr(series, "reshape", lambda *_: series)(1, -1)):
+                try:
+                    output = model(past_values=past_values)
+                    break
+                except Exception as exc:
+                    errors.append(safe_error(exc, 120))
+        predictions = _extract_timesfm_mean_predictions(output)
+        if not predictions:
+            return {
+                "available": False,
+                "kind": "timeseries",
+                "primary_model": chain.get("primary_model"),
+                "challenger_model": chain.get("challenger_model"),
+                "artifacts_ready": bool(chain.get("artifacts_ready")),
+                "actual_inference": False,
+                "reason": "timesfm_empty_prediction" if not errors else "; ".join(errors[-2:]),
+                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                "live_mutation": False,
+            }
+        horizon_step = int(
+            max(
+                1,
+                f(
+                    features,
+                    "horizon_steps",
+                    f(features, "forecast_horizon_steps", f(features, "horizon_minutes", 1.0)),
+                ),
+            )
+        )
+        horizon_index = min(horizon_step, len(predictions)) - 1
+        last_close = closes[-1]
+        forecast_price = float(predictions[horizon_index])
+        expected_move_pct = (
+            (forecast_price - last_close) / max(abs(last_close), 1e-9) * 100.0
+            if math.isfinite(forecast_price)
+            else 0.0
+        )
+        recent = np.array(closes[-80:], dtype=float)
+        diff = np.diff(recent)
+        realized_vol_pct = (
+            float(np.std(diff / max(abs(last_close), 1e-9)) * 100.0)
+            if len(diff)
+            else 0.0
+        )
+        confidence = clamp(abs(expected_move_pct) / max(realized_vol_pct * 2.5, 0.35), 0.0, 1.0)
+        direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
+        return {
+            "available": True,
+            "kind": "timeseries",
+            "model": "timesfm-2.5-shadow-challenger",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": True,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "horizon_step": horizon_step,
+            "forecast_price": round(forecast_price, 8),
+            "last_close": round(float(last_close), 8),
+            "expected_move_pct": round(expected_move_pct, 6),
+            "expected_return_pct": round(expected_move_pct, 6),
+            "direction": direction,
+            "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
+            "confidence": round(confidence, 6),
+            "realized_vol_pct": round(realized_vol_pct, 6),
+            "prediction_count": len(predictions),
+            "adapter": "timesfm_transformers_adapter",
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": safe_error(exc, 220),
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            "live_mutation": False,
+        }
+
+
+def _attach_timeseries_specialist_shadow(
+    payload: dict[str, Any],
+    *,
+    features: dict[str, Any],
+) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    primary_shadow = _run_chronos2_shadow(features)
+    challenger_shadow = _run_timesfm_shadow(features)
+    active = bool(primary_shadow.get("available") or challenger_shadow.get("available"))
+    specialist_shadow = primary_shadow if primary_shadow.get("available") else challenger_shadow
+    chain = dict(chain)
+    chain["actual_inference"] = active
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = active
+    payload["specialist_model_chain"] = chain
+    payload["chronos_shadow_expected_move_pct"] = primary_shadow.get("expected_move_pct")
+    payload["chronos_shadow_expected_return_pct"] = primary_shadow.get("expected_return_pct")
+    payload["chronos_shadow_side"] = primary_shadow.get("best_side")
+    payload["chronos_shadow_confidence"] = primary_shadow.get("confidence")
+    payload["chronos_shadow_horizon_step"] = primary_shadow.get("horizon_step")
+    payload["timesfm_shadow_expected_move_pct"] = challenger_shadow.get("expected_move_pct")
+    payload["timesfm_shadow_expected_return_pct"] = challenger_shadow.get("expected_return_pct")
+    payload["timesfm_shadow_side"] = challenger_shadow.get("best_side")
+    payload["timesfm_shadow_confidence"] = challenger_shadow.get("confidence")
+    payload["timesfm_shadow_horizon_step"] = challenger_shadow.get("horizon_step")
+    payload["professional_model_shadow"] = {
+        "kind": "timeseries",
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": active,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": "walk_forward_required",
+        "shadow_result": specialist_shadow,
+        "primary_shadow_result": primary_shadow,
+        "challenger_shadow_result": challenger_shadow,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+    }
+    payload["fallback_reason"] = (
+        "specialist_timeseries_shadow_only"
+        if active
+        else "specialist_timeseries_adapter_not_promoted"
+    )
+    payload["note"] = (
+        "TimesFM specialist inference is shadow-only and cannot mutate live routing."
+        if active
+        else payload.get("note")
+        or "Timeseries specialist adapters remain blocked until preflight and walk-forward pass."
+    )
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        "time_series_prediction",
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=payload.get("fallback_reason") or "",
+    )
+
+
 def _text_value(row: dict[str, Any]) -> str:
     text = str(row.get("text") or "").strip()
     platform = str(row.get("platform") or "")
@@ -647,15 +1194,580 @@ def _public_torch_patch_status(model_info: dict[str, Any] | None) -> dict[str, A
     }
 
 
+def _feature_coverage(features: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(features, dict):
+        return {"ratio": 0.0, "present": 0, "total": len(FEATURE_KEYS), "status": "missing"}
+    present = 0
+    for key in FEATURE_KEYS:
+        value = features.get(key)
+        if value is not None and str(value).strip() != "":
+            present += 1
+    total = max(len(FEATURE_KEYS), 1)
+    return {
+        "ratio": round(present / total, 6),
+        "present": present,
+        "total": total,
+        "status": "reported",
+    }
+
+
+def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "available",
+        "trained",
+        "primary_model",
+        "challenger_model",
+        "model_version",
+        "route_mode",
+        "fallback_reason",
+        "best_side",
+        "side",
+        "action",
+        "expected_return_pct",
+        "adjusted_expected_return_pct",
+        "loss_probability",
+        "profit_quality_score",
+        "expected_move_pct",
+        "confidence",
+        "urgency",
+        "feature_coverage",
+        "specialist_primary_model",
+        "specialist_challenger_model",
+        "specialist_artifacts_ready",
+        "specialist_inference_active",
+        "specialist_model_chain",
+        "professional_model_shadow",
+    ]
+    shadow = {
+        "tool": tool,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+    }
+    for key in keys:
+        if key in payload:
+            shadow[key] = payload.get(key)
+    return shadow
+
+
+def with_model_metadata(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    features: dict[str, Any] | None = None,
+    challenger_model: str | None = None,
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    defaults = {
+        "profit_prediction": "profit_v1_baseline",
+        "time_series_prediction": "timeseries_v1_baseline",
+        "sentiment_analysis": "sentiment_v1_baseline",
+        "exit_advice": "exit_v1_rules",
+    }
+    model_name = str(payload.get("model") or defaults.get(tool) or "local_ai_tools")
+    payload.setdefault("primary_model", model_name)
+    payload.setdefault("challenger_model", challenger_model)
+    payload.setdefault("model_version", f"{model_name}.v1")
+    payload.setdefault(
+        "route_mode",
+        "shadow_candidate" if bool(payload.get("trained")) else "shadow_observation",
+    )
+    payload.setdefault("fallback_reason", fallback_reason)
+    payload.setdefault("feature_coverage", _feature_coverage(features or {}))
+    payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
+    payload.setdefault("live_mutation", False)
+    if not isinstance(payload.get("shadow_payload"), dict):
+        payload["shadow_payload"] = _shadow_payload(tool, payload)
+    return payload
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _phase3_inventory_status() -> dict[str, Any]:
+    validation = _read_json_file(PHASE3_VALIDATION_REPORT_PATH)
+    download = _read_json_file(PHASE3_DOWNLOAD_REPORT_PATH)
+    rows = validation.get("models") if isinstance(validation.get("models"), list) else []
+    model_status = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_status.append(
+            {
+                "slot": row.get("slot") or row.get("role") or "",
+                "repo_id": row.get("repo_id") or row.get("model") or "",
+                "status": row.get("status") or ("ok" if row.get("required_any_ok") else "unknown"),
+                "path": row.get("path") or row.get("target") or "",
+            }
+        )
+    ok_count = sum(1 for row in model_status if row.get("status") == "ok")
+    downloaded_rows = download.get("models") if isinstance(download.get("models"), list) else []
+    downloaded_count = len(downloaded_rows) if downloaded_rows else ok_count
+    validation_all_ok = bool(model_status) and ok_count == len(model_status)
+    if validation.get("all_ok") is not None:
+        validation_all_ok = bool(validation.get("all_ok"))
+    return {
+        "downloaded_model_count": downloaded_count,
+        "validated_model_count": ok_count,
+        "validation_all_ok": validation_all_ok,
+        "imports_ok": bool(validation.get("imports_ok", validation_all_ok)),
+        "torch_cuda_visible": bool(validation.get("torch_cuda_visible", True)),
+        "model_status": model_status,
+        "download_manifest_path": PHASE3_DOWNLOAD_REPORT_PATH.as_posix(),
+        "validation_report_path": PHASE3_VALIDATION_REPORT_PATH.as_posix(),
+    }
+
+
+SPECIALIST_MODEL_CHAINS = {
+    "timeseries": [
+        {
+            "slot": "timeseries_primary",
+            "role": "primary",
+            "repo_id": "amazon/chronos-2",
+            "purpose": "online_primary_time_series_forecast",
+        },
+        {
+            "slot": "timeseries_challenger",
+            "role": "challenger",
+            "repo_id": "google/timesfm-2.5-200m-transformers",
+            "purpose": "shadow_challenger_time_series_forecast",
+        },
+        {
+            "slot": "timeseries_fallback",
+            "role": "fallback",
+            "repo_id": "ibm-granite/granite-timeseries-ttm-r2",
+            "purpose": "fallback_time_series_regime_check",
+        },
+    ],
+    "sentiment": [
+        {
+            "slot": "sentiment_primary",
+            "role": "primary",
+            "repo_id": "ProsusAI/finbert",
+            "purpose": "finance_sentiment_primary",
+        },
+        {
+            "slot": "sentiment_challenger",
+            "role": "challenger",
+            "repo_id": "yiyanghkust/finbert-tone",
+            "purpose": "finance_sentiment_challenger",
+        },
+    ],
+}
+
+SPECIALIST_ADAPTER_REQUIREMENTS = {
+    "timeseries_primary": {
+        "adapter": "chronos_2_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": ["chronos"],
+        "requires_walk_forward": True,
+    },
+    "timeseries_challenger": {
+        "adapter": "timesfm_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": ["timesfm"],
+        "requires_walk_forward": True,
+    },
+    "timeseries_fallback": {
+        "adapter": "granite_ttm_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+    "sentiment_primary": {
+        "adapter": "finbert_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+    "sentiment_challenger": {
+        "adapter": "finbert_tone_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+}
+IMPLEMENTED_SPECIALIST_ADAPTERS = {
+    "timeseries_primary",
+    "timeseries_challenger",
+    "sentiment_primary",
+    "sentiment_challenger",
+}
+
+
+def _import_state(module_name: str) -> dict[str, Any]:
+    try:
+        module = __import__(module_name)
+        return {
+            "module": module_name,
+            "available": True,
+            "version": str(getattr(module, "__version__", "")),
+        }
+    except Exception as exc:
+        return {
+            "module": module_name,
+            "available": False,
+            "error": safe_error(exc, 160),
+        }
+
+
+def _specialist_adapter_preflight(kind: str | None = None) -> dict[str, Any]:
+    chain_names = [kind] if kind in SPECIALIST_MODEL_CHAINS else sorted(SPECIALIST_MODEL_CHAINS)
+    chains = {name: _specialist_model_chain(name) for name in chain_names}
+    rows = []
+    blocked_reasons: set[str] = set()
+
+    for chain_name, chain in chains.items():
+        for model in chain.get("models", []):
+            if not isinstance(model, dict):
+                continue
+            slot = str(model.get("slot") or "")
+            req = SPECIALIST_ADAPTER_REQUIREMENTS.get(slot, {})
+            required_imports = [
+                _import_state(name) for name in req.get("required_imports", [])
+            ]
+            optional_imports = [
+                _import_state(name) for name in req.get("optional_imports", [])
+            ]
+            required_imports_ready = all(item.get("available") for item in required_imports)
+            artifact_ready = bool(model.get("artifact_ready"))
+            adapter_code_ready = slot in IMPLEMENTED_SPECIALIST_ADAPTERS
+            row_blockers = []
+            if not artifact_ready:
+                row_blockers.append("specialist_artifact_not_ready")
+            if not required_imports_ready:
+                row_blockers.append("specialist_required_import_missing")
+            if not adapter_code_ready:
+                row_blockers.append("specialist_adapter_not_implemented")
+            if bool(req.get("requires_walk_forward", True)):
+                row_blockers.append("walk_forward_required")
+            blocked_reasons.update(row_blockers)
+            rows.append(
+                {
+                    "kind": chain_name,
+                    "slot": slot,
+                    "repo_id": model.get("repo_id"),
+                    "role": model.get("role"),
+                    "adapter": req.get("adapter", ""),
+                    "artifact_ready": artifact_ready,
+                    "required_imports": required_imports,
+                    "optional_imports": optional_imports,
+                    "required_imports_ready": required_imports_ready,
+                    "adapter_code_ready": adapter_code_ready,
+                    "shadow_inference_ready": (
+                        artifact_ready and required_imports_ready and adapter_code_ready
+                    ),
+                    "requires_walk_forward": bool(req.get("requires_walk_forward", True)),
+                    "blocked_reasons": row_blockers,
+                }
+            )
+
+    return {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "root": PHASE3_ROOT.as_posix(),
+        "policy": "phase3_specialist_adapter_preflight",
+        "stage": "preflight_only",
+        "live_mutation": False,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "all_artifacts_ready": bool(rows) and all(row["artifact_ready"] for row in rows),
+        "all_required_imports_ready": bool(rows)
+        and all(row["required_imports_ready"] for row in rows),
+        "any_shadow_inference_ready": any(row["shadow_inference_ready"] for row in rows),
+        "blocked_reasons": sorted(blocked_reasons),
+        "chains": chains,
+        "adapters": rows,
+    }
+
+
+def _specialist_model_chain(kind: str) -> dict[str, Any]:
+    inventory = _phase3_inventory_status()
+    by_slot = {
+        str(row.get("slot") or ""): row
+        for row in inventory.get("model_status", [])
+        if isinstance(row, dict)
+    }
+    models = []
+    for expected in SPECIALIST_MODEL_CHAINS.get(kind, []):
+        row = by_slot.get(expected["slot"], {})
+        status = str(row.get("status") or "missing")
+        models.append({**expected, "status": status, "artifact_ready": status == "ok"})
+    primary = next((row for row in models if row.get("role") == "primary"), {})
+    challenger = next((row for row in models if row.get("role") == "challenger"), {})
+    required = [row for row in models if row.get("role") in {"primary", "challenger"}]
+    artifacts_ready = bool(required) and all(bool(row.get("artifact_ready")) for row in required)
+    return {
+        "kind": kind,
+        "primary_model": primary.get("repo_id", ""),
+        "challenger_model": challenger.get("repo_id", ""),
+        "artifacts_ready": artifacts_ready,
+        "actual_inference": False,
+        "activation_gate": "specialist_adapter_and_walk_forward_required",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+        "models": models,
+    }
+
+
+def _attach_specialist_shadow(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    features: dict[str, Any],
+    fallback_reason: str,
+) -> dict[str, Any]:
+    chain = _specialist_model_chain(kind)
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = False
+    payload["specialist_model_chain"] = chain
+    payload["professional_model_shadow"] = {
+        "kind": kind,
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": False,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": "specialist_adapter_and_walk_forward_required",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+    }
+    payload["fallback_reason"] = fallback_reason
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        tool,
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=fallback_reason,
+    )
+
+
+def _attach_baseline_only_shadow(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    features: dict[str, Any],
+    fallback_reason: str,
+) -> dict[str, Any]:
+    chain = _specialist_model_chain(kind)
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = False
+    payload["specialist_model_chain"] = chain
+    payload["professional_model_shadow"] = {
+        "kind": kind,
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": False,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": fallback_reason,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+    }
+    payload["fallback_reason"] = fallback_reason
+    return with_model_metadata(
+        tool,
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=fallback_reason,
+    )
+
+
+def _text_items_from_features(features: dict[str, Any], limit: int = 12) -> list[str]:
+    raw_items = (
+        features.get("recent_headlines")
+        or features.get("headlines")
+        or features.get("news_headlines")
+        or features.get("texts")
+        or []
+    )
+    if isinstance(raw_items, str):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        return []
+    items = []
+    for raw in raw_items[:limit]:
+        text = str(raw or "").strip()
+        if text:
+            items.append(text[:512])
+    return items
+
+
+def _sentiment_score_from_label(label: str, score: float) -> float:
+    normalized = str(label or "").strip().lower()
+    if normalized == "positive":
+        return abs(score)
+    if normalized == "negative":
+        return -abs(score)
+    return 0.0
+
+
+def _load_transformer_classifier(model_dir: str):
+    def loader():
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            BertConfig,
+            BertForSequenceClassification,
+            BertTokenizer,
+        )
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        except Exception:
+            vocab_path = Path(model_dir) / "vocab.txt"
+            if not vocab_path.exists():
+                raise
+            tokenizer = BertTokenizer.from_pretrained(model_dir, local_files_only=True)
+        try:
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_dir,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            config_path = Path(model_dir) / "config.json"
+            if "model_type" not in str(exc) or not config_path.exists():
+                raise
+            config = BertConfig.from_json_file(config_path.as_posix())
+            config.model_type = "bert"
+            model = BertForSequenceClassification.from_pretrained(
+                model_dir,
+                config=config,
+                local_files_only=True,
+            )
+        model.eval()
+        return tokenizer, model
+
+    return _cache_get_or_load(model_dir, loader)
+
+
+def _predict_transformer_sentiment(model_dir: str, texts: list[str]) -> dict[str, Any]:
+    if not texts:
+        return {"available": False, "reason": "no_text_inputs"}
+    try:
+        import torch
+
+        tokenizer, model = _load_transformer_classifier(model_dir)
+        encoded = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=192,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            output = model(**encoded)
+            probabilities = torch.softmax(output.logits, dim=-1)
+        id2label = getattr(model.config, "id2label", {}) or {}
+        rows = []
+        scores = []
+        for index, text in enumerate(texts):
+            probs = probabilities[index]
+            best_index = int(torch.argmax(probs).item())
+            confidence = float(probs[best_index].item())
+            label = str(id2label.get(best_index) or id2label.get(str(best_index)) or best_index)
+            signed = _sentiment_score_from_label(label, confidence)
+            scores.append(signed)
+            rows.append(
+                {
+                    "label": label,
+                    "confidence": round(confidence, 6),
+                    "signed_score": round(signed, 6),
+                    "text_preview": text[:120],
+                }
+            )
+        avg_score = float(sum(scores) / max(len(scores), 1))
+        return {
+            "available": True,
+            "text_count": len(texts),
+            "score": round(avg_score, 6),
+            "label": "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral",
+            "rows": rows,
+        }
+    except Exception as exc:
+        return {"available": False, "reason": safe_error(exc, 220)}
+
+
+def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    texts = _text_items_from_features(features)
+    chain = _specialist_model_chain("sentiment")
+    model_dirs = {
+        "sentiment_primary": PHASE3_ROOT
+        / "models"
+        / "sentiment"
+        / "ProsusAI--finbert",
+        "sentiment_challenger": PHASE3_ROOT
+        / "models"
+        / "sentiment"
+        / "yiyanghkust--finbert-tone",
+    }
+    predictions = {}
+    for slot, path in model_dirs.items():
+        predictions[slot] = _predict_transformer_sentiment(path.as_posix(), texts)
+    available = any(item.get("available") for item in predictions.values())
+    primary = predictions.get("sentiment_primary", {})
+    challenger = predictions.get("sentiment_challenger", {})
+    score_values = [
+        float(item.get("score"))
+        for item in (primary, challenger)
+        if item.get("available") and item.get("score") is not None
+    ]
+    avg_score = sum(score_values) / len(score_values) if score_values else 0.0
+    disagreement = (
+        abs(float(primary.get("score") or 0.0) - float(challenger.get("score") or 0.0))
+        if primary.get("available") and challenger.get("available")
+        else None
+    )
+    return {
+        "available": available,
+        "kind": "sentiment",
+        "text_count": len(texts),
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": available,
+        "score": round(avg_score, 6),
+        "label": "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral",
+        "disagreement": round(disagreement, 6) if disagreement is not None else None,
+        "predictions": predictions,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     bundle = load_bundle()
     metadata = {}
     if bundle and isinstance(bundle.get("metadata"), dict):
         metadata = bundle["metadata"]
-    return {
+    payload = {
         "ok": True,
-        "service": "trade-local-ai-tools",
+        "service": "phase3_quant_api",
+        "root": PHASE3_ROOT.as_posix(),
+        "server_role": "dedicated_cryptocurrency_quant_model_server",
+        "storage_policy": "new model/cache/training/runtime/log data under /data/BB",
+        "legacy_policy": "old data preserved in place but not referenced by Phase 3 runtime",
+        "port": PHASE3_API_PORT,
+        "policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+        "live_trading_mutation": False,
+        "route_mode": "shadow_observation",
         "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
         "trained_models_available": bool(bundle),
         "trained_at": metadata.get("trained_at"),
@@ -666,7 +1778,14 @@ def health() -> dict[str, Any]:
         "quality_report": metadata.get("quality_report", {}),
         "governance_report": metadata.get("governance_report", {}),
         "review_backend": "disabled_use_trading_app_online_model",
+        "model_dir": MODEL_DIR.as_posix(),
     }
+    payload.update(_phase3_inventory_status())
+    payload["specialist_model_chains"] = {
+        "timeseries": _specialist_model_chain("timeseries"),
+        "sentiment": _specialist_model_chain("sentiment"),
+    }
+    return payload
 
 
 @app.get("/models/status")
@@ -677,12 +1796,19 @@ def local_models_status() -> dict[str, Any]:
             "available": False,
             "message": "No trained local quant bundle found; heuristic fallback is active.",
             "model_path": str(BUNDLE_PATH),
+            "specialist_adapter_preflight": _specialist_adapter_preflight(),
         }
     return {
         "available": True,
         "model_path": str(BUNDLE_PATH),
+        "specialist_adapter_preflight": _specialist_adapter_preflight(),
         **(bundle.get("metadata") or {}),
     }
+
+
+@app.get("/specialists/preflight")
+def specialist_preflight(kind: str | None = None) -> dict[str, Any]:
+    return _specialist_adapter_preflight(kind)
 
 
 @app.post("/train")
@@ -787,7 +1913,19 @@ def train(req: TrainRequest) -> dict[str, Any]:
         sample for sample in (req.trade_samples or []) if not bool(sample.get("exclude_from_training"))
     ]
     profiles = _train_profiles(trainable_trade_samples)
+    evaluation_policy = req.evaluation_policy or {
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "live_mutation": False,
+        "requires_walk_forward": True,
+        "phase": "phase3_model_factory",
+    }
+    evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
+    evaluation_policy.setdefault("live_mutation", False)
+    evaluation_policy.setdefault("requires_walk_forward", True)
+    evaluation_policy.setdefault("phase", "phase3_model_factory")
     metadata = {
+        "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "phase": "phase3_model_factory",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "source": req.source,
         "shadow_sample_count": len(rows),
@@ -814,6 +1952,16 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
+        "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "training_mode": str(req.training_mode or "shadow"),
+        "model_stage": str(req.model_stage or "shadow"),
+        "evaluation_policy": evaluation_policy,
+        "artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild),
+        "preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild),
+        "persist_artifact_requested": bool(req.persist_artifact),
+        "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
+        "promotion_recommendation": req.promotion_recommendation or {},
         "training_objective": "Predict executable net return after estimated fees/slippage; win rate is auxiliary.",
         "models": {
             "profit": "ExtraTreesRegressor long/short expected return",
@@ -849,6 +1997,18 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "transformers_sentiment_backend": transformers_sentiment_backend,
         "profiles": profiles,
     }
+    if not req.persist_artifact:
+        return {
+            "trained": False,
+            "reason": "phase3_preflight_no_artifact_write",
+            **metadata,
+        }
+    if not req.confirm_phase3_rebuild:
+        return {
+            "trained": False,
+            "reason": "phase3_rebuild_confirmation_required",
+            **metadata,
+        }
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     dump_trusted_joblib_bundle(bundle, BUNDLE_PATH)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -883,7 +2043,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             edge = abs(adjusted_long - adjusted_short)
             loss_prob = long_loss_prob if best_side == "long" else short_loss_prob
             quality = max(best_expected, 0.0) + edge * 0.45 - loss_prob * 0.18
-            return {
+            return _attach_baseline_only_shadow("profit_prediction", {
                 "available": True,
                 "trained": True,
                 "model": "local-profit-trained-v2",
@@ -894,16 +2054,18 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "adjusted_long_return_pct": round(adjusted_long, 4),
                 "adjusted_short_return_pct": round(adjusted_short, 4),
                 "expected_return_pct": round(best_expected, 4),
+                "adjusted_expected_return_pct": round(best_expected, 4),
                 "profit_edge_pct": round(edge, 4),
                 "profit_quality_score": round(quality, 4),
                 "long_loss_probability": round(long_loss_prob, 4),
                 "short_loss_probability": round(short_loss_prob, 4),
+                "loss_probability": round(loss_prob, 4),
                 "symbol_side_profile": {
                     "long": long_profile,
                     "short": short_profile,
                 },
                 "note": "Trained profit-first model: expected return and loss probability drive the score; win rate is not the objective.",
-            }
+            }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
     else:
@@ -921,8 +2083,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     best_side = "long" if long_expected >= short_expected else "short"
     best_expected = long_expected if best_side == "long" else short_expected
     edge = abs(long_expected - short_expected)
+    loss_prob = clamp((risk_penalty + max(-best_expected, 0.0)) / 2.0, 0.0, 1.0)
     quality = max(best_expected, 0.0) + edge * 0.35 - risk_penalty * 0.5
-    return {
+    return _attach_baseline_only_shadow("profit_prediction", {
         "available": True,
         "trained": False,
         "model": "local-profit-heuristic-v1",
@@ -931,12 +2094,16 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
         "long_expected_return_pct": round(long_expected, 4),
         "short_expected_return_pct": round(short_expected, 4),
         "expected_return_pct": round(best_expected, 4),
+        "adjusted_expected_return_pct": round(best_expected, 4),
         "profit_edge_pct": round(edge, 4),
         "profit_quality_score": round(quality, 4),
+        "loss_probability": round(loss_prob, 4),
+        "long_loss_probability": round(clamp((risk_penalty + max(-long_expected, 0.0)) / 2.0, 0.0, 1.0), 4),
+        "short_loss_probability": round(clamp((risk_penalty + max(-short_expected, 0.0)) / 2.0, 0.0, 1.0), 4),
         "risk_penalty": round(risk_penalty, 4),
         "fallback_error": fallback_error,
         "note": "Profit-first local signal; win rate is not used as the primary objective.",
-    }
+    }, kind="profit", features=features, fallback_reason=fallback_error or "trained_profit_model_unavailable")
 
 
 @app.post("/timeseries/predict")
@@ -958,7 +2125,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 primary = sorted(predictions, key=lambda r: abs(float(r["expected_move_pct"])), reverse=True)[0]
                 confidence = clamp(abs(float(primary["expected_move_pct"])) / 0.8, 0.0, 1.0)
                 best_side = "long" if primary["direction"] == "up" else "short" if primary["direction"] == "down" else "hold"
-                return {
+                return with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
                     "model": "local-timeseries-trained-v2",
@@ -971,7 +2138,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "expected_return_pct": primary["expected_move_pct"],
                     "confidence": round(confidence, 4),
                     "predictions": predictions,
-                }
+                }, features=features)
         except Exception:
             pass
 
@@ -982,7 +2149,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     confidence = clamp(abs(forecast) / (vol * 1.8 + 1e-6), 0.0, 1.0)
     direction = "up" if forecast > 0 else "down" if forecast < 0 else "flat"
     best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
-    return {
+    return with_model_metadata("time_series_prediction", {
         "available": True,
         "trained": False,
         "model": "local-timeseries-ensemble-v1",
@@ -994,7 +2161,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
         "expected_move_pct": round(forecast * 100.0, 4),
         "expected_return_pct": round(forecast * 100.0, 4),
         "confidence": round(confidence, 4),
-    }
+    }, features=features, fallback_reason="trained_timeseries_model_unavailable")
 
 
 @app.post("/timeseries/deep/predict")
@@ -1004,19 +2171,19 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     bundle = load_bundle()
     torch_patch_model = (bundle or {}).get("torch_patch_model") or {}
     sequence_model = (bundle or {}).get("deep_sequence_model") or {}
+    close_sequence, sequence_reason, sequence_source = _timeseries_close_sequence(features)
+    volume_sequence = features.get("volume_sequence") or features.get("recent_volumes")
     try:
-        close_sequence = features.get("close_sequence") or features.get("recent_closes")
-        volume_sequence = features.get("volume_sequence") or features.get("recent_volumes")
-        if not close_sequence:
-            close = f(features, "current_price", f(features, "close", 0.0))
-            returns = [f(features, "returns_20"), f(features, "returns_5"), f(features, "returns_1")]
-            close_sequence = [close * (1.0 - r / 100.0) for r in returns if close > 0] + [close]
-        torch_expected = _predict_torch_patch_model(torch_patch_model, close_sequence, volume_sequence)
+        torch_expected = (
+            None
+            if sequence_reason
+            else _predict_torch_patch_model(torch_patch_model, close_sequence, volume_sequence)
+        )
         if torch_expected is not None:
             confidence = clamp(abs(torch_expected) / 0.8, 0.0, 1.0)
             direction = "up" if torch_expected > 0 else "down" if torch_expected < 0 else "flat"
             best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
-            return {
+            return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
                 "model": "local-torch-patch-timeseries-v1",
@@ -1033,14 +2200,16 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "endpoint": "timeseries_deep",
                 "model_family": "PatchTST/TFT-style torch sequence model",
                 "status": "trained_torch_sequence_model",
-            }
+                "sequence_length": len(close_sequence),
+                "sequence_source": sequence_source,
+            }, features=features)
         model = sequence_model.get("model")
-        if model:
+        if model and not sequence_reason:
             expected = float(model.predict([sequence_features(close_sequence, volume_sequence)])[0])
             confidence = clamp(abs(expected) / 0.8, 0.0, 1.0)
             direction = "up" if expected > 0 else "down" if expected < 0 else "flat"
             best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
-            return {
+            return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
                 "model": "local-sequence-timeseries-v1",
@@ -1057,15 +2226,33 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "endpoint": "timeseries_deep",
                 "model_family": "PatchTST/TFT-style sequence model",
                 "status": "trained_sequence_model",
-            }
+                "sequence_length": len(close_sequence),
+                "sequence_source": sequence_source,
+            }, features=features)
     except Exception:
         pass
     base = timeseries_predict(req)
-    base["endpoint"] = "timeseries_deep"
-    base["model_family"] = "PatchTST/TFT-compatible"
-    base["status"] = "trained_horizon_fallback" if base.get("trained") else "heuristic_fallback"
-    base["note"] = "Sequence model unavailable for this request; using trained horizon ensemble."
-    return base
+    base.update(
+        {
+            "endpoint": "timeseries_deep",
+            "model_family": "Chronos-2/TimesFM shadow-ready time-series chain",
+            "status": (
+                "trained_horizon_fallback" if base.get("trained") else "heuristic_fallback"
+            ),
+            "note": (
+                "Chronos-2/TimesFM artifacts are audited separately; this response remains "
+                "baseline-only until specialist adapters pass walk-forward gates."
+            ),
+            "sequence_input_status": sequence_reason or "real_sequence_ready",
+            "sequence_length": len(close_sequence),
+            "sequence_source": sequence_source,
+            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+        }
+    )
+    return _attach_timeseries_specialist_shadow(
+        base,
+        features=features,
+    )
 
 
 @app.post("/sentiment/analyze")
@@ -1112,7 +2299,7 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
         risk = "normal"
     best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
     expected_from_sentiment = round(trained_expected, 4) if trained_expected is not None else None
-    return {
+    return with_model_metadata("sentiment_analysis", {
         "available": True,
         "trained": trained_expected is not None,
         "model": "local-sentiment-trained-v2" if trained_expected is not None else "local-sentiment-light-v1",
@@ -1128,18 +2315,56 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
         "risk_level": risk,
         "mentions": int(mentions),
         "articles": int(articles),
-    }
+    }, features=features, fallback_reason="" if trained_expected is not None else "trained_sentiment_model_unavailable")
 
 
 @app.post("/sentiment/deep/analyze")
 def deep_sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
     """Independent text sentiment service slot for CryptoBERT/FinBERT style models."""
+    features = req.features or {}
     base = sentiment_analyze(req)
-    base["endpoint"] = "sentiment_deep"
-    base["model_family"] = "CryptoBERT/FinBERT-style text model"
-    base["status"] = "trained_text_model" if base.get("text_sentiment_score") is not None else ("trained_calibrator" if base.get("trained") else "feature_fallback")
-    base["note"] = "Uses an independently trained local text sentiment model when headlines/text are supplied."
-    return base
+    specialist_shadow = _run_finbert_shadow(features)
+    base.update(
+        {
+            "endpoint": "sentiment_deep",
+            "model_family": "FinBERT shadow-ready sentiment chain",
+            "status": (
+                "specialist_shadow_inference"
+                if specialist_shadow.get("available")
+                else "trained_text_model"
+                if base.get("text_sentiment_score") is not None
+                else ("trained_calibrator" if base.get("trained") else "feature_fallback")
+            ),
+            "note": (
+                "FinBERT specialist inference is shadow-only and cannot mutate live routing."
+                if specialist_shadow.get("available")
+                else "FinBERT artifacts are audited separately; this response remains baseline-only "
+                "until specialist adapters pass evaluation gates."
+            ),
+        }
+    )
+    payload = _attach_specialist_shadow(
+        "sentiment_analysis",
+        base,
+        kind="sentiment",
+        features=features,
+        fallback_reason=(
+            "specialist_sentiment_shadow_only"
+            if specialist_shadow.get("available")
+            else "specialist_sentiment_adapter_not_promoted"
+        ),
+    )
+    payload["specialist_inference_active"] = bool(specialist_shadow.get("available"))
+    payload["professional_model_shadow"].update(specialist_shadow)
+    payload["professional_model_shadow"]["baseline_response"] = True
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        "sentiment_analysis",
+        payload,
+        features=features,
+        challenger_model=str(payload.get("specialist_challenger_model") or ""),
+        fallback_reason=payload.get("fallback_reason") or "",
+    )
 
 
 @app.post("/exit/advise")
@@ -1153,14 +2378,15 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
         if symbol_key(pos.get("symbol")) == symbol:
             positions.append(pos)
     if not positions:
-        return {
+        return with_model_metadata("exit_advice", {
             "available": True,
             "trained": bool(bundle),
             "model": "local-exit-advisor-v1",
             "symbol": req.symbol,
-            "action": "no_position",
+            "action": "hold",
+            "no_matching_position": True,
             "reason": "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。",
-        }
+        }, features=features, fallback_reason="no_matching_open_position")
     advices = []
     for pos in positions:
         side = str(pos.get("side") or "").lower()
@@ -1191,9 +2417,9 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
                 "建议优先保护利润，避免盈利仓拖成亏损仓。"
             )
         elif pnl_pct <= -0.012:
-            action = "close_if_ai_agrees"
+            action = "reduce_or_close"
             urgency = 0.72
-            reason = "亏损扩大到本地平仓模型容忍线之外，若 AI 也确认应优先退出。"
+            reason = "亏损扩大到本地平仓模型容忍线之外，建议减仓或平仓压缩尾部亏损。"
         elif pnl_pct >= 0.012 and profit_factor >= 1.2:
             action = "trail_profit"
             urgency = 0.52
@@ -1211,7 +2437,7 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
             "small_win_big_loss_risk": round(small_win_big_loss_risk, 4),
         })
     top = sorted(advices, key=lambda r: float(r["urgency"]), reverse=True)[0]
-    return {
+    return with_model_metadata("exit_advice", {
         "available": True,
         "trained": bool(bundle),
         "model": "local-exit-advisor-v1",
@@ -1220,7 +2446,7 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
         "urgency": top["urgency"],
         "reason": top["reason"],
         "advices": advices,
-    }
+    }, features=features)
 
 
 @app.get("/v1/models")
@@ -1238,75 +2464,286 @@ def chat_completions(_payload: dict[str, Any]) -> Any:
 '''
 
 
-def main() -> None:
-    info = load_model_server_info_from_platform(ROOT)
-    ssh = connect_remote_ssh(ROOT, timeout=15, info=info)
-    try:
-        run_remote_text(
-            ssh,
-            "mkdir -p /data/trade_ai/tools /data/trade_ai/logs /data/trade_ai/systemd && "
-            "touch /data/trade_ai/local_ai_tools.env && chmod 600 /data/trade_ai/local_ai_tools.env",
-            timeout=120,
-        )
-        sftp = ssh.open_sftp()
-        with sftp.file("/data/trade_ai/tools/local_ai_tools_api.py", "w") as remote:
-            remote.write(SERVICE_CODE)
-        sftp.close()
-        python_bin = "/home/linux/anaconda3/envs/trade_ml/bin/python"
-        env_bin = "/home/linux/anaconda3/envs/trade_ml/bin"
-        service = (
-            textwrap.dedent("""
+def sh(value: str | int | float) -> str:
+    text = str(value)
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def render_phase3_quant_api_service() -> str:
+    """Render the Phase 3 quant API systemd unit rooted under /data/BB."""
+
+    env_bin = PurePosixPath(PHASE3_PYTHON_BIN).parent.as_posix()
+    return (
+        textwrap.dedent(
+            f"""
             [Unit]
-            Description=Trade Local AI Tools API
-            After=network-online.target qwen3-32b-main.service
+            Description=BB Phase 3 Quant API - local_ai_tools v2 shadow contracts
+            After=network-online.target
             Wants=network-online.target
 
             [Service]
-            User=linux
-            WorkingDirectory=/data/trade_ai/tools
-            Environment=PATH=__ENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            Type=simple
+            User=root
+            WorkingDirectory={PHASE3_APP_DIR}
+            Environment=PATH={env_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            Environment=BB_PHASE3_ROOT={PHASE3_ROOT}
+            Environment=PHASE3_QUANT_API_PORT={PHASE3_API_PORT}
+            Environment=LOCAL_AI_TOOLS_MODEL_DIR={PHASE3_MODEL_DIR}
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
-            Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002
+            Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001
             Environment=LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT=0.12
             Environment=LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT=0.18
-            EnvironmentFile=-/data/trade_ai/local_ai_tools.env
+            EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
-            ExecStart=__PYTHON_BIN__ -m uvicorn local_ai_tools_api:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 5
+            ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 5
             Restart=always
             RestartSec=5
-            StandardOutput=append:/data/trade_ai/logs/local_ai_tools_api.log
-            StandardError=append:/data/trade_ai/logs/local_ai_tools_api.err.log
+            StandardOutput=append:{PHASE3_LOG_DIR}/phase3_quant_api.log
+            StandardError=append:{PHASE3_LOG_DIR}/phase3_quant_api.err.log
 
             [Install]
             WantedBy=multi-user.target
-            """).strip().replace("__ENV_BIN__", env_bin).replace("__PYTHON_BIN__", python_bin)
-            + "\n"
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def render_phase3_deploy_plan() -> dict[str, Any]:
+    return {
+        "policy_id": PHASE3_POLICY_ID,
+        "phase3_root": PHASE3_ROOT,
+        "service_name": PHASE3_SERVICE_NAME,
+        "app_dir": PHASE3_APP_DIR,
+        "systemd_dir": PHASE3_SYSTEMD_DIR,
+        "log_dir": PHASE3_LOG_DIR,
+        "model_dir": PHASE3_MODEL_DIR,
+        "runtime_dir": PHASE3_RUNTIME_DIR,
+        "env_file": PHASE3_ENV_FILE,
+        "python_bin": PHASE3_PYTHON_BIN,
+        "port": PHASE3_API_PORT,
+        "health_url": f"http://127.0.0.1:{PHASE3_API_PORT}/health",
+        "shadow_only": True,
+        "live_mutation": False,
+        "promotion_flow": "shadow_to_canary_to_live",
+        "legacy_root_used": False,
+    }
+
+
+def _upload_text(ssh, remote_path: str, content: str, *, mode: int = 0o644) -> None:
+    directory = posixpath.dirname(remote_path)
+    run_remote_text(ssh, f"mkdir -p {sh(directory)}", timeout=30, check=True)
+    sftp = ssh.open_sftp()
+    try:
+        with sftp.file(remote_path, "w") as remote:
+            remote.write(content)
+        sftp.chmod(remote_path, mode)
+    finally:
+        sftp.close()
+
+
+def _remote_preflight_command() -> str:
+    return " && ".join(
+        [
+            f"test -x {sh(PHASE3_PYTHON_BIN)}",
+            f"mkdir -p {sh(PHASE3_APP_DIR)} {sh(PHASE3_SYSTEMD_DIR)} {sh(PHASE3_LOG_DIR)} "
+            f"{sh(PHASE3_MODEL_DIR)} {sh(PHASE3_RUNTIME_DIR)} {sh(f'{PHASE3_ROOT}/manifests')} "
+            f"{sh(PurePosixPath(PHASE3_ENV_FILE).parent.as_posix())}",
+            f"touch {sh(PHASE3_ENV_FILE)}",
+            f"chmod 600 {sh(PHASE3_ENV_FILE)}",
+            f"{PHASE3_PYTHON_BIN} - <<'PY'\n"
+            "import fastapi, joblib, numpy, sklearn, uvicorn\n"
+            "print('phase3_quant_api_deps_ok')\n"
+            "PY",
+        ]
+    )
+
+
+def _stop_legacy_8101_holder_command() -> str:
+    """Stop the old ad-hoc 8101 inventory API before systemd owns the port."""
+
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"new_service={sh(PHASE3_SERVICE_NAME)}",
+            f"new_app={sh(PHASE3_APP_DIR + '/local_ai_tools_api.py')}",
+            "holders=$(ss -ltnp 'sport = :8101' 2>/dev/null | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u || true)",
+            "for pid in ${holders}; do",
+            "  [ -n \"${pid}\" ] || continue",
+            "  cmdline=$(tr '\\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)",
+            "  unit=$(systemctl status ${pid} --no-pager 2>/dev/null | sed -n 's/^.*CGroup: \\/system.slice\\/\\([^ ]*\\.service\\).*$/\\1/p' | head -1 || true)",
+            "  if printf '%s' \"${cmdline}\" | grep -F \"$new_app\" >/dev/null; then",
+            "    continue",
+            "  fi",
+            "  if [ -n \"${unit}\" ] && [ \"${unit}\" != \"$new_service\" ]; then",
+            "    systemctl stop \"${unit}\" || true",
+            "    systemctl disable \"${unit}\" || true",
+            "  fi",
+            "  if kill -0 \"${pid}\" 2>/dev/null; then",
+            "    kill \"${pid}\" || true",
+            "    sleep 2",
+            "  fi",
+            "  if kill -0 \"${pid}\" 2>/dev/null; then",
+            "    kill -9 \"${pid}\" || true",
+            "  fi",
+            "done",
+        ]
+    )
+
+
+def _remote_smoke_command() -> str:
+    return (
+        f"{PHASE3_PYTHON_BIN} - <<'PY'\n"
+        "import json\n"
+        "import urllib.request\n"
+        "\n"
+        f"BASE = 'http://127.0.0.1:{PHASE3_API_PORT}'\n"
+        f"ENV_FILE = {PHASE3_ENV_FILE!r}\n"
+        "\n"
+        "def api_key():\n"
+        "    try:\n"
+        "        for raw_line in open(ENV_FILE, encoding='utf-8'):\n"
+        "            line = raw_line.strip()\n"
+        "            if line.startswith('LOCAL_AI_TOOLS_API_KEY='):\n"
+        "                return line.split('=', 1)[1].strip().strip(chr(34)).strip(chr(39))\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n"
+        "    return ''\n"
+        "\n"
+        "def get(path):\n"
+        "    headers = {}\n"
+        "    key = api_key()\n"
+        "    if key:\n"
+        "        headers['Authorization'] = 'Bearer ' + key\n"
+        "    request = urllib.request.Request(BASE + path, headers=headers)\n"
+        "    with urllib.request.urlopen(request, timeout=8) as response:\n"
+        "        return json.loads(response.read(256000).decode('utf-8'))\n"
+        "\n"
+        "def post(path, payload):\n"
+        "    data = json.dumps(payload).encode('utf-8')\n"
+        "    headers = {'Content-Type': 'application/json'}\n"
+        "    key = api_key()\n"
+        "    if key:\n"
+        "        headers['Authorization'] = 'Bearer ' + key\n"
+        "    request = urllib.request.Request(\n"
+        "        BASE + path,\n"
+        "        data=data,\n"
+        "        headers=headers,\n"
+        "        method='POST',\n"
+        "    )\n"
+        "    with urllib.request.urlopen(request, timeout=8) as response:\n"
+        "        return json.loads(response.read(256000).decode('utf-8'))\n"
+        "\n"
+        "features = {\n"
+        "    'current_price': 100.0,\n"
+        "    'close': 100.0,\n"
+        "    'returns_1': 0.01,\n"
+        "    'returns_5': 0.02,\n"
+        "    'returns_20': 0.03,\n"
+        "    'rsi_14': 55.0,\n"
+        "    'volume_ratio': 1.1,\n"
+        "}\n"
+        "health = get('/health')\n"
+        "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
+        "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
+        "assert health.get('service') == 'phase3_quant_api', health\n"
+        "assert health.get('root') == '/data/BB', health\n"
+        "assert health.get('live_mutation') is False, health\n"
+        "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
+        "assert profit.get('live_mutation') is False, profit\n"
+        "assert 'adjusted_expected_return_pct' in profit, profit\n"
+        "assert 'loss_probability' in profit, profit\n"
+        "assert exit_advice.get('action') == 'hold', exit_advice\n"
+        "assert exit_advice.get('no_matching_position') is True, exit_advice\n"
+        "print(json.dumps({\n"
+        "    'event': 'phase3_quant_api_smoke_ok',\n"
+        "    'health': health,\n"
+        "    'profit_contract': {\n"
+        "        'shadow_payload': bool(profit.get('shadow_payload')),\n"
+        "        'live_mutation': profit.get('live_mutation'),\n"
+        "        'promotion_flow': profit.get('promotion_flow'),\n"
+        "    },\n"
+        "    'exit_contract': {\n"
+        "        'action': exit_advice.get('action'),\n"
+        "        'no_matching_position': exit_advice.get('no_matching_position'),\n"
+        "    },\n"
+        "}, ensure_ascii=False, indent=2, sort_keys=True))\n"
+        "PY"
+    )
+
+
+def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> None:
+    safe_print(json.dumps(render_phase3_deploy_plan(), ensure_ascii=False, indent=2, sort_keys=True))
+    if plan_only:
+        return
+
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
+    try:
+        run_remote_text(ssh, _remote_preflight_command(), timeout=180, check=True)
+        _upload_text(ssh, f"{PHASE3_APP_DIR}/local_ai_tools_api.py", SERVICE_CODE)
+        staged_service_path = f"{PHASE3_SYSTEMD_DIR}/{PHASE3_SERVICE_NAME}"
+        _upload_text(ssh, staged_service_path, render_phase3_quant_api_service())
+        _upload_text(
+            ssh,
+            f"{PHASE3_ROOT}/manifests/phase3_quant_api_manifest.json",
+            json.dumps(render_phase3_deploy_plan(), ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
         )
-        remote_service_path = "/data/trade_ai/systemd/local-ai-tools.service"
-        with ssh.open_sftp().file(remote_service_path, "w") as remote:
-            remote.write(service)
         run_remote_text(
             ssh,
-            f"sudo install -m 0644 {remote_service_path} /etc/systemd/system/local-ai-tools.service && "
-            "sudo systemctl daemon-reload && "
-            "sudo systemctl enable local-ai-tools.service && "
-            "sudo systemctl restart local-ai-tools.service",
-            timeout=120,
+            f"install -m 0644 {sh(staged_service_path)} /etc/systemd/system/{sh(PHASE3_SERVICE_NAME)} && "
+            "systemctl daemon-reload",
+            timeout=60,
+            check=True,
+        )
+        if not start:
+            safe_print("Phase 3 quant API installed but not started.")
+            return
+        run_remote_text(
+            ssh,
+            _stop_legacy_8101_holder_command(),
+            timeout=60,
+            check=True,
+            max_output_chars=20_000,
+        )
+        run_remote_text(
+            ssh,
+            f"systemctl enable {sh(PHASE3_SERVICE_NAME)} && "
+            f"systemctl restart {sh(PHASE3_SERVICE_NAME)}",
+            timeout=90,
+            check=True,
         )
         safe_print(
             run_remote_text(
                 ssh,
-                "systemctl is-active local-ai-tools.service && "
-                "sleep 2 && "
-                "set -a; . /data/trade_ai/local_ai_tools.env; set +a; "
-                'curl -s -H "Authorization: Bearer ${LOCAL_AI_TOOLS_API_KEY}" '
-                "http://127.0.0.1:8001/health",
-                timeout=120,
+                f"systemctl is-active {sh(PHASE3_SERVICE_NAME)} && sleep 2 && "
+                + _remote_smoke_command(),
+                timeout=180,
+                check=True,
+                max_output_chars=80_000,
             )
         )
     finally:
         ssh.close()
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--install-only",
+        action="store_true",
+        help="Install files and systemd unit without restarting the Phase 3 quant API.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    deploy_phase3_quant_api(plan_only=bool(args.plan_only), start=not bool(args.install_only))
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -93,3 +93,42 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
         "VECTOR_MEMORY_MIN_SCORE": "0.33",
     }
     assert reset_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_clear_endpoint_clears_phase3_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_calls = 0
+    clear_reasons: list[str] = []
+
+    class FakeVectorMemoryService:
+        async def clear_index(self, *, reason: str) -> dict[str, object]:
+            nonlocal clear_calls
+            clear_calls += 1
+            clear_reasons.append(reason)
+            return {
+                "enabled": True,
+                "status": "cleared",
+                "removed": 7,
+                "document_count": 0,
+                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+            }
+
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(
+        vector_memory_module,
+        "get_vector_memory_service",
+        lambda: FakeVectorMemoryService(),
+    )
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/vector-memory/clear")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cleared"
+    assert response.json()["removed"] == 7
+    assert clear_calls == 1
+    assert clear_reasons == ["phase3_dashboard_clear_old_index"]

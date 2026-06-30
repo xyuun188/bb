@@ -47,20 +47,63 @@ def test_open_positions_applier_adds_filled_entry() -> None:
         _result(OrderStatus.FILLED, quantity=2.0),
     )
 
-    assert open_positions == [
+    assert len(open_positions) == 1
+    assert open_positions[0] == {
+        "model_name": "ensemble_trader",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "entry_price": 100.0,
+        "current_price": 100.0,
+        "quantity": 2.0,
+        "unrealized_pnl": 0.0,
+        "stop_loss": 98.0,
+        "take_profit": 104.0,
+        "is_open": True,
+        "profit_first_trade_plan": {},
+        "profit_first_exit_plan": {},
+        "profit_first_exit_plan_id": "",
+    }
+
+
+def test_open_positions_applier_merges_same_symbol_side_add_entry() -> None:
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "profit_first_trade_plan": {"exit_plan_id": "pfep-new"},
+        "profit_first_exit_plan": {"exit_plan_id": "pfep-new"},
+    }
+    open_positions = [
         {
             "model_name": "ensemble_trader",
-            "symbol": "BTC/USDT",
+            "symbol": "BTC-USDT",
             "side": "long",
-            "entry_price": 100.0,
-            "current_price": 100.0,
-            "quantity": 2.0,
-            "unrealized_pnl": 0.0,
-            "stop_loss": 98.0,
-            "take_profit": 104.0,
+            "entry_price": 90.0,
+            "current_price": 95.0,
+            "quantity": 1.0,
+            "unrealized_pnl": 5.0,
             "is_open": True,
+            "profit_first_trade_plan": {"exit_plan_id": "pfep-old"},
+            "profit_first_exit_plan": {"exit_plan_id": "pfep-old"},
+            "profit_first_exit_plan_id": "pfep-old",
         }
     ]
+
+    _applier().apply(
+        open_positions,
+        "ensemble_trader",
+        decision,
+        _result(OrderStatus.FILLED, quantity=3.0),
+    )
+
+    assert len(open_positions) == 1
+    merged = open_positions[0]
+    assert merged["quantity"] == 4.0
+    assert merged["entry_price"] == 97.5
+    assert merged["current_price"] == 100.0
+    assert merged["stop_loss"] == 95.55
+    assert merged["take_profit"] == 101.4
+    assert merged["profit_first_exit_plan_id"] == "pfep-new"
+    assert merged["merged_entry_count"] == 2
+    assert merged["entry_legs"][-1]["exchange_order_id"] == "okx-1"
 
 
 def test_open_positions_applier_ignores_unconfirmed_entry() -> None:
