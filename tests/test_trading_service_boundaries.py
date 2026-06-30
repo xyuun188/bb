@@ -2290,6 +2290,215 @@ async def test_entry_profit_risk_sizing_records_low_payoff_reason_codes():
     ]
 
 
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_roster_fill_relief_survives_low_payoff_soft_reasons():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.08
+    decision.suggested_leverage = 6.0
+    decision.stop_loss_pct = 0.012
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.74,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.31,
+            "expected_loss_pct": 0.55,
+            "tail_risk_score": 0.39,
+            "raw_expected_return_pct": 0.31,
+            "profit_quality_ratio": 0.39,
+            "server_profit_loss_probability": 0.48,
+            "model_contribution_adjustment": {"hard_caution": True},
+            "portfolio_roster": {
+                "underfilled": True,
+                "gap": 8,
+                "target_position_groups": 10,
+                "current_position_groups": 2,
+            },
+            "portfolio_roster_fill_relief": {
+                "applied": True,
+                "expected_net_return_pct": 0.31,
+                "profit_quality_ratio": 0.39,
+                "loss_probability": 0.48,
+            },
+            "evidence_score": {
+                "tier": "small",
+                "effective_score": 58.0,
+                "size_multiplier": 0.18,
+                "max_size_pct": 0.025,
+                "aligned_support_sources": [
+                    "ai",
+                    "timeseries",
+                    "sentiment",
+                    "shadow_memory",
+                ],
+                "tradeable_probe": True,
+            },
+        }
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["quality_tier"] == "roster_fill"
+    assert sizing["low_payoff_quality"] is False
+    assert sizing["low_payoff_reasons"] == []
+    assert sizing["low_payoff_relief"]["applied"] is True
+    assert sizing["low_payoff_relief"]["relieved_reasons"] == [
+        "score_below_required",
+        "expected_net_below_min",
+        "profit_quality_below_min",
+        "hard_contribution_caution",
+        "evidence_low_payoff_quality",
+    ]
+    assert sizing["notional_floor_applied"] is False
+    assert sizing["target_min_notional_balance_ratio"] == pytest.approx(0.18)
+    assert sizing["profit_first_position_ladder"]["lane"] == "tiny_probe"
+    assert sizing["profit_first_position_ladder"]["adjusted_size_pct"] > 0
+    assert sizing["position_size_pct"] > 0
+    assert decision.position_size_pct > 0
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_reclassifies_stale_shadow_profit_first_plan():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.suggested_leverage = 3.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.06
+    decision.raw_response = {
+        "profit_first_trade_plan": {
+            "decision_lane": "shadow_only",
+            "is_complete_for_real_trade": False,
+            "missing_required_fields": ["profit_risk_sizing", "position_size_pct"],
+            "position_size_pct": None,
+        },
+        "opportunity_score": {
+            "score": 2.2,
+            "min_score_required": 0.95,
+            "expected_net_return_pct": 0.6,
+            "expected_loss_pct": 0.4,
+            "tail_risk_score": 0.45,
+            "raw_expected_return_pct": 0.65,
+            "profit_quality_ratio": 0.7,
+            "reward_risk_ratio": 1.0,
+            "server_profit_loss_probability": 0.46,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": True,
+            "evidence_score": {
+                "tier": "small",
+                "effective_score": 66.0,
+                "size_multiplier": 0.4,
+                "max_size_pct": 0.03,
+                "aligned_support_sources": ["ml", "server_profit", "timeseries"],
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    ladder = sizing["profit_first_position_ladder"]
+    assert ladder["lane"] != "shadow_only"
+    assert ladder["adjusted_size_pct"] > 0
+    assert ladder["classifier"]["source"] == "sizing_profit_first_classifier"
+    assert ladder["classifier"]["ignored_persisted_plan"]["lane"] == "shadow_only"
+    assert decision.position_size_pct > 0
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_stale_shadow_plan_keeps_low_payoff_tiny_probe_real():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.08
+    decision.suggested_leverage = 6.0
+    decision.stop_loss_pct = 0.012
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "profit_first_trade_plan": {
+            "decision_lane": "shadow_only",
+            "is_complete_for_real_trade": False,
+            "missing_required_fields": ["profit_risk_sizing", "position_size_pct"],
+            "position_size_pct": None,
+        },
+        "strategy_learning_context": {
+            "strategy_learning_sizing": {
+                "profile_id": "long_side_recovery",
+                "position_size_multiplier": 0.62,
+                "probe_fraction": 0.05,
+                "max_probe_size_pct": 0.02,
+            }
+        },
+        "opportunity_score": {
+            "score": 0.07,
+            "min_score_required": 0.645,
+            "expected_net_return_pct": 0.38,
+            "expected_loss_pct": 0.55,
+            "tail_risk_score": 0.35,
+            "raw_expected_return_pct": -0.01,
+            "profit_quality_ratio": 0.51,
+            "server_profit_loss_probability": 0.46,
+            "model_contribution_adjustment": {"hard_caution": True},
+            "evidence_score": {
+                "tier": "small",
+                "effective_score": 64.3,
+                "size_multiplier": 0.18,
+                "max_size_pct": 0.025,
+                "aligned_support_sources": [
+                    "ai",
+                    "timeseries",
+                    "sentiment",
+                    "shadow_memory",
+                ],
+                "tradeable_probe": True,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    ladder = sizing["profit_first_position_ladder"]
+    assert sizing["low_payoff_quality"] is True
+    assert ladder["lane"] == "tiny_probe"
+    assert ladder["adjusted_size_pct"] > 0
+    assert ladder["classifier"]["ignored_persisted_plan"]["lane"] == "shadow_only"
+    assert 0 < sizing["position_size_pct"] <= 0.02
+    assert decision.position_size_pct > 0
+
+
 def test_entry_opportunity_gate_treats_strategy_learning_pause_as_advisory():
     decision = _decision(Action.LONG)
     decision.raw_response = {

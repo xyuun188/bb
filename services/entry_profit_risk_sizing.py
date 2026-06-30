@@ -572,6 +572,7 @@ class EntryProfitRiskSizingPolicy:
     ) -> dict[str, Any]:
         persisted_plan = cls._safe_dict(raw.get("profit_first_trade_plan"))
         existing_lane = str(persisted_plan.get("decision_lane") or "").lower().strip()
+        ignored_persisted_plan: dict[str, Any] = {}
         if existing_lane in {
             "shadow_only",
             "tiny_probe",
@@ -579,14 +580,29 @@ class EntryProfitRiskSizingPolicy:
             "meaningful_entry",
             "high_conviction",
         }:
-            return {
+            missing_fields = [
+                str(item)
+                for item in cls._safe_list(persisted_plan.get("missing_required_fields"))
+                if str(item or "").strip()
+            ]
+            persisted_complete = bool(persisted_plan.get("is_complete_for_real_trade"))
+            persisted_size = cls._safe_float(persisted_plan.get("position_size_pct"), 0.0)
+            if existing_lane != "shadow_only" and persisted_complete and persisted_size > 0:
+                return {
+                    "lane": existing_lane,
+                    "promotion_reasons": persisted_plan.get("promotion_reasons") or [],
+                    "downgrade_reasons": persisted_plan.get("block_or_downgrade_reasons") or [],
+                    "independent_source_count": int(
+                        cls._safe_float(persisted_plan.get("independent_source_count"), 0.0)
+                    ),
+                    "source": "persisted_profit_first_plan",
+                }
+            ignored_persisted_plan = {
                 "lane": existing_lane,
-                "promotion_reasons": persisted_plan.get("promotion_reasons") or [],
-                "downgrade_reasons": persisted_plan.get("block_or_downgrade_reasons") or [],
-                "independent_source_count": int(
-                    cls._safe_float(persisted_plan.get("independent_source_count"), 0.0)
-                ),
-                "source": "persisted_profit_first_plan",
+                "is_complete_for_real_trade": persisted_complete,
+                "missing_required_fields": missing_fields[:8],
+                "position_size_pct": round(persisted_size, 6),
+                "reason": "stale_or_incomplete_profit_first_plan_reclassified_after_sizing",
             }
 
         opportunity = cls._safe_dict(raw.get("opportunity_score"))
@@ -626,6 +642,7 @@ class EntryProfitRiskSizingPolicy:
             "downgrade_reasons": downgrade,
             "independent_source_count": independent_source_count,
             "source": "sizing_profit_first_classifier",
+            "ignored_persisted_plan": ignored_persisted_plan,
         }
 
     @classmethod
@@ -816,6 +833,42 @@ class EntryProfitRiskSizingPolicy:
                 current_size = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE
                 decision.position_size_pct = current_size
                 caps.append("服务器盈利模型反向或预期为负，仅允许极小仓")
+        strategy_sizing = self._strategy_learning_sizing(raw)
+        timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
+        legacy_aligned_source_count = sum(
+            1
+            for aligned in (
+                local_aligned,
+                ml_aligned,
+                timeseries_aligned,
+                bool(opportunity.get("expert_aligned")),
+            )
+            if aligned
+        )
+        evidence_aligned_source_count = len(
+            {
+                str(source)
+                for source in self._safe_list(evidence_score.get("aligned_support_sources"))
+                if str(source or "").strip()
+            }
+        )
+        aligned_source_count = max(legacy_aligned_source_count, evidence_aligned_source_count)
+        roster_fill_quality = bool(
+            roster_fill_candidate
+            and expected_net >= PORTFOLIO_ROSTER_FILL_MIN_NET_PCT
+            and profit_quality_ratio >= PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO
+            and loss_probability <= PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY
+            and tail_risk <= 0.88
+            and (aligned_source_count >= 3 or bool(roster_fill_relief.get("applied")))
+            and (
+                local_aligned
+                or ml_aligned
+                or timeseries_aligned
+                or quant_probe_triggered
+                or evidence_aligned_source_count >= 3
+                or bool(roster_fill_relief.get("applied"))
+            )
+        )
         low_payoff_reasons = self.entry_low_payoff_quality.reasons(
             score=score,
             min_score_required=min_score_required,
@@ -827,6 +880,36 @@ class EntryProfitRiskSizingPolicy:
             evidence_score=evidence_score,
             evidence_effective_score=evidence_effective_score,
         )
+        low_payoff_relief: dict[str, Any] = {"applied": False}
+        if roster_fill_quality and low_payoff_reasons:
+            roster_fill_soft_reasons = {
+                "score_below_required",
+                "expected_net_below_min",
+                "profit_quality_below_min",
+                "hard_contribution_caution",
+                "evidence_low_payoff_quality",
+            }
+            remaining_low_payoff_reasons = [
+                reason
+                for reason in low_payoff_reasons
+                if reason not in roster_fill_soft_reasons
+            ]
+            relieved_low_payoff_reasons = [
+                reason for reason in low_payoff_reasons if reason in roster_fill_soft_reasons
+            ]
+            if relieved_low_payoff_reasons:
+                low_payoff_relief = {
+                    "applied": True,
+                    "reason": "portfolio_roster_fill_quality",
+                    "relieved_reasons": relieved_low_payoff_reasons,
+                    "remaining_reasons": remaining_low_payoff_reasons,
+                    "expected_net_return_pct": round(expected_net, 6),
+                    "profit_quality_ratio": round(profit_quality_ratio, 6),
+                    "loss_probability": round(loss_probability, 6),
+                    "tail_risk_score": round(tail_risk, 6),
+                    "aligned_source_count": aligned_source_count,
+                }
+                low_payoff_reasons = remaining_low_payoff_reasons
         low_payoff_quality = bool(low_payoff_reasons)
         if low_payoff_quality:
             high_quality_entry = False
@@ -842,18 +925,6 @@ class EntryProfitRiskSizingPolicy:
                 current_size = loser_size_cap
                 decision.position_size_pct = current_size
                 caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
-        strategy_sizing = self._strategy_learning_sizing(raw)
-        timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
-        aligned_source_count = sum(
-            1
-            for aligned in (
-                local_aligned,
-                ml_aligned,
-                timeseries_aligned,
-                bool(opportunity.get("expert_aligned")),
-            )
-            if aligned
-        )
         quality_override_reasons: list[str] = []
         strong_positive_strategy_signal = bool(
             not low_payoff_quality
@@ -1026,14 +1097,6 @@ class EntryProfitRiskSizingPolicy:
             and profit_quality_ratio >= _ENTRY_RISK_SIZING_PARAMS.good_probe_min_profit_quality
             and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.good_probe_max_loss_probability
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
-        )
-        roster_fill_quality = bool(
-            roster_fill_candidate
-            and expected_net >= PORTFOLIO_ROSTER_FILL_MIN_NET_PCT
-            and profit_quality_ratio >= PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO
-            and loss_probability <= PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY
-            and tail_risk <= 0.88
-            and (local_aligned or ml_aligned or timeseries_aligned or quant_probe_triggered)
         )
         if has_existing_winner and (
             strong_probe_quality
@@ -1370,6 +1433,7 @@ class EntryProfitRiskSizingPolicy:
             "atr_pct": round(atr_pct, 8),
             "low_payoff_quality": bool(low_payoff_quality),
             "low_payoff_reasons": low_payoff_reasons,
+            "low_payoff_relief": low_payoff_relief,
             "quality_caps": caps,
             "evidence_score": evidence_score,
             "high_quality_entry": bool(high_quality_entry),
