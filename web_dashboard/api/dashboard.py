@@ -62,6 +62,7 @@ from services.exchange_position_state import (
 from services.exchange_position_state import (
     parse_exchange_position_snapshot,
 )
+from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.runtime_entry_filters import entry_filters_from_context
@@ -445,11 +446,11 @@ def _display_execution_reason(decision, order=None) -> str | None:
     reason = getattr(decision, "execution_reason", None) or _fallback_execution_reason(
         decision, order
     )
-    sanitized = sanitize_text(reason)
+    sanitized = sanitize_text(localize_execution_reason(reason))
     if _execution_reason_is_unusable(str(sanitized or "")):
         recovered = _recover_execution_reason_from_raw_decision(decision)
         if recovered:
-            return recovered
+            return localize_execution_reason(recovered)
     return sanitized
 
 
@@ -464,7 +465,9 @@ def _display_opportunity_score(
     payload = dict(opportunity)
     if bool(getattr(decision, "was_executed", False)):
         return payload
-    reason_text = sanitize_text(execution_reason or getattr(decision, "execution_reason", None))
+    reason_text = sanitize_text(
+        localize_execution_reason(execution_reason or getattr(decision, "execution_reason", None))
+    )
     final_state = str(
         payload.get("execution_final_state")
         or raw.get("stage_status")
@@ -719,6 +722,8 @@ def _build_decision_attribution(
             or getattr(decision, "reasoning", None)
             or "未达到执行条件。"
         )
+
+    final_reason = localize_execution_reason(final_reason) or final_reason
 
     return {
         "action": action,

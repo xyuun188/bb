@@ -242,6 +242,9 @@ def test_profit_first_entry_contract_blocks_low_payoff_one_x_probe_before_submit
 
     assert result.passed is False
     assert result.blocker == "profit_first_defensive_probe_shadow"
+    assert result.reason is not None
+    assert "Profit-First 防御探针拦截" in result.reason
+    assert "low-payoff" not in result.reason
     assert result.data["shadow_only"] is True
     assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
     assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"

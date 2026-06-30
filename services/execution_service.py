@@ -71,7 +71,7 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
     if not complete or lane == "shadow_only":
         return PolicyGateResult.block(
             "profit_first_trade_plan_incomplete",
-            "Profit-First trade plan is incomplete or shadow-only; entry stayed in shadow before OKX submit.",
+            "Profit-First 交易计划不完整或仍处于影子档，本轮未提交 OKX 开仓订单。",
             {
                 **base_data,
                 "stage_status": "skipped",
@@ -85,7 +85,7 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
     if not sizing:
         return PolicyGateResult.block(
             "missing_profit_risk_sizing",
-            "Profit-First entry has no profit_risk_sizing snapshot; entry blocked before OKX submit.",
+            "Profit-First 开仓缺少收益/风险仓位快照，本轮在提交 OKX 前拦截。",
             {
                 **base_data,
                 "stage_status": "blocked",
@@ -111,8 +111,8 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
             return PolicyGateResult.block(
                 "profit_first_position_ladder_missing_before_sizing",
                 (
-                    "Profit-First position ladder was missing and late reconstruction would "
-                    "change size; entry blocked before OKX submit."
+                    "Profit-First 仓位阶梯缺失，且临时重建会改变下单仓位；"
+                    "本轮在提交 OKX 前拦截。"
                 ),
                 {
                     **base_data,
@@ -141,7 +141,7 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
     if str(ladder.get("lane") or "").lower().strip() == "shadow_only":
         return PolicyGateResult.block(
             "profit_first_position_ladder_shadow_only",
-            "Profit-First position ladder is shadow-only; entry stayed in shadow before OKX submit.",
+            "Profit-First 仓位阶梯仍为影子档，本轮未提交 OKX 开仓订单。",
             {
                 **base_data,
                 "stage_status": "skipped",
@@ -166,7 +166,7 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
     if _safe_float(ladder.get("adjusted_size_pct")) <= 0.0:
         return PolicyGateResult.block(
             "profit_first_position_ladder_zero_size",
-            "Profit-First position ladder produced zero real size; entry blocked before OKX submit.",
+            "Profit-First 仓位阶梯计算出的真实仓位为 0，本轮在提交 OKX 前拦截。",
             {
                 **base_data,
                 "stage_status": "blocked",

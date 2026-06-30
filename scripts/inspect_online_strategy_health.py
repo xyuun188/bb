@@ -31,6 +31,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from models.learning import ShadowBacktest, ExpertMemory, StrategyLearningEvent
 from services.decision_state import decision_state_from_raw
+from services.execution_reason_localizer import localize_execution_reason
 from services.ml_signal_service import MLSignalService
 from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
 from services.trade_execution_contract import TradeExecutionContractService
@@ -193,7 +194,7 @@ def probe_diagnostics(decision):
             "blocked": bool(blocked.get("blocked")),
             "block_kind": blocked.get("block_kind") or "",
             "block_reasons": safe_list(blocked.get("block_reasons")),
-            "reason": short_text(blocked.get("reason"), 260),
+                "reason": short_text(blocked.get("reason"), 260, localize=True),
             "side": blocked.get("side") or "",
             "expected_net_return_pct": roundv(blocked.get("expected_net_return_pct")),
             "profit_quality_ratio": roundv(blocked.get("profit_quality_ratio")),
@@ -471,14 +472,19 @@ def state(decision):
     return {
         "final_stage": summary.get("final_stage"),
         "final_status": summary.get("final_status"),
-        "final_reason": summary.get("final_reason") or decision.execution_reason or "",
+        "final_reason": localize_execution_reason(
+            summary.get("final_reason") or decision.execution_reason or ""
+        )
+        or "",
         "completed_stage_count": summary.get("completed_stage_count"),
         "blocked": bool(summary.get("blocked")),
         "failed": bool(summary.get("failed")),
     }
 
 
-def short_text(text, limit=260):
+def short_text(text, limit=260, *, localize=False):
+    if localize:
+        text = localize_execution_reason(str(text or ""))
     text = str(text or "").replace("\n", " ").strip()
     return text[:limit] + ("…" if len(text) > limit else "")
 
@@ -2529,7 +2535,7 @@ async def main():
             market_entry_tail_risks.append(safe_float(ev.get("tail_risk_score")))
             for key, contribution in expected_net_components(d).items():
                 market_entry_component_contributions.setdefault(key, []).append(contribution)
-        reason = st["final_reason"] or d.execution_reason or ""
+        reason = localize_execution_reason(st["final_reason"] or d.execution_reason or "") or ""
         reason_counts[reason[:100] if reason else "无原因"] += 1
         state_counts[f"{st['final_stage']}:{st['final_status']}"] += 1
         expected_values.append(ev["expected_net_return_pct"])
@@ -2580,7 +2586,7 @@ async def main():
                 "cooldown_allowed": cooldown.get("allowed"),
                 "cooldown_failed": cooldown.get("failed"),
                 "metrics": cooldown.get("metrics"),
-                "reason": short_text(reason, 260),
+                "reason": short_text(reason, 260, localize=True),
             })
         if len(examples) < 50:
             order = order_by_decision.get(d.id)
@@ -2591,7 +2597,7 @@ async def main():
                 "action": d.action,
                 "analysis_type": analysis_type(d),
                 "executed": bool(d.was_executed),
-                "reason": short_text(reason, 280),
+                "reason": short_text(reason, 280, localize=True),
                 "state": st,
                 "evidence": ev,
                 "probe": probe,
@@ -2702,6 +2708,7 @@ async def main():
                 "execution_reason": short_text(
                     getattr(decision, "execution_reason", "") if decision else "",
                     500,
+                    localize=True,
                 ),
                 "execution_parameters": safe_dict(
                     safe_dict(getattr(decision, "raw_llm_response", None)).get(

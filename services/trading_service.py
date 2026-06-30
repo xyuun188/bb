@@ -1137,16 +1137,16 @@ class TradingService:
         requires_attention = int(payload.get("last_requires_attention_count") or 0)
         last_error = str(payload.get("last_error") or "").strip()
         if status in {"warning", "stale"}:
-            reason = "OKX auto reconciliation is unhealthy"
+            reason = "OKX 自动对账异常"
             if status == "stale":
-                reason = "OKX auto reconciliation is stale"
+                reason = "OKX 自动对账已过期"
             if last_error:
-                reason = f"{reason}: {last_error}"
-            return f"{reason}; pause new entries until OKX/backend state is consistent."
+                reason = f"{reason}：{last_error}"
+            return f"{reason}；暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
         if requires_attention > 0:
             return (
-                f"OKX auto reconciliation found {requires_attention} current-state "
-                "differences requiring review; pause new entries until reconciled."
+                f"OKX 自动对账发现 {requires_attention} 个当前状态差异需要复核；"
+                "暂停新开仓，等待状态对齐后再恢复。"
             )
         return None
 

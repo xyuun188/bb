@@ -1044,7 +1044,7 @@ async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None
 
     reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
 
-    assert "OKX auto reconciliation is unhealthy" in reason
+    assert "OKX 自动对账异常" in reason
     assert "OKX timeout" in reason
 
 
@@ -1062,8 +1062,8 @@ async def test_okx_authoritative_sync_attention_pauses_new_pair_analysis() -> No
 
     reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
 
-    assert "found 2 current-state differences" in reason
-    assert "pause new entries" in reason
+    assert "发现 2 个当前状态差异" in reason
+    assert "暂停新开仓" in reason
 
 
 @pytest.mark.asyncio
@@ -3112,6 +3112,9 @@ async def test_entry_policy_keeps_low_payoff_risk_budget_probe_shadow_only() -> 
 
     assert result.passed is False
     assert result.blocker == "profit_first_defensive_probe_shadow"
+    assert result.reason is not None
+    assert "Profit-First 防御探针拦截" in result.reason
+    assert "low-payoff" not in result.reason
     assert result.data["shadow_only"] is True
     assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
     assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"

@@ -41,8 +41,8 @@ class RecentProbePnLBrakePolicy:
         return ProfitFirstStage2Decision(
             False,
             reason=(
-                "Profit-First v3 probe-loss brake: recent tiny/probe closes are all losing; "
-                "this candidate stays shadow unless it upgrades to validated_probe or better."
+                "Profit-First 探针亏损刹车：最近的极小/探针仓位平仓全部亏损；"
+                "该候选先保留为影子样本，只有升级到已验证探针或更高质量档后才允许真实开仓。"
             ),
             data={
                 "lane": lane,
@@ -121,9 +121,9 @@ class DefensiveProbeShadowPolicy:
         return ProfitFirstStage2Decision(
             False,
             reason=(
-                "Profit-First defensive probe guard: low-payoff tiny/probe entry was capped to "
-                "1x by risk budget and has too little expected profit; keep it shadow-only until "
-                "quality upgrades."
+                "Profit-First 防御探针拦截：该极小/探针开仓属于低收益质量，"
+                "又被风险预算限制为 1 倍杠杆，预期实际盈利过低；"
+                "本轮只记录影子样本，等收益质量升级后再允许真实开仓。"
             ),
             data={
                 **data,
@@ -167,8 +167,8 @@ class ReleaseNetBenefitPolicy:
         return ProfitFirstStage2Decision(
             False,
             reason=(
-                "Profit-First v3 release net-benefit guard: this is a losing release and there "
-                "is no hard risk or stronger replacement opportunity; keep it open for the next review."
+                "Profit-First 释放净收益保护：当前是亏损释放信号，且没有硬风险或更强替代机会；"
+                "本轮先保留仓位，等待下一轮复盘。"
             ),
             data={
                 "pnl_ratio": pnl_ratio,

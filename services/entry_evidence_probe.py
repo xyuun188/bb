@@ -116,8 +116,7 @@ class EntryEvidenceProbePolicy:
                 block_kind="probe_threshold_not_met",
                 block_reasons=threshold_block_reasons,
                 reason=(
-                    "Entry evidence was retained for shadow learning, but it did not meet "
-                    "the controlled probe conversion thresholds."
+                    "入场证据已保留用于影子学习，但未达到受控探针转换阈值，本轮不提交 OKX 订单。"
                 ),
             )
             return None
@@ -154,7 +153,7 @@ class EntryEvidenceProbePolicy:
                 review_feedback=review_feedback,
                 block_kind="score_below_probe_floor",
                 block_reasons=["score_below_probe_floor"],
-                reason="Entry evidence score is below the controlled probe floor.",
+                reason="入场证据分数低于受控探针底线，本轮不提交 OKX 订单。",
             )
             return None
         if recommendation == "hold_or_tiny_probe_only" and not high_profit:
@@ -169,7 +168,7 @@ class EntryEvidenceProbePolicy:
                 review_feedback=review_feedback,
                 block_kind="hold_or_tiny_probe_only",
                 block_reasons=["hold_or_tiny_probe_only"],
-                reason="Entry evidence explicitly recommends hold or tiny shadow probe only.",
+                reason="入场证据明确建议观望或只保留极小影子探针，本轮不提交 OKX 订单。",
             )
             return None
 

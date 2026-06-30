@@ -54,6 +54,7 @@ from services.profit_first_governance_report import ProfitFirstGovernanceReportS
 from services.profit_first_ranking import ProfitFirstRankingService
 from services.profit_first_recovery_blockers import build_profit_first_recovery_blockers
 from services.server_monitor_status import collect_platform_runtime_status
+from services.execution_reason_localizer import localize_execution_reason
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
 )
@@ -491,8 +492,7 @@ def _okx_runtime_entry_gate_summary(runtime_status: dict[str, Any]) -> dict[str,
             "entry_blocked": True,
             "blocker": "runtime_heartbeat_unavailable",
             "reason": (
-                "Trading runtime heartbeat is unavailable; new entries are blocked "
-                "until the runtime publishes a fresh OKX sync heartbeat."
+                "交易运行时心跳不可用；暂停新开仓，直到运行时发布新的 OKX 同步心跳。"
             ),
             "heartbeat_age_seconds": runtime_status.get("heartbeat_age_seconds"),
             "heartbeat_fresh_limit_seconds": None,
@@ -517,39 +517,39 @@ def _okx_runtime_entry_gate_summary(runtime_status: dict[str, Any]) -> dict[str,
         or _safe_float(heartbeat_age, heartbeat_fresh_limit + 1.0) > heartbeat_fresh_limit
     )
     entry_blocked = False
-    reason = "OKX runtime sync healthy for new entries."
+    reason = "OKX 运行态同步正常，允许新开仓。"
     blocker: str | None = None
     status = sync_status
     if not running:
         entry_blocked = True
         status = "runtime_inactive"
         blocker = "trading_runtime_inactive"
-        reason = "Trading runtime is not running; OKX runtime sync cannot authorize new entries."
+        reason = "交易运行时未运行；OKX 运行态同步无法授权新开仓。"
     elif heartbeat_stale:
         entry_blocked = True
         status = "runtime_heartbeat_stale"
         blocker = "trading_runtime_heartbeat_stale"
         reason = (
-            "Trading runtime heartbeat is stale; new entries are blocked until a fresh "
-            "OKX sync heartbeat is observed."
+            "交易运行时心跳已过期；暂停新开仓，直到观察到新的 OKX 同步心跳。"
         )
     elif sync_status in {"warning", "stale"}:
         entry_blocked = True
         blocker = "okx_authoritative_sync_unhealthy"
         reason = (
-            "OKX runtime sync is stale; new entries are blocked."
+            "OKX 运行态同步已过期；暂停新开仓。"
             if sync_status == "stale"
-            else "OKX runtime sync is unhealthy; new entries are blocked."
+            else "OKX 运行态同步异常；暂停新开仓。"
         )
         if last_error:
-            reason = f"{reason} Last error: {last_error}"
+            reason = f"{reason} 最近错误：{last_error}"
     elif requires_attention > 0:
         entry_blocked = True
         blocker = "okx_authoritative_sync_unhealthy"
         reason = (
-            f"OKX runtime sync found {requires_attention} current-state differences; "
-            "new entries are blocked until reconciled."
+            f"OKX 运行态同步发现 {requires_attention} 个当前状态差异；"
+            "暂停新开仓，等待状态对齐后再恢复。"
         )
+    reason = localize_execution_reason(reason) or reason
     return {
         "available": True,
         "status": status,

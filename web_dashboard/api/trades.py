@@ -19,6 +19,7 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.decision_execution_trace import build_execution_trace
+from services.execution_reason_localizer import localize_execution_reason
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.okx_error_classifier import is_okx_temporary_service_error
@@ -232,7 +233,7 @@ def _extract_okx_error(text: str) -> tuple[str | None, str | None]:
 
 
 def _translate_execution_text(message: str | None) -> str:
-    text = str(message or "").strip()
+    text = str(localize_execution_reason(message) or "").strip()
     if not text:
         return "交易接口未返回具体原因。"
 
@@ -561,7 +562,7 @@ async def get_trades(
                 int(row.id): {
                     "action": row.action,
                     "reasoning": row.reasoning,
-                    "execution_reason": row.execution_reason,
+                    "execution_reason": localize_execution_reason(row.execution_reason),
                     "position_size_pct": row.position_size_pct,
                     "suggested_leverage": row.suggested_leverage,
                     "feature_snapshot": row.feature_snapshot,
@@ -1024,7 +1025,9 @@ async def get_trade_detail(trade_id: int):
         return {"error": "Trade not found"}
 
     raw_response = _safe_dict(getattr(decision, "raw_llm_response", None))
-    execution_reason = sanitize_text(getattr(decision, "execution_reason", None))
+    execution_reason = sanitize_text(
+        localize_execution_reason(getattr(decision, "execution_reason", None))
+    )
     fallback_reason = _readable_execution_reason(
         execution_reason=execution_reason,
         reasoning=sanitize_text(getattr(decision, "reasoning", None)),

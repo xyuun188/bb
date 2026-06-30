@@ -5465,7 +5465,7 @@ def test_okx_runtime_entry_gate_blocks_inactive_runtime() -> None:
     assert gate["status"] == "runtime_inactive"
     assert gate["sync_status"] == "ok"
     assert gate["blocker"] == "trading_runtime_inactive"
-    assert "not running" in gate["reason"]
+    assert "交易运行时未运行" in gate["reason"]
     assert gate["heartbeat_fresh_limit_seconds"] == 180.0
 
 
@@ -5525,7 +5525,7 @@ def test_okx_runtime_entry_gate_blocks_stale_runtime_heartbeat() -> None:
     assert gate["status"] == "runtime_heartbeat_stale"
     assert gate["sync_status"] == "ok"
     assert gate["blocker"] == "trading_runtime_heartbeat_stale"
-    assert "heartbeat is stale" in gate["reason"]
+    assert "心跳已过期" in gate["reason"]
     assert gate["heartbeat_fresh_limit_seconds"] == 180.0
 
 
