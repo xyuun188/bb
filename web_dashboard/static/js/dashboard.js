@@ -63,6 +63,8 @@ const state = {
     mlSignalStatus: null,
     localAIToolsStatus: null,
     dataCollectionStatus: null,
+    dataCollectionSettingsDirty: false,
+    dataCollectionSettingsSaving: false,
     serverMonitorStatus: null,
     systemAuditStatus: null,
     serverMonitorTab: 'self-check',
@@ -144,6 +146,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initSidebarNav();
     initTradeTabs();
     initSettingsTabs();
+    initDataCollectionSettingsForm();
     initScanModeButtons();
     initPositionActions();
     initDashboardUserActions();
@@ -1654,6 +1657,21 @@ function initServerMonitorTabs() {
         event.preventDefault();
         state.serverMonitorTab = button.dataset.serverMonitorTab || 'self-check';
         renderServerMonitor();
+    });
+}
+
+function initDataCollectionSettingsForm() {
+    document.addEventListener('input', event => {
+        const target = event.target;
+        if (target?.matches?.('[data-data-collection-setting], #data-external-source-list input')) {
+            markDataCollectionSettingsDirty();
+        }
+    });
+    document.addEventListener('change', event => {
+        const target = event.target;
+        if (target?.matches?.('[data-data-collection-setting], #data-external-source-list input')) {
+            markDataCollectionSettingsDirty();
+        }
     });
 }
 
@@ -4657,7 +4675,31 @@ function renderPhase3PromotionGate(promotion, localTools = {}) {
         </div>`;
 }
 
-function fillDataCollectionSettings(config) {
+function markDataCollectionSettingsDirty(message = '外部事件采集设置有未保存修改，请点击“保存设置”。') {
+    if (state.dataCollectionSettingsSaving) return;
+    state.dataCollectionSettingsDirty = true;
+    const status = document.getElementById('data-collection-save-status');
+    if (status && message) {
+        status.style.color = 'var(--accent-light)';
+        status.textContent = message;
+    }
+}
+
+function clearDataCollectionSettingsDirty() {
+    state.dataCollectionSettingsDirty = false;
+}
+
+function fillDataCollectionSettings(config, options = {}) {
+    if (state.dataCollectionSettingsDirty && !options.force) {
+        const note = document.getElementById('data-external-runtime-note');
+        if (note) {
+            const dependency = config.external_event_scraper_dependency_installed ? '依赖已安装' : '依赖未安装';
+            const runtime = config.external_event_scraper_runtime_active ? '后台可运行' : '后台未运行';
+            const sourceMode = config.external_event_scraper_uses_default_sources ? '使用默认源' : '使用自定义源';
+            note.textContent = `${dependency} · ${runtime} · ${sourceMode} · 有未保存修改`;
+        }
+        return;
+    }
     const enabled = document.getElementById('data-external-enabled');
     if (enabled) enabled.checked = Boolean(config.external_event_scraper_enabled);
     setInputValue('data-external-interval', config.external_event_scraper_interval_seconds);
@@ -4710,7 +4752,7 @@ function renderDataCollectionDashboard(options = {}) {
         }
         return;
     }
-    fillDataCollectionSettings(config);
+    fillDataCollectionSettings(config, { force: options.forceSettings === true });
     renderDataCollectionOverview(data, config, stats, training);
     renderDataCollectionSources(data, stats);
     renderDataCollectionFeatureCoverage(data.feature_coverage || {});
@@ -5113,15 +5155,17 @@ function addDataCollectionSource(source = {}) {
     const sources = currentDataCollectionSourcesFromForm();
     sources.push(source);
     renderDataCollectionSourceManager(sources);
+    markDataCollectionSettingsDirty();
 }
 
 function removeDataCollectionSource(index) {
     const sources = currentDataCollectionSourcesFromForm();
     sources.splice(Number(index), 1);
     renderDataCollectionSourceManager(sources);
+    markDataCollectionSettingsDirty();
 }
 
-function applyRecommendedDataCollectionSources() {
+async function applyRecommendedDataCollectionSources() {
     const status = document.getElementById('data-collection-save-status');
     const sourcesEl = document.getElementById('data-external-source-list');
     const config = state.dataCollectionStatus?.config || {};
@@ -5142,14 +5186,15 @@ function applyRecommendedDataCollectionSources() {
         const currentMaxSources = Number(maxSourcesInput.value || 0);
         maxSourcesInput.value = String(Math.min(32, Math.max(currentMaxSources, recommended.length)));
     }
-    if (status) {
-        status.style.color = 'var(--accent-light)';
-        status.textContent = `已填入 ${recommended.length} 个推荐源，并同步调整每轮源数量；确认后请点击“保存设置”。`;
-    }
+    markDataCollectionSettingsDirty(`已填入 ${recommended.length} 个推荐源，并同步调整每轮源数量；正在保存到后端配置...`);
+    await saveDataCollectionSettings({
+        successMessage: `已填入并保存 ${recommended.length} 个推荐源，每轮最多源数量已同步到后端配置。`,
+    });
 }
 
-async function saveDataCollectionSettings() {
+async function saveDataCollectionSettings(options = {}) {
     const status = document.getElementById('data-collection-save-status');
+    state.dataCollectionSettingsSaving = true;
     if (status) {
         status.style.color = 'var(--text-muted)';
         status.textContent = '正在保存数据采集配置...';
@@ -5168,18 +5213,21 @@ async function saveDataCollectionSettings() {
         };
         const data = await postJSON('/api/data-collection/settings', body);
         state.dataCollectionStatus = data || null;
-        renderDataCollectionDashboard();
+        clearDataCollectionSettingsDirty();
+        renderDataCollectionDashboard({ forceSettings: true });
         if (isPageActive('data-collection')) fetchDataCollectionStatus({ silent: true });
         if (status) {
             status.style.color = 'var(--green)';
             const runtime = data?.runtime_sync?.message ? ` ${data.runtime_sync.message}` : '';
-            status.textContent = `${data?.message || '数据采集配置已保存。'}${runtime}`;
+            status.textContent = `${options.successMessage || data?.message || '数据采集配置已保存。'}${runtime}`;
         }
     } catch (err) {
         if (status) {
             status.style.color = 'var(--red)';
             status.textContent = err?.message || '数据采集配置保存失败。';
         }
+    } finally {
+        state.dataCollectionSettingsSaving = false;
     }
 }
 

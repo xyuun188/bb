@@ -677,9 +677,11 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in data_page_html
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" not in model_settings_html
     assert "\u542f\u7528 Scrapling \u5916\u90e8\u4e8b\u4ef6\u91c7\u96c6" in external_settings_html
+    assert "点击“填入推荐源”会同步保存推荐源和每轮源数量" in external_settings_html
     assert "applyRecommendedDataCollectionSources()" in external_settings_html
     assert 'id="data-external-source-list"' in external_settings_html
     assert 'id="data-external-sources"' not in external_settings_html
+    assert 'data-data-collection-setting' in external_settings_html
     assert 'id="data-cryptopanic-api-key"' in external_settings_html
     assert 'id="data-coinmarketcal-api-key"' in external_settings_html
     assert 'id="data-newsapi-api-key"' in external_settings_html
@@ -696,6 +698,14 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "selected === 'models') fetchDataCollectionStatus" not in script
     assert "applyRecommendedDataCollectionSources" in script
     assert "recommended_external_event_sources" in script
+    assert "initDataCollectionSettingsForm()" in script
+    assert "dataCollectionSettingsDirty" in script
+    assert "markDataCollectionSettingsDirty" in script
+    assert "options.forceSettings === true" in script
+    assert "正在保存到后端配置" in script
+    assert "await saveDataCollectionSettings({" in script
+    assert "options.successMessage" in script
+    assert "renderDataCollectionDashboard({ forceSettings: true })" in script
     assert "renderDataCollectionSourceManager" in script
     assert "addDataCollectionSource" in script
     assert "removeDataCollectionSource" in script
