@@ -12,7 +12,7 @@ from scripts.train_local_ai_tools_models import (
     _load_trade_reflection_samples,
     _merge_trade_samples,
 )
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
+from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from services.training_data_quality import annotate_training_payload
 
 
@@ -169,6 +169,65 @@ async def test_local_ai_closed_position_samples_require_okx_confirmed_orders(
     assert [sample["position_id"] for sample in payload["trade_samples"]] == [trusted.id]
     top_reasons = {item["reason"]: item["count"] for item in payload["quality_report"]["top_reasons"]}
     assert top_reasons["trade:untrusted_trade_fact:entry_order_not_okx_confirmed"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_local_ai_accepts_okx_execution_result_confirmed_orders(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'trade-execution-result-confirmed-training.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime(2026, 7, 1, 6, 46, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            trusted = Position(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="ACT/USDT",
+                side="short",
+                quantity=1580.0,
+                entry_price=0.00999,
+                current_price=0.0097,
+                realized_pnl=0.4582,
+                is_open=False,
+                closed_at=closed_at,
+                created_at=closed_at - timedelta(minutes=20),
+                okx_inst_id="ACT-USDT-SWAP",
+                entry_exchange_order_id="act-entry",
+                close_exchange_order_id="3703940352525967360",
+            )
+            session.add(trusted)
+            await session.flush()
+            session.add_all(
+                [
+                    _order("ACT/USDT", "act-entry", OKX_SYNC_CONFIRMED, closed_at),
+                    _order(
+                        "ACT/USDT",
+                        "3703940352525967360",
+                        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                        closed_at,
+                    ),
+                ]
+            )
+
+        closed_positions = await _load_closed_position_samples(10)
+    finally:
+        await close_db()
+
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=closed_positions,
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert [sample["position_id"] for sample in payload["trade_samples"]] == [trusted.id]
 
 
 def _reflection(position_id: int, symbol: str, realized_pnl: float) -> TradeReflection:

@@ -14,7 +14,11 @@ from typing import Any
 
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symbol_from_okx_inst_id
 from models.trade import Order, Position
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY
+from services.okx_order_fact_sync import (
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+)
 
 NON_EXCHANGE_ORDER_TOKENS = {
     "-",
@@ -922,12 +926,20 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
         ]
     trade_id = ",".join(str(item) for item in trade_ids if str(item).strip())
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
-    okx_confirmed = sync_status in {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
+    okx_confirmed = sync_status in {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    }
     source = "okx_raw_fills" if raw else "local_order_cache"
     if bool(raw.get("position_snapshot_confirmed")) and not bool(
         raw.get("fills_history_confirmed")
     ):
         source = "okx_current_position_snapshot"
+    elif bool(raw.get("execution_result_confirmed")) and not bool(
+        raw.get("fills_history_confirmed")
+    ):
+        source = "okx_execution_result"
     return OkxLinkedFillRow(
         side=str(getattr(order, "side", "") or "").lower(),
         quantity=quantity,

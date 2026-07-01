@@ -8,9 +8,17 @@ from services.manual_close_marker import (
     ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX,
     is_manual_close_exchange_order_id,
 )
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY
+from services.okx_order_fact_sync import (
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+)
 
-TRUSTED_OKX_ORDER_SYNC_STATUSES = {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
+TRUSTED_OKX_ORDER_SYNC_STATUSES = {
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+}
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:

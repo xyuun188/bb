@@ -920,6 +920,7 @@ class TradingService:
         self._okx_authoritative_sync_last_result_count: int | None = None
         self._okx_authoritative_sync_last_result_kinds: dict[str, int] = {}
         self._okx_authoritative_sync_last_requires_attention_count: int = 0
+        self._okx_authoritative_sync_last_degraded_count: int = 0
         self._okx_authoritative_sync_last_samples: list[dict[str, Any]] = []
         self._okx_authoritative_sync_success_count = 0
         self._okx_authoritative_sync_failure_count = 0
@@ -1118,6 +1119,9 @@ class TradingService:
                 )
                 or 0
             ),
+            "last_degraded_count": int(
+                getattr(self, "_okx_authoritative_sync_last_degraded_count", 0) or 0
+            ),
             "last_samples": list(
                 getattr(self, "_okx_authoritative_sync_last_samples", []) or []
             ),
@@ -1144,11 +1148,47 @@ class TradingService:
                 reason = f"{reason}：{last_error}"
             return f"{reason}；暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
         if requires_attention > 0:
+            detail = self._okx_authoritative_sync_attention_detail(
+                payload.get("last_samples"),
+            )
+            detail_text = f" 具体差异：{detail}；" if detail else ""
             return (
                 f"OKX 自动对账发现 {requires_attention} 个当前状态差异需要复核；"
-                "暂停新开仓，等待状态对齐后再恢复。"
+                f"{detail_text}暂停新开仓，等待状态对齐后再恢复。"
             )
         return None
+
+    @staticmethod
+    def _okx_authoritative_sync_attention_detail(samples: Any) -> str | None:
+        """Format the attention sample that made OKX/local current state unsafe."""
+
+        if not isinstance(samples, list):
+            return None
+        details: list[str] = []
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("requires_attention") is not True:
+                continue
+            kind = str(sample.get("kind") or "unknown").strip() or "unknown"
+            pieces = [kind]
+            symbol = str(sample.get("symbol") or "").strip()
+            side = str(sample.get("side") or "").strip()
+            exchange_order_id = str(sample.get("exchange_order_id") or "").strip()
+            note = safe_error_text(sample.get("note"), limit=160) if sample.get("note") else None
+            error = safe_error_text(sample.get("error"), limit=120) if sample.get("error") else None
+            if symbol:
+                pieces.append(symbol)
+            if side:
+                pieces.append(side)
+            if exchange_order_id:
+                pieces.append(f"订单 {exchange_order_id}")
+            if note:
+                pieces.append(note)
+            if error:
+                pieces.append(f"错误：{error}")
+            details.append(" / ".join(pieces))
+            if len(details) >= 3:
+                break
+        return "；".join(details) if details else None
 
     @staticmethod
     def _okx_authoritative_sync_result_summary(
@@ -1162,6 +1202,7 @@ class TradingService:
         kind_counts: Counter[str] = Counter()
         samples: list[dict[str, Any]] = []
         requires_attention_count = 0
+        degraded_count = 0
         for row in rows:
             if not isinstance(row, dict):
                 kind_counts["unknown"] += 1
@@ -1170,6 +1211,8 @@ class TradingService:
             kind_counts[kind] += 1
             if row.get("requires_attention") is True:
                 requires_attention_count += 1
+            if row.get("degraded") is True:
+                degraded_count += 1
             if len(samples) >= sample_limit:
                 continue
             samples.append(
@@ -1179,6 +1222,12 @@ class TradingService:
                     "side": row.get("side"),
                     "exchange_order_id": row.get("exchange_order_id"),
                     "requires_attention": bool(row.get("requires_attention") is True),
+                    "degraded": bool(row.get("degraded") is True),
+                    "status": row.get("status"),
+                    "okx_pull_available": row.get("okx_pull_available"),
+                    "error": safe_error_text(row.get("error"), limit=180)
+                    if row.get("error") is not None
+                    else None,
                     "note": safe_error_text(row.get("note"), limit=180)
                     if row.get("note") is not None
                     else None,
@@ -1188,6 +1237,7 @@ class TradingService:
             "count": len(rows),
             "kinds": dict(kind_counts),
             "requires_attention_count": requires_attention_count,
+            "degraded_count": degraded_count,
             "samples": samples,
         }
 
@@ -1210,19 +1260,34 @@ class TradingService:
         unverified_count = int(report.get("unverified_count") or 0)
         position_confirmed_count = int(report.get("position_confirmed_count") or 0)
         okx_pull_available = bool(report.get("okx_pull_available") is not False)
-        requires_attention = (
-            status in {"critical", "error", "unavailable"}
-            or unverified_count > 0
-            or not okx_pull_available
+        local_checked = int(report.get("local_checked") or 0)
+        pull_error = safe_error_text(report.get("error"), limit=180) if report.get("error") else None
+        degraded = not okx_pull_available
+        requires_attention = unverified_count > 0 or (
+            okx_pull_available and status in {"critical", "error", "unavailable"}
         )
-        return {
-            "kind": "order_fact_sync",
-            "symbol": None,
-            "side": None,
-            "exchange_order_id": None,
-            "requires_attention": requires_attention,
-            "note": (
-                f"OKX order facts sync status={status}, "
+        if degraded:
+            note = (
+                "OKX 订单事实同步降级：本轮未能从 OKX 拉取原生订单/成交数据，"
+                f"status={status}, local_checked={local_checked}, "
+                f"confirmed={int(report.get('confirmed_count') or 0)}, "
+                f"unverified={unverified_count}"
+            )
+            if pull_error:
+                note = f"{note}, error={pull_error}"
+            note = f"{note}；当前持仓对账已单独执行，本轮不把拉取失败误判为当前状态差异。"
+        elif requires_attention:
+            note = (
+                "OKX 订单事实同步发现本地已成交订单未被 OKX 原生成交确认："
+                f"status={status}, local_checked={local_checked}, "
+                f"confirmed={int(report.get('confirmed_count') or 0)}, "
+                f"position_confirmed={position_confirmed_count}, "
+                f"unverified={unverified_count}；需要复核后再允许新开仓。"
+            )
+        else:
+            note = (
+                f"OKX 订单事实同步正常：status={status}, "
+                f"local_checked={local_checked}, "
                 f"confirmed={int(report.get('confirmed_count') or 0)}, "
                 f"position_confirmed={position_confirmed_count}, "
                 f"unverified={unverified_count}, "
@@ -1230,7 +1295,18 @@ class TradingService:
                 "position_history="
                 f"{int(report.get('position_history_backfilled_count') or 0)}+"
                 f"{int(report.get('position_history_updated_count') or 0)}"
-            ),
+            )
+        return {
+            "kind": "order_fact_sync",
+            "symbol": None,
+            "side": None,
+            "exchange_order_id": None,
+            "requires_attention": requires_attention,
+            "degraded": degraded,
+            "status": status,
+            "okx_pull_available": okx_pull_available,
+            "error": pull_error,
+            "note": note,
             "order_fact_sync": report,
         }
 
@@ -1411,6 +1487,9 @@ class TradingService:
                 self._okx_authoritative_sync_last_result_kinds = result_summary["kinds"]
                 self._okx_authoritative_sync_last_requires_attention_count = result_summary[
                     "requires_attention_count"
+                ]
+                self._okx_authoritative_sync_last_degraded_count = result_summary[
+                    "degraded_count"
                 ]
                 self._okx_authoritative_sync_last_samples = result_summary["samples"]
                 self._okx_authoritative_sync_success_count = (

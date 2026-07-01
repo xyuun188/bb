@@ -324,6 +324,79 @@ async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gat
 
 
 @pytest.mark.asyncio
+async def test_okx_order_fact_sync_pull_degraded_does_not_create_state_difference() -> None:
+    service = TradingService.__new__(TradingService)
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+
+    class FakeOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            return {
+                "status": "warning",
+                "okx_pull_available": False,
+                "local_checked": 231,
+                "confirmed_count": 0,
+                "position_confirmed_count": 0,
+                "unverified_count": 0,
+                "backfilled_count": 0,
+                "position_history_backfilled_count": 0,
+                "position_history_updated_count": 0,
+                "error": "TimeoutError",
+            }
+
+    def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
+        return FakeOrderFactSyncService()
+
+    service.okx_order_fact_sync_factory = factory
+
+    row = await service._sync_okx_order_facts_for_loop()
+    summary = TradingService._okx_authoritative_sync_result_summary([row])
+
+    assert row["kind"] == "order_fact_sync"
+    assert row["requires_attention"] is False
+    assert row["degraded"] is True
+    assert row["okx_pull_available"] is False
+    assert row["error"] == "TimeoutError"
+    assert "OKX 订单事实同步降级" in row["note"]
+    assert "不把拉取失败误判为当前状态差异" in row["note"]
+    assert summary["requires_attention_count"] == 0
+    assert summary["degraded_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_order_fact_sync_unverified_still_blocks_runtime_gate() -> None:
+    service = TradingService.__new__(TradingService)
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+
+    class FakeOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            return {
+                "status": "warning",
+                "okx_pull_available": True,
+                "local_checked": 3,
+                "confirmed_count": 2,
+                "position_confirmed_count": 0,
+                "unverified_count": 1,
+                "backfilled_count": 0,
+                "position_history_backfilled_count": 0,
+                "position_history_updated_count": 0,
+            }
+
+    def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
+        return FakeOrderFactSyncService()
+
+    service.okx_order_fact_sync_factory = factory
+
+    row = await service._sync_okx_order_facts_for_loop()
+    summary = TradingService._okx_authoritative_sync_result_summary([row])
+
+    assert row["requires_attention"] is True
+    assert row["degraded"] is False
+    assert "未被 OKX 原生成交确认" in row["note"]
+    assert summary["requires_attention_count"] == 1
+    assert summary["degraded_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_okx_authoritative_sync_loop_records_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

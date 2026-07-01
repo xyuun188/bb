@@ -144,6 +144,64 @@ async def test_trade_order_log_service_native_inst_id_overrides_wrong_canonical_
 
 
 @pytest.mark.asyncio
+async def test_trade_order_log_service_persists_okx_execution_result_facts() -> None:
+    repo = FakeTradeRepo()
+    filled_at = datetime(2026, 7, 1, 6, 46, tzinfo=UTC)
+    result = ExecutionResult(
+        order_id="3703940352525967360",
+        exchange_order_id="3703940352525967360",
+        symbol="ACT-USDT-SWAP",
+        side="buy",
+        order_type="market",
+        quantity=1580.0,
+        price=0.0097,
+        status=OrderStatus.FILLED,
+        fee=0.007663,
+        pnl=0.4582,
+        timestamp=filled_at,
+        raw_response={
+            "id": "3703940352525967360",
+            "filled_contracts": 158.0,
+            "filled": 158.0,
+            "average": 0.0097,
+            "info": {
+                "ordId": "3703940352525967360",
+                "instId": "ACT-USDT-SWAP",
+                "side": "buy",
+                "state": "filled",
+                "accFillSz": "158",
+                "fillSz": "9",
+                "avgPx": "0.0097",
+                "fee": "-0.007663",
+                "pnl": "0.4582",
+                "tradeId": "535631715",
+            },
+        },
+    )
+    decision = _decision()
+    decision.symbol = "ACT/USDT"
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda model_name: f"mode:{model_name}",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", decision, decision_id=18794)
+
+    order = repo.orders[0]
+    assert order["symbol"] == "ACT/USDT"
+    assert order["okx_inst_id"] == "ACT-USDT-SWAP"
+    assert order["okx_sync_status"] == "okx_execution_result_confirmed"
+    assert order["okx_state"] == "filled"
+    assert order["okx_trade_ids"] == "535631715"
+    assert order["okx_fill_contracts"] == pytest.approx(158.0)
+    assert order["okx_fill_pnl"] == pytest.approx(0.4582)
+    assert order["okx_raw_fills"]["execution_result_confirmed"] is True
+    assert order["okx_raw_fills"]["order_id"] == "3703940352525967360"
+    assert order["okx_raw_fills"]["inst_id"] == "ACT-USDT-SWAP"
+
+
+@pytest.mark.asyncio
 async def test_trade_order_log_service_skips_zero_quantity_tracking_order() -> None:
     repo = FakeTradeRepo()
     result = ExecutionResult(

@@ -55,6 +55,7 @@ class TradeOrderLogService:
             async with self._session_context_factory() as session:
                 repo = self._trade_repo_factory(session)
                 symbol = self._result_symbol(result, decision)
+                payload = self._okx_execution_fact_payload(result)
                 await repo.create_order(
                     {
                         "model_name": model_name,
@@ -69,6 +70,7 @@ class TradeOrderLogService:
                         "decision_id": decision_id,
                         "exchange_order_id": result.exchange_order_id,
                         "filled_at": result.timestamp,
+                        **payload,
                     }
                 )
         except Exception as exc:
@@ -146,3 +148,65 @@ class TradeOrderLogService:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _okx_execution_fact_payload(result: Any) -> dict[str, Any]:
+        raw = getattr(result, "raw_response", None)
+        raw = raw if isinstance(raw, dict) else {}
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        inst_id = okx_inst_id_from_payload(raw, include_fallback=False)
+        order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
+        info_order_id = str(info.get("ordId") or raw.get("ordId") or raw.get("id") or "").strip()
+        status = str(getattr(getattr(result, "status", None), "value", getattr(result, "status", "")) or "").lower()
+        state = str(info.get("state") or raw.get("status") or status or "").lower().strip()
+        filled_contracts = TradeOrderLogService._safe_float(
+            info.get("accFillSz") or raw.get("filled_contracts") or raw.get("filled"),
+            0.0,
+        )
+        fill_price = TradeOrderLogService._safe_float(
+            info.get("avgPx") or info.get("fillPx") or raw.get("average") or raw.get("price"),
+            0.0,
+        )
+        if (
+            status not in {OrderStatus.FILLED.value, OrderStatus.PARTIAL.value}
+            or not order_id
+            or not info_order_id
+            or order_id != info_order_id
+            or not inst_id
+            or filled_contracts <= 0
+            or fill_price <= 0
+        ):
+            return {}
+        trade_id = str(info.get("tradeId") or "").strip()
+        fee = abs(TradeOrderLogService._safe_float(info.get("fee"), 0.0))
+        pnl = TradeOrderLogService._safe_float(
+            info.get("fillPnl") or info.get("pnl") or raw.get("pnl"),
+            0.0,
+        )
+        raw_fact = {
+            "source": "okx_execution_result",
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": True,
+            "order_id": order_id,
+            "trade_ids": [trade_id] if trade_id else [],
+            "inst_id": inst_id,
+            "contracts": filled_contracts,
+            "base_quantity": TradeOrderLogService._safe_float(getattr(result, "quantity", 0.0), 0.0),
+            "avg_price": fill_price,
+            "fee_abs": fee,
+            "fill_pnl": pnl,
+            "timestamp": getattr(result, "timestamp", None).isoformat()
+            if getattr(result, "timestamp", None) is not None
+            else None,
+            "rows": [dict(info)],
+        }
+        payload: dict[str, Any] = {
+            "okx_inst_id": inst_id,
+            "okx_trade_ids": trade_id or None,
+            "okx_fill_contracts": filled_contracts,
+            "okx_fill_pnl": pnl,
+            "okx_state": state or "filled",
+            "okx_sync_status": "okx_execution_result_confirmed",
+            "okx_raw_fills": raw_fact,
+        }
+        return payload

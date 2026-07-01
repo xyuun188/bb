@@ -18,9 +18,15 @@ import structlog
 from sqlalchemy import or_, select
 
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symbol_from_okx_inst_id
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_payload,
+    okx_inst_id_from_symbol,
+    symbol_from_okx_inst_id,
+)
 from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
+from models.decision import AIDecision
 from models.trade import Order, Position
 from services.okx_native_facts import OkxNativeFactsClient, OkxNativeFillGroup
 from services.okx_position_confirmation import (
@@ -53,6 +59,7 @@ OKX_SYNC_OKX_ONLY = "okx_only_backfilled"
 OKX_SYNC_NO_FILL_REJECTED = "okx_no_fill_rejected"
 OKX_SYNC_ORDER_ONLY = "okx_order_only"
 OKX_SYNC_POSITION_CONFIRMED = "okx_position_confirmed"
+OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +284,19 @@ class OkxOrderFactSyncService:
                 .limit(self.limit)
             )
             writable_orders = list(rows.scalars().all())
+            decision_ids = {
+                int(decision_id)
+                for order in writable_orders
+                if (decision_id := getattr(order, "decision_id", None))
+            }
+            decisions_by_id: dict[int, AIDecision] = {}
+            if decision_ids:
+                decision_rows = await session.execute(
+                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                )
+                decisions_by_id = {
+                    int(decision.id): decision for decision in decision_rows.scalars().all()
+                }
             (
                 confirmed_count,
                 position_confirmed_count,
@@ -290,6 +310,7 @@ class OkxOrderFactSyncService:
                 fills_by_order_id=fills_by_order_id,
                 order_rows_by_id=order_rows_by_id,
                 contract_sizes=contract_sizes,
+                decisions_by_id=decisions_by_id,
                 now=datetime.now(UTC),
                 since=since,
             )
@@ -419,6 +440,7 @@ class OkxOrderFactSyncService:
         fills_by_order_id: dict[str, OkxNativeFillGroup],
         order_rows_by_id: dict[str, dict[str, Any]],
         contract_sizes: dict[str, float],
+        decisions_by_id: dict[int, AIDecision] | None = None,
         now: datetime,
         since: datetime,
     ) -> tuple[int, int, int, int, list[dict[str, Any]]]:
@@ -465,6 +487,17 @@ class OkxOrderFactSyncService:
                     )
                     position_confirmed_count += 1
                     samples.append(_sample(order, kind="local_order_position_confirmed"))
+                    continue
+                decision = (decisions_by_id or {}).get(int(getattr(order, "decision_id", 0) or 0))
+                if _recover_okx_execution_result_fact_from_decision(order, decision):
+                    _apply_execution_result_confirmation_to_order(order, now=now)
+                    confirmed_count += 1
+                    samples.append(_sample(order, kind="local_order_execution_result_recovered"))
+                    continue
+                if _order_has_okx_execution_result_fact(order):
+                    _apply_execution_result_confirmation_to_order(order, now=now)
+                    confirmed_count += 1
+                    samples.append(_sample(order, kind="local_order_execution_result_confirmed"))
                     continue
                 if str(getattr(order, "status", "") or "").lower() == "filled":
                     order.okx_sync_status = OKX_SYNC_UNVERIFIED
@@ -1071,6 +1104,148 @@ def _apply_position_confirmation_to_order(
     order.okx_synced_at = now
     order.okx_last_error = None
     order.okx_raw_fills = confirmation.as_raw_payload()
+
+
+def _order_has_okx_execution_result_fact(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("execution_result_confirmed") is not True:
+        return False
+    order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    raw_order_id = str(raw.get("order_id") or "").strip()
+    inst_id = str(raw.get("inst_id") or getattr(order, "okx_inst_id", "") or "").strip().upper()
+    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
+    if not order_id or not raw_order_id or order_id != raw_order_id:
+        return False
+    if not inst_id or not inst_id.endswith("-SWAP"):
+        return False
+    return contracts > 0 and avg_price > 0
+
+
+def _recover_okx_execution_result_fact_from_decision(
+    order: Order,
+    decision: AIDecision | None,
+) -> bool:
+    if decision is None:
+        return False
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    execution_result = raw.get("execution_result")
+    if not isinstance(execution_result, dict):
+        return False
+    status = str(execution_result.get("status") or "").lower().strip()
+    if status not in {"filled", "partial"}:
+        return False
+    raw_response = execution_result.get("raw_response")
+    raw_response = raw_response if isinstance(raw_response, dict) else {}
+    info = raw_response.get("info") if isinstance(raw_response.get("info"), dict) else {}
+    order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    result_order_id = str(
+        execution_result.get("exchange_order_id")
+        or execution_result.get("order_id")
+        or raw_response.get("ordId")
+        or raw_response.get("id")
+        or info.get("ordId")
+        or ""
+    ).strip()
+    if not order_id or not result_order_id or order_id != result_order_id:
+        return False
+    inst_id = okx_inst_id_from_payload(raw_response, include_fallback=False)
+    if not inst_id:
+        inst_id = str(info.get("instId") or "").strip().upper()
+    contracts = _safe_float(
+        info.get("accFillSz")
+        or raw_response.get("filled_contracts")
+        or raw_response.get("filled")
+        or execution_result.get("filled_contracts")
+        or execution_result.get("quantity"),
+        0.0,
+    )
+    avg_price = _safe_float(
+        info.get("avgPx")
+        or info.get("fillPx")
+        or raw_response.get("average")
+        or raw_response.get("price")
+        or execution_result.get("price"),
+        0.0,
+    )
+    if not inst_id or not inst_id.endswith("-SWAP") or contracts <= 0 or avg_price <= 0:
+        return False
+    trade_id = str(info.get("tradeId") or raw_response.get("tradeId") or "").strip()
+    fee_abs = abs(_safe_float(info.get("fee") or execution_result.get("fee"), 0.0))
+    fill_pnl = _safe_float(
+        info.get("fillPnl")
+        or info.get("pnl")
+        or raw_response.get("pnl")
+        or execution_result.get("pnl"),
+        0.0,
+    )
+    base_quantity = _safe_float(
+        execution_result.get("quantity") or getattr(order, "quantity", None),
+        0.0,
+    )
+    raw_fact = {
+        "source": "okx_execution_result",
+        "fills_history_confirmed": False,
+        "execution_result_confirmed": True,
+        "recovered_from_decision": int(getattr(decision, "id", 0) or 0) or None,
+        "order_id": order_id,
+        "trade_ids": [trade_id] if trade_id else [],
+        "inst_id": inst_id,
+        "contracts": contracts,
+        "base_quantity": base_quantity,
+        "avg_price": avg_price,
+        "fee_abs": fee_abs,
+        "fill_pnl": fill_pnl,
+        "timestamp": _execution_result_timestamp(execution_result),
+        "rows": [dict(info)] if info else [],
+    }
+    order.okx_raw_fills = raw_fact
+    return _order_has_okx_execution_result_fact(order)
+
+
+def _execution_result_timestamp(execution_result: dict[str, Any]) -> str | None:
+    for key in ("timestamp", "filled_at", "created_at"):
+        value = execution_result.get(key)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _apply_execution_result_confirmation_to_order(order: Order, *, now: datetime) -> None:
+    raw = dict(getattr(order, "okx_raw_fills", None) or {})
+    inst_id = str(raw.get("inst_id") or getattr(order, "okx_inst_id", "") or "").strip().upper()
+    trade_ids = [
+        str(item or "").strip()
+        for item in (raw.get("trade_ids") or [])
+        if str(item or "").strip()
+    ]
+    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
+    fee_abs = _safe_float(raw.get("fee_abs") or getattr(order, "fee", None), 0.0)
+    fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
+    if inst_id:
+        order.okx_inst_id = inst_id
+        order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
+    if contracts > 0:
+        order.okx_fill_contracts = contracts
+    if avg_price > 0:
+        order.price = avg_price
+    if fee_abs >= 0:
+        order.fee = fee_abs
+    order.okx_trade_ids = ",".join(trade_ids) if trade_ids else None
+    order.okx_fill_pnl = fill_pnl
+    order.okx_state = "execution_result_confirmed"
+    order.okx_sync_status = OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+    order.okx_synced_at = now
+    order.okx_last_error = None
+    raw["execution_result_confirmed"] = True
+    raw.setdefault("fills_history_confirmed", False)
+    order.okx_raw_fills = raw
 
 
 def _order_inst_id(order: Order) -> str:

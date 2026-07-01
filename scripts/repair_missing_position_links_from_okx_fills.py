@@ -44,6 +44,11 @@ from services.okx_authoritative_sync import (  # noqa: E402
     _local_orders_by_exchange_id,
 )
 from services.okx_native_facts import OkxNativeFactsClient  # noqa: E402
+from services.okx_order_fact_sync import (  # noqa: E402
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+)
 
 DEFAULT_DAYS = 30
 DEFAULT_WINDOW_SECONDS = 180
@@ -55,7 +60,11 @@ REPAIR_REFLECTION_SOURCE = "okx_position_link_repair"
 ORDER_DECISION_LINEAGE_REPAIR_SOURCE = "okx_order_decision_lineage_repair"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
-TRUSTED_CLOSE_ORDER_SYNC_STATUSES = {"okx_confirmed", "okx_only_backfilled"}
+TRUSTED_CLOSE_ORDER_SYNC_STATUSES = {
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+}
 
 
 @dataclass(frozen=True, slots=True)

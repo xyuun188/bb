@@ -12,6 +12,7 @@ from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
 from scripts import repair_missing_position_links_from_okx_fills as repair_script
+from services.okx_order_fact_sync import OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 
 
 def test_missing_position_link_repair_imports_online_runtime_bootstrap() -> None:
@@ -1077,6 +1078,56 @@ def test_existing_close_order_plan_requires_okx_confirmed_status() -> None:
     )
 
     assert plan is None
+
+
+def test_existing_execution_result_confirmed_close_order_closes_open_position_plan() -> None:
+    opened_at = datetime(2026, 7, 1, 6, 20, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 1, 6, 46, tzinfo=UTC)
+    position = Position(
+        id=65,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ACT/USDT",
+        side="short",
+        quantity=1580.0,
+        entry_price=0.00999,
+        current_price=0.0097,
+        leverage=3.0,
+        is_open=True,
+        created_at=opened_at,
+        okx_inst_id="ACT-USDT-SWAP",
+        entry_exchange_order_id="act-entry",
+    )
+    close_order = Order(
+        id=97,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ACT/USDT",
+        side="buy",
+        order_type="market",
+        quantity=1580.0,
+        price=0.0097,
+        status="filled",
+        fee=0.007663,
+        exchange_order_id="3703940352525967360",
+        filled_at=closed_at,
+        created_at=closed_at,
+        okx_inst_id="ACT-USDT-SWAP",
+        okx_fill_contracts=158.0,
+        okx_fill_pnl=0.4582,
+        okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    )
+
+    plan = repair_script._match_existing_close_order_open_position_plan(
+        position,
+        [close_order],
+        contract_sizes={"ACT-USDT-SWAP": 10.0},
+    )
+
+    assert plan is not None
+    assert plan.okx_order_id == "3703940352525967360"
+    assert plan.fill_quantity == pytest.approx(1580.0)
+    assert plan.fill_pnl == pytest.approx(0.4582)
 
 
 def test_native_full_close_shared_plan_matches_split_positions() -> None:

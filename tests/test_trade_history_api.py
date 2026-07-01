@@ -8,7 +8,7 @@ from config.settings import settings
 from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
+from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
 from web_dashboard.api.trades import (
     _execution_status_label,
@@ -101,6 +101,71 @@ async def test_trade_history_uses_matched_position_leverage_for_close_order(
     assert detail["matched_positions"][0]["leverage"] == pytest.approx(3.0)
     assert detail["execution_source"] == "system"
     assert detail["execution_source_label"] == "系统执行"
+
+
+@pytest.mark.asyncio
+async def test_trade_history_accepts_okx_execution_result_confirmed_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'trade-history-execution-confirmed.db').as_posix()}",
+    )
+    await init_db()
+    filled_at = datetime(2026, 7, 1, 6, 46, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            order = await repo.create_order(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "ACT/USDT",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": 1580.0,
+                    "price": 0.0097,
+                    "status": "filled",
+                    "fee": 0.007663,
+                    "exchange_order_id": "3703940352525967360",
+                    "filled_at": filled_at,
+                    "created_at": filled_at,
+                    "okx_inst_id": "ACT-USDT-SWAP",
+                    "okx_trade_ids": "535631715",
+                    "okx_fill_contracts": 158.0,
+                    "okx_fill_pnl": 0.4582,
+                    "okx_sync_status": OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    "okx_raw_fills": {
+                        "source": "okx_execution_result",
+                        "fills_history_confirmed": False,
+                        "execution_result_confirmed": True,
+                        "order_id": "3703940352525967360",
+                        "trade_ids": ["535631715"],
+                        "inst_id": "ACT-USDT-SWAP",
+                        "contracts": 158.0,
+                        "base_quantity": 1580.0,
+                        "avg_price": 0.0097,
+                        "fee_abs": 0.007663,
+                        "fill_pnl": 0.4582,
+                        "timestamp": filled_at.isoformat(),
+                    },
+                }
+            )
+
+        trades = await get_trades(model_name=None, symbol=None, mode="paper", limit=10, page=1)
+        detail = await get_trade_detail(order.id)
+    finally:
+        await close_db()
+
+    row = next(item for item in trades["trades"] if item["id"] == order.id)
+    assert row["okx_confirmed"] is True
+    assert row["success"] is True
+    assert detail["okx_confirmed"] is True
+    assert detail["success"] is True
+    assert detail["okx_sync_status"] == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 
 
 @pytest.mark.asyncio

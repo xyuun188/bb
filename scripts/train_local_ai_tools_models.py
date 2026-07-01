@@ -25,7 +25,11 @@ from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY
+from services.okx_order_fact_sync import (
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+)
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.okx_training_gate import okx_training_refresh_gate
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
@@ -194,7 +198,11 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
 
 
 def _okx_confirmed_order_fee_by_id(orders: list[Order]) -> dict[str, float]:
-    confirmed_statuses = {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
+    confirmed_statuses = {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    }
     confirmed: dict[str, float] = {}
     for order in orders:
         sync_status = str(getattr(order, "okx_sync_status", "") or "").lower().strip()

@@ -3,7 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from models.trade import Position
+from services.okx_order_fact_sync import OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from services.trade_fact_trust import (
+    closed_position_trade_fact_untrusted_reason_with_orders,
     closed_position_trade_fact_trusted,
     closed_position_trade_fact_untrusted_reason,
     filter_trusted_closed_positions,
@@ -98,3 +100,25 @@ def test_filter_trusted_closed_positions_reports_quarantine_reasons() -> None:
     assert report["quarantined"] == 1
     assert report["reason_counts"] == {"missing_close_exchange_order_id": 1}
     assert report["position_ids"] == [2]
+
+
+def test_execution_result_confirmed_orders_are_trusted_trade_facts() -> None:
+    position = SimpleNamespace(
+        id=1,
+        is_open=False,
+        realized_pnl=1.2,
+        entry_exchange_order_id="entry-ok",
+        close_exchange_order_id="close-ok",
+    )
+    orders = {
+        "entry-ok": SimpleNamespace(
+            exchange_order_id="entry-ok",
+            okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        ),
+        "close-ok": SimpleNamespace(
+            exchange_order_id="close-ok",
+            okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        ),
+    }
+
+    assert closed_position_trade_fact_untrusted_reason_with_orders(position, orders) is None

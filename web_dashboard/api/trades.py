@@ -23,7 +23,11 @@ from services.execution_reason_localizer import localize_execution_reason
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.okx_error_classifier import is_okx_temporary_service_error
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY
+from services.okx_order_fact_sync import (
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_OKX_ONLY,
+)
 from services.okx_position_ledger_view import build_okx_position_ledger_groups
 from services.position_open_time import parse_position_time
 from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
@@ -337,7 +341,11 @@ CORRUPTED_HISTORY_REASON = "该笔历史记录的原始说明已损坏，无法�
 
 def _order_okx_confirmed(order: Any) -> bool:
     sync_status = str(getattr(order, "okx_sync_status", "") or "").lower().strip()
-    return sync_status in {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY}
+    return sync_status in {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    }
 
 
 def _order_success(order: Any) -> bool:

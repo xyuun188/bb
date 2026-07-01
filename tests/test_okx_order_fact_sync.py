@@ -7,9 +7,11 @@ import pytest
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
+from models.decision import AIDecision
 from models.trade import Order, Position
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_NO_FILL_REJECTED,
     OKX_SYNC_ORDER_ONLY,
     OKX_SYNC_OKX_ONLY,
@@ -195,6 +197,41 @@ class _Executor:
 
     async def shutdown(self) -> None:
         return None
+
+
+class _NoHistoryExecutor:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = self
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> "_NoHistoryExecutor":
+        return self
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def privateGetTradeFillsHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetTradeOrdersHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetTradeOrdersHistoryArchive(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetAccountPositionsHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"instId": "ACT-USDT-SWAP", "ctVal": "10"}]}
 
 
 def test_position_history_payload_preserves_existing_order_links() -> None:
@@ -1232,6 +1269,195 @@ async def test_order_fact_sync_marks_current_position_confirmed_without_fill_con
         )
         assert item["okx_confirmed"] is False
         assert item["success"] is False
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_keeps_okx_execution_result_confirmed_when_history_lags(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-execution-result-fact.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(days=3, minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1580.0,
+                    price=0.0097,
+                    status="filled",
+                    fee=0.007663,
+                    exchange_order_id="3703940352525967360",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="ACT-USDT-SWAP",
+                    okx_trade_ids="535631715",
+                    okx_fill_contracts=158.0,
+                    okx_fill_pnl=0.4582,
+                    okx_state="filled",
+                    okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    okx_raw_fills={
+                        "source": "okx_execution_result",
+                        "fills_history_confirmed": False,
+                        "execution_result_confirmed": True,
+                        "order_id": "3703940352525967360",
+                        "trade_ids": ["535631715"],
+                        "inst_id": "ACT-USDT-SWAP",
+                        "contracts": 158.0,
+                        "base_quantity": 1580.0,
+                        "avg_price": 0.0097,
+                        "fee_abs": 0.007663,
+                        "fill_pnl": 0.4582,
+                        "rows": [{"ordId": "3703940352525967360", "accFillSz": "158"}],
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_NoHistoryExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "3703940352525967360"
+                    )
+                )
+            ).one()._mapping
+
+        assert report["confirmed_count"] == 1
+        assert report["unverified_count"] == 0
+        assert row["okx_sync_status"] == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+        assert row["okx_state"] == "execution_result_confirmed"
+        assert row["okx_fill_contracts"] == pytest.approx(158.0)
+        assert row["okx_fill_pnl"] == pytest.approx(0.4582)
+        assert row["okx_last_error"] is None
+        assert row["okx_raw_fills"]["execution_result_confirmed"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_recovers_okx_execution_result_fact_from_decision(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-execution-result-decision-recovery.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(days=3, minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ACT/USDT",
+                action="close_short",
+                confidence=0.88,
+                reasoning="close",
+                position_size_pct=1.0,
+                suggested_leverage=1.0,
+                raw_llm_response={
+                    "execution_result": {
+                        "order_id": "3703940352525967360",
+                        "exchange_order_id": "3703940352525967360",
+                        "status": "filled",
+                        "quantity": 1580.0,
+                        "price": 0.0097,
+                        "fee": 0.007663,
+                        "pnl": 0.4582,
+                        "timestamp": "2026-07-01T06:46:00+00:00",
+                        "raw_response": {
+                            "id": "3703940352525967360",
+                            "filled_contracts": 158.0,
+                            "average": 0.0097,
+                            "info": {
+                                "ordId": "3703940352525967360",
+                                "instId": "ACT-USDT-SWAP",
+                                "state": "filled",
+                                "accFillSz": "158",
+                                "avgPx": "0.0097",
+                                "fee": "-0.007663",
+                                "pnl": "0.4582",
+                                "tradeId": "535631715",
+                            },
+                        },
+                    }
+                },
+                is_paper=True,
+                was_executed=True,
+                created_at=phase3_time,
+            )
+            session.add(decision)
+            await session.flush()
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1580.0,
+                    price=0.0097,
+                    status="filled",
+                    fee=0.007663,
+                    decision_id=decision.id,
+                    exchange_order_id="3703940352525967360",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="ACT-USDT-SWAP",
+                    okx_state="missing_okx_fill",
+                    okx_sync_status=OKX_SYNC_UNVERIFIED,
+                    okx_last_error="OKX orders-history/fills-history did not confirm this local filled order",
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_NoHistoryExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "3703940352525967360"
+                    )
+                )
+            ).one()._mapping
+
+        assert report["confirmed_count"] == 1
+        assert report["unverified_count"] == 0
+        assert row["okx_sync_status"] == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+        assert row["okx_state"] == "execution_result_confirmed"
+        assert row["okx_trade_ids"] == "535631715"
+        assert row["okx_fill_contracts"] == pytest.approx(158.0)
+        assert row["okx_fill_pnl"] == pytest.approx(0.4582)
+        assert row["okx_last_error"] is None
+        assert row["okx_raw_fills"]["recovered_from_decision"] == decision.id
     finally:
         await close_db()
 
