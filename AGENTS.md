@@ -13,7 +13,7 @@ Use the persistent CODEX++ MCP server `hindsight_bb` for this repository. The ol
 
 At the beginning of a session, do not run broad live recall by default. Use `hindsight_bb.recall` only when current context is needed, with `budget="low"` and a small `max_tokens` limit first. Escalate to broader recall only when the user explicitly asks for deeper historical context.
 
-Durable project changes are retained automatically by the user-level CODEX++ watcher and local Git hooks under `C:\Users\Administrator\.codex\hindsight-memory`. Do not duplicate this by saving every turn manually.
+Durable project changes must be retained in the online `bb` Hindsight bank. Prefer the configured `hindsight_bb` MCP server when it is available in the current Codex session. If that MCP server is not hot-loaded, use the online Hindsight API/MCP endpoint listed above or report that memory sync could not be completed; do not fall back to missing local scripts.
 
 ## Required Post-Change Workflow
 
@@ -37,11 +37,7 @@ rtk git commit -m "<concise change summary>"
 rtk git push origin main
 ```
 
-4. Update project memory for meaningful durable facts with the `bb` Hindsight bank. Prefer the configured CODEX++ automation/manual sync path, and never store secrets:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1" -ProjectRoot "F:\BB" -Event "manual"
-```
+4. Update project memory for meaningful durable facts with the online `bb` Hindsight bank. Prefer `hindsight_bb` MCP when available; otherwise use the remote endpoint `http://45.207.197.48:18888/mcp/bb/` or the Hindsight API at `http://45.207.197.48:18888`. Never store secrets. Do not call `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync script is not part of this setup.
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
@@ -186,11 +182,7 @@ Overall average: **60-90% token reduction** on common development operations.
 For this repository, use the project-specific Hindsight MCP server `hindsight_bb` and bank `bb` automatically.
 Hindsight reads and writes must use `http://45.207.197.48:18888/mcp/bb/` by default.
 
-Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts; that directory is not part of the current setup. Project changes are retained by user-level CODEX++ automation:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1" -ProjectRoot "F:\BB" -Event "manual"
-```
+Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts. Do not run `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync path is obsolete for this project. Project memory lives on the online Hindsight service, with project bank `bb` at `http://45.207.197.48:18888/mcp/bb/`.
 
 Only call live recall when it is needed for the current task. Prefer `hindsight_bb.recall` with `budget="low"` and `max_tokens` around `1200` first; avoid `budget="high"` at session start because it commonly takes 30+ seconds on this remote Hindsight server.
 
