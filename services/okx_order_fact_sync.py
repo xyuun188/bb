@@ -27,6 +27,7 @@ from core.symbols import (
 from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
+from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
 from services.okx_native_facts import OkxNativeFactsClient, OkxNativeFillGroup
 from services.okx_position_confirmation import (
@@ -60,6 +61,7 @@ OKX_SYNC_NO_FILL_REJECTED = "okx_no_fill_rejected"
 OKX_SYNC_ORDER_ONLY = "okx_order_only"
 OKX_SYNC_POSITION_CONFIRMED = "okx_position_confirmed"
 OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
+OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE = "okx_position_sync_suppression"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,23 @@ class OkxPositionFactSyncSummary:
             "skipped_count": self.skipped_count,
             "samples": list(self.samples),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class OkxPositionSyncSuppression:
+    mode: str
+    symbol: str
+    side: str
+    okx_inst_id: str
+    okx_pos_id: str
+    entry_order_ids: frozenset[str]
+    close_order_ids: frozenset[str]
+    created_at: datetime | None = None
+    closed_at: datetime | None = None
+    reason: str = ""
+
+    def has_strong_identity(self) -> bool:
+        return bool(self.okx_pos_id or self.entry_order_ids or self.close_order_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,6 +657,7 @@ class OkxOrderFactSyncService:
         backfilled = 0
         updated = 0
         skipped = 0
+        suppressions = await self._load_position_sync_suppressions(session)
         fills_by_inst_side = _fills_by_inst_and_position_side(fills)
         for row in position_history_rows:
             position_time = _position_history_time(row)
@@ -697,6 +717,32 @@ class OkxOrderFactSyncService:
                 if lifecycle_close_fills:
                     close_order_ids = _ordered_exchange_ids(fill.order_id for fill in lifecycle_close_fills)
                     close_fills = lifecycle_close_fills
+            suppression = _matching_position_sync_suppression(
+                suppressions,
+                mode=self.mode,
+                symbol=symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id),
+                side=side,
+                okx_inst_id=inst_id,
+                okx_pos_id=pos_id,
+                entry_order_ids=entry_order_ids,
+                close_order_ids=close_order_ids,
+                created_at=created_at,
+                closed_at=closed_at,
+            )
+            if suppression is not None:
+                skipped += 1
+                samples.append(
+                    {
+                        "kind": "okx_position_history_suppressed",
+                        "symbol": symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id),
+                        "side": side,
+                        "okx_pos_id": pos_id,
+                        "entry_exchange_order_id": ",".join(entry_order_ids) or None,
+                        "close_exchange_order_id": ",".join(close_order_ids) or None,
+                        "reason": suppression.reason,
+                    }
+                )
+                continue
             payload = _position_from_history_row(
                 row,
                 mode=self.mode,
@@ -760,6 +806,7 @@ class OkxOrderFactSyncService:
         samples: list[dict[str, Any]],
     ) -> OkxPositionFactSyncSummary:
         linked_order_ids = await self._load_linked_position_order_ids(session)
+        suppressions = await self._load_position_sync_suppressions(session)
         unlinked_fills = [
             fill
             for fill in sorted(fills, key=lambda item: item.timestamp or datetime.min.replace(tzinfo=UTC))
@@ -775,6 +822,33 @@ class OkxOrderFactSyncService:
             checked += 1
             if entry_fill.order_id in linked_order_ids or close_fill.order_id in linked_order_ids:
                 skipped += 1
+                continue
+            suppression = _matching_position_sync_suppression(
+                suppressions,
+                mode=self.mode,
+                symbol=symbol_from_okx_inst_id(entry_fill.inst_id) or entry_fill.symbol,
+                side=side,
+                okx_inst_id=entry_fill.inst_id,
+                okx_pos_id="",
+                entry_order_ids=[entry_fill.order_id],
+                close_order_ids=[close_fill.order_id],
+                created_at=entry_fill.timestamp,
+                closed_at=close_fill.timestamp,
+            )
+            if suppression is not None:
+                skipped += 1
+                linked_order_ids.add(entry_fill.order_id)
+                linked_order_ids.add(close_fill.order_id)
+                samples.append(
+                    {
+                        "kind": "okx_fill_pair_position_suppressed",
+                        "symbol": symbol_from_okx_inst_id(entry_fill.inst_id) or entry_fill.symbol,
+                        "side": side,
+                        "entry_exchange_order_id": entry_fill.order_id,
+                        "close_exchange_order_id": close_fill.order_id,
+                        "reason": suppression.reason,
+                    }
+                )
                 continue
             payload = _position_from_fill_pair(
                 entry_fill,
@@ -843,6 +917,27 @@ class OkxOrderFactSyncService:
             conditions.append(Position.close_exchange_order_id == close_order_id)
         result = await session.execute(select(Position.id).where(*conditions).limit(1))
         return result.scalar_one_or_none() is not None
+
+    async def _load_position_sync_suppressions(
+        self,
+        session: Any,
+    ) -> tuple[OkxPositionSyncSuppression, ...]:
+        rows = await session.execute(
+            select(StrategyLearningEvent)
+            .where(
+                StrategyLearningEvent.execution_mode == self.mode,
+                StrategyLearningEvent.event_type == OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
+                StrategyLearningEvent.event_status == "active",
+            )
+            .order_by(StrategyLearningEvent.updated_at.desc().nullslast(), StrategyLearningEvent.id.desc())
+            .limit(200)
+        )
+        suppressions: list[OkxPositionSyncSuppression] = []
+        for event in rows.scalars().all():
+            suppression = _position_sync_suppression_from_event(event)
+            if suppression is not None and suppression.has_strong_identity():
+                suppressions.append(suppression)
+        return tuple(suppressions)
 
     async def _sync_current_position_rows(
         self,
@@ -2334,6 +2429,166 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
             pieces.update(part.strip() for part in token.split(separator) if part.strip())
         tokens = pieces
     return {token for token in tokens if token}
+
+
+def _position_sync_suppression_from_event(
+    event: StrategyLearningEvent,
+) -> OkxPositionSyncSuppression | None:
+    data = _dict_payload(getattr(event, "attribution", None))
+    inst_id = _normalize_okx_inst_id(
+        data.get("okx_inst_id")
+        or data.get("instId")
+        or data.get("inst_id")
+    )
+    symbol = normalize_trading_symbol(
+        getattr(event, "symbol", None)
+        or data.get("symbol")
+        or symbol_from_okx_inst_id(inst_id)
+        or ""
+    )
+    side = _normalize_position_side(getattr(event, "side", None) or data.get("side"))
+    entry_order_ids = frozenset(
+        _suppression_order_ids(
+            data,
+            "entry_exchange_order_ids",
+            "entry_exchange_order_id",
+            "entry_order_ids",
+            "entry_order_id",
+        )
+    )
+    close_order_ids = frozenset(
+        _suppression_order_ids(
+            data,
+            "close_exchange_order_ids",
+            "close_exchange_order_id",
+            "close_order_ids",
+            "close_order_id",
+        )
+    )
+    pos_id = str(data.get("okx_pos_id") or data.get("posId") or data.get("pos_id") or "").strip()
+    if not (symbol or inst_id) or not (pos_id or entry_order_ids or close_order_ids):
+        return None
+    return OkxPositionSyncSuppression(
+        mode="live" if str(getattr(event, "execution_mode", "") or "").lower() == "live" else "paper",
+        symbol=symbol,
+        side=side,
+        okx_inst_id=inst_id,
+        okx_pos_id=pos_id,
+        entry_order_ids=entry_order_ids,
+        close_order_ids=close_order_ids,
+        created_at=_parse_datetime(
+            data.get("created_at")
+            or data.get("opened_at")
+            or data.get("open_time")
+        ),
+        closed_at=_parse_datetime(
+            data.get("closed_at")
+            or data.get("close_time")
+            or data.get("uTime")
+        ),
+        reason=str(getattr(event, "reason", "") or data.get("reason") or "").strip(),
+    )
+
+
+def _matching_position_sync_suppression(
+    suppressions: tuple[OkxPositionSyncSuppression, ...],
+    *,
+    mode: str,
+    symbol: str | None,
+    side: str | None,
+    okx_inst_id: str | None,
+    okx_pos_id: str | None,
+    entry_order_ids: list[str],
+    close_order_ids: list[str],
+    created_at: datetime | None,
+    closed_at: datetime | None,
+) -> OkxPositionSyncSuppression | None:
+    normalized_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    normalized_symbol = normalize_trading_symbol(symbol or symbol_from_okx_inst_id(okx_inst_id or "") or "")
+    normalized_inst_id = _normalize_okx_inst_id(okx_inst_id)
+    normalized_side = _normalize_position_side(side)
+    normalized_pos_id = str(okx_pos_id or "").strip()
+    entry_ids = set(_ordered_exchange_ids(entry_order_ids))
+    close_ids = set(_ordered_exchange_ids(close_order_ids))
+
+    for suppression in suppressions:
+        if suppression.mode != normalized_mode:
+            continue
+        if suppression.okx_inst_id:
+            if normalized_inst_id != suppression.okx_inst_id:
+                continue
+        elif suppression.symbol and normalized_symbol != suppression.symbol:
+            continue
+        if suppression.side and normalized_side and suppression.side != normalized_side:
+            continue
+        if suppression.okx_pos_id and normalized_pos_id and suppression.okx_pos_id != normalized_pos_id:
+            continue
+        if suppression.entry_order_ids and not (suppression.entry_order_ids & entry_ids):
+            continue
+        if suppression.close_order_ids and not (suppression.close_order_ids & close_ids):
+            continue
+        if not suppression.entry_order_ids and not suppression.close_order_ids:
+            if not suppression.okx_pos_id:
+                continue
+            if not _suppression_time_matches(suppression.created_at, created_at):
+                continue
+            if not _suppression_time_matches(suppression.closed_at, closed_at):
+                continue
+        elif suppression.created_at and not _suppression_time_matches(suppression.created_at, created_at):
+            continue
+        elif suppression.closed_at and not _suppression_time_matches(suppression.closed_at, closed_at):
+            continue
+        return suppression
+    return None
+
+
+def _suppression_order_ids(data: dict[str, Any], *keys: str) -> set[str]:
+    result: set[str] = set()
+    for key in keys:
+        result.update(_coerce_order_id_set(data.get(key)))
+    return result
+
+
+def _coerce_order_id_set(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for item in value.values():
+            result.update(_coerce_order_id_set(item))
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_coerce_order_id_set(item))
+        return result
+    return _split_exchange_order_ids(value)
+
+
+def _dict_payload(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_okx_inst_id(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalize_position_side(value: Any) -> str:
+    text = str(value or "").lower().strip()
+    if text in {"long", "short"}:
+        return text
+    if text in {"buy", "sell"}:
+        return "long" if text == "buy" else "short"
+    return ""
+
+
+def _suppression_time_matches(
+    expected: datetime | None,
+    actual: datetime | None,
+    *,
+    tolerance_seconds: float = 5 * 60,
+) -> bool:
+    if expected is None or actual is None:
+        return True
+    return abs((_aware_utc(actual) - _aware_utc(expected)).total_seconds()) <= tolerance_seconds
 
 
 def _merge_exchange_order_ids(*values: Any, max_length: int = 100) -> str:

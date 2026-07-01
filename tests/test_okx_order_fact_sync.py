@@ -8,6 +8,7 @@ import pytest
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
+from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
@@ -15,6 +16,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_NO_FILL_REJECTED,
     OKX_SYNC_ORDER_ONLY,
     OKX_SYNC_OKX_ONLY,
+    OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
     OKX_SYNC_POSITION_CONFIRMED,
     OKX_SYNC_UNVERIFIED,
     PHASE3_DEFAULT_ORDER_SYNC_START,
@@ -1728,6 +1730,70 @@ async def test_order_fact_sync_backfills_closed_position_from_okx_fill_pair_when
 
 
 @pytest.mark.asyncio
+async def test_order_fact_sync_suppresses_manual_deleted_fill_pair_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-suppressed-fill-pair.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                StrategyLearningEvent(
+                    model_name="okx_authoritative_sync",
+                    execution_mode="paper",
+                    symbol="MET/USDT",
+                    side="short",
+                    action="suppress_sync",
+                    event_type=OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
+                    event_status="active",
+                    severity="info",
+                    reason="manual user deletion of invalid historical position row",
+                    attribution={
+                        "okx_inst_id": "MET-USDT-SWAP",
+                        "entry_exchange_order_ids": ["3695269432500391936"],
+                        "close_exchange_order_ids": ["3695833143904538624"],
+                    },
+                    exclude_from_training=True,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_FillPairOnlyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            position_rows = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.symbol == "MET/USDT"
+                    )
+                )
+            ).all()
+            order_rows = (
+                await session.execute(
+                    Order.__table__.select().where(Order.__table__.c.symbol == "MET/USDT")
+                )
+            ).all()
+
+        assert report["backfilled_count"] == 2
+        assert report["fill_pair_position_checked_count"] == 1
+        assert report["fill_pair_position_backfilled_count"] == 0
+        assert report["fill_pair_position_skipped_count"] == 1
+        assert len(order_rows) == 2
+        assert len(position_rows) == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_splits_reused_okx_pos_id_into_distinct_lifecycles(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1826,6 +1892,80 @@ async def test_order_fact_sync_splits_reused_okx_pos_id_into_distinct_lifecycles
         assert profitable["realized_pnl"] == pytest.approx(1.77827305)
         assert profitable["leverage"] == pytest.approx(3.0)
         assert profitable["close_exchange_order_id"] == _RepeatedPosIdLifecycleCcxt.new_close_order_id
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_suppresses_manual_deleted_position_history_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-suppressed-history-lifecycle.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                StrategyLearningEvent(
+                    model_name="okx_authoritative_sync",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="short",
+                    action="suppress_sync",
+                    event_type=OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
+                    event_status="active",
+                    severity="info",
+                    reason="manual user deletion of invalid OKX historical lifecycle",
+                    attribution={
+                        "okx_inst_id": "ACT-USDT-SWAP",
+                        "okx_pos_id": _RepeatedPosIdLifecycleCcxt.pos_id,
+                        "entry_exchange_order_ids": [
+                            _RepeatedPosIdLifecycleCcxt.new_entry_order_id
+                        ],
+                        "close_exchange_order_ids": [
+                            _RepeatedPosIdLifecycleCcxt.new_close_order_id
+                        ],
+                        "closed_at": "2026-06-28T07:46:45.670000+00:00",
+                    },
+                    exclude_from_training=True,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_RepeatedPosIdLifecycleExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            position_rows = (
+                await session.execute(
+                    Position.__table__
+                    .select()
+                    .where(Position.__table__.c.symbol == "ACT/USDT")
+                    .order_by(Position.__table__.c.created_at.asc())
+                )
+            ).all()
+            order_rows = (
+                await session.execute(
+                    Order.__table__.select().where(Order.__table__.c.symbol == "ACT/USDT")
+                )
+            ).all()
+
+        positions = [row._mapping for row in position_rows]
+        assert report["position_history_checked_count"] == 2
+        assert report["position_history_backfilled_count"] == 1
+        assert report["position_history_skipped_count"] == 1
+        assert report["fill_pair_position_backfilled_count"] == 0
+        assert len(order_rows) == 4
+        assert len(positions) == 1
+        assert positions[0]["entry_exchange_order_id"] == _RepeatedPosIdLifecycleCcxt.old_entry_order_id
+        assert positions[0]["close_exchange_order_id"] == _RepeatedPosIdLifecycleCcxt.old_close_order_id
     finally:
         await close_db()
 
