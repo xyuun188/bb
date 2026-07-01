@@ -81,7 +81,7 @@ STATE_FILE_NAME = "strategy_learning_state.json"
 PROFILE_SNAPSHOT_MIN_INTERVAL_SECONDS = 600
 LLM_CANDIDATE_CACHE_SECONDS = 6 * 60 * 60
 LLM_CANDIDATE_MAX_COUNT = 2
-LLM_CANDIDATE_PROMPT_VERSION = 3
+LLM_CANDIDATE_PROMPT_VERSION = 4
 LLM_CANDIDATE_PROMPT_MAX_CHARS = 9000
 LLM_CANDIDATE_FAILURE_RETRY_SECONDS = 300
 LLM_CANDIDATE_ERROR_TIMEOUT = "timeout"
@@ -1463,6 +1463,9 @@ class StrategyFeedbackCompiler:
         execution_errors = 0
         execution_successes = 0
         execution_event_rows: list[dict[str, Any]] = []
+        skip_kind_counts: dict[str, int] = {}
+        defensive_probe_shadow_count = 0
+        entry_evidence_shadow_only_count = 0
         covered = 0
         missing_profile = 0
         attributable_total = 0
@@ -1477,6 +1480,13 @@ class StrategyFeedbackCompiler:
             profile_id = str(getattr(row, "profile_id", "") or "")
             reason = str(getattr(row, "reason", "") or "")
             attribution = _safe_dict(getattr(row, "attribution", None))
+            skip_kind = self._event_skip_kind(reason=reason, attribution=attribution)
+            if skip_kind:
+                skip_kind_counts[skip_kind] = skip_kind_counts.get(skip_kind, 0) + 1
+                if skip_kind == "profit_first_defensive_probe_shadow":
+                    defensive_probe_shadow_count += 1
+                if skip_kind in {"entry_evidence_shadow_only", "entry_evidence_wait"}:
+                    entry_evidence_shadow_only_count += 1
             reason_info = self._event_reason_info(
                 event_type=event_type,
                 status=status,
@@ -1545,6 +1555,7 @@ class StrategyFeedbackCompiler:
                         "event_type": event_type,
                         "status": status,
                         "reason_category": reason_info.get("category", "other"),
+                        "skip_kind": skip_kind,
                         "blocks_execution_guard": self._event_blocks_execution_guard(
                             event_type=event_type,
                             status=status,
@@ -1591,6 +1602,7 @@ class StrategyFeedbackCompiler:
                         "reason": reason,
                         "reason_label": reason_info.get("label"),
                         "reason_category": reason_info.get("category"),
+                        "skip_kind": skip_kind,
                         "exclude_from_training": bool(getattr(row, "exclude_from_training", False)),
                     }
                 )
@@ -1632,6 +1644,11 @@ class StrategyFeedbackCompiler:
             "profile_counts": dict(
                 sorted(profile_counts.items(), key=lambda item: item[1], reverse=True)
             ),
+            "skip_kind_counts": dict(
+                sorted(skip_kind_counts.items(), key=lambda item: item[1], reverse=True)
+            ),
+            "profit_first_defensive_probe_shadow_count": defensive_probe_shadow_count,
+            "entry_evidence_shadow_only_count": entry_evidence_shadow_only_count,
             "attribution_coverage": round(coverage, 6),
             "attributable_event_coverage": round(attributable_coverage, 6),
             "attributable_events": attributable_total,
@@ -1659,6 +1676,33 @@ class StrategyFeedbackCompiler:
             "top_block_reasons": top_blocks,
             "recent_events": recent,
         }
+
+    @staticmethod
+    def _event_skip_kind(*, reason: str, attribution: dict[str, Any]) -> str:
+        direct = str(attribution.get("skip_kind") or "").strip().lower()
+        if direct:
+            return direct[:120]
+        text = " ".join(
+            str(value or "")
+            for value in (
+                reason,
+                attribution.get("blocker"),
+                attribution.get("policy_blocker"),
+                attribution.get("reason"),
+            )
+        ).lower()
+        known = {
+            "profit_first_defensive_probe_shadow",
+            "profit_first_probe_loss_brake",
+            "entry_evidence_shadow_only",
+            "entry_evidence_wait",
+            "entry_pre_execution_skip",
+            "round_unresolved_terminal_skip",
+        }
+        for token in known:
+            if token in text:
+                return token
+        return ""
 
     @staticmethod
     def _latest_execution_event_at(
@@ -1780,6 +1824,20 @@ class StrategyFeedbackCompiler:
         raw = str(attribution.get("blocker") or reason or event_type or "").strip()
         combined = f"{event_type} {status} {raw}"
         lower = combined.lower()
+        skip_kind = str(attribution.get("skip_kind") or "").lower()
+        if (
+            skip_kind == "profit_first_defensive_probe_shadow"
+            or "profit_first_defensive_probe_shadow" in lower
+        ):
+            return {
+                "category": "defensive_probe_shadow",
+                "label": "Profit-First 防御探针把低收益小仓开仓转为影子样本。",
+            }
+        if skip_kind in {"entry_evidence_shadow_only", "entry_evidence_wait"}:
+            return {
+                "category": "entry_evidence_shadow",
+                "label": "动态证据不足，候选只记录影子样本，暂不进入真实下单。",
+            }
         if not raw:
             return {"category": "unknown", "label": "未记录事件原因"}
         if is_okx_temporary_service_error(raw):
@@ -1867,6 +1925,27 @@ class StrategyFeedbackCompiler:
                     "trade_count": trade_count,
                     "target": trade_count_target,
                     "policy": "动态学习置信目标；不是开仓硬阈值",
+                },
+            )
+        defensive_probe_shadow_count = _safe_int(
+            event_feedback.get("profit_first_defensive_probe_shadow_count"),
+            0,
+        )
+        if defensive_probe_shadow_count:
+            add(
+                "defensive_probe_shadow_loop",
+                "high" if defensive_probe_shadow_count >= 3 else "medium",
+                (
+                    "Profit-First 防御探针正在把低收益小仓开仓转为影子样本；"
+                    "策略生成不能继续只制造探针，应生成质量升级画像，让高质量信号走动态收益校验。"
+                ),
+                {
+                    "profit_first_defensive_probe_shadow_count": defensive_probe_shadow_count,
+                    "skip_kind_counts": _safe_dict(event_feedback.get("skip_kind_counts")),
+                    "policy": (
+                        "低收益探针继续变多不会带来真实训练样本；需要把生成目标从探针数量"
+                        "切换到收益质量和正常 sizing 恢复"
+                    ),
                 },
             )
         if trade_count >= 3 and net_pnl < 0:
@@ -2013,6 +2092,28 @@ class StrategyCandidateGenerator:
         open_pressure = feedback.open_position_pressure
         totals = feedback.totals
         trade_target = _safe_int(totals.get("trade_count_target"), default_min_trade_target())
+        defensive_probe_shadow_loop = "defensive_probe_shadow_loop" in problem_keys
+
+        if defensive_probe_shadow_loop:
+            profiles.append(
+                StrategyProfile(
+                    profile_id="quality_entry_recovery",
+                    version=1,
+                    label="质量开仓恢复",
+                    status="candidate",
+                    source="feedback_generator",
+                    description=(
+                        "低收益探针已被 Profit-First 影子化时，不继续强制小仓探针；"
+                        "保留严格专家完整性，让运行时收益质量达标的信号恢复正常 sizing。"
+                    ),
+                    params={
+                        "global_min_score_delta": 0.0,
+                        "position_size_multiplier": 1.0,
+                        "expert_integrity_mode": "strict_all_required",
+                        "min_trade_count_target": trade_target,
+                    },
+                )
+            )
 
         if (
             "expert_fallback_overblocking" in problem_keys
@@ -2461,7 +2562,10 @@ class StrategyBacktester:
             for fix_key, delta in self._generic_candidate_deltas(profile, feedback, problem_keys):
                 estimated_delta += delta
                 matched_fixes.append(fix_key)
-            if "controlled_entry_recovery" in matched_fixes:
+            if (
+                "controlled_entry_recovery" in matched_fixes
+                or "defensive_probe_quality_recovery" in matched_fixes
+            ):
                 low_trade_penalty = max(low_trade_penalty - trade_gap * 0.95, 0.0)
 
         score = net_pnl + estimated_delta - low_trade_penalty
@@ -2557,6 +2661,34 @@ class StrategyBacktester:
                 (
                     "controlled_entry_recovery",
                     min(trade_gap * 0.32 + missed * 0.18 + blocks * 0.16, 4.0),
+                )
+            )
+        defensive_probe_blocks = _safe_int(
+            feedback.event_feedback.get("profit_first_defensive_probe_shadow_count"),
+            0,
+        )
+        probe_cap_active = bool(
+            _safe_float(params.get("probe_fraction"), 0.0) > 0
+            or _safe_float(params.get("max_probe_size_pct"), 0.0) > 0
+        )
+        quality_recovery_profile = bool(
+            profile.profile_id == "quality_entry_recovery"
+            or (
+                not probe_cap_active
+                and _safe_float(params.get("position_size_multiplier"), 1.0) >= 1.0
+                and str(params.get("expert_integrity_mode") or "strict_all_required")
+                == "strict_all_required"
+            )
+        )
+        if (
+            quality_recovery_profile
+            and "defensive_probe_shadow_loop" in problem_keys
+            and defensive_probe_blocks > 0
+        ):
+            deltas.append(
+                (
+                    "defensive_probe_quality_recovery",
+                    min(defensive_probe_blocks * 0.28 + trade_gap * 0.22, 4.0),
                 )
             )
         releases_losers = (
@@ -2727,6 +2859,12 @@ class StrategyScheduler:
         ):
             selected = by_id["loss_release"]
             reason = "策略复盘显示费后亏损或亏损仓拖延过久，调度亏损释放画像。"
+        elif "defensive_probe_shadow_loop" in problem_keys and "quality_entry_recovery" in by_id:
+            selected = by_id["quality_entry_recovery"]
+            reason = (
+                "Profit-First 已多次把低收益探针转为影子样本，调度质量开仓恢复画像，"
+                "不再让低样本问题继续生成探针闭环。"
+            )
         else:
             degraded_sides = [
                 side
@@ -2951,14 +3089,22 @@ class StrategyScheduler:
             and any(key.endswith("_side_degraded") for key in problem_keys)
             and _safe_list(backtest.get("matched_fixes"))
         )
+        solves_quality_recovery = bool(
+            (
+                "defensive_probe_quality_recovery" in matched
+                or shadow.get("would_restore_quality_entries")
+            )
+            and "defensive_probe_shadow_loop" in problem_keys
+        )
         return bool(
             (small_probe and solves_fallback)
             or solves_loss_pressure
             or solves_side_degradation
+            or solves_quality_recovery
             or (
                 model_health_recovered
                 and fallback_reason_only
-                and (solves_fallback or solves_loss_pressure)
+                and (solves_fallback or solves_loss_pressure or solves_quality_recovery)
             )
         )
 
@@ -3044,12 +3190,17 @@ class StrategyScheduler:
             return (
                 "开仓样本不足、专家 fallback 拦截或影子复盘错过机会偏多，自动调度到平衡探针画像。"
             )
+        if selected_profile_id == "quality_entry_recovery":
+            return (
+                "Profit-First 已把低收益探针转为影子样本；自动调度质量开仓恢复画像，"
+                "取消策略学习层的探针仓位上限，让高质量信号继续接受动态收益和风控校验。"
+            )
         if selected_profile_id == "winner_hold":
             return "盈利仓小盈过多且大亏存在，自动调度到赢家持仓优化画像。"
         if selected_source == "llm_structured_candidate":
             fixes = ", ".join(str(item) for item in (matched_fixes or [])[:4])
             suffix = f"，命中反馈：{fixes}" if fixes else ""
-            return f"结构化候选已通过回测和影子验证，自动进入小仓探针调度{suffix}。"
+            return f"结构化候选已通过回测和影子验证，自动进入受控策略调度{suffix}。"
         if selected_profile_id == "baseline_current" and blocked_candidate_count:
             reasons = _safe_dict(disabled_profile_reasons)
             top = ", ".join(
@@ -3283,6 +3434,10 @@ class StrategyScheduler:
         fallback_blocks = _safe_int(feedback.event_feedback.get("fallback_blocks"), 0)
         integrity_blocks = _safe_int(feedback.decision_quality.get("expert_integrity_blocks"), 0)
         max_position_blocks = _safe_int(feedback.event_feedback.get("max_position_blocks"), 0)
+        defensive_probe_blocks = _safe_int(
+            feedback.event_feedback.get("profit_first_defensive_probe_shadow_count"),
+            0,
+        )
         losing_open_count = _safe_int(feedback.open_position_pressure.get("losing_open_count"), 0)
         low_quality_open_count = _safe_int(
             feedback.open_position_pressure.get("low_quality_open_count"),
@@ -3325,10 +3480,6 @@ class StrategyScheduler:
                 or str(params.get("winner_hold_extension") or "") == "high"
                 or _safe_float(params.get("profit_lock_min_usdt_multiplier"), 1.0) > 1.05
             )
-            side_recovery = profile.profile_id.endswith("_side_recovery") or any(
-                _safe_float(_safe_dict(item).get("size_multiplier"), 1.0) < 1.0
-                for item in _safe_dict(params.get("side_overrides")).values()
-            )
             fallback_safety = "strict"
             integrity_mode = str(params.get("expert_integrity_mode") or "strict_all_required")
             tolerance = _safe_dict(params.get("fallback_tolerance"))
@@ -3336,6 +3487,25 @@ class StrategyScheduler:
                 fallback_safety = "probe_core_required"
             if _safe_int(tolerance.get("allow_missing_non_core_experts"), 0) > 1:
                 fallback_safety = "too_loose"
+            probe_cap_active = bool(
+                _safe_float(params.get("probe_fraction"), 0.0) > 0
+                or _safe_float(params.get("max_probe_size_pct"), 0.0) > 0
+            )
+            would_restore_quality_entries = bool(
+                defensive_probe_blocks > 0
+                and (
+                    profile.profile_id == "quality_entry_recovery"
+                    or (
+                        not probe_cap_active
+                        and _safe_float(params.get("position_size_multiplier"), 1.0) >= 1.0
+                        and integrity_mode == "strict_all_required"
+                    )
+                )
+            )
+            side_recovery = profile.profile_id.endswith("_side_recovery") or any(
+                _safe_float(_safe_dict(item).get("size_multiplier"), 1.0) < 1.0
+                for item in _safe_dict(params.get("side_overrides")).values()
+            )
 
             score = 0.0
             if would_increase_entries:
@@ -3350,6 +3520,8 @@ class StrategyScheduler:
                 )
             if would_hold_winners:
                 score += small_wins * 0.16 + good * 0.05
+            if would_restore_quality_entries:
+                score += defensive_probe_blocks * 0.34 + max(trade_target - trade_count, 0) * 0.14
             if side_recovery:
                 score += bad * 0.22 + large_losses * 0.08
             if fallback_safety == "too_loose":
@@ -3383,12 +3555,16 @@ class StrategyScheduler:
                     "would_reduce_blocks": would_reduce_blocks,
                     "would_release_losers": would_release_losers,
                     "would_hold_winners": would_hold_winners,
+                    "would_restore_quality_entries": would_restore_quality_entries,
                     "fallback_safety": fallback_safety,
                     "param_consumption": param_consumption,
                     "consumed_runtime_params": param_consumption["consumed_runtime_params"],
                     "unused_runtime_params": param_consumption["unused_runtime_params"],
                     "trade_count_guard": trade_count_guard,
-                    "probe_required": profile.profile_id != "baseline_current",
+                    "probe_required": bool(
+                        profile.profile_id != "baseline_current"
+                        and _safe_float(params.get("probe_fraction"), 0.0) > 0
+                    ),
                     "missed_opportunities_used": missed,
                     "missed_opportunity_raw_count": raw_missed,
                     "missed_opportunity_closed_loop": {
@@ -3405,6 +3581,9 @@ class StrategyScheduler:
                         "more_entries": "yes" if would_increase_entries else "no",
                         "release_losers": "yes" if would_release_losers else "no",
                         "hold_winners": "yes" if would_hold_winners else "no",
+                        "quality_entry_recovery": (
+                            "yes" if would_restore_quality_entries else "no"
+                        ),
                         "block_reduction": "yes" if would_reduce_blocks else "no",
                     },
                 }
@@ -4401,11 +4580,14 @@ class StrategyLearningService:
                 "latest_execution_success_at",
                 "latest_execution_error_at",
                 "execution_recovered_after_error",
+                "profit_first_defensive_probe_shadow_count",
+                "entry_evidence_shadow_only_count",
             ),
         )
         result["type_counts"] = self._compact_count_map(source.get("type_counts"), limit=6)
         result["status_counts"] = self._compact_count_map(source.get("status_counts"), limit=6)
         result["profile_counts"] = self._compact_count_map(source.get("profile_counts"), limit=6)
+        result["skip_kind_counts"] = self._compact_count_map(source.get("skip_kind_counts"), limit=8)
         result["top_block_reasons"] = [
             {
                 "reason": str(_safe_dict(item).get("reason") or "")[:120],
@@ -4426,6 +4608,7 @@ class StrategyLearningService:
                 "reason": str(row.get("reason") or "")[:100],
                 "reason_label": str(row.get("reason_label") or "")[:140],
                 "reason_category": str(row.get("reason_category") or "")[:80],
+                "skip_kind": str(row.get("skip_kind") or "")[:120],
             }
             if include_recent_details:
                 created_at = row.get("created_at")
@@ -4655,6 +4838,9 @@ class StrategyLearningService:
                         "max_position_blocks",
                         "fallback_blocks",
                         "execution_errors",
+                        "skip_kind_counts",
+                        "profit_first_defensive_probe_shadow_count",
+                        "entry_evidence_shadow_only_count",
                     )
                 },
                 "recent_events": _safe_list(events.get("recent_events"))[:3],
@@ -4688,9 +4874,60 @@ class StrategyLearningService:
         minimal["feedback_summary"] = minimal_summary
         return minimal
 
+    @staticmethod
+    def _candidate_generation_guidance(feedback: StrategyFeedback) -> dict[str, Any]:
+        problem_keys = {str(item.get("key") or "") for item in feedback.problems}
+        skip_kind_counts = _safe_dict(feedback.event_feedback.get("skip_kind_counts"))
+        defensive_probe_shadow_count = _safe_int(
+            feedback.event_feedback.get("profit_first_defensive_probe_shadow_count"),
+            0,
+        )
+        low_trade_count = bool(feedback.totals.get("low_trade_count_penalty"))
+        fallback_or_missed = bool(
+            problem_keys
+            & {
+                "expert_fallback_overblocking",
+                "event_fallback_blocks",
+                "missed_opportunities",
+                "trade_reflection_mistakes",
+            }
+        )
+        require_quality_recovery = bool(
+            defensive_probe_shadow_count > 0 or "defensive_probe_shadow_loop" in problem_keys
+        )
+        return {
+            "primary_issue_keys": sorted(key for key in problem_keys if key),
+            "skip_kind_counts": skip_kind_counts,
+            "defensive_probe_shadow_count": defensive_probe_shadow_count,
+            "require_quality_entry_recovery_candidate": require_quality_recovery,
+            "allow_recovery_probe_candidate": bool(low_trade_count and fallback_or_missed),
+            "candidate_modes": {
+                "quality_entry_recovery": (
+                    "Use when low-payoff probes are being shadowed. Do not set "
+                    "probe_fraction or max_probe_size_pct; keep strict expert integrity so "
+                    "existing Profit-First quality gates decide whether real entries are large "
+                    "enough to matter."
+                ),
+                "recovery_probe": (
+                    "Use only when fallback, missed opportunity, or low-sample feedback is the "
+                    "primary issue and there is no defensive-probe loop. Use bounded "
+                    "probe_fraction/max_probe_size_pct."
+                ),
+                "loss_release": (
+                    "Use when current low-quality losing positions or capacity pressure are the "
+                    "primary issue."
+                ),
+                "winner_hold": (
+                    "Use when feedback shows small wins are closed too early while larger losses "
+                    "remain."
+                ),
+            },
+        }
+
     def _llm_candidate_prompt(self, feedback: StrategyFeedback) -> dict[str, Any]:
         event_feedback = feedback.event_feedback
         reflection_feedback = feedback.reflection_feedback
+        generation_guidance = self._candidate_generation_guidance(feedback)
         recent_events = []
         for item in _safe_list(event_feedback.get("recent_events"))[:8]:
             if not isinstance(item, dict):
@@ -4711,10 +4948,19 @@ class StrategyLearningService:
             "rules": [
                 '只返回 JSON 对象，不要 Markdown。格式必须是 {"candidates": [...]}。',
                 "不能生成 Python、SQL、shell 或任意可执行逻辑。只能设置 allowed_params 白名单参数。",
-                "候选策略必须先小仓探针，probe_fraction 不超过 0.10，max_probe_size_pct 不超过 0.03。",
+                (
+                    "不要把所有候选都强制生成小仓探针；只有 recovery_probe 模式才设置 "
+                    "probe_fraction/max_probe_size_pct。"
+                ),
+                (
+                    "如果 generation_guidance.require_quality_entry_recovery_candidate=true，"
+                    "至少生成一个 quality_entry_recovery 候选，不设置 probe_fraction 和 "
+                    "max_probe_size_pct。"
+                ),
                 "评分目标是手续费后净收益、交易次数、回撤、亏损释放和错过机会减少，不能用不开仓提高胜率。",
             ],
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
+            "generation_guidance": generation_guidance,
             "feedback_summary": {
                 "totals": {
                     "training_trade_count": feedback.totals.get("training_trade_count"),
@@ -4743,6 +4989,10 @@ class StrategyLearningService:
                     "max_position_blocks": event_feedback.get("max_position_blocks"),
                     "fallback_blocks": event_feedback.get("fallback_blocks"),
                     "execution_errors": event_feedback.get("execution_errors"),
+                    "skip_kind_counts": event_feedback.get("skip_kind_counts"),
+                    "profit_first_defensive_probe_shadow_count": event_feedback.get(
+                        "profit_first_defensive_probe_shadow_count"
+                    ),
                     "recent_events": recent_events,
                 },
                 "reflection_feedback": {
@@ -4778,6 +5028,7 @@ class StrategyLearningService:
     def _llm_candidate_prompt_v3(self, feedback: StrategyFeedback) -> dict[str, Any]:
         event_feedback = feedback.event_feedback
         reflection_feedback = feedback.reflection_feedback
+        generation_guidance = self._candidate_generation_guidance(feedback)
         prompt = {
             "task": "generate_bounded_strategy_profile_candidates",
             "language": "zh-CN",
@@ -4785,13 +5036,23 @@ class StrategyLearningService:
                 'Return one JSON object only, no Markdown. Format: {"candidates": [...] }.',
                 "Do not generate Python, SQL, shell, or arbitrary executable logic.",
                 "Only set whitelisted allowed_params. Keep candidates bounded and reversible.",
-                "Probe first: probe_fraction <= 0.10 and max_probe_size_pct <= 0.03.",
+                (
+                    "Do not force every candidate into probe mode. Use probe_fraction and "
+                    "max_probe_size_pct only for recovery_probe candidates."
+                ),
+                (
+                    "If generation_guidance.require_quality_entry_recovery_candidate is true, "
+                    "include one quality_entry_recovery candidate without probe_fraction or "
+                    "max_probe_size_pct so quality signals can be sized by existing dynamic "
+                    "Profit-First gates."
+                ),
                 "Do not optimize by avoiding trades; low trade count must be penalized.",
                 "Use concise Chinese label and description fields.",
                 "Return at most 2 candidates. label <= 12 chars, description <= 40 chars.",
                 "Each candidate params must contain 3 to 5 keys only.",
             ],
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
+            "generation_guidance": generation_guidance,
             "feedback_summary": {
                 "totals": self._scalar_subset(
                     feedback.totals,
@@ -4877,9 +5138,15 @@ class StrategyLearningService:
                 "Return minified JSON only. No thinking, no Markdown, no explanation.",
                 "Return exactly one candidate in candidates[].",
                 "Use only 3 to 4 allowed params and keep strings short.",
-                'Valid shape: {"candidates":[{"profile_id":"llm_probe_1","label":"短标签","description":"短说明","params":{"probe_fraction":0.05,"global_min_score_delta":-0.03}}]}',
+                (
+                    "If generation_guidance requires quality_entry_recovery, return a candidate "
+                    "without probe_fraction/max_probe_size_pct; otherwise a bounded recovery "
+                    "probe is allowed."
+                ),
+                'Valid shape: {"candidates":[{"profile_id":"llm_quality_recovery","label":"质量恢复","description":"恢复高质量正常开仓","params":{"position_size_multiplier":1.0,"expert_integrity_mode":"strict_all_required","global_min_score_delta":0.0}}]}',
             ],
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
+            "generation_guidance": prompt.get("generation_guidance"),
             "feedback_summary": {
                 "totals": summary.get("totals"),
                 "side_performance": summary.get("side_performance"),

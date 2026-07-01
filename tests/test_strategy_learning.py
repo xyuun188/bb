@@ -826,6 +826,65 @@ def test_strategy_learning_compiles_events_and_full_score_metrics(tmp_path) -> N
     assert "position_occupancy" in score
 
 
+def test_strategy_learning_defensive_probe_shadow_loop_schedules_quality_recovery(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("long", executed=False) for _ in range(12)],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "execution_result",
+                status="skipped",
+                reason="Profit-First 防御探针拦截：该极小/探针开仓属于低收益质量。",
+                attribution={
+                    "skip_kind": "profit_first_defensive_probe_shadow",
+                    "blocker": "profit_first_defensive_probe_shadow",
+                },
+            )
+            for _ in range(4)
+        ],
+        max_open_positions=14,
+    )
+    context = engine.apply_to_context({}, payload)
+    feedback = payload["feedback"]
+    event_feedback = feedback["event_feedback"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    schedule = payload["schedule"]
+    backtest = next(
+        row
+        for row in schedule["backtest"]["rows"]
+        if row["profile_id"] == "quality_entry_recovery"
+    )
+    shadow = next(
+        row
+        for row in schedule["shadow_validation"]["rows"]
+        if row["profile_id"] == "quality_entry_recovery"
+    )
+
+    assert event_feedback["profit_first_defensive_probe_shadow_count"] == 4
+    assert event_feedback["skip_kind_counts"]["profit_first_defensive_probe_shadow"] == 4
+    assert "defensive_probe_shadow_loop" in problem_keys
+    assert schedule["active_profile"]["id"] == "quality_entry_recovery"
+    assert "defensive_probe_quality_recovery" in backtest["matched_fixes"]
+    assert shadow["eligible"] is True
+    assert shadow["would_restore_quality_entries"] is True
+    assert shadow["probe_required"] is False
+    assert context["strategy_profile_id"] == "quality_entry_recovery"
+    assert context["probe_fraction"] == 0.0
+    assert context["max_probe_size_pct"] == 0.0
+
+
 def test_strategy_learning_groups_fragmented_open_positions_by_symbol_and_side(
     tmp_path,
 ) -> None:
@@ -2177,6 +2236,46 @@ def test_strategy_learning_llm_candidate_prompt_stays_under_budget(tmp_path) -> 
     assert "recent_reflections" not in prompt_text
 
     assert "created_at" not in prompt_text
+
+
+def test_strategy_learning_llm_prompt_uses_quality_recovery_for_defensive_probe_loop(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+
+    feedback = service.engine.compiler.compile(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("long", executed=False) for _ in range(8)],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            _strategy_event(
+                "execution_result",
+                status="skipped",
+                reason="Profit-First 防御探针拦截：低收益质量。",
+                attribution={
+                    "skip_kind": "profit_first_defensive_probe_shadow",
+                    "blocker": "profit_first_defensive_probe_shadow",
+                },
+            )
+            for _ in range(2)
+        ],
+        max_open_positions=14,
+    )
+
+    prompt = service._llm_candidate_prompt_v3(feedback)
+    rules_text = " ".join(str(item) for item in prompt["rules"])
+    prompt_text = json.dumps(prompt, ensure_ascii=False)
+
+    assert prompt["generation_guidance"]["require_quality_entry_recovery_candidate"] is True
+    assert "quality_entry_recovery" in prompt_text
+    assert "Do not force every candidate into probe mode" in rules_text
+    assert "Probe first" not in rules_text
 
 
 def test_strategy_learning_parses_json_after_thinking_text() -> None:
