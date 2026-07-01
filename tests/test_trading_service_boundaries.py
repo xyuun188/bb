@@ -2266,6 +2266,68 @@ async def test_entry_profit_risk_sizing_uses_dynamic_integer_leverage_without_ti
 
 
 @pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_does_not_lock_roster_fill_to_one_x_on_model_noise():
+    async def allocated_balance(_model_mode, _decision):
+        return 5000.0
+
+    decision = _decision(Action.SHORT)
+    decision.position_size_pct = 0.05
+    decision.suggested_leverage = 10.0
+    decision.stop_loss_pct = 0.012
+    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 1.6}
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_sizing": {
+                "profile_id": "candidate_1",
+                "position_size_multiplier": 0.62,
+                "probe_fraction": 0.05,
+                "max_probe_size_pct": 0.02,
+            }
+        },
+        "opportunity_score": {
+            "score": 0.55,
+            "min_score_required": 0.435,
+            "expected_net_return_pct": 0.31,
+            "expected_loss_pct": 0.20,
+            "tail_risk_score": 0.35,
+            "raw_expected_return_pct": 0.31,
+            "profit_quality_ratio": 0.40,
+            "server_profit_expected_return_pct": -0.02,
+            "server_profit_loss_probability": 0.48,
+            "portfolio_roster": {"underfilled": True},
+            "portfolio_roster_fill_relief": {"applied": True},
+            "evidence_score": {
+                "tier": "exploration",
+                "effective_score": 45.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+                "aligned_support_sources": ["ai", "timeseries", "shadow_memory"],
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 20.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    dynamic = sizing["dynamic_leverage_decision"]
+    assert sizing["quality_tier"] == "roster_fill"
+    assert sizing["low_payoff_quality"] is False
+    assert sizing["notional_floor_blocked"] == ""
+    assert "tempered_by_risk_flags" not in dynamic["reasons"]
+    assert dynamic["limiting_factor"] == "risk_budget"
+    assert dynamic["final_integer_leverage"] > 1
+    assert decision.suggested_leverage == dynamic["final_integer_leverage"]
+
+
+@pytest.mark.asyncio
 async def test_entry_profit_risk_sizing_applies_profit_first_meaningful_ladder():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0

@@ -161,6 +161,120 @@ class EntryProfitRiskSizingPolicy:
             return default
 
     @classmethod
+    def _material_negative_server_expected(
+        cls,
+        *,
+        server_expected_return_pct: float,
+        expected_net_return_pct: float,
+        profit_quality_ratio: float,
+        loss_probability: float,
+        aligned_source_count: int,
+    ) -> bool:
+        """Separate a real negative edge from tiny model noise inside a positive setup."""
+
+        if server_expected_return_pct >= 0:
+            return False
+        if expected_net_return_pct <= 0:
+            return True
+        if aligned_source_count < 2:
+            return True
+        if profit_quality_ratio < PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO:
+            return True
+        if loss_probability > PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY:
+            return True
+        return abs(server_expected_return_pct) >= expected_net_return_pct
+
+    @classmethod
+    def _adaptive_pnl_structure_loss_multiple(
+        cls,
+        *,
+        base_multiple: float,
+        expected_net_return_pct: float,
+        profit_quality_ratio: float,
+        loss_probability: float,
+        tail_risk_score: float,
+        aligned_source_count: int,
+        quality_tier: str,
+        high_quality_entry: bool,
+        low_payoff_quality: bool,
+    ) -> float:
+        """Scale the allowed loss/expected-profit structure by current edge quality."""
+
+        adaptive_tiers = {
+            "roster_fill",
+            "elite",
+            "winner_add",
+            "high_profit",
+            "strong_probe",
+            "quality_override",
+        }
+        if not (high_quality_entry or quality_tier in adaptive_tiers):
+            return base_multiple
+        if (
+            low_payoff_quality
+            or expected_net_return_pct <= 0
+            or profit_quality_ratio <= 0
+            or aligned_source_count < 2
+            or loss_probability > PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY
+            or tail_risk_score >= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        ):
+            return base_multiple
+
+        expected_component = min(
+            max(expected_net_return_pct, 0.0) / max(PORTFOLIO_ROSTER_FILL_MIN_NET_PCT, 1e-12),
+            1.0,
+        )
+        quality_component = min(
+            max(profit_quality_ratio, 0.0)
+            / max(PORTFOLIO_ROSTER_FILL_MIN_PROFIT_QUALITY_RATIO, 1e-12),
+            1.0,
+        )
+        probability_component = min(
+            max(PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY - loss_probability, 0.0)
+            / max(PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY, 1e-12),
+            1.0,
+        )
+        tail_component = min(
+            max(ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK - tail_risk_score, 0.0)
+            / max(ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK, 1e-12),
+            1.0,
+        )
+        alignment_component = min(max(aligned_source_count, 0) / 4.0, 1.0)
+        quality_index = (
+            expected_component * 0.25
+            + quality_component * 0.25
+            + probability_component * 0.20
+            + tail_component * 0.15
+            + alignment_component * 0.15
+        )
+        high_quality_tiers = {"elite", "winner_add", "high_profit", "strong_probe", "quality_override"}
+        max_multiple = 5.0 if high_quality_entry or quality_tier in high_quality_tiers else 3.5
+        return min(max(base_multiple + (max_multiple - base_multiple) * quality_index, base_multiple), max_multiple)
+
+    @classmethod
+    def _reward_risk_ratio_for_sizing(
+        cls,
+        *,
+        explicit_reward_risk_ratio: Any,
+        decision: DecisionOutput,
+        expected_net_return_pct: float,
+        expected_loss_pct: float,
+    ) -> float:
+        explicit = cls._safe_float(explicit_reward_risk_ratio, 0.0)
+        if explicit > 0:
+            return explicit
+
+        stop_loss_pct = abs(cls._safe_float(getattr(decision, "stop_loss_pct", None), 0.0))
+        take_profit_pct = abs(cls._safe_float(getattr(decision, "take_profit_pct", None), 0.0))
+        if stop_loss_pct > 0 and take_profit_pct > 0:
+            return take_profit_pct / max(stop_loss_pct, 1e-12)
+
+        if expected_net_return_pct > 0 and expected_loss_pct > 0:
+            return expected_net_return_pct / max(expected_loss_pct, 1e-12)
+
+        return 0.0
+
+    @classmethod
     def _strategy_learning_sizing(cls, raw: dict[str, Any]) -> dict[str, Any]:
         strategy_mode = cls._safe_dict(raw.get("strategy_mode"))
         sizing = cls._safe_dict(strategy_mode.get("strategy_learning_sizing"))
@@ -813,27 +927,6 @@ class EntryProfitRiskSizingPolicy:
         decision.suggested_leverage = leverage
         caps.extend(evidence_sizing.caps)
         evidence_effective_score = evidence_sizing.effective_score
-        if weak_history:
-            weak_history_max_size = (
-                ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE
-                if high_quality_entry
-                else ENTRY_WEAK_HISTORY_MAX_SIZE
-            )
-            if current_size > weak_history_max_size:
-                current_size = weak_history_max_size
-                decision.position_size_pct = current_size
-                caps.append(
-                    "近期该币种/方向真实盈亏偏弱，但当前盈利证据同向，仓位按中小仓验证"
-                    if high_quality_entry
-                    else "近期该币种/方向真实盈亏偏弱，仓位降为小仓验证"
-                )
-        negative_local_expected = bool(local_expected < 0 and not (local_aligned or ml_aligned))
-        if negative_local_expected:
-            if current_size > ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE:
-                current_size = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE
-                decision.position_size_pct = current_size
-                caps.append("服务器盈利模型反向或预期为负，仅允许极小仓")
-        strategy_sizing = self._strategy_learning_sizing(raw)
         timeseries_aligned = bool(opportunity.get("timeseries_aligned"))
         legacy_aligned_source_count = sum(
             1
@@ -853,6 +946,36 @@ class EntryProfitRiskSizingPolicy:
             }
         )
         aligned_source_count = max(legacy_aligned_source_count, evidence_aligned_source_count)
+        if weak_history:
+            weak_history_max_size = (
+                ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE
+                if high_quality_entry
+                else ENTRY_WEAK_HISTORY_MAX_SIZE
+            )
+            if current_size > weak_history_max_size:
+                current_size = weak_history_max_size
+                decision.position_size_pct = current_size
+                caps.append(
+                    "近期该币种/方向真实盈亏偏弱，但当前盈利证据同向，仓位按中小仓验证"
+                    if high_quality_entry
+                    else "近期该币种/方向真实盈亏偏弱，仓位降为小仓验证"
+                )
+        negative_local_expected = bool(
+            not (local_aligned or ml_aligned)
+            and self._material_negative_server_expected(
+                server_expected_return_pct=local_expected,
+                expected_net_return_pct=expected_net,
+                profit_quality_ratio=profit_quality_ratio,
+                loss_probability=loss_probability,
+                aligned_source_count=aligned_source_count,
+            )
+        )
+        if negative_local_expected:
+            if current_size > ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE:
+                current_size = ENTRY_NEGATIVE_LOCAL_EXPECTED_MAX_SIZE
+                decision.position_size_pct = current_size
+                caps.append("服务器盈利模型反向或预期为负，仅允许极小仓")
+        strategy_sizing = self._strategy_learning_sizing(raw)
         roster_fill_quality = bool(
             roster_fill_candidate
             and expected_net >= PORTFOLIO_ROSTER_FILL_MIN_NET_PCT
@@ -1045,6 +1168,7 @@ class EntryProfitRiskSizingPolicy:
         target_min_notional = 0.0
         notional_floor_ratio = 0.0
         notional_floor_reason = ""
+        notional_floor_applied = False
         quality_tier = "probe" if (quant_probe_triggered or evidence_probe_triggered) else "base"
         meaningful_size_reason = ""
         existing_winner = self.entry_existing_winner_context.context(
@@ -1253,6 +1377,17 @@ class EntryProfitRiskSizingPolicy:
                     else ENTRY_PNL_STRUCTURE_NORMAL_MAX_LOSS_MULTIPLE
                 )
             )
+            max_loss_multiple = self._adaptive_pnl_structure_loss_multiple(
+                base_multiple=max_loss_multiple,
+                expected_net_return_pct=expected_net,
+                profit_quality_ratio=profit_quality_ratio,
+                loss_probability=loss_probability,
+                tail_risk_score=tail_risk,
+                aligned_source_count=aligned_source_count,
+                quality_tier=quality_tier,
+                high_quality_entry=high_quality_entry,
+                low_payoff_quality=low_payoff_quality or symbol_profit_tier == "side_loser",
+            )
             structure_max_loss = max(
                 ENTRY_PNL_STRUCTURE_MIN_EXPECTED_PROFIT_USDT,
                 expected_profit_usdt * max_loss_multiple,
@@ -1319,7 +1454,7 @@ class EntryProfitRiskSizingPolicy:
                 notional_floor_blocked = "尾部风险偏高，不抬高仓位"
             elif weak_history and not high_quality_entry:
                 notional_floor_blocked = "该币种/方向近期真实盈亏偏弱，普通信号不抬高仓位"
-            elif local_expected < 0 and not (local_aligned or ml_aligned):
+            elif negative_local_expected:
                 notional_floor_blocked = (
                     "服务器盈利模型预期为负且未获得本地模型同向支持，不抬高仓位"
                 )
@@ -1334,6 +1469,7 @@ class EntryProfitRiskSizingPolicy:
                 if raised_size > current_size:
                     current_size = raised_size
                     decision.position_size_pct = current_size
+                    notional_floor_applied = True
 
         profit_first_lane = self._profit_first_lane_for_sizing(
             raw=raw,
@@ -1341,7 +1477,12 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             expected_profit_usdt=expected_profit_usdt,
             profit_quality_ratio=profit_quality_ratio,
-            reward_risk_ratio=self._safe_float(opportunity.get("reward_risk_ratio"), 0.0),
+            reward_risk_ratio=self._reward_risk_ratio_for_sizing(
+                explicit_reward_risk_ratio=opportunity.get("reward_risk_ratio"),
+                decision=decision,
+                expected_net_return_pct=expected_net,
+                expected_loss_pct=expected_loss_pct,
+            ),
             loss_probability=loss_probability,
             tail_risk_score=tail_risk,
             aligned_source_count=aligned_source_count,
@@ -1450,7 +1591,7 @@ class EntryProfitRiskSizingPolicy:
             "strategy_quality_override": bool(strategy_quality_override),
             "strategy_quality_override_reasons": quality_override_reasons,
             "aligned_source_count": aligned_source_count,
-            "notional_floor_applied": current_size > original_size_before_floor,
+            "notional_floor_applied": notional_floor_applied,
             "original_notional_usdt": round(original_notional, 6),
             "target_min_notional_usdt": round(target_min_notional, 6),
             "target_min_notional_balance_ratio": round(notional_floor_ratio, 6),

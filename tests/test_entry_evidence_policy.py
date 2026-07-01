@@ -1044,7 +1044,7 @@ async def test_short_evidence_score_reduces_size_even_when_aligned(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_atr_stress_stop_caps_position_by_loss_budget() -> None:
+async def test_atr_stress_stop_is_tempered_by_dynamic_volatility_and_budget() -> None:
     service = _service()
 
     async def fake_balance(*args, **kwargs):
@@ -1093,8 +1093,14 @@ async def test_atr_stress_stop_caps_position_by_loss_budget() -> None:
     sizing = _raw_response(decision)["profit_risk_sizing"]
     assert sizing["stress_stop_loss_pct"] == pytest.approx(0.08)
     assert sizing["atr_pct"] == pytest.approx(0.05)
-    assert sizing["applied"] is True
-    assert decision.position_size_pct <= 0.0167
+    assert sizing["planned_stop_loss_usdt"] <= sizing["max_stop_loss_usdt"]
+    assert sizing["profit_first_position_ladder"]["post_stop_budget_size_pct"] <= 0.05
+    assert sizing["profit_first_position_ladder"]["capped_by_stop_loss_budget"] is False
+    assert sizing["pnl_structure_guard"]["applied"] is True
+    dynamic = sizing["dynamic_leverage_decision"]
+    assert dynamic["limiting_factor"] in {"risk_budget", "volatility"}
+    assert dynamic["final_integer_leverage"] == 1
+    assert decision.position_size_pct <= 0.05
 
 
 def test_signal_extraction_falls_back_to_evidence_components():
@@ -1142,7 +1148,7 @@ def test_evidence_sizing_policy_is_independent_from_trading_service():
     )
 
     assert result.position_size_pct == 0.02
-    assert result.leverage == 4.0
+    assert result.leverage == 8.0
     assert result.effective_score == 62.0
     assert result.caps
     assert evidence_is_low_payoff_quality({"tier": "small"}, 59.0) is True
@@ -1161,7 +1167,7 @@ def test_weak_conflict_probe_sizing_caps_position_and_leverage():
     )
 
     assert result.position_size_pct == 0.004
-    assert result.leverage == 2.0
+    assert result.leverage == 8.0
     assert result.tier == "weak_conflict_probe"
     assert (
         evidence_is_low_payoff_quality(
@@ -1299,4 +1305,5 @@ async def test_high_quality_entry_escapes_learning_probe_micro_size() -> None:
     assert sizing["low_payoff_quality"] is False
     assert sizing["strategy_learning_sizing"]["quality_override"] is True
     assert sizing["notional_floor_applied"] is True
+    assert sizing["profit_first_position_ladder"]["lane"] == "meaningful_entry"
     assert decision.position_size_pct >= 0.06

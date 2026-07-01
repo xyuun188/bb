@@ -70,11 +70,17 @@ class EntryLowPayoffQualityPolicy:
             reasons.append("expected_net_below_min")
         if profit_quality_ratio < self.min_profit_quality_ratio:
             reasons.append("profit_quality_below_min")
-        if raw_expected_return_pct < 0:
+        strong_aggregate_quality = (
+            expected_net_return_pct >= self.min_expected_net_return_pct
+            and profit_quality_ratio >= self.min_profit_quality_ratio
+            and score >= min_score_required
+            and not evidence_is_low_payoff_quality(evidence_score, evidence_effective_score)
+        )
+        if raw_expected_return_pct < 0 and not strong_aggregate_quality:
             reasons.append("raw_expected_return_negative")
         if small_win_big_loss_penalty >= self.max_small_win_big_loss_penalty:
             reasons.append("small_win_big_loss_penalty_high")
-        if hard_contribution_caution:
+        if hard_contribution_caution and not strong_aggregate_quality:
             reasons.append("hard_contribution_caution")
         if evidence_is_low_payoff_quality(evidence_score, evidence_effective_score):
             reasons.append("evidence_low_payoff_quality")
