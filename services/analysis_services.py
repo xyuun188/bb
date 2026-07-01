@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 
 from core.safe_output import safe_error_text
+from services.decision_state import DecisionStage, DecisionStageStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -23,6 +24,8 @@ IntervalProvider = Callable[[], float]
 ReviewCandidate = tuple[str, str, Any, Any, int | None]
 TimeoutProvider = Callable[[], float]
 TimeBudgetProvider = Callable[[], float]
+DecisionStageRecorder = Callable[..., Awaitable[dict[str, Any]]]
+DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 
 
 class _ScopedAnalysisService:
@@ -124,6 +127,8 @@ class PositionReviewService(_ScopedAnalysisService):
         analysis_symbol_claimer: Callable[[str, str], Awaitable[bool]] | None = None,
         symbol_normalizer: Callable[[str], str] | None = None,
         candidate_executor: Callable[..., Awaitable[Any]] | None = None,
+        decision_stage_recorder: DecisionStageRecorder | None = None,
+        decision_reason_marker: DecisionReasonMarker | None = None,
         timeout_provider: TimeoutProvider | None = None,
         round_watchdog_provider: TimeBudgetProvider | None = None,
     ) -> None:
@@ -139,6 +144,8 @@ class PositionReviewService(_ScopedAnalysisService):
         self.analysis_symbol_claimer = analysis_symbol_claimer
         self.symbol_normalizer = symbol_normalizer
         self.candidate_executor = candidate_executor
+        self.decision_stage_recorder = decision_stage_recorder
+        self.decision_reason_marker = decision_reason_marker
         self.timeout_provider = timeout_provider
         self.round_watchdog_provider = round_watchdog_provider
 
@@ -184,6 +191,16 @@ class PositionReviewService(_ScopedAnalysisService):
         if self.candidate_executor is None:
             raise RuntimeError("PositionReviewService requires candidate_executor")
         return self.candidate_executor
+
+    def _required_decision_stage_recorder(self) -> DecisionStageRecorder:
+        if self.decision_stage_recorder is None:
+            raise RuntimeError("PositionReviewService requires decision_stage_recorder")
+        return self.decision_stage_recorder
+
+    def _required_decision_reason_marker(self) -> DecisionReasonMarker:
+        if self.decision_reason_marker is None:
+            raise RuntimeError("PositionReviewService requires decision_reason_marker")
+        return self.decision_reason_marker
 
     def _timeout_seconds(self) -> float:
         if self.timeout_provider is None:
@@ -264,6 +281,8 @@ class PositionReviewService(_ScopedAnalysisService):
         try_claim_analysis_symbol = self._required_analysis_symbol_claimer()
         normalize_symbol = self._required_symbol_normalizer()
         execute_candidate = self._required_candidate_executor()
+        record_decision_stage = self._required_decision_stage_recorder()
+        mark_decision_reason = self._required_decision_reason_marker()
         review_blocked_keys: set[tuple[str, str]] = set()
 
         set_loop_stage("enforce_sl_tp")
@@ -319,8 +338,39 @@ class PositionReviewService(_ScopedAnalysisService):
                 results=results,
             )
             if not claim_result:
+                reason = (
+                    "持仓复盘生成了执行候选，但同一币种正在被另一条分析流程处理；"
+                    "本轮不重复提交订单，下一轮会基于最新仓位和行情重新复盘。"
+                )
                 logger.info(
-                    "position execution skipped because another analysis owns symbol", symbol=symbol
+                    "position execution skipped because another analysis owns symbol",
+                    symbol=symbol,
+                    reason=reason,
+                )
+                if decision_db_id is not None:
+                    await record_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.STRATEGY_ARBITRATION,
+                        DecisionStageStatus.SKIPPED,
+                        reason,
+                        {
+                            "skip_kind": "position_analysis_symbol_claimed",
+                            "selected_for_execution": False,
+                        },
+                    )
+                    await mark_decision_reason(decision_db_id, reason)
+                results.setdefault("decisions", []).append(
+                    {
+                        "model": model_name,
+                        "symbol": symbol,
+                        "action": getattr(getattr(decision, "action", None), "value", None),
+                        "approved": True,
+                        "confidence": getattr(decision, "confidence", 0.0),
+                        "executed": False,
+                        "execution_status": "skipped",
+                        "reason": reason,
+                    }
                 )
                 continue
             claimed_analysis_symbols.append(symbol)

@@ -62,6 +62,7 @@ from services.entry_capacity import EntryCapacityPolicy
 from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
 from services.entry_evidence_probe import EntryEvidenceProbePolicy
+from services.entry_execution_handoff import await_entry_execution_handoff
 from services.entry_existing_winner import EntryExistingWinnerContextPolicy
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 from services.entry_fee_provider import EntryFeeProvider
@@ -395,6 +396,8 @@ class TradingService:
             analysis_symbol_claimer=self.claim_analysis_symbol,
             symbol_normalizer=self.normalize_position_symbol,
             candidate_executor=self.execute_position_review_candidate,
+            decision_stage_recorder=self.record_and_persist_decision_stage,
+            decision_reason_marker=self.mark_decision_reason,
             timeout_provider=self.position_review_stage_timeout_seconds,
             round_watchdog_provider=self.position_round_watchdog_seconds,
         )
@@ -1571,15 +1574,75 @@ class TradingService:
     ) -> ExecutionResult | None:
         """Execute a position-review candidate through an explicit boundary."""
 
-        return await self._execute_candidate(
-            symbol,
-            model_name,
-            decision,
-            assessment,
-            decision_db_id,
-            results,
-            open_positions=open_positions,
+        pending_reason = (
+            "持仓复盘候选已进入执行链路，系统正在进行风控复核、OKX 提交和本地订单同步。"
         )
+        if decision_db_id is not None:
+            await self._mark_decision_pending_execution(decision_db_id, pending_reason)
+        try:
+            execution_result = await await_entry_execution_handoff(
+                self._execute_candidate(
+                    symbol,
+                    model_name,
+                    decision,
+                    assessment,
+                    decision_db_id,
+                    results,
+                    open_positions=open_positions,
+                ),
+                symbol=symbol,
+                model_name=model_name,
+                action=decision.action.value,
+                source="position_review_candidate",
+            )
+        except asyncio.CancelledError:
+            reason = (
+                "持仓复盘候选已经进入执行链路，但本轮任务被外层超时保护取消；"
+                "系统已等待下单链路尽量收口，仍未拿到最终结果，本次旧候选不再继续等待。"
+            )
+            if decision_db_id is not None:
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    reason,
+                    {
+                        "skip_kind": "position_review_execution_cancelled",
+                        "source": "position_review_candidate",
+                    },
+                )
+                await self._mark_decision_reason(decision_db_id, reason)
+            raise
+        except Exception as exc:
+            reason = (
+                "持仓复盘候选进入执行链路后异常中断："
+                f"{safe_error_text(exc, limit=160)}。系统已跳过本次旧候选，下一轮会重新复盘。"
+            )
+            if decision_db_id is not None:
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.FAILED,
+                    reason,
+                    {
+                        "skip_kind": "position_review_execution_error",
+                        "source": "position_review_candidate",
+                    },
+                )
+                await self._mark_decision_reason(decision_db_id, reason)
+            raise
+
+        if decision_db_id is not None:
+            await self.decision_final_state_ensurer.ensure(
+                decision_db_id,
+                symbol,
+                model_name,
+                decision,
+                results,
+            )
+        return execution_result
 
     def record_round_error(self, reason: str) -> None:
         """Record the latest loop error through an explicit service boundary."""

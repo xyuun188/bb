@@ -16,6 +16,7 @@ from executor.base_executor import ExecutionResult, OrderStatus
 from services.account_accounting_service import AccountAccountingService
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
+from services.decision_state import DecisionStage, DecisionStageStatus
 from services.entry_existing_winner import EntryExistingWinnerContextPolicy
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_market_data_quality import EntryMarketDataQualityPolicy, MarketValueReader
@@ -1455,6 +1456,12 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
         )
         return None
 
+    async def mark_pending(decision_id, reason):
+        calls.append(("pending", decision_id, reason))
+
+    async def ensure_final(decision_id, symbol, model_name, decision_arg, results):
+        calls.append(("ensure", decision_id, symbol, model_name, decision_arg.action.value))
+
     service._set_loop_stage = set_loop_stage  # type: ignore[method-assign]
     service._enforce_sl_tp = enforce_sl_tp  # type: ignore[method-assign]
     service.okx_sync_service = FakeSyncService()
@@ -1462,6 +1469,8 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
     service._try_claim_analysis_symbol = claim_symbol  # type: ignore[method-assign]
     service._normalize_position_symbol = normalize_symbol  # type: ignore[method-assign]
     service._execute_candidate = execute_candidate  # type: ignore[method-assign]
+    service._mark_decision_pending_execution = mark_pending  # type: ignore[method-assign]
+    service.decision_final_state_ensurer = SimpleNamespace(ensure=ensure_final)
 
     service.set_loop_stage("position")
     assert await service.enforce_sl_tp_for_position_review({"BTC/USDT": object()}) == [
@@ -1496,7 +1505,9 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
         ("review", 1, ["BTC/USDT"], 0, 1, "paused", 3),
         ("claim", "BTC/USDT", "position"),
         ("normalize", "BTC/USDT"),
+        ("pending", 456, "持仓复盘候选已进入执行链路，系统正在进行风控复核、OKX 提交和本地订单同步。"),
         ("execute", "BTC/USDT", "ensemble_trader", "close_long", True, 456, 1),
+        ("ensure", 456, "BTC/USDT", "ensemble_trader", "close_long"),
     ]
 
 
@@ -7416,6 +7427,12 @@ async def test_position_review_service_runs_sl_tp_and_executes_review_candidates
             (symbol, model_name, decision_arg.action.value, decision_db_id, open_positions)
         )
 
+    async def record_stage(*args, **kwargs):
+        return {}
+
+    async def mark_reason(decision_id, reason):
+        return None
+
     service = PositionReviewService(
         loop_stage_setter=set_loop_stage,
         sl_tp_enforcer=enforce_sl_tp,
@@ -7424,6 +7441,8 @@ async def test_position_review_service_runs_sl_tp_and_executes_review_candidates
         analysis_symbol_claimer=claim_symbol,
         symbol_normalizer=lambda symbol: symbol,
         candidate_executor=execute_candidate,
+        decision_stage_recorder=record_stage,
+        decision_reason_marker=mark_reason,
     )
     results: dict[str, Any] = {"executions": []}
     open_positions, blocked = await service.review_open_positions(
@@ -7445,6 +7464,145 @@ async def test_position_review_service_runs_sl_tp_and_executes_review_candidates
     assert claimed == ["BTC/USDT"]
     assert round_ids == {456}
     assert executions == [("BTC/USDT", "ensemble_trader", "close_long", 456, open_positions)]
+
+
+@pytest.mark.asyncio
+async def test_position_review_service_records_claim_skip_for_review_candidates():
+    decision = _decision(Action.LONG)
+    assessment = SimpleNamespace(warnings=[])
+    stages: list[tuple[Any, ...]] = []
+    reasons: list[tuple[int, str]] = []
+
+    async def enforce_sl_tp(_feature_vectors):
+        return []
+
+    async def open_positions_context():
+        return [{"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"}]
+
+    async def review_open_positions(
+        open_positions,
+        feature_vectors,
+        *,
+        results,
+        round_decision_ids,
+        position_entry_pause_reason,
+        max_groups_override,
+    ):
+        return [("BTC/USDT", "ensemble_trader", decision, assessment, 789)], set()
+
+    async def claim_symbol(_symbol, _owner):
+        return False
+
+    async def execute_candidate(*_args, **_kwargs):
+        raise AssertionError("claim-failed position candidate must not execute")
+
+    async def record_stage(
+        decision_id,
+        decision_arg,
+        stage,
+        status,
+        reason,
+        data=None,
+        **_kwargs,
+    ):
+        stages.append((decision_id, decision_arg, stage, status, reason, data))
+        return {}
+
+    async def mark_reason(decision_id, reason):
+        reasons.append((decision_id, reason))
+
+    service = PositionReviewService(
+        loop_stage_setter=lambda _stage: None,
+        sl_tp_enforcer=enforce_sl_tp,
+        open_positions_context_provider=open_positions_context,
+        position_reviewer=review_open_positions,
+        analysis_symbol_claimer=claim_symbol,
+        symbol_normalizer=lambda symbol: symbol,
+        candidate_executor=execute_candidate,
+        decision_stage_recorder=record_stage,
+        decision_reason_marker=mark_reason,
+    )
+    results: dict[str, Any] = {"executions": [], "decisions": []}
+
+    _open_positions, blocked = await service.review_open_positions(
+        feature_vectors={"BTC/USDT": object()},
+        results=results,
+        round_decision_ids=set(),
+        open_positions=[],
+        position_entry_pause_reason=None,
+        max_groups_override=3,
+        claimed_analysis_symbols=[],
+    )
+
+    assert blocked == set()
+    assert stages[0][0] == 789
+    assert stages[0][2] == DecisionStage.STRATEGY_ARBITRATION
+    assert stages[0][3] == DecisionStageStatus.SKIPPED
+    assert stages[0][5]["skip_kind"] == "position_analysis_symbol_claimed"
+    assert reasons == [(789, stages[0][4])]
+    assert results["decisions"][0]["execution_status"] == "skipped"
+    assert "另一条分析流程" in results["decisions"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_execute_position_review_candidate_waits_for_handoff_after_outer_timeout():
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[Any, ...]] = []
+    decision = _decision(Action.LONG)
+    assessment = SimpleNamespace(warnings=[])
+
+    async def mark_pending(decision_id, reason):
+        calls.append(("pending", decision_id, reason))
+
+    async def execute_candidate(
+        symbol,
+        model_name,
+        decision_arg,
+        assessment_arg,
+        decision_db_id,
+        results,
+        *,
+        open_positions=None,
+    ):
+        calls.append(("execute_start", symbol, model_name, decision_arg.action.value))
+        await asyncio.sleep(0.03)
+        calls.append(("execute_done", symbol, model_name, decision_arg.action.value))
+        return ExecutionResult(
+            order_id="local-1",
+            symbol=symbol,
+            side=decision_arg.action.value,
+            order_type="market",
+            quantity=1.0,
+            price=100.0,
+            status=OrderStatus.FILLED,
+            exchange_order_id="okx-1",
+        )
+
+    async def ensure_final(decision_id, symbol, model_name, decision_arg, results):
+        calls.append(("ensure", decision_id, symbol, model_name, decision_arg.action.value))
+
+    service._mark_decision_pending_execution = mark_pending  # type: ignore[method-assign]
+    service._execute_candidate = execute_candidate  # type: ignore[method-assign]
+    service.decision_final_state_ensurer = SimpleNamespace(ensure=ensure_final)
+
+    result = await asyncio.wait_for(
+        service.execute_position_review_candidate(
+            "BTC/USDT",
+            "ensemble_trader",
+            decision,
+            assessment,
+            901,
+            {"executions": []},
+            open_positions=[{"symbol": "BTC/USDT"}],
+        ),
+        timeout=0.01,
+    )
+
+    assert result is not None
+    assert result.exchange_order_id == "okx-1"
+    assert ("execute_start", "BTC/USDT", "ensemble_trader", "long") in calls
+    assert ("execute_done", "BTC/USDT", "ensemble_trader", "long") in calls
+    assert ("ensure", 901, "BTC/USDT", "ensemble_trader", "long") in calls
 
 
 @pytest.mark.asyncio
@@ -7480,6 +7638,8 @@ async def test_position_review_service_times_out_slow_review_without_stalling_ro
         analysis_symbol_claimer=lambda _symbol, _owner: asyncio.sleep(0, result=True),
         symbol_normalizer=lambda symbol: symbol,
         candidate_executor=lambda *args, **kwargs: asyncio.sleep(0),
+        decision_stage_recorder=lambda *args, **kwargs: asyncio.sleep(0, result={}),
+        decision_reason_marker=lambda *args, **kwargs: asyncio.sleep(0),
         timeout_provider=lambda: 0.01,
     )
     results: dict[str, Any] = {"executions": [], "warnings": []}
