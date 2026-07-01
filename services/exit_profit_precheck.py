@@ -27,6 +27,37 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _strategy_profit_lock_policy(raw: dict[str, Any]) -> dict[str, Any]:
+    strategy_mode = _safe_dict(raw.get("strategy_mode"))
+    context = _safe_dict(raw.get("strategy_learning_context"))
+    learning = _safe_dict(context.get("strategy_learning"))
+    runtime = _safe_dict(learning.get("runtime"))
+    multiplier = min(
+        max(
+            _safe_float(
+                context.get("profit_lock_min_usdt_multiplier")
+                or strategy_mode.get("profit_lock_min_usdt_multiplier")
+                or learning.get("profit_lock_min_usdt_multiplier")
+                or runtime.get("profit_lock_min_usdt_multiplier"),
+                1.0,
+            ),
+            0.80,
+        ),
+        1.80,
+    )
+    winner_hold_extension = str(
+        context.get("winner_hold_extension")
+        or strategy_mode.get("winner_hold_extension")
+        or learning.get("winner_hold_extension")
+        or runtime.get("winner_hold_extension")
+        or "normal"
+    )
+    return {
+        "winner_hold_extension": winner_hold_extension,
+        "profit_lock_min_usdt_multiplier": round(multiplier, 6),
+    }
+
+
 @dataclass(slots=True)
 class ExitProfitPrecheckPolicy:
     """Recheck fresh profit before executing pure lock-profit exits."""
@@ -141,20 +172,21 @@ class ExitProfitPrecheckPolicy:
 
         standard_min_profit = max(self.min_net_usdt * 0.25, 0.05)
         estimated_fee_buffer = max(total_notional * ESTIMATED_TAKER_FEE_PCT * 2.0, 0.0)
+        strategy_policy = _strategy_profit_lock_policy(raw)
         small_position_min_profit = max(
             _EXIT_PARAMS.small_position_profit_lock_min_net_usdt,
             total_notional * _EXIT_PARAMS.small_position_profit_lock_min_pnl_ratio,
             estimated_fee_buffer * _EXIT_PARAMS.small_position_profit_lock_min_fee_multiple,
         )
+        if strategy_policy["winner_hold_extension"] == "high":
+            small_position_min_profit *= strategy_policy["profit_lock_min_usdt_multiplier"]
         small_position_profit_lock = bool(
             close_evidence.get("small_position_profit_lock")
             and 0 < total_notional <= _EXIT_PARAMS.small_position_profit_lock_max_notional_usdt
         )
-        min_profit = (
-            min(standard_min_profit, small_position_min_profit)
-            if small_position_profit_lock
-            else standard_min_profit
-        )
+        min_profit = standard_min_profit * strategy_policy["profit_lock_min_usdt_multiplier"]
+        if small_position_profit_lock:
+            min_profit = min(min_profit, small_position_min_profit)
         if total_unrealized > min_profit:
             return None
 
@@ -182,6 +214,7 @@ class ExitProfitPrecheckPolicy:
             "standard_min_required_profit": round(standard_min_profit, 6),
             "small_position_profit_lock": small_position_profit_lock,
             "small_position_min_required_profit": round(small_position_min_profit, 6),
+            "strategy_profit_lock_policy": strategy_policy,
             "total_notional": round(total_notional, 6),
             "non_profit_exit_evidence": non_profit_exit_evidence,
             "reason": (

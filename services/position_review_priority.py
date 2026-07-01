@@ -89,6 +89,7 @@ class PositionReviewPriorityPolicy:
         self,
         pos: dict[str, Any],
         feature_vector: Any | None,
+        strategy_context: dict[str, Any] | None = None,
     ) -> tuple[float, list[str]]:
         reasons: list[str] = []
         try:
@@ -101,6 +102,37 @@ class PositionReviewPriorityPolicy:
             return 0.0, reasons
         if entry <= 0 or current <= 0 or qty <= 0:
             return 0.0, reasons
+
+        strategy_context = strategy_context or {}
+        learning = (
+            strategy_context.get("strategy_learning")
+            if isinstance(strategy_context.get("strategy_learning"), dict)
+            else {}
+        )
+        strategy_runtime = _safe_dict(learning.get("runtime"))
+        winner_hold_extension = str(
+            strategy_context.get("winner_hold_extension")
+            or learning.get("winner_hold_extension")
+            or strategy_runtime.get("winner_hold_extension")
+            or "normal"
+        )
+        profit_lock_multiplier = min(
+            max(
+                _safe_float(
+                    strategy_context.get("profit_lock_min_usdt_multiplier")
+                    or learning.get("profit_lock_min_usdt_multiplier")
+                    or strategy_runtime.get("profit_lock_min_usdt_multiplier"),
+                    1.0,
+                ),
+                0.80,
+            ),
+            1.80,
+        )
+        pullback_lock_enabled = bool(
+            strategy_context.get("pullback_lock_enabled")
+            or learning.get("pullback_lock_enabled")
+            or strategy_runtime.get("pullback_lock_enabled")
+        )
 
         side = str(pos.get("side") or "").lower()
         notional = max(entry * qty, 1e-9)
@@ -170,28 +202,47 @@ class PositionReviewPriorityPolicy:
             peak_state.get("peak_unrealized_pnl", peak_state.get("peak_pnl")),
             0.0,
         )
-        if unrealized >= max(
+        profit_lock_min = max(
             notional * PROFIT_PROTECTION_MIN_NET_PNL_RATIO,
             estimated_round_trip_fee * PROFIT_PROTECTION_MIN_FEE_MULTIPLE,
             PROFIT_PROTECTION_MIN_NET_USDT,
-        ):
+        ) * profit_lock_multiplier
+        if unrealized >= profit_lock_min:
             score = max(score, 72.0)
             reasons.append("profit_lock_candidate")
-        if (
+        small_position_min_profit = max(
+            notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
+            estimated_round_trip_fee * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
+            SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
+        )
+        if winner_hold_extension == "high":
+            small_position_min_profit *= profit_lock_multiplier
+        small_lock_candidate = (
             0 < notional <= SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
             and pnl_ratio >= SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
-            and unrealized
-            >= max(
-                notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
-                estimated_round_trip_fee * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
-                SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
-            )
+            and unrealized >= small_position_min_profit
             and fee_multiple >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
             and age_minutes >= SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES
-        ):
+        )
+        if small_lock_candidate:
             score = max(score, 74.0)
             reasons.append("small_position_profit_lock_candidate")
-        if peak_pnl >= 0.8 and unrealized > 0 and unrealized <= peak_pnl * 0.72:
+        if (
+            winner_hold_extension == "high"
+            and unrealized > 0
+            and score < 84.0
+            and ("profit_lock_candidate" in reasons or "small_position_profit_lock_candidate" in reasons)
+        ):
+            score = min(score, 63.0)
+            reasons.append("strategy_winner_hold_delay_profit_lock")
+        retrace_trigger = 0.72
+        if winner_hold_extension == "high" and pullback_lock_enabled:
+            retrace_trigger = retrace_trigger / profit_lock_multiplier
+        if (
+            peak_pnl >= 0.8
+            and unrealized > 0
+            and unrealized <= peak_pnl * retrace_trigger
+        ):
             score = max(score, 80.0)
             retrace_ratio = (peak_pnl - unrealized) / max(peak_pnl, 1e-9)
             reasons.append(f"profit_retrace:{peak_pnl:.2f}->{unrealized:.2f}U/{retrace_ratio:.0%}")
@@ -384,7 +435,11 @@ class PositionReviewPriorityPolicy:
                 )
                 if not aggregate:
                     continue
-                pos_exit_score, pos_reasons = self.fast_position_exit_score(aggregate, fv)
+                pos_exit_score, pos_reasons = self.fast_position_exit_score(
+                    aggregate,
+                    fv,
+                    strategy_context,
+                )
                 pos_quality = (
                     self.quality_scorer.score(aggregate, feature_vector=fv)
                     if self.quality_scorer

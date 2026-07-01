@@ -123,3 +123,26 @@ async def test_exit_profit_precheck_allows_profitable_fresh_recheck() -> None:
     reason = await _policy(102.0).guard_reason(_decision(), [_position()])
 
     assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_exit_profit_precheck_uses_strategy_profit_lock_multiplier() -> None:
+    decision = _decision(
+        {
+            "close_evidence": {"profit_protection": True},
+            "strategy_learning_context": {
+                "winner_hold_extension": "high",
+                "profit_lock_min_usdt_multiplier": 1.6,
+            },
+        }
+    )
+
+    reason = await _policy(101.0).guard_reason(decision, [_position()])
+
+    assert reason is not None
+    guard = decision.raw_response["execution_profit_protection_guard"]
+    assert guard["min_required_profit"] == 1.2
+    assert guard["strategy_profit_lock_policy"] == {
+        "winner_hold_extension": "high",
+        "profit_lock_min_usdt_multiplier": 1.6,
+    }

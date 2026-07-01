@@ -115,6 +115,66 @@ def test_fast_position_exit_score_prioritizes_small_profitable_position_lock() -
     assert "small_position_profit_lock_candidate" in reasons
 
 
+def test_strategy_winner_hold_delays_small_profit_lock_until_generated_floor() -> None:
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "MET/USDT",
+        "side": "short",
+        "entry_price": 0.1713667,
+        "current_price": 0.1599,
+        "quantity": 150.0,
+        "unrealized_pnl": 1.72,
+        "created_at": (datetime.now(UTC) - timedelta(hours=12)).isoformat(),
+    }
+
+    baseline_score, baseline_reasons = _policy().fast_position_exit_score(position, None)
+    strategy_score, strategy_reasons = _policy().fast_position_exit_score(
+        position,
+        None,
+        {
+            "winner_hold_extension": "high",
+            "profit_lock_min_usdt_multiplier": 1.6,
+            "pullback_lock_enabled": True,
+        },
+    )
+
+    assert baseline_score >= 74.0
+    assert "small_position_profit_lock_candidate" in baseline_reasons
+    assert strategy_score < baseline_score
+    assert "strategy_winner_hold_delay_profit_lock" in strategy_reasons
+    assert "small_position_profit_lock_candidate" in strategy_reasons
+
+
+def test_strategy_pullback_lock_still_prioritizes_real_profit_retrace() -> None:
+    score, reasons = _policy(
+        {
+            ("ensemble_trader", "BTC/USDT", "long"): {
+                "peak_unrealized_pnl": 10.0,
+            }
+        }
+    ).fast_position_exit_score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price": 100.0,
+            "current_price": 104.0,
+            "quantity": 1.0,
+            "unrealized_pnl": 4.0,
+            "stop_loss": 90.0,
+        },
+        None,
+        {
+            "winner_hold_extension": "high",
+            "profit_lock_min_usdt_multiplier": 1.6,
+            "pullback_lock_enabled": True,
+        },
+    )
+
+    assert score >= 80.0
+    assert any(reason.startswith("profit_retrace:") for reason in reasons)
+
+
 def test_fast_position_add_score_detects_winner_add_candidate() -> None:
     score, reason = _policy().fast_position_add_score(
         [

@@ -144,6 +144,7 @@ class EntryDirectionCompetitionPolicy:
         self._add_sentiment_evidence(sides, local_ai_tools_context)
         self._add_technical_evidence(sides, feature_vector)
         self._add_market_regime_penalties(sides, strategy)
+        self._add_strategy_side_weights(sides, strategy)
         self._add_position_exposure_balance(sides, strategy)
 
         long_score = _safe_float(sides["long"]["score"], 0.0)
@@ -393,6 +394,36 @@ class EntryDirectionCompetitionPolicy:
                     -0.10,
                     f"Market regime soft penalty: {side} needs stronger single-symbol evidence.",
                 )
+
+    def _add_strategy_side_weights(
+        self,
+        sides: dict[str, dict[str, Any]],
+        strategy: dict[str, Any],
+    ) -> None:
+        weights = _safe_dict(strategy.get("side_weights"))
+        if not weights:
+            learning = _safe_dict(strategy.get("strategy_learning"))
+            weights = _safe_dict(_safe_dict(learning.get("runtime")).get("side_weights"))
+        if not weights:
+            return
+
+        for side in ("long", "short"):
+            if side not in weights:
+                continue
+            weight = min(max(_safe_float(weights.get(side), 1.0), 0.25), 1.40)
+            if abs(weight - 1.0) <= 1e-9:
+                continue
+            original = _safe_float(sides[side].get("score"), 0.0)
+            if weight < 1.0 and original < 0:
+                adjusted = original / max(weight, 0.25)
+            elif weight > 1.0 and original < 0:
+                adjusted = original / weight
+            else:
+                adjusted = original * weight
+            sides[side]["score"] = adjusted
+            sides[side]["evidence"].append(
+                f"Strategy learning side weight {side}: {weight:.2f}x."
+            )
 
     def _add_position_exposure_balance(
         self,

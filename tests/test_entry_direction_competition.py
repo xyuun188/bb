@@ -330,3 +330,48 @@ def test_direction_competition_model_evidence_is_observability_only() -> None:
     assert observed["local_ai_tools_model_evidence"]["profit_prediction"][
         "feature_coverage"
     ] == {"ratio": 0.75, "status": "reported"}
+
+
+def test_strategy_side_weights_softly_adjust_direction_scores() -> None:
+    tools = {
+        "profit_prediction": {
+            "adjusted_long_return_pct": 0.20,
+            "long_loss_probability": 0.45,
+            "adjusted_short_return_pct": 0.22,
+            "short_loss_probability": 0.43,
+            "profit_quality_score": 0.2,
+        }
+    }
+
+    baseline = _context(tools=tools)
+    weighted = _context(
+        tools=tools,
+        strategy={"side_weights": {"long": 1.35, "short": 0.60}},
+    )
+
+    assert weighted["long"]["score"] > baseline["long"]["score"]
+    assert weighted["short"]["score"] < baseline["short"]["score"]
+    assert weighted["preferred_side"] == "long"
+    assert any("Strategy learning side weight long" in note for note in weighted["long"]["evidence"])
+
+
+def test_strategy_side_weights_do_not_override_strong_opposing_evidence() -> None:
+    context = _context(
+        tools={
+            "profit_prediction": {
+                "adjusted_long_return_pct": 0.05,
+                "long_loss_probability": 0.55,
+                "adjusted_short_return_pct": 1.20,
+                "short_loss_probability": 0.20,
+                "profit_quality_score": 0.5,
+            },
+            "time_series_prediction": {
+                "best_side": "short",
+                "expected_return_pct": 0.9,
+            },
+        },
+        strategy={"side_weights": {"long": 1.40, "short": 0.70}},
+    )
+
+    assert context["preferred_side"] == "short"
+    assert context["short"]["score"] > context["long"]["score"]

@@ -130,6 +130,34 @@ ALLOWED_EXPERT_INTEGRITY_MODES = {
 }
 ALLOWED_AGGRESSIVENESS = {"low", "normal", "high"}
 ALLOWED_WINNER_HOLD = {"normal", "high"}
+CONSUMED_RUNTIME_PARAM_KEYS = {
+    "global_min_score_delta",
+    "position_size_multiplier",
+    "probe_fraction",
+    "max_probe_size_pct",
+    "expert_integrity_mode",
+    "fallback_tolerance",
+    "loss_exit_aggressiveness",
+    "full_position_release",
+    "position_review_priority_boost",
+    "release_losing_positions_first",
+    "winner_hold_extension",
+    "profit_lock_min_usdt_multiplier",
+    "pullback_lock_enabled",
+    "side_overrides",
+    "side_weights",
+}
+
+
+def _candidate_param_consumption(params: dict[str, Any]) -> dict[str, Any]:
+    keys = sorted(str(key) for key in _safe_dict(params))
+    consumed = sorted(key for key in keys if key in CONSUMED_RUNTIME_PARAM_KEYS)
+    unused = sorted(key for key in keys if key not in CONSUMED_RUNTIME_PARAM_KEYS)
+    return {
+        "consumed_runtime_params": consumed,
+        "unused_runtime_params": unused,
+        "has_consumed_runtime_params": bool(consumed),
+    }
 
 
 def default_min_trade_target() -> int:
@@ -511,6 +539,7 @@ class StrategyProfile:
     promotion: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        consumption = _candidate_param_consumption(self.params)
         return {
             "id": self.profile_id,
             "version": self.version,
@@ -520,6 +549,9 @@ class StrategyProfile:
             "description": self.description,
             "params": self.params,
             "promotion": self.promotion,
+            "param_consumption": consumption,
+            "consumed_runtime_params": consumption["consumed_runtime_params"],
+            "unused_runtime_params": consumption["unused_runtime_params"],
         }
 
 
@@ -2353,6 +2385,7 @@ class StrategyBacktester:
         problem_keys = {item["key"] for item in feedback.problems}
         estimated_delta = 0.0
         matched_fixes: list[str] = []
+        param_consumption = _candidate_param_consumption(profile.params)
 
         if profile.profile_id == "balanced_probe":
             if "expert_fallback_overblocking" in problem_keys:
@@ -2439,10 +2472,18 @@ class StrategyBacktester:
         pass_gate = score >= fee_adjusted_pnl - 0.75 and (
             trade_count >= max(2, int(target * 0.35)) or profile.profile_id == "balanced_probe"
         )
+        if profile.profile_id != "baseline_current" and not param_consumption[
+            "has_consumed_runtime_params"
+        ]:
+            pass_gate = False
         if profile.profile_id in {"loss_release", "winner_hold"} and matched_fixes:
             pass_gate = True
         if profile.profile_id not in {"baseline_current", "balanced_probe"} and matched_fixes:
             pass_gate = True
+        if profile.profile_id != "baseline_current" and not param_consumption[
+            "has_consumed_runtime_params"
+        ]:
+            pass_gate = False
         if profile.profile_id == "baseline_current":
             pass_gate = True
             estimated_delta = 0.0
@@ -2458,6 +2499,9 @@ class StrategyBacktester:
             "trade_count_target_policy": "dynamic_advisory_learning_confidence",
             "trade_count_target_is_entry_gate": False,
             "matched_fixes": matched_fixes,
+            "param_consumption": param_consumption,
+            "consumed_runtime_params": param_consumption["consumed_runtime_params"],
+            "unused_runtime_params": param_consumption["unused_runtime_params"],
             "fee_estimate": round(fee_estimate, 6),
             "fee_adjusted_pnl": round(fee_adjusted_pnl, 6),
             "max_drawdown": round(max_drawdown, 6),
@@ -3035,6 +3079,11 @@ class StrategyScheduler:
             "side_weights": _safe_dict(params.get("side_weights")),
             "loss_exit_aggressiveness": params.get("loss_exit_aggressiveness", "normal"),
             "winner_hold_extension": params.get("winner_hold_extension", "normal"),
+            "profit_lock_min_usdt_multiplier": _safe_float(
+                params.get("profit_lock_min_usdt_multiplier"),
+                1.0,
+            ),
+            "pullback_lock_enabled": bool(params.get("pullback_lock_enabled")),
             "full_position_release": bool(params.get("full_position_release")),
             "release_losing_positions_first": bool(params.get("release_losing_positions_first")),
             "position_review_priority_boost": _safe_float(
@@ -3254,6 +3303,7 @@ class StrategyScheduler:
 
         for profile in profiles:
             params = profile.params
+            param_consumption = _candidate_param_consumption(params)
             would_increase_entries = bool(
                 profile.profile_id == "balanced_probe"
                 or _safe_float(params.get("probe_fraction"), 0.0) > 0
@@ -3320,7 +3370,9 @@ class StrategyScheduler:
                 "low_trade_count": trade_count < target,
             }
             eligible = profile.profile_id == "baseline_current" or (
-                score >= -0.10 and fallback_safety != "too_loose"
+                score >= -0.10
+                and fallback_safety != "too_loose"
+                and param_consumption["has_consumed_runtime_params"]
             )
             rows.append(
                 {
@@ -3332,6 +3384,9 @@ class StrategyScheduler:
                     "would_release_losers": would_release_losers,
                     "would_hold_winners": would_hold_winners,
                     "fallback_safety": fallback_safety,
+                    "param_consumption": param_consumption,
+                    "consumed_runtime_params": param_consumption["consumed_runtime_params"],
+                    "unused_runtime_params": param_consumption["unused_runtime_params"],
                     "trade_count_guard": trade_count_guard,
                     "probe_required": profile.profile_id != "baseline_current",
                     "missed_opportunities_used": missed,
@@ -3493,6 +3548,7 @@ class StrategyLearningEngine:
         )
         result["probe_fraction"] = _safe_float(runtime.get("probe_fraction"), 0.0)
         result["max_probe_size_pct"] = _safe_float(runtime.get("max_probe_size_pct"), 0.0)
+        result["side_weights"] = _safe_dict(runtime.get("side_weights"))
         entry_filters = _safe_dict(runtime.get("entry_filters"))
         default_filters = default_entry_filters(reason="strategy_learning_context_default")
         result["entry_filters"] = entry_filters
@@ -3514,6 +3570,7 @@ class StrategyLearningEngine:
             "probe_fraction": result["probe_fraction"],
             "max_probe_size_pct": result["max_probe_size_pct"],
             "side_overrides": _safe_dict(runtime.get("side_overrides")),
+            "side_weights": result["side_weights"],
             "reason": schedule.get("reason", ""),
         }
         result["target_position_groups"] = _safe_int(runtime.get("target_position_groups"), 0)
@@ -3543,6 +3600,11 @@ class StrategyLearningEngine:
             runtime.get("position_review_priority_boost"), 1.0
         )
         result["winner_hold_extension"] = str(runtime.get("winner_hold_extension") or "normal")
+        result["profit_lock_min_usdt_multiplier"] = _safe_float(
+            runtime.get("profit_lock_min_usdt_multiplier"),
+            1.0,
+        )
+        result["pullback_lock_enabled"] = bool(runtime.get("pullback_lock_enabled"))
         guard = _safe_dict(payload.get("runtime_guard"))
         feedback_payload = _safe_dict(payload.get("feedback"))
         feedback_summary = self._compact_feedback(_safe_dict(payload.get("feedback")))
@@ -3716,6 +3778,9 @@ class StrategyLearningEngine:
             "release_losing_positions_first": result["release_losing_positions_first"],
             "position_review_priority_boost": result["position_review_priority_boost"],
             "winner_hold_extension": result["winner_hold_extension"],
+            "profit_lock_min_usdt_multiplier": result["profit_lock_min_usdt_multiplier"],
+            "pullback_lock_enabled": result["pullback_lock_enabled"],
+            "side_weights": result["side_weights"],
             "release_queue": release_queue[:8],
             "rebalance_queue": rebalance_queue,
             "low_quality_open_count": result["low_quality_open_count"],

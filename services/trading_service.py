@@ -3126,6 +3126,13 @@ class TradingService:
                 "strategy_learning_recovery_probe_reason", ""
             ),
             "strategy_learning_sizing": strategy_mode_context.get("strategy_learning_sizing", {}),
+            "side_weights": strategy_mode_context.get("side_weights", {}),
+            "winner_hold_extension": strategy_mode_context.get("winner_hold_extension", "normal"),
+            "profit_lock_min_usdt_multiplier": strategy_mode_context.get(
+                "profit_lock_min_usdt_multiplier",
+                1.0,
+            ),
+            "pullback_lock_enabled": strategy_mode_context.get("pullback_lock_enabled", False),
             "entry_filters": strategy_mode_context.get("entry_filters", {}),
             "min_entry_volume_ratio": strategy_mode_context.get("min_entry_volume_ratio"),
             "min_entry_adx": strategy_mode_context.get("min_entry_adx"),

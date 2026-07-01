@@ -413,6 +413,9 @@ class EntryOpportunityScoringPolicy:
         side = "long" if decision.action == Action.LONG else "short"
         raw = self._safe_dict(decision.raw_response)
         strategy = self._safe_dict(strategy)
+        if strategy:
+            raw["strategy_mode"] = strategy
+            decision.raw_response = raw
         ml_signal = self._safe_dict(raw.get("ml_signal"))
         predictions = self._safe_list(ml_signal.get("predictions"))
         primary = self._safe_dict(predictions[0] if predictions else {})

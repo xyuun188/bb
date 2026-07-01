@@ -2495,3 +2495,98 @@ def test_strategy_learning_trade_target_is_dynamic_advisory_not_entry_gate() -> 
     assert totals["trade_count_target_policy"] == "dynamic_advisory_learning_confidence"
     assert backtest["trade_count_target_is_entry_gate"] is False
     assert shadow["is_entry_gate"] is False
+
+
+def test_strategy_learning_winner_hold_params_are_runtime_consumed(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    state_store.set_manual_active_profile("winner_hold")
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[
+            _position(side="long", pnl=0.18, position_id=201),
+            _position(side="short", pnl=-4.0, position_id=202),
+            _position(side="long", pnl=0.15, position_id=203),
+            _position(side="short", pnl=-3.5, position_id=204),
+        ],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("hold")],
+        shadows=[],
+        memories=[],
+        reflections=[
+            _reflection(
+                position_id=201,
+                pnl=0.18,
+                mistake="small win closed too early",
+            ),
+            _reflection(position_id=202, pnl=-4.0),
+            _reflection(
+                position_id=203,
+                pnl=0.15,
+                mistake="small win closed too early",
+            ),
+            _reflection(position_id=204, pnl=-3.5),
+        ],
+        max_open_positions=14,
+    )
+    context = engine.apply_to_context({}, payload)
+
+    assert payload["schedule"]["active_profile"]["id"] == "winner_hold"
+    assert payload["schedule"]["scheduler_mode"] == "manual"
+    assert context["winner_hold_extension"] == "high"
+    assert context["profit_lock_min_usdt_multiplier"] == 1.25
+    assert context["pullback_lock_enabled"] is True
+    runtime = context["strategy_learning"]["runtime"]
+    assert runtime["profit_lock_min_usdt_multiplier"] == 1.25
+    assert "profit_lock_min_usdt_multiplier" in payload["schedule"]["active_profile"][
+        "consumed_runtime_params"
+    ]
+
+
+def test_strategy_learning_rejects_structured_candidate_with_no_runtime_params(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    inert_profile = StrategyProfile(
+        profile_id="llm_inert_sample_target",
+        version=1,
+        label="sample target only",
+        status="candidate",
+        source="llm_structured_candidate",
+        description="Only changes advisory training sample target.",
+        params={"min_trade_count_target": 40},
+    )
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-1.0, position_id=301)],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("hold") for _ in range(20)],
+        shadows=[],
+        memories=[],
+        max_open_positions=14,
+        extra_profiles=[inert_profile],
+    )
+
+    backtest = next(
+        row
+        for row in payload["schedule"]["backtest"]["rows"]
+        if row["profile_id"] == "llm_inert_sample_target"
+    )
+    shadow = next(
+        row
+        for row in payload["schedule"]["shadow_validation"]["rows"]
+        if row["profile_id"] == "llm_inert_sample_target"
+    )
+
+    assert backtest["pass"] is False
+    assert shadow["eligible"] is False
+    assert backtest["consumed_runtime_params"] == []
+    assert shadow["consumed_runtime_params"] == []
+    assert payload["schedule"]["active_profile"]["id"] != "llm_inert_sample_target"
