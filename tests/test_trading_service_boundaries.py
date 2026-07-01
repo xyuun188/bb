@@ -7606,6 +7606,54 @@ async def test_execute_position_review_candidate_waits_for_handoff_after_outer_t
 
 
 @pytest.mark.asyncio
+async def test_position_review_post_decision_handoff_finishes_after_stage_timeout():
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[Any, ...]] = []
+    decision = _decision(Action.LONG)
+    candidate = ("BTC/USDT", "ensemble_trader", decision, SimpleNamespace(warnings=[]), 902)
+
+    async def record_stage(
+        decision_id,
+        decision_arg,
+        stage,
+        status,
+        reason,
+        data,
+    ):
+        calls.append(("stage", decision_id, decision_arg.action.value, stage, status, reason, data))
+        return {}
+
+    async def slow_post_process():
+        calls.append(("post_start", decision.action.value))
+        await asyncio.sleep(0.03)
+        calls.append(("post_done", decision.action.value))
+        return SimpleNamespace(handled=False, candidate=candidate)
+
+    service._record_and_persist_decision_stage = record_stage  # type: ignore[method-assign]
+
+    result = await asyncio.wait_for(
+        service._await_position_review_post_decision_handoff(
+            slow_post_process(),
+            symbol="BTC/USDT",
+            model_name="ensemble_trader",
+            decision=decision,
+            decision_db_id=902,
+        ),
+        timeout=0.01,
+    )
+
+    assert result.handled is False
+    assert result.candidate == candidate
+    assert ("post_start", "long") in calls
+    assert ("post_done", "long") in calls
+    stage_calls = [call for call in calls if call[0] == "stage"]
+    assert stage_calls
+    assert stage_calls[0][3] == DecisionStage.RISK_CHECK
+    assert stage_calls[0][4] == DecisionStageStatus.PENDING
+    assert stage_calls[0][6]["source"] == "position_review_post_decision_handoff"
+
+
+@pytest.mark.asyncio
 async def test_position_review_service_times_out_slow_review_without_stalling_round():
     stages: list[str] = []
 

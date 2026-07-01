@@ -12,7 +12,7 @@ from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Awaitable
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -7363,17 +7363,23 @@ class TradingService:
             if risk_alert:
                 self.position_review_risk_alert_policy.attach(decision, risk_alert)
 
-            process_result = await self.position_review_decision_processor.process(
-                decision=decision,
-                model_name=model_name,
+            process_result = await self._await_position_review_post_decision_handoff(
+                self.position_review_decision_processor.process(
+                    decision=decision,
+                    model_name=model_name,
+                    symbol=symbol,
+                    model_mode=model_mode,
+                    decision_db_id=decision_db_id,
+                    open_positions=open_positions,
+                    feature_vector=fv,
+                    position_entry_pause_reason=position_entry_pause_reason,
+                    risk_alert=risk_alert,
+                    results=results,
+                ),
                 symbol=symbol,
-                model_mode=model_mode,
+                model_name=model_name,
+                decision=decision,
                 decision_db_id=decision_db_id,
-                open_positions=open_positions,
-                feature_vector=fv,
-                position_entry_pause_reason=position_entry_pause_reason,
-                risk_alert=risk_alert,
-                results=results,
             )
             if process_result.handled:
                 continue
@@ -7381,6 +7387,70 @@ class TradingService:
                 candidates.append(process_result.candidate)
 
         return candidates, handled_keys
+
+    async def _await_position_review_post_decision_handoff(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        symbol: str,
+        model_name: str,
+        decision: DecisionOutput,
+        decision_db_id: int | None,
+    ) -> Any:
+        """Finish post-AI position-review processing after a decision is logged.
+
+        The position-review stage has a wall-clock timeout so a slow review
+        cannot block the whole service forever.  Once a concrete long/short/exit
+        decision has been logged, cancelling the post-processing coroutine would
+        leave a visible entry decision with no risk result and no execution
+        handoff.  At that point the correct boundary is to finish risk
+        assessment and either hand the candidate to execution or persist the real
+        blocking reason.
+        """
+
+        task = asyncio.create_task(awaitable)
+        cancellation_count = 0
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                if cancellation_count:
+                    logger.info(
+                        "position review post-decision processing completed after outer cancellation",
+                        symbol=symbol,
+                        model=model_name,
+                        action=decision.action.value,
+                        decision_id=decision_db_id,
+                        outer_cancellations=cancellation_count,
+                    )
+                return result
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
+                cancellation_count += 1
+                reason = (
+                    "持仓复盘已经生成明确裁决，外层阶段超时保护已触发；"
+                    "系统继续完成风控复核和执行交接，避免已通过条件的开仓/平仓信号被中途丢弃。"
+                )
+                logger.warning(
+                    "position review post-decision processing is waiting for terminal result after outer cancellation",
+                    symbol=symbol,
+                    model=model_name,
+                    action=decision.action.value,
+                    decision_id=decision_db_id,
+                    outer_cancellations=cancellation_count,
+                )
+                if decision_db_id is not None:
+                    await self._record_and_persist_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.RISK_CHECK,
+                        DecisionStageStatus.PENDING,
+                        reason,
+                        {
+                            "source": "position_review_post_decision_handoff",
+                            "outer_cancellations": cancellation_count,
+                        },
+                    )
 
     def _position_release_scan(
         self,
