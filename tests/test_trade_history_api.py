@@ -384,6 +384,121 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
 
 
 @pytest.mark.asyncio
+async def test_position_history_prefers_final_okx_realized_pnl_over_local_fragments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-final-history-pnl.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 6, 30, 23, 57, 8, tzinfo=UTC)
+    first_close_at = datetime(2026, 7, 1, 0, 2, 32, tzinfo=UTC)
+    second_close_at = datetime(2026, 7, 1, 0, 5, 13, tzinfo=UTC)
+    final_close_at = datetime(2026, 7, 1, 0, 5, 56, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            for row in (
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "quantity": 732.0,
+                    "realized_pnl": 7.937940890773545,
+                    "close_exchange_order_id": "ai16z-close-a,ai16z-close-b,ai16z-close-c",
+                    "closed_at": final_close_at,
+                },
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "quantity": 423.0,
+                    "realized_pnl": 3.7719024514292054,
+                    "close_exchange_order_id": "ai16z-close-a",
+                    "closed_at": first_close_at,
+                },
+                {
+                    "model_name": "ensemble_trader",
+                    "quantity": 423.0,
+                    "realized_pnl": 3.403710916475388,
+                    "close_exchange_order_id": "ai16z-close-a",
+                    "closed_at": first_close_at - timedelta(seconds=20),
+                },
+            ):
+                await repo.open_position(
+                    {
+                        "execution_mode": "paper",
+                        "symbol": "AI16Z/USDT",
+                        "side": "short",
+                        "entry_price": 0.0737920765027324,
+                        "current_price": 0.063397868852459,
+                        "leverage": 1.0,
+                        "unrealized_pnl": 0.0,
+                        "is_open": False,
+                        "okx_inst_id": "AI16Z-USDT-SWAP",
+                        "okx_pos_id": "3703019077645344768",
+                        "entry_exchange_order_id": "ai16z-entry",
+                        "created_at": opened_at,
+                        **row,
+                    }
+                )
+
+            for order_id, side, qty, price, ts, pnl in (
+                ("ai16z-entry", "sell", 732.0, 0.0737920765027324, opened_at, 0.0),
+                ("ai16z-close-a", "buy", 423.0, 0.0656757446808511, first_close_at, 3.4332083606558053),
+                ("ai16z-close-b", "buy", 216.0, 0.0604861111111111, second_close_at, 2.8740885245901984),
+                ("ai16z-close-c", "buy", 93.0, 0.0598, final_close_at, 1.3012631147541132),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "AI16Z/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": qty,
+                        "price": price,
+                        "status": "filled",
+                        "fee": 0.01,
+                        "exchange_order_id": order_id,
+                        "filled_at": ts,
+                        "created_at": ts,
+                        "okx_inst_id": "AI16Z-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": qty / 10.0,
+                        "okx_fill_pnl": pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "AI16Z-USDT-SWAP",
+                            "contracts": qty / 10.0,
+                            "contract_size": 10.0,
+                            "base_quantity": qty,
+                            "avg_price": price,
+                            "fee_abs": 0.01,
+                            "fill_pnl": pnl,
+                            "timestamp": ts.isoformat(),
+                        },
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    assert payload["total"] == 1
+    row = payload["positions"][0]
+    assert row["symbol"] == "AI16Z/USDT"
+    assert row["quantity"] == pytest.approx(732.0)
+    assert row["realized_pnl"] == pytest.approx(7.937940890773545)
+    assert row["pnl_source"] == "okx_position_history_realized_pnl"
+    assert row["close_order_ids"] == ["ai16z-close-a", "ai16z-close-b", "ai16z-close-c"]
+    assert row["linked_order_count"] == 4
+    assert len(row["position_ids"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

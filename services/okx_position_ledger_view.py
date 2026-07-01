@@ -469,9 +469,14 @@ def _build_group_from_positions(
 ) -> OkxPositionLedgerGroup:
     mode, symbol, side, lifecycle_open = key
     inst_id = _position_inst_id(positions[0]) or okx_inst_id_from_symbol(symbol) or ""
+    metric_positions = _metric_positions_for_group(positions)
     position_ids = [int(pos.id) for pos in positions if getattr(pos, "id", None) is not None]
-    opened_at_values = [_as_utc(pos.created_at) for pos in positions if _as_utc(pos.created_at)]
-    closed_at_values = [_as_utc(pos.closed_at) for pos in positions if _as_utc(pos.closed_at)]
+    opened_at_values = [
+        _as_utc(pos.created_at) for pos in metric_positions if _as_utc(pos.created_at)
+    ]
+    closed_at_values = [
+        _as_utc(pos.closed_at) for pos in metric_positions if _as_utc(pos.closed_at)
+    ]
     opened_at = min(opened_at_values) if opened_at_values else None
     closed_at = max(closed_at_values) if closed_at_values else None
 
@@ -496,9 +501,17 @@ def _build_group_from_positions(
         key=lambda row: row.filled_at or datetime.min.replace(tzinfo=UTC),
     )
 
-    closed_quantity = sum(abs(_safe_float(getattr(pos, "quantity", None))) for pos in positions)
+    closed_quantity = sum(
+        abs(_safe_float(getattr(pos, "quantity", None))) for pos in metric_positions
+    )
     max_quantity = max(
-        [closed_quantity, *[abs(_safe_float(getattr(pos, "quantity", None))) for pos in positions]],
+        [
+            closed_quantity,
+            *[
+                abs(_safe_float(getattr(pos, "quantity", None)))
+                for pos in metric_positions
+            ],
+        ],
         default=closed_quantity,
     )
     entry_price = _weighted_average(
@@ -506,14 +519,14 @@ def _build_group_from_positions(
             abs(_safe_float(getattr(pos, "quantity", None))),
             _safe_float(getattr(pos, "entry_price", None)),
         )
-        for pos in positions
+        for pos in metric_positions
     )
     close_price = _weighted_average(
         (
             abs(_safe_float(getattr(pos, "quantity", None))),
             _safe_float(getattr(pos, "current_price", None)),
         )
-        for pos in positions
+        for pos in metric_positions
     )
     if close_ids:
         close_price_from_orders = _weighted_average(
@@ -524,8 +537,15 @@ def _build_group_from_positions(
         if close_price_from_orders > 0:
             close_price = close_price_from_orders
 
-    realized_pnl = sum(_safe_float(getattr(pos, "realized_pnl", None)) for pos in positions)
-    if not realized_pnl:
+    has_okx_authoritative_pnl = any(
+        _is_okx_authoritative_position_history_row(pos) for pos in metric_positions
+    )
+    realized_pnl = sum(
+        _safe_float(getattr(pos, "realized_pnl", None)) for pos in metric_positions
+    )
+    if has_okx_authoritative_pnl:
+        pnl_source = "okx_position_history_realized_pnl"
+    elif not realized_pnl:
         realized_pnl = sum(
             _safe_float(row.pnl)
             for row in linked_fills
@@ -540,7 +560,8 @@ def _build_group_from_positions(
         realized_pct = realized_pnl / entry_notional * 100.0
 
     leverage = max(
-        (_safe_float(getattr(pos, "leverage", None), 0.0) for pos in positions), default=0.0
+        (_safe_float(getattr(pos, "leverage", None), 0.0) for pos in metric_positions),
+        default=0.0,
     )
     gaps: list[str] = []
     if not inst_id:
@@ -593,10 +614,109 @@ def _deduplicate_superseded_position_rows(positions: list[Position]) -> list[Pos
     for bucket in _duplicate_position_buckets(positions).values():
         winner = max(bucket, key=_position_evidence_score)
         keep.append(winner)
+    keep = _drop_superseded_authoritative_position_rows(keep)
     return sorted(
         keep,
         key=lambda item: _as_utc(getattr(item, "created_at", None))
         or datetime.min.replace(tzinfo=UTC),
+    )
+
+
+def _metric_positions_for_group(positions: list[Position]) -> list[Position]:
+    authoritative_rows = [
+        position
+        for position in positions
+        if _is_okx_authoritative_position_history_row(position)
+    ]
+    return authoritative_rows or positions
+
+
+def _drop_superseded_authoritative_position_rows(positions: list[Position]) -> list[Position]:
+    authoritative_rows = [
+        position
+        for position in positions
+        if _is_okx_authoritative_position_history_row(position)
+    ]
+    if not authoritative_rows:
+        return positions
+    return [
+        position
+        for position in positions
+        if not any(
+            candidate is not position
+            and _authoritative_position_history_row_supersedes(candidate, position)
+            for candidate in authoritative_rows
+        )
+    ]
+
+
+def _authoritative_position_history_row_supersedes(
+    candidate: Position,
+    other: Position,
+) -> bool:
+    """Return True when an OKX final lifecycle row covers an older fragment.
+
+    OKX position-history sync can observe partial-close snapshots before the
+    final lifecycle snapshot.  The final row carries the OKX UI's realizedPnl
+    for the whole historical position, so older local/partial rows must remain
+    audit evidence only and must not be summed into the ledger PnL.
+    """
+
+    if not _is_okx_authoritative_position_history_row(candidate):
+        return False
+    if _position_base_key(candidate) != _position_base_key(other):
+        return False
+
+    candidate_pos_id = _position_pos_id(candidate)
+    other_pos_id = _position_pos_id(other)
+    if candidate_pos_id and other_pos_id and candidate_pos_id != other_pos_id:
+        return False
+
+    candidate_entry = set(_position_order_key(candidate, "entry_exchange_order_id"))
+    candidate_close = set(_position_order_key(candidate, "close_exchange_order_id"))
+    other_entry = set(_position_order_key(other, "entry_exchange_order_id"))
+    other_close = set(_position_order_key(other, "close_exchange_order_id"))
+    if not candidate_close:
+        return False
+    if other_close and not other_close.issubset(candidate_close):
+        return False
+    if other_entry and candidate_entry and not other_entry.issubset(candidate_entry):
+        return False
+    if other_entry and not candidate_entry:
+        return False
+
+    candidate_opened = _as_utc(getattr(candidate, "created_at", None))
+    other_opened = _as_utc(getattr(other, "created_at", None))
+    candidate_closed = _as_utc(getattr(candidate, "closed_at", None))
+    other_closed = _as_utc(getattr(other, "closed_at", None))
+    if candidate_opened and other_opened:
+        if abs((candidate_opened - other_opened).total_seconds()) > 5:
+            return False
+    elif not (
+        (candidate_entry and other_entry and bool(candidate_entry & other_entry))
+        or (candidate_close and other_close and bool(candidate_close & other_close))
+    ):
+        return False
+    if candidate_closed and other_closed and candidate_closed < other_closed:
+        if abs((candidate_closed - other_closed).total_seconds()) > 5:
+            return False
+
+    candidate_quantity = abs(_safe_float(getattr(candidate, "quantity", None)))
+    other_quantity = abs(_safe_float(getattr(other, "quantity", None)))
+    if other_quantity > 0 and candidate_quantity + max(other_quantity * 0.001, 1e-12) < other_quantity:
+        return False
+
+    strictly_more_complete = candidate_close != other_close or (
+        candidate_entry != other_entry and bool(candidate_close)
+    )
+    return strictly_more_complete
+
+
+def _is_okx_authoritative_position_history_row(position: Position) -> bool:
+    return (
+        str(getattr(position, "model_name", "") or "").strip() == "okx_authoritative_sync"
+        and bool(_position_pos_id(position))
+        and not bool(getattr(position, "is_open", False))
     )
 
 
