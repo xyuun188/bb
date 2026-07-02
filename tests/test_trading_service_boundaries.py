@@ -6538,22 +6538,23 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
     assert decision_logs[0]["close_fill"]["partial_reduction"] is True
     assert decision_logs[0]["close_fill"]["order_id"] == "usar-close-10"
     assert reflection_calls[0]["kwargs"]["source"] == "okx_reconcile"
-    assert created_orders == [
-        {
-            "model_name": "ensemble_trader",
-            "execution_mode": "paper",
-            "symbol": "USAR/USDT",
-            "side": "sell",
-            "order_type": "market",
-            "quantity": 10.0,
-            "price": 3.85,
-            "status": OrderStatus.FILLED.value,
-            "fee": 0.02,
-            "decision_id": 909,
-            "exchange_order_id": "usar-close-10",
-            "filled_at": closed_at,
-        }
-    ]
+    assert len(created_orders) == 1
+    assert created_orders[0]["model_name"] == "ensemble_trader"
+    assert created_orders[0]["execution_mode"] == "paper"
+    assert created_orders[0]["symbol"] == "USAR/USDT"
+    assert created_orders[0]["side"] == "sell"
+    assert created_orders[0]["order_type"] == "market"
+    assert created_orders[0]["quantity"] == 10.0
+    assert created_orders[0]["price"] == 3.85
+    assert created_orders[0]["status"] == OrderStatus.FILLED.value
+    assert created_orders[0]["fee"] == 0.02
+    assert created_orders[0]["decision_id"] == 909
+    assert created_orders[0]["exchange_order_id"] == "usar-close-10"
+    assert created_orders[0]["filled_at"] == closed_at
+    assert created_orders[0]["okx_inst_id"] == "USAR-USDT-SWAP"
+    assert created_orders[0]["okx_state"] == "filled"
+    assert created_orders[0]["okx_sync_status"] == "okx_confirmed"
+    assert isinstance(created_orders[0]["okx_synced_at"], datetime)
     assert balance_updates == []
     assert trade_results == []
     assert result[0]["kind"] == "quantity_reduction_closed_slice"
