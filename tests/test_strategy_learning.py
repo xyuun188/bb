@@ -2637,13 +2637,101 @@ def test_strategy_learning_winner_hold_params_are_runtime_consumed(tmp_path) -> 
     assert payload["schedule"]["active_profile"]["id"] == "winner_hold"
     assert payload["schedule"]["scheduler_mode"] == "manual"
     assert context["winner_hold_extension"] == "high"
-    assert context["profit_lock_min_usdt_multiplier"] == 1.25
+    dynamic_multiplier = payload["schedule"]["active_profile"]["params"][
+        "profit_lock_min_usdt_multiplier"
+    ]
+    assert dynamic_multiplier > 1.0
+    assert context["profit_lock_min_usdt_multiplier"] == dynamic_multiplier
     assert context["pullback_lock_enabled"] is True
     runtime = context["strategy_learning"]["runtime"]
-    assert runtime["profit_lock_min_usdt_multiplier"] == 1.25
+    assert runtime["profit_lock_min_usdt_multiplier"] == dynamic_multiplier
+    assert runtime["winner_hold_dynamic"]["policy"] == (
+        "dynamic_window_distribution_not_fixed_usdt_thresholds"
+    )
     assert "profit_lock_min_usdt_multiplier" in payload["schedule"]["active_profile"][
         "consumed_runtime_params"
     ]
+
+
+def test_strategy_learning_winner_hold_uses_dynamic_payoff_distribution(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    positions = [
+        *[
+            _position(side="long", pnl=pnl, position_id=3100 + index)
+            for index, pnl in enumerate(
+                [0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, -1.35, -1.45]
+            )
+        ],
+        *[
+            _position(side="short", pnl=pnl, position_id=3200 + index)
+            for index, pnl in enumerate(
+                [0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, -1.30, -1.55]
+            )
+        ],
+    ]
+    reflections = [
+        _reflection(position_id=3300 + index, pnl=pnl)
+        for index, pnl in enumerate([0.19, 0.21, 0.23, -1.95, -2.45])
+    ]
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=positions,
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("hold") for _ in range(40)],
+        shadows=[],
+        memories=[],
+        reflections=reflections,
+        max_open_positions=20,
+    )
+    context = engine.apply_to_context({}, payload)
+    feedback = payload["feedback"]
+    schedule = payload["schedule"]
+    active = schedule["active_profile"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    backtest = next(row for row in schedule["backtest"]["rows"] if row["profile_id"] == "winner_hold")
+
+    assert feedback["totals"]["payoff_profile"]["triggered"] is True
+    assert feedback["totals"]["payoff_profile"]["policy"] == (
+        "dynamic_window_distribution_not_fixed_usdt_thresholds"
+    )
+    assert "small_wins_large_losses" in problem_keys
+    assert schedule["active_profile"]["id"] == "winner_hold"
+    assert active["params"]["payoff_repair_intensity"] > 0
+    assert active["params"]["profit_lock_min_usdt_multiplier"] != 1.25
+    assert active["params"]["winner_hold_dynamic"]["training"]["triggered"] is True
+    assert backtest["payoff_repair_profile"]["triggered"] is True
+    assert "small_wins_large_losses" in backtest["matched_fixes"]
+    assert context["payoff_repair_intensity"] == active["params"]["payoff_repair_intensity"]
+    assert context["profit_lock_min_usdt_multiplier"] == active["params"][
+        "profit_lock_min_usdt_multiplier"
+    ]
+    assert context["winner_hold_dynamic"]["training"]["triggered"] is True
+
+    service = StrategyLearningService(state_store=state_store)
+    prompt = service._llm_candidate_prompt_v3(
+        service.engine.compiler.compile(
+            mode="paper",
+            window_hours=168,
+            positions=positions,
+            open_positions=[],
+            orders=[],
+            decisions=[_healthy_decision("hold") for _ in range(40)],
+            shadows=[],
+            memories=[],
+            reflections=reflections,
+            max_open_positions=20,
+        )
+    )
+    assert prompt["generation_guidance"]["payoff_repair_profile"]["triggered"] is True
+    assert prompt["feedback_summary"]["totals"]["payoff_profile"]["triggered"] is True
+    assert prompt["feedback_summary"]["reflection_feedback"]["payoff_profile"]["triggered"] is True
+    assert "fixed USDT cutoffs" in " ".join(prompt["rules"])
 
 
 def test_strategy_learning_rejects_structured_candidate_with_no_runtime_params(tmp_path) -> None:

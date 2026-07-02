@@ -43,6 +43,10 @@ RUNTIME_ONLY_ENTRY_BLOCKERS = {
     "runtime_heartbeat_unavailable",
     "trading_runtime_inactive",
     "trading_runtime_heartbeat_stale",
+    "okx_authoritative_sync_unhealthy",
+}
+TRAINING_NON_BLOCKING_UNRESOLVED_KEYS = {
+    "trade_execution_contract",
 }
 
 
@@ -218,16 +222,18 @@ def _operational_gates_from_cards(
     for row in unresolved_rows:
         if not isinstance(row, dict):
             continue
+        key = str(row.get("key") or "")
         item = {
-            "code": f"unresolved_{row.get('key') or 'audit_card'}",
-            "card_key": row.get("key"),
+            "code": f"unresolved_{key or 'audit_card'}",
+            "card_key": key,
             "status": row.get("status"),
             "summary": row.get("summary"),
             "owner_path": row.get("owner_path"),
             "requires_attention": True,
         }
         entry_blockers.append(item)
-        training_blockers.append(item)
+        if key not in TRAINING_NON_BLOCKING_UNRESOLVED_KEYS:
+            training_blockers.append(item)
         attention_items.append(item)
 
     integrity_card = cards_by_key.get("okx_trade_fact_integrity")

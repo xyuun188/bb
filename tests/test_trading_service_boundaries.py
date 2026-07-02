@@ -4619,6 +4619,45 @@ async def test_ml_signal_auto_train_uses_completed_cursor_for_new_samples() -> N
 
 
 @pytest.mark.asyncio
+async def test_ml_signal_auto_train_ignores_legacy_cursor_outside_phase3_view() -> None:
+    service = MLSignalService()
+
+    async def completed_shadow_sample_count() -> int:
+        return 12795
+
+    def current_metadata() -> dict[str, Any]:
+        return {
+            "sample_count": 12720,
+            "last_trained_completed_shadow_sample_count": 150810,
+            "trained_at": datetime.now(UTC).isoformat(),
+            "test_count": 250,
+            "metrics": {
+                "long_auc": 0.40,
+                "short_auc": 0.41,
+                "long_accuracy": 0.48,
+                "short_accuracy": 0.49,
+                "top_long_avg_return_pct": -0.10,
+                "top_short_avg_return_pct": -0.08,
+                "top_long_win_rate": 0.40,
+                "bottom_long_win_rate": 0.45,
+                "top_short_win_rate": 0.42,
+                "bottom_short_win_rate": 0.46,
+            },
+        }
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = current_metadata  # type: ignore[method-assign]
+
+    result = await service.maybe_auto_train()
+
+    assert result["reason"] == "not_due"
+    assert result["last_trained_completed_sample_count"] == 12720
+    assert result["new_sample_count"] == 75
+    assert result["training_policy"]["cursor_source"] == "phase3_clean_training_view"
+    assert result["training_policy"]["legacy_cursor_ignored_when_outside_phase3_view"] is True
+
+
+@pytest.mark.asyncio
 async def test_ml_signal_auto_train_quarantines_before_training(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

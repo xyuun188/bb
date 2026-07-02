@@ -877,6 +877,7 @@ class MLSignalService:
         )
         model_note = metadata.get("note")
         training_count = int(metadata.get("sample_count") or 0)
+        phase3_counts = self._phase3_sample_count_status(metadata)
         return {
             "available": True,
             "model_path": str(self.model_path),
@@ -889,6 +890,7 @@ class MLSignalService:
             ),
             "training_sample_note": metadata.get("training_sample_note")
             or "sample_count is the latest training window, not the all-time total.",
+            **phase3_counts,
             "status": (
                 "ready"
                 if allow_live_position_influence
@@ -922,6 +924,63 @@ class MLSignalService:
             **auto_status,
         }
 
+    @staticmethod
+    def _phase3_cursor_from_metadata(metadata: dict[str, Any], completed_count: int) -> int:
+        """Return a trained cursor on the current Phase 3 clean-sample scale."""
+
+        candidates = (
+            metadata.get("last_trained_phase3_shadow_sample_count"),
+            metadata.get("phase3_trained_shadow_sample_count"),
+            metadata.get("last_trained_completed_shadow_sample_count"),
+            metadata.get("last_trained_completed_sample_count"),
+            metadata.get("training_shadow_sample_count"),
+            metadata.get("sample_count"),
+        )
+        for value in candidates:
+            try:
+                cursor = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= cursor <= completed_count:
+                return cursor
+        try:
+            sample_count = int(metadata.get("sample_count") or 0)
+        except (TypeError, ValueError):
+            sample_count = 0
+        return max(min(sample_count, completed_count), 0)
+
+    def _phase3_sample_count_status(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Normalize legacy artifact counters to the Phase 3 clean training view.
+
+        Older artifacts stored all-time completed cursors.  Phase 3 training is
+        intentionally scoped to clean samples from the Phase 3 boundary, so an
+        all-time cursor such as 150810 must not make the UI or auto-trainer show
+        "0 new samples" when the current clean view has fewer rows.
+        """
+
+        try:
+            completed_count = int(metadata.get("phase3_clean_completed_shadow_sample_count") or 0)
+        except (TypeError, ValueError):
+            completed_count = 0
+        if completed_count <= 0:
+            try:
+                training_count = int(
+                    metadata.get("training_shadow_sample_count") or metadata.get("sample_count") or 0
+                )
+            except (TypeError, ValueError):
+                training_count = 0
+            completed_count = max(training_count, 0)
+        trained_cursor = self._phase3_cursor_from_metadata(metadata, completed_count)
+        new_count = max(completed_count - trained_cursor, 0)
+        return {
+            "phase3_clean_completed_shadow_sample_count": completed_count,
+            "phase3_clean_trainable_shadow_sample_count": completed_count,
+            "last_trained_phase3_shadow_sample_count": trained_cursor,
+            "phase3_new_shadow_sample_count": new_count,
+            "new_shadow_sample_count": new_count,
+            "phase3_sample_cursor_policy": "phase3_clean_training_view_only",
+        }
+
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
         """Retrain in the background when enough fresh shadow samples exist."""
         if self._train_lock.locked():
@@ -939,12 +998,9 @@ class MLSignalService:
                 completed_count = await self._completed_shadow_sample_count()
                 metadata = self._current_metadata()
                 last_sample_count = int(metadata.get("sample_count") or 0)
-                last_completed_count = int(
-                    metadata.get("last_trained_completed_shadow_sample_count")
-                    or metadata.get("completed_shadow_sample_count")
-                    or metadata.get("completed_sample_count")
-                    or last_sample_count
-                    or 0
+                last_completed_count = self._phase3_cursor_from_metadata(
+                    metadata,
+                    completed_count,
                 )
                 influence = _influence_policy(metadata) if metadata else {"enabled": False}
                 readiness = (
@@ -982,7 +1038,8 @@ class MLSignalService:
                     "min_interval_seconds": min_interval_seconds,
                     "min_new_samples": min_new_samples,
                     "min_training_samples": MIN_TRAINING_SAMPLES,
-                    "cursor_source": "last_trained_completed_shadow_sample_count",
+                    "cursor_source": "phase3_clean_training_view",
+                    "legacy_cursor_ignored_when_outside_phase3_view": True,
                     "promotion_requires_readiness": True,
                     "candidate_artifact_persisted": False,
                     "persist_artifact_only_when_readiness_allows_live_influence": True,

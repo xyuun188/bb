@@ -371,6 +371,33 @@ def test_okx_daily_reconciliation_unresolved_warning_exits_warning() -> None:
     assert report_script.exit_code_for_report(report) == 1
 
 
+def test_okx_daily_reconciliation_trade_execution_contract_blocks_entry_not_training() -> None:
+    report = report_script.build_report(
+        [
+            _card("okx_reconciliation", "ok"),
+            _card("okx_trade_fact_integrity", "ok"),
+            _card("position_price_integrity", "ok"),
+            _card("trade_execution_contract", "warning"),
+        ],
+        generated_at=datetime(2026, 6, 27, 0, 40, tzinfo=UTC),
+    )
+
+    assert report["status"] == "warning"
+    assert report["issue_ledger"]["summary"]["unresolved"] == 1
+    assert report["can_open_new_entries"] is False
+    assert report["can_refresh_training"] is True
+    assert report["requires_attention"] is True
+    assert report["operational_gates"]["entry_blockers"][0]["code"] == (
+        "unresolved_trade_execution_contract"
+    )
+    assert report["operational_gates"]["training_blockers"] == []
+    assert report["operational_gates"]["attention_buckets"] == {
+        "entry": 1,
+        "training": 0,
+        "manual_review": 1,
+    }
+
+
 def test_okx_daily_reconciliation_data_integrity_issue_blocks_entry_and_training() -> None:
     card = _card("okx_trade_fact_integrity", "warning")
     card["details"] = {

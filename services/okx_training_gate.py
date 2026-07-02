@@ -12,6 +12,13 @@ OKX_DAILY_RECONCILIATION_REPORT_REL_PATH = (
     "okx_daily_reconciliation_reports/latest.json"
 )
 OKX_DAILY_RECONCILIATION_REPORT_MAX_AGE_SECONDS = 36 * 3600
+TRAINING_ENTRY_ONLY_CODES = {
+    "unresolved_trade_execution_contract",
+    "okx_authoritative_sync_unhealthy",
+    "trading_runtime_inactive",
+    "trading_runtime_heartbeat_stale",
+    "runtime_heartbeat_unavailable",
+}
 
 
 def _parse_utc_datetime(value: Any) -> datetime | None:
@@ -35,6 +42,19 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
 def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _training_blockers_from_gate(gates: dict[str, Any]) -> list[Any]:
+    blockers: list[Any] = []
+    for item in _safe_list(gates.get("training_blockers")):
+        if not isinstance(item, dict):
+            blockers.append(item)
+            continue
+        code = str(item.get("code") or "")
+        if code in TRAINING_ENTRY_ONLY_CODES:
+            continue
+        blockers.append(item)
+    return blockers
 
 
 def _age_seconds(value: datetime | None, *, now: datetime | None = None) -> float | None:
@@ -97,13 +117,19 @@ def okx_training_refresh_gate(
         or age > int(max_age_seconds)
         or bool(payload.get("artifact_error"))
     )
-    can_refresh_training = bool(payload.get("can_refresh_training"))
+    training_blockers = _training_blockers_from_gate(gates)
+    can_refresh_training = not training_blockers
     requires_attention = bool(payload.get("requires_attention"))
-    allowed = bool(can_refresh_training and not requires_attention and not stale)
+    training_requires_attention = any(
+        item.get("requires_attention")
+        for item in training_blockers
+        if isinstance(item, dict)
+    )
+    allowed = bool(can_refresh_training and not training_requires_attention and not stale)
     reason = "okx_daily_reconciliation_allows_training_refresh"
     if stale:
         reason = "okx_daily_reconciliation_report_stale"
-    elif requires_attention:
+    elif training_requires_attention:
         reason = "okx_daily_reconciliation_requires_attention"
     elif not can_refresh_training:
         reason = "okx_daily_reconciliation_training_blocked"
@@ -119,10 +145,11 @@ def okx_training_refresh_gate(
         "can_refresh_training": can_refresh_training,
         "requires_attention": requires_attention,
         "entry_blocked": bool(gates.get("entry_blocked")),
-        "training_blocked": bool(gates.get("training_blocked")),
+        "training_blocked": bool(training_blockers or stale),
         "attention_buckets": _safe_dict(gates.get("attention_buckets")),
         "issue_ledger_summary": _safe_dict(ledger.get("summary")),
         "entry_blockers": _safe_list(gates.get("entry_blockers")),
-        "training_blockers": _safe_list(gates.get("training_blockers")),
+        "training_blockers": training_blockers,
         "attention_items": _safe_list(gates.get("attention_items")),
+        "training_requires_attention": training_requires_attention,
     }

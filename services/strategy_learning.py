@@ -111,6 +111,8 @@ ALLOWED_CANDIDATE_PARAM_KEYS = {
     "release_losing_positions_first",
     "winner_hold_extension",
     "profit_lock_min_usdt_multiplier",
+    "winner_hold_dynamic",
+    "payoff_repair_intensity",
     "pullback_lock_enabled",
     "side_overrides",
     "side_weights",
@@ -122,6 +124,7 @@ BOUNDED_FLOAT_PARAM_RANGES = {
     "max_probe_size_pct": (0.0, ENTRY_RISK_SIZING_PARAMS.strategy_probe_cap_max_pct),
     "position_review_priority_boost": (0.70, 1.80),
     "profit_lock_min_usdt_multiplier": (0.80, 1.80),
+    "payoff_repair_intensity": (0.0, 1.0),
 }
 ALLOWED_EXPERT_INTEGRITY_MODES = {
     "strict_all_required",
@@ -143,6 +146,8 @@ CONSUMED_RUNTIME_PARAM_KEYS = {
     "release_losing_positions_first",
     "winner_hold_extension",
     "profit_lock_min_usdt_multiplier",
+    "winner_hold_dynamic",
+    "payoff_repair_intensity",
     "pullback_lock_enabled",
     "side_overrides",
     "side_weights",
@@ -247,6 +252,159 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
 def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    clean = sorted(value for value in values if math.isfinite(value))
+    if not clean:
+        return 0.0
+    if len(clean) == 1:
+        return clean[0]
+    bounded = min(max(float(percentile or 0.0), 0.0), 1.0)
+    index = (len(clean) - 1) * bounded
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return clean[int(index)]
+    fraction = index - lower
+    return clean[lower] * (1.0 - fraction) + clean[upper] * fraction
+
+
+def _payoff_distribution_profile(pnls: list[float]) -> dict[str, Any]:
+    wins = [value for value in pnls if value > 0]
+    losses = [abs(value) for value in pnls if value < 0]
+    win_count = len(wins)
+    loss_count = len(losses)
+    total_count = len([value for value in pnls if value != 0])
+    avg_win = sum(wins) / win_count if win_count else 0.0
+    avg_loss = sum(losses) / loss_count if loss_count else 0.0
+    win_median = _percentile(wins, 0.50)
+    loss_median = _percentile(losses, 0.50)
+    win_floor = min(avg_win, win_median) if win_count else 0.0
+    loss_reference = max(avg_loss, loss_median)
+    small_wins = [value for value in wins if win_floor > 0 and value <= win_floor]
+    large_losses = [value for value in losses if loss_reference > 0 and value >= loss_reference]
+    profit = sum(wins)
+    loss = sum(losses)
+    profit_factor = profit / loss if loss > 0 else (999.0 if profit > 0 else 0.0)
+    payoff_ratio = avg_win / avg_loss if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0)
+    small_win_ratio = len(small_wins) / win_count if win_count else 0.0
+    large_loss_ratio = len(large_losses) / loss_count if loss_count else 0.0
+    imbalance = 0.0
+    if total_count:
+        low_payoff_pressure = max(0.0, 1.0 - min(payoff_ratio, 1.0))
+        loss_share = loss_count / total_count
+        imbalance = min(
+            1.0,
+            low_payoff_pressure * 0.45
+            + small_win_ratio * 0.25
+            + large_loss_ratio * 0.20
+            + loss_share * 0.10,
+        )
+    triggered = bool(
+        win_count > 0
+        and loss_count > 0
+        and (
+            payoff_ratio < 1.0
+            or profit_factor < 1.0
+            or (small_wins and large_losses and sum(large_losses) > sum(small_wins))
+        )
+    )
+    return {
+        "sample_count": total_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "avg_win": round(avg_win, 6),
+        "avg_loss": round(avg_loss, 6),
+        "median_win": round(win_median, 6),
+        "median_loss": round(loss_median, 6),
+        "dynamic_small_win_reference": round(win_floor, 6),
+        "dynamic_large_loss_reference": round(loss_reference, 6),
+        "small_win_count": len(small_wins),
+        "large_loss_count": len(large_losses),
+        "small_win_ratio": round(small_win_ratio, 6),
+        "large_loss_ratio": round(large_loss_ratio, 6),
+        "profit_factor": round(profit_factor, 6),
+        "payoff_ratio": round(payoff_ratio, 6),
+        "imbalance_score": round(imbalance, 6),
+        "triggered": triggered,
+        "policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+    }
+
+
+def _payoff_repair_profile(*profiles: dict[str, Any]) -> dict[str, Any]:
+    active = [_safe_dict(profile) for profile in profiles if _safe_dict(profile)]
+    if not active:
+        return {
+            "triggered": False,
+            "imbalance_score": 0.0,
+            "sample_count": 0,
+            "profit_factor": 0.0,
+            "payoff_ratio": 0.0,
+            "small_win_count": 0,
+            "large_loss_count": 0,
+            "policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+        }
+    triggered = any(bool(profile.get("triggered")) for profile in active)
+    imbalance = max(_safe_float(profile.get("imbalance_score"), 0.0) for profile in active)
+    sample_count = sum(_safe_int(profile.get("sample_count"), 0) for profile in active)
+    small_wins = sum(_safe_int(profile.get("small_win_count"), 0) for profile in active)
+    large_losses = sum(_safe_int(profile.get("large_loss_count"), 0) for profile in active)
+    profit_factors = [
+        _safe_float(profile.get("profit_factor"), 0.0)
+        for profile in active
+        if _safe_float(profile.get("profit_factor"), 0.0) > 0
+    ]
+    payoff_ratios = [
+        _safe_float(profile.get("payoff_ratio"), 0.0)
+        for profile in active
+        if _safe_float(profile.get("payoff_ratio"), 0.0) > 0
+    ]
+    return {
+        "triggered": triggered,
+        "imbalance_score": round(_clamp(imbalance, 0.0, 1.0), 6),
+        "sample_count": sample_count,
+        "profit_factor": round(min(profit_factors), 6) if profit_factors else 0.0,
+        "payoff_ratio": round(min(payoff_ratios), 6) if payoff_ratios else 0.0,
+        "small_win_count": small_wins,
+        "large_loss_count": large_losses,
+        "policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+    }
+
+
+def _compact_payoff_profile_value(value: Any) -> dict[str, Any]:
+    source = _safe_dict(value)
+    result: dict[str, Any] = {}
+    for key in (
+        "sample_count",
+        "win_count",
+        "loss_count",
+        "avg_win",
+        "avg_loss",
+        "median_win",
+        "median_loss",
+        "dynamic_small_win_reference",
+        "dynamic_large_loss_reference",
+        "small_win_count",
+        "large_loss_count",
+        "small_win_ratio",
+        "large_loss_ratio",
+        "profit_factor",
+        "payoff_ratio",
+        "imbalance_score",
+        "triggered",
+        "policy",
+    ):
+        item = source.get(key)
+        if isinstance(item, str):
+            result[key] = item[:140]
+        elif item is None or isinstance(item, (bool, int, float)):
+            result[key] = item
+    return result
 
 
 class StrategyCandidateModelError(RuntimeError):
@@ -837,11 +995,13 @@ class StrategyFeedbackCompiler:
         }
 
         trade_count = len(training_positions)
-        net_pnl = round(sum(_position_pnl(row) for row in training_positions), 6)
-        win_count = sum(1 for row in training_positions if _position_pnl(row) > 0)
-        loss_count = sum(1 for row in training_positions if _position_pnl(row) < 0)
-        small_win_count = sum(1 for row in training_positions if 0 < _position_pnl(row) <= 1.0)
-        large_loss_count = sum(1 for row in training_positions if _position_pnl(row) <= -3.0)
+        training_pnls = [_position_pnl(row) for row in training_positions]
+        payoff_profile = _payoff_distribution_profile(training_pnls)
+        net_pnl = round(sum(training_pnls), 6)
+        win_count = sum(1 for value in training_pnls if value > 0)
+        loss_count = sum(1 for value in training_pnls if value < 0)
+        small_win_count = _safe_int(payoff_profile.get("small_win_count"), 0)
+        large_loss_count = _safe_int(payoff_profile.get("large_loss_count"), 0)
         avg_hold_hours = (
             sum(
                 _hours_between(getattr(row, "created_at", None), getattr(row, "closed_at", None))
@@ -876,6 +1036,7 @@ class StrategyFeedbackCompiler:
             net_pnl=net_pnl,
             small_win_count=small_win_count,
             large_loss_count=large_loss_count,
+            payoff_profile=payoff_profile,
             avg_loss_hold_hours=avg_loss_hold_hours,
             event_feedback=event_feedback,
             reflection_feedback=reflection_feedback,
@@ -889,6 +1050,7 @@ class StrategyFeedbackCompiler:
             "win_rate": round(win_count / trade_count, 6) if trade_count else 0.0,
             "small_win_count": small_win_count,
             "large_loss_count": large_loss_count,
+            "payoff_profile": payoff_profile,
             "avg_hold_hours": round(avg_hold_hours, 4),
             "avg_loss_hold_hours": round(avg_loss_hold_hours, 4),
             "trade_count_target": trade_count_target,
@@ -1353,17 +1515,17 @@ class StrategyFeedbackCompiler:
         improvement_counts: dict[str, int] = {}
         loss_hold_minutes: list[float] = []
         win_hold_minutes: list[float] = []
+        reflection_pnls: list[float] = []
         total_hold_minutes = 0.0
         net_pnl = 0.0
         fee_estimate = 0.0
-        small_win_count = 0
-        large_loss_count = 0
         recent: list[dict[str, Any]] = []
 
         for row in training_rows:
             outcome = str(getattr(row, "outcome", "flat") or "flat").lower()
             pnl = _safe_float(getattr(row, "realized_pnl", None), 0.0)
             fee = _safe_float(getattr(row, "fee_estimate", None), 0.0)
+            reflection_pnls.append(pnl - fee)
             hold_minutes = _safe_float(getattr(row, "hold_minutes", None), 0.0)
             mistake = str(getattr(row, "mistake_summary", "") or "").strip()
             improvement = str(getattr(row, "improvement_summary", "") or "").strip()
@@ -1371,10 +1533,6 @@ class StrategyFeedbackCompiler:
             net_pnl += pnl
             fee_estimate += fee
             total_hold_minutes += hold_minutes
-            if 0 < pnl <= 1.0:
-                small_win_count += 1
-            if pnl <= -3.0:
-                large_loss_count += 1
             if pnl < 0:
                 loss_hold_minutes.append(hold_minutes)
             elif pnl > 0:
@@ -1409,6 +1567,7 @@ class StrategyFeedbackCompiler:
         top_improvements = sorted(
             improvement_counts.items(), key=lambda item: item[1], reverse=True
         )[:8]
+        payoff_profile = _payoff_distribution_profile(reflection_pnls)
         return {
             "total_count": len(rows),
             "training_count": count,
@@ -1438,8 +1597,9 @@ class StrategyFeedbackCompiler:
             "avg_win_hold_minutes": (
                 round(sum(win_hold_minutes) / len(win_hold_minutes), 2) if win_hold_minutes else 0.0
             ),
-            "small_win_count": small_win_count,
-            "large_loss_count": large_loss_count,
+            "small_win_count": _safe_int(payoff_profile.get("small_win_count"), 0),
+            "large_loss_count": _safe_int(payoff_profile.get("large_loss_count"), 0),
+            "payoff_profile": payoff_profile,
             "loss_sample_count": len(loss_hold_minutes),
             "win_sample_count": len(win_hold_minutes),
             "mistake_count": sum(mistake_counts.values()),
@@ -1884,6 +2044,7 @@ class StrategyFeedbackCompiler:
         net_pnl: float,
         small_win_count: int,
         large_loss_count: int,
+        payoff_profile: dict[str, Any],
         avg_loss_hold_hours: float,
         event_feedback: dict[str, Any],
         reflection_feedback: dict[str, Any],
@@ -1915,6 +2076,11 @@ class StrategyFeedbackCompiler:
                 {"key": key, "severity": severity, "label": label, "evidence": evidence}
             )
             root_causes.append(label)
+
+        payoff_profile = _safe_dict(payoff_profile)
+        reflection_payoff_profile = _safe_dict(reflection_feedback.get("payoff_profile"))
+        payoff_profile_triggered = bool(payoff_profile.get("triggered"))
+        reflection_payoff_triggered = bool(reflection_payoff_profile.get("triggered"))
 
         if trade_count < trade_count_target:
             add(
@@ -2014,9 +2180,7 @@ class StrategyFeedbackCompiler:
                 "策略复盘显示亏损仓拖延过久，满仓时要优先释放低质量亏损仓。",
                 reflection_feedback,
             )
-        if reflection_feedback.get("small_win_count", 0) >= max(
-            2, reflection_feedback.get("large_loss_count", 0)
-        ) and reflection_feedback.get("large_loss_count", 0):
+        if reflection_payoff_triggered:
             add(
                 "reflection_small_wins_large_losses",
                 "high",
@@ -2030,12 +2194,17 @@ class StrategyFeedbackCompiler:
                 "策略复盘已聚合出重复错误，候选策略生成必须吸收这些改进建议。",
                 reflection_feedback,
             )
-        if small_win_count >= max(2, large_loss_count) and large_loss_count:
+        if payoff_profile_triggered:
             add(
                 "small_wins_large_losses",
                 "high",
                 "盈利仓过早小盈平仓，而亏损单损失更大",
-                {"small_win_count": small_win_count, "large_loss_count": large_loss_count},
+                {
+                    "small_win_count": small_win_count,
+                    "large_loss_count": large_loss_count,
+                    "payoff_profile": payoff_profile,
+                    "policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+                },
             )
         if avg_loss_hold_hours >= 3.0 and large_loss_count:
             add(
@@ -2093,6 +2262,18 @@ class StrategyCandidateGenerator:
         totals = feedback.totals
         trade_target = _safe_int(totals.get("trade_count_target"), default_min_trade_target())
         defensive_probe_shadow_loop = "defensive_probe_shadow_loop" in problem_keys
+        payoff_profile = _safe_dict(totals.get("payoff_profile"))
+        reflection_payoff_profile = _safe_dict(
+            feedback.reflection_feedback.get("payoff_profile")
+        )
+        payoff_repair_intensity = _clamp(
+            max(
+                _safe_float(payoff_profile.get("imbalance_score"), 0.0),
+                _safe_float(reflection_payoff_profile.get("imbalance_score"), 0.0),
+            ),
+            0.0,
+            1.0,
+        )
 
         if defensive_probe_shadow_loop:
             profiles.append(
@@ -2198,7 +2379,16 @@ class StrategyCandidateGenerator:
                     params={
                         "global_min_score_delta": 0.0,
                         "winner_hold_extension": "high",
-                        "profit_lock_min_usdt_multiplier": 1.25,
+                        "profit_lock_min_usdt_multiplier": round(
+                            _clamp(1.0 + payoff_repair_intensity * 0.72, 0.80, 1.80),
+                            6,
+                        ),
+                        "payoff_repair_intensity": round(payoff_repair_intensity, 6),
+                        "winner_hold_dynamic": {
+                            "training": payoff_profile,
+                            "reflection": reflection_payoff_profile,
+                            "policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+                        },
                         "pullback_lock_enabled": True,
                         "loss_exit_aggressiveness": "normal",
                     },
@@ -2322,6 +2512,10 @@ class StrategyCandidateGenerator:
                 level = str(value or "")
                 if level in ALLOWED_WINNER_HOLD:
                     clean[key] = level
+            elif key == "winner_hold_dynamic":
+                dynamic = self._sanitize_winner_hold_dynamic(_safe_dict(value))
+                if dynamic:
+                    clean[key] = dynamic
             elif key in {
                 "full_position_release",
                 "release_losing_positions_first",
@@ -2348,6 +2542,42 @@ class StrategyCandidateGenerator:
                 ENTRY_RISK_SIZING_PARAMS.balanced_probe_max_position_size_pct,
             )
         return clean
+
+    @staticmethod
+    def _sanitize_winner_hold_dynamic(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key in ("training", "reflection"):
+            profile = _safe_dict(value.get(key))
+            if not profile:
+                continue
+            result[key] = {
+                profile_key: profile.get(profile_key)
+                for profile_key in (
+                    "sample_count",
+                    "win_count",
+                    "loss_count",
+                    "avg_win",
+                    "avg_loss",
+                    "median_win",
+                    "median_loss",
+                    "dynamic_small_win_reference",
+                    "dynamic_large_loss_reference",
+                    "small_win_count",
+                    "large_loss_count",
+                    "small_win_ratio",
+                    "large_loss_ratio",
+                    "profit_factor",
+                    "payoff_ratio",
+                    "imbalance_score",
+                    "triggered",
+                    "policy",
+                )
+                if profile_key in profile
+            }
+        policy = str(value.get("policy") or "")[:120]
+        if policy:
+            result["policy"] = policy
+        return result
 
     @staticmethod
     def _sanitize_fallback_tolerance(value: dict[str, Any]) -> dict[str, Any]:
@@ -2487,6 +2717,14 @@ class StrategyBacktester:
         estimated_delta = 0.0
         matched_fixes: list[str] = []
         param_consumption = _candidate_param_consumption(profile.params)
+        payoff_repair = _payoff_repair_profile(
+            _safe_dict(totals.get("payoff_profile")),
+            _safe_dict(reflection.get("payoff_profile")),
+        )
+        payoff_repair_intensity = _safe_float(
+            profile.params.get("payoff_repair_intensity"),
+            _safe_float(payoff_repair.get("imbalance_score"), 0.0),
+        )
 
         if profile.profile_id == "balanced_probe":
             if "expert_fallback_overblocking" in problem_keys:
@@ -2542,14 +2780,30 @@ class StrategyBacktester:
             low_trade_penalty = 0.0
         elif profile.profile_id == "winner_hold":
             if "small_wins_large_losses" in problem_keys:
-                estimated_delta += max(_safe_int(totals.get("small_win_count"), 0), 1) * 0.25
-                winner_avg_profit = avg_winner * 1.15 if avg_winner else 0.0
+                estimated_delta += min(
+                    max(_safe_int(payoff_repair.get("sample_count"), 1), 1)
+                    * max(_safe_float(payoff_repair.get("imbalance_score"), 0.0), 0.08)
+                    * 0.55,
+                    3.0,
+                )
+                winner_avg_profit = (
+                    avg_winner * (1.0 + payoff_repair_intensity * 0.35)
+                    if avg_winner
+                    else 0.0
+                )
                 matched_fixes.append("small_wins_large_losses")
             if "reflection_small_wins_large_losses" in problem_keys:
-                estimated_delta += max(_safe_int(reflection.get("small_win_count"), 0), 1) * 0.22
+                estimated_delta += min(
+                    max(_safe_int(payoff_repair.get("sample_count"), 1), 1)
+                    * max(_safe_float(payoff_repair.get("imbalance_score"), 0.0), 0.08)
+                    * 0.45,
+                    2.5,
+                )
                 winner_avg_profit = max(
                     winner_avg_profit,
-                    avg_winner * 1.12 if avg_winner else 0.0,
+                    avg_winner * (1.0 + payoff_repair_intensity * 0.28)
+                    if avg_winner
+                    else 0.0,
                 )
                 matched_fixes.append("reflection_small_wins_large_losses")
         elif profile.profile_id.endswith("_side_recovery"):
@@ -2617,6 +2871,8 @@ class StrategyBacktester:
             "missed_opportunity_reduction": round(missed_opportunity_reduction, 6),
             "loss_release_speed": round(loss_release_speed, 6),
             "winner_avg_profit": round(winner_avg_profit, 6),
+            "payoff_repair_profile": payoff_repair,
+            "payoff_repair_intensity": round(payoff_repair_intensity, 6),
             "pass": bool(pass_gate),
             "notes": (
                 "low trade count is penalized; a profile cannot win by refusing trades"
@@ -2638,6 +2894,11 @@ class StrategyBacktester:
         trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
         target = _safe_int(params.get("min_trade_count_target"), default_min_trade_target())
         trade_gap = max(target - trade_count, 0)
+        payoff_repair = _payoff_repair_profile(
+            _safe_dict(feedback.totals.get("payoff_profile")),
+            _safe_dict(feedback.reflection_feedback.get("payoff_profile")),
+            *_safe_dict(params.get("winner_hold_dynamic")).values(),
+        )
         opens_more = (
             _safe_float(params.get("global_min_score_delta"), 0.0) < 0
             or _safe_float(params.get("probe_fraction"), 0.0) > 0
@@ -2730,8 +2991,16 @@ class StrategyBacktester:
                 (
                     "winner_hold_from_candidate",
                     min(
-                        _safe_int(feedback.totals.get("small_win_count"), 0) * 0.20
-                        + _safe_int(feedback.reflection_feedback.get("small_win_count"), 0) * 0.15,
+                        max(_safe_int(payoff_repair.get("sample_count"), 1), 1)
+                        * max(
+                            _safe_float(
+                                params.get("payoff_repair_intensity"),
+                                _safe_float(payoff_repair.get("imbalance_score"), 0.0),
+                            ),
+                            _safe_float(payoff_repair.get("imbalance_score"), 0.0),
+                            0.08,
+                        )
+                        * 0.42,
                         3.0,
                     ),
                 )
@@ -3234,6 +3503,11 @@ class StrategyScheduler:
                 params.get("profit_lock_min_usdt_multiplier"),
                 1.0,
             ),
+            "payoff_repair_intensity": _safe_float(
+                params.get("payoff_repair_intensity"),
+                0.0,
+            ),
+            "winner_hold_dynamic": _safe_dict(params.get("winner_hold_dynamic")),
             "pullback_lock_enabled": bool(params.get("pullback_lock_enabled")),
             "full_position_release": bool(params.get("full_position_release")),
             "release_losing_positions_first": bool(params.get("release_losing_positions_first")),
@@ -3783,6 +4057,11 @@ class StrategyLearningEngine:
             runtime.get("profit_lock_min_usdt_multiplier"),
             1.0,
         )
+        result["payoff_repair_intensity"] = _safe_float(
+            runtime.get("payoff_repair_intensity"),
+            0.0,
+        )
+        result["winner_hold_dynamic"] = _safe_dict(runtime.get("winner_hold_dynamic"))
         result["pullback_lock_enabled"] = bool(runtime.get("pullback_lock_enabled"))
         guard = _safe_dict(payload.get("runtime_guard"))
         feedback_payload = _safe_dict(payload.get("feedback"))
@@ -3958,6 +4237,8 @@ class StrategyLearningEngine:
             "position_review_priority_boost": result["position_review_priority_boost"],
             "winner_hold_extension": result["winner_hold_extension"],
             "profit_lock_min_usdt_multiplier": result["profit_lock_min_usdt_multiplier"],
+            "payoff_repair_intensity": result["payoff_repair_intensity"],
+            "winner_hold_dynamic": result["winner_hold_dynamic"],
             "pullback_lock_enabled": result["pullback_lock_enabled"],
             "side_weights": result["side_weights"],
             "release_queue": release_queue[:8],
@@ -4000,6 +4281,10 @@ class StrategyLearningEngine:
             "full_position_pressure": open_pressure.get("full_position_pressure", False),
             "reflection_fee_adjusted_pnl": reflection.get("fee_adjusted_pnl", 0.0),
             "reflection_mistake_count": reflection.get("mistake_count", 0),
+            "payoff_profile": _compact_payoff_profile_value(totals.get("payoff_profile")),
+            "reflection_payoff_profile": _compact_payoff_profile_value(
+                reflection.get("payoff_profile")
+            ),
             "problem_keys": [item.get("key") for item in _safe_list(feedback.get("problems"))],
         }
 
@@ -4234,6 +4519,7 @@ class StrategyLearningService:
                     "avg_loss_hold_minutes",
                     "small_win_count",
                     "large_loss_count",
+                    "payoff_profile",
                     "mistake_count",
                 )
             },
@@ -4476,6 +4762,9 @@ class StrategyLearningService:
                 result[key] = item
         return result
 
+    def _compact_payoff_profile(self, value: Any) -> dict[str, Any]:
+        return _compact_payoff_profile_value(value)
+
     def _compact_open_position_pressure(self, value: Any) -> dict[str, Any]:
         result = self._scalar_subset(
             value,
@@ -4662,6 +4951,7 @@ class StrategyLearningService:
         result["top_improvements"] = self._top_text_items(
             source.get("top_improvements"), "summary", limit=4, text_limit=100
         )
+        result["payoff_profile"] = self._compact_payoff_profile(source.get("payoff_profile"))
         return result
 
     def _compact_problem_items(self, problems: Any) -> list[dict[str, Any]]:
@@ -4763,6 +5053,9 @@ class StrategyLearningService:
         )
         if top_improvements:
             result["top_improvements"] = top_improvements
+        payoff_profile = self._compact_payoff_profile(source.get("payoff_profile"))
+        if payoff_profile:
+            result["payoff_profile"] = payoff_profile
         return result
 
     @staticmethod
@@ -4857,6 +5150,7 @@ class StrategyLearningService:
                     "avg_loss_hold_minutes",
                     "small_win_count",
                     "large_loss_count",
+                    "payoff_profile",
                     "mistake_count",
                 )
             },
@@ -4874,8 +5168,7 @@ class StrategyLearningService:
         minimal["feedback_summary"] = minimal_summary
         return minimal
 
-    @staticmethod
-    def _candidate_generation_guidance(feedback: StrategyFeedback) -> dict[str, Any]:
+    def _candidate_generation_guidance(self, feedback: StrategyFeedback) -> dict[str, Any]:
         problem_keys = {str(item.get("key") or "") for item in feedback.problems}
         skip_kind_counts = _safe_dict(feedback.event_feedback.get("skip_kind_counts"))
         defensive_probe_shadow_count = _safe_int(
@@ -4895,12 +5188,18 @@ class StrategyLearningService:
         require_quality_recovery = bool(
             defensive_probe_shadow_count > 0 or "defensive_probe_shadow_loop" in problem_keys
         )
+        payoff_repair = _payoff_repair_profile(
+            _safe_dict(feedback.totals.get("payoff_profile")),
+            _safe_dict(feedback.reflection_feedback.get("payoff_profile")),
+        )
         return {
             "primary_issue_keys": sorted(key for key in problem_keys if key),
             "skip_kind_counts": skip_kind_counts,
             "defensive_probe_shadow_count": defensive_probe_shadow_count,
             "require_quality_entry_recovery_candidate": require_quality_recovery,
             "allow_recovery_probe_candidate": bool(low_trade_count and fallback_or_missed),
+            "payoff_repair_profile": payoff_repair,
+            "payoff_profile_policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
             "candidate_modes": {
                 "quality_entry_recovery": (
                     "Use when low-payoff probes are being shadowed. Do not set "
@@ -4918,8 +5217,9 @@ class StrategyLearningService:
                     "primary issue."
                 ),
                 "winner_hold": (
-                    "Use when feedback shows small wins are closed too early while larger losses "
-                    "remain."
+                    "Use when the dynamic payoff profile shows low payoff ratio, weak profit "
+                    "factor, or large-loss distribution pressure. Do not use fixed USDT cutoffs; "
+                    "derive payoff_repair_intensity from generation_guidance.payoff_repair_profile."
                 ),
             },
         }
@@ -4957,6 +5257,11 @@ class StrategyLearningService:
                     "至少生成一个 quality_entry_recovery 候选，不设置 probe_fraction 和 "
                     "max_probe_size_pct。"
                 ),
+                (
+                    "如果 generation_guidance.payoff_repair_profile.triggered=true，"
+                    "优先生成 winner_hold 候选；payoff_repair_intensity 必须来自动态收益分布画像，"
+                    "不要使用固定 USDT 阈值。"
+                ),
                 "评分目标是手续费后净收益、交易次数、回撤、亏损释放和错过机会减少，不能用不开仓提高胜率。",
             ],
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
@@ -4968,6 +5273,9 @@ class StrategyLearningService:
                     "net_pnl": feedback.totals.get("net_pnl"),
                     "win_rate": feedback.totals.get("win_rate"),
                     "avg_loss_hold_hours": feedback.totals.get("avg_loss_hold_hours"),
+                    "payoff_profile": self._compact_payoff_profile(
+                        feedback.totals.get("payoff_profile")
+                    ),
                 },
                 "side_performance": feedback.side_performance,
                 "open_position_pressure": feedback.open_position_pressure,
@@ -5003,6 +5311,9 @@ class StrategyLearningService:
                     "avg_loss_hold_minutes": reflection_feedback.get("avg_loss_hold_minutes"),
                     "small_win_count": reflection_feedback.get("small_win_count"),
                     "large_loss_count": reflection_feedback.get("large_loss_count"),
+                    "payoff_profile": self._compact_payoff_profile(
+                        reflection_feedback.get("payoff_profile")
+                    ),
                     "top_mistakes": self._top_text_items(
                         reflection_feedback.get("top_mistakes"), "summary", include_count=False
                     ),
@@ -5046,6 +5357,12 @@ class StrategyLearningService:
                     "max_probe_size_pct so quality signals can be sized by existing dynamic "
                     "Profit-First gates."
                 ),
+                (
+                    "If generation_guidance.payoff_repair_profile.triggered is true, include a "
+                    "winner_hold candidate. Set payoff_repair_intensity from the dynamic payoff "
+                    "distribution profile and pass winner_hold_dynamic evidence; do not use fixed "
+                    "USDT cutoffs."
+                ),
                 "Do not optimize by avoiding trades; low trade count must be penalized.",
                 "Use concise Chinese label and description fields.",
                 "Return at most 2 candidates. label <= 12 chars, description <= 40 chars.",
@@ -5054,20 +5371,25 @@ class StrategyLearningService:
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
             "generation_guidance": generation_guidance,
             "feedback_summary": {
-                "totals": self._scalar_subset(
-                    feedback.totals,
-                    (
-                        "training_trade_count",
-                        "trade_count_target",
-                        "net_pnl",
-                        "win_rate",
-                        "small_win_count",
-                        "large_loss_count",
-                        "avg_hold_hours",
-                        "avg_loss_hold_hours",
-                        "low_trade_count_penalty",
+                "totals": {
+                    **self._scalar_subset(
+                        feedback.totals,
+                        (
+                            "training_trade_count",
+                            "trade_count_target",
+                            "net_pnl",
+                            "win_rate",
+                            "small_win_count",
+                            "large_loss_count",
+                            "avg_hold_hours",
+                            "avg_loss_hold_hours",
+                            "low_trade_count_penalty",
+                        ),
                     ),
-                ),
+                    "payoff_profile": self._compact_payoff_profile(
+                        feedback.totals.get("payoff_profile")
+                    ),
+                },
                 "side_performance": {
                     side: self._scalar_subset(
                         bucket,
