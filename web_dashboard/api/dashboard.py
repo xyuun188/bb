@@ -2143,6 +2143,7 @@ async def _dashboard_closed_position_ledger_rows(
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     from sqlalchemy import select
 
+    from models.account import OkxAccountBill
     from models.trade import Order, Position
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
 
@@ -2210,7 +2211,17 @@ async def _dashboard_closed_position_ledger_rows(
             if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
             & linked_order_ids
         ]
-    ledger_groups = build_okx_position_ledger_groups(closed_rows, order_rows)
+    account_bill_rows = await _dashboard_okx_account_bill_rows(
+        session,
+        closed_rows=closed_rows,
+        mode=mode,
+        account_bill_model=OkxAccountBill,
+    )
+    ledger_groups = build_okx_position_ledger_groups(
+        closed_rows,
+        order_rows,
+        account_bills=account_bill_rows,
+    )
     total = len(ledger_groups)
     total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
     page = min(max(int(page or 1), 1), total_pages)
@@ -6026,6 +6037,8 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
 def _daily_pnl_ledger_row_has_okx_realized_pnl(row: dict[str, Any]) -> bool:
     """Only OKX-confirmed ledger PnL may feed daily realized PnL records."""
     source = str(row.get("pnl_source") or "").strip()
+    if source == "okx_linked_order_net_pnl":
+        return True
     if source == "okx_position_history_realized_pnl":
         return True
     if source == "okx_close_fill_net_pnl":
@@ -6072,6 +6085,49 @@ def _daily_pnl_ledger_position_detail(
         "entry_order_ids": list(row.get("entry_order_ids") or []),
         "close_order_ids": list(row.get("close_order_ids") or []),
     }
+
+
+async def _dashboard_okx_account_bill_rows(
+    session: Any,
+    *,
+    closed_rows: list[Any],
+    mode: str | None,
+    account_bill_model: Any,
+) -> list[Any]:
+    from sqlalchemy import select
+
+    if not closed_rows:
+        return []
+    inst_ids = {
+        str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+        for position in closed_rows
+        if str(getattr(position, "okx_inst_id", "") or "").strip()
+    }
+    opened_values = [
+        value
+        for position in closed_rows
+        if (value := _as_utc_datetime(getattr(position, "created_at", None))) is not None
+    ]
+    closed_values = [
+        value
+        for position in closed_rows
+        if (value := _as_utc_datetime(getattr(position, "closed_at", None))) is not None
+    ]
+    if not inst_ids or not opened_values or not closed_values:
+        return []
+    start = min(opened_values) - timedelta(hours=1)
+    end = max(closed_values) + timedelta(hours=1)
+    stmt = select(account_bill_model).where(
+        account_bill_model.inst_id.in_(sorted(inst_ids)),
+        account_bill_model.bill_ts >= start.replace(tzinfo=None),
+        account_bill_model.bill_ts <= end.replace(tzinfo=None),
+    )
+    if mode:
+        stmt = stmt.where(account_bill_model.mode == ("live" if mode == "live" else "paper"))
+    result = await session.execute(
+        stmt.order_by(account_bill_model.bill_ts.asc(), account_bill_model.id.asc()).limit(10000)
+    )
+    return list(result.scalars().all())
 
 
 def _daily_pnl_position_detail(

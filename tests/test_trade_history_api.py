@@ -7,6 +7,7 @@ import pytest
 from config.settings import settings
 from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
@@ -404,7 +405,10 @@ async def test_dashboard_position_history_prefers_confirmed_okx_close_fill_net_p
 
     row = payload["positions"][0]
     assert row["realized_pnl"] == pytest.approx(7.93)
-    assert row["pnl_source"] == "okx_close_fill_net_pnl"
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
+    assert row["close_fill_pnl"] == pytest.approx(7.95)
+    assert row["entry_fee"] == pytest.approx(0.01)
+    assert row["close_fee"] == pytest.approx(0.01)
 
 
 @pytest.mark.asyncio
@@ -534,6 +538,123 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_adds_okx_funding_fee_from_account_bills(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-funding-pnl.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 1, 0, 10, tzinfo=UTC)
+    funding_at = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 1, 9, 20, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "INJ/USDT",
+                    "side": "long",
+                    "quantity": 20.0,
+                    "entry_price": 4.0,
+                    "current_price": 4.6,
+                    "leverage": 2.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 99.0,
+                    "is_open": False,
+                    "okx_inst_id": "INJ-USDT-SWAP",
+                    "entry_exchange_order_id": "inj-funding-entry",
+                    "close_exchange_order_id": "inj-funding-close",
+                    "closed_at": closed_at,
+                    "created_at": opened_at,
+                }
+            )
+            for order_id, side, price, fee, fill_pnl, ts in (
+                ("inj-funding-entry", "buy", 4.0, 0.1, 0.0, opened_at),
+                ("inj-funding-close", "sell", 4.6, 0.2, 10.0, closed_at),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "ensemble_trader",
+                        "execution_mode": "paper",
+                        "symbol": "INJ/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": 20.0,
+                        "price": price,
+                        "status": "filled",
+                        "fee": fee,
+                        "exchange_order_id": order_id,
+                        "filled_at": ts,
+                        "created_at": ts,
+                        "okx_inst_id": "INJ-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": 20.0,
+                        "okx_fill_pnl": fill_pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "INJ-USDT-SWAP",
+                            "pos_side": "long",
+                            "contracts": 20.0,
+                            "contract_size": 1.0,
+                            "base_quantity": 20.0,
+                            "avg_price": price,
+                            "fee_abs": fee,
+                            "fill_pnl": fill_pnl,
+                            "timestamp": ts.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    }
+                )
+            session.add(
+                OkxAccountBill(
+                    mode="paper",
+                    bill_id="inj-funding-bill",
+                    inst_id="INJ-USDT-SWAP",
+                    pos_side="long",
+                    ccy="USDT",
+                    bill_type="8",
+                    bill_sub_type="173",
+                    bill_ts=funding_at,
+                    balance_change=-0.2,
+                    pnl=-0.2,
+                    fee=0.0,
+                    funding_fee=-0.2,
+                    raw_bill={
+                        "billId": "inj-funding-bill",
+                        "instId": "INJ-USDT-SWAP",
+                        "posSide": "long",
+                        "subType": "173",
+                        "ts": str(int(funding_at.timestamp() * 1000)),
+                        "pnl": "-0.2",
+                    },
+                )
+            )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    row = payload["positions"][0]
+    assert row["realized_pnl"] == pytest.approx(9.5)
+    assert row["close_fill_pnl"] == pytest.approx(10.0)
+    assert row["entry_fee"] == pytest.approx(0.1)
+    assert row["close_fee"] == pytest.approx(0.2)
+    assert row["funding_fee"] == pytest.approx(-0.2)
+    assert row["funding_bill_count"] == 1
+    assert row["funding_fee_source"] == "okx_account_bills"
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
+
+
+@pytest.mark.asyncio
 async def test_position_history_prefers_final_okx_realized_pnl_over_local_fragments(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -641,8 +762,8 @@ async def test_position_history_prefers_final_okx_realized_pnl_over_local_fragme
     row = payload["positions"][0]
     assert row["symbol"] == "AI16Z/USDT"
     assert row["quantity"] == pytest.approx(732.0)
-    assert row["realized_pnl"] == pytest.approx(7.937940890773545)
-    assert row["pnl_source"] == "okx_position_history_realized_pnl"
+    assert row["realized_pnl"] == pytest.approx(7.56856)
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
     assert row["close_order_ids"] == ["ai16z-close-a", "ai16z-close-b", "ai16z-close-c"]
     assert row["linked_order_count"] == 4
     assert len(row["position_ids"]) == 1
@@ -787,10 +908,10 @@ async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
         by_quantity = {row["quantity"]: row for row in sky_rows}
         assert by_quantity[400.0]["entry_order_ids"] == ["sky-entry-a"]
         assert by_quantity[400.0]["close_order_ids"] == ["sky-close-a"]
-        assert by_quantity[400.0]["realized_pnl"] == pytest.approx(0.24)
+        assert by_quantity[400.0]["realized_pnl"] == pytest.approx(0.22)
         assert by_quantity[500.0]["entry_order_ids"] == ["sky-entry-b"]
         assert by_quantity[500.0]["close_order_ids"] == ["sky-close-b"]
-        assert by_quantity[500.0]["realized_pnl"] == pytest.approx(0.11)
+        assert by_quantity[500.0]["realized_pnl"] == pytest.approx(-0.275)
 
 
 @pytest.mark.asyncio
@@ -881,7 +1002,7 @@ async def test_trade_positions_api_groups_closed_positions_with_okx_ledger(
     assert row["okx_inst_id"] == "SPK-USDT-SWAP"
     assert row["is_open"] is False
     assert row["quantity"] == pytest.approx(25.0)
-    assert row["realized_pnl"] == pytest.approx(1.25)
+    assert row["realized_pnl"] == pytest.approx(1.23)
     assert row["linked_order_count"] == 2
 
 
@@ -1006,7 +1127,7 @@ async def test_trade_positions_api_groups_add_entry_fragments_closed_by_same_okx
     assert row["average_entry_price"] == pytest.approx((5.0 * 610.0 + 6.0 * 608.0) / 11.0)
     assert row["average_close_price"] == pytest.approx(609.5)
     assert row["realized_pnl"] == pytest.approx(-0.26)
-    assert row["pnl_source"] == "okx_close_fill_net_pnl"
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
     assert row["position_ids"] and len(row["position_ids"]) == 2
     assert set(row["entry_order_ids"]) == {"bnb-entry-1", "bnb-entry-2"}
     assert row["close_order_ids"] == ["bnb-close"]
@@ -1105,7 +1226,7 @@ async def test_trade_positions_api_hides_zero_quantity_residual_and_dedupes_cano
     row = payload["positions"][0]
     assert row["symbol"] == "BNB/USDT"
     assert row["quantity"] == pytest.approx(0.45)
-    assert row["realized_pnl"] == pytest.approx(-0.4632)
+    assert row["realized_pnl"] == pytest.approx(-0.349)
     assert len(row["position_ids"]) == 1
     assert row["entry_order_ids"] == ["bnb-entry-a", "bnb-entry-b"]
     assert row["close_order_ids"] == ["bnb-close"]
@@ -1313,7 +1434,7 @@ async def test_trade_positions_api_hides_pending_zero_quantity_residual(
         row = payload_rowset["positions"][0]
         assert row["symbol"] == "BNB/USDT"
         assert row["quantity"] == pytest.approx(0.9)
-        assert row["realized_pnl"] == pytest.approx(-1.012)
+        assert row["realized_pnl"] == pytest.approx(-1.042)
         assert row["entry_order_ids"] == ["bnb-entry-a", "bnb-entry-b"]
         assert row["close_order_ids"] == ["bnb-close"]
 

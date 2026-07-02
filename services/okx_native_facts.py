@@ -20,6 +20,7 @@ DEFAULT_MAX_TARGET_ORDER_QUERIES = 100
 DEFAULT_MAX_INSTRUMENT_QUERIES = 20
 DEFAULT_MAX_ORDER_HISTORY_CONTEXT_QUERIES = 30
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
+FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,40 @@ class OkxNativeFillGroup:
             self.rows,
             key=lambda row: _safe_float(row.get("ts") or row.get("fillTime"), 0.0),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OkxNativeAccountBill:
+    bill_id: str
+    inst_id: str
+    pos_side: str
+    ccy: str
+    bill_type: str
+    bill_sub_type: str
+    timestamp_ms: float
+    timestamp: datetime | None
+    balance_change: float
+    pnl: float
+    fee: float
+    funding_fee: float
+    raw: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bill_id": self.bill_id,
+            "inst_id": self.inst_id,
+            "pos_side": self.pos_side,
+            "ccy": self.ccy,
+            "bill_type": self.bill_type,
+            "bill_sub_type": self.bill_sub_type,
+            "timestamp_ms": _round(self.timestamp_ms),
+            "timestamp": _iso(self.timestamp),
+            "balance_change": _round(self.balance_change),
+            "pnl": _round(self.pnl),
+            "fee": _round(self.fee),
+            "funding_fee": _round(self.funding_fee),
+            "raw": dict(self.raw),
+        }
 
 
 class OkxNativeFactsClient:
@@ -365,6 +400,113 @@ class OkxNativeFactsClient:
             key=lambda row: _safe_float(row.get("uTime") or row.get("cTime"), 0.0),
             reverse=True,
         )
+
+    async def fetch_account_bills(
+        self,
+        *,
+        inst_ids: Iterable[Any] | None = None,
+        since: datetime | int | float | None = None,
+        limit: int = DEFAULT_FILL_LIMIT,
+        max_pages: int = DEFAULT_MAX_FILL_PAGES,
+        funding_only: bool = False,
+        strict: bool = False,
+    ) -> list[OkxNativeAccountBill]:
+        """Fetch OKX account bills used to reconcile per-position funding fees."""
+
+        ccxt = await self.executor._get_ccxt()
+        fetch_bill_methods = [
+            method
+            for method in (
+                getattr(ccxt, "privateGetAccountBills", None),
+                getattr(ccxt, "privateGetAccountBillsArchive", None),
+            )
+            if callable(method)
+        ]
+        if not fetch_bill_methods:
+            if strict:
+                raise RuntimeError("OKX native account-bills API is unavailable")
+            return []
+
+        target_inst_ids = _target_inst_ids(symbols=None, inst_ids=inst_ids)
+        page_limit = _limit(limit)
+        page_count = _max_pages(max_pages)
+        since_ms = _timestamp_ms(since)
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for fetch_bills in fetch_bill_methods:
+            try:
+                page_rows = await self._fetch_account_bill_pages(
+                    fetch_bills,
+                    {
+                        "instType": "SWAP",
+                        "ccy": "USDT",
+                        "limit": str(page_limit),
+                    },
+                    since_ms=since_ms,
+                    target_inst_ids=target_inst_ids,
+                    funding_only=funding_only,
+                    page_limit=page_limit,
+                    max_pages=page_count,
+                )
+            except Exception:
+                if strict and fetch_bills is fetch_bill_methods[-1] and not rows:
+                    raise
+                continue
+            for row in page_rows:
+                key = _account_bill_row_identity(row)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+        return sorted(
+            [bill for bill in (_account_bill_from_row(row) for row in rows) if bill is not None],
+            key=lambda item: item.timestamp_ms,
+            reverse=True,
+        )
+
+    async def _fetch_account_bill_pages(
+        self,
+        fetch_bills: Any,
+        params: dict[str, Any],
+        *,
+        since_ms: float,
+        target_inst_ids: set[str],
+        funding_only: bool,
+        page_limit: int,
+        max_pages: int,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        after_cursor = ""
+        seen_cursors: set[str] = set()
+        for _page in range(max(1, int(max_pages or 1))):
+            page_params = dict(params)
+            page_params["limit"] = str(page_limit)
+            if since_ms > 0 and "begin" not in page_params:
+                page_params["begin"] = str(int(since_ms))
+            if after_cursor:
+                page_params["after"] = after_cursor
+            response = await self.executor._with_retry(fetch_bills, page_params)
+            page_rows = _response_rows(response)
+            for row in page_rows:
+                if _account_bill_row_matches(
+                    row,
+                    since_ms=since_ms,
+                    target_inst_ids=target_inst_ids,
+                    funding_only=funding_only,
+                ):
+                    rows.append(row)
+            if len(page_rows) < page_limit:
+                break
+            oldest_ts = _oldest_account_bill_timestamp_ms(page_rows)
+            if since_ms > 0 and oldest_ts > 0 and oldest_ts < since_ms:
+                break
+            cursor = _oldest_account_bill_pagination_cursor(page_rows)
+            if not cursor or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            after_cursor = cursor
+        return rows
 
     async def _fetch_position_history_pages(
         self,
@@ -1041,6 +1183,27 @@ def _order_row_matches(
     return True
 
 
+def _account_bill_row_matches(
+    row: dict[str, Any],
+    *,
+    since_ms: float,
+    target_inst_ids: set[str],
+    funding_only: bool,
+) -> bool:
+    timestamp_ms = _account_bill_timestamp_ms(row)
+    if since_ms > 0 and (timestamp_ms <= 0 or timestamp_ms < since_ms):
+        return False
+    ccy = str(row.get("ccy") or row.get("currency") or "USDT").strip().upper()
+    if ccy and ccy != "USDT":
+        return False
+    row_inst_id = str(row.get("instId") or "").strip().upper()
+    if target_inst_ids and (not row_inst_id or row_inst_id not in target_inst_ids):
+        return False
+    if funding_only and not _account_bill_row_is_funding_fee(row):
+        return False
+    return True
+
+
 def _position_history_row_matches(
     row: dict[str, Any],
     *,
@@ -1133,6 +1296,33 @@ def _oldest_order_pagination_cursor(rows: Iterable[dict[str, Any]]) -> str:
     return str(oldest_row.get("ordId") or oldest_row.get("clOrdId") or "").strip()
 
 
+def _oldest_account_bill_timestamp_ms(rows: Iterable[dict[str, Any]]) -> float:
+    timestamps = [
+        _account_bill_timestamp_ms(row)
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    timestamps = [item for item in timestamps if item > 0]
+    return min(timestamps) if timestamps else 0.0
+
+
+def _oldest_account_bill_pagination_cursor(rows: Iterable[dict[str, Any]]) -> str:
+    oldest_row: dict[str, Any] | None = None
+    oldest_timestamp = 0.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        timestamp = _account_bill_timestamp_ms(row)
+        if timestamp <= 0:
+            continue
+        if oldest_row is None or timestamp < oldest_timestamp:
+            oldest_row = row
+            oldest_timestamp = timestamp
+    if not oldest_row:
+        return ""
+    return str(oldest_row.get("billId") or oldest_row.get("id") or "").strip()
+
+
 def _oldest_position_history_timestamp_ms(rows: Iterable[dict[str, Any]]) -> float:
     timestamps = [
         _safe_float(row.get("uTime") or row.get("cTime"), 0.0)
@@ -1181,6 +1371,92 @@ def _position_history_row_identity(row: dict[str, Any]) -> str:
     if pos_id or inst_id or u_time:
         return "|".join([pos_id, inst_id, u_time])
     return ""
+
+
+def _account_bill_row_identity(row: dict[str, Any]) -> str:
+    bill_id = str(row.get("billId") or row.get("id") or "").strip()
+    if bill_id:
+        return bill_id
+    inst_id = str(row.get("instId") or "").strip().upper()
+    timestamp = str(row.get("ts") or row.get("uTime") or row.get("cTime") or "").strip()
+    sub_type = str(row.get("subType") or row.get("billSubType") or "").strip()
+    balance_change = str(row.get("balChg") or row.get("balanceChange") or row.get("pnl") or "").strip()
+    if timestamp or inst_id or sub_type or balance_change:
+        return "|".join([timestamp, inst_id, sub_type, balance_change])
+    return ""
+
+
+def _account_bill_from_row(row: dict[str, Any]) -> OkxNativeAccountBill | None:
+    if not isinstance(row, dict):
+        return None
+    timestamp_ms = _account_bill_timestamp_ms(row)
+    if timestamp_ms <= 0:
+        return None
+    bill_id = _account_bill_row_identity(row)
+    if not bill_id:
+        return None
+    inst_id = str(row.get("instId") or "").strip().upper()
+    bill_type = str(row.get("type") or row.get("billType") or "").strip()
+    bill_sub_type = str(row.get("subType") or row.get("billSubType") or "").strip()
+    balance_change = _safe_float(
+        row.get("balChg")
+        or row.get("balanceChange")
+        or row.get("cashBalChg")
+        or row.get("chg"),
+        0.0,
+    )
+    pnl = _safe_float(row.get("pnl") or row.get("realizedPnl") or row.get("realizedPnlChange"), 0.0)
+    fee = _safe_float(row.get("fee") or row.get("fillFee"), 0.0)
+    funding_fee = _account_bill_funding_fee(row, balance_change=balance_change, pnl=pnl)
+    return OkxNativeAccountBill(
+        bill_id=bill_id,
+        inst_id=inst_id,
+        pos_side=str(row.get("posSide") or row.get("positionSide") or "").lower().strip(),
+        ccy=str(row.get("ccy") or row.get("currency") or "USDT").strip().upper() or "USDT",
+        bill_type=bill_type,
+        bill_sub_type=bill_sub_type,
+        timestamp_ms=timestamp_ms,
+        timestamp=_datetime_from_ms(timestamp_ms),
+        balance_change=balance_change,
+        pnl=pnl,
+        fee=fee,
+        funding_fee=funding_fee,
+        raw=dict(row),
+    )
+
+
+def _account_bill_timestamp_ms(row: dict[str, Any]) -> float:
+    return _safe_float(row.get("ts") or row.get("uTime") or row.get("cTime"), 0.0)
+
+
+def _account_bill_row_is_funding_fee(row: dict[str, Any]) -> bool:
+    sub_type = str(row.get("subType") or row.get("billSubType") or "").strip()
+    if sub_type in FUNDING_FEE_BILL_SUBTYPES:
+        return True
+    for key in ("fundingFee", "funding_fee"):
+        if key in row and abs(_safe_float(row.get(key), 0.0)) > 0:
+            return True
+    text = " ".join(
+        str(row.get(key) or "").lower()
+        for key in ("type", "billType", "subType", "billSubType", "bizType", "desc")
+    )
+    return "funding" in text
+
+
+def _account_bill_funding_fee(
+    row: dict[str, Any],
+    *,
+    balance_change: float,
+    pnl: float,
+) -> float:
+    for key in ("fundingFee", "funding_fee"):
+        if key in row:
+            return _safe_float(row.get(key), 0.0)
+    if not _account_bill_row_is_funding_fee(row):
+        return 0.0
+    if abs(pnl) > 0:
+        return pnl
+    return balance_change
 
 
 def _timestamp_ms(value: datetime | int | float | None) -> float:

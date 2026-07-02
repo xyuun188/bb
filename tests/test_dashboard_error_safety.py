@@ -1159,7 +1159,7 @@ async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
     assert day["realized_pnl"] == pytest.approx(7.93794089)
     assert day["symbols"] == ["AI16Z/USDT"]
     assert len(day["position_details"]) == 1
-    assert day["position_details"][0]["pnl_source"] == "okx_position_history_realized_pnl"
+    assert day["position_details"][0]["pnl_source"] == "okx_linked_order_net_pnl"
     assert day["position_details"][0]["position_ids"]
     assert day["symbol_pnl"][0]["realized_pnl"] == pytest.approx(7.93794089)
 

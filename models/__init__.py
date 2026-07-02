@@ -1,4 +1,4 @@
-from models.account import ExecutionEquitySnapshot, VirtualAccount
+from models.account import ExecutionEquitySnapshot, OkxAccountBill, VirtualAccount
 from models.base import Base, TimestampMixin
 from models.dashboard_auth import DashboardUser
 from models.decision import AIDecision
@@ -26,6 +26,7 @@ __all__ = [
     "Position",
     "VirtualAccount",
     "ExecutionEquitySnapshot",
+    "OkxAccountBill",
     "DashboardUser",
     "AIDecision",
     "ExpertMemory",

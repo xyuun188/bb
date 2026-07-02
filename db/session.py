@@ -163,6 +163,7 @@ async def init_db() -> None:
                     """))
         await _ensure_trade_fact_columns(conn)
         await _ensure_trade_fact_indexes(conn)
+        await _ensure_okx_account_bill_indexes(conn)
         if "sqlite" in settings.database_url:
             for ddl in [
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created ON ai_decisions (is_paper, created_at DESC)",
@@ -255,6 +256,15 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
         "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
         "CREATE INDEX IF NOT EXISTS idx_orders_okx_sync_status ON orders (okx_sync_status, okx_synced_at DESC)",
+    ):
+        await conn.execute(text(ddl))
+
+
+async def _ensure_okx_account_bill_indexes(conn: Any) -> None:
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_inst_ts ON okx_account_bills (mode, inst_id, bill_ts DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_bill_ts ON okx_account_bills (mode, bill_ts DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_type_ts ON okx_account_bills (mode, bill_type, bill_sub_type, bill_ts DESC)",
     ):
         await conn.execute(text(ddl))
 

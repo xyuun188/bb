@@ -7,6 +7,7 @@ import pytest
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
@@ -131,6 +132,7 @@ class _FillCcxt:
                 "uTime": str(start_ms),
             }
         ]
+        self.account_bill_rows: list[dict[str, str]] = []
         self.order_history_params: list[dict[str, Any]] = []
 
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +172,19 @@ class _FillCcxt:
         assert params["instType"] == "SWAP"
         return {"data": []}
 
+    async def privateGetAccountBills(self, params: dict[str, Any]) -> dict[str, Any]:
+        since = int(params.get("begin") or 0)
+        return {
+            "data": [
+                row
+                for row in self.account_bill_rows
+                if int(row.get("ts") or 0) >= since
+            ]
+        }
+
+    async def privateGetAccountBillsArchive(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self.privateGetAccountBills(params)
+
     async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
         assert params["instType"] == "SWAP"
         return {
@@ -186,6 +201,26 @@ class _PositionHistoryBusyCcxt(_FillCcxt):
         raise TimeoutError("positions-history busy")
 
 
+class _FundingBillCcxt(_FillCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        funding_ms = int((PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=8)).timestamp() * 1000)
+        self.account_bill_rows = [
+            {
+                "billId": "funding-bill-1",
+                "instId": "SPK-USDT-SWAP",
+                "posSide": "short",
+                "ccy": "USDT",
+                "type": "8",
+                "subType": "173",
+                "balChg": "-0.17",
+                "pnl": "-0.17",
+                "fee": "0",
+                "ts": str(funding_ms),
+            }
+        ]
+
+
 class _Executor:
     ccxt_instances: list[_FillCcxt] = []
 
@@ -197,6 +232,26 @@ class _Executor:
         return None
 
     async def _get_ccxt(self) -> _FillCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _FundingBillExecutor:
+    ccxt_instances: list[_FundingBillCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _FundingBillCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _FundingBillCcxt:
         return self.ccxt
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -995,6 +1050,73 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
         assert position["close_exchange_order_id"] == "phase3-order"
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_persists_okx_funding_account_bills(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-account-bills.db').as_posix()}",
+    )
+    await init_db()
+    _FundingBillExecutor.ccxt_instances.clear()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="sell",
+                    order_type="market",
+                    quantity=1.0,
+                    price=0.03,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id="phase3-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_FundingBillExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            bill_rows = list(
+                (
+                    await session.execute(
+                        OkxAccountBill.__table__.select().order_by(
+                            OkxAccountBill.__table__.c.bill_id.asc()
+                        )
+                    )
+                ).all()
+            )
+    finally:
+        await close_db()
+
+    assert report["account_bill_error"] is None
+    assert report["account_bill_checked_count"] == 1
+    assert report["account_bill_backfilled_count"] == 1
+    assert len(bill_rows) == 1
+    row = bill_rows[0]._mapping
+    assert row["bill_id"] == "funding-bill-1"
+    assert row["inst_id"] == "SPK-USDT-SWAP"
+    assert row["pos_side"] == "short"
+    assert row["bill_sub_type"] == "173"
+    assert row["funding_fee"] == pytest.approx(-0.17)
 
 
 @pytest.mark.asyncio

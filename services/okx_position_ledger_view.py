@@ -39,6 +39,7 @@ NON_EXCHANGE_ORDER_TOKENS = {
     "pending",
     "rejected",
 }
+FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 
 
 @dataclass(slots=True)
@@ -100,6 +101,13 @@ class OkxPositionLedgerGroup:
     trainable: bool = False
     evidence_gaps: list[str] = field(default_factory=list)
     pnl_source: str = "position_realized_pnl"
+    close_fill_pnl: float = 0.0
+    entry_fee: float = 0.0
+    close_fee: float = 0.0
+    funding_fee: float = 0.0
+    funding_bill_count: int = 0
+    funding_fee_source: str = "none"
+    realized_pnl_formula: str = "close_fill_pnl_plus_funding_fee_minus_entry_and_close_fees"
 
     def as_dict(self, *, include_fills: bool = True) -> dict[str, Any]:
         payload = {
@@ -123,6 +131,13 @@ class OkxPositionLedgerGroup:
             "realized_pnl": _round(self.realized_pnl),
             "realized_pnl_pct": _round_optional(self.realized_pnl_pct),
             "pnl_source": self.pnl_source,
+            "close_fill_pnl": _round(self.close_fill_pnl),
+            "entry_fee": _round(self.entry_fee),
+            "close_fee": _round(self.close_fee),
+            "funding_fee": _round(self.funding_fee),
+            "funding_bill_count": int(self.funding_bill_count),
+            "funding_fee_source": self.funding_fee_source,
+            "realized_pnl_formula": self.realized_pnl_formula,
             "opened_at": _iso(self.opened_at),
             "closed_at": _iso(self.closed_at),
             "position_ids": list(self.position_ids),
@@ -163,12 +178,30 @@ class _LedgerPositionFragment:
     close_exchange_order_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _LinkedOrderPnlComponents:
+    close_fill_pnl: float
+    entry_fee: float
+    close_fee: float
+    close_quantity: float
+    entry_quantity: float
+
+
+@dataclass(frozen=True, slots=True)
+class _FundingFeeComponents:
+    funding_fee: float
+    bill_count: int
+    source: str
+
+
 def build_okx_position_ledger_groups(
     positions: list[Position],
     orders: list[Order],
+    account_bills: list[Any] | None = None,
 ) -> list[OkxPositionLedgerGroup]:
     """Build OKX-style grouped historical position rows from local OKX facts."""
     orders_by_id = _orders_by_exchange_id(orders)
+    funding_bills = list(account_bills or [])
     closed_positions = [
         position
         for position in positions
@@ -192,7 +225,7 @@ def build_okx_position_ledger_groups(
             or datetime.min.replace(tzinfo=UTC),
         )
         rows = _deduplicate_superseded_position_rows(rows)
-        group = _build_group_from_positions(key, rows, orders_by_id)
+        group = _build_group_from_positions(key, rows, orders_by_id, funding_bills)
         result.append(group)
     return sorted(
         result,
@@ -470,6 +503,7 @@ def _build_group_from_positions(
     key: tuple[str, str, str, str],
     positions: list[Position],
     orders_by_id: dict[str, Order],
+    account_bills: list[Any],
 ) -> OkxPositionLedgerGroup:
     mode, symbol, side, lifecycle_open = key
     inst_id = _position_inst_id(positions[0]) or okx_inst_id_from_symbol(symbol) or ""
@@ -541,23 +575,31 @@ def _build_group_from_positions(
         if close_price_from_orders > 0:
             close_price = close_price_from_orders
 
-    has_okx_authoritative_pnl = any(
-        _is_okx_authoritative_position_history_row(pos) for pos in metric_positions
-    )
     realized_pnl = sum(
         _safe_float(getattr(pos, "realized_pnl", None)) for pos in metric_positions
     )
-    okx_close_fill_net_pnl = _confirmed_close_fill_net_pnl(
+    pnl_components = _confirmed_linked_order_pnl_components(
         linked_fills=linked_fills,
         entry_ids=entry_ids,
         close_ids=close_ids,
         closed_quantity=closed_quantity,
     )
-    if has_okx_authoritative_pnl:
-        pnl_source = "okx_position_history_realized_pnl"
-    elif okx_close_fill_net_pnl is not None:
-        realized_pnl = okx_close_fill_net_pnl
-        pnl_source = "okx_close_fill_net_pnl"
+    funding_components = _funding_fee_components_for_group(
+        account_bills=account_bills,
+        mode=mode,
+        inst_id=inst_id,
+        side=side,
+        opened_at=opened_at,
+        closed_at=closed_at,
+    )
+    if pnl_components is not None:
+        realized_pnl = (
+            pnl_components.close_fill_pnl
+            + funding_components.funding_fee
+            - pnl_components.entry_fee
+            - pnl_components.close_fee
+        )
+        pnl_source = "okx_linked_order_net_pnl"
     elif not realized_pnl:
         realized_pnl = sum(
             _safe_float(row.pnl)
@@ -588,6 +630,8 @@ def _build_group_from_positions(
         gaps.append("missing_linked_order_rows")
     if any(not row.okx_confirmed for row in linked_fills):
         gaps.append("linked_order_not_okx_confirmed")
+    if pnl_components is None and entry_ids and close_ids:
+        gaps.append("incomplete_okx_linked_order_pnl_components")
     evidence_complete = not gaps and bool(close_ids) and bool(entry_ids)
     status = "partial" if len(positions) > 1 and not evidence_complete else "full"
     status_label = "部分平仓" if status == "partial" else "全部平仓"
@@ -617,16 +661,22 @@ def _build_group_from_positions(
         trainable=evidence_complete,
         evidence_gaps=gaps,
         pnl_source=pnl_source,
+        close_fill_pnl=pnl_components.close_fill_pnl if pnl_components is not None else 0.0,
+        entry_fee=pnl_components.entry_fee if pnl_components is not None else 0.0,
+        close_fee=pnl_components.close_fee if pnl_components is not None else 0.0,
+        funding_fee=funding_components.funding_fee,
+        funding_bill_count=funding_components.bill_count,
+        funding_fee_source=funding_components.source,
     )
 
 
-def _confirmed_close_fill_net_pnl(
+def _confirmed_linked_order_pnl_components(
     *,
     linked_fills: list[OkxLinkedFillRow],
     entry_ids: list[str],
     close_ids: list[str],
     closed_quantity: float,
-) -> float | None:
+) -> _LinkedOrderPnlComponents | None:
     if not entry_ids or not close_ids:
         return None
     fills_by_order_id = {row.order_id: row for row in linked_fills if row.order_id}
@@ -657,7 +707,139 @@ def _confirmed_close_fill_net_pnl(
     close_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in close_rows)
     entry_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in entry_rows)
     entry_fee *= min(max(close_quantity, 0.0) / entry_quantity, 1.0)
-    return close_gross_pnl - entry_fee - close_fee
+    return _LinkedOrderPnlComponents(
+        close_fill_pnl=close_gross_pnl,
+        entry_fee=entry_fee,
+        close_fee=close_fee,
+        close_quantity=close_quantity,
+        entry_quantity=entry_quantity,
+    )
+
+
+def _funding_fee_components_for_group(
+    *,
+    account_bills: list[Any],
+    mode: str,
+    inst_id: str,
+    side: str,
+    opened_at: datetime | None,
+    closed_at: datetime | None,
+) -> _FundingFeeComponents:
+    if not account_bills or not inst_id or opened_at is None or closed_at is None:
+        return _FundingFeeComponents(0.0, 0, "none")
+    start = _as_utc(opened_at)
+    end = _as_utc(closed_at)
+    if start is None or end is None:
+        return _FundingFeeComponents(0.0, 0, "none")
+    normalized_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    total = 0.0
+    count = 0
+    for bill in account_bills:
+        bill_mode = str(_bill_value(bill, "mode") or "").lower().strip()
+        if bill_mode and bill_mode != normalized_mode:
+            continue
+        bill_inst_id = str(
+            _bill_value(bill, "inst_id")
+            or _bill_raw_value(bill, "instId")
+            or ""
+        ).upper().strip()
+        if not bill_inst_id or bill_inst_id != inst_id:
+            continue
+        bill_ts = _as_utc(_bill_value(bill, "bill_ts") or _bill_value(bill, "timestamp"))
+        if bill_ts is None:
+            bill_ts = _datetime_from_ms(
+                _bill_raw_value(bill, "ts")
+                or _bill_raw_value(bill, "uTime")
+                or _bill_raw_value(bill, "cTime")
+            )
+        if bill_ts is None or bill_ts < start or bill_ts > end:
+            continue
+        bill_pos_side = str(
+            _bill_value(bill, "pos_side")
+            or _bill_raw_value(bill, "posSide")
+            or ""
+        ).lower().strip()
+        if bill_pos_side in {"long", "short"} and side and bill_pos_side != side:
+            continue
+        funding_fee = _bill_funding_fee(bill)
+        if abs(funding_fee) <= 1e-12:
+            continue
+        total += funding_fee
+        count += 1
+    return _FundingFeeComponents(
+        funding_fee=total,
+        bill_count=count,
+        source="okx_account_bills" if count else "none",
+    )
+
+
+def _bill_funding_fee(bill: Any) -> float:
+    funding_fee = _safe_float(_bill_value(bill, "funding_fee"), 0.0) or 0.0
+    if abs(funding_fee) > 1e-12:
+        return funding_fee
+    if not _bill_is_funding_fee(bill):
+        return 0.0
+    pnl = _safe_float(_bill_value(bill, "pnl") or _bill_raw_value(bill, "pnl"), 0.0) or 0.0
+    if abs(pnl) > 1e-12:
+        return pnl
+    return _safe_float(
+        _bill_value(bill, "balance_change")
+        or _bill_raw_value(bill, "balChg")
+        or _bill_raw_value(bill, "balanceChange"),
+        0.0,
+    ) or 0.0
+
+
+def _bill_is_funding_fee(bill: Any) -> bool:
+    sub_type = str(
+        _bill_value(bill, "bill_sub_type")
+        or _bill_raw_value(bill, "subType")
+        or _bill_raw_value(bill, "billSubType")
+        or ""
+    ).strip()
+    if sub_type in FUNDING_FEE_BILL_SUBTYPES:
+        return True
+    raw = _bill_raw(bill)
+    for key in ("fundingFee", "funding_fee"):
+        if key in raw and abs(_safe_float(raw.get(key), 0.0) or 0.0) > 1e-12:
+            return True
+    text = " ".join(
+        str(
+            _bill_value(bill, key)
+            or _bill_raw_value(bill, key)
+            or ""
+        ).lower()
+        for key in ("bill_type", "bill_sub_type", "type", "subType", "bizType", "desc")
+    )
+    return "funding" in text
+
+
+def _bill_value(bill: Any, key: str) -> Any:
+    if isinstance(bill, dict):
+        return bill.get(key)
+    return getattr(bill, key, None)
+
+
+def _bill_raw_value(bill: Any, key: str) -> Any:
+    return _bill_raw(bill).get(key)
+
+
+def _bill_raw(bill: Any) -> dict[str, Any]:
+    if isinstance(bill, dict):
+        raw = bill.get("raw_bill") or bill.get("raw") or bill
+    else:
+        raw = getattr(bill, "raw_bill", None) or getattr(bill, "raw", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _datetime_from_ms(value: Any) -> datetime | None:
+    timestamp_ms = _safe_float(value, 0.0) or 0.0
+    if timestamp_ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _deduplicate_superseded_position_rows(positions: list[Position]) -> list[Position]:

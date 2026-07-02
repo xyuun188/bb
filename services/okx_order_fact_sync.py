@@ -26,10 +26,15 @@ from core.symbols import (
 )
 from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
-from services.okx_native_facts import OkxNativeFactsClient, OkxNativeFillGroup
+from services.okx_native_facts import (
+    OkxNativeAccountBill,
+    OkxNativeFactsClient,
+    OkxNativeFillGroup,
+)
 from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
     find_current_position_entry_confirmation,
@@ -125,6 +130,11 @@ class OkxOrderFactSyncSummary:
     fill_pair_position_checked_count: int = 0
     fill_pair_position_backfilled_count: int = 0
     fill_pair_position_skipped_count: int = 0
+    account_bill_checked_count: int = 0
+    account_bill_backfilled_count: int = 0
+    account_bill_updated_count: int = 0
+    account_bill_skipped_count: int = 0
+    account_bill_error: str | None = None
     closed_position_pnl_repair_checked_count: int = 0
     closed_position_pnl_repaired_count: int = 0
     closed_position_pnl_repair_skipped_count: int = 0
@@ -161,6 +171,11 @@ class OkxOrderFactSyncSummary:
             "fill_pair_position_checked_count": self.fill_pair_position_checked_count,
             "fill_pair_position_backfilled_count": self.fill_pair_position_backfilled_count,
             "fill_pair_position_skipped_count": self.fill_pair_position_skipped_count,
+            "account_bill_checked_count": self.account_bill_checked_count,
+            "account_bill_backfilled_count": self.account_bill_backfilled_count,
+            "account_bill_updated_count": self.account_bill_updated_count,
+            "account_bill_skipped_count": self.account_bill_skipped_count,
+            "account_bill_error": self.account_bill_error,
             "closed_position_pnl_repair_checked_count": self.closed_position_pnl_repair_checked_count,
             "closed_position_pnl_repaired_count": self.closed_position_pnl_repaired_count,
             "closed_position_pnl_repair_skipped_count": self.closed_position_pnl_repair_skipped_count,
@@ -236,6 +251,8 @@ class OkxOrderFactSyncService:
         contract_sizes: dict[str, float] = {}
         position_history_rows: list[dict[str, Any]] = []
         position_history_error: str | None = None
+        account_bills: list[OkxNativeAccountBill] = []
+        account_bill_error: str | None = None
         try:
             await _bounded(executor.initialize(), self.timeout_seconds)
             native_facts = OkxNativeFactsClient(executor)
@@ -335,6 +352,25 @@ class OkxOrderFactSyncService:
                         mode=self.mode,
                         error=position_history_error,
                     )
+            try:
+                account_bills = await _bounded(
+                    native_facts.fetch_account_bills(
+                        inst_ids=fact_target_inst_ids,
+                        since=since,
+                        limit=100,
+                        max_pages=max(3, min(10, (self.limit // 100) + 2)),
+                        funding_only=True,
+                        strict=True,
+                    ),
+                    self.timeout_seconds,
+                )
+            except Exception as exc:
+                account_bill_error = safe_error_text(exc, limit=180)
+                logger.warning(
+                    "OKX account bill sync degraded; continuing order/fill fact sync",
+                    mode=self.mode,
+                    error=account_bill_error,
+                )
         except Exception as exc:
             okx_pull_available = False
             pull_error = safe_error_text(exc, limit=180)
@@ -376,6 +412,7 @@ class OkxOrderFactSyncService:
             position_history_result = OkxPositionFactSyncSummary()
             fill_pair_position_result = OkxPositionFactSyncSummary()
             current_position_result = OkxPositionFactSyncSummary()
+            account_bill_result = OkxPositionFactSyncSummary()
             if okx_pull_available:
                 (
                     confirmed_count,
@@ -422,6 +459,13 @@ class OkxOrderFactSyncService:
                     now=datetime.now(UTC),
                     samples=samples,
                 )
+                account_bill_result = await self._sync_account_bills(
+                    session,
+                    account_bills=account_bills,
+                    since=since,
+                    now=datetime.now(UTC),
+                    samples=samples,
+                )
             else:
                 confirmed_count = self._recover_local_stored_order_facts(
                     writable_orders,
@@ -448,7 +492,14 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
 
-        status = "warning" if unverified_count or position_history_error or not okx_pull_available else "ok"
+        status = (
+            "warning"
+            if unverified_count
+            or position_history_error
+            or account_bill_error
+            or not okx_pull_available
+            else "ok"
+        )
         return OkxOrderFactSyncSummary(
             status=status,
             mode=self.mode,
@@ -474,6 +525,11 @@ class OkxOrderFactSyncService:
             fill_pair_position_checked_count=fill_pair_position_result.checked_count,
             fill_pair_position_backfilled_count=fill_pair_position_result.backfilled_count,
             fill_pair_position_skipped_count=fill_pair_position_result.skipped_count,
+            account_bill_checked_count=account_bill_result.checked_count,
+            account_bill_backfilled_count=account_bill_result.backfilled_count,
+            account_bill_updated_count=account_bill_result.updated_count,
+            account_bill_skipped_count=account_bill_result.skipped_count,
+            account_bill_error=account_bill_error,
             closed_position_pnl_repair_checked_count=close_fill_repair_result.checked_count,
             closed_position_pnl_repaired_count=close_fill_repair_result.updated_count,
             closed_position_pnl_repair_skipped_count=close_fill_repair_result.skipped_count,
@@ -1028,6 +1084,86 @@ class OkxOrderFactSyncService:
         return OkxPositionFactSyncSummary(
             checked_count=checked,
             backfilled_count=backfilled,
+            skipped_count=skipped,
+            samples=tuple(samples[-8:]),
+        )
+
+    async def _sync_account_bills(
+        self,
+        session: Any,
+        *,
+        account_bills: list[OkxNativeAccountBill],
+        since: datetime,
+        now: datetime,
+        samples: list[dict[str, Any]],
+    ) -> OkxPositionFactSyncSummary:
+        checked = 0
+        backfilled = 0
+        updated = 0
+        skipped = 0
+        for bill in account_bills:
+            bill_time = _db_datetime_to_utc(bill.timestamp)
+            if bill_time is None or bill_time < since:
+                skipped += 1
+                continue
+            bill_id = str(bill.bill_id or "").strip()
+            if not bill_id:
+                skipped += 1
+                continue
+            checked += 1
+            result = await session.execute(
+                select(OkxAccountBill)
+                .where(
+                    OkxAccountBill.mode == self.mode,
+                    OkxAccountBill.bill_id == bill_id,
+                )
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
+            payload = {
+                "mode": self.mode,
+                "bill_id": bill_id,
+                "inst_id": bill.inst_id or None,
+                "pos_side": bill.pos_side or None,
+                "ccy": bill.ccy or "USDT",
+                "bill_type": bill.bill_type or None,
+                "bill_sub_type": bill.bill_sub_type or None,
+                "bill_ts": bill_time,
+                "balance_change": bill.balance_change,
+                "pnl": bill.pnl,
+                "fee": bill.fee,
+                "funding_fee": bill.funding_fee,
+                "source": "okx_account_bills",
+                "raw_bill": dict(bill.raw),
+            }
+            if existing is None:
+                session.add(OkxAccountBill(**payload))
+                backfilled += 1
+                samples.append(
+                    {
+                        "kind": "okx_account_bill_backfilled",
+                        "bill_id": bill_id,
+                        "inst_id": bill.inst_id,
+                        "funding_fee": bill.funding_fee,
+                    }
+                )
+                continue
+            changed = False
+            for key, value in payload.items():
+                if key in {"mode", "bill_id"}:
+                    continue
+                if getattr(existing, key) != value:
+                    setattr(existing, key, value)
+                    changed = True
+            if changed:
+                existing.updated_at = now
+                updated += 1
+            else:
+                skipped += 1
+        return OkxPositionFactSyncSummary(
+            checked_count=checked,
+            backfilled_count=backfilled,
+            updated_count=updated,
             skipped_count=skipped,
             samples=tuple(samples[-8:]),
         )

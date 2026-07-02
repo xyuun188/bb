@@ -16,6 +16,7 @@ from core.symbols import normalize_trading_symbol, symbol_query_variants
 from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.decision_execution_trace import build_execution_trace
@@ -399,6 +400,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -1166,10 +1185,19 @@ async def get_positions(mode: str | None = None):
         else:
             order_stmt = order_stmt.where(Order.id == -1)
         order_rows = list((await session.execute(order_stmt.limit(10000))).scalars().all())
+        account_bill_rows = await _okx_account_bill_rows_for_closed_positions(
+            session,
+            closed_positions=closed_positions,
+            mode=selected_mode,
+        )
 
     closed_ledger_rows = [
         group.as_dict(include_fills=True)
-        for group in build_okx_position_ledger_groups(closed_positions, order_rows)
+        for group in build_okx_position_ledger_groups(
+            closed_positions,
+            order_rows,
+            account_bills=account_bill_rows,
+        )
     ]
     try:
         open_rows = await dashboard_api._get_display_open_positions_snapshot(selected_mode)
@@ -1226,6 +1254,46 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
             pieces.update(part.strip() for part in token.split(separator) if part.strip())
         tokens = pieces
     return {token for token in tokens if token}
+
+
+async def _okx_account_bill_rows_for_closed_positions(
+    session: Any,
+    *,
+    closed_positions: list[Position],
+    mode: str | None,
+) -> list[OkxAccountBill]:
+    if not closed_positions:
+        return []
+    inst_ids = {
+        str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+        for position in closed_positions
+        if str(getattr(position, "okx_inst_id", "") or "").strip()
+    }
+    opened_values = [
+        value
+        for position in closed_positions
+        if (value := _as_utc_datetime(getattr(position, "created_at", None))) is not None
+    ]
+    closed_values = [
+        value
+        for position in closed_positions
+        if (value := _as_utc_datetime(getattr(position, "closed_at", None))) is not None
+    ]
+    if not inst_ids or not opened_values or not closed_values:
+        return []
+    start = min(opened_values) - timedelta(hours=1)
+    end = max(closed_values) + timedelta(hours=1)
+    stmt = select(OkxAccountBill).where(
+        OkxAccountBill.inst_id.in_(sorted(inst_ids)),
+        OkxAccountBill.bill_ts >= start.replace(tzinfo=None),
+        OkxAccountBill.bill_ts <= end.replace(tzinfo=None),
+    )
+    if mode:
+        stmt = stmt.where(OkxAccountBill.mode == ("live" if mode == "live" else "paper"))
+    result = await session.execute(
+        stmt.order_by(OkxAccountBill.bill_ts.asc(), OkxAccountBill.id.asc()).limit(10000)
+    )
+    return list(result.scalars().all())
 
 
 @router.delete(
