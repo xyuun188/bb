@@ -45,6 +45,7 @@ def _position(
     created_hours_ago: float = 5.0,
     closed_hours_ago: float = 1.0,
     position_id: int = 1,
+    entry_raw: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
 
     now = datetime.now(UTC)
@@ -59,7 +60,38 @@ def _position(
         unrealized_pnl=0.0,
         created_at=now - timedelta(hours=created_hours_ago),
         closed_at=now - timedelta(hours=closed_hours_ago),
+        entry_raw=entry_raw,
     )
+
+
+def _profit_first_entry_raw(
+    *,
+    side: str,
+    strategy: str = "balanced_probe",
+    source: str = "server_profit",
+) -> dict[str, Any]:
+    return {
+        "profit_first_trade_plan": {
+            "plan_version": "profit-first-v3.1",
+            "symbol": "BTC/USDT",
+            "side": side,
+            "action": side,
+            "strategy_profile_id": strategy,
+            "decision_lane": "validated_probe",
+            "expected_net_return_pct": 0.8,
+            "position_size_pct": 0.04,
+            "exit_plan_id": f"pfep-{side}",
+            "model_sources": ["decision_llm", source],
+            "model_contributions": [
+                {"source": "decision_llm", "field_path": "decision.model_name"},
+                {
+                    "source": source,
+                    "field_path": "opportunity_score.expected_net_return_pct",
+                },
+            ],
+        },
+        "profit_first_exit_plan": {"exit_plan_id": f"pfep-{side}"},
+    }
 
 
 def test_strategy_learning_expert_integrity_reads_duration_sec() -> None:
@@ -521,6 +553,59 @@ def test_strategy_learning_context_applies_profile_overrides(tmp_path) -> None:
     assert context["strategy_learning_sizing"]["profile_id"] == "balanced_probe"
 
     assert context["strategy_learning"]["low_trade_count_penalized"] is True
+
+
+def test_strategy_learning_applies_profit_first_runtime_side_feedback(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    positions = [
+        *[
+            _position(
+                side="long",
+                pnl=1.2,
+                position_id=100 + idx,
+                entry_raw=_profit_first_entry_raw(side="long"),
+            )
+            for idx in range(4)
+        ],
+        *[
+            _position(
+                side="short",
+                pnl=-3.0,
+                position_id=200 + idx,
+                entry_raw=_profit_first_entry_raw(
+                    side="short",
+                    strategy="short_loss_loop",
+                    source="timeseries",
+                ),
+            )
+            for idx in range(4)
+        ],
+    ]
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=positions,
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        max_open_positions=20,
+    )
+    context = engine.apply_to_context({"min_opportunity_score": 1.0}, payload)
+
+    feedback = payload["feedback"]["profit_first_runtime_feedback"]
+    assert feedback["objective"] == "maximize_realized_net_pnl"
+    assert feedback["side_feedback"]["short"]["recommended_stage"] == "demote"
+    assert feedback["side_feedback"]["short"]["hard_ban"] is False
+    assert context["profit_first_runtime_feedback_applied"] is True
+    assert context["side_weights"]["short"] < 1.0
+    assert context["side_weights"]["long"] >= 1.0
+    assert context["profit_first_runtime_feedback"]["exit_plan_reference"]["missing_count"] == 0
+    assert context["strategy_learning_sizing"]["profit_first_runtime_feedback_applied"] is True
 
 
 def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_path) -> None:

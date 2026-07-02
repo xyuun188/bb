@@ -90,6 +90,12 @@ class ProfitFirstRankingService:
             _safe_list(brain.get("recommendations", {}).get("source_weights"))
         )
         blockers = self._blockers(strategy_rows, source_rows)
+        runtime_feedback = self._runtime_feedback(
+            strategy_rows=strategy_rows,
+            source_rows=source_rows,
+            closed_positions=positions_list,
+            trade_fact_report=fact_report,
+        )
         summary = {
             "decision_count": len(decisions_list),
             "closed_position_count": len(positions_list),
@@ -111,6 +117,9 @@ class ProfitFirstRankingService:
             ),
             "negative_source_count": sum(
                 1 for row in source_rows if row.get("recommended_stage") in {"demote", "shadow"}
+            ),
+            "exit_plan_reference_missing_count": _safe_int(
+                _safe_dict(runtime_feedback.get("exit_plan_reference")).get("missing_count")
             ),
             "blocker_count": len(blockers),
         }
@@ -144,9 +153,76 @@ class ProfitFirstRankingService:
                 "profitable_profiles_need_clean_sample_floor": True,
                 "ranking_changes_are_auditable": True,
                 "trade_fact_policy": "okx_confirmed_closed_positions_only",
+                "runtime_feedback_policy": (
+                    "bounded_strategy_context_feedback_only; no order submission, no direct "
+                    "routing mutation, and no direct live-size increase"
+                ),
             },
             "trade_fact_report": fact_report,
             "brain_recommendations": brain.get("recommendations") or {},
+            "runtime_feedback": runtime_feedback,
+        }
+
+    def _runtime_feedback(
+        self,
+        *,
+        strategy_rows: list[dict[str, Any]],
+        source_rows: list[dict[str, Any]],
+        closed_positions: Sequence[Any],
+        trade_fact_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        side_feedback = _side_runtime_feedback(closed_positions)
+        exit_plan_reference = _exit_plan_reference_report(closed_positions)
+        strategy_feedback = _strategy_runtime_feedback(strategy_rows)
+        source_feedback = _source_runtime_feedback(source_rows)
+        acceptance = _profit_acceptance_report(
+            closed_positions=closed_positions,
+            strategy_feedback=strategy_feedback,
+            source_feedback=source_feedback,
+            side_feedback=side_feedback,
+        )
+        return {
+            "status": "ready" if closed_positions or strategy_rows or source_rows else "collecting_evidence",
+            "objective": "maximize_realized_net_pnl",
+            "audit_only": True,
+            "read_only": True,
+            "live_mutation": False,
+            "live_weight_mutation": False,
+            "live_sizing_mutation": False,
+            "can_submit_orders": False,
+            "can_change_model_routing": False,
+            "can_change_strategy_weight": False,
+            "can_increase_live_size": False,
+            "can_influence_strategy_context": True,
+            "side_weights": {
+                side: row["weight_multiplier"]
+                for side, row in side_feedback.items()
+                if row.get("weight_multiplier") is not None
+            },
+            "side_feedback": side_feedback,
+            "strategy_profile_feedback": strategy_feedback[:40],
+            "source_weight_feedback": source_feedback[:40],
+            "local_ml_live_influence": _local_ml_live_influence(source_feedback),
+            "exit_plan_reference": exit_plan_reference,
+            "profit_acceptance": acceptance,
+            "trade_fact_report": {
+                "policy": trade_fact_report.get("policy"),
+                "checked": _safe_int(trade_fact_report.get("checked")),
+                "trusted": _safe_int(trade_fact_report.get("trusted")),
+                "quarantined": _safe_int(trade_fact_report.get("quarantined")),
+                "reason_counts": _safe_dict(trade_fact_report.get("reason_counts")),
+            },
+            "policy": {
+                "feedback_type": "bounded_strategy_context_feedback",
+                "optimization_target": "realized_net_pnl",
+                "side_weight_policy": "relative_window_realized_pnl_not_fixed_usdt_thresholds",
+                "strategy_flow": "shadow_to_canary_to_live",
+                "low_sample_policy": "observe_or_shadow_until_window_evidence_improves",
+                "direct_order_mutation_allowed": False,
+                "direct_live_size_increase_allowed": False,
+                "hard_direction_ban_allowed": False,
+                "exit_plan_reference_required_for_clean_attribution": True,
+            },
         }
 
     async def _load_recent(
@@ -411,6 +487,280 @@ class ProfitFirstRankingService:
         )
         blockers.sort(key=lambda item: str(item.get("severity") or "") != "blocking")
         return blockers
+
+
+def _side_runtime_feedback(closed_positions: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {
+        "long": _empty_side_runtime_bucket("long"),
+        "short": _empty_side_runtime_bucket("short"),
+    }
+    for row in closed_positions:
+        side = str(_row_get(row, "side") or "").lower().strip()
+        if side not in stats:
+            continue
+        pnl = _safe_float(_row_get(row, "realized_pnl"), 0.0)
+        bucket = stats[side]
+        bucket["count"] += 1
+        bucket["realized_net_pnl"] += pnl
+        bucket["wins"] += 1 if pnl > 0 else 0
+        bucket["losses"] += 1 if pnl < 0 else 0
+        bucket["profit"] += max(pnl, 0.0)
+        bucket["loss"] += abs(min(pnl, 0.0))
+
+    total_count = sum(_safe_int(row.get("count")) for row in stats.values())
+    sample_floor = max(1, min(8, (total_count + 3) // 4)) if total_count else 1
+    total_abs_pnl = sum(abs(_safe_float(row.get("realized_net_pnl"))) for row in stats.values())
+    total_abs_pnl = max(total_abs_pnl, 1e-9)
+    for side, bucket in stats.items():
+        other_side = "short" if side == "long" else "long"
+        other = stats[other_side]
+        count = _safe_int(bucket.get("count"))
+        pnl = _safe_float(bucket.get("realized_net_pnl"))
+        profit = _safe_float(bucket.get("profit"))
+        loss = _safe_float(bucket.get("loss"))
+        other_pnl = _safe_float(other.get("realized_net_pnl"))
+        profit_factor = profit / loss if loss > 0 else (999.0 if profit > 0 else 0.0)
+        avg_pnl = pnl / count if count else 0.0
+        reasons: list[str] = []
+        stage = "observe"
+        weight = 1.0
+        if count < sample_floor:
+            stage = "shadow"
+            reasons.append("sample_floor_not_met")
+        elif pnl < 0:
+            loss_share = abs(pnl) / total_abs_pnl
+            underperformance_share = max(other_pnl - pnl, 0.0) / total_abs_pnl
+            profit_factor_pressure = max(0.0, 1.0 - min(profit_factor, 1.0))
+            reduction = min(
+                0.55,
+                0.18
+                + loss_share * 0.24
+                + underperformance_share * 0.18
+                + profit_factor_pressure * 0.16,
+            )
+            weight = max(0.45, 1.0 - reduction)
+            stage = "demote"
+            reasons.extend(["negative_realized_net_pnl", "relative_window_underperformance"])
+        elif pnl > 0:
+            advantage_share = max(pnl - other_pnl, 0.0) / total_abs_pnl
+            if advantage_share > 0:
+                weight = min(1.12, 1.0 + advantage_share * 0.10)
+                stage = "promote"
+                reasons.append("positive_relative_realized_net_pnl")
+        bucket.update(
+            {
+                "sample_floor": sample_floor,
+                "avg_pnl": round(avg_pnl, 6),
+                "win_rate": round(_safe_int(bucket.get("wins")) / count, 6)
+                if count
+                else 0.0,
+                "profit_factor": round(profit_factor, 6),
+                "relative_edge_vs_opposite": round(pnl - other_pnl, 6),
+                "recommended_stage": stage,
+                "weight_multiplier": round(weight, 6),
+                "ranking_reasons": reasons or ["observe_realized_net_pnl"],
+                "hard_ban": False,
+                "live_weight_mutation": False,
+                "policy": "relative_window_realized_pnl_not_fixed_usdt_thresholds",
+            }
+        )
+        for key in ("realized_net_pnl", "profit", "loss"):
+            bucket[key] = round(_safe_float(bucket.get(key)), 6)
+    return stats
+
+
+def _empty_side_runtime_bucket(side: str) -> dict[str, Any]:
+    return {
+        "side": side,
+        "count": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_net_pnl": 0.0,
+        "profit": 0.0,
+        "loss": 0.0,
+    }
+
+
+def _strategy_runtime_feedback(strategy_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in strategy_rows:
+        stage = str(row.get("recommended_stage") or "shadow")
+        if stage == "disable":
+            multiplier = 0.35
+        elif stage == "demote":
+            multiplier = 0.62
+        elif stage == "canary":
+            multiplier = 1.02
+        elif stage == "live_candidate":
+            multiplier = 1.05
+        else:
+            multiplier = 1.0
+        result.append(
+            {
+                "model_name": row.get("model_name"),
+                "strategy_profile_id": row.get("strategy_profile_id"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "decision_lane": row.get("decision_lane"),
+                "recommended_stage": stage,
+                "weight_multiplier": round(multiplier, 6),
+                "count": row.get("count"),
+                "realized_net_pnl": row.get("realized_net_pnl"),
+                "profit_factor": row.get("profit_factor"),
+                "ranking_reasons": _safe_list(row.get("ranking_reasons")),
+                "can_increase_budget": False,
+                "can_keep_live_size": stage not in {"demote", "disable"},
+                "live_mutation": False,
+            }
+        )
+    return result
+
+
+def _source_runtime_feedback(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in source_rows:
+        stage = str(row.get("recommended_stage") or "shadow")
+        weight = _safe_float(row.get("weight_multiplier"), 1.0)
+        result.append(
+            {
+                "source": row.get("source"),
+                "recommended_stage": stage,
+                "weight_multiplier": round(min(max(weight, 0.50), 1.15), 6),
+                "count": row.get("count"),
+                "realized_net_pnl": row.get("realized_net_pnl"),
+                "ranking_reasons": _safe_list(row.get("ranking_reasons")),
+                "can_change_model_routing": False,
+                "live_weight_mutation": False,
+            }
+        )
+    return result
+
+
+def _local_ml_live_influence(source_feedback: list[dict[str, Any]]) -> dict[str, Any]:
+    row = next(
+        (
+            item
+            for item in source_feedback
+            if str(item.get("source") or "").lower() in {"local_ml", "ml", "local_ml_model"}
+        ),
+        {},
+    )
+    if not row:
+        return {
+            "source": "local_ml",
+            "allow_live_entry_influence": False,
+            "reason": "no_realized_net_pnl_source_evidence",
+            "requires_top_bucket_positive_confirmation": True,
+        }
+    stage = str(row.get("recommended_stage") or "shadow")
+    pnl = _safe_float(row.get("realized_net_pnl"), 0.0)
+    return {
+        "source": row.get("source") or "local_ml",
+        "allow_live_entry_influence": False,
+        "eligible_for_shadow_to_canary_review": bool(stage == "promote" and pnl > 0),
+        "reason": (
+            "requires_top_bucket_positive_confirmation"
+            if stage == "promote" and pnl > 0
+            else "degraded_or_negative_realized_net_pnl_source"
+        ),
+        "recommended_stage": stage,
+        "realized_net_pnl": row.get("realized_net_pnl"),
+        "weight_multiplier": min(_safe_float(row.get("weight_multiplier"), 1.0), 1.0),
+        "requires_top_bucket_positive_confirmation": True,
+        "can_change_model_routing": False,
+    }
+
+
+def _exit_plan_reference_report(closed_positions: Sequence[Any]) -> dict[str, Any]:
+    missing_ids: list[int] = []
+    present = 0
+    for row in closed_positions:
+        if _position_exit_plan_id(row):
+            present += 1
+            continue
+        row_id = _safe_int(_row_get(row, "id"))
+        if row_id > 0:
+            missing_ids.append(row_id)
+    total = len(list(closed_positions))
+    missing = max(total - present, 0)
+    return {
+        "checked_count": total,
+        "present_count": present,
+        "missing_count": missing,
+        "coverage_ratio": round(present / total, 6) if total else 0.0,
+        "missing_position_ids": missing_ids[:50],
+        "clean_attribution_ready": bool(total > 0 and missing == 0),
+        "training_attribution_blocker": bool(missing > 0),
+        "policy": "closed_trade_training_requires_profit_first_exit_plan_reference",
+    }
+
+
+def _position_exit_plan_id(row: Any) -> str:
+    raw = _safe_dict(_row_get(row, "entry_raw") or _row_get(row, "raw_llm_response"))
+    plan = _safe_dict(raw.get("profit_first_trade_plan"))
+    exit_plan = _safe_dict(raw.get("profit_first_exit_plan"))
+    reference = _safe_dict(raw.get("profit_first_exit_reference"))
+    close_evidence = _safe_dict(raw.get("close_evidence"))
+    for value in (
+        _row_get(row, "profit_first_exit_plan_id"),
+        reference.get("exit_plan_id"),
+        close_evidence.get("profit_first_exit_plan_id"),
+        exit_plan.get("exit_plan_id"),
+        plan.get("exit_plan_id"),
+        raw.get("profit_first_exit_plan_id"),
+        raw.get("exit_plan_id"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _profit_acceptance_report(
+    *,
+    closed_positions: Sequence[Any],
+    strategy_feedback: list[dict[str, Any]],
+    source_feedback: list[dict[str, Any]],
+    side_feedback: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    pnls = [_safe_float(_row_get(row, "realized_pnl"), 0.0) for row in closed_positions]
+    wins = [value for value in pnls if value > 0]
+    losses = [abs(value) for value in pnls if value < 0]
+    profit = sum(wins)
+    loss = sum(losses)
+    return {
+        "window_closed_trade_count": len(pnls),
+        "net_pnl": round(sum(pnls), 6),
+        "profit_factor": round(profit / loss, 6) if loss > 0 else (999.0 if profit > 0 else 0.0),
+        "avg_win": round(profit / len(wins), 6) if wins else 0.0,
+        "avg_loss": round(loss / len(losses), 6) if losses else 0.0,
+        "side_contribution": {
+            side: {
+                "realized_net_pnl": row.get("realized_net_pnl"),
+                "weight_multiplier": row.get("weight_multiplier"),
+                "recommended_stage": row.get("recommended_stage"),
+            }
+            for side, row in side_feedback.items()
+        },
+        "promoted_strategies": [
+            row
+            for row in strategy_feedback
+            if row.get("recommended_stage") in {"canary", "live_candidate"}
+        ][:12],
+        "demoted_strategies": [
+            row
+            for row in strategy_feedback
+            if row.get("recommended_stage") in {"demote", "disable"}
+        ][:12],
+        "promoted_sources": [
+            row for row in source_feedback if row.get("recommended_stage") == "promote"
+        ][:12],
+        "demoted_sources": [
+            row for row in source_feedback if row.get("recommended_stage") == "demote"
+        ][:12],
+        "before_after_available": False,
+        "before_after_note": "current rolling window only; compare with previous reports for lift",
+    }
 
 
 def _linked_exchange_order_ids(positions: Sequence[Any]) -> set[str]:

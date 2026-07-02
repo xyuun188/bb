@@ -41,6 +41,7 @@ from services.okx_error_classifier import is_okx_temporary_service_error
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.position_open_time import parse_position_time, position_open_time
 from services.position_quality import PositionQualityScorer
+from services.profit_first_ranking import ProfitFirstRankingService
 from services.runtime_entry_filters import RuntimeEntryFilters, default_entry_filters
 from services.shadow_missed_opportunity_closed_loop import summarize_shadow_missed_opportunities
 from services.text_integrity import sanitize_runtime_text
@@ -256,6 +257,93 @@ def _safe_list(value: Any) -> list[Any]:
 
 def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
+
+
+def _profit_first_feedback_can_influence_context(value: dict[str, Any]) -> bool:
+    feedback = _safe_dict(value)
+    return bool(
+        feedback
+        and feedback.get("can_influence_strategy_context")
+        and not feedback.get("live_mutation")
+        and not feedback.get("live_weight_mutation")
+        and not feedback.get("live_sizing_mutation")
+        and not feedback.get("can_submit_orders")
+        and not feedback.get("can_increase_live_size")
+    )
+
+
+def _merge_profit_first_side_weights(
+    base_weights: dict[str, Any],
+    profit_first_feedback: dict[str, Any],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for side in ("long", "short"):
+        if side in base_weights:
+            result[side] = round(_clamp(_safe_float(base_weights.get(side), 1.0), 0.25, 1.40), 6)
+    if not _profit_first_feedback_can_influence_context(profit_first_feedback):
+        return result
+    feedback_weights = _safe_dict(profit_first_feedback.get("side_weights"))
+    for side in ("long", "short"):
+        if side not in feedback_weights:
+            continue
+        base = _safe_float(result.get(side), 1.0)
+        feedback_weight = _clamp(_safe_float(feedback_weights.get(side), 1.0), 0.45, 1.12)
+        result[side] = round(_clamp(base * feedback_weight, 0.25, 1.40), 6)
+    return result
+
+
+def _compact_profit_first_runtime_feedback(value: dict[str, Any]) -> dict[str, Any]:
+    feedback = _safe_dict(value)
+    if not feedback:
+        return {}
+    exit_reference = _safe_dict(feedback.get("exit_plan_reference"))
+    local_ml = _safe_dict(feedback.get("local_ml_live_influence"))
+    acceptance = _safe_dict(feedback.get("profit_acceptance"))
+    side_feedback = {
+        side: {
+            "count": row.get("count"),
+            "realized_net_pnl": row.get("realized_net_pnl"),
+            "profit_factor": row.get("profit_factor"),
+            "recommended_stage": row.get("recommended_stage"),
+            "weight_multiplier": row.get("weight_multiplier"),
+            "hard_ban": bool(row.get("hard_ban")),
+            "ranking_reasons": _safe_list(row.get("ranking_reasons"))[:6],
+        }
+        for side, row in _safe_dict(feedback.get("side_feedback")).items()
+        if isinstance(row, dict)
+    }
+    return {
+        "status": feedback.get("status"),
+        "objective": feedback.get("objective"),
+        "can_influence_strategy_context": bool(
+            feedback.get("can_influence_strategy_context")
+        ),
+        "side_weights": _safe_dict(feedback.get("side_weights")),
+        "side_feedback": side_feedback,
+        "exit_plan_reference": {
+            "checked_count": exit_reference.get("checked_count", 0),
+            "missing_count": exit_reference.get("missing_count", 0),
+            "coverage_ratio": exit_reference.get("coverage_ratio", 0.0),
+            "training_attribution_blocker": bool(
+                exit_reference.get("training_attribution_blocker")
+            ),
+        },
+        "local_ml_live_influence": {
+            "allow_live_entry_influence": bool(local_ml.get("allow_live_entry_influence")),
+            "eligible_for_shadow_to_canary_review": bool(
+                local_ml.get("eligible_for_shadow_to_canary_review")
+            ),
+            "reason": local_ml.get("reason", ""),
+        },
+        "profit_acceptance": {
+            "window_closed_trade_count": acceptance.get("window_closed_trade_count", 0),
+            "net_pnl": acceptance.get("net_pnl", 0.0),
+            "profit_factor": acceptance.get("profit_factor", 0.0),
+            "avg_win": acceptance.get("avg_win", 0.0),
+            "avg_loss": acceptance.get("avg_loss", 0.0),
+        },
+        "policy": _safe_dict(feedback.get("policy")),
+    }
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -730,6 +818,7 @@ class StrategyFeedback:
     trade_fact_quarantine: dict[str, Any]
     reflection_feedback: dict[str, Any]
     event_feedback: dict[str, Any]
+    profit_first_runtime_feedback: dict[str, Any]
     problems: list[dict[str, Any]]
     root_causes: list[str]
     training_policy: dict[str, Any]
@@ -749,6 +838,7 @@ class StrategyFeedback:
             "trade_fact_quarantine": self.trade_fact_quarantine,
             "reflection_feedback": self.reflection_feedback,
             "event_feedback": self.event_feedback,
+            "profit_first_runtime_feedback": self.profit_first_runtime_feedback,
             "problems": self.problems,
             "root_causes": self.root_causes,
             "training_policy": self.training_policy,
@@ -1041,6 +1131,13 @@ class StrategyFeedbackCompiler:
             event_feedback=event_feedback,
             reflection_feedback=reflection_feedback,
         )
+        profit_first_report = ProfitFirstRankingService().build_report(
+            decisions=decisions,
+            closed_positions=training_positions,
+        )
+        profit_first_runtime_feedback = _safe_dict(
+            profit_first_report.get("runtime_feedback")
+        )
         totals = {
             "closed_trade_count": len(positions),
             "training_trade_count": trade_count,
@@ -1075,6 +1172,7 @@ class StrategyFeedbackCompiler:
             trade_fact_quarantine=trade_fact_quarantine,
             reflection_feedback=reflection_feedback,
             event_feedback=event_feedback,
+            profit_first_runtime_feedback=profit_first_runtime_feedback,
             problems=problems,
             root_causes=root_causes,
             training_policy={
@@ -4001,7 +4099,20 @@ class StrategyLearningEngine:
         )
         result["probe_fraction"] = _safe_float(runtime.get("probe_fraction"), 0.0)
         result["max_probe_size_pct"] = _safe_float(runtime.get("max_probe_size_pct"), 0.0)
-        result["side_weights"] = _safe_dict(runtime.get("side_weights"))
+        profit_first_runtime_feedback = _safe_dict(
+            _safe_dict(payload.get("feedback")).get("profit_first_runtime_feedback")
+        )
+        result["profit_first_runtime_feedback"] = _compact_profit_first_runtime_feedback(
+            profit_first_runtime_feedback
+        )
+        result["side_weights"] = _merge_profit_first_side_weights(
+            _safe_dict(runtime.get("side_weights")),
+            profit_first_runtime_feedback,
+        )
+        result["profit_first_runtime_feedback_applied"] = bool(
+            _profit_first_feedback_can_influence_context(profit_first_runtime_feedback)
+            and _safe_dict(profit_first_runtime_feedback.get("side_weights"))
+        )
         entry_filters = _safe_dict(runtime.get("entry_filters"))
         default_filters = default_entry_filters(reason="strategy_learning_context_default")
         result["entry_filters"] = entry_filters
@@ -4024,6 +4135,10 @@ class StrategyLearningEngine:
             "max_probe_size_pct": result["max_probe_size_pct"],
             "side_overrides": _safe_dict(runtime.get("side_overrides")),
             "side_weights": result["side_weights"],
+            "profit_first_runtime_feedback_applied": result[
+                "profit_first_runtime_feedback_applied"
+            ],
+            "profit_first_runtime_feedback": result["profit_first_runtime_feedback"],
             "reason": schedule.get("reason", ""),
         }
         result["target_position_groups"] = _safe_int(runtime.get("target_position_groups"), 0)
@@ -4241,6 +4356,10 @@ class StrategyLearningEngine:
             "winner_hold_dynamic": result["winner_hold_dynamic"],
             "pullback_lock_enabled": result["pullback_lock_enabled"],
             "side_weights": result["side_weights"],
+            "profit_first_runtime_feedback": result["profit_first_runtime_feedback"],
+            "profit_first_runtime_feedback_applied": result[
+                "profit_first_runtime_feedback_applied"
+            ],
             "release_queue": release_queue[:8],
             "rebalance_queue": rebalance_queue,
             "low_quality_open_count": result["low_quality_open_count"],
@@ -4375,6 +4494,10 @@ class StrategyLearningService:
                     feedback.get("event_feedback"),
                     include_recent_details=True,
                 ),
+                "profit_first_runtime_feedback": feedback.get(
+                    "profit_first_runtime_feedback",
+                    {},
+                ),
                 "problems": _safe_list(feedback.get("problems"))[:10],
                 "root_causes": _safe_list(feedback.get("root_causes"))[:10],
                 "training_policy": feedback.get("training_policy", {}),
@@ -4501,6 +4624,7 @@ class StrategyLearningService:
             "open_position_pressure": feedback.open_position_pressure,
             "decision_quality": feedback.decision_quality,
             "shadow_feedback": feedback.shadow_feedback,
+            "profit_first_runtime_feedback": feedback.profit_first_runtime_feedback,
             "event_feedback": {
                 key: feedback.event_feedback.get(key)
                 for key in (

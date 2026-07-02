@@ -16,13 +16,14 @@ def _raw(
     strategy: str = "balanced_probe",
     lane: str = "validated_probe",
     sources: list[str] | None = None,
+    side: str = "long",
 ) -> dict:
     model_sources = sources or ["decision_llm", "server_profit"]
     return {
         "profit_first_trade_plan": {
             "plan_version": "profit-first-v3.1",
             "symbol": "BTC/USDT",
-            "side": "long",
+            "side": side,
             "strategy_profile_id": strategy,
             "decision_lane": lane,
             "expected_net_return_pct": 0.8,
@@ -47,18 +48,24 @@ def _position(
     lane: str = "validated_probe",
     source: str = "server_profit",
     closed_offset_minutes: int = 0,
+    side: str = "long",
 ) -> SimpleNamespace:
     closed_at = datetime(2026, 6, 29, 8, 0, tzinfo=UTC) + timedelta(minutes=closed_offset_minutes)
     return SimpleNamespace(
         id=idx,
         model_name="ensemble_trader",
         symbol="BTC/USDT",
-        side="long",
+        side=side,
         realized_pnl=pnl,
         fee=0.01,
         created_at=closed_at - timedelta(minutes=45),
         closed_at=closed_at,
-        entry_raw=_raw(strategy=strategy, lane=lane, sources=["decision_llm", source]),
+        entry_raw=_raw(
+            strategy=strategy,
+            lane=lane,
+            sources=["decision_llm", source],
+            side=side,
+        ),
     )
 
 
@@ -234,3 +241,87 @@ def test_profit_first_ranking_uses_okx_confirmed_linked_closed_position_facts() 
     assert report["summary"]["trusted_closed_position_count"] == 1
     assert report["summary"]["quarantined_closed_position_count"] == 0
     assert report["trade_fact_report"]["policy"] == "okx_confirmed_closed_positions_only"
+
+
+def test_profit_first_runtime_feedback_demotes_losing_short_without_hard_ban() -> None:
+    positions = [
+        *[
+            _position(idx, pnl=1.0, side="long", closed_offset_minutes=idx)
+            for idx in range(1, 5)
+        ],
+        *[
+            _position(
+                idx + 100,
+                pnl=-3.0,
+                side="short",
+                strategy="short_loss_loop",
+                closed_offset_minutes=idx + 100,
+            )
+            for idx in range(1, 5)
+        ],
+    ]
+
+    report = ProfitFirstRankingService(min_canary_samples=2).build_report(
+        decisions=[],
+        closed_positions=positions,
+    )
+
+    feedback = report["runtime_feedback"]
+    short = feedback["side_feedback"]["short"]
+    long = feedback["side_feedback"]["long"]
+
+    assert feedback["audit_only"] is True
+    assert feedback["live_mutation"] is False
+    assert feedback["live_weight_mutation"] is False
+    assert feedback["can_influence_strategy_context"] is True
+    assert short["recommended_stage"] == "demote"
+    assert short["weight_multiplier"] < 1.0
+    assert short["hard_ban"] is False
+    assert long["weight_multiplier"] >= 1.0
+    assert feedback["policy"]["side_weight_policy"] == (
+        "relative_window_realized_pnl_not_fixed_usdt_thresholds"
+    )
+
+
+def test_profit_first_runtime_feedback_reports_missing_exit_plan_reference() -> None:
+    clean = _position(1, pnl=1.0)
+    dirty = _position(2, pnl=-1.0)
+    dirty.entry_raw = {"profit_first_trade_plan": {"strategy_profile_id": "legacy"}}
+
+    report = ProfitFirstRankingService(min_canary_samples=1).build_report(
+        decisions=[],
+        closed_positions=[clean, dirty],
+    )
+
+    exit_reference = report["runtime_feedback"]["exit_plan_reference"]
+
+    assert report["summary"]["exit_plan_reference_missing_count"] == 1
+    assert exit_reference["checked_count"] == 2
+    assert exit_reference["missing_count"] == 1
+    assert exit_reference["training_attribution_blocker"] is True
+    assert dirty.id in exit_reference["missing_position_ids"]
+
+
+def test_profit_first_runtime_feedback_blocks_negative_local_ml_live_influence() -> None:
+    positions = [
+        _position(
+            idx,
+            pnl=-0.8,
+            source="local_ml",
+            closed_offset_minutes=idx,
+        )
+        for idx in range(1, 7)
+    ]
+
+    report = ProfitFirstRankingService().build_report(
+        decisions=[],
+        closed_positions=positions,
+    )
+
+    local_ml = report["runtime_feedback"]["local_ml_live_influence"]
+
+    assert local_ml["allow_live_entry_influence"] is False
+    assert local_ml["recommended_stage"] == "demote"
+    assert local_ml["realized_net_pnl"] < 0
+    assert local_ml["can_change_model_routing"] is False
+    assert local_ml["reason"] == "degraded_or_negative_realized_net_pnl_source"
