@@ -4140,6 +4140,65 @@ def test_market_round_time_budget_does_not_expand_in_hard_recovery(
     )
 
 
+def test_market_round_time_budget_expands_for_profit_first_quality_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    strategy_context = {
+        "risk_mode": "normal",
+        "portfolio_roster": {
+            "underfilled": False,
+            "gap": 0,
+            "current_position_groups": 5,
+            "target_position_groups": 5,
+            "market_symbol_min": 6,
+        },
+        "dynamic_position_capacity": {
+            "entry_limit": 6,
+            "open_group_count": 5,
+            "factors": {"rotation_slots": 1},
+        },
+        "strategy_learning_release_pressure_active": True,
+        "profit_first_runtime_feedback": {
+            "missed_opportunity_feedback": {
+                "entry_bias": "expand_quality_entries",
+            },
+            "profit_acceptance": {
+                "net_pnl": 3.2,
+                "profit_factor": 1.28,
+            },
+        },
+    }
+
+    assert (
+        service.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        > 27.0
+    )
+
+    progress = service._market_analysis_progress_snapshot(
+        symbol="BTC/USDT",
+        market_index=0,
+        market_total=8,
+        round_start=datetime.now(UTC) - timedelta(seconds=3),
+        market_ai_started_at=datetime.now(UTC) - timedelta(seconds=1),
+        strategy_context=strategy_context,
+    )
+
+    assert progress["market_round_time_budget_policy"] == "portfolio_roster_underfilled_extension"
+    assert progress["market_round_time_budget_seconds"] > progress[
+        "base_market_round_time_budget_seconds"
+    ]
+
+
 def test_parallel_loop_intervals_are_not_market_throttles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4191,6 +4250,46 @@ def test_position_round_watchdog_follows_position_review_cadence(
     assert service.position_review_stage_timeout_seconds() == 63.0
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
     assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
+
+
+def test_position_review_stage_timeout_expands_for_profit_first_and_release_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service._safe_list = TradingService._safe_list.__get__(service, TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._safe_int = TradingService._safe_int.__get__(service, TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
+
+    base_timeout = service.position_review_stage_timeout_seconds()
+    expanded = service._position_review_stage_timeout_seconds(
+        None,
+        strategy_context={
+            "strategy_learning_release_pressure_active": True,
+            "rotation_slots": 2,
+            "profit_first_runtime_feedback": {
+                "missed_opportunity_feedback": {
+                    "entry_bias": "expand_quality_entries",
+                },
+                "size_feedback": [
+                    {"sizing_bias": "quality_entries_can_expand_after_validation"}
+                ],
+            },
+        },
+        stage="position_review_decision",
+        symbol="BTC/USDT",
+    )
+
+    assert expanded > base_timeout
 
 
 @pytest.mark.asyncio

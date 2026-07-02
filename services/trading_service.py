@@ -965,11 +965,16 @@ class TradingService:
         base_budget = max(8.0, interval * 0.90)
         context = self._safe_dict(strategy_context)
         roster = self._safe_dict(context.get("portfolio_roster"))
+        capacity = self._safe_dict(context.get("dynamic_position_capacity"))
+        capacity_factors = self._safe_dict(capacity.get("factors"))
+        profit_first = self._safe_dict(context.get("profit_first_runtime_feedback"))
+        missed = self._safe_dict(profit_first.get("missed_opportunity_feedback"))
+        profit_acceptance = self._safe_dict(profit_first.get("profit_acceptance"))
         roster_underfilled = bool(roster.get("underfilled")) or self._safe_int(
             roster.get("gap"), 0
         ) > 0
         risk_mode = str(context.get("risk_mode") or "").lower()
-        if not roster_underfilled or risk_mode in {"hard_recovery", "defensive_recovery"}:
+        if risk_mode in {"hard_recovery", "defensive_recovery"}:
             return base_budget
 
         requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
@@ -980,8 +985,60 @@ class TradingService:
         target_symbols = min(max(target_symbols, 1), 8)
         per_symbol_floor = max(8.0, min(14.0, interval * 0.35))
         expanded_budget = max(base_budget, target_symbols * per_symbol_floor)
+        market_budget = base_budget
+        if roster_underfilled:
+            market_budget = max(market_budget, expanded_budget)
+
+        release_pressure_active = bool(
+            context.get("strategy_learning_release_pressure_active")
+            or self._safe_dict(context.get("strategy_learning_sizing")).get(
+                "release_pressure_active"
+            )
+        )
+        available_slots = max(
+            self._safe_int(context.get("max_open_positions_entry"), 0),
+            self._safe_int(capacity.get("entry_limit"), 0),
+        )
+        open_groups = max(
+            self._safe_int(roster.get("current_position_groups"), 0),
+            self._safe_int(capacity.get("open_group_count"), 0),
+        )
+        remaining_slots = (
+            max(available_slots - open_groups, 0) if available_slots > 0 else 0
+        )
+        rotation_slots = max(
+            self._safe_int(context.get("rotation_slots"), 0),
+            self._safe_int(roster.get("rotation_slots"), 0),
+            self._safe_int(capacity_factors.get("rotation_slots"), 0),
+            self._safe_int(capacity_factors.get("strategy_rotation_slots"), 0),
+        )
+        quality_expand_signal = bool(
+            missed.get("entry_bias") == "expand_quality_entries"
+            or self._safe_float(profit_acceptance.get("profit_factor"), 0.0) >= 1.15
+            or self._safe_float(profit_acceptance.get("net_pnl"), 0.0) > 0.0
+        )
+        if quality_expand_signal:
+            quality_target_symbols = min(
+                max(target_symbols, roster_symbol_min, 4) + (1 if requested_symbols >= 6 else 0),
+                max(8, requested_symbols or 8),
+            )
+            quality_expanded_budget = max(
+                market_budget,
+                quality_target_symbols * max(per_symbol_floor, 9.5),
+            )
+            market_budget = quality_expanded_budget
+
+        if release_pressure_active and remaining_slots <= max(rotation_slots, 1):
+            market_budget = max(
+                market_budget,
+                base_budget * 1.20,
+            )
+
+        if not roster_underfilled and not quality_expand_signal and not release_pressure_active:
+            return base_budget
+
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
-        return min(expanded_budget, watchdog_ceiling)
+        return min(market_budget, watchdog_ceiling)
 
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
@@ -1443,12 +1500,55 @@ class TradingService:
         deadline: float | None,
         *,
         fallback_timeout: float | None = None,
+        strategy_context: dict[str, Any] | None = None,
+        stage: str | None = None,
+        symbol: str | None = None,
     ) -> float:
-        stage_timeout = max(0.25, float(fallback_timeout or self.position_review_stage_timeout_seconds()))
+        stage_timeout = max(
+            0.25,
+            float(fallback_timeout or self.position_review_stage_timeout_seconds()),
+        )
+        context = self._safe_dict(strategy_context)
+        profit_first = self._safe_dict(context.get("profit_first_runtime_feedback"))
+        missed = self._safe_dict(profit_first.get("missed_opportunity_feedback"))
+        sizing_feedback = [
+            self._safe_dict(row) for row in self._safe_list(profit_first.get("size_feedback"))
+        ]
+        capacity = self._safe_dict(context.get("dynamic_position_capacity"))
+        capacity_factors = self._safe_dict(capacity.get("factors"))
+        release_pressure_active = bool(
+            context.get("strategy_learning_release_pressure_active")
+            or self._safe_dict(context.get("strategy_learning_sizing")).get(
+                "release_pressure_active"
+            )
+        )
+        if (
+            str(stage or "").lower() in {"position_review_decision", "position_feature_refresh"}
+            and (
+                missed.get("entry_bias") == "expand_quality_entries"
+                or any(
+                    str(row.get("sizing_bias") or "")
+                    == "quality_entries_can_expand_after_validation"
+                    for row in sizing_feedback
+                )
+            )
+        ):
+            stage_timeout *= 1.12
+        if release_pressure_active:
+            stage_timeout *= 1.10
+        if max(
+            self._safe_int(context.get("rotation_slots"), 0),
+            self._safe_int(capacity_factors.get("rotation_slots"), 0),
+            self._safe_int(capacity_factors.get("strategy_rotation_slots"), 0),
+        ) > 0:
+            stage_timeout *= 1.06
         remaining = self._remaining_monotonic_seconds(deadline)
         if remaining is None:
             return stage_timeout
-        reserve = min(2.0, max(0.25, stage_timeout * 0.03), remaining * 0.25)
+        reserve_ratio = 0.25
+        if release_pressure_active or str(stage or "").lower() == "position_review_decision":
+            reserve_ratio = 0.18
+        reserve = min(2.0, max(0.25, stage_timeout * 0.03), remaining * reserve_ratio)
         return max(0.0, min(stage_timeout, remaining - reserve))
 
     def _append_position_review_budget_warning(
@@ -7342,7 +7442,10 @@ class TradingService:
             )
         for (model_name, symbol), positions in grouped_items:
             group_timeout = self._position_review_stage_timeout_seconds(
-                round_deadline_monotonic
+                round_deadline_monotonic,
+                strategy_context=strategy_mode_context,
+                stage="position_review_group",
+                symbol=symbol,
             )
             if round_deadline_monotonic is not None and group_timeout <= 0:
                 self._append_position_review_budget_warning(
@@ -7371,6 +7474,9 @@ class TradingService:
                 feature_timeout = self._position_review_stage_timeout_seconds(
                     round_deadline_monotonic,
                     fallback_timeout=AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS,
+                    strategy_context=strategy_mode_context,
+                    stage="position_feature_refresh",
+                    symbol=normalized_symbol or symbol,
                 )
                 if round_deadline_monotonic is not None and feature_timeout <= 0:
                     self._append_position_review_budget_warning(
@@ -7408,6 +7514,16 @@ class TradingService:
                             ),
                         )
                         break
+                    results.setdefault("warnings", []).append(
+                        {
+                            "model": model_name,
+                            "symbol": normalized_symbol or symbol,
+                            "warning": (
+                                "持仓复盘中该币种行情刷新超时，系统已先跳过这一组并继续处理其他持仓；"
+                                "下一轮会用最新行情重试。"
+                            ),
+                        }
+                    )
                     fv = None
                 except Exception as exc:
                     logger.debug(
@@ -7447,7 +7563,10 @@ class TradingService:
 
             try:
                 decision_timeout = self._position_review_stage_timeout_seconds(
-                    round_deadline_monotonic
+                    round_deadline_monotonic,
+                    strategy_context=strategy_mode_context,
+                    stage="position_review_decision",
+                    symbol=normalized_symbol or symbol,
                 )
                 if round_deadline_monotonic is not None and decision_timeout <= 0:
                     self._append_position_review_budget_warning(
@@ -7495,7 +7614,24 @@ class TradingService:
                     symbol=symbol,
                     timeout_seconds=round(decision_timeout, 3),
                 )
-                break
+                remaining_seconds = self._remaining_monotonic_seconds(round_deadline_monotonic)
+                if (
+                    round_deadline_monotonic is not None
+                    and remaining_seconds is not None
+                    and remaining_seconds <= 1.5
+                ):
+                    break
+                results.setdefault("warnings", []).append(
+                    {
+                        "model": model_name,
+                        "symbol": normalized_symbol or symbol,
+                        "warning": (
+                            "持仓复盘中该币种决策超时，系统已先跳过这一组并继续处理其他持仓；"
+                            "下一轮会结合最新持仓和行情重新复盘。"
+                        ),
+                    }
+                )
+                continue
             except Exception as e:
                 logger.error(
                     "review position decide failed",
