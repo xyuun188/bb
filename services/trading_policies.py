@@ -19,6 +19,10 @@ from services.profit_first_stage2 import DefensiveProbeShadowPolicy, RecentProbe
 from services.profit_first_trade_plan import attach_profit_first_trade_plan
 
 
+def _safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
 @dataclass(slots=True)
 class PolicyGateResult:
     passed: bool
@@ -111,6 +115,53 @@ class EntryPolicy:
             return None
         return self.entry_priority.immediate_execution_reason(decision)
 
+    @staticmethod
+    def _entry_evidence_advisory(decision: DecisionOutput) -> dict[str, Any]:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
+        if not isinstance(opportunity, dict):
+            return {}
+        evidence_score = opportunity.get("evidence_score")
+        if not isinstance(evidence_score, dict):
+            return {}
+
+        advisory = {
+            "evidence_tier": str(evidence_score.get("tier") or ""),
+            "effective_score": float(evidence_score.get("effective_score") or 0.0),
+            "tradeable_probe": bool(evidence_score.get("tradeable_probe")),
+            "shadow_only": bool(evidence_score.get("shadow_only")),
+            "advisory_wait_reasons": list(
+                item for item in _safe_list(evidence_score.get("advisory_wait_reasons")) if item
+            )[:6],
+            "hard_block": bool(evidence_score.get("hard_block")),
+        }
+        return advisory
+
+    @classmethod
+    def _attach_entry_evidence_advisory(cls, decision: DecisionOutput) -> tuple[str, dict[str, Any]]:
+        advisory = cls._entry_evidence_advisory(decision)
+        evidence_tier = str(advisory.get("evidence_tier") or "")
+        if evidence_tier not in {"weak_conflict_probe", "degraded_missing_probe"}:
+            return evidence_tier, advisory
+
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
+        if not isinstance(opportunity, dict):
+            return evidence_tier, advisory
+
+        opportunity["entry_evidence_advisory"] = {
+            "applied": True,
+            "policy": "weak_evidence_is_soft_advisory_before_unified_profit_adjudication",
+            "reason": (
+                "动态证据仍偏弱，但不再在证据层直接终止开仓；"
+                "会保留弱证据标签、仓位约束和风险提示，继续进入统一收益裁决。"
+            ),
+            **advisory,
+        }
+        raw["opportunity_score"] = opportunity
+        decision.raw_response = raw
+        return evidence_tier, advisory
+
     def wait_sort_reason(
         self,
         decision: DecisionOutput,
@@ -131,6 +182,7 @@ class EntryPolicy:
             raise RuntimeError("EntryPolicy requires entry_opportunity_gate dependency")
         if self.entry_opportunity_score is not None:
             self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
+        self._attach_entry_evidence_advisory(decision)
         return self.entry_opportunity_gate.gate_reason(decision)
 
     def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
@@ -258,41 +310,23 @@ class EntryPolicy:
                     **(defensive_probe_shadow.data or {}),
                 },
             )
+        evidence_tier, entry_evidence_advisory = self._attach_entry_evidence_advisory(decision)
         evidence_score = {}
-        opportunity = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity_data = (
-            opportunity.get("opportunity_score") if isinstance(opportunity, dict) else {}
-        )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        opportunity_data = raw.get("opportunity_score") if isinstance(raw, dict) else {}
         if isinstance(opportunity_data, dict) and isinstance(
             opportunity_data.get("evidence_score"), dict
         ):
             evidence_score = opportunity_data["evidence_score"]
-        evidence_tier = str(evidence_score.get("tier") or "")
-        weak_shadow_tiers = {"weak_conflict_probe", "degraded_missing_probe"}
-        if evidence_tier in weak_shadow_tiers:
-            return PolicyGateResult.block(
-                "entry_evidence_shadow_only",
-                (
-                    "动态证据仍处于弱证据学习档，本轮只记录影子样本和复盘数据，"
-                    "不提交 OKX 真实/模拟订单；需要更多同向模型证据或更高预期收益后再开仓。"
-                ),
-                {
-                    "pipeline_context": context.public_data(),
-                    "stage_status": "skipped",
-                    "skip_kind": "entry_evidence_shadow_only",
-                    "shadow_only": True,
-                    "evidence_tier": evidence_tier,
-                    "evidence_score": evidence_score,
-                    "legacy_tradeable_probe": bool(evidence_score.get("tradeable_probe")),
-                    "position_size_pct_before_block": float(decision.position_size_pct or 0.0),
-                },
-            )
-        if decision.position_size_pct <= 0 or evidence_tier == "blocked":
+        if decision.position_size_pct <= 0 or (
+            evidence_tier == "blocked" and not bool(evidence_score.get("tradeable_probe"))
+        ):
             return PolicyGateResult.block(
                 "entry_evidence_wait",
                 (
-                    "动态证据不足，本轮保持观望或极小探针，未提交 OKX 订单；"
-                    "下一轮会根据最新市场与模型证据重新评估。"
+                    "动态证据仍未达到可执行状态：当前仓位预算已收敛为 0，"
+                    "或有效证据层级仍为 blocked 且没有被统一收益裁决提升。"
+                    "本轮不提交 OKX 订单，下一轮会用最新市场与模型证据重新评估。"
                 ),
                 {
                     "pipeline_context": context.public_data(),
@@ -300,6 +334,7 @@ class EntryPolicy:
                     "skip_kind": "entry_evidence_wait",
                     "evidence_tier": evidence_tier,
                     "evidence_score": evidence_score,
+                    "entry_evidence_advisory": entry_evidence_advisory,
                 },
             )
         gate_reason = self.gate_reason(decision)

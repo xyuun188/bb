@@ -3110,7 +3110,7 @@ async def test_entry_policy_scores_missing_opportunity_before_sizing_and_gate() 
 
 
 @pytest.mark.asyncio
-async def test_entry_policy_keeps_weak_evidence_shadow_only_even_with_size() -> None:
+async def test_entry_policy_keeps_weak_evidence_as_advisory_even_with_size() -> None:
     calls: list[str] = []
     decision = _decision(Action.LONG)
     decision.position_size_pct = 0.018
@@ -3148,16 +3148,16 @@ async def test_entry_policy_keeps_weak_evidence_shadow_only_even_with_size() -> 
 
     result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
 
-    assert result.passed is False
-    assert result.blocker == "entry_evidence_shadow_only"
-    assert result.data["shadow_only"] is True
-    assert result.data["skip_kind"] == "entry_evidence_shadow_only"
-    assert result.data["position_size_pct_before_block"] == 0.018
-    assert calls == ["sizing"]
+    assert result.passed is True
+    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
+    assert advisory["applied"] is True
+    assert advisory["evidence_tier"] == "weak_conflict_probe"
+    assert advisory["shadow_only"] is False
+    assert calls == ["sizing", "gate"]
 
 
 @pytest.mark.asyncio
-async def test_entry_policy_blocks_legacy_positive_net_tradeable_probe() -> None:
+async def test_entry_policy_allows_positive_net_tradeable_probe_to_continue() -> None:
     calls: list[str] = []
     decision = _decision(Action.LONG)
     decision.position_size_pct = 0.018
@@ -3197,10 +3197,58 @@ async def test_entry_policy_blocks_legacy_positive_net_tradeable_probe() -> None
 
     result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
 
+    assert result.passed is True
+    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
+    assert advisory["applied"] is True
+    assert advisory["tradeable_probe"] is True
+    assert calls == ["sizing", "gate"]
+
+
+@pytest.mark.asyncio
+async def test_entry_policy_blocks_blocked_evidence_without_tradeable_probe() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.018
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.92,
+            "min_score_required": 0.7,
+            "expected_net_return_pct": 0.24,
+            "profit_quality_ratio": 0.3,
+            "tail_risk_score": 0.62,
+            "success_probability": 0.46,
+            "evidence_score": {
+                "tier": "blocked",
+                "effective_score": 34.0,
+                "size_multiplier": 0.0,
+                "tradeable_probe": False,
+            },
+        }
+    }
+
+    async def fake_sizing(sized_decision, model_mode, open_positions):
+        calls.append("sizing")
+        assert model_mode == "paper"
+        assert open_positions == []
+        assert sized_decision.position_size_pct > 0
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            calls.append("gate")
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
     assert result.passed is False
-    assert result.blocker == "entry_evidence_shadow_only"
-    assert result.data["shadow_only"] is True
-    assert result.data["legacy_tradeable_probe"] is True
+    assert result.blocker == "entry_evidence_wait"
+    assert result.data["skip_kind"] == "entry_evidence_wait"
+    assert result.data["evidence_tier"] == "blocked"
+    assert "动态证据仍未达到可执行状态" in (result.reason or "")
     assert calls == ["sizing"]
 
 
@@ -3311,6 +3359,44 @@ def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_caller
 
     assert policy.gate_reason(decision) is None
     assert calls == ["score", "gate"]
+
+
+def test_entry_policy_gate_reason_attaches_weak_evidence_advisory_for_prefilter_callers() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.88,
+            "min_score_required": 0.7,
+            "expected_net_return_pct": 0.24,
+            "profit_quality_ratio": 0.42,
+            "tail_risk_score": 0.52,
+            "success_probability": 0.49,
+            "evidence_score": {
+                "tier": "weak_conflict_probe",
+                "effective_score": 39.0,
+                "tradeable_probe": False,
+                "shadow_only": True,
+                "advisory_wait_reasons": ["waiting for more aligned evidence"],
+            },
+        }
+    }
+
+    class FakeGate:
+        def gate_reason(self, gated_decision):
+            calls.append("gate")
+            advisory = gated_decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
+            assert advisory["applied"] is True
+            assert advisory["evidence_tier"] == "weak_conflict_probe"
+            return None
+
+    policy = EntryPolicy(entry_opportunity_gate=FakeGate())
+
+    assert policy.gate_reason(decision) is None
+    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
+    assert advisory["shadow_only"] is True
+    assert advisory["advisory_wait_reasons"] == ["waiting for more aligned evidence"]
+    assert calls == ["gate"]
 
 
 def test_entry_policy_uses_injected_abnormal_wick_guard_boundary():

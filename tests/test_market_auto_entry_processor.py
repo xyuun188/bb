@@ -9,10 +9,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
-from services.market_auto_entry_processor import (
-    ENTRY_EVIDENCE_SHADOW_ONLY_REASON,
-    MarketAutoEntryProcessor,
-)
+from services.market_auto_entry_processor import MarketAutoEntryProcessor
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 
@@ -176,7 +173,7 @@ def _processor(
 
 
 @pytest.mark.asyncio
-async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> None:
+async def test_market_auto_entry_processor_allows_weak_evidence_probe_to_continue() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
     decision = _decision()
@@ -192,7 +189,11 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
         }
     }
 
-    result = await _processor(calls, execution_result=_filled_result()).process(
+    result = await _processor(
+        calls,
+        immediate_reason="继续执行弱证据探针",
+        execution_result=_filled_result(),
+    ).process(
         symbol="BTC/USDT",
         model_name="ensemble_trader",
         decision=decision,
@@ -206,19 +207,21 @@ async def test_market_auto_entry_processor_keeps_weak_evidence_shadow_only() -> 
     )
 
     assert result.handled is True
-    assert result.execution_attempted is False
-    assert result.reason == ENTRY_EVIDENCE_SHADOW_ONLY_REASON
-    assert results["decisions"][0]["execution_status"] == "skipped"
-    assert decision.raw_response["entry_evidence_shadow_only"]["shadow_only"] is True
-    machine = decision.raw_response["decision_state_machine"]
-    assert machine["current_stage"] == DecisionStage.RISK_CHECK
-    assert machine["current_status"] == DecisionStageStatus.SKIPPED
-    assert ("reason", 12, ENTRY_EVIDENCE_SHADOW_ONLY_REASON) in calls
-    assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is True
+    assert result.reason == "继续执行弱证据探针"
+    assert results["decisions"] == []
+    assert "entry_evidence_shadow_only" not in decision.raw_response
+    assert decision.raw_response["candidate_selection"]["selected"] is True
+    assert ("immediate", "BTC/USDT") in calls
+    assert ("reserve", "ensemble_trader", "BTC/USDT") in calls
+    assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
+    assert ("ensure", 12, "BTC/USDT", "ensemble_trader", "long") in calls
+    assert not any(call[0] == "reason" for call in calls)
 
 
 @pytest.mark.asyncio
-async def test_market_auto_entry_processor_blocks_legacy_tradeable_weak_probe() -> None:
+async def test_market_auto_entry_processor_keeps_legacy_tradeable_weak_probe_executable() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
     decision = _decision()
@@ -236,7 +239,11 @@ async def test_market_auto_entry_processor_blocks_legacy_tradeable_weak_probe() 
         }
     }
 
-    result = await _processor(calls, execution_result=_filled_result()).process(
+    result = await _processor(
+        calls,
+        immediate_reason="执行可交易弱证据探针",
+        execution_result=_filled_result(),
+    ).process(
         symbol="BTC/USDT",
         model_name="ensemble_trader",
         decision=decision,
@@ -250,12 +257,16 @@ async def test_market_auto_entry_processor_blocks_legacy_tradeable_weak_probe() 
     )
 
     assert result.handled is True
-    assert result.execution_attempted is False
-    assert result.reason == ENTRY_EVIDENCE_SHADOW_ONLY_REASON
-    shadow = decision.raw_response["entry_evidence_shadow_only"]
-    assert shadow["applied"] is True
-    assert shadow["legacy_tradeable_probe"] is True
-    assert not any(call[0] in {"immediate", "reserve", "execute"} for call in calls)
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is True
+    assert result.reason == "执行可交易弱证据探针"
+    assert "entry_evidence_shadow_only" not in decision.raw_response
+    assert decision.raw_response["candidate_selection"]["selected"] is True
+    assert ("immediate", "BTC/USDT") in calls
+    assert ("reserve", "ensemble_trader", "BTC/USDT") in calls
+    assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
+    assert ("ensure", 12, "BTC/USDT", "ensemble_trader", "long") in calls
+    assert not any(call[0] == "reason" for call in calls)
 
 
 @pytest.mark.asyncio
