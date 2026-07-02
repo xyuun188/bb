@@ -240,6 +240,29 @@ def _healthy_decision(action: str, *, executed: bool = False) -> SimpleNamespace
     )
 
 
+def _no_entry_decision(
+    action: str = "long",
+    *,
+    reason: str = "profit_insufficient",
+    shadow_return_pct: float = 1.2,
+    missed_opportunity_count: int = 6,
+) -> SimpleNamespace:
+
+    raw = _profit_first_entry_raw(side="long" if action == "long" else "short")
+    raw["shadow_outcome"] = {"shadow_return_pct": shadow_return_pct}
+    raw["review_feedback"] = {"missed_opportunity_count": missed_opportunity_count}
+    raw["no_entry_reason"] = reason
+    raw["model_timings"] = COMPLETED_EXPERT_TIMINGS
+    return SimpleNamespace(
+        action=action,
+        analysis_type="market",
+        was_executed=False,
+        execution_reason=reason,
+        created_at=datetime.now(UTC),
+        raw_llm_response=raw,
+    )
+
+
 def _strategy_event(
     event_type: str,
     *,
@@ -606,6 +629,63 @@ def test_strategy_learning_applies_profit_first_runtime_side_feedback(tmp_path) 
     assert context["side_weights"]["long"] >= 1.0
     assert context["profit_first_runtime_feedback"]["exit_plan_reference"]["missing_count"] == 0
     assert context["strategy_learning_sizing"]["profit_first_runtime_feedback_applied"] is True
+
+
+def test_strategy_learning_profit_first_runtime_guidance_drives_candidates_and_runtime(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    early_exit = _position(
+        side="long",
+        pnl=-0.9,
+        position_id=301,
+        entry_raw=_profit_first_entry_raw(side="long"),
+    )
+    early_exit.reason = "early exit after shallow noise"
+    tiny_probe = _position(
+        side="long",
+        pnl=-0.4,
+        position_id=302,
+        entry_raw=_profit_first_entry_raw(side="long"),
+    )
+    tiny_probe.entry_raw["profit_first_trade_plan"]["position_size_pct"] = 0.01
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[early_exit, tiny_probe],
+        open_positions=[],
+        orders=[],
+        decisions=[
+            _no_entry_decision("long"),
+            _no_entry_decision("long", shadow_return_pct=0.9, missed_opportunity_count=8),
+            _no_entry_decision("long", shadow_return_pct=1.5, missed_opportunity_count=7),
+        ],
+        shadows=[],
+        memories=[],
+        max_open_positions=20,
+    )
+    context = engine.apply_to_context({"min_opportunity_score": 1.0}, payload)
+    candidate_ids = {
+        row["id"] for row in payload["schedule"]["candidates"] if isinstance(row, dict)
+    }
+    profit_first_context = context["strategy_learning"]["profit_first_context"]
+
+    assert "quality_entry_recovery" in candidate_ids
+    assert "winner_hold" in candidate_ids
+    assert profit_first_context["missed_opportunity_feedback"]["diagnosis"] == (
+        "system_over_conservative_review"
+    )
+    assert "missed_positive_shadow_relaxed_entry_reference" in profit_first_context[
+        "applied_reasons"
+    ]
+    assert "exit_feedback_requests_longer_winner_hold" in profit_first_context["applied_reasons"]
+    assert context["winner_hold_extension"] == "high"
+    assert context["profit_lock_min_usdt_multiplier"] > 1.0
+    assert context["strategy_learning_sizing"]["profit_first_context"]["applied_reasons"]
 
 
 def test_strategy_learning_low_quality_open_positions_trigger_loss_release(tmp_path) -> None:

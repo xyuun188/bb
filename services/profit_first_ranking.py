@@ -95,6 +95,7 @@ class ProfitFirstRankingService:
             source_rows=source_rows,
             closed_positions=positions_list,
             trade_fact_report=fact_report,
+            brain_recommendations=_safe_dict(brain.get("recommendations")),
         )
         summary = {
             "decision_count": len(decisions_list),
@@ -170,11 +171,24 @@ class ProfitFirstRankingService:
         source_rows: list[dict[str, Any]],
         closed_positions: Sequence[Any],
         trade_fact_report: dict[str, Any],
+        brain_recommendations: dict[str, Any],
     ) -> dict[str, Any]:
         side_feedback = _side_runtime_feedback(closed_positions)
         exit_plan_reference = _exit_plan_reference_report(closed_positions)
         strategy_feedback = _strategy_runtime_feedback(strategy_rows)
         source_feedback = _source_runtime_feedback(source_rows)
+        lane_feedback = _lane_runtime_feedback(
+            _safe_list(brain_recommendations.get("lane_threshold_recommendations"))
+        )
+        size_feedback = _size_runtime_feedback(
+            _safe_list(brain_recommendations.get("size_promotion_demotion"))
+        )
+        missed_opportunity_feedback = _missed_opportunity_runtime_feedback(
+            _safe_dict(brain_recommendations.get("no_entry_governance"))
+        )
+        exit_feedback = _exit_runtime_feedback(
+            _safe_dict(brain_recommendations.get("losing_exit_governance"))
+        )
         acceptance = _profit_acceptance_report(
             closed_positions=closed_positions,
             strategy_feedback=strategy_feedback,
@@ -194,6 +208,11 @@ class ProfitFirstRankingService:
             "can_change_strategy_weight": False,
             "can_increase_live_size": False,
             "can_influence_strategy_context": True,
+            "objective_basis": {
+                "metric": "closed_position_realized_pnl",
+                "cost_policy": "optimize_realized_net_pnl_after_recorded_costs",
+                "window_policy": "rolling_closed_position_window",
+            },
             "side_weights": {
                 side: row["weight_multiplier"]
                 for side, row in side_feedback.items()
@@ -202,6 +221,10 @@ class ProfitFirstRankingService:
             "side_feedback": side_feedback,
             "strategy_profile_feedback": strategy_feedback[:40],
             "source_weight_feedback": source_feedback[:40],
+            "lane_feedback": lane_feedback[:24],
+            "size_feedback": size_feedback[:24],
+            "missed_opportunity_feedback": missed_opportunity_feedback,
+            "exit_feedback": exit_feedback[:24],
             "local_ml_live_influence": _local_ml_live_influence(source_feedback),
             "exit_plan_reference": exit_plan_reference,
             "profit_acceptance": acceptance,
@@ -669,6 +692,128 @@ def _local_ml_live_influence(source_feedback: list[dict[str, Any]]) -> dict[str,
         "requires_top_bucket_positive_confirmation": True,
         "can_change_model_routing": False,
     }
+
+
+def _lane_runtime_feedback(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = _safe_dict(row)
+        recommendation = str(item.get("recommendation") or "")
+        bias = "observe"
+        if recommendation in {
+            "allow_lane_promotion_review",
+            "review_shadow_to_tiny_or_validated_thresholds",
+        }:
+            bias = "expand_quality_entries"
+        elif recommendation in {
+            "tighten_or_keep_lane_threshold",
+            "pause_or_raise_quality_floor_for_tiny_probe",
+        }:
+            bias = "tighten_or_limit_weak_entries"
+        result.append(
+            {
+                "lane": item.get("lane"),
+                "recommendation": recommendation,
+                "reason": item.get("reason"),
+                "count": item.get("count"),
+                "realized_net_pnl": item.get("realized_net_pnl"),
+                "profit_factor": item.get("profit_factor"),
+                "entry_bias": bias,
+                "live_mutation": False,
+            }
+        )
+    return result
+
+
+def _size_runtime_feedback(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = _safe_dict(row)
+        recommendation = str(item.get("recommendation") or "")
+        bias = "observe"
+        if recommendation == "eligible_for_budget_increase_after_operator_gate":
+            bias = "quality_entries_can_expand_after_validation"
+        elif recommendation in {
+            "reduce_or_disable_budget",
+            "do_not_continue_tiny_size_when_fee_drag_losses_repeat",
+        }:
+            bias = "reduce_weak_or_fee_drag_size"
+        elif recommendation == "keep_shadow_or_sampling_size":
+            bias = "keep_sampling_size"
+        result.append(
+            {
+                "model_name": item.get("model_name"),
+                "strategy_profile_id": item.get("strategy_profile_id"),
+                "symbol": item.get("symbol"),
+                "side": item.get("side"),
+                "decision_lane": item.get("decision_lane"),
+                "recommended_stage": item.get("recommended_stage"),
+                "recommendation": recommendation,
+                "sizing_bias": bias,
+                "evidence": _safe_dict(item.get("evidence")),
+                "live_mutation": False,
+            }
+        )
+    return result
+
+
+def _missed_opportunity_runtime_feedback(no_entry_governance: dict[str, Any]) -> dict[str, Any]:
+    governance = _safe_dict(no_entry_governance)
+    return {
+        "sample_count": _safe_int(governance.get("sample_count")),
+        "diagnosis": governance.get("diagnosis"),
+        "missed_positive_shadow_count": _safe_int(
+            governance.get("missed_positive_shadow_count")
+        ),
+        "missed_shadow_return_total_pct": _safe_float(
+            governance.get("missed_shadow_return_total_pct")
+        ),
+        "reason_counts": _safe_list(governance.get("reason_counts"))[:12],
+        "recommendations": _safe_list(governance.get("recommendations"))[:12],
+        "entry_bias": (
+            "expand_quality_entries"
+            if governance.get("diagnosis") == "system_over_conservative_review"
+            else "observe"
+        ),
+        "live_mutation": False,
+    }
+
+
+def _exit_runtime_feedback(losing_exit_governance: dict[str, Any]) -> list[dict[str, Any]]:
+    governance = _safe_dict(losing_exit_governance)
+    counts = {
+        str(_safe_dict(item).get("value") or ""): _safe_int(_safe_dict(item).get("count"))
+        for item in _safe_list(governance.get("attribution_counts"))
+    }
+    result: list[dict[str, Any]] = []
+    for item in _safe_list(governance.get("exit_policy_adjustments")):
+        row = _safe_dict(item)
+        attribution = str(row.get("attribution") or "")
+        recommendation = str(row.get("recommendation") or "")
+        exit_bias = "observe"
+        if attribution in {"exit_too_early", "hold_too_short"}:
+            exit_bias = "hold_winners_longer"
+        elif attribution in {"exit_too_late", "capital_release_forced_loss"}:
+            exit_bias = "cut_losers_faster"
+        elif attribution == "position_too_small_fee_drag":
+            exit_bias = "keep_tiny_entries_shadow_only"
+        elif attribution in {
+            "entry_wrong_direction",
+            "model_false_positive",
+            "timeseries_false_signal",
+            "sentiment_false_signal",
+        }:
+            exit_bias = "demote_false_positive_inputs"
+        result.append(
+            {
+                "attribution": attribution,
+                "recommendation": recommendation,
+                "count": counts.get(attribution, _safe_int(row.get("count"))),
+                "exit_bias": exit_bias,
+                "live_mutation": False,
+            }
+        )
+    return result
 
 
 def _exit_plan_reference_report(closed_positions: Sequence[Any]) -> dict[str, Any]:

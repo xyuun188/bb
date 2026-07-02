@@ -332,6 +332,16 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             or item.get("consistency") == "divergent"
         )
     ] or validations
+    strategy_mode = context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
+    profit_first_guidance = (
+        strategy_mode.get("profit_first_context")
+        or (
+            strategy_mode.get("strategy_learning")
+            if isinstance(strategy_mode.get("strategy_learning"), dict)
+            else {}
+        ).get("profit_first_context")
+        or {}
+    )
     payload = {
         "contract": "STRICT_FINAL_DECISION_JSON_V2",
         "symbol": symbol,
@@ -374,6 +384,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         ),
         "add_evidence": compact_value(context.get("add_evidence") or {}, depth=1),
         "opportunity_score": compact_value(context.get("opportunity_score") or {}, depth=1),
+        "profit_first_guidance": compact_value(profit_first_guidance, depth=2, dict_limit=10),
         "ml_profit_quality_gate": compact_value(
             context.get("ml_profit_quality_gate") or {},
             depth=1,
@@ -392,6 +403,9 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             "entry: repeated missed-opportunity feedback is a reason to consider a small probe, not a reason to bypass hard risk.",
             "entry: decision_habit.probe_when_ev_ok means be selectively earlier; decision_habit.strict_confirm means demand stronger evidence.",
             "entry: realized-loss feedback means require stronger confirmation or reduce size/leverage.",
+            "entry: use profit_first_guidance to read which source/lane/exit patterns recently made or lost real net profit.",
+            "entry: profit_first missed-positive-shadow means quality opportunities may deserve earlier attention; tiny-probe fee drag means weak edges should stay shadow/small.",
+            "position: exit_too_early means let winners breathe longer with drawdown protection; exit_too_late means cut weaker losers faster.",
             "position: close only with should_close/hard risk/TP-SL/thesis invalidation/profit protection.",
         ],
     }
@@ -439,6 +453,16 @@ def build_batch_experts_user_prompt(
         else ""
     )
 
+    strategy_mode = context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
+    profit_first_guidance = (
+        strategy_mode.get("profit_first_context")
+        or (
+            strategy_mode.get("strategy_learning")
+            if isinstance(strategy_mode.get("strategy_learning"), dict)
+            else {}
+        ).get("profit_first_context")
+        or {}
+    )
     payload = {
         "entry_candidate_evidence": context.get("entry_candidate_evidence") or {},
         "memory_feedback": context.get("memory_feedback") or {},
@@ -446,7 +470,8 @@ def build_batch_experts_user_prompt(
         "analysis_type": "position" if context.get("review_positions") else "market",
         "open_positions": context.get("open_positions", [])[:4],
         "market_regime": context.get("market_regime") or {},
-        "strategy_mode": context.get("strategy_mode") or {},
+        "strategy_mode": strategy_mode,
+        "profit_first_guidance": compact_value(profit_first_guidance, depth=2, dict_limit=10),
         "direction_competition": context.get("direction_competition") or {},
         "ml_signal": (
             context.get("ml_signal") if context.get("ml_signal_prompt_enabled", True) else {}
@@ -464,7 +489,10 @@ def build_batch_experts_user_prompt(
             "if evidence is weak, explain hold; if evidence is usable, propose side/size/leverage. "
             "Use memory_feedback to correct habits: repeated missed opportunities may justify a small probe when "
             "current EV is positive and hard risk is absent; repeated realized losses require stronger confirmation "
-            "or smaller size. Use memory_feedback.decision_habit: probe_when_ev_ok makes passive HOLD require "
+            "or smaller size. Read profit_first_guidance for recent source/lane/exit lessons: missed-positive-shadow "
+            "means quality opportunities should not be ignored, tiny-probe fee drag means weak entries should stay "
+            "shadow/small, exit_too_early means winners may need more hold room, exit_too_late means weaker losers "
+            "should be cut faster. Use memory_feedback.decision_habit: probe_when_ev_ok makes passive HOLD require "
             "evidence; strict_confirm makes the side need stronger current proof."
         ),
         "position_review_rule": (

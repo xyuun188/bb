@@ -98,6 +98,26 @@ def _trusted_for_ranking(
     )
 
 
+def _no_entry_decision(
+    idx: int,
+    *,
+    reason: str = "profit_insufficient",
+    shadow_return_pct: float = 1.2,
+    missed_opportunity_count: int = 6,
+) -> SimpleNamespace:
+    raw = _raw(side="long")
+    raw["shadow_outcome"] = {"shadow_return_pct": shadow_return_pct}
+    raw["review_feedback"] = {"missed_opportunity_count": missed_opportunity_count}
+    raw["no_entry_reason"] = reason
+    return SimpleNamespace(
+        id=idx,
+        action="long",
+        was_executed=False,
+        execution_reason=reason,
+        raw_llm_response=raw,
+    )
+
+
 def test_profit_first_ranking_promotes_profitable_profile_after_sample_floor() -> None:
     positions = [_position(idx, pnl=1.0, closed_offset_minutes=idx) for idx in range(1, 22)]
     report = ProfitFirstRankingService(min_canary_samples=20).build_report(
@@ -325,3 +345,33 @@ def test_profit_first_runtime_feedback_blocks_negative_local_ml_live_influence()
     assert local_ml["realized_net_pnl"] < 0
     assert local_ml["can_change_model_routing"] is False
     assert local_ml["reason"] == "degraded_or_negative_realized_net_pnl_source"
+
+
+def test_profit_first_runtime_feedback_surfaces_runtime_guidance_beyond_side_weights() -> None:
+    early_exit = _position(401, pnl=-0.7, closed_offset_minutes=1)
+    early_exit.reason = "early exit after weak pullback"
+    tiny_probe = _position(402, pnl=-0.4, closed_offset_minutes=2)
+    tiny_probe.entry_raw["profit_first_trade_plan"]["position_size_pct"] = 0.01
+
+    report = ProfitFirstRankingService(min_canary_samples=1).build_report(
+        decisions=[
+            _no_entry_decision(1),
+            _no_entry_decision(2, shadow_return_pct=0.9, missed_opportunity_count=8),
+            _no_entry_decision(3, shadow_return_pct=1.4, missed_opportunity_count=7),
+        ],
+        closed_positions=[early_exit, tiny_probe],
+    )
+
+    feedback = report["runtime_feedback"]
+
+    assert feedback["objective_basis"]["cost_policy"] == "optimize_realized_net_pnl_after_recorded_costs"
+    assert feedback["missed_opportunity_feedback"]["diagnosis"] == "system_over_conservative_review"
+    assert any(
+        row["entry_bias"] == "expand_quality_entries" for row in feedback["lane_feedback"]
+    )
+    assert any(
+        row["sizing_bias"] == "reduce_weak_or_fee_drag_size" for row in feedback["size_feedback"]
+    )
+    assert any(
+        row["exit_bias"] == "hold_winners_longer" for row in feedback["exit_feedback"]
+    )

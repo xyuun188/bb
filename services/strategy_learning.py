@@ -296,9 +296,11 @@ def _compact_profit_first_runtime_feedback(value: dict[str, Any]) -> dict[str, A
     feedback = _safe_dict(value)
     if not feedback:
         return {}
+    objective_basis = _safe_dict(feedback.get("objective_basis"))
     exit_reference = _safe_dict(feedback.get("exit_plan_reference"))
     local_ml = _safe_dict(feedback.get("local_ml_live_influence"))
     acceptance = _safe_dict(feedback.get("profit_acceptance"))
+    missed = _safe_dict(feedback.get("missed_opportunity_feedback"))
     side_feedback = {
         side: {
             "count": row.get("count"),
@@ -312,14 +314,95 @@ def _compact_profit_first_runtime_feedback(value: dict[str, Any]) -> dict[str, A
         for side, row in _safe_dict(feedback.get("side_feedback")).items()
         if isinstance(row, dict)
     }
+    strategy_profile_feedback = [
+        {
+            "strategy_profile_id": row.get("strategy_profile_id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "decision_lane": row.get("decision_lane"),
+            "recommended_stage": row.get("recommended_stage"),
+            "weight_multiplier": row.get("weight_multiplier"),
+            "realized_net_pnl": row.get("realized_net_pnl"),
+            "profit_factor": row.get("profit_factor"),
+            "ranking_reasons": _safe_list(row.get("ranking_reasons"))[:4],
+        }
+        for row in _safe_list(feedback.get("strategy_profile_feedback"))[:12]
+        if isinstance(row, dict)
+    ]
+    source_weight_feedback = [
+        {
+            "source": row.get("source"),
+            "recommended_stage": row.get("recommended_stage"),
+            "weight_multiplier": row.get("weight_multiplier"),
+            "realized_net_pnl": row.get("realized_net_pnl"),
+            "count": row.get("count"),
+            "ranking_reasons": _safe_list(row.get("ranking_reasons"))[:4],
+        }
+        for row in _safe_list(feedback.get("source_weight_feedback"))[:12]
+        if isinstance(row, dict)
+    ]
+    lane_feedback = [
+        {
+            "lane": row.get("lane"),
+            "recommendation": row.get("recommendation"),
+            "reason": row.get("reason"),
+            "entry_bias": row.get("entry_bias"),
+            "count": row.get("count"),
+            "realized_net_pnl": row.get("realized_net_pnl"),
+            "profit_factor": row.get("profit_factor"),
+        }
+        for row in _safe_list(feedback.get("lane_feedback"))[:12]
+        if isinstance(row, dict)
+    ]
+    size_feedback = [
+        {
+            "strategy_profile_id": row.get("strategy_profile_id"),
+            "decision_lane": row.get("decision_lane"),
+            "recommended_stage": row.get("recommended_stage"),
+            "recommendation": row.get("recommendation"),
+            "sizing_bias": row.get("sizing_bias"),
+            "evidence": _safe_dict(row.get("evidence")),
+        }
+        for row in _safe_list(feedback.get("size_feedback"))[:12]
+        if isinstance(row, dict)
+    ]
+    exit_feedback = [
+        {
+            "attribution": row.get("attribution"),
+            "recommendation": row.get("recommendation"),
+            "count": row.get("count"),
+            "exit_bias": row.get("exit_bias"),
+        }
+        for row in _safe_list(feedback.get("exit_feedback"))[:12]
+        if isinstance(row, dict)
+    ]
     return {
         "status": feedback.get("status"),
         "objective": feedback.get("objective"),
+        "objective_basis": {
+            "metric": objective_basis.get("metric"),
+            "cost_policy": objective_basis.get("cost_policy"),
+            "window_policy": objective_basis.get("window_policy"),
+        },
         "can_influence_strategy_context": bool(
             feedback.get("can_influence_strategy_context")
         ),
         "side_weights": _safe_dict(feedback.get("side_weights")),
         "side_feedback": side_feedback,
+        "strategy_profile_feedback": strategy_profile_feedback,
+        "source_weight_feedback": source_weight_feedback,
+        "lane_feedback": lane_feedback,
+        "size_feedback": size_feedback,
+        "missed_opportunity_feedback": {
+            "sample_count": missed.get("sample_count", 0),
+            "diagnosis": missed.get("diagnosis"),
+            "missed_positive_shadow_count": missed.get("missed_positive_shadow_count", 0),
+            "missed_shadow_return_total_pct": missed.get("missed_shadow_return_total_pct", 0.0),
+            "entry_bias": missed.get("entry_bias"),
+            "reason_counts": _safe_list(missed.get("reason_counts"))[:8],
+            "recommendations": _safe_list(missed.get("recommendations"))[:8],
+        },
+        "exit_feedback": exit_feedback,
         "exit_plan_reference": {
             "checked_count": exit_reference.get("checked_count", 0),
             "missing_count": exit_reference.get("missing_count", 0),
@@ -2358,8 +2441,32 @@ class StrategyCandidateGenerator:
         problem_keys = {item["key"] for item in feedback.problems}
         open_pressure = feedback.open_position_pressure
         totals = feedback.totals
+        profit_first_feedback = _safe_dict(feedback.profit_first_runtime_feedback)
+        missed_feedback = _safe_dict(profit_first_feedback.get("missed_opportunity_feedback"))
+        lane_feedback = _safe_list(profit_first_feedback.get("lane_feedback"))
+        exit_feedback = _safe_list(profit_first_feedback.get("exit_feedback"))
         trade_target = _safe_int(totals.get("trade_count_target"), default_min_trade_target())
         defensive_probe_shadow_loop = "defensive_probe_shadow_loop" in problem_keys
+        missed_positive_shadow_pressure = bool(
+            missed_feedback.get("diagnosis") == "system_over_conservative_review"
+            or any(
+                _safe_dict(row).get("entry_bias") == "expand_quality_entries"
+                for row in lane_feedback
+            )
+        )
+        tiny_probe_fee_drag = bool(
+            any(_safe_dict(row).get("reason") == "position_too_small_fee_drag" for row in lane_feedback)
+            or any(
+                _safe_dict(row).get("exit_bias") == "keep_tiny_entries_shadow_only"
+                for row in exit_feedback
+            )
+        )
+        exit_too_early = any(
+            _safe_dict(row).get("exit_bias") == "hold_winners_longer" for row in exit_feedback
+        )
+        exit_too_late = any(
+            _safe_dict(row).get("exit_bias") == "cut_losers_faster" for row in exit_feedback
+        )
         payoff_profile = _safe_dict(totals.get("payoff_profile"))
         reflection_payoff_profile = _safe_dict(
             feedback.reflection_feedback.get("payoff_profile")
@@ -2373,7 +2480,7 @@ class StrategyCandidateGenerator:
             1.0,
         )
 
-        if defensive_probe_shadow_loop:
+        if defensive_probe_shadow_loop or tiny_probe_fee_drag or missed_positive_shadow_pressure:
             profiles.append(
                 StrategyProfile(
                     profile_id="quality_entry_recovery",
@@ -2382,8 +2489,9 @@ class StrategyCandidateGenerator:
                     status="candidate",
                     source="feedback_generator",
                     description=(
-                        "低收益探针已被 Profit-First 影子化时，不继续强制小仓探针；"
-                        "保留严格专家完整性，让运行时收益质量达标的信号恢复正常 sizing。"
+                        "低收益探针已被 Profit-First 影子化或确认存在过度保守时，"
+                        "不继续强制所有机会都走小仓；保留严格专家完整性，让收益质量"
+                        "达标的信号恢复正常 sizing。"
                     ),
                     params={
                         "global_min_score_delta": 0.0,
@@ -2399,6 +2507,7 @@ class StrategyCandidateGenerator:
             or "missed_opportunities" in problem_keys
             or "trade_reflection_mistakes" in problem_keys
             or totals.get("training_trade_count", 0) < trade_target
+            or (missed_positive_shadow_pressure and not tiny_probe_fee_drag)
         ):
             profiles.append(
                 StrategyProfile(
@@ -2437,6 +2546,7 @@ class StrategyCandidateGenerator:
             or "loss_hold_too_long" in problem_keys
             or "reflection_loss_hold_too_long" in problem_keys
             or "reflection_negative_pnl" in problem_keys
+            or exit_too_late
         ):
             profiles.append(
                 StrategyProfile(
@@ -2462,6 +2572,7 @@ class StrategyCandidateGenerator:
         if (
             "small_wins_large_losses" in problem_keys
             or "reflection_small_wins_large_losses" in problem_keys
+            or exit_too_early
         ):
             profiles.append(
                 StrategyProfile(
@@ -3583,7 +3694,7 @@ class StrategyScheduler:
         params = profile.params
         roster = self._runtime_roster(profile, feedback)
         entry_filters = self._runtime_entry_filters(profile, feedback, roster)
-        return {
+        runtime = {
             "profile_id": profile.profile_id,
             "profile_version": profile.version,
             "global_min_score_delta": _safe_float(params.get("global_min_score_delta"), 0.0),
@@ -3635,6 +3746,153 @@ class StrategyScheduler:
             "training_trade_count": feedback.totals.get("training_trade_count", 0),
             "low_trade_count_penalty": bool(feedback.totals.get("low_trade_count_penalty")),
         }
+        return self._apply_profit_first_runtime_feedback(runtime, profile, feedback)
+
+    @staticmethod
+    def _apply_profit_first_runtime_feedback(
+        runtime: dict[str, Any],
+        profile: StrategyProfile,
+        feedback: StrategyFeedback,
+    ) -> dict[str, Any]:
+        profit_first = _safe_dict(feedback.profit_first_runtime_feedback)
+        if not _profit_first_feedback_can_influence_context(profit_first):
+            return runtime
+
+        adjusted = dict(runtime)
+        entry_filters = _safe_dict(adjusted.get("entry_filters"))
+        params = STRATEGY_LEARNING_PARAMS
+        reasons: list[str] = []
+        missed = _safe_dict(profit_first.get("missed_opportunity_feedback"))
+        lane_feedback = _safe_list(profit_first.get("lane_feedback"))
+        size_feedback = _safe_list(profit_first.get("size_feedback"))
+        exit_feedback = _safe_list(profit_first.get("exit_feedback"))
+
+        if (
+            missed.get("entry_bias") == "expand_quality_entries"
+            or any(_safe_dict(row).get("entry_bias") == "expand_quality_entries" for row in lane_feedback)
+        ) and entry_filters:
+            volume_ratio = _clamp(
+                _safe_float(entry_filters.get("min_entry_volume_ratio"), params.entry_volume_ratio_max)
+                * 0.94,
+                params.entry_volume_ratio_min,
+                params.entry_volume_ratio_max,
+            )
+            adx = _clamp(
+                _safe_float(entry_filters.get("min_entry_adx"), params.entry_adx_max) * 0.94,
+                params.entry_adx_min,
+                params.entry_adx_max,
+            )
+            entry_filters = {
+                **entry_filters,
+                "min_entry_volume_ratio": round(volume_ratio, 4),
+                "min_entry_adx": round(adx, 2),
+                "reason": ", ".join(
+                    part
+                    for part in (
+                        str(entry_filters.get("reason") or "").strip(),
+                        "profit_first_missed_positive_shadow_relaxation",
+                    )
+                    if part
+                ),
+            }
+            adjusted["entry_filters"] = entry_filters
+            adjusted["min_entry_volume_ratio"] = entry_filters["min_entry_volume_ratio"]
+            adjusted["min_entry_adx"] = entry_filters["min_entry_adx"]
+            reasons.append("missed_positive_shadow_relaxed_entry_reference")
+
+        fee_drag_count = sum(
+            _safe_int(_safe_dict(row).get("count"))
+            for row in exit_feedback
+            if _safe_dict(row).get("exit_bias") == "keep_tiny_entries_shadow_only"
+        )
+        fee_drag_count += sum(
+            _safe_int(_safe_dict(_safe_dict(row).get("evidence")).get("position_too_small_fee_drag"))
+            for row in size_feedback
+            if _safe_dict(row).get("sizing_bias") == "reduce_weak_or_fee_drag_size"
+        )
+        if fee_drag_count > 0 and _safe_float(adjusted.get("probe_fraction"), 0.0) > 0:
+            drag_pressure = min(0.30, fee_drag_count * 0.04)
+            adjusted["probe_fraction"] = round(
+                max(_safe_float(adjusted.get("probe_fraction"), 0.0) * (1.0 - drag_pressure), 0.0),
+                6,
+            )
+            adjusted["max_probe_size_pct"] = round(
+                max(
+                    _safe_float(adjusted.get("max_probe_size_pct"), 0.0)
+                    * (1.0 - min(0.35, fee_drag_count * 0.05)),
+                    0.0,
+                ),
+                6,
+            )
+            reasons.append("fee_drag_feedback_keeps_weak_probe_small")
+
+        hold_count = sum(
+            _safe_int(_safe_dict(row).get("count"))
+            for row in exit_feedback
+            if _safe_dict(row).get("exit_bias") == "hold_winners_longer"
+        )
+        if hold_count > 0:
+            hold_strength = min(1.0, hold_count / max(_safe_int(feedback.totals.get("training_trade_count"), 0), 1))
+            adjusted["winner_hold_extension"] = "high"
+            adjusted["pullback_lock_enabled"] = True
+            adjusted["profit_lock_min_usdt_multiplier"] = round(
+                _clamp(
+                    max(
+                        _safe_float(adjusted.get("profit_lock_min_usdt_multiplier"), 1.0),
+                        1.0 + hold_strength * 0.18,
+                    ),
+                    0.80,
+                    1.80,
+                ),
+                6,
+            )
+            adjusted["payoff_repair_intensity"] = round(
+                _clamp(
+                    max(
+                        _safe_float(adjusted.get("payoff_repair_intensity"), 0.0),
+                        hold_strength * 0.60,
+                    ),
+                    0.0,
+                    1.0,
+                ),
+                6,
+            )
+            reasons.append("exit_feedback_requests_longer_winner_hold")
+
+        cut_loss_count = sum(
+            _safe_int(_safe_dict(row).get("count"))
+            for row in exit_feedback
+            if _safe_dict(row).get("exit_bias") == "cut_losers_faster"
+        )
+        if cut_loss_count > 0:
+            cut_strength = min(1.0, cut_loss_count / max(_safe_int(feedback.totals.get("training_trade_count"), 0), 1))
+            adjusted["loss_exit_aggressiveness"] = "high"
+            adjusted["position_review_priority_boost"] = round(
+                max(
+                    _safe_float(adjusted.get("position_review_priority_boost"), 1.0),
+                    1.0 + cut_strength * 0.30,
+                ),
+                6,
+            )
+            reasons.append("exit_feedback_requests_faster_loser_release")
+
+        adjusted["profit_first_context"] = {
+            "profile_id": profile.profile_id,
+            "objective": profit_first.get("objective"),
+            "objective_basis": _safe_dict(profit_first.get("objective_basis")),
+            "strategy_profile_feedback": _safe_list(profit_first.get("strategy_profile_feedback"))[:8],
+            "source_weight_feedback": _safe_list(profit_first.get("source_weight_feedback"))[:8],
+            "lane_feedback": lane_feedback[:8],
+            "size_feedback": size_feedback[:8],
+            "missed_opportunity_feedback": missed,
+            "exit_feedback": exit_feedback[:8],
+            "applied_reasons": reasons,
+            "policy": "bounded_strategy_context_feedback_only",
+        }
+        adjusted["profit_first_runtime_feedback_applied"] = bool(
+            reasons or adjusted["profit_first_context"]
+        )
+        return adjusted
 
     @staticmethod
     def _runtime_roster(profile: StrategyProfile, feedback: StrategyFeedback) -> dict[str, Any]:
@@ -4110,8 +4368,12 @@ class StrategyLearningEngine:
             profit_first_runtime_feedback,
         )
         result["profit_first_runtime_feedback_applied"] = bool(
-            _profit_first_feedback_can_influence_context(profit_first_runtime_feedback)
-            and _safe_dict(profit_first_runtime_feedback.get("side_weights"))
+            (
+                _profit_first_feedback_can_influence_context(profit_first_runtime_feedback)
+                and _safe_dict(profit_first_runtime_feedback.get("side_weights"))
+            )
+            or bool(runtime.get("profit_first_runtime_feedback_applied"))
+            or bool(_safe_dict(runtime.get("profit_first_context")).get("applied_reasons"))
         )
         entry_filters = _safe_dict(runtime.get("entry_filters"))
         default_filters = default_entry_filters(reason="strategy_learning_context_default")
@@ -4135,6 +4397,7 @@ class StrategyLearningEngine:
             "max_probe_size_pct": result["max_probe_size_pct"],
             "side_overrides": _safe_dict(runtime.get("side_overrides")),
             "side_weights": result["side_weights"],
+            "profit_first_context": _safe_dict(runtime.get("profit_first_context")),
             "profit_first_runtime_feedback_applied": result[
                 "profit_first_runtime_feedback_applied"
             ],
@@ -4356,6 +4619,7 @@ class StrategyLearningEngine:
             "winner_hold_dynamic": result["winner_hold_dynamic"],
             "pullback_lock_enabled": result["pullback_lock_enabled"],
             "side_weights": result["side_weights"],
+            "profit_first_context": _safe_dict(runtime.get("profit_first_context")),
             "profit_first_runtime_feedback": result["profit_first_runtime_feedback"],
             "profit_first_runtime_feedback_applied": result[
                 "profit_first_runtime_feedback_applied"
@@ -5299,6 +5563,10 @@ class StrategyLearningService:
             feedback.event_feedback.get("profit_first_defensive_probe_shadow_count"),
             0,
         )
+        profit_first_feedback = _safe_dict(feedback.profit_first_runtime_feedback)
+        missed_feedback = _safe_dict(profit_first_feedback.get("missed_opportunity_feedback"))
+        lane_feedback = _safe_list(profit_first_feedback.get("lane_feedback"))
+        exit_feedback = _safe_list(profit_first_feedback.get("exit_feedback"))
         low_trade_count = bool(feedback.totals.get("low_trade_count_penalty"))
         fallback_or_missed = bool(
             problem_keys
@@ -5309,8 +5577,22 @@ class StrategyLearningService:
                 "trade_reflection_mistakes",
             }
         )
+        missed_positive_shadow_pressure = bool(
+            missed_feedback.get("diagnosis") == "system_over_conservative_review"
+            or any(
+                _safe_dict(row).get("entry_bias") == "expand_quality_entries"
+                for row in lane_feedback
+            )
+        )
+        tiny_probe_fee_drag = any(
+            _safe_dict(row).get("exit_bias") == "keep_tiny_entries_shadow_only"
+            for row in exit_feedback
+        )
         require_quality_recovery = bool(
-            defensive_probe_shadow_count > 0 or "defensive_probe_shadow_loop" in problem_keys
+            defensive_probe_shadow_count > 0
+            or "defensive_probe_shadow_loop" in problem_keys
+            or tiny_probe_fee_drag
+            or missed_positive_shadow_pressure
         )
         payoff_repair = _payoff_repair_profile(
             _safe_dict(feedback.totals.get("payoff_profile")),
@@ -5321,7 +5603,11 @@ class StrategyLearningService:
             "skip_kind_counts": skip_kind_counts,
             "defensive_probe_shadow_count": defensive_probe_shadow_count,
             "require_quality_entry_recovery_candidate": require_quality_recovery,
-            "allow_recovery_probe_candidate": bool(low_trade_count and fallback_or_missed),
+            "allow_recovery_probe_candidate": bool(
+                low_trade_count and fallback_or_missed and not tiny_probe_fee_drag
+            ),
+            "profit_first_over_conservative_signal": missed_positive_shadow_pressure,
+            "profit_first_tiny_probe_fee_drag": tiny_probe_fee_drag,
             "payoff_repair_profile": payoff_repair,
             "payoff_profile_policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
             "candidate_modes": {
@@ -5550,6 +5836,9 @@ class StrategyLearningService:
                 ),
                 "event_feedback": self._compact_event_feedback(event_feedback),
                 "reflection_feedback": self._compact_reflection_feedback(reflection_feedback),
+                "profit_first_runtime_feedback": _compact_profit_first_runtime_feedback(
+                    feedback.profit_first_runtime_feedback
+                ),
                 "problems": self._compact_problem_items(feedback.problems),
                 "root_causes": [str(item)[:140] for item in feedback.root_causes[:8]],
                 "training_policy": self._scalar_subset(
@@ -5599,6 +5888,7 @@ class StrategyLearningService:
                 "open_position_pressure": summary.get("open_position_pressure"),
                 "decision_quality": summary.get("decision_quality"),
                 "reflection_feedback": summary.get("reflection_feedback"),
+                "profit_first_runtime_feedback": summary.get("profit_first_runtime_feedback"),
                 "problems": [
                     {
                         "key": _safe_dict(item).get("key"),
