@@ -6,11 +6,13 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from services.profit_first_trade_plan import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-06-23.v3"
+DATA_QUALITY_VERSION = "2026-07-03.v4"
+PROFIT_LEARNING_VERSION = "profit-first-training-v1"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 HIGH_CONTAMINATION_EXCLUDED_RATIO = 0.05
 HIGH_CONTAMINATION_BLOCKED_REASON_RATIO = 0.02
@@ -76,6 +78,22 @@ def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
 
 def _safe_str(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _first_float(*values: Any) -> float | None:
+    for value in values:
+        number = _safe_float(value, None)
+        if number is not None:
+            return number
+    return None
 
 
 def _features(sample: dict[str, Any]) -> dict[str, Any]:
@@ -387,6 +405,13 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         score -= _QUALITY_PARAMS.unknown_outcome_penalty
         reasons.append("missing_or_unknown_outcome")
 
+    if pnl < 0:
+        attribution = _trade_losing_exit_attribution(sample)
+        if attribution == "okx_slippage_or_execution":
+            return _final_assessment(0.0, ["execution_anomaly_trade"], exclude=True)
+        if attribution == "unknown_requires_review":
+            return _final_assessment(0.0, ["unknown_losing_exit_attribution"], exclude=True)
+
     return _final_assessment(score, reasons, exclude=exclude)
 
 
@@ -443,10 +468,323 @@ ASSESSORS = {
 }
 
 
+def _trade_entry_raw(sample: dict[str, Any]) -> dict[str, Any]:
+    for key in ("entry_raw", "raw_llm_response", "raw_response"):
+        value = _safe_dict(sample.get(key))
+        if value:
+            return value
+    return {}
+
+
+def _trade_close_raw(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(sample.get("close_raw"))
+
+
+def _trade_shadow(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(sample.get("shadow"))
+
+
+def _trade_plan(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(_trade_entry_raw(sample).get("profit_first_trade_plan"))
+
+
+def _trade_sizing(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(_trade_entry_raw(sample).get("profit_risk_sizing"))
+
+
+def _trade_close_evidence(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(_trade_close_raw(sample).get("close_evidence"))
+
+
+def _trade_fee(sample: dict[str, Any]) -> float | None:
+    fee_source = sample.get("fee_estimate")
+    if fee_source is None:
+        fee_source = sample.get("fee")
+    fee = _safe_float(fee_source, None)
+    return None if fee is None else abs(fee)
+
+
+def _trade_funding_fee(sample: dict[str, Any]) -> float | None:
+    for value in (
+        sample.get("funding_fee"),
+        _trade_close_raw(sample).get("funding_fee"),
+        _trade_entry_raw(sample).get("funding_fee"),
+    ):
+        fee = _safe_float(value, None)
+        if fee is not None:
+            return fee
+    return None
+
+
+def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
+    quantity = _safe_float(sample.get("quantity"), None)
+    entry_price = _safe_float(sample.get("entry_price"), None)
+    explicit = _first_float(
+        sample.get("notional_usdt"),
+        _trade_sizing(sample).get("final_notional_usdt"),
+        _trade_sizing(sample).get("target_min_notional_usdt"),
+    )
+    if explicit is not None:
+        return abs(explicit)
+    if quantity is None or entry_price is None:
+        return None
+    return abs(quantity * entry_price)
+
+
+def _trade_actual_leverage(sample: dict[str, Any]) -> float | None:
+    return _first_float(sample.get("leverage"))
+
+
+def _trade_planned_leverage(sample: dict[str, Any]) -> float | None:
+    return _first_float(
+        sample.get("decision_suggested_leverage"),
+        sample.get("suggested_leverage"),
+        _trade_plan(sample).get("leverage"),
+    )
+
+
+def _trade_position_size_pct(sample: dict[str, Any]) -> float | None:
+    return _first_float(
+        sample.get("position_size_pct"),
+        _trade_sizing(sample).get("position_size_pct"),
+        _trade_plan(sample).get("position_size_pct"),
+    )
+
+
+def _trade_losing_exit_attribution(sample: dict[str, Any]) -> str:
+    pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
+    if pnl >= 0:
+        return ""
+    return normalize_losing_exit_attribution(
+        sample,
+        entry_raw=_trade_entry_raw(sample),
+        close_raw=_trade_close_raw(sample),
+        shadow=_trade_shadow(sample),
+    )
+
+
+def _trade_profit_class(
+    sample: dict[str, Any],
+    *,
+    fee: float | None,
+    attribution: str,
+) -> str:
+    pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
+    if pnl > 0:
+        if fee and pnl <= fee * 1.5:
+            return "micro_profit_after_cost"
+        return "net_profit"
+    if pnl < 0:
+        if attribution == "position_too_small_fee_drag":
+            return "cost_drag_loss"
+        if fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple:
+            return "cost_drag_loss"
+        return "net_loss"
+    return "flat"
+
+
+def _trade_exit_timing_label(sample: dict[str, Any], *, attribution: str) -> str:
+    if attribution in {"exit_too_early", "hold_too_short"}:
+        return "too_early"
+    if attribution in {"exit_too_late", "capital_release_forced_loss"}:
+        return "too_late"
+    close_evidence = _trade_close_evidence(sample)
+    if _safe_float(sample.get("realized_pnl"), 0.0) > 0 and (
+        close_evidence.get("profit_protection")
+        or close_evidence.get("profit_retrace_protection")
+        or close_evidence.get("small_position_profit_lock")
+    ):
+        return "profit_locked"
+    return "neutral_or_unknown"
+
+
+def _trade_size_efficiency_label(
+    sample: dict[str, Any],
+    *,
+    attribution: str,
+    actual_leverage: float | None,
+    planned_leverage: float | None,
+) -> str:
+    if attribution == "position_too_small_fee_drag":
+        return "too_small_fee_drag"
+    if (
+        planned_leverage is not None
+        and planned_leverage >= 2.0
+        and actual_leverage is not None
+        and actual_leverage <= max(1.0, planned_leverage * 0.6)
+    ):
+        return "underleveraged_vs_plan"
+    position_size_pct = _trade_position_size_pct(sample)
+    if position_size_pct is not None and position_size_pct <= 0.015:
+        return "tiny_size"
+    notional_usdt = _trade_notional_usdt(sample)
+    if notional_usdt is not None and notional_usdt < 15.0:
+        return "tiny_notional"
+    return "adequate_or_unknown"
+
+
+def _trade_payoff_label(
+    sample: dict[str, Any],
+    *,
+    attribution: str,
+    exit_timing_label: str,
+    fee: float | None,
+) -> str:
+    pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
+    if pnl < 0 and attribution in {"exit_too_late", "capital_release_forced_loss"}:
+        return "loss_dragged"
+    if pnl < 0 and attribution in {"exit_too_early", "hold_too_short"}:
+        return "loss_cut_fast"
+    if pnl > 0 and exit_timing_label == "profit_locked":
+        return "profit_locked"
+    if pnl > 0 and fee and pnl <= fee * 1.5:
+        return "micro_profit"
+    return "normal_or_unknown"
+
+
+def _trade_cost_basis_label(sample: dict[str, Any], *, fee: float | None) -> str:
+    funding_fee = _trade_funding_fee(sample)
+    if fee is None:
+        return "missing_fee"
+    if funding_fee is None:
+        return "fee_only"
+    return "fee_plus_funding"
+
+
+def _trade_strategy_context(sample: dict[str, Any]) -> dict[str, Any]:
+    plan = _trade_plan(sample)
+    return {
+        "decision_lane": _safe_str(plan.get("decision_lane")),
+        "exit_plan_id": _safe_str(plan.get("exit_plan_id")),
+        "strategy_profile_id": _safe_str(plan.get("strategy_profile_id")),
+        "position_size_pct": _trade_position_size_pct(sample),
+        "planned_leverage": _trade_planned_leverage(sample),
+        "actual_leverage": _trade_actual_leverage(sample),
+    }
+
+
+def _trade_profit_learning_labels(
+    sample: dict[str, Any],
+    assessment: SampleQualityAssessment,
+) -> dict[str, Any]:
+    fee = _trade_fee(sample)
+    funding_fee = _trade_funding_fee(sample)
+    actual_leverage = _trade_actual_leverage(sample)
+    planned_leverage = _trade_planned_leverage(sample)
+    attribution = _trade_losing_exit_attribution(sample)
+    exit_timing_label = _trade_exit_timing_label(sample, attribution=attribution)
+    size_efficiency_label = _trade_size_efficiency_label(
+        sample,
+        attribution=attribution,
+        actual_leverage=actual_leverage,
+        planned_leverage=planned_leverage,
+    )
+    trade_profit_class = _trade_profit_class(sample, fee=fee, attribution=attribution)
+    cost_basis_label = _trade_cost_basis_label(sample, fee=fee)
+    pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
+    fee_dominated = bool(fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple)
+    return {
+        "version": PROFIT_LEARNING_VERSION,
+        "sample_kind": "trade",
+        "training_supervision_ready": bool(
+            not assessment.exclude_from_training
+            and attribution not in {"okx_slippage_or_execution", "unknown_requires_review"}
+        ),
+        "trade_profit_class": trade_profit_class,
+        "losing_exit_attribution": attribution,
+        "exit_timing_label": exit_timing_label,
+        "size_efficiency_label": size_efficiency_label,
+        "payoff_profile_label": _trade_payoff_label(
+            sample,
+            attribution=attribution,
+            exit_timing_label=exit_timing_label,
+            fee=fee,
+        ),
+        "cost_basis_label": cost_basis_label,
+        "fee_dominated": fee_dominated,
+        "fee_estimate_usdt": fee,
+        "funding_fee_usdt": funding_fee,
+        "notional_usdt": _trade_notional_usdt(sample),
+        "strategy_context": _trade_strategy_context(sample),
+    }
+
+
+def _shadow_profit_learning_labels(
+    sample: dict[str, Any],
+    assessment: SampleQualityAssessment,
+) -> dict[str, Any]:
+    best_action = _sample_best_direction(sample)
+    best_return = _actual_return_for_side(sample, best_action) if best_action else None
+    missed = bool(sample.get("missed_opportunity")) and best_action in {"long", "short"}
+    if missed and (best_return or 0.0) > 0:
+        missed_label = "missed_positive_entry"
+    elif missed:
+        missed_label = "missed_non_positive_entry"
+    else:
+        missed_label = "no_missed_opportunity"
+    if best_return is None:
+        outcome_label = "unknown_outcome"
+    elif best_return > 0:
+        outcome_label = "positive_shadow_edge"
+    elif best_return < 0:
+        outcome_label = "negative_shadow_edge"
+    else:
+        outcome_label = "flat_shadow_edge"
+    return {
+        "version": PROFIT_LEARNING_VERSION,
+        "sample_kind": "shadow",
+        "training_supervision_ready": bool(not assessment.exclude_from_training),
+        "missed_opportunity_label": missed_label,
+        "shadow_outcome_label": outcome_label,
+        "opportunity_side": best_action,
+    }
+
+
+def _profit_learning_labels(
+    sample: dict[str, Any],
+    kind: SampleKind,
+    assessment: SampleQualityAssessment,
+) -> dict[str, Any]:
+    if kind == "trade":
+        return _trade_profit_learning_labels(sample, assessment)
+    if kind == "shadow":
+        return _shadow_profit_learning_labels(sample, assessment)
+    return {}
+
+
+def _apply_profit_learning_aliases(
+    annotated: dict[str, Any],
+    *,
+    kind: SampleKind,
+    labels: dict[str, Any],
+) -> None:
+    if kind == "trade":
+        for key in (
+            "trade_profit_class",
+            "losing_exit_attribution",
+            "exit_timing_label",
+            "size_efficiency_label",
+            "payoff_profile_label",
+            "cost_basis_label",
+        ):
+            value = labels.get(key)
+            if isinstance(value, str) and value:
+                annotated[key] = value
+    if kind == "shadow":
+        for key in ("missed_opportunity_label", "shadow_outcome_label"):
+            value = labels.get(key)
+            if isinstance(value, str) and value:
+                annotated[key] = value
+
+
 def annotate_sample(sample: dict[str, Any], kind: SampleKind) -> dict[str, Any]:
     assessment = ASSESSORS[kind](sample)
     annotated = dict(sample)
     annotated.update(assessment.as_dict())
+    labels = _profit_learning_labels(annotated, kind, assessment)
+    if labels:
+        annotated["profit_learning_labels"] = labels
+        _apply_profit_learning_aliases(annotated, kind=kind, labels=labels)
     return annotated
 
 
@@ -456,6 +794,38 @@ def annotate_samples(samples: list[dict[str, Any]], kind: SampleKind) -> list[di
 
 def trainable_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [sample for sample in samples if not bool(sample.get("exclude_from_training"))]
+
+
+def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    counters: dict[str, Counter[str]] = {}
+    supervision_ready = 0
+    for sample in samples:
+        labels = _safe_dict(sample.get("profit_learning_labels"))
+        if not labels:
+            continue
+        if bool(labels.get("training_supervision_ready")):
+            supervision_ready += 1
+        for key, value in labels.items():
+            if key in {
+                "version",
+                "sample_kind",
+                "training_supervision_ready",
+                "strategy_context",
+                "fee_estimate_usdt",
+                "funding_fee_usdt",
+                "notional_usdt",
+                "fee_dominated",
+            }:
+                continue
+            if isinstance(value, str) and value:
+                counters.setdefault(key, Counter())[value] += 1
+    return {
+        "supervision_ready_count": supervision_ready,
+        "label_counts": {
+            key: [{"value": value, "count": count} for value, count in counter.most_common(20)]
+            for key, counter in counters.items()
+        },
+    }
 
 
 def _sample_action(sample: dict[str, Any]) -> str:
@@ -949,12 +1319,16 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
             "trainable_timeframes": dict(kind_trainable_timeframe_counts),
             "sources": dict(kind_source_counts),
             "trainable_sources": dict(kind_trainable_source_counts),
+            "profit_learning": _profit_learning_report(samples),
         }
     total_count = sum(len(samples) for samples in samples_by_kind.values())
     return {
         "data_quality_version": DATA_QUALITY_VERSION,
         "policy": asdict(DEFAULT_TRADING_PARAMS.training_data_quality),
         "by_kind": by_kind,
+        "profit_learning_summary": {
+            kind: _profit_learning_report(samples) for kind, samples in samples_by_kind.items()
+        },
         "specialist_shadow_models": _shadow_model_report(samples_by_kind.get("shadow", [])),
         "totals": {
             "total": total_count,

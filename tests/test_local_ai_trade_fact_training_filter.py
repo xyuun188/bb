@@ -94,7 +94,7 @@ async def test_local_ai_trade_samples_exclude_unlinked_okx_position_facts(
 
     assert [sample["position_id"] for sample in payload["trade_samples"]] == [trusted.id]
     top_reasons = {item["reason"]: item["count"] for item in payload["quality_report"]["top_reasons"]}
-    assert top_reasons["trade:untrusted_trade_fact:missing_close_exchange_order_id"] >= 1
+    assert top_reasons["trade:untrusted_trade_fact:entry_order_not_okx_confirmed"] >= 1
 
 
 @pytest.mark.asyncio
@@ -472,4 +472,4 @@ async def test_local_ai_position_link_repairs_remain_quarantined_from_training(
 
     assert [sample["position_id"] for sample in payload["trade_samples"]] == [trusted.id]
     top_reasons = {item["reason"]: item["count"] for item in payload["quality_report"]["top_reasons"]}
-    assert top_reasons["trade:historical_reconciliation_repair:okx_position_link_repair"] >= 1
+    assert top_reasons["trade:untrusted_trade_fact:entry_order_not_okx_confirmed"] >= 1

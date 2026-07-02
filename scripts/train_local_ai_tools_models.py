@@ -20,6 +20,7 @@ from config.settings import settings
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text
 from core.url_safety import normalize_http_base_url
 from db.session import get_session_ctx
+from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
@@ -119,6 +120,14 @@ _LOCAL_AI_TOOLS_SHADOW_TOOL_KEYS = {
     "timesfm_shadow_expected_move_pct",
     "timesfm_shadow_side",
     "timesfm_shadow_confidence",
+}
+_TRAINING_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
+_TRAINING_REPAIR_SOURCES = {
+    "missing_closed_position_repair",
+    "okx_native_full_close_fill_correction",
+    "okx_order_pair_repair",
+    "okx_orphan_position_quarantine",
+    "okx_position_link_repair",
 }
 _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "kind",
@@ -558,6 +567,87 @@ async def _load_trade_reflection_samples(limit: int | None) -> list[dict[str, An
     return samples
 
 
+async def _decision_raw_by_position_id(position_ids: set[int]) -> dict[int, dict[str, Any]]:
+    if not position_ids:
+        return {}
+    async with get_session_ctx() as session:
+        position_result = await session.execute(
+            select(Position).where(Position.id.in_(sorted(position_ids)))
+        )
+        positions = list(position_result.scalars().all())
+        symbols = {str(row.symbol or "").strip() for row in positions if str(row.symbol or "").strip()}
+        entry_order_ids = {
+            order_id
+            for row in positions
+            for order_id in _split_exchange_order_ids(getattr(row, "entry_exchange_order_id", None))
+        }
+        orders: list[Order] = []
+        if symbols:
+            order_result = await session.execute(
+                select(Order)
+                .where(Order.symbol.in_(sorted(symbols)))
+                .order_by(Order.filled_at.desc(), Order.created_at.desc(), Order.id.desc())
+            )
+            orders = list(order_result.scalars().all())
+        decision_ids = {
+            int(getattr(order, "decision_id", 0) or 0)
+            for order in orders
+            if int(getattr(order, "decision_id", 0) or 0) > 0
+        }
+        decisions_by_id: dict[int, Any] = {}
+        if decision_ids:
+            decision_result = await session.execute(
+                select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+            )
+            decisions_by_id = {
+                int(decision.id): decision for decision in decision_result.scalars().all()
+            }
+    order_list = list(orders)
+    raw_by_position_id: dict[int, dict[str, Any]] = {}
+    for position in positions:
+        decision = _match_entry_decision_for_training(position, order_list, decisions_by_id)
+        if decision is None or not isinstance(getattr(decision, "raw_llm_response", None), dict):
+            continue
+        raw_by_position_id[int(position.id)] = dict(decision.raw_llm_response)
+    return raw_by_position_id
+
+
+def _match_entry_decision_for_training(
+    position: Position,
+    orders: list[Order],
+    decisions_by_id: dict[int, Any],
+) -> Any | None:
+    position_symbol = str(getattr(position, "symbol", "") or "").strip()
+    position_side = str(getattr(position, "side", "") or "").lower().strip()
+    position_created = _as_utc(getattr(position, "created_at", None))
+    entry_exchange_order_id = str(getattr(position, "entry_exchange_order_id", "") or "").strip()
+    best: Any | None = None
+    best_delta: float | None = None
+    for order in orders:
+        if position_symbol and str(getattr(order, "symbol", "") or "").strip() != position_symbol:
+            continue
+        decision = decisions_by_id.get(int(getattr(order, "decision_id", 0) or 0))
+        if decision is None:
+            continue
+        action = str(getattr(decision, "action", "") or "").lower()
+        if action not in {"long", "short"} or action != position_side:
+            continue
+        order_exchange_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if entry_exchange_order_id and order_exchange_id == entry_exchange_order_id:
+            return decision
+        order_time = _as_utc(getattr(order, "filled_at", None) or getattr(order, "created_at", None))
+        if position_created is not None and order_time is not None:
+            delta = abs((position_created - order_time).total_seconds())
+            if delta > 15 * 60:
+                continue
+        else:
+            delta = 0.0
+        if best_delta is None or delta < best_delta:
+            best = decision
+            best_delta = delta
+    return best
+
+
 async def _load_closed_position_samples(limit: int | None) -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         stmt = (
@@ -592,6 +682,9 @@ async def _load_closed_position_samples(limit: int | None) -> list[dict[str, Any
                 list(order_result.scalars().all())
             )
 
+    decision_raw_by_position_id = await _decision_raw_by_position_id(
+        {int(row.id or 0) for row in rows if int(row.id or 0) > 0}
+    )
     samples: list[dict[str, Any]] = []
     for row in rows:
         if position_has_manual_close_order(row, manual_orders):
@@ -624,6 +717,8 @@ async def _load_closed_position_samples(limit: int | None) -> list[dict[str, Any
                 "realized_pnl": _as_float(row.realized_pnl),
                 "fee_estimate": _position_fee_estimate(row, confirmed_order_fee_by_id),
                 "hold_minutes": hold_minutes,
+                "leverage": _as_float(row.leverage, 1.0),
+                "raw_llm_response": decision_raw_by_position_id.get(int(row.id or 0), {}),
                 "outcome": (
                     "profit"
                     if _as_float(row.realized_pnl) > 0
@@ -647,19 +742,68 @@ def _trade_sample_key(sample: dict[str, Any]) -> str | None:
     return None
 
 
+def _deep_merge_trade_sample_dict(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in extra.items():
+        if key not in merged or merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+            continue
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_trade_sample_dict(existing, value)
+    return merged
+
+
+def _merge_trade_sample_pair(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    primary_trusted = _sample_is_training_trusted(primary)
+    secondary_trusted = _sample_is_training_trusted(secondary)
+    if secondary.get("source") == "closed_position" and (
+        secondary_trusted or not primary_trusted
+    ):
+        merged = _deep_merge_trade_sample_dict(secondary, primary)
+        merged["source"] = "closed_position"
+        return merged
+    merged = _deep_merge_trade_sample_dict(primary, secondary)
+    if primary_trusted and not secondary_trusted:
+        merged["trade_fact_trusted"] = bool(primary.get("trade_fact_trusted", True))
+        merged["trade_fact_trust_reason"] = str(primary.get("trade_fact_trust_reason") or "")
+    return merged
+
+
+def _sample_is_training_trusted(sample: dict[str, Any]) -> bool:
+    trust_reason = str(sample.get("trade_fact_trust_reason") or "").strip()
+    if trust_reason:
+        return False
+    for candidate in (
+        str(sample.get("trade_fact_repair_source") or "").strip().lower(),
+        str(sample.get("reflection_source") or "").strip().lower(),
+    ):
+        if not candidate:
+            continue
+        if candidate in _TRAINING_REPAIR_SOURCES:
+            return False
+        if any(token in candidate for token in _TRAINING_REPAIR_SOURCE_MARKERS):
+            return False
+    return bool(sample.get("trade_fact_trusted", True))
+
+
 def _merge_trade_samples(
     reflection_samples: list[dict[str, Any]],
     closed_position_samples: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    index_by_key: dict[str, int] = {}
     for sample in [*reflection_samples, *closed_position_samples]:
         key = _trade_sample_key(sample)
-        if key and key in seen:
+        if not key:
+            merged.append(sample)
             continue
-        merged.append(sample)
-        if key:
-            seen.add(key)
+        existing_index = index_by_key.get(key)
+        if existing_index is None:
+            index_by_key[key] = len(merged)
+            merged.append(sample)
+            continue
+        merged[existing_index] = _merge_trade_sample_pair(merged[existing_index], sample)
     return merged
 
 

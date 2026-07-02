@@ -46,22 +46,37 @@ def test_local_ai_tools_training_base_url_validation() -> None:
 
 def test_local_ai_tools_training_merges_trade_samples_without_duplicate_positions() -> None:
     reflection_samples = [
-        {"source": "trade_reflection", "id": 11, "position_id": 7, "realized_pnl": -1.2},
+        {
+            "source": "trade_reflection",
+            "id": 11,
+            "position_id": 7,
+            "realized_pnl": -1.2,
+            "hold_minutes": 3.0,
+        },
         {"source": "trade_reflection", "id": 12, "position_id": 8, "realized_pnl": 2.4},
     ]
     closed_position_samples = [
-        {"source": "closed_position", "id": 7, "position_id": 7, "realized_pnl": -1.2},
+        {
+            "source": "closed_position",
+            "id": 7,
+            "position_id": 7,
+            "realized_pnl": -1.2,
+            "raw_llm_response": {
+                "profit_first_trade_plan": {
+                    "decision_lane": "tiny_probe",
+                    "position_size_pct": 0.01,
+                }
+            },
+        },
         {"source": "closed_position", "id": 9, "position_id": 9, "realized_pnl": 0.4},
     ]
 
     merged = _merge_trade_samples(reflection_samples, closed_position_samples)
 
-    assert [item["source"] for item in merged] == [
-        "trade_reflection",
-        "trade_reflection",
-        "closed_position",
-    ]
+    assert [item["source"] for item in merged] == ["closed_position", "trade_reflection", "closed_position"]
     assert [item["position_id"] for item in merged] == [7, 8, 9]
+    assert merged[0]["hold_minutes"] == 3.0
+    assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
 
 
 @pytest.mark.asyncio

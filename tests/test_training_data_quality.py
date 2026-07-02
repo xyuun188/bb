@@ -151,6 +151,20 @@ def test_trade_historical_repair_and_untrusted_fact_are_excluded() -> None:
     )
 
 
+def test_trade_unknown_losing_exit_attribution_is_excluded() -> None:
+    assessment = assess_trade_sample(
+        _trade_sample(
+            realized_pnl=-0.7,
+            hold_minutes=16.0,
+            fee_estimate=0.02,
+            raw_llm_response={},
+        )
+    )
+
+    assert assessment.status == "excluded"
+    assert "unknown_losing_exit_attribution" in assessment.reasons
+
+
 def test_sequence_future_leakage_is_excluded() -> None:
     assessment = assess_sequence_sample(
         {
@@ -246,6 +260,78 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert governance["quarantine_applied"] is True
     assert governance["requires_artifact_refresh"] is True
     assert "local_ai_tools" in governance["refresh_targets"]
+
+
+def test_training_payload_enriches_trade_profit_learning_labels() -> None:
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[
+            _trade_sample(
+                source="closed_position",
+                realized_pnl=-0.12,
+                fee_estimate=0.08,
+                hold_minutes=18.0,
+                leverage=1.0,
+                raw_llm_response={
+                    "profit_first_trade_plan": {
+                        "decision_lane": "tiny_probe",
+                        "position_size_pct": 0.01,
+                        "leverage": 3.0,
+                        "exit_plan_id": "pfep-test-1",
+                        "strategy_profile_id": "profile-a",
+                    },
+                    "profit_risk_sizing": {
+                        "position_size_pct": 0.01,
+                        "final_notional_usdt": 12.0,
+                    },
+                },
+            )
+        ],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    trade = payload["trade_samples"][0]
+    labels = trade["profit_learning_labels"]
+    assert labels["version"] == "profit-first-training-v1"
+    assert labels["training_supervision_ready"] is True
+    assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
+    assert labels["trade_profit_class"] == "cost_drag_loss"
+    assert labels["size_efficiency_label"] == "too_small_fee_drag"
+    assert labels["cost_basis_label"] == "fee_only"
+    assert labels["strategy_context"]["decision_lane"] == "tiny_probe"
+    assert trade["losing_exit_attribution"] == "position_too_small_fee_drag"
+    report = payload["quality_report"]["by_kind"]["trade"]["profit_learning"]
+    assert report["supervision_ready_count"] == 1
+    assert report["label_counts"]["losing_exit_attribution"][0]["value"] == (
+        "position_too_small_fee_drag"
+    )
+
+
+def test_training_payload_enriches_shadow_missed_opportunity_labels() -> None:
+    payload = annotate_training_payload(
+        shadow_samples=[
+            _shadow_sample(
+                decision_action="hold",
+                best_action="long",
+                long_return_pct=0.9,
+                short_return_pct=-0.3,
+                missed_opportunity=True,
+            )
+        ],
+        trade_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    shadow = payload["shadow_samples"][0]
+    labels = shadow["profit_learning_labels"]
+    assert labels["missed_opportunity_label"] == "missed_positive_entry"
+    assert labels["shadow_outcome_label"] == "positive_shadow_edge"
+    summary = payload["quality_report"]["profit_learning_summary"]["shadow"]
+    assert summary["label_counts"]["missed_opportunity_label"][0]["value"] == (
+        "missed_positive_entry"
+    )
 
 
 def test_training_payload_reports_specialist_shadow_model_quality() -> None:
