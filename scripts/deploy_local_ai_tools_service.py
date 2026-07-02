@@ -140,6 +140,7 @@ _STATUS_METADATA_KEYS = (
     "tail_loss_threshold_pct",
     "quality_report",
     "governance_report",
+    "profit_first_report",
     "training_policy",
     "trade_sample_cursor_policy",
     "training_mode",
@@ -235,6 +236,7 @@ class TrainRequest(BaseModel):
     completed_trade_sample_count: int | None = None
     quality_report: dict[str, Any] = {}
     governance_report: dict[str, Any] = {}
+    profit_first_report: dict[str, Any] = {}
     training_mode: str = "shadow"
     model_stage: str = "shadow"
     evaluation_policy: dict[str, Any] = {}
@@ -1879,6 +1881,7 @@ def health() -> dict[str, Any]:
     payload.setdefault("completed_trade_sample_count", 0)
     payload.setdefault("quality_report", {})
     payload.setdefault("governance_report", {})
+    payload.setdefault("profit_first_report", {})
     payload.update(_phase3_inventory_status())
     payload["specialist_model_chains"] = {
         "timeseries": _specialist_model_chain("timeseries"),
@@ -2050,6 +2053,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
+        "profit_first_report": req.profit_first_report or {},
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": str(req.training_mode or "shadow"),

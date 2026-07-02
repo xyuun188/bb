@@ -987,6 +987,7 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             _merge_trade_samples,
         )
         from services.model_promotion_policy import (
+            build_profit_first_promotion_report,
             build_phase3_promotion_recommendation,
             load_latest_paper_observation_report,
         )
@@ -1033,6 +1034,10 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             "phase": "phase3_model_factory",
         }
         paper_observation_report = load_latest_paper_observation_report()
+        profit_first_report = build_profit_first_promotion_report(
+            trade_samples=payload["trade_samples"],
+            shadow_samples=payload["shadow_samples"],
+        )
         promotion_recommendation = build_phase3_promotion_recommendation(
             training_mode="shadow",
             model_stage="shadow",
@@ -1042,6 +1047,7 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
             paper_observation_report=paper_observation_report,
             completed_shadow_sample_count=completed_shadow_count,
             completed_trade_sample_count=completed_trade_count,
+            profit_first_report=profit_first_report,
         )
         result = await trainer(
             payload["shadow_samples"],
@@ -1067,6 +1073,7 @@ async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
         )
         result.setdefault("quality_report", payload["quality_report"])
         result.setdefault("governance_report", payload["governance_report"])
+        result.setdefault("profit_first_report", profit_first_report)
         result.setdefault("promotion_recommendation", promotion_recommendation)
         result.setdefault("paper_observation_report", paper_observation_report)
         result.setdefault("raw_trade_sample_count", raw_trade_sample_count)

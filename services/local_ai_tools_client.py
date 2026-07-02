@@ -24,6 +24,7 @@ from services.entry_signal_extraction import (
     unwrap_tool_payload,
 )
 from services.model_promotion_policy import (
+    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
     load_latest_paper_observation_report,
 )
@@ -585,6 +586,10 @@ class LocalAIToolsClient:
         effective_paper_observation = (
             paper_observation_report or load_latest_paper_observation_report()
         )
+        profit_first_report = build_profit_first_promotion_report(
+            trade_samples=trade_samples,
+            shadow_samples=shadow_samples,
+        )
         effective_promotion = promotion_recommendation or build_phase3_promotion_recommendation(
             training_mode=training_mode,
             model_stage=model_stage,
@@ -594,6 +599,7 @@ class LocalAIToolsClient:
             paper_observation_report=effective_paper_observation,
             completed_shadow_sample_count=int(completed_shadow_sample_count or 0),
             completed_trade_sample_count=int(completed_trade_sample_count or 0),
+            profit_first_report=profit_first_report,
         )
         payload = {
             "source": source,
@@ -613,6 +619,7 @@ class LocalAIToolsClient:
             "model_stage": model_stage,
             "evaluation_policy": effective_evaluation_policy,
             "paper_observation_report": effective_paper_observation,
+            "profit_first_report": profit_first_report,
             "promotion_recommendation": effective_promotion,
             "persist_artifact": bool(persist_artifact),
             "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),

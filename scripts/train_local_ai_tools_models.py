@@ -40,6 +40,7 @@ from services.trade_fact_trust import (
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.model_promotion_policy import (
+    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
     load_latest_paper_observation_report,
 )
@@ -1033,6 +1034,10 @@ async def _main() -> None:
     trainable_trade_sample_count = len(training_payload["trade_samples"])
     quarantined_trade_sample_count = max(raw_trade_sample_count - trainable_trade_sample_count, 0)
     paper_observation_report = load_latest_paper_observation_report()
+    profit_first_report = build_profit_first_promotion_report(
+        trade_samples=training_payload["trade_samples"],
+        shadow_samples=training_payload["shadow_samples"],
+    )
 
     payload = {
         "source": "local_trading_system",
@@ -1062,6 +1067,7 @@ async def _main() -> None:
             "phase": "phase3_model_factory",
         },
         "paper_observation_report": paper_observation_report,
+        "profit_first_report": profit_first_report,
     }
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
@@ -1072,6 +1078,7 @@ async def _main() -> None:
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=completed_shadow_count,
         completed_trade_sample_count=completed_trade_count,
+        profit_first_report=profit_first_report,
     )
     result = await _post_training_payload(
         args.base_url,

@@ -31,6 +31,7 @@ from core.safe_output import safe_error_text
 from services.artifact_retirement_audit import ArtifactRetirementAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.model_promotion_policy import (
+    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
     load_latest_paper_observation_report,
 )
@@ -276,6 +277,10 @@ async def collect_phase3_rebuild_preflight(
         "phase": "phase3_model_factory",
     }
     paper_observation_report = load_latest_paper_observation_report(root=ROOT)
+    profit_first_report = build_profit_first_promotion_report(
+        trade_samples=payload["trade_samples"],
+        shadow_samples=payload["shadow_samples"],
+    )
     promotion = build_phase3_promotion_recommendation(
         training_mode="shadow",
         model_stage="shadow",
@@ -285,6 +290,7 @@ async def collect_phase3_rebuild_preflight(
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=training["completed_shadow_sample_count"],
         completed_trade_sample_count=training["completed_trade_sample_count"],
+        profit_first_report=profit_first_report,
     )
     local_ai_tools = {
         "available": True,
@@ -298,6 +304,7 @@ async def collect_phase3_rebuild_preflight(
         "text_sentiment_sample_count": training["text_sentiment_sample_count"],
         "quality_report": payload["quality_report"],
         "governance_report": payload["governance_report"],
+        "profit_first_report": profit_first_report,
         "training_mode": "shadow",
         "model_stage": "shadow",
         "promotion_flow": "shadow_to_canary_to_live",
@@ -365,6 +372,7 @@ async def collect_phase3_rebuild_preflight(
         },
         "quality_report": payload["quality_report"],
         "governance_report": payload["governance_report"],
+        "profit_first_report": profit_first_report,
         "promotion_recommendation": promotion,
         "paper_observation_report": paper_observation_report,
         "historical_trade_fact_audit": historical_report,

@@ -1,6 +1,7 @@
 import json
 
 from services.model_promotion_policy import (
+    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
     load_latest_paper_observation_report,
 )
@@ -322,3 +323,133 @@ def test_load_latest_paper_observation_report_reads_local_data_dir(
     assert loaded["status"] == "healthy"
     assert loaded["can_use_for_promotion"] is True
     assert loaded["report_path"].endswith("latest.json")
+
+
+def test_phase3_promotion_policy_blocks_canary_when_profit_first_net_pnl_is_non_positive() -> None:
+    profit_first_report = {
+        "summary": {"promote_candidate_count": 1},
+        "strategy_rankings": [
+            {"recommended_stage": "canary", "realized_net_pnl": -1.0, "profit_factor": 0.92}
+        ],
+        "source_rankings": [{"recommended_stage": "promote"}],
+        "runtime_feedback": {
+            "profit_acceptance": {
+                "window_closed_trade_count": 20,
+                "net_pnl": -1.0,
+                "profit_factor": 0.92,
+            },
+            "size_feedback": [
+                {"sizing_bias": "quality_entries_can_expand_after_validation"}
+            ],
+        },
+    }
+    recommendation = build_phase3_promotion_recommendation(
+        training_mode="shadow",
+        model_stage="shadow",
+        quality_report={
+            "totals": {
+                "total": 500,
+                "excluded": 0,
+                "effective_weight_ratio": 0.92,
+            }
+        },
+        governance_report={
+            "trainable_sample_count": 500,
+            "contamination_risk": "low",
+        },
+        evaluation_policy={"live_mutation": False, "requires_walk_forward": True},
+        paper_observation_report=_healthy_paper_observation(),
+        completed_shadow_sample_count=500,
+        completed_trade_sample_count=20,
+        profit_first_report=profit_first_report,
+    )
+
+    assert recommendation["canary_ready"] is False
+    assert "profit_first_net_pnl_non_positive" in recommendation["canary_blocking_reasons"]
+    assert recommendation["runtime_permissions"]["canary_budget_permission"] == "shadow_only"
+
+
+def test_phase3_promotion_policy_uses_profit_first_report_to_unlock_canary_permissions() -> None:
+    profit_first_report = {
+        "summary": {"promote_candidate_count": 1},
+        "strategy_rankings": [
+            {"recommended_stage": "canary", "realized_net_pnl": 3.4, "profit_factor": 1.4}
+        ],
+        "source_rankings": [{"recommended_stage": "promote"}],
+        "runtime_feedback": {
+            "profit_acceptance": {
+                "window_closed_trade_count": 20,
+                "net_pnl": 3.4,
+                "profit_factor": 1.4,
+            },
+            "size_feedback": [
+                {"sizing_bias": "quality_entries_can_expand_after_validation"}
+            ],
+            "missed_opportunity_feedback": {
+                "entry_bias": "expand_quality_entries",
+                "missed_positive_shadow_count": 2,
+            },
+        },
+    }
+    recommendation = build_phase3_promotion_recommendation(
+        training_mode="shadow",
+        model_stage="shadow",
+        quality_report={
+            "totals": {
+                "total": 500,
+                "excluded": 0,
+                "effective_weight_ratio": 0.92,
+            }
+        },
+        governance_report={
+            "trainable_sample_count": 500,
+            "contamination_risk": "low",
+        },
+        evaluation_policy={"live_mutation": False, "requires_walk_forward": True},
+        paper_observation_report=_healthy_paper_observation(),
+        completed_shadow_sample_count=500,
+        completed_trade_sample_count=20,
+        profit_first_report=profit_first_report,
+    )
+
+    assert recommendation["canary_ready"] is True
+    assert recommendation["runtime_permissions"]["canary_budget_permission"] == (
+        "operator_review_canary_expand"
+    )
+    assert recommendation["runtime_permissions"]["size_permission"] == (
+        "operator_review_canary_expand"
+    )
+
+
+def test_build_profit_first_promotion_report_uses_training_samples_for_runtime_feedback() -> None:
+    report = build_profit_first_promotion_report(
+        shadow_samples=[
+            {
+                "symbol": "BTC/USDT",
+                "decision_action": "hold",
+                "missed_opportunity": True,
+                "long_return_pct": 0.12,
+                "short_return_pct": -0.03,
+            }
+        ],
+        trade_samples=[
+            {
+                "id": 7,
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "realized_pnl": 2.5,
+                "raw_llm_response": {
+                    "profit_first_trade_plan": {
+                        "decision_lane": "validated",
+                        "model_contributions": [{"source": "local_ml"}],
+                    }
+                },
+            }
+        ],
+    )
+
+    assert report["evidence_source"] == "phase3_training_samples"
+    assert report["summary"]["closed_position_count"] == 1
+    assert report["runtime_feedback"]["missed_opportunity_feedback"][
+        "missed_positive_shadow_count"
+    ] == 1

@@ -754,6 +754,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
         "phase3_shadow_to_canary_to_live"
     )
+    assert result["profit_first_report"]["evidence_source"] == "phase3_training_samples"
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
     assert result["promotion_recommendation"]["policy"] == "phase3_shadow_to_canary_to_live"

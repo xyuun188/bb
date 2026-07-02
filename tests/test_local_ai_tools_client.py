@@ -192,6 +192,7 @@ async def test_local_ai_tools_train_sends_training_cursors(
     assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
     assert captured["payload"]["persist_artifact"] is False
     assert captured["payload"]["confirm_phase3_rebuild"] is False
+    assert captured["payload"]["profit_first_report"]["evidence_source"] == "phase3_training_samples"
     assert captured["payload"]["promotion_recommendation"]["recommended_stage"] == "shadow"
     assert captured["request_timeout"] == 180.0
 
@@ -259,11 +260,13 @@ async def test_local_ai_tools_train_builds_default_promotion_recommendation(
     )
 
     recommendation = captured["payload"]["promotion_recommendation"]
+    profit_first_report = captured["payload"]["profit_first_report"]
     assert recommendation["policy"] == "phase3_shadow_to_canary_to_live"
     assert recommendation["canary_ready"] is True
     assert recommendation["live_ready"] is False
     assert "walk_forward_required" in recommendation["live_blocking_reasons"]
     assert captured["payload"]["paper_observation_report"]["status"] == "healthy"
+    assert profit_first_report["evidence_source"] == "phase3_training_samples"
 
 
 @pytest.mark.asyncio

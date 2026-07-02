@@ -127,6 +127,7 @@ async def test_phase3_rebuild_preflight_is_read_only_and_lists_commands(
     assert report["readiness"]["can_run_confirmed_rebuild"] is True
     assert report["readiness"]["can_persist_artifact"] is False
     assert report["paper_observation_report"]["status"] == "healthy"
+    assert report["profit_first_report"]["evidence_source"] == "phase3_training_samples"
     assert "paper_observation_report_missing" not in report["promotion_recommendation"][
         "canary_blocking_reasons"
     ]
