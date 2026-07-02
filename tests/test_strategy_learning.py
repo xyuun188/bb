@@ -1157,6 +1157,9 @@ def test_strategy_learning_defensive_probe_shadow_loop_schedules_quality_recover
     assert context["strategy_profile_id"] == "quality_entry_recovery"
     assert context["probe_fraction"] == 0.0
     assert context["max_probe_size_pct"] == 0.0
+    assert context["strategy_learning_sizing"]["quality_entry_recovery_active"] is True
+    assert context["strategy_learning_sizing"]["probe_fraction"] == 0.0
+    assert context["strategy_learning_sizing"]["max_probe_size_pct"] == 0.0
 
 
 def test_strategy_learning_groups_fragmented_open_positions_by_symbol_and_side(

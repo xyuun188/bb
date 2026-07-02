@@ -4677,11 +4677,19 @@ class StrategyLearningEngine:
         )
         result["entry_filters_are_hard_gate"] = False
         result["entry_filter_preference"] = _safe_dict(runtime.get("entry_filter_preference"))
+        strategy_profile_id = active_profile.get("id") or runtime.get("profile_id")
+        quality_entry_recovery_selected = (
+            str(strategy_profile_id or "") == "quality_entry_recovery"
+        )
         result["strategy_learning_sizing"] = {
-            "profile_id": active_profile.get("id") or runtime.get("profile_id"),
+            "profile_id": strategy_profile_id,
             "position_size_multiplier": result["position_size_multiplier"],
-            "probe_fraction": result["probe_fraction"],
-            "max_probe_size_pct": result["max_probe_size_pct"],
+            "probe_fraction": 0.0
+            if quality_entry_recovery_selected
+            else result["probe_fraction"],
+            "max_probe_size_pct": 0.0
+            if quality_entry_recovery_selected
+            else result["max_probe_size_pct"],
             "side_overrides": _safe_dict(runtime.get("side_overrides")),
             "side_weights": result["side_weights"],
             "profit_first_context": _safe_dict(runtime.get("profit_first_context")),
@@ -4690,6 +4698,7 @@ class StrategyLearningEngine:
             ],
             "profit_first_runtime_feedback": result["profit_first_runtime_feedback"],
             "reason": schedule.get("reason", ""),
+            "quality_entry_recovery_active": quality_entry_recovery_selected,
         }
         result["target_position_groups"] = _safe_int(runtime.get("target_position_groups"), 0)
         result["target_open_position_groups"] = _safe_int(
@@ -4779,60 +4788,83 @@ class StrategyLearningEngine:
         )
         recovery_probe_allowed = bool(fallback_health_guard_active or execution_guard_active)
         entry_pause = False
+        sizing = result["strategy_learning_sizing"]
+        quality_entry_recovery_active = (
+            str(sizing.get("profile_id") or "") == "quality_entry_recovery"
+        )
         if release_pressure_active:
             sizing = result["strategy_learning_sizing"]
             sizing["release_pressure_active"] = True
-            sizing["reason"] = (
-                "满仓/低质量仓位压力存在：优先释放低质量仓位，同时只允许高质量小仓探针。"
-            )
-            sizing["probe_fraction"] = max(
-                _safe_float(sizing.get("probe_fraction"), 0.0),
-                ENTRY_RISK_SIZING_PARAMS.release_probe_fraction_floor,
-            )
-            sizing["max_probe_size_pct"] = min(
-                max(
-                    _safe_float(
-                        sizing.get("max_probe_size_pct"),
-                        ENTRY_RISK_SIZING_PARAMS.release_probe_default_cap_pct,
+            if quality_entry_recovery_active:
+                sizing["quality_entry_recovery_active"] = True
+                sizing["probe_fraction"] = 0.0
+                sizing["max_probe_size_pct"] = 0.0
+                sizing["reason"] = (
+                    "满仓或低质量仓位压力存在，但当前为质量开仓恢复画像；"
+                    "取消策略学习层探针仓位上限，继续走动态收益和风控校验。"
+                )
+            else:
+                sizing["reason"] = (
+                    "满仓/低质量仓位压力存在：优先释放低质量仓位，同时只允许高质量小仓探针。"
+                )
+                sizing["probe_fraction"] = max(
+                    _safe_float(sizing.get("probe_fraction"), 0.0),
+                    ENTRY_RISK_SIZING_PARAMS.release_probe_fraction_floor,
+                )
+                sizing["max_probe_size_pct"] = min(
+                    max(
+                        _safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RISK_SIZING_PARAMS.release_probe_default_cap_pct,
+                        ),
+                        ENTRY_RISK_SIZING_PARAMS.release_probe_min_cap_pct,
                     ),
-                    ENTRY_RISK_SIZING_PARAMS.release_probe_min_cap_pct,
-                ),
-                ENTRY_RISK_SIZING_PARAMS.release_probe_max_cap_pct,
-            )
-            sizing["reason"] = (
-                "满仓或低质量仓位压力存在：优先释放低质量仓位，" "同时只允许高质量小仓探针。"
-            )
+                    ENTRY_RISK_SIZING_PARAMS.release_probe_max_cap_pct,
+                )
+                sizing["reason"] = (
+                    "满仓或低质量仓位压力存在：优先释放低质量仓位，同时只允许高质量小仓探针。"
+                )
         if recovery_probe_allowed:
             sizing = result["strategy_learning_sizing"]
             sizing["health_guard_active"] = True
             sizing["recovery_probe_allowed"] = True
-            sizing["reason"] = (
-                "模型健康护栏激活：fallback 依赖偏高，系统不再硬停所有新开仓，"
-                "改为质量驱动恢复探针来采集真实健康样本。"
-            )
-            sizing["position_size_multiplier"] = min(
-                _safe_float(sizing.get("position_size_multiplier"), 1.0),
-                ENTRY_RISK_SIZING_PARAMS.recovery_multiplier_cap,
-            )
-            sizing["probe_fraction"] = max(
-                _safe_float(sizing.get("probe_fraction"), 0.0),
-                ENTRY_RISK_SIZING_PARAMS.recovery_probe_fraction_floor,
-            )
-            sizing["max_probe_size_pct"] = min(
-                max(
-                    _safe_float(
-                        sizing.get("max_probe_size_pct"),
-                        ENTRY_RISK_SIZING_PARAMS.recovery_probe_default_cap_pct,
+            if quality_entry_recovery_active:
+                sizing["quality_entry_recovery_active"] = True
+                sizing["probe_fraction"] = 0.0
+                sizing["max_probe_size_pct"] = 0.0
+                sizing["execution_guard_active"] = execution_guard_active
+                sizing["reason"] = (
+                    "策略健康护栏已切换到质量开仓恢复画像；"
+                    "取消策略学习层探针仓位上限，强信号继续走动态收益和风控校验。"
+                )
+            else:
+                sizing["reason"] = (
+                    "模型健康护栏激活：fallback 依赖偏高，系统不再硬停所有新开仓，"
+                    "改为质量驱动恢复探针来采集真实健康样本。"
+                )
+                sizing["position_size_multiplier"] = min(
+                    _safe_float(sizing.get("position_size_multiplier"), 1.0),
+                    ENTRY_RISK_SIZING_PARAMS.recovery_multiplier_cap,
+                )
+                sizing["probe_fraction"] = max(
+                    _safe_float(sizing.get("probe_fraction"), 0.0),
+                    ENTRY_RISK_SIZING_PARAMS.recovery_probe_fraction_floor,
+                )
+                sizing["max_probe_size_pct"] = min(
+                    max(
+                        _safe_float(
+                            sizing.get("max_probe_size_pct"),
+                            ENTRY_RISK_SIZING_PARAMS.recovery_probe_default_cap_pct,
+                        ),
+                        ENTRY_RISK_SIZING_PARAMS.recovery_probe_min_cap_pct,
                     ),
-                    ENTRY_RISK_SIZING_PARAMS.recovery_probe_min_cap_pct,
-                ),
-                ENTRY_RISK_SIZING_PARAMS.recovery_health_probe_max_cap_pct,
-            )
-            sizing["execution_guard_active"] = execution_guard_active
-            sizing["reason"] = (
-                "策略健康护栏已触发：系统不再硬停全部新开仓，"
-                "改为质量驱动恢复探针；强信号可按收益质量动态放大，弱信号仍保持小仓。"
-            )
+                    ENTRY_RISK_SIZING_PARAMS.recovery_health_probe_max_cap_pct,
+                )
+                sizing["execution_guard_active"] = execution_guard_active
+                sizing["reason"] = (
+                    "策略健康护栏已触发：系统不再硬停全部新开仓，"
+                    "改为质量驱动恢复探针；强信号可按收益质量动态放大，弱信号仍保持小仓。"
+                )
         result["strategy_learning_entry_pause"] = entry_pause
         result["strategy_learning_entry_pause_reason"] = ""
         result["strategy_learning_execution_guard_active"] = execution_guard_active

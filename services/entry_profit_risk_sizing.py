@@ -411,6 +411,16 @@ class EntryProfitRiskSizingPolicy:
                 "max_probe_size_pct": strategy_mode.get("max_probe_size_pct"),
                 "side_overrides": strategy_mode.get("side_quality"),
             }
+        if str(sizing.get("profile_id") or "") == "quality_entry_recovery":
+            sizing = {
+                **sizing,
+                "quality_entry_recovery_active": True,
+                "probe_fraction": 0.0,
+                "max_probe_size_pct": 0.0,
+                "reason": str(
+                    sizing.get("reason") or "质量开仓恢复画像取消策略学习层探针仓位上限。"
+                )[:240],
+            }
         return sizing
 
     @classmethod
@@ -455,6 +465,19 @@ class EntryProfitRiskSizingPolicy:
                     or "策略学习护栏提示：已转为小仓恢复探针，不作为新开仓硬拦截。"
                 )[:240],
             }
+        quality_entry_recovery_active = bool(sizing.get("quality_entry_recovery_active")) or str(
+            sizing.get("profile_id") or ""
+        ) == "quality_entry_recovery"
+        if quality_entry_recovery_active:
+            sizing = {
+                **sizing,
+                "quality_entry_recovery_active": True,
+                "probe_fraction": 0.0,
+                "max_probe_size_pct": 0.0,
+                "reason": str(
+                    sizing.get("reason") or "质量开仓恢复画像取消策略学习层探针仓位上限。"
+                )[:240],
+            }
         global_multiplier = min(
             max(
                 cls._safe_float(sizing.get("position_size_multiplier"), 1.0),
@@ -486,7 +509,8 @@ class EntryProfitRiskSizingPolicy:
             or sizing.get("entry_paused")
         )
         adaptive_recovery_lift = bool(
-            recovery_probe_active
+            not quality_entry_recovery_active
+            and recovery_probe_active
             and recovery_quality_cap_pct > max(max_probe_size, ENTRY_RECOVERY_PROBE_BASE_CAP_PCT)
         )
         if adaptive_recovery_lift:
@@ -516,6 +540,7 @@ class EntryProfitRiskSizingPolicy:
             or sizing.get("entry_paused")
             or probe_fraction > 0
             or max_probe_size > 0
+            or quality_entry_recovery_active
             or abs(global_multiplier - 1.0) > 1e-9
             or abs(side_multiplier - 1.0) > 1e-9
             or quality_override
@@ -547,6 +572,7 @@ class EntryProfitRiskSizingPolicy:
             "health_guard_active": bool(sizing.get("health_guard_active")),
             "recovery_probe_allowed": bool(sizing.get("recovery_probe_allowed")),
             "execution_guard_active": bool(sizing.get("execution_guard_active")),
+            "quality_entry_recovery_active": quality_entry_recovery_active,
             "reason": str(sizing.get("reason") or side_row.get("reason") or "")[:240],
         }
 
@@ -1048,7 +1074,23 @@ class EntryProfitRiskSizingPolicy:
                 current_size = loser_size_cap
                 decision.position_size_pct = current_size
                 caps.append("该币种同方向近期真实亏损，未达到高质量解锁前缩小仓位")
+        strategy_profile_id = str(strategy_sizing.get("profile_id") or "")
+        recovery_quality_cap_pct = self._adaptive_recovery_probe_cap_pct(
+            expected_net_return_pct=expected_net,
+            profit_quality_ratio=profit_quality_ratio,
+            loss_probability=loss_probability,
+            tail_risk_score=tail_risk,
+            score=score,
+            min_score_required=min_score_required,
+            aligned_source_count=aligned_source_count,
+        )
+        quality_entry_recovery_override = bool(
+            strategy_profile_id == "quality_entry_recovery"
+            and recovery_quality_cap_pct > ENTRY_RECOVERY_PROBE_BASE_CAP_PCT
+        )
         quality_override_reasons: list[str] = []
+        if quality_entry_recovery_override:
+            quality_override_reasons.append("quality_entry_recovery_profile")
         strong_positive_strategy_signal = bool(
             not low_payoff_quality
             and aligned_source_count >= 2
@@ -1072,6 +1114,9 @@ class EntryProfitRiskSizingPolicy:
         if high_quality_strategy_signal:
             quality_override_reasons.append("high_quality_entry")
         strategy_quality_override = bool(
+            quality_entry_recovery_override
+            or
+            (
             strong_positive_strategy_signal
             or high_quality_strategy_signal
             or (
@@ -1085,18 +1130,10 @@ class EntryProfitRiskSizingPolicy:
                 and loss_probability <= 0.46
                 and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
             )
+            )
         )
         if strategy_quality_override and not quality_override_reasons:
             quality_override_reasons.append("quality_profit_risk_override")
-        recovery_quality_cap_pct = self._adaptive_recovery_probe_cap_pct(
-            expected_net_return_pct=expected_net,
-            profit_quality_ratio=profit_quality_ratio,
-            loss_probability=loss_probability,
-            tail_risk_score=tail_risk,
-            score=score,
-            min_score_required=min_score_required,
-            aligned_source_count=aligned_source_count,
-        )
         strategy_sizing_applied = self._apply_strategy_learning_sizing(
             current_size=current_size,
             action_side="long" if str(decision.action.value) == "long" else "short",
@@ -1209,10 +1246,14 @@ class EntryProfitRiskSizingPolicy:
         )
         meaningful_quality_override = bool(
             strategy_quality_override
-            and expected_net >= _ENTRY_RISK_SIZING_PARAMS.quality_override_min_expected_net
-            and profit_quality_ratio
-            >= _ENTRY_RISK_SIZING_PARAMS.quality_override_min_profit_quality
-            and loss_probability <= _ENTRY_RISK_SIZING_PARAMS.quality_override_max_loss_probability
+            and recovery_quality_cap_pct > 0.0
+            and expected_net > 0.0
+            and profit_quality_ratio >= min_profit_quality_ratio
+            and loss_probability
+            <= max(
+                _ENTRY_RISK_SIZING_PARAMS.quality_override_max_loss_probability,
+                PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY,
+            )
             and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
         )
         good_probe_quality = bool(
@@ -1410,7 +1451,8 @@ class EntryProfitRiskSizingPolicy:
                 high_quality_entry
                 and not low_payoff_quality
                 and target_min_notional > 0
-                and quality_tier in {"elite", "winner_add", "high_profit", "strong_probe"}
+                and quality_tier
+                in {"elite", "winner_add", "high_profit", "strong_probe", "quality_override"}
             ):
                 required_floor_loss = target_min_notional * stress_stop_loss_pct
                 adaptive_cap_pct = self._adaptive_quality_loss_cap_pct(

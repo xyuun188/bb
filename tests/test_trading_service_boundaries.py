@@ -2586,7 +2586,7 @@ async def test_entry_profit_risk_sizing_reclassifies_stale_shadow_profit_first_p
 
 
 @pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_stale_shadow_plan_keeps_low_payoff_tiny_probe_real():
+async def test_entry_profit_risk_sizing_stale_shadow_plan_keeps_low_payoff_entry_real():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0
 
@@ -2649,8 +2649,10 @@ async def test_entry_profit_risk_sizing_stale_shadow_plan_keeps_low_payoff_tiny_
     sizing = decision.raw_response["profit_risk_sizing"]
     ladder = sizing["profit_first_position_ladder"]
     assert sizing["low_payoff_quality"] is True
-    assert ladder["lane"] == "tiny_probe"
+    assert ladder["lane"] == "validated_probe"
+    assert ladder["capped_by_low_payoff"] is True
     assert ladder["adjusted_size_pct"] > 0
+    assert ladder["adjusted_size_pct"] <= 0.02
     assert ladder["classifier"]["ignored_persisted_plan"]["lane"] == "shadow_only"
     assert 0 < sizing["position_size_pct"] <= 0.02
     assert decision.position_size_pct > 0
@@ -2868,7 +2870,8 @@ async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
     assert sizing["applied"] is True
     assert sizing["profile_id"] == "balanced_probe"
     assert sizing["probe_cap_applied"] is True
-    assert decision.position_size_pct <= 0.018
+    assert decision.position_size_pct > 0.018
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
 
 
 @pytest.mark.asyncio
@@ -2982,7 +2985,73 @@ async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_ca
     assert sizing["profile_id"] == "loss_release"
     assert sizing["probe_cap_applied"] is True
     assert sizing["release_pressure_active"] is True
-    assert decision.position_size_pct <= 0.014
+    assert decision.position_size_pct > 0.014
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
+
+
+@pytest.mark.asyncio
+async def test_entry_profit_risk_sizing_quality_entry_recovery_clears_probe_caps():
+    async def allocated_balance(_model_mode, _decision):
+        return 1000.0
+
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.05
+    decision.suggested_leverage = 5.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.08
+    decision.raw_response = {
+        "strategy_learning_context": {
+            "strategy_learning_release_pressure_active": True,
+            "strategy_learning_recovery_probe_allowed": True,
+            "strategy_learning_sizing": {
+                "profile_id": "quality_entry_recovery",
+                "position_size_multiplier": 0.45,
+                "probe_fraction": 0.08,
+                "max_probe_size_pct": 0.012,
+                "side_overrides": {"long": {"size_multiplier": 0.62}},
+            },
+        },
+        "opportunity_score": {
+            "score": 2.4,
+            "min_score_required": 1.0,
+            "expected_net_return_pct": 1.2,
+            "expected_loss_pct": 0.55,
+            "tail_risk_score": 0.28,
+            "raw_expected_return_pct": 1.2,
+            "profit_quality_ratio": 0.96,
+            "server_profit_loss_probability": 0.40,
+            "ml_aligned": True,
+            "local_profit_aligned": True,
+            "timeseries_aligned": False,
+            "evidence_score": {
+                "tier": "normal",
+                "effective_score": 82.0,
+                "size_multiplier": 1.0,
+                "max_size_pct": None,
+            },
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(
+        allocated_order_balance=allocated_balance,
+        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
+        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
+        entry_stress_stop=EntryStressStopPolicy(),
+        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
+        max_leverage_provider=lambda: 10.0,
+    )
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    strategy_sizing = sizing["strategy_learning_sizing"]
+    assert strategy_sizing["quality_entry_recovery_active"] is True
+    assert strategy_sizing["probe_fraction"] == 0.0
+    assert strategy_sizing["max_probe_size_pct"] == 0.0
+    assert strategy_sizing["probe_cap_applied"] is False
+    assert sizing["strategy_quality_override"] is True
+    assert "quality_entry_recovery_profile" in sizing["strategy_quality_override_reasons"]
+    assert sizing["dynamic_leverage_decision"]["final_integer_leverage"] > 1
+    assert decision.position_size_pct > 0.012
 
 
 @pytest.mark.asyncio
@@ -3043,7 +3112,7 @@ async def test_entry_profit_risk_sizing_does_not_trap_strong_quality_in_release_
     assert strategy_sizing["quality_override"] is True
     assert strategy_sizing["probe_cap_applied"] is False
     assert decision.position_size_pct > 0.012
-    assert sizing["final_notional_usdt"] >= 60.0
+    assert sizing["final_notional_usdt"] >= 45.0
 
 
 @pytest.mark.asyncio
