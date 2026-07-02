@@ -1011,12 +1011,7 @@ class TradingService:
         return max(configured_watchdog, interval * 4.0, expert_budget * 2.0)
 
     def position_round_watchdog_seconds(self) -> float:
-        """Return the hard watchdog for one full position-review round.
-
-        This must stay separate from ``position_review_stage_timeout_seconds``:
-        the stage timeout bounds one slow sub-step, while the round watchdog only
-        catches a genuinely stuck full position-review cycle.
-        """
+        """Return the hard watchdog for one full position-review round."""
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
@@ -1026,7 +1021,16 @@ class TradingService:
             or settings.market_analysis_watchdog_seconds
             or 180
         )
-        return max(configured_watchdog, interval * 4.0, stage_budget * 2.0)
+        responsive_budget = max(
+            interval * 1.5,
+            self.position_loop_interval_seconds() * 1.8,
+            min(
+                stage_budget + max(4.0, min(8.0, interval * 0.25)),
+                interval * 2.0,
+            ),
+            30.0,
+        )
+        return max(10.0, min(configured_watchdog, responsive_budget))
 
     def round_start_reconcile_timeout_seconds(self) -> float:
         """Return the short OKX sync boundary used at analysis round start."""
@@ -1431,6 +1435,60 @@ class TradingService:
     def _round_elapsed_seconds(started_at: datetime) -> float:
         return max((datetime.now(UTC) - started_at).total_seconds(), 0.0)
 
+    @staticmethod
+    def _remaining_monotonic_seconds(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return max(float(deadline) - asyncio.get_running_loop().time(), 0.0)
+
+    def _position_review_stage_timeout_seconds(
+        self,
+        deadline: float | None,
+        *,
+        fallback_timeout: float | None = None,
+    ) -> float:
+        stage_timeout = max(0.25, float(fallback_timeout or self.position_review_stage_timeout_seconds()))
+        remaining = self._remaining_monotonic_seconds(deadline)
+        if remaining is None:
+            return stage_timeout
+        reserve = min(2.0, max(0.25, stage_timeout * 0.03), remaining * 0.25)
+        return max(0.0, min(stage_timeout, remaining - reserve))
+
+    def _append_position_review_budget_warning(
+        self,
+        *,
+        results: dict[str, Any] | None,
+        stage: str,
+        symbol: str | None,
+        remaining_seconds: float | None,
+    ) -> None:
+        if results is None:
+            return
+        symbol_label = symbol or "ALL"
+        message = (
+            f"持仓复盘本轮预算不足：{symbol_label} / {stage} 已顺延到下一轮；"
+            "系统会用最新持仓和行情重新复盘。"
+        )
+        diagnostic = {
+            "stage": stage,
+            "kind": "position_review_round_budget_exhausted",
+            "symbol": symbol_label,
+            "remaining_budget_seconds": (
+                round(float(remaining_seconds), 3)
+                if remaining_seconds is not None
+                else None
+            ),
+            "message": message,
+        }
+        results.setdefault("position_review_diagnostics", []).append(diagnostic)
+        results.setdefault("warnings", []).append(
+            {
+                "model": "position_review",
+                "symbol": symbol_label,
+                "warning": message,
+            }
+        )
+
     def _round_budget_exhausted(self, started_at: datetime) -> bool:
         return self._round_elapsed_seconds(started_at) >= self.market_round_time_budget_seconds()
 
@@ -1539,16 +1597,33 @@ class TradingService:
         round_decision_ids: set[int],
         position_entry_pause_reason: str | None,
         max_groups_override: int,
+        round_deadline_monotonic: float | None = None,
     ) -> tuple[list[tuple[str, str, DecisionOutput, Any, int | None]], set[tuple[str, str]]]:
         """Create position-review candidates through an explicit boundary."""
+
+        review_kwargs = {
+            "results": results,
+            "round_decision_ids": round_decision_ids,
+            "position_entry_pause_reason": position_entry_pause_reason,
+            "max_groups_override": max_groups_override,
+        }
+        try:
+            from inspect import Parameter, signature
+
+            parameters = signature(self._review_open_positions).parameters
+            if any(
+                parameter.kind == Parameter.VAR_KEYWORD
+                or name == "round_deadline_monotonic"
+                for name, parameter in parameters.items()
+            ):
+                review_kwargs["round_deadline_monotonic"] = round_deadline_monotonic
+        except (TypeError, ValueError):
+            review_kwargs["round_deadline_monotonic"] = round_deadline_monotonic
 
         return await self._review_open_positions(
             open_positions,
             feature_vectors,
-            results=results,
-            round_decision_ids=round_decision_ids,
-            position_entry_pause_reason=position_entry_pause_reason,
-            max_groups_override=max_groups_override,
+            **review_kwargs,
         )
 
     async def claim_analysis_symbol(self, symbol: str, scope: str) -> bool:
@@ -4181,6 +4256,11 @@ class TradingService:
             run_position_analysis = analysis_scope in {"full", "position"}
         new_pair_market_pause_applied = False
         round_start = datetime.now(UTC)
+        round_deadline_monotonic: float | None = None
+        if analysis_scope == "position":
+            round_deadline_monotonic = (
+                asyncio.get_running_loop().time() + self.position_round_watchdog_seconds()
+            )
         results: dict[str, Any] = {
             "status": "ok",
             "mode": mode_manager.mode.value,
@@ -4649,6 +4729,7 @@ class TradingService:
                             or POSITION_REVIEW_MAX_GROUPS_PER_ROUND
                         ),
                         claimed_analysis_symbols=claimed_analysis_symbols,
+                        round_deadline_monotonic=round_deadline_monotonic,
                     )
                 )
                 strategy_mode_context = self._refresh_dynamic_capacity(
@@ -7186,6 +7267,7 @@ class TradingService:
         round_decision_ids: set[int] | None = None,
         position_entry_pause_reason: str | None = None,
         max_groups_override: int | None = None,
+        round_deadline_monotonic: float | None = None,
     ) -> tuple[list[tuple], set[tuple[str, str]]]:
         """For each model+symbol with open positions, ask AI to review and possibly act.
 
@@ -7262,6 +7344,19 @@ class TradingService:
                 ],
             )
         for (model_name, symbol), positions in grouped_items:
+            group_timeout = self._position_review_stage_timeout_seconds(
+                round_deadline_monotonic
+            )
+            if round_deadline_monotonic is not None and group_timeout <= 0:
+                self._append_position_review_budget_warning(
+                    results=results,
+                    stage="position_review_group",
+                    symbol=symbol,
+                    remaining_seconds=self._remaining_monotonic_seconds(
+                        round_deadline_monotonic
+                    ),
+                )
+                break
             normalized_symbol = self._normalize_position_symbol(symbol)
             portfolio_symbol_context = self._portfolio_profit_protection_symbol_context(
                 portfolio_profit_context,
@@ -7276,8 +7371,47 @@ class TradingService:
             )
             fv = feature_vectors.get(symbol) or feature_vectors.get(normalized_symbol)
             if fv is None:
+                feature_timeout = self._position_review_stage_timeout_seconds(
+                    round_deadline_monotonic,
+                    fallback_timeout=AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS,
+                )
+                if round_deadline_monotonic is not None and feature_timeout <= 0:
+                    self._append_position_review_budget_warning(
+                        results=results,
+                        stage="position_feature_refresh",
+                        symbol=normalized_symbol or symbol,
+                        remaining_seconds=self._remaining_monotonic_seconds(
+                            round_deadline_monotonic
+                        ),
+                    )
+                    break
                 try:
-                    fv = await self.data_service.get_feature_vector(normalized_symbol or symbol)
+                    fv = await asyncio.wait_for(
+                        self.data_service.get_feature_vector(normalized_symbol or symbol),
+                        timeout=feature_timeout,
+                    )
+                except TimeoutError:
+                    budget_limited = feature_timeout < (
+                        max(float(AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS), 0.25) - 0.001
+                    )
+                    logger.warning(
+                        "position review feature vector refresh timed out",
+                        symbol=normalized_symbol or symbol,
+                        model=model_name,
+                        timeout_seconds=round(feature_timeout, 3),
+                        budget_limited=budget_limited,
+                    )
+                    if budget_limited:
+                        self._append_position_review_budget_warning(
+                            results=results,
+                            stage="position_feature_refresh",
+                            symbol=normalized_symbol or symbol,
+                            remaining_seconds=self._remaining_monotonic_seconds(
+                                round_deadline_monotonic
+                            ),
+                        )
+                        break
+                    fv = None
                 except Exception as exc:
                     logger.debug(
                         "position review feature vector refresh failed",
@@ -7315,24 +7449,56 @@ class TradingService:
                 continue
 
             try:
-                decision_result = await self.position_review_decision_service.decide(
-                    PositionReviewDecisionRequest(
-                        model_name=model_name,
-                        symbol=symbol,
-                        normalized_symbol=normalized_symbol,
-                        feature_vector=fv,
-                        open_positions=open_positions,
-                        trading_mode=mode_manager.mode.value,
-                        position_entry_pause_reason=position_entry_pause_reason,
-                        market_regime_context=market_regime_context,
-                        strategy_mode_context=strategy_mode_context,
-                        portfolio_symbol_context=portfolio_symbol_context,
-                        position_profit_peak_context=position_profit_peak_context,
+                decision_timeout = self._position_review_stage_timeout_seconds(
+                    round_deadline_monotonic
+                )
+                if round_deadline_monotonic is not None and decision_timeout <= 0:
+                    self._append_position_review_budget_warning(
+                        results=results,
+                        stage="position_review_decision",
+                        symbol=normalized_symbol or symbol,
+                        remaining_seconds=self._remaining_monotonic_seconds(
+                            round_deadline_monotonic
+                        ),
                     )
+                    break
+                decision_result = await asyncio.wait_for(
+                    self.position_review_decision_service.decide(
+                        PositionReviewDecisionRequest(
+                            model_name=model_name,
+                            symbol=symbol,
+                            normalized_symbol=normalized_symbol,
+                            feature_vector=fv,
+                            open_positions=open_positions,
+                            trading_mode=mode_manager.mode.value,
+                            position_entry_pause_reason=position_entry_pause_reason,
+                            market_regime_context=market_regime_context,
+                            strategy_mode_context=strategy_mode_context,
+                            portfolio_symbol_context=portfolio_symbol_context,
+                            position_profit_peak_context=position_profit_peak_context,
+                        )
+                    ),
+                    timeout=decision_timeout,
                 )
                 if decision_result is None:
                     continue
                 decision = decision_result.decision
+            except TimeoutError:
+                self._append_position_review_budget_warning(
+                    results=results,
+                    stage="position_review_decision",
+                    symbol=normalized_symbol or symbol,
+                    remaining_seconds=self._remaining_monotonic_seconds(
+                        round_deadline_monotonic
+                    ),
+                )
+                logger.warning(
+                    "position review decision timed out within round budget",
+                    model=model_name,
+                    symbol=symbol,
+                    timeout_seconds=round(decision_timeout, 3),
+                )
+                break
             except Exception as e:
                 logger.error(
                     "review position decide failed",

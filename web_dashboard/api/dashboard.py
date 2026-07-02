@@ -90,16 +90,23 @@ _ml_signal_status_service = None
 _EXCHANGE_MARK_CACHE_TTL_SECONDS = 15.0
 _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 15.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
-_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 6.0
-_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 12.0
+_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 3.0
+_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 3.0
+_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 3.0
+_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 3.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
-_DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
+_dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], int | None]] = {}
+_dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, int | None]] = {}
+_dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, Any]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
 _dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
-_dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any], int | None]] = {}
+_dashboard_okx_balance_locks: dict[str, asyncio.Lock] = {}
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
@@ -153,6 +160,20 @@ def _clear_dashboard_heavy_cache(*names: str) -> None:
 def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
     """Log a recoverable dashboard fallback without breaking the endpoint."""
     logger.debug(event, error=safe_error_text(exc), **fields)
+
+
+def _dashboard_okx_account_label(mode: str) -> str:
+    return "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
+
+
+def _dashboard_okx_error_text(exc: Exception, *, resource: str) -> str:
+    error = safe_error_text(exc)
+    lower = error.lower()
+    if isinstance(exc, TimeoutError) or error in ("TimeoutError", "") or "timed out" in lower:
+        return f"OKX {resource}响应超时，已优先返回缓存数据"
+    if "authorization" in lower or "api key" in lower or "signature" in lower:
+        return f"OKX {resource}鉴权失败：{error}"
+    return f"OKX {resource}读取失败：{error}"
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
@@ -1090,28 +1111,6 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     selected_mode = "live" if mode == "live" else "paper"
     allocated = 0.0
     okx_current_equity: float | None = None
-    try:
-        snapshot = await _dashboard_okx_balance_snapshot_for_mode(selected_mode)
-        okx_current_equity = _safe_float(
-            (snapshot or {}).get("equity") or (snapshot or {}).get("total"),
-            None,
-        )
-        allocated = (
-            _safe_float(
-                (snapshot or {}).get("allocatable")
-                or (snapshot or {}).get("equity")
-                or (snapshot or {}).get("total")
-                or (snapshot or {}).get("free"),
-                0.0,
-            )
-            or 0.0
-        )
-    except Exception as exc:
-        _log_dashboard_fallback(
-            "dashboard balance snapshot fallback",
-            exc,
-            mode=selected_mode,
-        )
     realized_profit = 0.0
     realized_loss = 0.0
     today_realized_profit = 0.0
@@ -1124,24 +1123,53 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = start_local.astimezone(UTC)
 
-    try:
-        exchange_marks = await _get_exchange_position_mark_map(selected_mode)
-    except Exception as exc:
+    balance_result, marks_result, symbols_result = await asyncio.gather(
+        _dashboard_okx_balance_snapshot_for_mode(selected_mode),
+        _get_exchange_position_mark_map(selected_mode),
+        _get_exchange_open_position_symbols(selected_mode),
+        return_exceptions=True,
+    )
+    if isinstance(balance_result, Exception):
+        _log_dashboard_fallback(
+            "dashboard balance snapshot fallback",
+            balance_result,
+            mode=selected_mode,
+        )
+        snapshot = None
+    else:
+        snapshot = balance_result
+    okx_current_equity = _safe_float(
+        (snapshot or {}).get("equity") or (snapshot or {}).get("total"),
+        None,
+    )
+    allocated = (
+        _safe_float(
+            (snapshot or {}).get("allocatable")
+            or (snapshot or {}).get("equity")
+            or (snapshot or {}).get("total")
+            or (snapshot or {}).get("free"),
+            0.0,
+        )
+        or 0.0
+    )
+    if isinstance(marks_result, Exception):
         _log_dashboard_fallback(
             "exchange mark snapshot fallback",
-            exc,
+            marks_result,
             mode=selected_mode,
         )
         exchange_marks = {}
-    try:
-        exchange_symbols = await _get_exchange_open_position_symbols(selected_mode)
-    except Exception as exc:
+    else:
+        exchange_marks = marks_result
+    if isinstance(symbols_result, Exception):
         _log_dashboard_fallback(
             "exchange open symbol fallback",
-            exc,
+            symbols_result,
             mode=selected_mode,
         )
         exchange_symbols = None
+    else:
+        exchange_symbols = symbols_result
 
     try:
         async with get_session_ctx() as session:
@@ -1875,9 +1903,7 @@ def _dashboard_okx_executor_for_mode(mode: str) -> Any | None:
     return getter("live" if mode == "live" else "paper")
 
 
-async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, Any]]:
-    """Fetch current OKX positions in both inline and split-dashboard processes."""
-
+async def _fetch_dashboard_okx_positions_uncached(selected_mode: str) -> list[dict[str, Any]]:
     executor = _dashboard_okx_executor_for_mode(selected_mode)
     if executor:
         fetch_strict = getattr(executor, "get_positions_strict", None)
@@ -1889,13 +1915,13 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
 
     fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
     try:
-        await asyncio.wait_for(
-            fallback_executor.initialize(),
-            timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
-        )
+        async def fetch_with_fallback() -> list[dict[str, Any]]:
+            await fallback_executor.initialize()
+            return await fallback_executor.get_positions_strict()
+
         return await asyncio.wait_for(
-            fallback_executor.get_positions_strict(),
-            timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+            fetch_with_fallback(),
+            timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
         )
     finally:
         try:
@@ -1908,16 +1934,83 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             )
 
 
+async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, Any]]:
+    """Fetch current OKX positions once per dashboard refresh window.
+
+    The dashboard needs both open-symbol and mark-price views.  Without this
+    cache, a single page refresh can hit the same OKX private positions API
+    several times and amplify transient slowness into endpoint timeouts.
+    """
+
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    executor_identity = id(_dashboard_okx_executor_for_mode(selected_mode))
+    now = datetime.now(UTC)
+    cached = _dashboard_okx_position_cache.get(selected_mode)
+    if cached:
+        cached_at, cached_value, cached_executor_identity = cached
+        if (
+            cached_executor_identity == executor_identity
+            and (now - cached_at).total_seconds() <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
+        ):
+            return copy.deepcopy(cached_value)
+
+    cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
+    if cached_error:
+        cached_at, cached_text, cached_executor_identity = cached_error
+        if (
+            cached_executor_identity == executor_identity
+            and (now - cached_at).total_seconds()
+            <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
+        ):
+            if cached:
+                return copy.deepcopy(cached[1])
+            raise RuntimeError(cached_text)
+
+    lock = _dashboard_okx_position_locks.setdefault(selected_mode, asyncio.Lock())
+    async with lock:
+        now = datetime.now(UTC)
+        cached = _dashboard_okx_position_cache.get(selected_mode)
+        if cached:
+            cached_at, cached_value, cached_executor_identity = cached
+            if (
+                cached_executor_identity == executor_identity
+                and (now - cached_at).total_seconds() <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
+            ):
+                return copy.deepcopy(cached_value)
+        cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
+        if cached_error:
+            cached_at, cached_text, cached_executor_identity = cached_error
+            if (
+                cached_executor_identity == executor_identity
+                and
+                (now - cached_at).total_seconds()
+                <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
+            ):
+                if cached:
+                    return copy.deepcopy(cached[1])
+                raise RuntimeError(cached_text)
+
+        try:
+            positions = await _fetch_dashboard_okx_positions_uncached(selected_mode)
+        except Exception as exc:
+            _dashboard_okx_position_error_cache[selected_mode] = (
+                datetime.now(UTC),
+                _dashboard_okx_error_text(exc, resource="持仓"),
+                executor_identity,
+            )
+            raise
+
+        normalized_positions = [dict(position) for position in positions or []]
+        _dashboard_okx_position_cache[selected_mode] = (
+            datetime.now(UTC),
+            copy.deepcopy(normalized_positions),
+            executor_identity,
+        )
+        _dashboard_okx_position_error_cache.pop(selected_mode, None)
+        return normalized_positions
+
+
 async def _dashboard_okx_balance_snapshot_for_mode(mode: str) -> dict[str, Any] | None:
-    getter = getattr(_trading_service, "get_okx_balance_snapshot_for_mode", None)
-    if not callable(getter):
-        return await _get_dashboard_okx_account_snapshot(mode)
-    try:
-        snapshot = await getter("live" if mode == "live" else "paper")
-    except Exception:
-        snapshot = None
-    if snapshot:
-        return snapshot
     return await _get_dashboard_okx_account_snapshot(mode)
 
 
@@ -2239,57 +2332,143 @@ async def _get_exchange_position_mark_map(
 async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, Any] | None:
     """Fetch the OKX balance snapshot used by dashboard summary with bounded retries."""
     selected_mode = "live" if selected_mode == "live" else "paper"
-    now = datetime.now(UTC)
-    cached = _dashboard_okx_balance_cache.get(selected_mode)
-    if cached:
+    initial_executor = _dashboard_okx_executor_for_mode(selected_mode)
+    executor_identity = id(initial_executor) if initial_executor is not None else None
+
+    def cached_success(now: datetime, *, fresh_only: bool) -> dict[str, Any] | None:
+        cached = _dashboard_okx_balance_cache.get(selected_mode)
+        if not cached:
+            return None
         cached_at, cached_value = cached
-        if (now - cached_at).total_seconds() <= _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
-            return copy.deepcopy(cached_value)
+        age_seconds = (now - cached_at).total_seconds()
+        if fresh_only and age_seconds > _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
+            return None
+        snapshot = copy.deepcopy(cached_value)
+        if not fresh_only:
+            snapshot["stale"] = True
+            snapshot["stale_age_seconds"] = round(age_seconds, 3)
+        return snapshot
 
-    cached_error = _dashboard_okx_balance_error_cache.get(selected_mode)
-    if cached_error:
-        cached_at, cached_value = cached_error
-        if (now - cached_at).total_seconds() <= _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS:
-            stale_cached = _dashboard_okx_balance_cache.get(selected_mode)
-            if stale_cached and stale_cached[1]:
-                stale_snapshot = copy.deepcopy(stale_cached[1])
-                stale_snapshot["stale"] = True
-                stale_snapshot["stale_age_seconds"] = round(
-                    (now - stale_cached[0]).total_seconds(), 3
-                )
-                stale_snapshot["error"] = cached_value.get("error")
-                stale_snapshot["balance_error"] = cached_value.get("balance_error")
-                stale_snapshot["error_cached"] = True
-                return stale_snapshot
-            return copy.deepcopy(cached_value)
+    def cached_failure(now: datetime) -> dict[str, Any] | None:
+        cached_error = _dashboard_okx_balance_error_cache.get(selected_mode)
+        if not cached_error:
+            return None
+        cached_at, cached_value, cached_executor_identity = cached_error
+        if (
+            cached_executor_identity != executor_identity
+            or (now - cached_at).total_seconds()
+            > _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS
+        ):
+            return None
+        stale_snapshot = cached_success(now, fresh_only=False)
+        if stale_snapshot:
+            stale_snapshot["error"] = cached_value.get("error")
+            stale_snapshot["balance_error"] = cached_value.get("balance_error")
+            stale_snapshot["error_cached"] = True
+            return stale_snapshot
+        return copy.deepcopy(cached_value)
 
-    def cache_failure(exc: Exception, *, source: str) -> dict[str, Any]:
-        error = safe_error_text(exc)
+    now = datetime.now(UTC)
+    fresh_cached = cached_success(now, fresh_only=True)
+    if fresh_cached:
+        return fresh_cached
+    error_cached = cached_failure(now)
+    if error_cached:
+        return error_cached
+
+    def cache_failure(
+        exc: Exception,
+        *,
+        source: str,
+        identity: int | None = executor_identity,
+    ) -> dict[str, Any]:
+        error = _dashboard_okx_error_text(exc, resource="余额")
         failure = {
             "error": error,
             "balance_error": error,
-            "balance_source": (
-                "OKX live account" if selected_mode == "live" else "OKX paper account"
-            ),
+            "balance_source": _dashboard_okx_account_label(selected_mode),
             "source": source,
             "error_cached": True,
         }
-        _dashboard_okx_balance_error_cache[selected_mode] = (datetime.now(UTC), failure)
+        _dashboard_okx_balance_error_cache[selected_mode] = (
+            datetime.now(UTC),
+            failure,
+            identity,
+        )
         return copy.deepcopy(failure)
 
     async def fetch_with_executor(executor: Any) -> dict[str, Any] | None:
-        snapshot = await asyncio.wait_for(executor.get_balance_snapshot("USDT"), timeout=8.0)
+        snapshot = await asyncio.wait_for(
+            executor.get_balance_snapshot("USDT"),
+            timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
+        )
         if not snapshot:
             raise RuntimeError("empty OKX balance snapshot")
         if snapshot.get("error"):
             raise RuntimeError(safe_error_text(snapshot.get("error")))
         return dict(snapshot)
 
-    executor = _dashboard_okx_executor_for_mode(selected_mode)
-    if executor:
+    lock = _dashboard_okx_balance_locks.setdefault(selected_mode, asyncio.Lock())
+    async with lock:
+        now = datetime.now(UTC)
+        fresh_cached = cached_success(now, fresh_only=True)
+        if fresh_cached:
+            return fresh_cached
+        error_cached = cached_failure(now)
+        if error_cached:
+            return error_cached
+
+        executor = initial_executor
+        if executor:
+            try:
+                snapshot = await fetch_with_executor(executor)
+                _dashboard_okx_balance_cache[selected_mode] = (
+                    datetime.now(UTC),
+                    copy.deepcopy(snapshot),
+                )
+                _dashboard_okx_balance_error_cache.pop(selected_mode, None)
+                return snapshot
+            except Exception as exc:
+                _log_dashboard_fallback(
+                    "dashboard summary okx balance fallback",
+                    exc,
+                    mode=selected_mode,
+                    source="trading_service_executor",
+                )
+                stale_snapshot = cached_success(datetime.now(UTC), fresh_only=False)
+                if stale_snapshot:
+                    error = _dashboard_okx_error_text(exc, resource="余额")
+                    stale_snapshot["error"] = error
+                    stale_snapshot["balance_error"] = error
+                    stale_snapshot["error_cached"] = True
+                    _dashboard_okx_balance_error_cache[selected_mode] = (
+                        datetime.now(UTC),
+                        {
+                            "error": error,
+                            "balance_error": error,
+                            "balance_source": _dashboard_okx_account_label(selected_mode),
+                            "source": "trading_service_executor",
+                            "error_cached": True,
+                        },
+                        executor_identity,
+                    )
+                    return stale_snapshot
+
+        fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
+        fallback_identity = id(fallback_executor)
         try:
-            snapshot = await fetch_with_executor(executor)
-            _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
+            async def fetch_with_fallback() -> dict[str, Any] | None:
+                await fallback_executor.initialize()
+                return await fetch_with_executor(fallback_executor)
+
+            snapshot = await asyncio.wait_for(
+                fetch_with_fallback(),
+                timeout=_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
+            )
+            _dashboard_okx_balance_cache[selected_mode] = (
+                datetime.now(UTC),
+                copy.deepcopy(snapshot),
+            )
             _dashboard_okx_balance_error_cache.pop(selected_mode, None)
             return snapshot
         except Exception as exc:
@@ -2297,32 +2476,11 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                 "dashboard summary okx balance fallback",
                 exc,
                 mode=selected_mode,
-                source="trading_service_executor",
+                source="isolated_executor",
             )
-
-    fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
-    try:
-        await asyncio.wait_for(fallback_executor.initialize(), timeout=12.0)
-        snapshot = await fetch_with_executor(fallback_executor)
-        _dashboard_okx_balance_cache[selected_mode] = (now, copy.deepcopy(snapshot))
-        _dashboard_okx_balance_error_cache.pop(selected_mode, None)
-        return snapshot
-    except Exception as exc:
-        _log_dashboard_fallback(
-            "dashboard summary okx balance fallback",
-            exc,
-            mode=selected_mode,
-            source="isolated_executor",
-        )
-        cached = _dashboard_okx_balance_cache.get(selected_mode)
-        if cached and cached[1]:
-            stale_snapshot = copy.deepcopy(cached[1])
-            if isinstance(stale_snapshot, dict):
-                error = safe_error_text(exc)
-                stale_snapshot["stale"] = True
-                stale_snapshot["stale_age_seconds"] = round(
-                    (datetime.now(UTC) - cached[0]).total_seconds(), 3
-                )
+            stale_snapshot = cached_success(datetime.now(UTC), fresh_only=False)
+            if stale_snapshot:
+                error = _dashboard_okx_error_text(exc, resource="余额")
                 stale_snapshot["error"] = error
                 stale_snapshot["balance_error"] = error
                 stale_snapshot["error_cached"] = True
@@ -2331,24 +2489,23 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                     {
                         "error": error,
                         "balance_error": error,
-                        "balance_source": (
-                            "OKX live account" if selected_mode == "live" else "OKX paper account"
-                        ),
+                        "balance_source": _dashboard_okx_account_label(selected_mode),
                         "source": "isolated_executor",
                         "error_cached": True,
                     },
+                    executor_identity,
                 )
-            return stale_snapshot
-        return cache_failure(exc, source="isolated_executor")
-    finally:
-        try:
-            await fallback_executor.shutdown()
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "dashboard summary okx fallback shutdown failed",
-                exc,
-                mode=selected_mode,
-            )
+                return stale_snapshot
+            return cache_failure(exc, source="isolated_executor", identity=executor_identity)
+        finally:
+            try:
+                await fallback_executor.shutdown()
+            except Exception as exc:
+                _log_dashboard_fallback(
+                    "dashboard summary okx fallback shutdown failed",
+                    exc,
+                    mode=selected_mode,
+                )
 
 
 async def _get_display_open_position_symbols(mode: str | None = None) -> set[str]:

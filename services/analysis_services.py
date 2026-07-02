@@ -8,7 +8,9 @@ position-review candidate execution, and SL/TP review sequencing live here.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -26,6 +28,13 @@ TimeoutProvider = Callable[[], float]
 TimeBudgetProvider = Callable[[], float]
 DecisionStageRecorder = Callable[..., Awaitable[dict[str, Any]]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _PositionReviewStageSkip:
+    stage: str
+    kind: str
+    message: str
 
 
 class _ScopedAnalysisService:
@@ -210,56 +219,155 @@ class PositionReviewService(_ScopedAnalysisService):
         except (TypeError, ValueError):
             return 30.0
 
+    @staticmethod
+    def _callable_accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
+        try:
+            signature = inspect.signature(callback)
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD or name == keyword
+            for name, parameter in signature.parameters.items()
+        )
+
+    @staticmethod
+    def _close_unawaited(awaitable: Awaitable[Any]) -> None:
+        if inspect.iscoroutine(awaitable):
+            awaitable.close()
+        elif isinstance(awaitable, asyncio.Future) and not awaitable.done():
+            awaitable.cancel()
+
+    def _resolve_round_deadline(self, explicit_deadline: float | None) -> float | None:
+        if explicit_deadline is not None:
+            try:
+                return float(explicit_deadline)
+            except (TypeError, ValueError):
+                return None
+        budget = self._time_budget_seconds()
+        if budget is None:
+            return None
+        return asyncio.get_running_loop().time() + budget
+
+    @staticmethod
+    def _remaining_round_seconds(round_deadline: float | None) -> float | None:
+        if round_deadline is None:
+            return None
+        return max(float(round_deadline) - asyncio.get_running_loop().time(), 0.0)
+
+    def _stage_timeout_seconds(self, round_deadline: float | None) -> float:
+        stage_timeout = self._timeout_seconds()
+        remaining = self._remaining_round_seconds(round_deadline)
+        if remaining is None:
+            return stage_timeout
+        reserve_seconds = min(2.0, max(0.25, stage_timeout * 0.03), remaining * 0.25)
+        return max(0.0, min(stage_timeout, remaining - reserve_seconds))
+
+    def _record_stage_skip(
+        self,
+        *,
+        stage: str,
+        kind: str,
+        message: str,
+        results: dict[str, Any],
+        timeout_seconds: float | None = None,
+        remaining_budget_seconds: float | None = None,
+        error: str | None = None,
+    ) -> _PositionReviewStageSkip:
+        diagnostic: dict[str, Any] = {
+            "stage": stage,
+            "kind": kind,
+            "message": message,
+        }
+        if timeout_seconds is not None:
+            diagnostic["timeout_seconds"] = round(float(timeout_seconds), 3)
+        if remaining_budget_seconds is not None:
+            diagnostic["remaining_budget_seconds"] = round(float(remaining_budget_seconds), 3)
+        if error:
+            diagnostic["error"] = error
+        results.setdefault("position_review_diagnostics", []).append(diagnostic)
+        results.setdefault("warnings", []).append(
+            {
+                "model": "position_review",
+                "symbol": "ALL",
+                "warning": diagnostic["message"],
+            }
+        )
+        return _PositionReviewStageSkip(stage=stage, kind=kind, message=message)
+
     async def _wait_stage(
         self,
         stage: str,
         awaitable: Awaitable[Any],
         *,
         results: dict[str, Any],
-    ) -> Any | None:
-        timeout_seconds = self._timeout_seconds()
+        round_deadline: float | None = None,
+    ) -> Any | _PositionReviewStageSkip:
+        timeout_seconds = self._stage_timeout_seconds(round_deadline)
+        remaining = self._remaining_round_seconds(round_deadline)
+        if round_deadline is not None and timeout_seconds <= 0:
+            self._close_unawaited(awaitable)
+            message = (
+                f"持仓复盘本轮剩余时间不足：{stage} 已顺延到下一轮，"
+                "系统会用最新持仓和行情重新复盘。"
+            )
+            skip = self._record_stage_skip(
+                stage=stage,
+                kind="position_review_round_budget_exhausted",
+                message=message,
+                results=results,
+                timeout_seconds=0.0,
+                remaining_budget_seconds=remaining,
+            )
+            logger.info(
+                "position review round budget exhausted before stage",
+                stage=stage,
+                remaining_budget_seconds=remaining,
+            )
+            return skip
         try:
             return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
         except TimeoutError:
-            diagnostic = {
-                "stage": stage,
-                "timeout_seconds": timeout_seconds,
-                "message": f"持仓复盘阶段超时：{stage}，本轮跳过该阶段并继续下一轮。",
-            }
-            results.setdefault("position_review_diagnostics", []).append(diagnostic)
-            results.setdefault("warnings", []).append(
-                {
-                    "model": "position_review",
-                    "symbol": "ALL",
-                    "warning": diagnostic["message"],
-                }
+            stage_timeout = self._timeout_seconds()
+            budget_limited = timeout_seconds < (stage_timeout - 0.001)
+            if budget_limited:
+                message = (
+                    f"持仓复盘本轮预算用尽：{stage} 没有在剩余时间内完成，"
+                    "系统已停止继续消耗本轮时间并顺延到下一轮。"
+                )
+                kind = "position_review_round_budget_exhausted"
+            else:
+                message = f"持仓复盘阶段超时：{stage}，本轮跳过该阶段并继续下一轮。"
+                kind = "position_review_stage_timeout"
+            skip = self._record_stage_skip(
+                stage=stage,
+                kind=kind,
+                message=message,
+                results=results,
+                timeout_seconds=timeout_seconds,
+                remaining_budget_seconds=self._remaining_round_seconds(round_deadline),
             )
             logger.warning(
                 "position review stage timed out",
                 stage=stage,
                 timeout_seconds=timeout_seconds,
+                budget_limited=budget_limited,
             )
-            return None
+            return skip
         except Exception as exc:
-            diagnostic = {
-                "stage": stage,
-                "error": safe_error_text(exc),
-                "message": f"持仓复盘阶段异常：{stage}，本轮跳过该阶段并继续下一轮。",
-            }
-            results.setdefault("position_review_diagnostics", []).append(diagnostic)
-            results.setdefault("warnings", []).append(
-                {
-                    "model": "position_review",
-                    "symbol": "ALL",
-                    "warning": diagnostic["message"],
-                }
+            error = safe_error_text(exc)
+            skip = self._record_stage_skip(
+                stage=stage,
+                kind="position_review_stage_error",
+                message=f"持仓复盘阶段异常：{stage}，本轮跳过该阶段并继续下一轮。",
+                results=results,
+                error=error,
             )
             logger.warning(
                 "position review stage failed",
                 stage=stage,
-                error=safe_error_text(exc),
+                error=error,
             )
-            return None
+            return skip
 
     async def review_open_positions(
         self,
@@ -271,6 +379,7 @@ class PositionReviewService(_ScopedAnalysisService):
         position_entry_pause_reason: str | None,
         max_groups_override: int,
         claimed_analysis_symbols: list[str],
+        round_deadline_monotonic: float | None = None,
     ) -> tuple[list[dict[str, Any]], set[tuple[str, str]]]:
         """Run the position-review pass and execute approved exit/add candidates."""
 
@@ -284,13 +393,19 @@ class PositionReviewService(_ScopedAnalysisService):
         record_decision_stage = self._required_decision_stage_recorder()
         mark_decision_reason = self._required_decision_reason_marker()
         review_blocked_keys: set[tuple[str, str]] = set()
+        round_deadline = self._resolve_round_deadline(round_deadline_monotonic)
 
         set_loop_stage("enforce_sl_tp")
         sl_tp_results = await self._wait_stage(
             "enforce_sl_tp",
             enforce_sl_tp(feature_vectors),
             results=results,
+            round_deadline=round_deadline,
         )
+        if isinstance(sl_tp_results, _PositionReviewStageSkip):
+            if sl_tp_results.kind == "position_review_round_budget_exhausted":
+                return open_positions, review_blocked_keys
+            sl_tp_results = []
         if sl_tp_results is None:
             sl_tp_results = []
         for action in sl_tp_results:
@@ -310,21 +425,33 @@ class PositionReviewService(_ScopedAnalysisService):
             "get_open_positions_context",
             get_open_positions_context(),
             results=results,
+            round_deadline=round_deadline,
         )
-        if isinstance(refreshed_open_positions, list):
+        if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
+            if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
+                return open_positions, review_blocked_keys
+        elif isinstance(refreshed_open_positions, list):
             open_positions = refreshed_open_positions
+        review_kwargs = {
+            "results": results,
+            "round_decision_ids": round_decision_ids,
+            "position_entry_pause_reason": position_entry_pause_reason,
+            "max_groups_override": max_groups_override,
+        }
+        if self._callable_accepts_keyword(review_positions, "round_deadline_monotonic"):
+            review_kwargs["round_deadline_monotonic"] = round_deadline
         review_result = await self._wait_stage(
             "review_positions",
             review_positions(
                 open_positions,
                 feature_vectors,
-                results=results,
-                round_decision_ids=round_decision_ids,
-                position_entry_pause_reason=position_entry_pause_reason,
-                max_groups_override=max_groups_override,
+                **review_kwargs,
             ),
             results=results,
+            round_deadline=round_deadline,
         )
+        if isinstance(review_result, _PositionReviewStageSkip):
+            return open_positions, review_blocked_keys
         if review_result is None:
             return open_positions, review_blocked_keys
         review_candidates, review_blocked_keys = review_result
@@ -336,7 +463,45 @@ class PositionReviewService(_ScopedAnalysisService):
                 f"claim_position_symbol:{symbol}",
                 try_claim_analysis_symbol(symbol, "position"),
                 results=results,
+                round_deadline=round_deadline,
             )
+            if isinstance(claim_result, _PositionReviewStageSkip):
+                reason = claim_result.message
+                logger.info(
+                    "position execution skipped because review stage did not finish",
+                    symbol=symbol,
+                    stage=claim_result.stage,
+                    kind=claim_result.kind,
+                    reason=reason,
+                )
+                if decision_db_id is not None:
+                    await record_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.STRATEGY_ARBITRATION,
+                        DecisionStageStatus.SKIPPED,
+                        reason,
+                        {
+                            "skip_kind": claim_result.kind,
+                            "selected_for_execution": False,
+                        },
+                    )
+                    await mark_decision_reason(decision_db_id, reason)
+                results.setdefault("decisions", []).append(
+                    {
+                        "model": model_name,
+                        "symbol": symbol,
+                        "action": getattr(getattr(decision, "action", None), "value", None),
+                        "approved": True,
+                        "confidence": getattr(decision, "confidence", 0.0),
+                        "executed": False,
+                        "execution_status": "skipped",
+                        "reason": reason,
+                    }
+                )
+                if claim_result.kind == "position_review_round_budget_exhausted":
+                    break
+                continue
             if not claim_result:
                 reason = (
                     "持仓复盘生成了执行候选，但同一币种正在被另一条分析流程处理；"
@@ -377,7 +542,7 @@ class PositionReviewService(_ScopedAnalysisService):
             if decision_db_id is not None:
                 round_decision_ids.add(decision_db_id)
             review_blocked_keys.add((model_name, normalize_symbol(symbol)))
-            await self._wait_stage(
+            execute_result = await self._wait_stage(
                 f"execute_position_candidate:{symbol}",
                 execute_candidate(
                     symbol,
@@ -389,6 +554,24 @@ class PositionReviewService(_ScopedAnalysisService):
                     open_positions=open_positions,
                 ),
                 results=results,
+                round_deadline=round_deadline,
             )
+            if isinstance(execute_result, _PositionReviewStageSkip):
+                reason = execute_result.message
+                if decision_db_id is not None:
+                    await record_decision_stage(
+                        decision_db_id,
+                        decision,
+                        DecisionStage.EXCHANGE_SUBMIT,
+                        DecisionStageStatus.SKIPPED,
+                        reason,
+                        {
+                            "skip_kind": execute_result.kind,
+                            "selected_for_execution": True,
+                        },
+                    )
+                    await mark_decision_reason(decision_db_id, reason)
+                if execute_result.kind == "position_review_round_budget_exhausted":
+                    break
 
         return open_positions, review_blocked_keys

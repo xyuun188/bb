@@ -5,8 +5,10 @@ Exchange & AI settings API — get/set OKX credentials (paper/live split), AI co
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -45,8 +47,12 @@ from web_dashboard.api import dashboard as _dash
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 _OKX_BALANCE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OKX_BALANCE_ERROR_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OKX_BALANCE_LOCKS: dict[str, asyncio.Lock] = {}
 _OKX_BALANCE_TTL_SECONDS = 60.0
-_OKX_BALANCE_TIMEOUT_SECONDS = 8.0
+_OKX_BALANCE_STALE_SECONDS = 300.0
+_OKX_BALANCE_ERROR_TTL_SECONDS = 5.0
+_OKX_BALANCE_TIMEOUT_SECONDS = 3.0
 _MODEL_CONNECTION_ERROR_LIMIT = 700
 
 
@@ -134,6 +140,102 @@ def _model_server_error(exc: Exception) -> str:
     return safe_error_text(exc, limit=500)
 
 
+def _okx_mode_label(mode: str) -> str:
+    return "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
+
+
+def _empty_okx_snapshot(mode: str) -> dict[str, Any]:
+    return {
+        "available_balance": None,
+        "used_balance": None,
+        "total_balance": None,
+        "cash_balance": None,
+        "equity_balance": None,
+        "allocatable_balance": None,
+        "balance_error": None,
+        "balance_source": _okx_mode_label(mode),
+    }
+
+
+def _okx_balance_error_text(exc: Exception) -> str:
+    error = _connection_error_text(exc)
+    lower = error.lower()
+    if isinstance(exc, TimeoutError) or error in ("TimeoutError", "") or "timed out" in lower:
+        return "OKX 余额响应超时，已优先返回缓存数据"
+    return f"OKX 余额查询失败: {error}"
+
+
+def _okx_balance_result_from_raw_snapshot(
+    mode: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    result = _empty_okx_snapshot(mode)
+    result.update(
+        {
+            "available_balance": float(snapshot.get("free") or 0.0),
+            "used_balance": float(snapshot.get("used") or 0.0),
+            "total_balance": float(snapshot.get("total") or 0.0),
+            "cash_balance": float(snapshot.get("cash") or snapshot.get("total") or 0.0),
+            "equity_balance": float(snapshot.get("equity") or snapshot.get("total") or 0.0),
+            "allocatable_balance": float(
+                snapshot.get("allocatable")
+                or snapshot.get("equity")
+                or snapshot.get("total")
+                or snapshot.get("free")
+                or 0.0
+            ),
+        }
+    )
+    if snapshot.get("stale"):
+        result["stale"] = True
+        result["stale_age_seconds"] = snapshot.get("stale_age_seconds")
+    if snapshot.get("error") or snapshot.get("balance_error"):
+        result["balance_error"] = snapshot.get("balance_error") or snapshot.get("error")
+        result["error_cached"] = bool(snapshot.get("error_cached"))
+    return result
+
+
+def _cached_okx_snapshot(
+    mode: str,
+    *,
+    allow_stale: bool,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    cached = _OKX_BALANCE_CACHE.get(mode)
+    if not cached:
+        return None
+    cached_at, cached_value = cached
+    age_seconds = time.time() - cached_at
+    ttl_seconds = _OKX_BALANCE_STALE_SECONDS if allow_stale else _OKX_BALANCE_TTL_SECONDS
+    if age_seconds > ttl_seconds:
+        return None
+    result = copy.deepcopy(cached_value)
+    if allow_stale and age_seconds > _OKX_BALANCE_TTL_SECONDS:
+        result["stale"] = True
+        result["stale_age_seconds"] = round(age_seconds, 3)
+    if error:
+        result["balance_error"] = error
+        result["error_cached"] = True
+    return result
+
+
+def _clear_okx_snapshot_caches(mode: str) -> None:
+    mode = "live" if mode == "live" else "paper"
+    _OKX_BALANCE_CACHE.pop(mode, None)
+    _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+    for cache_name in (
+        "_dashboard_okx_balance_cache",
+        "_dashboard_okx_balance_error_cache",
+        "_dashboard_okx_position_cache",
+        "_dashboard_okx_position_error_cache",
+        "_exchange_mark_cache",
+        "_exchange_open_symbol_cache",
+    ):
+        cache = getattr(_dash, cache_name, None)
+        if isinstance(cache, dict):
+            cache.pop(mode, None)
+
+
 def _make_okx_executor(cls: Any, mode: str):
     """Create OKX executor in lightweight-balance mode, compatible with test doubles."""
     try:
@@ -145,71 +247,77 @@ def _make_okx_executor(cls: Any, mode: str):
 async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
     """Fetch the real OKX USDT balance snapshot for paper/demo or live mode."""
     mode = "live" if mode == "live" else "paper"
-    mode_label = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
-    result: dict[str, Any] = {
-        "available_balance": None,
-        "used_balance": None,
-        "total_balance": None,
-        "cash_balance": None,
-        "equity_balance": None,
-        "allocatable_balance": None,
-        "balance_error": None,
-        "balance_source": mode_label,
-    }
+    result = _empty_okx_snapshot(mode)
 
     creds = settings.get_okx_credentials(mode)
     if not creds.get("api_key"):
         result["balance_error"] = "未配置 OKX API Key"
         return result
 
-    cached = _OKX_BALANCE_CACHE.get(mode)
-    if cached and not force and time.time() - cached[0] < _OKX_BALANCE_TTL_SECONDS:
-        return dict(cached[1])
+    cached = _cached_okx_snapshot(mode, allow_stale=False)
+    if cached and not force:
+        return cached
 
-    from executor.okx_executor import OKXExecutor
-
-    executor = _make_okx_executor(OKXExecutor, mode)
-    try:
-        await asyncio.wait_for(executor.initialize(), timeout=_OKX_BALANCE_TIMEOUT_SECONDS)
-        snapshot = await asyncio.wait_for(
-            executor.get_balance_snapshot("USDT"),
-            timeout=_OKX_BALANCE_TIMEOUT_SECONDS,
-        )
-        if snapshot.get("error"):
-            result["balance_error"] = _connection_error_text(snapshot.get("error"))
-            _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
-            return result
-        result.update(
-            {
-                "available_balance": float(snapshot.get("free") or 0.0),
-                "used_balance": float(snapshot.get("used") or 0.0),
-                "total_balance": float(snapshot.get("total") or 0.0),
-                "cash_balance": float(snapshot.get("cash") or snapshot.get("total") or 0.0),
-                "equity_balance": float(snapshot.get("equity") or snapshot.get("total") or 0.0),
-                "allocatable_balance": float(
-                    snapshot.get("allocatable")
-                    or snapshot.get("equity")
-                    or snapshot.get("total")
-                    or snapshot.get("free")
-                    or 0.0
-                ),
-            }
-        )
-        _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
-        return result
-    except Exception as exc:
-        result["balance_error"] = f"OKX 余额查询失败: {_connection_error_text(exc)}"
-        _OKX_BALANCE_CACHE[mode] = (time.time(), dict(result))
-        return result
-    finally:
-        try:
-            await executor.shutdown()
-        except Exception as exc:
-            logger.debug(
-                "OKX executor shutdown failed after balance snapshot",
-                mode=mode,
-                error=_connection_error_text(exc),
+    cached_error = _OKX_BALANCE_ERROR_CACHE.get(mode)
+    if cached_error and not force:
+        cached_at, cached_value = cached_error
+        if time.time() - cached_at <= _OKX_BALANCE_ERROR_TTL_SECONDS:
+            stale = _cached_okx_snapshot(
+                mode,
+                allow_stale=True,
+                error=cached_value.get("balance_error"),
             )
+            return stale or copy.deepcopy(cached_value)
+
+    lock = _OKX_BALANCE_LOCKS.setdefault(mode, asyncio.Lock())
+    async with lock:
+        cached = _cached_okx_snapshot(mode, allow_stale=False)
+        if cached and not force:
+            return cached
+
+        dashboard_cached = (
+            None if force else getattr(_dash, "_dashboard_okx_balance_cache", {}).get(mode)
+        )
+        if dashboard_cached:
+            dashboard_cached_at, dashboard_snapshot = dashboard_cached
+            dashboard_age = (datetime.now(UTC) - dashboard_cached_at).total_seconds()
+            if dashboard_age <= _OKX_BALANCE_TTL_SECONDS and dashboard_snapshot:
+                normalized = _okx_balance_result_from_raw_snapshot(mode, dashboard_snapshot)
+                _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+                _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+                return normalized
+
+        from executor.okx_executor import OKXExecutor
+
+        executor = _make_okx_executor(OKXExecutor, mode)
+        try:
+            async def fetch_snapshot() -> dict[str, Any]:
+                await executor.initialize()
+                snapshot = await executor.get_balance_snapshot("USDT")
+                if snapshot.get("error"):
+                    raise RuntimeError(_connection_error_text(snapshot.get("error")))
+                return snapshot
+
+            snapshot = await asyncio.wait_for(fetch_snapshot(), timeout=_OKX_BALANCE_TIMEOUT_SECONDS)
+            normalized = _okx_balance_result_from_raw_snapshot(mode, snapshot)
+            _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+            _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+            return normalized
+        except Exception as exc:
+            error_text = _okx_balance_error_text(exc)
+            stale = _cached_okx_snapshot(mode, allow_stale=True, error=error_text)
+            failure = {**result, "balance_error": error_text, "error_cached": True}
+            _OKX_BALANCE_ERROR_CACHE[mode] = (time.time(), copy.deepcopy(failure))
+            return stale or failure
+        finally:
+            try:
+                await executor.shutdown()
+            except Exception as exc:
+                logger.debug(
+                    "OKX executor shutdown failed after balance snapshot",
+                    mode=mode,
+                    error=_connection_error_text(exc),
+                )
 
 
 async def _get_okx_usdt_balance(mode: str, force: bool = False) -> float | None:
@@ -525,7 +633,7 @@ async def update_okx_settings(req: OKXSettingsRequest):
         env_updates = strip_secret_env_updates(updates)
         if env_updates:
             settings.update_env_file(env_updates)
-        _OKX_BALANCE_CACHE.pop(req.mode, None)
+        _clear_okx_snapshot_caches(req.mode)
 
     # Reinitialize connections so displayed OKX balances immediately use the
     # latest credentials. Failures do not block saving the credentials.

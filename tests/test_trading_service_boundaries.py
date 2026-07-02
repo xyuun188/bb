@@ -4006,6 +4006,27 @@ def test_market_round_budget_is_not_used_as_outer_watchdog(
     assert service.market_round_watchdog_seconds() == 180.0
 
 
+def test_position_round_watchdog_follows_position_review_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    monkeypatch.setattr(trading_service.settings, "position_analysis_watchdog_seconds", 180)
+    monkeypatch.setattr(trading_service.settings, "market_analysis_watchdog_seconds", 180)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
+
+    assert service.position_review_stage_timeout_seconds() == 63.0
+    assert service.position_loop_interval_seconds() == pytest.approx(19.5)
+    assert service.position_round_watchdog_seconds() == pytest.approx(60.0)
+
+
 @pytest.mark.asyncio
 async def test_feature_batch_wait_cancels_slow_tasks() -> None:
     cancelled = False

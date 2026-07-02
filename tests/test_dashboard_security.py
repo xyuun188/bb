@@ -53,6 +53,31 @@ class _FakeTradingService:
         self._okx_live = None
 
 
+class _SuccessfulBalanceExecutor:
+    created = 0
+
+    def __init__(self, mode: str = "paper", **kwargs: Any) -> None:
+        type(self).created += 1
+        self.mode = mode
+        self.kwargs = kwargs
+
+    async def initialize(self) -> None:
+        return None
+
+    async def get_balance_snapshot(self, currency: str) -> dict[str, Any]:
+        return {
+            "free": 11.0,
+            "used": 2.0,
+            "total": 13.0,
+            "cash": 13.0,
+            "equity": 14.0,
+            "allocatable": 14.0,
+        }
+
+    async def shutdown(self) -> None:
+        return None
+
+
 def _request_from(host: str) -> Request:
     return Request(
         {
@@ -646,6 +671,70 @@ async def test_dashboard_okx_balance_error_is_redacted(
     assert leaked_value not in body["live_error"]
     assert "Authorization: ***" in body["paper_error"]
     assert "Authorization: ***" in body["live_error"]
+
+
+@pytest.mark.asyncio
+async def test_settings_okx_snapshot_reuses_dashboard_cache_without_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_api_module._OKX_BALANCE_CACHE.clear()
+    settings_api_module._OKX_BALANCE_ERROR_CACHE.clear()
+    monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
+    monkeypatch.setattr(settings, "okx_paper_api_secret", "paper-secret")
+    monkeypatch.setattr(settings, "okx_paper_passphrase", "paper-pass")
+    monkeypatch.setattr(
+        settings_api_module._dash,
+        "_dashboard_okx_balance_cache",
+        {
+            "paper": (
+                settings_api_module.datetime.now(settings_api_module.UTC),
+                {
+                    "free": 11.0,
+                    "used": 2.0,
+                    "total": 13.0,
+                    "cash": 13.0,
+                    "equity": 14.0,
+                    "allocatable": 14.0,
+                },
+            )
+        },
+    )
+
+    async def fail_dashboard_fetch(mode: str) -> dict[str, Any]:
+        raise AssertionError("settings must only read dashboard cache, not fetch through it")
+
+    monkeypatch.setattr(
+        settings_api_module._dash,
+        "_get_dashboard_okx_account_snapshot",
+        fail_dashboard_fetch,
+    )
+
+    snapshot = await settings_api_module._get_okx_usdt_snapshot("paper")
+
+    assert snapshot["allocatable_balance"] == 14.0
+    assert snapshot["balance_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_settings_okx_snapshot_timeout_returns_chinese_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import executor.okx_executor as okx_executor_module
+
+    settings_api_module._OKX_BALANCE_CACHE.clear()
+    settings_api_module._OKX_BALANCE_ERROR_CACHE.clear()
+    _FakeOKXExecutor.raise_on_balance = True
+    _FakeOKXExecutor.error_text = "TimeoutError"
+    monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
+    monkeypatch.setattr(settings, "okx_paper_api_secret", "paper-secret")
+    monkeypatch.setattr(settings, "okx_paper_passphrase", "paper-pass")
+    monkeypatch.setattr(settings_api_module._dash, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(okx_executor_module, "OKXExecutor", _FakeOKXExecutor)
+
+    snapshot = await settings_api_module._get_okx_usdt_snapshot("paper", force=True)
+
+    assert snapshot["balance_error"] == "OKX 余额响应超时，已优先返回缓存数据"
+    assert snapshot["error_cached"] is True
 
 
 @pytest.mark.asyncio

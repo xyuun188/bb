@@ -314,6 +314,7 @@ async def test_open_position_symbols_do_not_use_paper_executor_memory_positions(
 
     monkeypatch.setattr(dashboard, "_trading_service", TradingService())
     monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_cache", {})
 
     result = await dashboard._get_open_position_symbols("paper")
 
@@ -458,9 +459,9 @@ async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
     assert result == {
-        "error": "standalone balance unavailable",
-        "balance_error": "standalone balance unavailable",
-        "balance_source": "OKX paper account",
+        "error": "OKX 余额读取失败：standalone balance unavailable",
+        "balance_error": "OKX 余额读取失败：standalone balance unavailable",
+        "balance_source": "OKX 模拟盘账户",
         "source": "isolated_executor",
         "error_cached": True,
     }
@@ -506,3 +507,42 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
         "trading_service_executor",
         "isolated_executor",
     ]
+
+
+async def test_dashboard_okx_position_cache_is_bound_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SwitchingTradingService:
+        def __init__(self) -> None:
+            self.positions = [
+                {
+                    "symbol": "OLD/USDT:USDT",
+                    "side": "long",
+                    "contracts": 1,
+                    "info": {"instId": "OLD-USDT-SWAP", "pos": "1"},
+                }
+            ]
+
+        def okx_executor_for_dashboard(self, mode: str) -> Any | None:
+            return PositionExecutor(self.positions)
+
+    service = SwitchingTradingService()
+    monkeypatch.setattr(dashboard, "_trading_service", service)
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_cache", {})
+    monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+
+    first = await dashboard._get_exchange_open_position_symbols("paper")
+    service.positions = [
+        {
+            "symbol": "NEW/USDT:USDT",
+            "side": "long",
+            "contracts": 1,
+            "info": {"instId": "NEW-USDT-SWAP", "pos": "1"},
+        }
+    ]
+    dashboard._exchange_open_symbol_cache.clear()
+
+    second = await dashboard._get_exchange_open_position_symbols("paper")
+
+    assert first == {"OLD/USDT"}
+    assert second == {"NEW/USDT"}
