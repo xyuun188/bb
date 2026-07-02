@@ -2136,21 +2136,38 @@ async def _dashboard_closed_position_ledger_rows(
     repo: Any,
     *,
     mode: str | None,
+    model_names: tuple[str, ...] | None = None,
     page: int = 1,
     page_size: int = 20,
     paginate: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     from sqlalchemy import select
 
-    from models.trade import Order
+    from models.trade import Order, Position
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
 
-    closed_rows = await repo.get_position_records(
-        execution_mode=mode,
-        limit=5000,
-        offset=0,
-        is_open=False,
-    )
+    if model_names:
+        closed_result = await session.execute(
+            select(Position)
+            .where(
+                Position.execution_mode == mode if mode else True,
+                Position.model_name.in_(model_names),
+                Position.is_open.is_(False),
+            )
+            .order_by(
+                Position.closed_at.desc().nullslast(),
+                Position.created_at.desc(),
+            )
+            .limit(5000)
+        )
+        closed_rows = list(closed_result.scalars().all())
+    else:
+        closed_rows = await repo.get_position_records(
+            execution_mode=mode,
+            limit=5000,
+            offset=0,
+            is_open=False,
+        )
     linked_order_ids = {
         token
         for position in closed_rows
@@ -5726,15 +5743,10 @@ async def get_pnl_history(mode: str | None = None):
 @router.get("/dashboard/daily-pnl")
 async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     """Daily execution PnL grouped by Beijing calendar day."""
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
 
+    from db.repositories.trade_repo import TradeRepository
     from db.session import get_session_ctx
-    from models.trade import Order, Position
-    from services.trade_fact_trust import (
-        closed_position_trade_fact_trusted_with_orders,
-        orders_by_exchange_id,
-        split_exchange_order_ids,
-    )
 
     selected_mode = "live" if mode == "live" else "paper"
     days = min(max(int(days or 30), 1), 180)
@@ -5778,50 +5790,18 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         )
         exchange_marks = {}
     async with get_session_ctx() as session:
-        result = await session.execute(
-            select(Position)
-            .where(
-                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                Position.execution_mode == selected_mode,
-                or_(
-                    Position.created_at >= PHASE3_CLEAN_START_UTC,
-                    Position.closed_at >= PHASE3_CLEAN_START_UTC,
-                ),
+        repo = TradeRepository(session)
+        closed_ledger_rows, _closed_total, _closed_page, _closed_total_pages = (
+            await _dashboard_closed_position_ledger_rows(
+                session,
+                repo,
+                mode=selected_mode,
+                model_names=EXECUTION_LEDGER_MODEL_NAMES,
+                page=1,
+                page_size=5000,
+                paginate=False,
             )
-            .order_by(Position.closed_at.asc(), Position.created_at.asc())
         )
-        positions = list(result.scalars().all())
-        linked_order_ids = {
-            order_id
-            for pos in positions
-            if not pos.is_open
-            for value in (
-                getattr(pos, "entry_exchange_order_id", None),
-                getattr(pos, "close_exchange_order_id", None),
-            )
-            for order_id in split_exchange_order_ids(value)
-        }
-        linked_orders = []
-        if linked_order_ids:
-            linked_orders = list(
-                (
-                    await session.execute(
-                        select(Order).where(
-                            Order.execution_mode == selected_mode,
-                            Order.exchange_order_id.in_(sorted(linked_order_ids)),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        linked_orders_by_id = orders_by_exchange_id(linked_orders)
-        positions = [
-            pos
-            for pos in positions
-            if pos.is_open
-            or closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
-        ]
         from models.account import ExecutionEquitySnapshot
 
         snapshot_result = await session.execute(
@@ -5855,54 +5835,56 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "source": snapshot.source or "okx_snapshot",
         }
 
-    for pos in positions:
-        pnl = float(pos.realized_pnl or 0.0)
-        closed_at = _as_utc_datetime(pos.closed_at)
-        if not pos.is_open and closed_at and closed_at < start_utc:
+    for ledger_row in closed_ledger_rows:
+        if not _daily_pnl_ledger_row_has_okx_realized_pnl(ledger_row):
+            continue
+        pnl = float(_safe_float(ledger_row.get("realized_pnl"), 0.0) or 0.0)
+        closed_at = _as_utc_datetime(ledger_row.get("closed_at"))
+        if closed_at is None or closed_at < PHASE3_CLEAN_START_UTC:
+            continue
+        if closed_at < start_utc:
             cumulative_before += pnl
             continue
-        if not pos.is_open and closed_at:
-            day = closed_at.astimezone(BEIJING_TZ).date().isoformat()
-            row = records.get(day)
-            if not row:
-                continue
-            if pnl >= 0:
-                row["realized_profit"] += pnl
-                row["win_count"] += 1
-            else:
-                row["realized_loss"] += abs(pnl)
-                row["loss_count"] += 1
-            row["realized_pnl"] += pnl
-            row["total_pnl"] += pnl
-            row["trade_count"] += 1
-            symbol = str(pos.symbol or "")
-            if symbol and symbol not in row["symbols"]:
-                row["symbols"].append(symbol)
-            row["position_details"].append(
-                _daily_pnl_position_detail(pos, pnl=pnl, closed_at=closed_at)
-            )
-            if symbol:
-                symbol_row = row["symbol_pnl"].setdefault(
-                    symbol,
-                    {
-                        "symbol": symbol,
-                        "realized_profit": 0.0,
-                        "realized_loss": 0.0,
-                        "realized_pnl": 0.0,
-                        "trade_count": 0,
-                        "win_count": 0,
-                        "loss_count": 0,
-                    },
-                )
-                if pnl >= 0:
-                    symbol_row["realized_profit"] += pnl
-                    symbol_row["win_count"] += 1
-                else:
-                    symbol_row["realized_loss"] += abs(pnl)
-                    symbol_row["loss_count"] += 1
-                symbol_row["realized_pnl"] += pnl
-                symbol_row["trade_count"] += 1
+        day = closed_at.astimezone(BEIJING_TZ).date().isoformat()
+        row = records.get(day)
+        if not row:
             continue
+        if pnl >= 0:
+            row["realized_profit"] += pnl
+            row["win_count"] += 1
+        else:
+            row["realized_loss"] += abs(pnl)
+            row["loss_count"] += 1
+        row["realized_pnl"] += pnl
+        row["total_pnl"] += pnl
+        row["trade_count"] += 1
+        symbol = str(ledger_row.get("symbol") or "")
+        if symbol and symbol not in row["symbols"]:
+            row["symbols"].append(symbol)
+        row["position_details"].append(
+            _daily_pnl_ledger_position_detail(ledger_row, pnl=pnl, closed_at=closed_at)
+        )
+        if symbol:
+            symbol_row = row["symbol_pnl"].setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "realized_profit": 0.0,
+                    "realized_loss": 0.0,
+                    "realized_pnl": 0.0,
+                    "trade_count": 0,
+                    "win_count": 0,
+                    "loss_count": 0,
+                },
+            )
+            if pnl >= 0:
+                symbol_row["realized_profit"] += pnl
+                symbol_row["win_count"] += 1
+            else:
+                symbol_row["realized_loss"] += abs(pnl)
+                symbol_row["loss_count"] += 1
+            symbol_row["realized_pnl"] += pnl
+            symbol_row["trade_count"] += 1
 
     if exchange_marks:
         open_unrealized = float(_exchange_position_totals(exchange_marks)["unrealized_pnl"])
@@ -6034,10 +6016,61 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         "mode": selected_mode,
         "timezone": "Asia/Shanghai",
         "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
-        "pnl_source": "okx_equity_snapshots",
+        "pnl_source": "okx_equity_snapshots_and_okx_position_ledger",
         "start_date": start_day.isoformat(),
         "end_date": today_local.isoformat(),
         "records": [records[key] for key in sorted(records.keys(), reverse=True)],
+    }
+
+
+def _daily_pnl_ledger_row_has_okx_realized_pnl(row: dict[str, Any]) -> bool:
+    """Only OKX-confirmed ledger PnL may feed daily realized PnL records."""
+    source = str(row.get("pnl_source") or "").strip()
+    if source == "okx_position_history_realized_pnl":
+        return True
+    if source == "okx_close_fill_net_pnl":
+        return True
+    if source == "okx_fill_pnl" and bool(row.get("evidence_complete")):
+        return True
+    return False
+
+
+def _daily_pnl_ledger_position_detail(
+    row: dict[str, Any],
+    *,
+    pnl: float,
+    closed_at: datetime | None,
+) -> dict[str, Any]:
+    quantity = _safe_float(row.get("closed_quantity") or row.get("quantity"), 0.0) or 0.0
+    entry_price = (
+        _safe_float(row.get("average_entry_price"), None)
+        or _safe_float(row.get("entry_price"), 0.0)
+        or 0.0
+    )
+    exit_price = (
+        _safe_float(row.get("average_close_price"), None)
+        or _safe_float(row.get("current_price"), 0.0)
+        or 0.0
+    )
+    side = str(row.get("side") or "")
+    return {
+        "id": row.get("id") or row.get("group_id"),
+        "group_id": row.get("group_id") or row.get("id"),
+        "symbol": str(row.get("symbol") or ""),
+        "side": side,
+        "side_label": _side_label(side),
+        "quantity": round(quantity, 8),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "realized_pnl": round(float(pnl or 0.0), 8),
+        "closed_at": closed_at.isoformat() if closed_at else None,
+        "opened_at": row.get("opened_at"),
+        "pnl_source": row.get("pnl_source"),
+        "ledger_source": row.get("ledger_source"),
+        "evidence_complete": bool(row.get("evidence_complete")),
+        "position_ids": list(row.get("position_ids") or []),
+        "entry_order_ids": list(row.get("entry_order_ids") or []),
+        "close_order_ids": list(row.get("close_order_ids") or []),
     }
 
 

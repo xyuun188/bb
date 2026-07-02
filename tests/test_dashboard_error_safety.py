@@ -1059,6 +1059,111 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
     assert today["total_pnl"] == pytest.approx(-1.63)
 
 
+@pytest.mark.asyncio
+async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-ledger-no-double-count.db').as_posix()}",
+    )
+    await init_db()
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 2, 12, 0, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode: _async_value(set()),
+    )
+
+    try:
+        async with get_session_ctx() as session:
+            opened_at = datetime(2026, 7, 1, 6, 10, tzinfo=UTC)
+            closed_at = datetime(2026, 7, 1, 7, 10, tzinfo=UTC)
+            session.add_all(
+                [
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="long",
+                        quantity=100.0,
+                        entry_price=0.1,
+                        current_price=0.251136,
+                        leverage=3.0,
+                        realized_pnl=15.1136,
+                        is_open=False,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_pos_id="ai16z-pos-1",
+                        entry_exchange_order_id="ai16z-entry",
+                        close_exchange_order_id="ai16z-close",
+                        created_at=opened_at,
+                        closed_at=closed_at,
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="long",
+                        quantity=100.0,
+                        entry_price=0.1,
+                        current_price=0.1793794089,
+                        leverage=3.0,
+                        realized_pnl=7.93794089,
+                        is_open=False,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_pos_id="ai16z-pos-1",
+                        entry_exchange_order_id="ai16z-entry",
+                        close_exchange_order_id="ai16z-close",
+                        created_at=opened_at,
+                        closed_at=closed_at,
+                    ),
+                    _confirmed_okx_order(
+                        symbol="AI16Z/USDT",
+                        exchange_order_id="ai16z-entry",
+                        side="buy",
+                        quantity=100.0,
+                        price=0.1,
+                        filled_at=opened_at,
+                    ),
+                    _confirmed_okx_order(
+                        symbol="AI16Z/USDT",
+                        exchange_order_id="ai16z-close",
+                        side="sell",
+                        quantity=100.0,
+                        price=0.1793794089,
+                        filled_at=closed_at,
+                        pnl=7.93794089,
+                    ),
+                ]
+            )
+
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    finally:
+        await close_db()
+
+    day = next(row for row in payload["records"] if row["date"] == "2026-07-01")
+    assert day["trade_count"] == 1
+    assert day["win_count"] == 1
+    assert day["loss_count"] == 0
+    assert day["realized_profit"] == pytest.approx(7.93794089)
+    assert day["realized_pnl"] == pytest.approx(7.93794089)
+    assert day["symbols"] == ["AI16Z/USDT"]
+    assert len(day["position_details"]) == 1
+    assert day["position_details"][0]["pnl_source"] == "okx_position_history_realized_pnl"
+    assert day["position_details"][0]["position_ids"]
+    assert day["symbol_pnl"][0]["realized_pnl"] == pytest.approx(7.93794089)
+
+
 async def _async_value(value):
     return value
 
