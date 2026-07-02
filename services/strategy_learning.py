@@ -115,6 +115,9 @@ ALLOWED_CANDIDATE_PARAM_KEYS = {
     "winner_hold_dynamic",
     "payoff_repair_intensity",
     "pullback_lock_enabled",
+    "entry_filters",
+    "portfolio_preference",
+    "exit_preference",
     "side_overrides",
     "side_weights",
 }
@@ -134,6 +137,26 @@ ALLOWED_EXPERT_INTEGRITY_MODES = {
 }
 ALLOWED_AGGRESSIVENESS = {"low", "normal", "high"}
 ALLOWED_WINNER_HOLD = {"normal", "high"}
+ALLOWED_ENTRY_FILTER_QUALITY_BIAS = {"expand", "balanced", "tighten"}
+ALLOWED_ENTRY_FILTER_MISSED_BIAS = {"relax", "neutral", "tighten"}
+ENTRY_FILTER_PREFERENCE_FLOAT_RANGES = {
+    "volume_ratio_multiplier": (0.75, 1.20),
+    "adx_multiplier": (0.75, 1.20),
+}
+ALLOWED_PORTFOLIO_CAPACITY_MODES = {"expand", "balanced", "focus"}
+PORTFOLIO_PREFERENCE_FLOAT_RANGES = {
+    "target_open_bias": (0.80, 1.35),
+    "rotation_bias": (0.80, 1.60),
+    "roster_fill_bias": (0.75, 1.60),
+    "review_bias": (0.85, 1.50),
+}
+ALLOWED_EXIT_WINNER_MODES = {"let_run", "balanced", "lock_faster"}
+ALLOWED_EXIT_LOSER_MODES = {"cut_faster", "balanced", "give_room"}
+EXIT_PREFERENCE_FLOAT_RANGES = {
+    "profit_lock_bias": (0.85, 1.35),
+    "review_priority_bias": (0.85, 1.60),
+    "loss_exit_bias": (0.80, 1.50),
+}
 CONSUMED_RUNTIME_PARAM_KEYS = {
     "global_min_score_delta",
     "position_size_multiplier",
@@ -150,6 +173,9 @@ CONSUMED_RUNTIME_PARAM_KEYS = {
     "winner_hold_dynamic",
     "payoff_repair_intensity",
     "pullback_lock_enabled",
+    "entry_filters",
+    "portfolio_preference",
+    "exit_preference",
     "side_overrides",
     "side_weights",
 }
@@ -2725,6 +2751,18 @@ class StrategyCandidateGenerator:
                 dynamic = self._sanitize_winner_hold_dynamic(_safe_dict(value))
                 if dynamic:
                     clean[key] = dynamic
+            elif key == "entry_filters":
+                sanitized = self._sanitize_entry_filter_preference(_safe_dict(value))
+                if sanitized:
+                    clean[key] = sanitized
+            elif key == "portfolio_preference":
+                sanitized = self._sanitize_portfolio_preference(_safe_dict(value))
+                if sanitized:
+                    clean[key] = sanitized
+            elif key == "exit_preference":
+                sanitized = self._sanitize_exit_preference(_safe_dict(value))
+                if sanitized:
+                    clean[key] = sanitized
             elif key in {
                 "full_position_release",
                 "release_losing_positions_first",
@@ -2786,6 +2824,57 @@ class StrategyCandidateGenerator:
         policy = str(value.get("policy") or "")[:120]
         if policy:
             result["policy"] = policy
+        return result
+
+    @staticmethod
+    def _sanitize_entry_filter_preference(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, (low, high) in ENTRY_FILTER_PREFERENCE_FLOAT_RANGES.items():
+            if key not in value:
+                continue
+            result[key] = round(_clamp(_safe_float(value.get(key), 1.0), low, high), 6)
+        quality_bias = str(value.get("quality_bias") or "")
+        if quality_bias in ALLOWED_ENTRY_FILTER_QUALITY_BIAS:
+            result["quality_bias"] = quality_bias
+        missed_bias = str(value.get("missed_opportunity_bias") or "")
+        if missed_bias in ALLOWED_ENTRY_FILTER_MISSED_BIAS:
+            result["missed_opportunity_bias"] = missed_bias
+        reason = str(value.get("reason") or "")[:160]
+        if reason:
+            result["reason"] = reason
+        return result
+
+    @staticmethod
+    def _sanitize_portfolio_preference(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, (low, high) in PORTFOLIO_PREFERENCE_FLOAT_RANGES.items():
+            if key not in value:
+                continue
+            result[key] = round(_clamp(_safe_float(value.get(key), 1.0), low, high), 6)
+        capacity_mode = str(value.get("capacity_mode") or "")
+        if capacity_mode in ALLOWED_PORTFOLIO_CAPACITY_MODES:
+            result["capacity_mode"] = capacity_mode
+        reason = str(value.get("reason") or "")[:160]
+        if reason:
+            result["reason"] = reason
+        return result
+
+    @staticmethod
+    def _sanitize_exit_preference(value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, (low, high) in EXIT_PREFERENCE_FLOAT_RANGES.items():
+            if key not in value:
+                continue
+            result[key] = round(_clamp(_safe_float(value.get(key), 1.0), low, high), 6)
+        winner_mode = str(value.get("winner_mode") or "")
+        if winner_mode in ALLOWED_EXIT_WINNER_MODES:
+            result["winner_mode"] = winner_mode
+        loser_mode = str(value.get("loser_mode") or "")
+        if loser_mode in ALLOWED_EXIT_LOSER_MODES:
+            result["loser_mode"] = loser_mode
+        reason = str(value.get("reason") or "")[:160]
+        if reason:
+            result["reason"] = reason
         return result
 
     @staticmethod
@@ -3103,6 +3192,10 @@ class StrategyBacktester:
         trade_count = _safe_int(feedback.totals.get("training_trade_count"), 0)
         target = _safe_int(params.get("min_trade_count_target"), default_min_trade_target())
         trade_gap = max(target - trade_count, 0)
+        entry_preference = _safe_dict(params.get("entry_filters"))
+        portfolio_preference = _safe_dict(params.get("portfolio_preference"))
+        exit_preference = _safe_dict(params.get("exit_preference"))
+        capacity_mode = str(portfolio_preference.get("capacity_mode") or "balanced")
         payoff_repair = _payoff_repair_profile(
             _safe_dict(feedback.totals.get("payoff_profile")),
             _safe_dict(feedback.reflection_feedback.get("payoff_profile")),
@@ -3112,6 +3205,11 @@ class StrategyBacktester:
             _safe_float(params.get("global_min_score_delta"), 0.0) < 0
             or _safe_float(params.get("probe_fraction"), 0.0) > 0
             or _safe_float(params.get("position_size_multiplier"), 1.0) > 1.0
+            or str(entry_preference.get("quality_bias") or "") == "expand"
+            or str(entry_preference.get("missed_opportunity_bias") or "") == "relax"
+            or capacity_mode == "expand"
+            or _safe_float(portfolio_preference.get("target_open_bias"), 1.0) > 1.02
+            or _safe_float(portfolio_preference.get("roster_fill_bias"), 1.0) > 1.02
         )
         if opens_more and (
             problem_keys
@@ -3149,6 +3247,12 @@ class StrategyBacktester:
                 and str(params.get("expert_integrity_mode") or "strict_all_required")
                 == "strict_all_required"
             )
+            or (
+                str(entry_preference.get("quality_bias") or "") == "expand"
+                and not probe_cap_active
+                and str(params.get("expert_integrity_mode") or "strict_all_required")
+                == "strict_all_required"
+            )
         )
         if (
             quality_recovery_profile
@@ -3166,6 +3270,11 @@ class StrategyBacktester:
                 params.get("full_position_release") or params.get("release_losing_positions_first")
             )
             or str(params.get("loss_exit_aggressiveness") or "") == "high"
+            or str(exit_preference.get("loser_mode") or "") == "cut_faster"
+            or (
+                capacity_mode == "focus"
+                and _safe_float(portfolio_preference.get("review_bias"), 1.0) >= 1.05
+            )
         )
         if releases_losers and (
             problem_keys
@@ -3192,6 +3301,8 @@ class StrategyBacktester:
         holds_winners = (
             str(params.get("winner_hold_extension") or "") == "high"
             or _safe_float(params.get("profit_lock_min_usdt_multiplier"), 1.0) > 1.05
+            or str(exit_preference.get("winner_mode") or "") == "let_run"
+            or _safe_float(exit_preference.get("profit_lock_bias"), 1.0) > 1.05
         )
         if holds_winners and (
             problem_keys & {"small_wins_large_losses", "reflection_small_wins_large_losses"}
@@ -3211,6 +3322,28 @@ class StrategyBacktester:
                         )
                         * 0.42,
                         3.0,
+                    ),
+                )
+            )
+        expands_capacity = (
+            capacity_mode == "expand"
+            or _safe_float(portfolio_preference.get("target_open_bias"), 1.0) > 1.02
+            or _safe_float(portfolio_preference.get("roster_fill_bias"), 1.0) > 1.02
+        )
+        if expands_capacity and (
+            problem_keys & {"low_trade_count", "missed_opportunities", "max_position_blocks"}
+        ):
+            missed_loop = _safe_dict(feedback.shadow_feedback.get("missed_opportunity_closed_loop"))
+            missed = _safe_int(missed_loop.get("usable_group_count"), 0)
+            capacity_pressure = _safe_int(feedback.event_feedback.get("max_position_blocks"), 0)
+            deltas.append(
+                (
+                    "portfolio_capacity_reallocation",
+                    min(
+                        max(trade_gap, 0) * 0.20
+                        + missed * 0.12
+                        + capacity_pressure * 0.18,
+                        3.2,
                     ),
                 )
             )
@@ -3701,6 +3834,9 @@ class StrategyScheduler:
             "position_size_multiplier": _safe_float(params.get("position_size_multiplier"), 1.0),
             "probe_fraction": _safe_float(params.get("probe_fraction"), 0.0),
             "max_probe_size_pct": _safe_float(params.get("max_probe_size_pct"), 0.0),
+            "entry_filter_preference": _safe_dict(params.get("entry_filters")),
+            "portfolio_preference": _safe_dict(params.get("portfolio_preference")),
+            "exit_preference": _safe_dict(params.get("exit_preference")),
             "expert_integrity_mode": str(
                 params.get("expert_integrity_mode") or "strict_all_required"
             ),
@@ -3746,7 +3882,73 @@ class StrategyScheduler:
             "training_trade_count": feedback.totals.get("training_trade_count", 0),
             "low_trade_count_penalty": bool(feedback.totals.get("low_trade_count_penalty")),
         }
+        runtime = self._apply_structured_exit_preference(runtime, profile)
         return self._apply_profit_first_runtime_feedback(runtime, profile, feedback)
+
+    @staticmethod
+    def _apply_structured_exit_preference(
+        runtime: dict[str, Any],
+        profile: StrategyProfile,
+    ) -> dict[str, Any]:
+        preference = _safe_dict(profile.params.get("exit_preference"))
+        if not preference:
+            return runtime
+
+        adjusted = dict(runtime)
+        reasons: list[str] = []
+        winner_mode = str(preference.get("winner_mode") or "balanced")
+        loser_mode = str(preference.get("loser_mode") or "balanced")
+        profit_lock_bias = _safe_float(preference.get("profit_lock_bias"), 1.0)
+        review_priority_bias = _safe_float(preference.get("review_priority_bias"), 1.0)
+        loss_exit_bias = _safe_float(preference.get("loss_exit_bias"), 1.0)
+        profit_lock_multiplier = _safe_float(
+            adjusted.get("profit_lock_min_usdt_multiplier"),
+            1.0,
+        )
+
+        if winner_mode == "let_run":
+            adjusted["winner_hold_extension"] = "high"
+            profit_lock_multiplier *= max(profit_lock_bias, 1.0)
+            adjusted["pullback_lock_enabled"] = True
+            reasons.append("exit_preference_let_winners_run")
+        elif winner_mode == "lock_faster":
+            profit_lock_multiplier *= min(profit_lock_bias, 1.0)
+            reasons.append("exit_preference_lock_winners_faster")
+        elif abs(profit_lock_bias - 1.0) >= 0.02:
+            profit_lock_multiplier *= profit_lock_bias
+            reasons.append("exit_preference_profit_lock_bias")
+
+        adjusted["profit_lock_min_usdt_multiplier"] = round(
+            _clamp(profit_lock_multiplier, 0.80, 1.80),
+            6,
+        )
+
+        review_priority = _safe_float(adjusted.get("position_review_priority_boost"), 1.0)
+        review_priority *= review_priority_bias
+        if loser_mode == "cut_faster":
+            adjusted["loss_exit_aggressiveness"] = "high"
+            review_priority *= max(loss_exit_bias, 1.0)
+            reasons.append("exit_preference_cut_losers_faster")
+        elif loser_mode == "give_room":
+            adjusted["loss_exit_aggressiveness"] = "low"
+            review_priority *= min(loss_exit_bias, 1.0)
+            reasons.append("exit_preference_give_losers_more_room")
+        else:
+            if loss_exit_bias >= 1.10 and adjusted.get("loss_exit_aggressiveness") == "normal":
+                adjusted["loss_exit_aggressiveness"] = "high"
+                reasons.append("exit_preference_raise_loss_exit_aggressiveness")
+            elif loss_exit_bias <= 0.90 and adjusted.get("loss_exit_aggressiveness") == "normal":
+                adjusted["loss_exit_aggressiveness"] = "low"
+                reasons.append("exit_preference_lower_loss_exit_aggressiveness")
+            review_priority *= loss_exit_bias
+
+        adjusted["position_review_priority_boost"] = round(
+            _clamp(review_priority, 0.70, 1.80),
+            6,
+        )
+        if reasons:
+            adjusted["exit_preference_applied_reasons"] = reasons
+        return adjusted
 
     @staticmethod
     def _apply_profit_first_runtime_feedback(
@@ -3923,6 +4125,7 @@ class StrategyScheduler:
             max(low_quality, min(losing, max(release_queue, 1))) if release_pressure else 0
         )
         rotation_slots = 0
+        reasons: list[str] = []
         if release_pressure and open_groups > 0:
             pressure_count = max(release_target, low_quality, release_queue, 1)
             pressure_slots = max(1, math.ceil(pressure_count * 0.20))
@@ -3931,7 +4134,7 @@ class StrategyScheduler:
             max_open = max(max_open, open_groups + rotation_slots)
             target_groups = min(max_open, open_groups + rotation_slots)
             review_groups = min(max_open, max(open_groups, release_target + rotation_slots))
-            reason = "release_low_quality_positions_with_rotation_slots"
+            reasons.append("release_low_quality_positions_with_rotation_slots")
         else:
             healthy_target = max(
                 open_groups,
@@ -3939,7 +4142,37 @@ class StrategyScheduler:
             )
             target_groups = min(max_open, healthy_target)
             review_groups = min(max_open, max(1, math.ceil(max(target_groups, 1) * 0.60)))
-            reason = "expand_by_learned_positive_expectancy_capacity"
+            reasons.append("expand_by_learned_positive_expectancy_capacity")
+        portfolio_preference = _safe_dict(profile.params.get("portfolio_preference"))
+        capacity_mode = str(portfolio_preference.get("capacity_mode") or "balanced")
+        target_open_bias = _safe_float(portfolio_preference.get("target_open_bias"), 1.0)
+        rotation_bias = _safe_float(portfolio_preference.get("rotation_bias"), 1.0)
+        roster_fill_bias = _safe_float(portfolio_preference.get("roster_fill_bias"), 1.0)
+        review_bias = _safe_float(portfolio_preference.get("review_bias"), 1.0)
+        if capacity_mode == "expand":
+            target_groups = min(
+                max_open,
+                max(open_groups, max(1, math.ceil(target_groups * max(target_open_bias, 1.0)))),
+            )
+            reasons.append("portfolio_preference_expand_capacity")
+        elif capacity_mode == "focus":
+            target_groups = min(
+                max_open,
+                max(open_groups, max(1, math.floor(target_groups * min(target_open_bias, 1.0)))),
+            )
+            reasons.append("portfolio_preference_focus_capacity")
+        elif abs(target_open_bias - 1.0) >= 0.02:
+            target_groups = min(
+                max_open,
+                max(open_groups, max(1, math.ceil(target_groups * target_open_bias))),
+            )
+            reasons.append("portfolio_preference_target_open_bias")
+        if rotation_slots > 0 and abs(rotation_bias - 1.0) >= 0.02:
+            rotation_slots = min(max_open, max(0, math.ceil(rotation_slots * rotation_bias)))
+            reasons.append("portfolio_preference_rotation_bias")
+        if abs(review_bias - 1.0) >= 0.02:
+            review_groups = min(max_open, max(1, math.ceil(review_groups * review_bias)))
+            reasons.append("portfolio_preference_review_bias")
         high_risk_groups = min(max_open, max(review_groups, open_groups, target_groups))
         urgent_groups = min(
             max_open,
@@ -3957,6 +4190,15 @@ class StrategyScheduler:
                 ),
             ),
         )
+        if abs(roster_fill_bias - 1.0) >= 0.02:
+            roster_fill_market_symbol_min = max(
+                1,
+                min(
+                    int(settings.auto_scan_symbol_limit or 1),
+                    math.ceil(roster_fill_market_symbol_min * roster_fill_bias),
+                ),
+            )
+            reasons.append("portfolio_preference_roster_fill_bias")
         return {
             "target_position_groups": target_groups,
             "max_open_positions": max_open,
@@ -3966,7 +4208,7 @@ class StrategyScheduler:
             "position_high_risk_max_groups": max(1, high_risk_groups),
             "position_urgent_exit_max_groups": max(1, urgent_groups),
             "roster_fill_market_symbol_min": roster_fill_market_symbol_min,
-            "reason": reason,
+            "reason": ", ".join(reasons) or "strategy_learning_runtime",
         }
 
     @staticmethod
@@ -3989,9 +4231,10 @@ class StrategyScheduler:
         problem_keys = {
             str(item.get("key")) for item in feedback.problems if isinstance(item, dict)
         }
-        release_pressure = (
-            roster.get("reason") == "release_low_quality_positions_with_rotation_slots"
+        release_pressure = "release_low_quality_positions_with_rotation_slots" in str(
+            roster.get("reason") or ""
         )
+        entry_preference = _safe_dict(profile.params.get("entry_filters"))
 
         if net_pnl > 0 and win_rate >= 0.52 and not low_trade_count:
             factor = params.entry_filter_profit_tighten_factor
@@ -4017,6 +4260,35 @@ class StrategyScheduler:
         if _safe_float(open_pressure.get("low_quality_open_ratio"), 0.0) > 0.30:
             volume_ratio *= 1.04
             reasons.append("low_quality_open_pressure_biases_quality_reference")
+
+        if entry_preference:
+            volume_ratio *= _safe_float(entry_preference.get("volume_ratio_multiplier"), 1.0)
+            adx *= _safe_float(entry_preference.get("adx_multiplier"), 1.0)
+            quality_bias = str(entry_preference.get("quality_bias") or "balanced")
+            if quality_bias == "expand":
+                volume_ratio *= 0.94
+                adx *= 0.94
+                reasons.append("entry_preference_expand_quality_entries")
+            elif quality_bias == "tighten":
+                volume_ratio *= 1.06
+                adx *= 1.06
+                reasons.append("entry_preference_tighten_quality_entries")
+            missed_bias = str(entry_preference.get("missed_opportunity_bias") or "neutral")
+            if (
+                missed_bias == "relax"
+                and (
+                    "missed_opportunities" in problem_keys
+                    or "trade_reflection_mistakes" in problem_keys
+                    or low_trade_count
+                )
+            ):
+                volume_ratio *= 0.95
+                adx *= 0.95
+                reasons.append("entry_preference_relax_for_missed_opportunity_pressure")
+            elif missed_bias == "tighten" and net_pnl > 0:
+                volume_ratio *= 1.04
+                adx *= 1.04
+                reasons.append("entry_preference_tighten_after_profitable_window")
 
         bounded_volume = min(
             max(volume_ratio, params.entry_volume_ratio_min),
@@ -4089,11 +4361,19 @@ class StrategyScheduler:
         for profile in profiles:
             params = profile.params
             param_consumption = _candidate_param_consumption(params)
+            entry_preference = _safe_dict(params.get("entry_filters"))
+            portfolio_preference = _safe_dict(params.get("portfolio_preference"))
+            exit_preference = _safe_dict(params.get("exit_preference"))
+            capacity_mode = str(portfolio_preference.get("capacity_mode") or "balanced")
             would_increase_entries = bool(
                 profile.profile_id == "balanced_probe"
                 or _safe_float(params.get("probe_fraction"), 0.0) > 0
                 or _safe_float(params.get("global_min_score_delta"), 0.0) < 0
                 or _safe_float(params.get("position_size_multiplier"), 1.0) > 1.0
+                or str(entry_preference.get("quality_bias") or "") == "expand"
+                or str(entry_preference.get("missed_opportunity_bias") or "") == "relax"
+                or capacity_mode == "expand"
+                or _safe_float(portfolio_preference.get("target_open_bias"), 1.0) > 1.02
             )
             would_reduce_blocks = bool(
                 would_increase_entries
@@ -4104,11 +4384,15 @@ class StrategyScheduler:
                 or params.get("full_position_release")
                 or params.get("release_losing_positions_first")
                 or str(params.get("loss_exit_aggressiveness") or "") == "high"
+                or str(exit_preference.get("loser_mode") or "") == "cut_faster"
+                or capacity_mode == "focus"
             )
             would_hold_winners = bool(
                 profile.profile_id == "winner_hold"
                 or str(params.get("winner_hold_extension") or "") == "high"
                 or _safe_float(params.get("profit_lock_min_usdt_multiplier"), 1.0) > 1.05
+                or str(exit_preference.get("winner_mode") or "") == "let_run"
+                or _safe_float(exit_preference.get("profit_lock_bias"), 1.0) > 1.05
             )
             fallback_safety = "strict"
             integrity_mode = str(params.get("expert_integrity_mode") or "strict_all_required")
@@ -4154,6 +4438,8 @@ class StrategyScheduler:
                 score += defensive_probe_blocks * 0.34 + max(trade_target - trade_count, 0) * 0.14
             if side_recovery:
                 score += bad * 0.22 + large_losses * 0.08
+            if capacity_mode == "expand":
+                score += max_position_blocks * 0.18 + max(missed, 0) * 0.08
             if fallback_safety == "too_loose":
                 score -= 0.7 + fallback_blocks * 0.08
             if would_increase_entries and bad > good + missed:
@@ -4390,6 +4676,7 @@ class StrategyLearningEngine:
             _safe_float(runtime.get("min_entry_adx"), default_filters.min_entry_adx),
         )
         result["entry_filters_are_hard_gate"] = False
+        result["entry_filter_preference"] = _safe_dict(runtime.get("entry_filter_preference"))
         result["strategy_learning_sizing"] = {
             "profile_id": active_profile.get("id") or runtime.get("profile_id"),
             "position_size_multiplier": result["position_size_multiplier"],
@@ -4419,6 +4706,7 @@ class StrategyLearningEngine:
             "max_open_positions": _safe_int(runtime.get("max_open_positions"), 0),
             "policy_source": "strategy_learning_runtime",
             "policy_reason": runtime.get("capacity_policy_reason"),
+            "preference": _safe_dict(runtime.get("portfolio_preference")),
         }
         result["loss_exit_aggressiveness"] = str(
             runtime.get("loss_exit_aggressiveness") or "normal"
@@ -4441,6 +4729,7 @@ class StrategyLearningEngine:
         )
         result["winner_hold_dynamic"] = _safe_dict(runtime.get("winner_hold_dynamic"))
         result["pullback_lock_enabled"] = bool(runtime.get("pullback_lock_enabled"))
+        result["exit_preference"] = _safe_dict(runtime.get("exit_preference"))
         guard = _safe_dict(payload.get("runtime_guard"))
         feedback_payload = _safe_dict(payload.get("feedback"))
         feedback_summary = self._compact_feedback(_safe_dict(payload.get("feedback")))
@@ -4594,6 +4883,11 @@ class StrategyLearningEngine:
             "active_profile": active_profile,
             "runtime": runtime,
             "entry_filters": entry_filters,
+            "structured_params": {
+                "entry_filters": result["entry_filter_preference"],
+                "portfolio_preference": _safe_dict(runtime.get("portfolio_preference")),
+                "exit_preference": result["exit_preference"],
+            },
             "reason": schedule.get("reason", ""),
             "rollback": schedule.get("rollback", {}),
             "feedback_summary": feedback_summary,
@@ -5452,6 +5746,9 @@ class StrategyLearningService:
         if len(payload) <= LLM_CANDIDATE_PROMPT_MAX_CHARS:
             return prompt
         compact = json.loads(payload)
+        structured_guidance = _safe_dict(
+            _safe_dict(_safe_dict(compact.get("generation_guidance")).get("structured_param_guidance"))
+        )
         summary = _safe_dict(compact.get("feedback_summary"))
         events = _safe_dict(summary.get("event_feedback"))
         events["recent_events"] = [
@@ -5470,6 +5767,52 @@ class StrategyLearningService:
         summary["root_causes"] = _safe_list(summary.get("root_causes"))[:4]
         summary["problems"] = _safe_list(summary.get("problems"))[:5]
         compact["feedback_summary"] = summary
+        if "generation_guidance" in compact:
+            guidance = _safe_dict(compact.get("generation_guidance"))
+            guidance.pop("structured_param_guidance", None)
+            compact["generation_guidance"] = guidance
+        if structured_guidance:
+            compact["structured_param_guidance"] = {
+                "entry_filters": {
+                    "allowed_keys": sorted(
+                        _safe_dict(_safe_dict(structured_guidance.get("entry_filters")).get("allowed_keys")).keys()
+                    ),
+                },
+                "portfolio_preference": {
+                    "allowed_keys": {
+                        "capacity_mode": _safe_dict(
+                            _safe_dict(structured_guidance.get("portfolio_preference")).get(
+                                "allowed_keys"
+                            )
+                        ).get("capacity_mode"),
+                        "bias_keys": [
+                            "target_open_bias",
+                            "rotation_bias",
+                            "roster_fill_bias",
+                            "review_bias",
+                        ],
+                    },
+                },
+                "exit_preference": {
+                    "allowed_keys": {
+                        "winner_mode": _safe_dict(
+                            _safe_dict(structured_guidance.get("exit_preference")).get(
+                                "allowed_keys"
+                            )
+                        ).get("winner_mode"),
+                        "loser_mode": _safe_dict(
+                            _safe_dict(structured_guidance.get("exit_preference")).get(
+                                "allowed_keys"
+                            )
+                        ).get("loser_mode"),
+                        "bias_keys": [
+                            "profit_lock_bias",
+                            "review_priority_bias",
+                            "loss_exit_bias",
+                        ],
+                    },
+                },
+            }
         if len(json.dumps(compact, ensure_ascii=False)) <= LLM_CANDIDATE_PROMPT_MAX_CHARS:
             return compact
 
@@ -5554,6 +5897,59 @@ class StrategyLearningService:
             "training_policy": summary.get("training_policy"),
         }
         minimal["feedback_summary"] = minimal_summary
+        if "generation_guidance" in minimal:
+            guidance = _safe_dict(minimal.get("generation_guidance"))
+            guidance["candidate_modes"] = {
+                key: str(value)[:120]
+                for key, value in _safe_dict(guidance.get("candidate_modes")).items()
+            }
+            minimal["generation_guidance"] = guidance
+        payload = json.dumps(_json_safe(minimal), ensure_ascii=False)
+        if len(payload) <= LLM_CANDIDATE_PROMPT_MAX_CHARS:
+            return minimal
+        minimal_summary["side_performance"] = {
+            side: {
+                key: _safe_dict(bucket).get(key)
+                for key in ("pnl", "win_rate", "avg_hold_hours", "profit_factor", "state")
+            }
+            for side, bucket in _safe_dict(minimal_summary.get("side_performance")).items()
+        }
+        minimal["feedback_summary"] = minimal_summary
+        payload = json.dumps(_json_safe(minimal), ensure_ascii=False)
+        if len(payload) <= LLM_CANDIDATE_PROMPT_MAX_CHARS:
+            return minimal
+        minimal["generation_guidance"] = {
+            "primary_issue_keys": _safe_list(guidance.get("primary_issue_keys"))[:5],
+            "require_quality_entry_recovery_candidate": bool(
+                guidance.get("require_quality_entry_recovery_candidate")
+            ),
+            "allow_recovery_probe_candidate": bool(guidance.get("allow_recovery_probe_candidate")),
+            "profit_first_over_conservative_signal": bool(
+                guidance.get("profit_first_over_conservative_signal")
+            ),
+            "profit_first_tiny_probe_fee_drag": bool(
+                guidance.get("profit_first_tiny_probe_fee_drag")
+            ),
+            "payoff_repair_profile": {
+                key: _safe_dict(guidance.get("payoff_repair_profile")).get(key)
+                for key in ("triggered", "sample_count", "imbalance_score", "policy")
+            },
+        }
+        minimal["feedback_summary"] = {
+            **minimal_summary,
+            "problems": [
+                {
+                    "key": _safe_dict(item).get("key"),
+                    "severity": _safe_dict(item).get("severity"),
+                }
+                for item in _safe_list(minimal_summary.get("problems"))[:4]
+            ],
+            "root_causes": _safe_list(minimal_summary.get("root_causes"))[:2],
+            "training_policy": {
+                key: _safe_dict(minimal_summary.get("training_policy")).get(key)
+                for key in ("low_trade_count_is_penalized", "candidate_profiles_only")
+            },
+        }
         return minimal
 
     def _candidate_generation_guidance(self, feedback: StrategyFeedback) -> dict[str, Any]:
@@ -5610,6 +6006,44 @@ class StrategyLearningService:
             "profit_first_tiny_probe_fee_drag": tiny_probe_fee_drag,
             "payoff_repair_profile": payoff_repair,
             "payoff_profile_policy": "dynamic_window_distribution_not_fixed_usdt_thresholds",
+            "structured_param_guidance": {
+                "entry_filters": {
+                    "use_for": (
+                        "Use when root cause is entry quality being too loose or too conservative."
+                    ),
+                    "allowed_keys": {
+                        "volume_ratio_multiplier": "0.75 to 1.20",
+                        "adx_multiplier": "0.75 to 1.20",
+                        "quality_bias": sorted(ALLOWED_ENTRY_FILTER_QUALITY_BIAS),
+                        "missed_opportunity_bias": sorted(ALLOWED_ENTRY_FILTER_MISSED_BIAS),
+                    },
+                },
+                "portfolio_preference": {
+                    "use_for": (
+                        "Use when the system should expand capacity, focus capacity, or refill the "
+                        "candidate roster differently."
+                    ),
+                    "allowed_keys": {
+                        "capacity_mode": sorted(ALLOWED_PORTFOLIO_CAPACITY_MODES),
+                        "target_open_bias": "0.80 to 1.35",
+                        "rotation_bias": "0.80 to 1.60",
+                        "roster_fill_bias": "0.75 to 1.60",
+                        "review_bias": "0.85 to 1.50",
+                    },
+                },
+                "exit_preference": {
+                    "use_for": (
+                        "Use when winners should run longer or losers should be reviewed/released faster."
+                    ),
+                    "allowed_keys": {
+                        "winner_mode": sorted(ALLOWED_EXIT_WINNER_MODES),
+                        "loser_mode": sorted(ALLOWED_EXIT_LOSER_MODES),
+                        "profit_lock_bias": "0.85 to 1.35",
+                        "review_priority_bias": "0.85 to 1.60",
+                        "loss_exit_bias": "0.80 to 1.50",
+                    },
+                },
+            },
             "candidate_modes": {
                 "quality_entry_recovery": (
                     "Use when low-payoff probes are being shadowed. Do not set "
@@ -5773,6 +6207,11 @@ class StrategyLearningService:
                     "distribution profile and pass winner_hold_dynamic evidence; do not use fixed "
                     "USDT cutoffs."
                 ),
+                (
+                    "When root cause is entry quality, capacity usage, or exit payoff shape, "
+                    "prefer structured params entry_filters, portfolio_preference, and "
+                    "exit_preference instead of only tweaking a single scalar."
+                ),
                 "Do not optimize by avoiding trades; low trade count must be penalized.",
                 "Use concise Chinese label and description fields.",
                 "Return at most 2 candidates. label <= 12 chars, description <= 40 chars.",
@@ -5866,6 +6305,11 @@ class StrategyLearningService:
 
     def _llm_candidate_retry_prompt(self, prompt: dict[str, Any]) -> dict[str, Any]:
         summary = _safe_dict(prompt.get("feedback_summary"))
+        structured_guidance = _safe_dict(prompt.get("structured_param_guidance"))
+        if not structured_guidance:
+            structured_guidance = _safe_dict(
+                _safe_dict(prompt.get("generation_guidance")).get("structured_param_guidance")
+            )
         return {
             "task": "generate_one_bounded_strategy_candidate",
             "language": "zh-CN",
@@ -5878,10 +6322,15 @@ class StrategyLearningService:
                     "without probe_fraction/max_probe_size_pct; otherwise a bounded recovery "
                     "probe is allowed."
                 ),
+                (
+                    "Use structured params entry_filters, portfolio_preference, and "
+                    "exit_preference when they match the root cause."
+                ),
                 'Valid shape: {"candidates":[{"profile_id":"llm_quality_recovery","label":"质量恢复","description":"恢复高质量正常开仓","params":{"position_size_multiplier":1.0,"expert_integrity_mode":"strict_all_required","global_min_score_delta":0.0}}]}',
             ],
             "allowed_params": sorted(ALLOWED_CANDIDATE_PARAM_KEYS),
             "generation_guidance": prompt.get("generation_guidance"),
+            "structured_param_guidance": structured_guidance or None,
             "feedback_summary": {
                 "totals": summary.get("totals"),
                 "side_performance": summary.get("side_performance"),

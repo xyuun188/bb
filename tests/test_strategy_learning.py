@@ -796,6 +796,115 @@ def test_strategy_learning_runtime_keeps_roster_fill_candidate_floor(tmp_path) -
     assert runtime_budget["roster_fill_market_symbol_min"] >= 6
 
 
+def test_strategy_learning_structured_candidate_preferences_are_consumed(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+    state_store.set_manual_active_profile("llm_structured_preference")
+
+    llm_profile = StrategyProfile(
+        profile_id="llm_structured_preference",
+        version=1,
+        label="结构偏好",
+        status="candidate",
+        source="llm_structured_candidate",
+        description="用结构化偏好扩大容量并优化进退场。",
+        params={
+            "global_min_score_delta": -0.03,
+            "position_size_multiplier": 1.02,
+            "entry_filters": {
+                "quality_bias": "expand",
+                "missed_opportunity_bias": "relax",
+                "volume_ratio_multiplier": 0.9,
+                "adx_multiplier": 0.92,
+            },
+            "portfolio_preference": {
+                "capacity_mode": "expand",
+                "target_open_bias": 1.2,
+                "rotation_bias": 1.4,
+                "roster_fill_bias": 1.3,
+                "review_bias": 1.15,
+            },
+            "exit_preference": {
+                "winner_mode": "let_run",
+                "loser_mode": "cut_faster",
+                "profit_lock_bias": 1.15,
+                "review_priority_bias": 1.2,
+                "loss_exit_bias": 1.25,
+            },
+        },
+    )
+
+    open_positions = [
+        _old_flat_open_position("LOW1/USDT"),
+        _old_flat_open_position("LOW2/USDT"),
+        _old_flat_open_position("LOW3/USDT"),
+    ]
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-2.0, position_id=601)],
+        open_positions=open_positions,
+        orders=[],
+        decisions=[_healthy_decision("long", executed=True)],
+        shadows=[
+            _missed_shadow("BTC/USDT", "long", 0.9),
+            _missed_shadow("ETH/USDT", "long", 0.8),
+        ],
+        memories=[],
+        strategy_events=[
+            _strategy_event("capacity_block", status="blocked", reason="max_position capacity")
+        ],
+        reflections=[
+            _reflection(position_id=602, pnl=-1.4, hold_minutes=220.0, mistake="loss hold too long")
+        ],
+        max_open_positions=8,
+        extra_profiles=[llm_profile],
+    )
+    context = engine.apply_to_context({}, payload)
+
+    active = next(
+        row
+        for row in payload["schedule"]["candidates"]
+        if row["id"] == "llm_structured_preference"
+    )
+    backtest = next(
+        row
+        for row in payload["schedule"]["backtest"]["rows"]
+        if row["profile_id"] == "llm_structured_preference"
+    )
+    shadow = next(
+        row
+        for row in payload["schedule"]["shadow_validation"]["rows"]
+        if row["profile_id"] == "llm_structured_preference"
+    )
+
+    assert active["consumed_runtime_params"] == [
+        "entry_filters",
+        "exit_preference",
+        "global_min_score_delta",
+        "portfolio_preference",
+        "position_size_multiplier",
+    ]
+    assert "portfolio_capacity_reallocation" in backtest["matched_fixes"]
+    assert shadow["would_increase_entries"] is True
+    assert shadow["would_release_losers"] is True
+    assert shadow["would_hold_winners"] is True
+    assert payload["schedule"]["active_profile"]["id"] == "llm_structured_preference"
+    assert context["entry_filter_preference"]["quality_bias"] == "expand"
+    assert context["portfolio_roster"]["preference"]["capacity_mode"] == "expand"
+    assert context["strategy_learning"]["structured_params"]["exit_preference"]["winner_mode"] == (
+        "let_run"
+    )
+    assert context["winner_hold_extension"] == "high"
+    assert context["loss_exit_aggressiveness"] == "high"
+    assert context["target_position_groups"] >= 4
+    assert context["strategy_learning"]["runtime"]["analysis_budget"]["roster_fill_market_symbol_min"] >= 6
+    assert "entry_preference_expand_quality_entries" in context["entry_filters"]["reason"]
+    assert "portfolio_preference_expand_capacity" in context["portfolio_roster"]["policy_reason"]
+
+
 def test_strategy_learning_historical_capacity_blocks_do_not_trigger_release_without_current_pressure(
     tmp_path,
 ) -> None:
@@ -1948,6 +2057,46 @@ def test_strategy_learning_context_and_snapshot_include_dispatch_details(tmp_pat
     assert learning["training_policy"]["manual_close_excluded"] is True
 
     assert snapshot["exclude_from_training"] is True
+
+
+def test_strategy_learning_llm_prompt_exposes_structured_param_guidance(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+
+    feedback = service.engine.compiler.compile(
+        mode="paper",
+        window_hours=168,
+        positions=[_position(side="long", pnl=-1.6, position_id=701)],
+        open_positions=[_old_flat_open_position("LOW/USDT")],
+        orders=[],
+        decisions=[_decision("long", reason="expert_integrity fallback") for _ in range(8)],
+        shadows=[_missed_shadow("BTC/USDT", "long", 0.9)],
+        memories=[],
+        strategy_events=[
+            _strategy_event("capacity_block", status="blocked", reason="max_position capacity")
+        ],
+        reflections=[_reflection(position_id=702, pnl=-1.0, hold_minutes=160.0)],
+        max_open_positions=10,
+    )
+
+    prompt = service._llm_candidate_prompt_v3(feedback)
+    retry_prompt = service._llm_candidate_retry_prompt(prompt)
+    rules_text = " ".join(str(item) for item in prompt["rules"])
+    retry_rules_text = " ".join(str(item) for item in retry_prompt["rules"])
+    structured_guidance = prompt.get("structured_param_guidance") or prompt[
+        "generation_guidance"
+    ].get("structured_param_guidance")
+
+    assert "entry_filters" in prompt["allowed_params"]
+    assert "portfolio_preference" in prompt["allowed_params"]
+    assert "exit_preference" in prompt["allowed_params"]
+    assert (
+        structured_guidance["portfolio_preference"]["allowed_keys"]["capacity_mode"]
+        == ["balanced", "expand", "focus"]
+    )
+    assert "structured params entry_filters, portfolio_preference, and exit_preference" in rules_text
+    assert retry_prompt["structured_param_guidance"] == structured_guidance
+    assert "structured params entry_filters, portfolio_preference, and exit_preference" in retry_rules_text
 
 
 def test_strategy_learning_llm_candidate_prompt_accepts_datetimes(tmp_path, monkeypatch) -> None:
