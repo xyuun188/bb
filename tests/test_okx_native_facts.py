@@ -316,6 +316,47 @@ class _PositionHistoryCcxt:
         return {"data": self.pages.get(cursor, [])}
 
 
+class _AccountBillsCcxt:
+    def __init__(self) -> None:
+        self.params: list[dict[str, Any]] = []
+        self.archive_params: list[dict[str, Any]] = []
+
+    async def privateGetAccountBills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.params.append(dict(params))
+        sub_type = str(params.get("subType") or "")
+        rows = [
+            {
+                "billId": "funding-173",
+                "instId": "GOOGL-USDT-SWAP",
+                "posSide": "long",
+                "ccy": "USDT",
+                "type": "8",
+                "subType": "173",
+                "balChg": "-0.12",
+                "pnl": "-0.12",
+                "fee": "0",
+                "ts": "1783008001094",
+            },
+            {
+                "billId": "funding-174",
+                "instId": "MET-USDT-SWAP",
+                "posSide": "short",
+                "ccy": "USDT",
+                "type": "8",
+                "subType": "174",
+                "balChg": "0.02",
+                "pnl": "0.02",
+                "fee": "0",
+                "ts": "1783008001071",
+            },
+        ]
+        return {"data": [row for row in rows if not sub_type or row["subType"] == sub_type]}
+
+    async def privateGetAccountBillsArchive(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.archive_params.append(dict(params))
+        return {"data": []}
+
+
 def test_group_okx_native_fill_rows_uses_inst_id_not_ccxt_alias() -> None:
     timestamp = int(datetime(2026, 6, 26, 12, 0, tzinfo=UTC).timestamp() * 1000)
 
@@ -680,6 +721,38 @@ async def test_native_facts_client_fetches_position_history_by_pos_ids() -> None
             "limit": "5",
             "begin": str(int(since.timestamp() * 1000)),
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_facts_client_fetches_funding_bills_with_type_and_subtype_filters() -> None:
+    ccxt = _AccountBillsCcxt()
+    since = datetime(2026, 6, 28, 0, 0, tzinfo=UTC)
+
+    bills = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_account_bills(
+        since=since,
+        limit=20,
+        funding_only=True,
+    )
+
+    assert [bill.bill_id for bill in bills] == ["funding-173", "funding-174"]
+    assert ccxt.params == [
+        {
+            "instType": "SWAP",
+            "ccy": "USDT",
+            "limit": "20",
+            "type": "8",
+            "subType": "173",
+            "begin": str(int(since.timestamp() * 1000)),
+        },
+        {
+            "instType": "SWAP",
+            "ccy": "USDT",
+            "limit": "20",
+            "type": "8",
+            "subType": "174",
+            "begin": str(int(since.timestamp() * 1000)),
+        },
     ]
 
 

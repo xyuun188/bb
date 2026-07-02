@@ -434,20 +434,35 @@ class OkxNativeFactsClient:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for fetch_bills in fetch_bill_methods:
-            try:
-                page_rows = await self._fetch_account_bill_pages(
-                    fetch_bills,
+            base_params = {
+                "instType": "SWAP",
+                "ccy": "USDT",
+                "limit": str(page_limit),
+            }
+            param_sets = [base_params]
+            if funding_only:
+                param_sets = [
                     {
-                        "instType": "SWAP",
-                        "ccy": "USDT",
-                        "limit": str(page_limit),
-                    },
-                    since_ms=since_ms,
-                    target_inst_ids=target_inst_ids,
-                    funding_only=funding_only,
-                    page_limit=page_limit,
-                    max_pages=page_count,
-                )
+                        **base_params,
+                        "type": "8",
+                        "subType": sub_type,
+                    }
+                    for sub_type in sorted(FUNDING_FEE_BILL_SUBTYPES)
+                ]
+            try:
+                page_rows: list[dict[str, Any]] = []
+                for params in param_sets:
+                    page_rows.extend(
+                        await self._fetch_account_bill_pages(
+                            fetch_bills,
+                            params,
+                            since_ms=since_ms,
+                            target_inst_ids=target_inst_ids,
+                            funding_only=funding_only,
+                            page_limit=page_limit,
+                            max_pages=page_count,
+                        )
+                    )
             except Exception:
                 if strict and fetch_bills is fetch_bill_methods[-1] and not rows:
                     raise

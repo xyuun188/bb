@@ -321,6 +321,31 @@ class _PullTimeoutExecutor(_NoHistoryExecutor):
         raise TimeoutError("OKX pull timeout")
 
 
+class _FundingBillThenPullTimeoutCcxt(_FundingBillCcxt):
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        raise TimeoutError("OKX pull timeout")
+
+
+class _FundingBillThenPullTimeoutExecutor:
+    ccxt_instances: list[_FundingBillThenPullTimeoutCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _FundingBillThenPullTimeoutCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _FundingBillThenPullTimeoutCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
 def test_position_history_payload_preserves_existing_order_links() -> None:
     position = Position(
         model_name="manual_repair",
@@ -1198,6 +1223,72 @@ async def test_order_fact_sync_keeps_order_confirmation_when_position_history_is
         assert row["okx_fill_pnl"] == pytest.approx(1.23)
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_persists_funding_bills_even_when_okx_pull_times_out(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-funding-bills-timeout.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="sell",
+                    order_type="market",
+                    quantity=1.0,
+                    price=0.03,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id="phase3-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_FundingBillThenPullTimeoutExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            bill_rows = list(
+                (
+                    await session.execute(
+                        OkxAccountBill.__table__.select().order_by(
+                            OkxAccountBill.__table__.c.bill_id.asc()
+                        )
+                    )
+                ).all()
+            )
+    finally:
+        await close_db()
+
+    assert report["okx_pull_available"] is False
+    assert "OKX pull timeout" in report["error"]
+    assert report["account_bill_error"] is None
+    assert report["account_bill_checked_count"] == 1
+    assert report["account_bill_backfilled_count"] == 1
+    assert len(bill_rows) == 1
+    row = bill_rows[0]._mapping
+    assert row["bill_id"] == "funding-bill-1"
+    assert row["inst_id"] == "SPK-USDT-SWAP"
+    assert row["funding_fee"] == pytest.approx(-0.17)
 
 
 @pytest.mark.asyncio

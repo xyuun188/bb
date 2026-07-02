@@ -256,6 +256,27 @@ class OkxOrderFactSyncService:
         try:
             await _bounded(executor.initialize(), self.timeout_seconds)
             native_facts = OkxNativeFactsClient(executor)
+            try:
+                # Funding fees are balance-ledger events, not order/fill facts.
+                # Pull them account-wide before the slower position/order sync so
+                # a timeout in those later calls does not starve historical PnL.
+                account_bills = await _bounded(
+                    native_facts.fetch_account_bills(
+                        since=since,
+                        limit=100,
+                        max_pages=max(3, min(10, (self.limit // 100) + 2)),
+                        funding_only=True,
+                        strict=True,
+                    ),
+                    self.timeout_seconds,
+                )
+            except Exception as exc:
+                account_bill_error = safe_error_text(exc, limit=180)
+                logger.warning(
+                    "OKX account bill sync degraded; continuing order/fill fact sync",
+                    mode=self.mode,
+                    error=account_bill_error,
+                )
             exchange_positions = await _bounded(
                 native_facts.fetch_positions(),
                 self.timeout_seconds,
@@ -352,25 +373,6 @@ class OkxOrderFactSyncService:
                         mode=self.mode,
                         error=position_history_error,
                     )
-            try:
-                account_bills = await _bounded(
-                    native_facts.fetch_account_bills(
-                        inst_ids=fact_target_inst_ids,
-                        since=since,
-                        limit=100,
-                        max_pages=max(3, min(10, (self.limit // 100) + 2)),
-                        funding_only=True,
-                        strict=True,
-                    ),
-                    self.timeout_seconds,
-                )
-            except Exception as exc:
-                account_bill_error = safe_error_text(exc, limit=180)
-                logger.warning(
-                    "OKX account bill sync degraded; continuing order/fill fact sync",
-                    mode=self.mode,
-                    error=account_bill_error,
-                )
         except Exception as exc:
             okx_pull_available = False
             pull_error = safe_error_text(exc, limit=180)
@@ -470,6 +472,14 @@ class OkxOrderFactSyncService:
                 confirmed_count = self._recover_local_stored_order_facts(
                     writable_orders,
                     decisions_by_id=decisions_by_id,
+                    now=datetime.now(UTC),
+                    samples=samples,
+                )
+            if not okx_pull_available or account_bill_result.checked_count == 0:
+                account_bill_result = await self._sync_account_bills(
+                    session,
+                    account_bills=account_bills,
+                    since=since,
                     now=datetime.now(UTC),
                     samples=samples,
                 )
