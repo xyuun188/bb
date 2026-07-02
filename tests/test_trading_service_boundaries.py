@@ -809,6 +809,7 @@ async def test_position_review_loop_keeps_stage_timeout_separate_from_round_watc
     monkeypatch,
 ):
     calls: list[str] = []
+    completed: list[str] = []
     running = True
     sleeps: list[float] = []
     original_sleep = asyncio.sleep
@@ -821,14 +822,15 @@ async def test_position_review_loop_keeps_stage_timeout_separate_from_round_watc
 
     async def run_once(scope):
         calls.append(scope)
-        await original_sleep(60)
+        await original_sleep(0.03)
+        completed.append(scope)
         return {"scope": scope}
 
     service = PositionReviewService(
         run_once_provider=run_once,
         is_running_provider=lambda: running,
-        timeout_provider=lambda: 0.05,
-        round_watchdog_provider=lambda: 0.2,
+        timeout_provider=lambda: 0.001,
+        round_watchdog_provider=lambda: 0.001,
     )
     service.initial_delay_seconds = 0.0
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
@@ -836,7 +838,16 @@ async def test_position_review_loop_keeps_stage_timeout_separate_from_round_watc
     await service.loop(lambda: 30.0)
 
     assert calls == ["position"]
+    assert completed == ["position"]
     assert sleeps == [0.0, 30.0]
+
+
+def test_position_review_batch_timeout_scales_with_selected_groups() -> None:
+    service = PositionReviewService(timeout_provider=lambda: 2.0)
+
+    assert service._review_positions_timeout_seconds(1) == pytest.approx(6.0)
+    assert service._review_positions_timeout_seconds(4) == pytest.approx(16.0)
+    assert service._review_positions_timeout_seconds(20) == pytest.approx(70.0)
 
 
 @pytest.mark.asyncio
@@ -4024,7 +4035,7 @@ def test_position_round_watchdog_follows_position_review_cadence(
 
     assert service.position_review_stage_timeout_seconds() == 63.0
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
-    assert service.position_round_watchdog_seconds() == pytest.approx(60.0)
+    assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
 
 
 @pytest.mark.asyncio

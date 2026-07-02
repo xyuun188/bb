@@ -80,11 +80,7 @@ class _ScopedAnalysisService:
         await asyncio.sleep(self.initial_delay_seconds)
         while self.is_running():
             try:
-                time_budget = self._time_budget_seconds()
-                if time_budget is None:
-                    await self.run_once()
-                else:
-                    await asyncio.wait_for(self.run_once(), timeout=time_budget)
+                await self._run_loop_round()
                 await asyncio.sleep(self._resolve_interval(interval_seconds))
             except asyncio.CancelledError:
                 task = asyncio.current_task()
@@ -109,6 +105,13 @@ class _ScopedAnalysisService:
                     error=safe_error_text(exc),
                 )
                 await asyncio.sleep(self._resolve_interval(interval_seconds))
+
+    async def _run_loop_round(self) -> None:
+        time_budget = self._time_budget_seconds()
+        if time_budget is None:
+            await self.run_once()
+        else:
+            await asyncio.wait_for(self.run_once(), timeout=time_budget)
 
 
 class MarketAnalysisService(_ScopedAnalysisService):
@@ -157,6 +160,15 @@ class PositionReviewService(_ScopedAnalysisService):
         self.decision_reason_marker = decision_reason_marker
         self.timeout_provider = timeout_provider
         self.round_watchdog_provider = round_watchdog_provider
+
+    async def _run_loop_round(self) -> None:
+        # Position review has its own round deadline and per-stage timeouts
+        # inside TradingService.run_once()/review_open_positions().  Wrapping
+        # the whole coroutine in asyncio.wait_for cancels the round before those
+        # softer boundaries can persist skipped groups and execution handoffs.
+        # Keep round_watchdog_provider for diagnostics and internal deadlines,
+        # not as an outer cancellation boundary.
+        await self.run_once()
 
     def _required_loop_stage_setter(self) -> Callable[[str], None]:
         if self.loop_stage_setter is None:
@@ -254,13 +266,36 @@ class PositionReviewService(_ScopedAnalysisService):
             return None
         return max(float(round_deadline) - asyncio.get_running_loop().time(), 0.0)
 
-    def _stage_timeout_seconds(self, round_deadline: float | None) -> float:
-        stage_timeout = self._timeout_seconds()
+    def _stage_timeout_seconds(
+        self,
+        round_deadline: float | None,
+        *,
+        requested_timeout_seconds: float | None = None,
+        deadline_grace_seconds: float = 0.0,
+    ) -> float:
+        stage_timeout = max(
+            1.0,
+            float(
+                requested_timeout_seconds
+                if requested_timeout_seconds is not None
+                else self._timeout_seconds()
+            ),
+        )
         remaining = self._remaining_round_seconds(round_deadline)
         if remaining is None:
             return stage_timeout
         reserve_seconds = min(2.0, max(0.25, stage_timeout * 0.03), remaining * 0.25)
-        return max(0.0, min(stage_timeout, remaining - reserve_seconds))
+        deadline_grace_seconds = max(0.0, float(deadline_grace_seconds or 0.0))
+        return max(0.0, min(stage_timeout, remaining - reserve_seconds + deadline_grace_seconds))
+
+    def _review_positions_timeout_seconds(self, max_groups_override: int) -> float:
+        stage_timeout = self._timeout_seconds()
+        try:
+            group_count = max(1, int(max_groups_override or 1))
+        except (TypeError, ValueError):
+            group_count = 1
+        shared_overhead = max(4.0, min(30.0, group_count * 2.0))
+        return max(stage_timeout, stage_timeout * group_count + shared_overhead)
 
     def _record_stage_skip(
         self,
@@ -301,10 +336,18 @@ class PositionReviewService(_ScopedAnalysisService):
         *,
         results: dict[str, Any],
         round_deadline: float | None = None,
+        requested_timeout_seconds: float | None = None,
+        deadline_grace_seconds: float = 0.0,
     ) -> Any | _PositionReviewStageSkip:
-        timeout_seconds = self._stage_timeout_seconds(round_deadline)
+        timeout_seconds = self._stage_timeout_seconds(
+            round_deadline,
+            requested_timeout_seconds=requested_timeout_seconds,
+            deadline_grace_seconds=deadline_grace_seconds,
+        )
         remaining = self._remaining_round_seconds(round_deadline)
-        if round_deadline is not None and timeout_seconds <= 0:
+        if round_deadline is not None and (
+            timeout_seconds <= 0 or (remaining is not None and remaining <= 0)
+        ):
             self._close_unawaited(awaitable)
             message = (
                 f"持仓复盘本轮剩余时间不足：{stage} 已顺延到下一轮，"
@@ -327,7 +370,14 @@ class PositionReviewService(_ScopedAnalysisService):
         try:
             return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
         except TimeoutError:
-            stage_timeout = self._timeout_seconds()
+            stage_timeout = max(
+                1.0,
+                float(
+                    requested_timeout_seconds
+                    if requested_timeout_seconds is not None
+                    else self._timeout_seconds()
+                ),
+            )
             budget_limited = timeout_seconds < (stage_timeout - 0.001)
             if budget_limited:
                 message = (
@@ -449,6 +499,10 @@ class PositionReviewService(_ScopedAnalysisService):
             ),
             results=results,
             round_deadline=round_deadline,
+            requested_timeout_seconds=self._review_positions_timeout_seconds(
+                max_groups_override
+            ),
+            deadline_grace_seconds=5.0,
         )
         if isinstance(review_result, _PositionReviewStageSkip):
             return open_positions, review_blocked_keys

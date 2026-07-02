@@ -1011,7 +1011,13 @@ class TradingService:
         return max(configured_watchdog, interval * 4.0, expert_budget * 2.0)
 
     def position_round_watchdog_seconds(self) -> float:
-        """Return the hard watchdog for one full position-review round."""
+        """Return the stuck-round watchdog for one full position-review round.
+
+        Position review also has softer per-stage deadlines.  The round watchdog
+        must be larger than those stage budgets; otherwise a normal slow review
+        gets cancelled before the stage code can skip one group and persist the
+        real diagnostic.
+        """
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
@@ -1021,16 +1027,7 @@ class TradingService:
             or settings.market_analysis_watchdog_seconds
             or 180
         )
-        responsive_budget = max(
-            interval * 1.5,
-            self.position_loop_interval_seconds() * 1.8,
-            min(
-                stage_budget + max(4.0, min(8.0, interval * 0.25)),
-                interval * 2.0,
-            ),
-            30.0,
-        )
-        return max(10.0, min(configured_watchdog, responsive_budget))
+        return max(configured_watchdog, interval * 4.0, stage_budget * 2.0)
 
     def round_start_reconcile_timeout_seconds(self) -> float:
         """Return the short OKX sync boundary used at analysis round start."""
