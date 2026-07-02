@@ -170,6 +170,89 @@ def _exchange_reconcile_close_origin(
     return RECONCILE_ORIGIN_EXTERNAL_OKX
 
 
+def _okx_close_fill_order_payload(
+    *,
+    model_name: str,
+    execution_mode: str,
+    symbol: str,
+    side: str,
+    quantity: float,
+    price: float,
+    fee: float,
+    decision_id: int | None,
+    close_order_id: str,
+    filled_at: datetime | None,
+    close_fill: dict[str, Any] | None,
+    okx_inst_id: str,
+) -> dict[str, Any]:
+    fill = _dict_value(close_fill)
+    order_info = _close_fill_order_info(fill)
+    trade_id = str(
+        _first_value(
+            fill.get("trade_id"),
+            fill.get("tradeId"),
+            order_info.get("tradeId"),
+        )
+        or ""
+    ).strip()
+    contracts = _float_value(fill.get("contracts"), 0.0)
+    if contracts <= 0:
+        contracts = _float_value(order_info.get("fillSz") or order_info.get("accFillSz"), 0.0)
+    fill_pnl = _float_value(
+        _first_value(fill.get("pnl"), fill.get("fillPnl"), order_info.get("fillPnl")),
+        0.0,
+    )
+    timestamp = filled_at
+    raw_timestamp = _first_value(fill.get("timestamp"), order_info.get("ts"), fill.get("timestamp_ms"))
+    if timestamp is None and isinstance(raw_timestamp, datetime):
+        timestamp = raw_timestamp
+    raw_payload = {
+        "source": fill.get("source") or "okx_reconcile_close_fill",
+        "fills_history_confirmed": True,
+        "order_id": close_order_id or None,
+        "trade_ids": [trade_id] if trade_id else [],
+        "inst_id": okx_inst_id or _okx_inst_id_from_close_fill(fill, fallback=symbol),
+        "contracts": contracts or None,
+        "contract_size": fill.get("contract_size"),
+        "base_quantity": quantity,
+        "avg_price": price,
+        "fee_abs": abs(float(fee or 0.0)),
+        "fill_pnl": fill_pnl,
+        "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else raw_timestamp,
+        "rows": [dict(order_info)] if order_info else [],
+    }
+    return {
+        "model_name": model_name,
+        "execution_mode": execution_mode,
+        "symbol": symbol,
+        "side": side,
+        "order_type": "market",
+        "quantity": quantity,
+        "price": price,
+        "status": OrderStatus.FILLED.value,
+        "fee": abs(float(fee or 0.0)),
+        "decision_id": decision_id,
+        "exchange_order_id": close_order_id or None,
+        "filled_at": filled_at,
+        "okx_inst_id": okx_inst_id or raw_payload["inst_id"],
+        "okx_trade_ids": ",".join(raw_payload["trade_ids"]) if raw_payload["trade_ids"] else None,
+        "okx_fill_contracts": contracts or None,
+        "okx_fill_pnl": fill_pnl,
+        "okx_state": "filled",
+        "okx_sync_status": "okx_confirmed",
+        "okx_synced_at": datetime.now(UTC),
+        "okx_last_error": None,
+        "okx_raw_fills": raw_payload,
+    }
+
+
+def _apply_okx_close_fill_order_payload(order: Order, payload: dict[str, Any]) -> None:
+    for key, value in payload.items():
+        if key == "decision_id" and value is None:
+            continue
+        setattr(order, key, value)
+
+
 def _position_context_opened_at(position_payload: dict[str, Any], info: dict[str, Any]) -> Any:
     """Return a stable open time, never the OKX update time."""
 
@@ -1589,7 +1672,7 @@ class OkxSyncService:
                     existing_close_order = None
                     if close_order_id:
                         existing_close_order_result = await session.execute(
-                            select(Order.id)
+                            select(Order)
                             .where(
                                 Order.execution_mode == pos.execution_mode,
                                 Order.exchange_order_id == close_order_id,
@@ -1598,22 +1681,25 @@ class OkxSyncService:
                         )
                         existing_close_order = existing_close_order_result.scalar_one_or_none()
 
-                    if not existing_close_order:
+                    close_order_payload = _okx_close_fill_order_payload(
+                        model_name=pos.model_name,
+                        execution_mode=pos.execution_mode,
+                        symbol=pos.symbol,
+                        side=close_side,
+                        quantity=pos.quantity,
+                        price=exit_price,
+                        fee=close_fee,
+                        decision_id=decision_id,
+                        close_order_id=close_order_id,
+                        filled_at=pos.closed_at,
+                        close_fill=close_fill,
+                        okx_inst_id=close_okx_inst_id,
+                    )
+                    if existing_close_order is not None:
+                        _apply_okx_close_fill_order_payload(existing_close_order, close_order_payload)
+                    else:
                         await trade_repo.create_order(
-                            {
-                                "model_name": pos.model_name,
-                                "execution_mode": pos.execution_mode,
-                                "symbol": pos.symbol,
-                                "side": close_side,
-                                "order_type": "market",
-                                "quantity": pos.quantity,
-                                "price": exit_price,
-                                "status": OrderStatus.FILLED.value,
-                                "fee": close_fee,
-                                "decision_id": decision_id,
-                                "exchange_order_id": close_order_id,
-                                "filled_at": pos.closed_at,
-                            }
+                            close_order_payload
                         )
 
                     remove_memory_position(pos.model_name, pos.symbol, pos.side)
@@ -1823,7 +1909,7 @@ class OkxSyncService:
             existing_close_order = None
             if close_order_id:
                 existing_close_order_result = await session.execute(
-                    select(Order.id)
+                    select(Order)
                     .where(
                         Order.execution_mode == getattr(pos, "execution_mode", None),
                         Order.exchange_order_id == close_order_id,
@@ -1831,22 +1917,25 @@ class OkxSyncService:
                     .limit(1)
                 )
                 existing_close_order = existing_close_order_result.scalar_one_or_none()
-            if not existing_close_order:
+            close_order_payload = _okx_close_fill_order_payload(
+                model_name=pos.model_name,
+                execution_mode=pos.execution_mode,
+                symbol=closed_symbol,
+                side=close_side,
+                quantity=closed_qty,
+                price=close_price,
+                fee=close_fee,
+                decision_id=decision_id,
+                close_order_id=close_order_id,
+                filled_at=closed_at,
+                close_fill=close_fill if fill_matches_slice else None,
+                okx_inst_id=close_okx_inst_id,
+            )
+            if existing_close_order is not None:
+                _apply_okx_close_fill_order_payload(existing_close_order, close_order_payload)
+            else:
                 await trade_repo.create_order(
-                    {
-                        "model_name": pos.model_name,
-                        "execution_mode": pos.execution_mode,
-                        "symbol": closed_symbol,
-                        "side": close_side,
-                        "order_type": "market",
-                        "quantity": closed_qty,
-                        "price": close_price,
-                        "status": OrderStatus.FILLED.value,
-                        "fee": close_fee,
-                        "decision_id": decision_id,
-                        "exchange_order_id": close_order_id or None,
-                        "filled_at": closed_at,
-                    }
+                    close_order_payload
                 )
             reconciled.append(
                 {

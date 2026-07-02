@@ -181,6 +181,11 @@ class _FillCcxt:
         }
 
 
+class _PositionHistoryBusyCcxt(_FillCcxt):
+    async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        raise TimeoutError("positions-history busy")
+
+
 class _Executor:
     ccxt_instances: list[_FillCcxt] = []
 
@@ -192,6 +197,26 @@ class _Executor:
         return None
 
     async def _get_ccxt(self) -> _FillCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _PositionHistoryBusyExecutor:
+    ccxt_instances: list[_PositionHistoryBusyCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _PositionHistoryBusyCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _PositionHistoryBusyCcxt:
         return self.ccxt
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -234,6 +259,11 @@ class _NoHistoryExecutor:
 
     async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"data": [{"instId": "ACT-USDT-SWAP", "ctVal": "10"}]}
+
+
+class _PullTimeoutExecutor(_NoHistoryExecutor):
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        raise TimeoutError("OKX pull timeout")
 
 
 def test_position_history_payload_preserves_existing_order_links() -> None:
@@ -963,6 +993,590 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
         assert position["current_price"] == pytest.approx(0.0345)
         assert position["realized_pnl"] == pytest.approx(1.23)
         assert position["close_exchange_order_id"] == "phase3-order"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_keeps_order_confirmation_when_position_history_is_busy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-position-history-busy.db').as_posix()}",
+    )
+    await init_db()
+    _PositionHistoryBusyExecutor.ccxt_instances.clear()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SPK/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=12.0,
+                        price=0.0345,
+                        status="filled",
+                        fee=0.0,
+                        exchange_order_id="phase3-order",
+                        filled_at=phase3_time,
+                        created_at=phase3_time,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SPK/USDT",
+                        side="short",
+                        quantity=12.0,
+                        entry_price=0.039,
+                        current_price=0.0345,
+                        leverage=3.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=-99.0,
+                        is_open=False,
+                        okx_inst_id="SPK-USDT-SWAP",
+                        okx_pos_id="spk-phase3-pos",
+                        entry_exchange_order_id="entry-order",
+                        close_exchange_order_id="phase3-order",
+                        closed_at=phase3_time,
+                        created_at=phase3_time - timedelta(minutes=5),
+                    ),
+                ]
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_PositionHistoryBusyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "phase3-order"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["okx_pull_available"] is True
+        assert report["status"] == "warning"
+        assert "positions-history busy" in report["position_history_error"]
+        assert report["confirmed_count"] == 1
+        assert row["okx_sync_status"] == OKX_SYNC_CONFIRMED
+        assert row["okx_fill_pnl"] == pytest.approx(1.23)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_closed_position_pnl_from_okx_close_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-close-fill-pnl-repair.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=7)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=11, minutes=40)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="MET/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=100.0,
+                        price=0.1601,
+                        status="filled",
+                        fee=0.0,
+                        exchange_order_id="3695269432500391936",
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="MET/USDT",
+                        side="short",
+                        quantity=100.0,
+                        entry_price=0.1601,
+                        current_price=0.16437,
+                        leverage=3.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=12.34,
+                        is_open=False,
+                        okx_inst_id="MET-USDT-SWAP",
+                        okx_pos_id="met-pos",
+                        entry_exchange_order_id="3695269432500391936",
+                        close_exchange_order_id="3695833143904538624",
+                        closed_at=closed_at,
+                        created_at=opened_at,
+                    ),
+                ]
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_FillPairOnlyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.close_exchange_order_id == "3695833143904538624"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["closed_position_pnl_repaired_count"] == 1
+        assert row["realized_pnl"] == pytest.approx(-0.4432235)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-stored-close-fill-pnl-repair.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=12)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_at = opened_at + timedelta(minutes=12)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=100.0,
+                        price=0.08,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="ai16z-entry-okx",
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_trade_ids="trade-ai16z-entry-okx",
+                        okx_fill_contracts=10.0,
+                        okx_fill_pnl=0.0,
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": "ai16z-entry-okx",
+                            "trade_ids": ["trade-ai16z-entry-okx"],
+                            "inst_id": "AI16Z-USDT-SWAP",
+                            "contracts": 10.0,
+                            "contract_size": 10.0,
+                            "base_quantity": 100.0,
+                            "avg_price": 0.08,
+                            "fee_abs": 0.01,
+                            "fill_pnl": 0.0,
+                            "timestamp": opened_at.isoformat(),
+                        },
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=100.0,
+                        price=0.072,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="ai16z-close-okx",
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_trade_ids="trade-ai16z-close-okx",
+                        okx_fill_contracts=10.0,
+                        okx_fill_pnl=7.95,
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": "ai16z-close-okx",
+                            "trade_ids": ["trade-ai16z-close-okx"],
+                            "inst_id": "AI16Z-USDT-SWAP",
+                            "contracts": 10.0,
+                            "contract_size": 10.0,
+                            "base_quantity": 100.0,
+                            "avg_price": 0.072,
+                            "fee_abs": 0.01,
+                            "fill_pnl": 7.95,
+                            "timestamp": closed_at.isoformat(),
+                        },
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="short",
+                        quantity=100.0,
+                        entry_price=0.08,
+                        current_price=0.072,
+                        leverage=1.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=15.1136,
+                        is_open=False,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        entry_exchange_order_id="ai16z-entry-okx",
+                        close_exchange_order_id="ai16z-close-okx",
+                        closed_at=closed_at,
+                        created_at=opened_at,
+                    ),
+                ]
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_NoHistoryExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.close_exchange_order_id == "ai16z-close-okx"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["confirmed_count"] == 0
+        assert report["closed_position_pnl_repaired_count"] == 1
+        assert row["realized_pnl"] == pytest.approx(7.93)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_stored_okx_facts_when_okx_pull_times_out(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-timeout-stored-pnl-repair.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=12)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_at = opened_at + timedelta(minutes=12)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=100.0,
+                        price=0.08,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="ai16z-entry-timeout",
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_trade_ids="trade-ai16z-entry-timeout",
+                        okx_fill_contracts=10.0,
+                        okx_fill_pnl=0.0,
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": "ai16z-entry-timeout",
+                            "trade_ids": ["trade-ai16z-entry-timeout"],
+                            "inst_id": "AI16Z-USDT-SWAP",
+                            "contracts": 10.0,
+                            "contract_size": 10.0,
+                            "base_quantity": 100.0,
+                            "avg_price": 0.08,
+                            "fee_abs": 0.01,
+                            "fill_pnl": 0.0,
+                            "timestamp": opened_at.isoformat(),
+                        },
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=100.0,
+                        price=0.072,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="ai16z-close-timeout",
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        okx_trade_ids="trade-ai16z-close-timeout",
+                        okx_fill_contracts=10.0,
+                        okx_fill_pnl=7.95,
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": "ai16z-close-timeout",
+                            "trade_ids": ["trade-ai16z-close-timeout"],
+                            "inst_id": "AI16Z-USDT-SWAP",
+                            "contracts": 10.0,
+                            "contract_size": 10.0,
+                            "base_quantity": 100.0,
+                            "avg_price": 0.072,
+                            "fee_abs": 0.01,
+                            "fill_pnl": 7.95,
+                            "timestamp": closed_at.isoformat(),
+                        },
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="AI16Z/USDT",
+                        side="short",
+                        quantity=100.0,
+                        entry_price=0.08,
+                        current_price=0.072,
+                        leverage=1.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=15.1136,
+                        is_open=False,
+                        okx_inst_id="AI16Z-USDT-SWAP",
+                        entry_exchange_order_id="ai16z-entry-timeout",
+                        close_exchange_order_id="ai16z-close-timeout",
+                        closed_at=closed_at,
+                        created_at=opened_at,
+                    ),
+                ]
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_PullTimeoutExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.close_exchange_order_id == "ai16z-close-timeout"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["okx_pull_available"] is False
+        assert report["status"] == "warning"
+        assert "OKX pull timeout" in report["error"]
+        assert report["closed_position_pnl_repaired_count"] == 1
+        assert row["realized_pnl"] == pytest.approx(7.93)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_recovers_close_fill_decision_fact_when_okx_pull_times_out(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-timeout-close-fill-decision.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(days=4)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_at = opened_at + timedelta(minutes=59)
+    try:
+        async with get_session_ctx() as session:
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SKY/USDT",
+                action="close_short",
+                confidence=1.0,
+                reasoning="exchange reconcile",
+                position_size_pct=1.0,
+                suggested_leverage=4.0,
+                raw_llm_response={
+                    "system_sync": True,
+                    "source": "okx_position_reconcile",
+                    "close_fill": {
+                        "price": 0.05292,
+                        "fee": 0.095256,
+                        "order_id": "3705179573634957312",
+                        "timestamp_ms": 1782925356210.0,
+                        "timestamp": "2026-07-01T17:02:36.210000+00:00",
+                        "quantity": 3600.0,
+                        "contracts": 36.0,
+                        "contract_size": 100.0,
+                        "pnl": -0.792,
+                        "source": "okx_fills_history",
+                        "order_info": {
+                            "ordId": "3705179573634957312",
+                            "tradeId": "16354195",
+                            "instId": "SKY-USDT-SWAP",
+                            "posSide": "net",
+                            "side": "buy",
+                            "fillSz": "36",
+                            "fillPx": "0.05292",
+                            "fee": "-0.095256",
+                            "fillPnl": "-0.792",
+                            "ts": "1782925356210",
+                        },
+                    },
+                },
+                is_paper=True,
+                was_executed=True,
+                created_at=closed_at,
+            )
+            session.add(close_decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SKY/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=3600.0,
+                        price=0.0527,
+                        status="filled",
+                        fee=0.09486,
+                        exchange_order_id="3705061053542670336",
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                        okx_inst_id="SKY-USDT-SWAP",
+                        okx_trade_ids="16350886",
+                        okx_fill_contracts=36.0,
+                        okx_fill_pnl=0.0,
+                        okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                        okx_raw_fills={
+                            "source": "okx_execution_result",
+                            "fills_history_confirmed": False,
+                            "execution_result_confirmed": True,
+                            "order_id": "3705061053542670336",
+                            "trade_ids": ["16350886"],
+                            "inst_id": "SKY-USDT-SWAP",
+                            "contracts": 36.0,
+                            "base_quantity": 3600.0,
+                            "avg_price": 0.0527,
+                            "fee_abs": 0.09486,
+                            "fill_pnl": 0.0,
+                            "timestamp": opened_at.isoformat(),
+                        },
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SKY/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=3600.0,
+                        price=0.05292,
+                        status="filled",
+                        fee=0.095256,
+                        exchange_order_id="3705179573634957312",
+                        decision_id=close_decision.id,
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SKY/USDT",
+                        side="short",
+                        quantity=3600.0,
+                        entry_price=0.0527,
+                        current_price=0.05292,
+                        leverage=4.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=12.34,
+                        is_open=False,
+                        okx_inst_id="SKY-USDT-SWAP",
+                        okx_pos_id="3705061055321055232",
+                        entry_exchange_order_id="3705061053542670336",
+                        close_exchange_order_id="3705179573634957312",
+                        closed_at=closed_at,
+                        created_at=opened_at,
+                    ),
+                ]
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_PullTimeoutExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            close_order = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "3705179573634957312"
+                    )
+                )
+            ).first()._mapping
+            position = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.close_exchange_order_id == "3705179573634957312"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["okx_pull_available"] is False
+        assert report["confirmed_count"] == 2
+        assert report["closed_position_pnl_repaired_count"] == 1
+        assert close_order["okx_sync_status"] == OKX_SYNC_CONFIRMED
+        assert close_order["okx_inst_id"] == "SKY-USDT-SWAP"
+        assert close_order["okx_trade_ids"] == "16354195"
+        assert close_order["okx_fill_contracts"] == pytest.approx(36.0)
+        assert close_order["okx_fill_pnl"] == pytest.approx(-0.792)
+        assert close_order["okx_raw_fills"]["fills_history_confirmed"] is True
+        assert position["realized_pnl"] == pytest.approx(-0.982116)
     finally:
         await close_db()
 

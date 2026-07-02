@@ -547,8 +547,17 @@ def _build_group_from_positions(
     realized_pnl = sum(
         _safe_float(getattr(pos, "realized_pnl", None)) for pos in metric_positions
     )
+    okx_close_fill_net_pnl = _confirmed_close_fill_net_pnl(
+        linked_fills=linked_fills,
+        entry_ids=entry_ids,
+        close_ids=close_ids,
+        closed_quantity=closed_quantity,
+    )
     if has_okx_authoritative_pnl:
         pnl_source = "okx_position_history_realized_pnl"
+    elif okx_close_fill_net_pnl is not None:
+        realized_pnl = okx_close_fill_net_pnl
+        pnl_source = "okx_close_fill_net_pnl"
     elif not realized_pnl:
         realized_pnl = sum(
             _safe_float(row.pnl)
@@ -609,6 +618,46 @@ def _build_group_from_positions(
         evidence_gaps=gaps,
         pnl_source=pnl_source,
     )
+
+
+def _confirmed_close_fill_net_pnl(
+    *,
+    linked_fills: list[OkxLinkedFillRow],
+    entry_ids: list[str],
+    close_ids: list[str],
+    closed_quantity: float,
+) -> float | None:
+    if not entry_ids or not close_ids:
+        return None
+    fills_by_order_id = {row.order_id: row for row in linked_fills if row.order_id}
+    close_rows: list[OkxLinkedFillRow] = []
+    for order_id in close_ids:
+        row = fills_by_order_id.get(order_id)
+        if row is None or not row.okx_confirmed or row.pnl is None or row.quantity <= 0:
+            return None
+        close_rows.append(row)
+    entry_rows: list[OkxLinkedFillRow] = []
+    for order_id in entry_ids:
+        row = fills_by_order_id.get(order_id)
+        if row is None or not row.okx_confirmed or row.quantity <= 0:
+            return None
+        entry_rows.append(row)
+
+    close_quantity = sum(row.quantity for row in close_rows)
+    if closed_quantity > 0 and not _quantities_match(
+        close_quantity,
+        closed_quantity,
+        tolerance_ratio=0.02,
+    ):
+        return None
+    entry_quantity = sum(row.quantity for row in entry_rows)
+    if entry_quantity <= 0:
+        return None
+    close_gross_pnl = sum(_safe_float(row.pnl, 0.0) or 0.0 for row in close_rows)
+    close_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in close_rows)
+    entry_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in entry_rows)
+    entry_fee *= min(max(close_quantity, 0.0) / entry_quantity, 1.0)
+    return close_gross_pnl - entry_fee - close_fee
 
 
 def _deduplicate_superseded_position_rows(positions: list[Position]) -> list[Position]:

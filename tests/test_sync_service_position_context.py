@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from core.symbols import normalize_trading_symbol
-from services.sync_service import normalized_open_position_context
+from services.sync_service import _okx_close_fill_order_payload, normalized_open_position_context
 
 
 def _float(value, default=0.0):
@@ -109,3 +109,43 @@ def test_normalized_open_position_context_uses_contract_value_without_price_snap
     assert context["contracts"] == pytest.approx(99.5)
     assert context["contract_size"] == pytest.approx(0.1)
     assert context["notional"] == pytest.approx(35.1434)
+
+
+def test_okx_close_fill_order_payload_persists_native_fill_fact() -> None:
+    filled_at = datetime(2026, 7, 2, 1, 20, 53, tzinfo=UTC)
+
+    payload = _okx_close_fill_order_payload(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="SAND/USDT",
+        side="buy",
+        quantity=1455.0,
+        price=0.0498,
+        fee=0.0289836,
+        decision_id=123,
+        close_order_id="3706182741831417856",
+        filled_at=filled_at,
+        close_fill={
+            "source": "okx_fills_history",
+            "pnl": -3.58808175,
+            "contracts": 145.5,
+            "quantity": 1455.0,
+            "order_info": {
+                "instId": "SAND-USDT-SWAP",
+                "tradeId": "sand-close-trade",
+                "fillSz": "145.5",
+                "fillPnl": "-3.58808175",
+                "ts": str(int(filled_at.timestamp() * 1000)),
+            },
+        },
+        okx_inst_id="SAND-USDT-SWAP",
+    )
+
+    assert payload["okx_inst_id"] == "SAND-USDT-SWAP"
+    assert payload["okx_sync_status"] == "okx_confirmed"
+    assert payload["okx_fill_contracts"] == pytest.approx(145.5)
+    assert payload["okx_fill_pnl"] == pytest.approx(-3.58808175)
+    assert payload["okx_raw_fills"]["fills_history_confirmed"] is True
+    assert payload["okx_raw_fills"]["order_id"] == "3706182741831417856"
+    assert payload["okx_raw_fills"]["trade_ids"] == ["sand-close-trade"]
+    assert payload["okx_raw_fills"]["rows"][0]["instId"] == "SAND-USDT-SWAP"
