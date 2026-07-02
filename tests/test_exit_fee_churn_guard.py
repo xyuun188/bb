@@ -309,3 +309,39 @@ async def test_winner_run_guard_blocks_ordinary_full_close_when_trend_still_vali
     assert guard["close_pct"] == 1.0
     assert guard["trend_still_valid"] is True
     assert guard["strong_lock"] is False
+
+
+@pytest.mark.asyncio
+async def test_exit_fee_churn_guard_records_dynamic_strategy_exit_policy() -> None:
+    decision = _decision(
+        current_price=100.8,
+        confidence=0.72,
+        reasoning="普通止盈全平",
+        position_size_pct=1.0,
+        raw_response={
+            "strategy_learning_context": {
+                "winner_hold_extension": "high",
+                "profit_lock_min_usdt_multiplier": 1.4,
+                "payoff_repair_intensity": 0.75,
+                "winner_hold_dynamic": {
+                    "training": {"triggered": True, "imbalance_score": 0.75},
+                },
+                "exit_preference": {"winner_mode": "let_run", "profit_lock_bias": 1.2},
+            }
+        },
+    )
+    positions = [
+        _position(
+            entry_price=100.0,
+            current_price=100.8,
+            created_at=datetime.now(UTC) - timedelta(minutes=4, seconds=30),
+        )
+    ]
+
+    reason = await _policy(positions).guard_reason("ensemble_trader", decision)
+
+    assert reason is not None
+    exit_quality = decision.raw_response["exit_quality"]
+    assert exit_quality["strategy_exit_policy"]["policy"] == "shared_strategy_exit_runtime_projection"
+    assert exit_quality["dynamic_min_hold_minutes"] > 4.0
+    assert exit_quality["winner_run_drawdown_limit"] < 0.38

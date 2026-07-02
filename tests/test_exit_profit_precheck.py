@@ -142,7 +142,6 @@ async def test_exit_profit_precheck_uses_strategy_profit_lock_multiplier() -> No
     assert reason is not None
     guard = decision.raw_response["execution_profit_protection_guard"]
     assert guard["min_required_profit"] == 1.2
-    assert guard["strategy_profit_lock_policy"] == {
-        "winner_hold_extension": "high",
-        "profit_lock_min_usdt_multiplier": 1.6,
-    }
+    assert guard["strategy_profit_lock_policy"]["winner_hold_extension"] == "high"
+    assert guard["strategy_profit_lock_policy"]["profit_lock_min_usdt_multiplier"] == 1.6
+    assert guard["strategy_profit_lock_policy"]["policy"] == "shared_strategy_exit_runtime_projection"

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from services.exit_strategy_policy import exit_strategy_policy_from_context
 from services.exit_fast_risk import FAST_RISK_NEAR_STOP_PROGRESS
 from services.exit_predictive_reversal import (
     PREDICTIVE_REVERSAL_EXIT_SCORE,
@@ -104,41 +105,27 @@ class PositionReviewPriorityPolicy:
             return 0.0, reasons
 
         strategy_context = strategy_context or {}
-        learning = (
-            strategy_context.get("strategy_learning")
-            if isinstance(strategy_context.get("strategy_learning"), dict)
-            else {}
+        exit_policy = exit_strategy_policy_from_context(strategy_context)
+        winner_hold_extension = str(exit_policy.get("winner_hold_extension") or "normal")
+        profit_lock_multiplier = _safe_float(
+            exit_policy.get("profit_lock_min_usdt_multiplier"),
+            1.0,
         )
-        strategy_runtime = _safe_dict(learning.get("runtime"))
-        winner_hold_extension = str(
-            strategy_context.get("winner_hold_extension")
-            or learning.get("winner_hold_extension")
-            or strategy_runtime.get("winner_hold_extension")
-            or "normal"
-        )
-        profit_lock_multiplier = min(
-            max(
-                _safe_float(
-                    strategy_context.get("profit_lock_min_usdt_multiplier")
-                    or learning.get("profit_lock_min_usdt_multiplier")
-                    or strategy_runtime.get("profit_lock_min_usdt_multiplier"),
-                    1.0,
-                ),
-                0.80,
-            ),
-            1.80,
-        )
-        pullback_lock_enabled = bool(
-            strategy_context.get("pullback_lock_enabled")
-            or learning.get("pullback_lock_enabled")
-            or strategy_runtime.get("pullback_lock_enabled")
-        )
+        pullback_lock_enabled = bool(exit_policy.get("pullback_lock_enabled"))
+        winner_hold_strength = _safe_float(exit_policy.get("winner_hold_strength"), 0.0)
+        loser_exit_strength = _safe_float(exit_policy.get("loser_exit_strength"), 0.0)
 
         side = str(pos.get("side") or "").lower()
         notional = max(entry * qty, 1e-9)
         pnl_ratio = unrealized / notional
         estimated_round_trip_fee = max(notional * ESTIMATED_TAKER_FEE_PCT * 2.0, 1e-9)
         fee_multiple = unrealized / estimated_round_trip_fee
+        funding_rate = 0.0
+        if feature_vector is not None:
+            try:
+                funding_rate = float(getattr(feature_vector, "funding_rate", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                funding_rate = 0.0
         age_minutes = 9999.0
         opened_at = pos.get("created_at")
         if opened_at:
@@ -214,15 +201,30 @@ class PositionReviewPriorityPolicy:
             notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
             estimated_round_trip_fee * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
             SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
+        ) * profit_lock_multiplier
+        small_position_min_hold_minutes = SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES * min(
+            max(
+                1.0
+                + winner_hold_strength * 0.38
+                - max(1.0 - profit_lock_multiplier, 0.0) * 0.40,
+                0.72,
+            ),
+            1.70,
         )
-        if winner_hold_extension == "high":
-            small_position_min_profit *= profit_lock_multiplier
+        adverse_funding = bool(
+            (side == "long" and funding_rate > 0.0) or (side == "short" and funding_rate < 0.0)
+        )
+        carry_pressure = (
+            min(abs(funding_rate) * max(age_minutes / 60.0, 0.0) * 12.0, 0.35)
+            if adverse_funding
+            else 0.0
+        )
         small_lock_candidate = (
             0 < notional <= SMALL_POSITION_PROFIT_LOCK_MAX_NOTIONAL_USDT
             and pnl_ratio >= SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO
             and unrealized >= small_position_min_profit
             and fee_multiple >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
-            and age_minutes >= SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES
+            and age_minutes >= small_position_min_hold_minutes
         )
         if small_lock_candidate:
             score = max(score, 74.0)
@@ -236,8 +238,10 @@ class PositionReviewPriorityPolicy:
             score = min(score, 63.0)
             reasons.append("strategy_winner_hold_delay_profit_lock")
         retrace_trigger = 0.72
-        if winner_hold_extension == "high" and pullback_lock_enabled:
-            retrace_trigger = retrace_trigger / profit_lock_multiplier
+        if pullback_lock_enabled:
+            retrace_trigger = retrace_trigger / max(profit_lock_multiplier, 1e-9)
+            retrace_trigger *= min(max(1.0 - winner_hold_strength * 0.20, 0.65), 1.08)
+            retrace_trigger = min(max(retrace_trigger, 0.40), 0.85)
         if (
             peak_pnl >= 0.8
             and unrealized > 0
@@ -246,6 +250,11 @@ class PositionReviewPriorityPolicy:
             score = max(score, 80.0)
             retrace_ratio = (peak_pnl - unrealized) / max(peak_pnl, 1e-9)
             reasons.append(f"profit_retrace:{peak_pnl:.2f}->{unrealized:.2f}U/{retrace_ratio:.0%}")
+        if unrealized < 0 and carry_pressure > 0:
+            loss_carry_score = 70.0 + min(max(loser_exit_strength, 0.0), 0.8) * 16.0
+            if carry_pressure >= 0.10 or age_minutes >= small_position_min_hold_minutes:
+                score = max(score, loss_carry_score)
+                reasons.append("adverse_funding_carry")
 
         if feature_vector is not None:
             self._apply_feature_exit_score(feature_vector, side, reasons, score_ref := [score])

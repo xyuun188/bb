@@ -35,6 +35,7 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
+from services.exit_strategy_policy import exit_strategy_policy_from_context
 from services.model_dynamic_routing import plan_dynamic_model_route
 from services.runtime_entry_filters import entry_filters_from_context
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -5253,6 +5254,27 @@ class EnsembleCoordinator:
         portfolio_current_group = self._safe_dict(portfolio_profit.get("current_group"))
         portfolio_profit_share = self._safe_float(portfolio_current_group.get("profit_share"), 0.0)
         portfolio_threshold_usdt = self._safe_float(portfolio_profit.get("threshold_usdt"), 0.0)
+        strategy_exit_policy = exit_strategy_policy_from_context(
+            context if isinstance(context, dict) else {}
+        )
+        profit_lock_multiplier = min(
+            max(
+                self._safe_float(
+                    strategy_exit_policy.get("profit_lock_min_usdt_multiplier"),
+                    1.0,
+                ),
+                0.80,
+            ),
+            1.80,
+        )
+        winner_hold_strength = min(
+            max(self._safe_float(strategy_exit_policy.get("winner_hold_strength"), 0.0), 0.0),
+            1.0,
+        )
+        loser_exit_strength = min(
+            max(self._safe_float(strategy_exit_policy.get("loser_exit_strength"), 0.0), -0.35),
+            0.95,
+        )
         estimated_fee_usdt = max(position_notional * 0.001, 0.0)
         dynamic_profit_lock_line = min(
             max(
@@ -5261,8 +5283,9 @@ class EnsembleCoordinator:
                 planned_risk_usdt * PROFIT_LOCK_RISK_RATIO,
                 PROFIT_LOCK_MIN_FLOOR_USDT,
                 PROFIT_PROTECT_MIN_LOCK_USDT,
-            ),
-            PROFIT_LOCK_MAX_FLOOR_USDT,
+            )
+            * profit_lock_multiplier,
+            PROFIT_LOCK_MAX_FLOOR_USDT * max(1.0, min(profit_lock_multiplier, 1.35)),
         )
         meaningful_reduce_lock_line = min(
             max(
@@ -5271,7 +5294,17 @@ class EnsembleCoordinator:
                 planned_risk_usdt * PROFIT_LOCK_REDUCE_RISK_RATIO,
                 PROFIT_LOCK_MEANINGFUL_REDUCE_USDT,
             ),
-            PROFIT_LOCK_MAX_FLOOR_USDT,
+            PROFIT_LOCK_MAX_FLOOR_USDT
+            * max(1.0, min(0.95 + winner_hold_strength * 0.18, 1.20)),
+        )
+        meaningful_reduce_lock_line *= min(
+            max(
+                0.90
+                + (profit_lock_multiplier - 1.0) * 0.80
+                + winner_hold_strength * 0.18,
+                0.78,
+            ),
+            1.45,
         )
         expected_reduce_lock_net = max(
             position_unrealized_pnl * PROFIT_PROTECT_REDUCE_SIZE
@@ -5279,8 +5312,10 @@ class EnsembleCoordinator:
             0.0,
         )
         analysis_profit_exit_floor = max(
-            PROFIT_EXIT_ANALYSIS_MIN_FLOOR_USDT,
-            estimated_fee_usdt * PROFIT_LOCK_FEE_MULTIPLE,
+            PROFIT_EXIT_ANALYSIS_MIN_FLOOR_USDT * min(max(profit_lock_multiplier, 0.80), 1.35),
+            estimated_fee_usdt
+            * PROFIT_LOCK_FEE_MULTIPLE
+            * min(max(0.90 + (profit_lock_multiplier - 1.0) * 0.55, 0.80), 1.35),
         )
         profit_floor_ready = position_unrealized_pnl >= analysis_profit_exit_floor
         meaningful_reduce_lock = expected_reduce_lock_net >= meaningful_reduce_lock_line
@@ -5343,6 +5378,16 @@ class EnsembleCoordinator:
         )
         bb_pct = self._safe_float(getattr(features, "bb_pct", 0.5), 0.5) if features else 0.5
         rsi_14 = self._safe_float(getattr(features, "rsi_14", 50.0), 50.0) if features else 50.0
+        funding_rate = self._safe_float(getattr(features, "funding_rate", 0.0), 0.0) if features else 0.0
+        adverse_funding = bool(
+            (current_side == "long" and funding_rate > 0.0)
+            or (current_side == "short" and funding_rate < 0.0)
+        )
+        carry_pressure = (
+            min(abs(funding_rate) * max(age_minutes / 60.0, 0.0) * 12.0, 0.35)
+            if adverse_funding
+            else 0.0
+        )
         low_participation = volume_ratio < 0.55
         if current_side == "long":
             momentum_waning = (
@@ -5392,8 +5437,11 @@ class EnsembleCoordinator:
         dynamic_retrace_reduce_ratio = PROFIT_RETRACE_BASE_REDUCE_RATIO
         dynamic_retrace_reduce_ratio += min(max(volatility_20, 0.0), 0.08) * 1.25
         dynamic_retrace_reduce_ratio += max(continuation_score, 0.0) * 0.10
+        dynamic_retrace_reduce_ratio += winner_hold_strength * 0.10
         if momentum_waning or weak_continuation or moderate_opposite_pressure:
             dynamic_retrace_reduce_ratio -= 0.08
+        if adverse_funding and carry_pressure > 0:
+            dynamic_retrace_reduce_ratio -= min(carry_pressure, 0.10)
         dynamic_retrace_reduce_ratio = min(
             max(dynamic_retrace_reduce_ratio, PROFIT_RETRACE_MIN_REDUCE_RATIO),
             PROFIT_RETRACE_MAX_REDUCE_RATIO,
@@ -5423,7 +5471,7 @@ class EnsembleCoordinator:
             SMALL_POSITION_PROFIT_LOCK_MIN_NET_USDT,
             estimated_fee_usdt * SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE,
             position_notional * SMALL_POSITION_PROFIT_LOCK_MIN_PNL_RATIO,
-        )
+        ) * profit_lock_multiplier
         small_position_profit_lock_size = min(
             max(
                 PROFIT_PROTECT_REDUCE_SIZE,
@@ -5438,12 +5486,14 @@ class EnsembleCoordinator:
             0.0,
         )
         small_position_planned_lock_line = max(
-            SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT,
+            SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT * profit_lock_multiplier,
             estimated_fee_usdt
             * SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE
+            * profit_lock_multiplier
             * small_position_profit_lock_size,
             position_notional
             * SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO
+            * profit_lock_multiplier
             * small_position_profit_lock_size,
         )
         small_position_fee_multiple = position_unrealized_pnl / max(estimated_fee_usdt, 1e-9)
@@ -5453,6 +5503,16 @@ class EnsembleCoordinator:
             or low_participation
             or support
             or moderate_opposite_pressure
+            or (adverse_funding and carry_pressure >= 0.08)
+        )
+        small_position_min_hold_minutes = SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES * min(
+            max(
+                1.0
+                + winner_hold_strength * 0.32
+                - max(1.0 - profit_lock_multiplier, 0.0) * 0.36,
+                0.72,
+            ),
+            1.65,
         )
         small_position_profit_lock = (
             position_profit
@@ -5461,8 +5521,12 @@ class EnsembleCoordinator:
             and position_unrealized_pnl >= small_position_profit_lock_line
             and small_position_fee_multiple >= SMALL_POSITION_PROFIT_LOCK_MIN_FEE_MULTIPLE
             and small_position_planned_lock_net >= small_position_planned_lock_line
-            and age_minutes >= SMALL_POSITION_PROFIT_LOCK_MIN_HOLD_MINUTES
-            and continuation_score <= SMALL_POSITION_PROFIT_LOCK_MAX_CONTINUATION_SCORE
+            and age_minutes >= small_position_min_hold_minutes
+            and continuation_score
+            <= (
+                SMALL_POSITION_PROFIT_LOCK_MAX_CONTINUATION_SCORE
+                * min(max(1.0 - winner_hold_strength * 0.30, 0.55), 1.10)
+            )
             and small_position_quality_weakened
         )
         profit_lock_ready_for_exit = bool(
@@ -5528,6 +5592,17 @@ class EnsembleCoordinator:
             position_notional * LOSS_COMPRESS_FULL_RATIO,
             planned_risk_usdt * LOSS_COMPRESS_FULL_RISK_RATIO,
         )
+        loss_threshold_scale = min(
+            max(
+                1.0
+                - max(loser_exit_strength, 0.0) * 0.18
+                - min(carry_pressure, 0.20) * 0.12,
+                0.70,
+            ),
+            1.12,
+        )
+        dynamic_loss_reduce_usdt *= loss_threshold_scale
+        dynamic_loss_full_usdt *= loss_threshold_scale
         loss_abs = abs(min(position_unrealized_pnl, 0.0))
         loss_repair = self._loss_repair_evidence(
             current_side=current_side,
@@ -5736,7 +5811,8 @@ class EnsembleCoordinator:
         elif (
             position_profit
             and position_profit_pct >= WINNER_RUN_MIN_PROFIT_RATIO
-            and continuation_score >= 0.24
+            and continuation_score
+            >= (0.24 + winner_hold_strength * 0.08 - max(1.0 - profit_lock_multiplier, 0.0) * 0.10)
             and not strong_opposite_pressure
             and len(strong_support) < 2
             and not momentum_waning
@@ -5899,9 +5975,16 @@ class EnsembleCoordinator:
             "portfolio_focus_reduce_size": PORTFOLIO_FOCUS_LOCK_REDUCE_SIZE,
             "position_unrealized_pnl": round(position_unrealized_pnl, 6),
             "age_minutes": round(age_minutes, 3),
+            "strategy_exit_policy": strategy_exit_policy,
+            "strategy_profit_lock_multiplier": round(profit_lock_multiplier, 6),
+            "winner_hold_strength": round(winner_hold_strength, 6),
+            "loser_exit_strength": round(loser_exit_strength, 6),
             "continuation_score": round(continuation_score, 4),
             "weak_continuation": bool(weak_continuation),
             "momentum_waning": bool(momentum_waning),
+            "funding_rate": round(funding_rate, 8),
+            "adverse_funding": bool(adverse_funding),
+            "carry_pressure": round(carry_pressure, 6),
             "predictive_reversal": predictive_reversal,
             "predictive_reversal_score": round(predictive_reversal_score, 4),
             "predictive_exit": bool(predictive_exit),
@@ -5929,6 +6012,7 @@ class EnsembleCoordinator:
             "small_position_planned_lock_line_usdt": round(
                 small_position_planned_lock_line, 6
             ),
+            "small_position_min_hold_minutes": round(small_position_min_hold_minutes, 6),
             "small_position_quality_weakened": bool(small_position_quality_weakened),
             "profit_retrace_protection": bool(profit_retrace_protection),
             "dynamic_profit_lock_line_usdt": round(dynamic_profit_lock_line, 6),
@@ -5950,7 +6034,12 @@ class EnsembleCoordinator:
             "winner_run_protected": bool(
                 position_profit
                 and position_profit_pct >= WINNER_RUN_MIN_PROFIT_RATIO
-                and continuation_score >= 0.24
+                and continuation_score
+                >= (
+                    0.24
+                    + winner_hold_strength * 0.08
+                    - max(1.0 - profit_lock_multiplier, 0.0) * 0.10
+                )
                 and not strong_opposite_pressure
                 and len(strong_support) < 2
                 and not momentum_waning

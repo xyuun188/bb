@@ -13,6 +13,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.safe_output import safe_error_text
 from db.repositories.trade_repo import TradeRepository
+from services.exit_strategy_policy import exit_strategy_policy_from_context
 from services.exit_intent import (
     PROFIT_EXIT_INTENTS,
     PROTECTIVE_DOWNSIDE_INTENTS,
@@ -97,6 +98,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(float(value), low), high)
 
 
 def _protective_downside_exit_intent(
@@ -438,6 +443,39 @@ class ExitFeeChurnGuardPolicy:
                     drawdown_from_peak / max(abs(peak_net), 1e-9) if peak_net > 0 else 0.0
                 )
                 raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                strategy_exit_policy = exit_strategy_policy_from_context(raw)
+                profit_lock_multiplier = _safe_float(
+                    strategy_exit_policy.get("profit_lock_min_usdt_multiplier"),
+                    1.0,
+                )
+                winner_hold_strength = _safe_float(
+                    strategy_exit_policy.get("winner_hold_strength"),
+                    0.0,
+                )
+                loser_exit_strength = _safe_float(
+                    strategy_exit_policy.get("loser_exit_strength"),
+                    0.0,
+                )
+                dynamic_min_hold_minutes = MIN_DISCRETIONARY_HOLD_MINUTES * _clamp(
+                    1.0
+                    + winner_hold_strength * 0.35
+                    - max(loser_exit_strength, 0.0) * 0.22
+                    - max(1.0 - profit_lock_multiplier, 0.0) * 0.30,
+                    0.70,
+                    1.65,
+                )
+                dynamic_exit_confidence_floor = _clamp(
+                    DISCRETIONARY_CLOSE_CONFIDENCE - max(loser_exit_strength, 0.0) * 0.10,
+                    0.56,
+                    DISCRETIONARY_CLOSE_CONFIDENCE,
+                )
+                winner_run_drawdown_limit = PROFIT_DRAWDOWN_PARTIAL_RETRACE * _clamp(
+                    1.0
+                    - winner_hold_strength * 0.22
+                    + max(1.0 - profit_lock_multiplier, 0.0) * 0.35,
+                    0.65,
+                    1.15,
+                )
                 raw["exit_quality"] = {
                     "net_profit_after_fee": round(net_now, 8),
                     "fee_coverage_multiple": round(fee_coverage_multiple, 4),
@@ -448,6 +486,13 @@ class ExitFeeChurnGuardPolicy:
                     "drawdown_from_peak": round(drawdown_from_peak, 8),
                     "drawdown_from_peak_ratio": round(drawdown_ratio, 6),
                     "invalidation": invalidation,
+                    "strategy_exit_policy": strategy_exit_policy,
+                    "dynamic_min_hold_minutes": round(dynamic_min_hold_minutes, 4),
+                    "dynamic_exit_confidence_floor": round(
+                        dynamic_exit_confidence_floor,
+                        4,
+                    ),
+                    "winner_run_drawdown_limit": round(winner_run_drawdown_limit, 6),
                 }
                 decision.raw_response = raw
 
@@ -510,7 +555,7 @@ class ExitFeeChurnGuardPolicy:
                     )
 
                 if (
-                    age_minutes < MIN_DISCRETIONARY_HOLD_MINUTES
+                    age_minutes < dynamic_min_hold_minutes
                     and not invalidation_confirmed
                     and not protective_downside_exit_intent
                 ):
@@ -522,13 +567,13 @@ class ExitFeeChurnGuardPolicy:
                             abs(notional) * PROFIT_PROTECTION_STRONG_NET_PNL_RATIO,
                             fee_buffer * PROFIT_PROTECTION_STRONG_FEE_MULTIPLE,
                         )
-                        and confidence >= DISCRETIONARY_CLOSE_CONFIDENCE
+                        and confidence >= dynamic_exit_confidence_floor
                     )
                     early_deep_loss = (
                         net_now < 0
                         and abs(notional) > 0
                         and abs(net_now) >= abs(notional) * FAST_RISK_REDUCE_LOSS_PCT
-                        and confidence >= DISCRETIONARY_CLOSE_CONFIDENCE
+                        and confidence >= dynamic_exit_confidence_floor
                         and early_hard_risk_confirmed
                     )
                     if not early_strong_profit and not early_deep_loss:
@@ -544,6 +589,16 @@ class ExitFeeChurnGuardPolicy:
                     fee_buffer=fee_buffer,
                     confidence=confidence,
                     age_minutes=age_minutes,
+                    min_net_pnl_ratio=PROFIT_PROTECTION_MIN_NET_PNL_RATIO * profit_lock_multiplier,
+                    min_fee_multiple=PROFIT_PROTECTION_MIN_FEE_MULTIPLE
+                    * _clamp(0.90 + (profit_lock_multiplier - 1.0) * 0.65, 0.75, 1.35),
+                    min_net_usdt=PROFIT_PROTECTION_MIN_NET_USDT * profit_lock_multiplier,
+                    strong_net_pnl_ratio=PROFIT_PROTECTION_STRONG_NET_PNL_RATIO
+                    * _clamp(0.95 + (profit_lock_multiplier - 1.0) * 0.55, 0.80, 1.35),
+                    strong_fee_multiple=PROFIT_PROTECTION_STRONG_FEE_MULTIPLE
+                    * _clamp(0.95 + (profit_lock_multiplier - 1.0) * 0.55, 0.80, 1.35),
+                    discretionary_confidence=dynamic_exit_confidence_floor,
+                    min_hold_minutes=dynamic_min_hold_minutes,
                 )
                 if profit_protection["allow"]:
                     close_pct = min(max(float(decision.position_size_pct or 1.0), 0.0), 1.0)
@@ -557,7 +612,7 @@ class ExitFeeChurnGuardPolicy:
                         close_pct >= 0.999
                         and ordinary_profit_intent
                         and continuation_valid
-                        and drawdown_ratio < PROFIT_DRAWDOWN_PARTIAL_RETRACE
+                        and drawdown_ratio < winner_run_drawdown_limit
                         and not profit_protection.get("strong_lock")
                         and not protective_downside_exit_intent
                     ):
@@ -586,21 +641,29 @@ class ExitFeeChurnGuardPolicy:
                             "硬风险或交易所止盈止损触发，再允许平仓。"
                         )
                     standard_meaningful_partial_lock = max(
-                        PROFIT_PROTECTION_MIN_NET_USDT,
-                        fee_buffer * max(PROFIT_PROTECTION_MIN_FEE_MULTIPLE, 6.0),
-                        abs(notional) * max(PROFIT_PROTECTION_MIN_NET_PNL_RATIO, 0.008),
+                        PROFIT_PROTECTION_MIN_NET_USDT * profit_lock_multiplier,
+                        fee_buffer
+                        * max(
+                            PROFIT_PROTECTION_MIN_FEE_MULTIPLE
+                            * _clamp(0.95 + (profit_lock_multiplier - 1.0) * 0.55, 0.85, 1.35),
+                            6.0,
+                        ),
+                        abs(notional)
+                        * max(PROFIT_PROTECTION_MIN_NET_PNL_RATIO * profit_lock_multiplier, 0.008),
                     )
                     small_position_partial_lock = bool(
                         close_evidence.get("small_position_profit_lock")
                         or profit_protection.get("small_position_lock")
                     )
                     small_position_meaningful_partial_lock = max(
-                        SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT,
+                        SMALL_POSITION_PROFIT_LOCK_MIN_PLANNED_NET_USDT * profit_lock_multiplier,
                         fee_buffer
                         * SMALL_POSITION_PROFIT_LOCK_PARTIAL_FEE_MULTIPLE
+                        * profit_lock_multiplier
                         * close_pct,
                         abs(notional)
                         * SMALL_POSITION_PROFIT_LOCK_PARTIAL_NOTIONAL_RATIO
+                        * profit_lock_multiplier
                         * close_pct,
                     )
                     meaningful_partial_lock = (
@@ -644,7 +707,7 @@ class ExitFeeChurnGuardPolicy:
                     decision.raw_response = raw
                     return None
 
-                if protected_by_okx and confidence < DISCRETIONARY_CLOSE_CONFIDENCE:
+                if protected_by_okx and confidence < dynamic_exit_confidence_floor:
                     if net_now > 0:
                         return (
                             "平仓保护：该仓位已有 OKX 止盈/止损托底，当前扣费后仍盈利，"
@@ -657,7 +720,7 @@ class ExitFeeChurnGuardPolicy:
                         "为避免和交易所止盈止损互相打架，本轮继续持有。"
                     )
 
-                if net_now < 0 and confidence < DISCRETIONARY_CLOSE_CONFIDENCE:
+                if net_now < 0 and confidence < dynamic_exit_confidence_floor:
                     invalidation_pressure = self.invalidation_snapshot_provider(
                         decision,
                         target_side,
@@ -688,7 +751,7 @@ class ExitFeeChurnGuardPolicy:
                 if (
                     net_now > 0
                     and continuation_valid
-                    and drawdown_ratio < PROFIT_DRAWDOWN_PARTIAL_RETRACE
+                    and drawdown_ratio < winner_run_drawdown_limit
                     and confidence < 0.82
                 ):
                     return (

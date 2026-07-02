@@ -175,6 +175,62 @@ def test_strategy_pullback_lock_still_prioritizes_real_profit_retrace() -> None:
     assert any(reason.startswith("profit_retrace:") for reason in reasons)
 
 
+def test_strategy_exit_policy_delays_small_profit_lock_with_dynamic_hold_strength() -> None:
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "MET/USDT",
+        "side": "short",
+        "entry_price": 0.1713667,
+        "current_price": 0.1599,
+        "quantity": 150.0,
+        "unrealized_pnl": 1.72,
+        "created_at": (datetime.now(UTC) - timedelta(hours=12)).isoformat(),
+    }
+
+    relaxed_score, relaxed_reasons = _policy().fast_position_exit_score(
+        position,
+        SimpleNamespace(funding_rate=0.0),
+        {
+            "strategy_learning": {
+                "winner_hold_extension": "high",
+                "profit_lock_min_usdt_multiplier": 1.4,
+                "pullback_lock_enabled": True,
+                "payoff_repair_intensity": 0.7,
+                "winner_hold_dynamic": {"training": {"triggered": True, "imbalance_score": 0.7}},
+                "exit_preference": {"winner_mode": "let_run", "profit_lock_bias": 1.2},
+            }
+        },
+    )
+
+    assert relaxed_score < 74.0
+    assert "strategy_winner_hold_delay_profit_lock" in relaxed_reasons
+
+
+def test_position_review_priority_flags_adverse_funding_carry_on_loser() -> None:
+    score, reasons = _policy().fast_position_exit_score(
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price": 100.0,
+            "current_price": 98.6,
+            "quantity": 1.0,
+            "unrealized_pnl": -1.4,
+            "created_at": (datetime.now(UTC) - timedelta(hours=10)).isoformat(),
+        },
+        SimpleNamespace(funding_rate=0.0012),
+        {
+            "strategy_learning": {
+                "loss_exit_aggressiveness": "high",
+                "exit_preference": {"loser_mode": "cut_faster", "loss_exit_bias": 1.25},
+            }
+        },
+    )
+
+    assert score >= 70.0
+    assert "adverse_funding_carry" in reasons
+
+
 def test_fast_position_add_score_detects_winner_add_candidate() -> None:
     score, reason = _policy().fast_position_add_score(
         [
