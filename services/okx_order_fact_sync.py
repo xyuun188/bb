@@ -8,6 +8,7 @@ local rows from OKX native fills (`instId`, `ordId`, `tradeId`, `fillSz`,
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -253,12 +254,16 @@ class OkxOrderFactSyncService:
         account_bills: list[OkxNativeAccountBill] = []
         account_bill_error: str | None = None
         try:
-            await _bounded(executor.initialize(), self.timeout_seconds)
+            pull_deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+            await _bounded(
+                executor.initialize(),
+                _remaining_stage_timeout(pull_deadline, min(self.timeout_seconds, 2.0)),
+            )
             native_facts = OkxNativeFactsClient(executor)
             try:
                 # Funding fees are balance-ledger events, not order/fill facts.
-                # Pull them account-wide before the slower position/order sync so
-                # a timeout in those later calls does not starve historical PnL.
+                # Keep this optional stage on a short budget so it cannot starve
+                # the core position/fill/order facts needed for execution truth.
                 account_bills = await _bounded(
                     native_facts.fetch_account_bills(
                         since=since,
@@ -267,7 +272,10 @@ class OkxOrderFactSyncService:
                         funding_only=True,
                         strict=True,
                     ),
-                    self.timeout_seconds,
+                    _remaining_stage_timeout(
+                        pull_deadline,
+                        max(0.25, min(self.timeout_seconds * 0.25, 1.5)),
+                    ),
                 )
             except Exception as exc:
                 account_bill_error = safe_error_text(exc, limit=180)
@@ -278,7 +286,7 @@ class OkxOrderFactSyncService:
                 )
             exchange_positions = await _bounded(
                 native_facts.fetch_positions(),
-                self.timeout_seconds,
+                _remaining_stage_timeout(pull_deadline, min(self.timeout_seconds, 2.0)),
             )
             current_position_target_inst_ids = _current_position_inst_ids(exchange_positions)
             fact_target_inst_ids = (
@@ -296,7 +304,7 @@ class OkxOrderFactSyncService:
                     account_wide_only=not bool(fact_target_inst_ids),
                     strict=True,
                 ),
-                self.timeout_seconds,
+                _remaining_stage_timeout(pull_deadline, self.timeout_seconds),
             )
             account_order_rows = await _bounded(
                 native_facts.fetch_order_history_rows(
@@ -306,7 +314,7 @@ class OkxOrderFactSyncService:
                     max_pages=1 if fact_target_inst_ids else max(3, min(10, (self.limit // 100) + 2)),
                     strict=True,
                 ),
-                self.timeout_seconds,
+                _remaining_stage_timeout(pull_deadline, self.timeout_seconds),
             )
             if fact_target_inst_ids:
                 account_order_rows = _dedupe_order_rows(
@@ -319,7 +327,7 @@ class OkxOrderFactSyncService:
                                 max_pages=1,
                                 strict=True,
                             ),
-                            self.timeout_seconds,
+                            _remaining_stage_timeout(pull_deadline, min(self.timeout_seconds, 2.0)),
                         ),
                     ]
                 )
@@ -337,7 +345,7 @@ class OkxOrderFactSyncService:
                     max_pages=1,
                     strict=True,
                 ),
-                self.timeout_seconds,
+                _remaining_stage_timeout(pull_deadline, min(self.timeout_seconds, 2.0)),
             ) if missing_order_ids else []
             order_rows = _dedupe_order_rows([*account_order_rows, *target_order_rows])
             contract_sizes = await _bounded(
@@ -350,7 +358,7 @@ class OkxOrderFactSyncService:
                         | position_target_inst_ids
                     ),
                 ),
-                self.timeout_seconds,
+                _remaining_stage_timeout(pull_deadline, min(self.timeout_seconds, 2.0)),
             )
             if target_pos_ids or position_target_inst_ids or fact_target_inst_ids or not local_positions:
                 try:
@@ -363,7 +371,10 @@ class OkxOrderFactSyncService:
                             max_pages=2,
                             strict=True,
                         ),
-                        self.timeout_seconds,
+                        _remaining_stage_timeout(
+                            pull_deadline,
+                            max(0.25, min(self.timeout_seconds * 0.25, 1.5)),
+                        ),
                     )
                 except Exception as exc:
                     position_history_error = safe_error_text(exc, limit=180)
@@ -390,9 +401,18 @@ class OkxOrderFactSyncService:
         order_rows_by_id = _order_rows_by_id(order_rows)
         async with get_session_ctx() as session:
             writable_orders = await self._load_writable_refresh_orders(session, since_naive)
+            stored_repair_orders = (
+                writable_orders
+                if okx_pull_available
+                else [
+                    order
+                    for order in writable_orders
+                    if _order_needs_local_stored_fact_recovery(order)
+                ]
+            )
             decision_ids = {
                 int(decision_id)
-                for order in writable_orders
+                for order in (writable_orders if okx_pull_available else stored_repair_orders)
                 if (decision_id := getattr(order, "decision_id", None))
             }
             decisions_by_id: dict[int, AIDecision] = {}
@@ -469,7 +489,7 @@ class OkxOrderFactSyncService:
                 )
             else:
                 confirmed_count = self._recover_local_stored_order_facts(
-                    writable_orders,
+                    stored_repair_orders,
                     decisions_by_id=decisions_by_id,
                     now=datetime.now(UTC),
                     samples=samples,
@@ -516,7 +536,7 @@ class OkxOrderFactSyncService:
             phase3_order_sync_start=since,
             checked_at=datetime.now(UTC),
             okx_pull_available=okx_pull_available,
-            local_checked=len(writable_orders) if okx_pull_available else len(local_orders),
+            local_checked=len(writable_orders) if okx_pull_available else len(stored_repair_orders),
             confirmed_count=confirmed_count,
             position_confirmed_count=position_confirmed_count,
             unverified_count=unverified_count,
@@ -1893,6 +1913,22 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
         "cancelled",
         "canceled",
     }
+
+
+def _order_needs_local_stored_fact_recovery(order: Order) -> bool:
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
+    if sync_status in {OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY} and _order_has_confirmed_okx_fill_fact(order):
+        return False
+    if sync_status == OKX_SYNC_EXECUTION_RESULT_CONFIRMED and _order_has_okx_execution_result_fact(order):
+        return False
+    if sync_status == OKX_SYNC_POSITION_CONFIRMED:
+        raw = getattr(order, "okx_raw_fills", None)
+        raw = raw if isinstance(raw, dict) else {}
+        if raw.get("source") == "current_position_entry_confirmation":
+            return False
+    if sync_status == OKX_SYNC_NO_FILL_REJECTED and _order_is_rejected_without_exchange_fill(order):
+        return False
+    return _order_needs_okx_fact_refresh(order)
 
 
 def _order_needs_okx_pull(order: Order) -> bool:
@@ -3416,6 +3452,11 @@ def _datetime_from_ms(value: Any) -> datetime | None:
 
 
 async def _bounded(awaitable: Any, timeout_seconds: float) -> Any:
-    import asyncio
+    return await asyncio.wait_for(awaitable, timeout=max(float(timeout_seconds), 0.05))
 
-    return await asyncio.wait_for(awaitable, timeout=max(float(timeout_seconds), 0.5))
+
+def _remaining_stage_timeout(deadline: float, cap_seconds: float) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError("OKX order fact sync pull budget exhausted")
+    return min(max(float(cap_seconds), 0.05), max(remaining, 0.05))

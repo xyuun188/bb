@@ -416,6 +416,26 @@ async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
 
 
 @pytest.mark.asyncio
+async def test_okx_order_fact_sync_background_backs_off_after_degraded_result() -> None:
+    service = TradingService.__new__(TradingService)
+    service.okx_order_fact_sync_factory = object()
+    service._okx_order_fact_sync_task = None
+    service._okx_order_fact_sync_last_finished_at = datetime.now(UTC) - timedelta(seconds=30)
+    service._okx_order_fact_sync_last_row = {
+        "kind": "order_fact_sync",
+        "status": "warning",
+        "okx_pull_available": False,
+        "degraded": True,
+    }
+    service.okx_order_fact_sync_interval_seconds = lambda: 90.0  # type: ignore[method-assign]
+    service.okx_order_fact_sync_degraded_interval_seconds = lambda: 240.0  # type: ignore[method-assign]
+
+    service._start_okx_order_fact_sync_background()
+
+    assert service._okx_order_fact_sync_task is None
+
+
+@pytest.mark.asyncio
 async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gate() -> None:
     service = TradingService.__new__(TradingService)
     service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]

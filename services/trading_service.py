@@ -1112,6 +1112,16 @@ class TradingService:
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(20.0, min(60.0, interval * 0.5))
 
+    def okx_order_fact_sync_interval_seconds(self) -> float:
+        """Return the normal cadence for optional OKX order-fact repair."""
+
+        return max(90.0, self.okx_authoritative_sync_interval_seconds() * 4.0)
+
+    def okx_order_fact_sync_degraded_interval_seconds(self) -> float:
+        """Back off optional order-fact repair after OKX native fact timeouts."""
+
+        return max(240.0, self.okx_authoritative_sync_interval_seconds() * 8.0)
+
     def _okx_authoritative_sync_status_payload(
         self,
         now: datetime | None = None,
@@ -1242,6 +1252,11 @@ class TradingService:
             "last_error": getattr(self, "_okx_order_fact_sync_last_error", None),
             "success_count": int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_order_fact_sync_failure_count", 0) or 0),
+            "normal_interval_seconds": round(self.okx_order_fact_sync_interval_seconds(), 3),
+            "degraded_interval_seconds": round(
+                self.okx_order_fact_sync_degraded_interval_seconds(),
+                3,
+            ),
         }
 
     def _okx_authoritative_sync_entry_block_reason(
@@ -1368,7 +1383,7 @@ class TradingService:
         report = await factory(
             mode=mode,
             lookback_hours=24,
-            timeout_seconds=max(4.0, self.round_start_reconcile_timeout_seconds() * 0.75),
+            timeout_seconds=max(3.0, min(6.0, self.round_start_reconcile_timeout_seconds() * 0.45)),
         ).sync()
         status = str(report.get("status") or "unknown").lower()
         unverified_count = int(report.get("unverified_count") or 0)
@@ -1432,7 +1447,26 @@ class TradingService:
         task = getattr(self, "_okx_order_fact_sync_task", None)
         if task is not None and not task.done():
             return
-        self._okx_order_fact_sync_last_started_at = datetime.now(UTC)
+        now = datetime.now(UTC)
+        last_finished_at = getattr(self, "_okx_order_fact_sync_last_finished_at", None)
+        if isinstance(last_finished_at, datetime):
+            last_row = getattr(self, "_okx_order_fact_sync_last_row", None)
+            degraded = bool(
+                isinstance(last_row, dict)
+                and (
+                    last_row.get("degraded") is True
+                    or last_row.get("okx_pull_available") is False
+                    or str(last_row.get("status") or "").lower() in {"warning", "error", "critical"}
+                )
+            )
+            min_interval = (
+                self.okx_order_fact_sync_degraded_interval_seconds()
+                if degraded
+                else self.okx_order_fact_sync_interval_seconds()
+            )
+            if (now - last_finished_at).total_seconds() < min_interval:
+                return
+        self._okx_order_fact_sync_last_started_at = now
         task = asyncio.create_task(self._sync_okx_order_facts_for_loop())
         self._okx_order_fact_sync_task = task
         task.add_done_callback(self._consume_okx_order_fact_sync_result)
