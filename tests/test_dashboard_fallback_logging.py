@@ -533,6 +533,46 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
     assert [event["source"] for event in dashboard_fallback_events] == ["isolated_executor"]
 
 
+async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refresh_calls: list[str] = []
+    stale_at = datetime.now(UTC) - timedelta(seconds=90)
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_balance_cache",
+        {
+            "paper": (
+                stale_at,
+                {
+                    "free": 5.0,
+                    "used": 1.0,
+                    "total": 6.0,
+                    "cash": 6.0,
+                    "equity": 7.0,
+                    "allocatable": 7.0,
+                },
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_locks", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_okx_balance_refresh",
+        lambda mode: refresh_calls.append(mode),
+    )
+
+    result = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert result["equity"] == 7.0
+    assert result["stale"] is True
+    assert result["refresh_in_progress"] is True
+    assert refresh_calls == ["paper"]
+
+
 async def test_dashboard_okx_position_cache_is_bound_to_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,3 +610,40 @@ async def test_dashboard_okx_position_cache_is_bound_to_executor(
 
     assert first == {"OLD/USDT"}
     assert second == {"NEW/USDT"}
+
+
+async def test_dashboard_okx_positions_stale_cache_returns_before_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refresh_calls: list[str] = []
+    executor = object()
+
+    class StableTradingService:
+        def okx_executor_for_dashboard(self, mode: str) -> object:
+            assert mode == "paper"
+            return executor
+
+    monkeypatch.setattr(dashboard, "_trading_service", StableTradingService())
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_cache",
+        {
+            "paper": (
+                datetime.now(UTC) - timedelta(seconds=20),
+                [{"symbol": "OLD/USDT:USDT", "side": "long", "contracts": 1}],
+                executor,
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_locks", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_okx_position_refresh",
+        lambda mode: refresh_calls.append(mode),
+    )
+
+    result = await dashboard._fetch_dashboard_okx_positions("paper")
+
+    assert result == [{"symbol": "OLD/USDT:USDT", "side": "long", "contracts": 1}]
+    assert refresh_calls == ["paper"]
