@@ -3941,6 +3941,14 @@ class TradingService:
             "rank_underfilled": rank_diagnostics.get("rank_underfilled"),
             "rank_underfill_reason": rank_diagnostics.get("rank_underfill_reason"),
             "rank_filtered_out_candidates": rank_diagnostics.get("filtered_out_candidates"),
+            "rank_fallback_filtered_fill_count": rank_diagnostics.get(
+                "fallback_filtered_fill_count",
+                0,
+            ),
+            "rank_fallback_filtered_fill_policy": rank_diagnostics.get(
+                "fallback_filtered_fill_policy",
+                {},
+            ),
             "rank_filtered_out_reason_counts": rank_diagnostics.get(
                 "filtered_out_reason_counts", []
             ),

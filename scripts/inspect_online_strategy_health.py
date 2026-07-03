@@ -1161,6 +1161,7 @@ def candidate_funnel_aggregate(funnels):
         "rank_tradable_candidates",
         "rank_secondary_candidates",
         "rank_filtered_out_candidates",
+        "rank_fallback_filtered_fill_count",
         "recent_analysis_dedupe_count",
         "market_feature_after_dedupe_count",
     )
@@ -1191,7 +1192,7 @@ def candidate_funnel_aggregate(funnels):
             elif item.get("non_selected_reason") == "outside_market_symbol_budget":
                 outside_budget_symbols[symbol] += 1
         for item in safe_list(funnel.get("filtered_symbol_sample")):
-            if isinstance(item, dict):
+            if isinstance(item, dict) and not item.get("selected"):
                 filtered_symbols[str(item.get("symbol") or "unknown")] += 1
     return {
         "count": len(funnels),
@@ -1347,7 +1348,7 @@ def candidate_filter_outcome_diagnostics(funnel_decisions, market_entry_decision
                 category = "non_selected_other"
             upsert(item.get("symbol"), category, item, seen_at)
         for item in safe_list(funnel.get("filtered_symbol_sample")):
-            if isinstance(item, dict):
+            if isinstance(item, dict) and not item.get("selected"):
                 upsert(item.get("symbol"), "feature_filter_rejected", item, seen_at)
 
     if not candidate_rows:
@@ -1550,6 +1551,17 @@ def compact_candidate_funnel(funnel):
         )
         return result
 
+    def compact_fallback_policy(value):
+        return pick(
+            safe_dict(value),
+            (
+                "read_only",
+                "is_entry_gate",
+                "applied",
+                "symbols",
+            ),
+        )
+
     def compact_rank_item(item):
         item = safe_dict(item)
         metrics = safe_dict(item.get("filter_metrics"))
@@ -1613,9 +1625,13 @@ def compact_candidate_funnel(funnel):
             "rank_underfilled",
             "rank_underfill_reason",
             "rank_filtered_out_candidates",
+            "rank_fallback_filtered_fill_count",
         ),
     )
     compact["market_budget_rotation"] = safe_dict(funnel.get("market_budget_rotation"))
+    compact["rank_fallback_filtered_fill_policy"] = compact_fallback_policy(
+        funnel.get("rank_fallback_filtered_fill_policy")
+    )
     compact["rank_filtered_out_reason_counts"] = safe_list(
         funnel.get("rank_filtered_out_reason_counts")
     )[:6]
@@ -1641,6 +1657,7 @@ def compact_candidate_funnel_window(window):
         "market_symbol_budget",
         "rank_selected_count",
         "rank_filtered_out_candidates",
+        "rank_fallback_filtered_fill_count",
         "recent_analysis_dedupe_count",
     )
     return {
@@ -3205,6 +3222,18 @@ def _compact_candidate_funnel(funnel: dict) -> dict:
             ),
         )
 
+    def compact_fallback_policy(value: dict | None) -> dict:
+        value = value if isinstance(value, dict) else {}
+        return _pick(
+            value,
+            (
+                "read_only",
+                "is_entry_gate",
+                "applied",
+                "symbols",
+            ),
+        )
+
     def compact_rank_item(item: dict | None) -> dict:
         item = item if isinstance(item, dict) else {}
         metrics = item.get("filter_metrics") if isinstance(item.get("filter_metrics"), dict) else {}
@@ -3269,12 +3298,16 @@ def _compact_candidate_funnel(funnel: dict) -> dict:
             "rank_underfilled",
             "rank_underfill_reason",
             "rank_filtered_out_candidates",
+            "rank_fallback_filtered_fill_count",
         ),
     )
     rotation = funnel.get("market_budget_rotation")
     compact["market_budget_rotation"] = rotation if isinstance(rotation, dict) else {}
     compact["feature_fetch_budget"] = compact_feature_fetch_budget(
         funnel.get("feature_fetch_budget")
+    )
+    compact["rank_fallback_filtered_fill_policy"] = compact_fallback_policy(
+        funnel.get("rank_fallback_filtered_fill_policy")
     )
     reasons = funnel.get("rank_filtered_out_reason_counts")
     compact["rank_filtered_out_reason_counts"] = reasons[:6] if isinstance(reasons, list) else []
@@ -3303,6 +3336,7 @@ def _compact_candidate_funnel_window(window: dict) -> dict:
         "market_symbol_budget",
         "rank_selected_count",
         "rank_filtered_out_candidates",
+        "rank_fallback_filtered_fill_count",
         "recent_analysis_dedupe_count",
     )
     return {

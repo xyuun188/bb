@@ -813,6 +813,14 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                         "zero": 0,
                         "min": 1,
                     },
+                    "rank_fallback_filtered_fill_count": {
+                        "count": 42,
+                        "median": 1,
+                        "p75": 2,
+                        "max": 3,
+                        "positive": 24,
+                        "zero": 18,
+                    },
                 },
                 "filtered_out_reason_counts": [
                     {"value": f"filter_reason_{i}", "count": i} for i in range(20)
@@ -889,6 +897,14 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                 "feature_valid_count": 12,
                 "market_symbol_budget": 2,
                 "rank_selected_count": 2,
+                "rank_fallback_filtered_fill_count": 1,
+                "rank_fallback_filtered_fill_policy": {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "applied": True,
+                    "symbols": ["F0/USDT"],
+                    "reason": "omit",
+                },
                 "rank_filtered_out_reason_counts": [
                     {"reason": f"reason_{i}", "count": i} for i in range(20)
                 ],
@@ -947,6 +963,7 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert window["count"] == 42
     assert window["rank_underfilled_count"] == 7
     assert window["metric_stats"]["scan_symbol_count"]["median"] == 120
+    assert window["metric_stats"]["rank_fallback_filtered_fill_count"]["median"] == 1
     assert "min" not in window["metric_stats"]["scan_symbol_count"]
     assert len(window["filtered_out_reason_counts"]) == 6
     assert len(window["selected_symbol_counts"]) == 6
@@ -977,6 +994,11 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert latest["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48
     assert latest["feature_fetch_budget"]["is_entry_gate"] is False
     assert "unused_large_payload" not in latest["feature_fetch_budget"]
+    assert latest["rank_fallback_filtered_fill_count"] == 1
+    assert latest["rank_fallback_filtered_fill_policy"]["read_only"] is True
+    assert latest["rank_fallback_filtered_fill_policy"]["is_entry_gate"] is False
+    assert latest["rank_fallback_filtered_fill_policy"]["symbols"] == ["F0/USDT"]
+    assert "reason" not in latest["rank_fallback_filtered_fill_policy"]
     assert len(latest["rank_filtered_out_reason_counts"]) == 6
     assert len(latest["ranked_symbol_sample"]) == 2
     assert len(latest["filtered_symbol_sample"]) == 2

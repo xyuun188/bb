@@ -4133,6 +4133,13 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
         "filtered_out_candidates": 1,
         "rank_underfilled": False,
         "rank_underfill_reason": "",
+        "fallback_filtered_fill_count": 1,
+        "fallback_filtered_fill_policy": {
+            "read_only": True,
+            "is_entry_gate": False,
+            "applied": True,
+            "symbols": ["NEAR/USDT"],
+        },
         "filtered_out_reason_counts": [{"reason": "analysis_volume_ratio_below_floor", "count": 1}],
         "symbols": [{"symbol": "BTC/USDT", "score": 80.0}],
         "ranked_symbol_sample": [
@@ -4223,6 +4230,10 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     )
     assert funnel["rank_underfilled"] is False
     assert funnel["rank_underfill_reason"] == ""
+    assert funnel["rank_fallback_filtered_fill_count"] == 1
+    assert funnel["rank_fallback_filtered_fill_policy"]["read_only"] is True
+    assert funnel["rank_fallback_filtered_fill_policy"]["is_entry_gate"] is False
+    assert funnel["rank_fallback_filtered_fill_policy"]["symbols"] == ["NEAR/USDT"]
     assert funnel["ranked_symbol_sample"][1]["non_selected_reason"] == (
         "outside_market_symbol_budget"
     )

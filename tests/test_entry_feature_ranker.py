@@ -249,6 +249,36 @@ def test_entry_feature_ranker_explains_symbols_outside_market_budget() -> None:
     assert "THIN/USDT" not in diagnostics
 
 
+def test_entry_feature_ranker_fills_underused_analysis_budget_with_near_miss() -> None:
+    ranker = _ranker()
+    result = ranker.rank(
+        {
+            "SOL/USDT": _feature("SOL/USDT"),
+            "NEAR/USDT": _feature(
+                "NEAR/USDT",
+                volume_ratio=0.04,
+                volume_24h=10_000.0,
+                adx_14=12.0,
+            ),
+        },
+        2,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    assert list(result.selected) == ["SOL/USDT", "NEAR/USDT"]
+    assert result.diagnostics["rank_underfilled"] is False
+    assert result.diagnostics["fallback_filtered_fill_count"] == 1
+    assert result.diagnostics["fallback_filtered_fill_policy"]["applied"] is True
+    assert result.diagnostics["fallback_filtered_fill_policy"]["symbols"] == ["NEAR/USDT"]
+    selected = {item["symbol"]: item for item in result.diagnostics["symbols"]}
+    assert selected["NEAR/USDT"]["selection_tier"] == "fallback_score"
+    assert "analysis_volume_ratio_below_floor" in selected["NEAR/USDT"]["filter_reasons"]
+    filtered = {item["symbol"]: item for item in result.diagnostics["filtered_symbol_sample"]}
+    assert filtered["NEAR/USDT"]["selected"] is True
+
+
 def test_entry_feature_ranker_explains_filtered_symbols_when_rank_underfills() -> None:
     ranker = _ranker()
     result = ranker.rank(
@@ -283,6 +313,8 @@ def test_entry_feature_ranker_explains_filtered_symbols_when_rank_underfills() -
         "insufficient_tradeable_or_secondary_candidates"
     )
     assert result.diagnostics["filtered_out_candidates"] == 2
+    assert result.diagnostics["fallback_filtered_fill_count"] == 0
+    assert result.diagnostics["fallback_filtered_fill_policy"]["applied"] is False
     assert reason_counts["analysis_volume_ratio_below_floor"] == 1
     assert reason_counts["analysis_notional_below_floor"] == 1
     assert reason_counts["analysis_volatility_above_cap"] == 1

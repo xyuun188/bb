@@ -253,11 +253,19 @@ class EntryFeatureRankerPolicy:
             if len(selected_items) >= limit:
                 break
             selected_items.extend(bucket[: max(limit - len(selected_items), 0)])
-        if not selected_items:
-            fallback_items = [
-                item for item in all_items if not self._missing_indicator_snapshot(item[1])
+        underfill_fallback_symbols: set[str] = set()
+        if len(selected_items) < max(limit, 0):
+            fallback_fill_items = [
+                item
+                for item in ranked_filtered
+                if self._can_fill_underfilled_analysis(
+                    item[1],
+                    filter_diagnostics.get(item[0], {}),
+                )
             ]
-            selected_items = sorted(fallback_items, key=ranking_score, reverse=True)[:limit]
+            selected_fallback_items = fallback_fill_items[: max(limit - len(selected_items), 0)]
+            selected_items.extend(selected_fallback_items)
+            underfill_fallback_symbols = {symbol for symbol, _feature in selected_fallback_items}
 
         selected = dict(selected_items)
         selected_symbols = {symbol for symbol, _ in selected_items}
@@ -351,6 +359,7 @@ class EntryFeatureRankerPolicy:
             fallback_symbols = {symbol for symbol, _ in ranked_candidates}
         else:
             fallback_symbols = set()
+        fallback_symbols |= underfill_fallback_symbols
         rank_sample_items = []
         seen_symbols: set[str] = set()
         for symbol, feature in [*selected_items, *ranked_candidates]:
@@ -386,6 +395,21 @@ class EntryFeatureRankerPolicy:
             "market_symbol_limit": max(0, int(limit or 0)),
             "rank_underfilled": rank_underfilled,
             "rank_underfill_reason": rank_underfill_reason,
+            "fallback_filtered_fill_count": len(underfill_fallback_symbols),
+            "fallback_filtered_fill_policy": {
+                "read_only": True,
+                "is_entry_gate": False,
+                "applied": bool(underfill_fallback_symbols),
+                "symbols": sorted(underfill_fallback_symbols)[:12],
+                "reason": (
+                    "When qualified market-analysis candidates underfill the available budget, "
+                    "the ranker may spend unused analysis capacity on the best non-severe "
+                    "filtered candidates that still have positive opportunity score and at "
+                    "least one market-structure anchor. This only broadens analysis coverage; "
+                    "entry evidence, sizing, leverage, ML readiness, OKX state, and risk checks "
+                    "still decide whether a real order can be submitted."
+                ),
+            },
             "recent_analysis_diversity": {
                 "read_only": True,
                 "is_entry_gate": False,
@@ -415,15 +439,71 @@ class EntryFeatureRankerPolicy:
                 for symbol, feature in rank_sample_items
             ],
             "filtered_symbol_sample": [
-                symbol_diagnostic(symbol, feature, selected_item=False)
+                symbol_diagnostic(
+                    symbol,
+                    feature,
+                    selected_item=symbol in selected_symbols,
+                    fallback_item=symbol in fallback_symbols,
+                )
                 for symbol, feature in ranked_filtered[: min(8, len(ranked_filtered))]
             ],
             "symbols": [
-                symbol_diagnostic(symbol, feature, selected_item=True)
+                symbol_diagnostic(
+                    symbol,
+                    feature,
+                    selected_item=True,
+                    fallback_item=symbol in fallback_symbols,
+                )
                 for symbol, feature in selected_items[: min(8, len(selected_items))]
             ],
         }
         return EntryFeatureRankResult(selected=selected, diagnostics=diagnostics)
+
+    def _can_fill_underfilled_analysis(self, feature: Any, diagnostic: dict[str, Any]) -> bool:
+        if self._missing_indicator_snapshot(feature):
+            return False
+        symbol = str(getattr(feature, "symbol", "") or "").upper()
+        if symbol and self.suspicious_symbol_reason(symbol):
+            return False
+        reasons = set(diagnostic.get("analysis_reasons") or [])
+        severe_reasons = {
+            "missing_indicator_snapshot",
+            "suspicious_symbol",
+            "invalid_feature_values",
+            "recent_abnormal_wick",
+            "analysis_volatility_above_cap",
+            "analysis_day_change_above_cap",
+        }
+        if reasons & severe_reasons:
+            return False
+        if self.feature_opportunity_score(feature) <= 0:
+            return False
+        return self._has_underfilled_market_support(diagnostic)
+
+    @staticmethod
+    def _has_underfilled_market_support(diagnostic: dict[str, Any]) -> bool:
+        metrics = dict(diagnostic.get("metrics") or {})
+
+        def as_float(key: str) -> float:
+            try:
+                return float(metrics.get(key) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        notional = as_float("notional_24h")
+        min_notional = as_float("analysis_min_notional")
+        volume_ratio = as_float("volume_ratio")
+        volume_floor = as_float("analysis_volume_floor")
+        adx = as_float("adx")
+        adx_floor = as_float("analysis_adx_floor")
+        support_count = 0
+        if min_notional <= 0 or notional >= min_notional:
+            support_count += 1
+        if volume_floor <= 0 or volume_ratio >= volume_floor:
+            support_count += 1
+        if adx_floor <= 0 or adx >= adx_floor:
+            support_count += 1
+        return support_count > 0
 
     def _feature_filter_diagnostic(self, feature: Any) -> dict[str, Any]:
         params = self.params
