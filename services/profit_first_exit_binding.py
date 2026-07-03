@@ -50,12 +50,24 @@ def attach_profit_first_exit_reference(
         target_entry_order_id=target_entry_order_id,
         target_okx_pos_id=target_okx_pos_id,
     )
-    reference = _reference_from_position(match)
+    reference = _reference_from_position(
+        match,
+        target_exit_plan_id=target_exit_plan_id,
+        target_entry_order_id=target_entry_order_id,
+    )
+    if not reference.get("exit_plan_id"):
+        reference = _fallback_reference_from_decision(
+            symbol=decision.symbol,
+            side=side,
+            target_exit_plan_id=target_exit_plan_id,
+            target_entry_order_id=target_entry_order_id,
+            target_okx_pos_id=target_okx_pos_id,
+        )
     if reference.get("exit_plan_id"):
         close_evidence["profit_first_exit_plan_id"] = reference["exit_plan_id"]
         raw["profit_first_exit_reference"] = {
             **reference,
-            "source": "matched_open_position",
+            "source": reference.get("source") or "matched_open_position",
             "missing_original_exit_plan_reference": False,
         }
     else:
@@ -111,34 +123,133 @@ def _matching_position(
     return {}
 
 
-def _reference_from_position(position: dict[str, Any]) -> dict[str, Any]:
+def _reference_from_position(
+    position: dict[str, Any],
+    *,
+    target_exit_plan_id: str = "",
+    target_entry_order_id: str = "",
+) -> dict[str, Any]:
     if not position:
         return {}
     exit_plan = position.get("profit_first_exit_plan")
     exit_plan = exit_plan if isinstance(exit_plan, dict) else {}
     trade_plan = position.get("profit_first_trade_plan")
     trade_plan = trade_plan if isinstance(trade_plan, dict) else {}
+    leg_reference = _entry_leg_reference(
+        position,
+        target_exit_plan_id=target_exit_plan_id,
+        target_entry_order_id=target_entry_order_id,
+    )
     exit_plan_id = (
-        position.get("profit_first_exit_plan_id")
+        leg_reference.get("exit_plan_id")
+        or position.get("profit_first_exit_plan_id")
         or exit_plan.get("exit_plan_id")
         or trade_plan.get("exit_plan_id")
         or ""
     )
     if not str(exit_plan_id or "").strip():
         return {}
-    return {
+    reference = {
         "exit_plan_id": str(exit_plan_id),
         "entry_symbol": position.get("symbol") or trade_plan.get("symbol") or "",
         "entry_side": position.get("side") or trade_plan.get("side") or "",
         "entry_plan_version": trade_plan.get("plan_version") or "",
         "entry_decision_lane": trade_plan.get("decision_lane") or "",
         "entry_exchange_order_id": _first_text(
+            leg_reference.get("entry_exchange_order_id"),
             position.get("entry_exchange_order_id"),
             _first_text(*(leg.get("exchange_order_id") for leg in _entry_legs(position))),
         ),
         "max_hold_minutes": exit_plan.get("max_hold_minutes") or trade_plan.get("max_hold_minutes"),
         "profit_drawdown_exit_pct": exit_plan.get("profit_drawdown_exit_pct")
         or trade_plan.get("profit_drawdown_exit_pct"),
+    }
+    if leg_reference.get("source"):
+        reference["source"] = leg_reference["source"]
+    return reference
+
+
+def _entry_leg_reference(
+    position: dict[str, Any],
+    *,
+    target_exit_plan_id: str = "",
+    target_entry_order_id: str = "",
+) -> dict[str, Any]:
+    legs = _entry_legs(position)
+    if not legs:
+        return {}
+
+    if target_entry_order_id:
+        for leg in legs:
+            leg_order_id = str(leg.get("exchange_order_id") or "").strip()
+            if leg_order_id != target_entry_order_id:
+                continue
+            exit_plan_id = _first_text(
+                leg.get("profit_first_exit_plan_id"),
+                leg.get("exit_plan_id"),
+                target_exit_plan_id,
+            )
+            if exit_plan_id:
+                return {
+                    "exit_plan_id": exit_plan_id,
+                    "entry_exchange_order_id": leg_order_id,
+                    "source": "matched_open_position_entry_leg",
+                }
+
+    if target_exit_plan_id:
+        for leg in legs:
+            leg_exit_plan_id = _first_text(
+                leg.get("profit_first_exit_plan_id"),
+                leg.get("exit_plan_id"),
+            )
+            if leg_exit_plan_id == target_exit_plan_id:
+                return {
+                    "exit_plan_id": leg_exit_plan_id,
+                    "entry_exchange_order_id": str(leg.get("exchange_order_id") or "").strip(),
+                    "source": "matched_open_position_entry_leg",
+                }
+
+    unique_leg_plan_ids = {
+        _first_text(leg.get("profit_first_exit_plan_id"), leg.get("exit_plan_id"))
+        for leg in legs
+        if _first_text(leg.get("profit_first_exit_plan_id"), leg.get("exit_plan_id"))
+    }
+    if len(unique_leg_plan_ids) == 1:
+        only_exit_plan_id = next(iter(unique_leg_plan_ids))
+        matching_leg = next(
+            (
+                leg
+                for leg in legs
+                if _first_text(leg.get("profit_first_exit_plan_id"), leg.get("exit_plan_id"))
+                == only_exit_plan_id
+            ),
+            {},
+        )
+        return {
+            "exit_plan_id": only_exit_plan_id,
+            "entry_exchange_order_id": str(matching_leg.get("exchange_order_id") or "").strip(),
+            "source": "matched_open_position_entry_leg",
+        }
+    return {}
+
+
+def _fallback_reference_from_decision(
+    *,
+    symbol: str,
+    side: str,
+    target_exit_plan_id: str,
+    target_entry_order_id: str,
+    target_okx_pos_id: str,
+) -> dict[str, Any]:
+    if not target_exit_plan_id:
+        return {}
+    return {
+        "exit_plan_id": target_exit_plan_id,
+        "entry_symbol": symbol,
+        "entry_side": side,
+        "entry_exchange_order_id": target_entry_order_id,
+        "okx_pos_id": target_okx_pos_id,
+        "source": "decision_payload_exit_plan_id",
     }
 
 

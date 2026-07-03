@@ -12,6 +12,10 @@ from services.trade_execution_contract import (
 from services.profit_first_trade_plan import build_profit_first_trade_plan
 
 
+def _anchor_now() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
 def _entry_decision(
     *,
     decision_id: int = 1,
@@ -25,7 +29,7 @@ def _entry_decision(
     include_profit_first_plan: bool = True,
     created_at: datetime | None = None,
 ) -> SimpleNamespace:
-    now = datetime(2026, 6, 23, 8, 0, tzinfo=UTC)
+    now = created_at or (_anchor_now() - timedelta(minutes=5))
     raw = {
         "opportunity_score": {
             "score": 3.2,
@@ -122,7 +126,7 @@ def _order(
         symbol="BTC/USDT",
         side="buy",
         status=status,
-        created_at=created_at or datetime(2026, 6, 23, 8, 1, tzinfo=UTC),
+        created_at=created_at or (_anchor_now() - timedelta(minutes=4)),
     )
 
 
@@ -134,7 +138,7 @@ def _position(
     hold_minutes: float = 6.0,
     realized_pnl: float = -2.0,
 ) -> SimpleNamespace:
-    closed_at = datetime(2026, 6, 23, 8, 5, tzinfo=UTC)
+    closed_at = _anchor_now()
     return SimpleNamespace(
         id=position_id,
         symbol=symbol,
@@ -189,7 +193,7 @@ def _exit_decision(
         raw_llm_response=raw,
         execution_reason="exit submitted",
         was_executed=True,
-        created_at=created_at or datetime(2026, 6, 23, 8, 5, tzinfo=UTC),
+        created_at=created_at or _anchor_now(),
     )
 
 

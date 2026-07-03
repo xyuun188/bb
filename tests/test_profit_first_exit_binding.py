@@ -93,6 +93,71 @@ def test_exit_reference_prefers_exact_entry_exchange_order_id_match() -> None:
     assert raw["close_evidence"]["profit_first_exit_plan_id"] == "pfep-new"
 
 
+def test_exit_reference_uses_entry_leg_plan_when_position_is_aggregated() -> None:
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.8,
+        reasoning="close matched aggregated leg",
+        raw_response={"close_evidence": {"entry_exchange_order_id": "entry-b"}},
+    )
+
+    raw = attach_profit_first_exit_reference(
+        decision,
+        [
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "entry_exchange_order_id": "entry-a,entry-b",
+                "entry_legs": [
+                    {
+                        "exchange_order_id": "entry-a",
+                        "profit_first_exit_plan_id": "pfep-a",
+                    },
+                    {
+                        "exchange_order_id": "entry-b",
+                        "profit_first_exit_plan_id": "pfep-b",
+                    },
+                ],
+            }
+        ],
+        model_name="ensemble_trader",
+    )
+
+    assert raw["profit_first_exit_reference"]["exit_plan_id"] == "pfep-b"
+    assert raw["profit_first_exit_reference"]["source"] == "matched_open_position_entry_leg"
+    assert raw["close_evidence"]["profit_first_exit_plan_id"] == "pfep-b"
+
+
+def test_exit_reference_keeps_decision_payload_plan_id_when_snapshot_match_is_missing() -> None:
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        action=Action.CLOSE_SHORT,
+        confidence=0.8,
+        reasoning="close with pre-attached plan id",
+        raw_response={
+            "close_evidence": {
+                "profit_first_exit_plan_id": "pfep-eth",
+                "entry_exchange_order_id": "entry-eth",
+            }
+        },
+    )
+
+    raw = attach_profit_first_exit_reference(
+        decision,
+        [],
+        model_name="ensemble_trader",
+    )
+
+    assert raw["profit_first_exit_reference"]["exit_plan_id"] == "pfep-eth"
+    assert raw["profit_first_exit_reference"]["source"] == "decision_payload_exit_plan_id"
+    assert raw["profit_first_exit_reference"]["missing_original_exit_plan_reference"] is False
+    assert raw["close_evidence"]["profit_first_exit_plan_id"] == "pfep-eth"
+
+
 def test_open_position_snapshot_carries_profit_first_exit_plan() -> None:
     decision = DecisionOutput(
         model_name="ensemble_trader",
