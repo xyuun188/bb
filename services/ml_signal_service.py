@@ -1042,7 +1042,8 @@ class MLSignalService:
                     "legacy_cursor_ignored_when_outside_phase3_view": True,
                     "promotion_requires_readiness": True,
                     "candidate_artifact_persisted": False,
-                    "persist_artifact_only_when_readiness_allows_live_influence": True,
+                    "persist_artifact_only_when_readiness_allows_live_influence": False,
+                    "persist_latest_artifact_even_when_readiness_blocks_live_influence": True,
                 }
                 if completed_count < MIN_TRAINING_SAMPLES:
                     result = {
@@ -1054,42 +1055,6 @@ class MLSignalService:
                         "new_sample_count": new_samples,
                         "training_policy": training_policy,
                         "message": f"本地 ML 自动训练三期干净样本不足：{completed_count} < {MIN_TRAINING_SAMPLES}。等待三期新影子复盘样本形成。",
-                    }
-                    self._last_train_result = result
-                    return result
-
-                last_result = _safe_dict(self._last_train_result)
-                last_result_finished_at = self._parse_datetime(self._last_train_finished_at)
-                last_result_completed_count = int(
-                    last_result.get("completed_sample_count")
-                    or last_result.get("last_trained_completed_sample_count")
-                    or 0
-                )
-                last_result_age_seconds = (
-                    (now - last_result_finished_at).total_seconds()
-                    if last_result_finished_at is not None
-                    else min_interval_seconds
-                )
-                if (
-                    not force
-                    and last_result.get("reason") == "candidate_readiness_rejected"
-                    and last_result_age_seconds < min_interval_seconds
-                    and completed_count - last_result_completed_count < min_new_samples
-                ):
-                    result = {
-                        "trained": False,
-                        "reason": "not_due_after_candidate_rejection",
-                        "completed_sample_count": completed_count,
-                        "last_candidate_completed_sample_count": last_result_completed_count,
-                        "last_candidate_rejected_at": self._last_train_finished_at,
-                        "new_sample_count": max(completed_count - last_result_completed_count, 0),
-                        "model_age_seconds": round(age_seconds, 1),
-                        "last_candidate_age_seconds": round(last_result_age_seconds, 1),
-                        "training_policy": training_policy,
-                        "message": (
-                            "上一轮候选 ML 模型未通过 readiness 晋级门，且尚未达到重新评估间隔"
-                            "或新增样本门槛；继续保留当前线上 artifact。"
-                        ),
                     }
                     self._last_train_result = result
                     return result
@@ -1166,30 +1131,6 @@ class MLSignalService:
                         _safe_dict(candidate_metadata.get("quality_report")).get("totals")
                     ),
                 }
-                if not bool(candidate_readiness.get("allow_live_position_influence")):
-                    result = {
-                        "trained": False,
-                        "reason": "candidate_readiness_rejected",
-                        "completed_sample_count": completed_count,
-                        "previous_sample_count": last_sample_count,
-                        "previous_completed_sample_count": last_completed_count,
-                        "new_sample_count": new_samples,
-                        "sample_count": int(candidate_metadata.get("sample_count") or 0),
-                        "last_trained_completed_sample_count": last_completed_count,
-                        "training_quarantine": quarantine_result,
-                        "training_policy": training_policy,
-                        "candidate": candidate_summary,
-                        "candidate_readiness": candidate_readiness,
-                        "candidate_influence_policy": candidate_influence,
-                        "artifact_persisted": False,
-                        "message": (
-                            "候选 ML 模型未通过 readiness 晋级门，已拒绝替换线上 artifact；"
-                            "继续使用上一版模型或保持学习观察。"
-                        ),
-                    }
-                    self._last_train_result = result
-                    return result
-
                 trained_metadata = await asyncio.to_thread(
                     train_from_frame,
                     frame,
@@ -1197,12 +1138,22 @@ class MLSignalService:
                     training_quality_report=quality_state["quality_report"],
                     persist_artifact=True,
                 )
+                trained_influence = _influence_policy(trained_metadata)
+                trained_readiness = build_ml_readiness_report(
+                    trained_metadata,
+                    trained_influence,
+                )
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
+                allow_live_position_influence = bool(
+                    trained_readiness.get("allow_live_position_influence")
+                )
                 result = {
                     "trained": True,
-                    "reason": "trained",
+                    "reason": (
+                        "trained" if allow_live_position_influence else "trained_learning_only"
+                    ),
                     "completed_sample_count": completed_count,
                     "previous_sample_count": last_sample_count,
                     "previous_completed_sample_count": last_completed_count,
@@ -1217,9 +1168,22 @@ class MLSignalService:
                     "candidate": candidate_summary,
                     "candidate_readiness": candidate_readiness,
                     "candidate_influence_policy": candidate_influence,
+                    "readiness": trained_readiness,
+                    "readiness_state": trained_readiness.get("state"),
+                    "allow_live_position_influence": allow_live_position_influence,
+                    "influence_enabled": allow_live_position_influence,
+                    "influence_policy": trained_influence,
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
                     "trained_at": trained_metadata.get("trained_at"),
-                    "message": "本地 ML 盈亏质量模型已自动完成训练并热加载。",
+                    "message": (
+                        "本地 ML 盈亏质量模型已自动完成训练、替换为最新 artifact 并热加载；"
+                        "当前已允许参与开仓过滤与收益排序。"
+                        if allow_live_position_influence
+                        else (
+                            "本地 ML 盈亏质量模型已自动完成训练、替换为最新 artifact 并热加载；"
+                            "当前仍处于学习观察/降级状态，暂不参与实盘影响。"
+                        )
+                    ),
                 }
                 self._last_train_result = result
                 return result

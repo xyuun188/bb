@@ -459,7 +459,7 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_auto_train_rejects_degraded_candidate_without_persisting(
+async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate_is_degraded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = MLSignalService()
@@ -504,13 +504,15 @@ async def test_ml_signal_auto_train_rejects_degraded_candidate_without_persistin
 
     result = await service.maybe_auto_train(force=True)
 
-    assert calls == [False]
-    assert ensure_load_calls == []
-    assert result["trained"] is False
-    assert result["reason"] == "candidate_readiness_rejected"
-    assert result["artifact_persisted"] is False
+    assert calls == [False, True]
+    assert ensure_load_calls == ["load"]
+    assert result["trained"] is True
+    assert result["reason"] == "trained_learning_only"
+    assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is False
+    assert result["allow_live_position_influence"] is False
+    assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_below_threshold" in reason_codes
     assert "short_top_return_below_threshold" in reason_codes
