@@ -34,6 +34,9 @@ def _service() -> DataService:
     service._derivatives_refresh_tasks = {}
     service._ticker_persisted_at = {}
     service._ticker_persist_inflight = set()
+    service._available_symbols_cache = []
+    service._available_symbols_cache_updated_at = None
+    service._available_symbols_refresh_task = None
     return service
 
 
@@ -331,6 +334,61 @@ async def test_normal_feature_vector_can_build_indicators_from_cached_klines() -
     assert fv.indicator_snapshot_available is True
     assert fv.technical_indicator_timeframe == "1h"
     assert fv.volume_ratio == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+async def test_available_symbols_uses_fresh_cache_without_rest_call() -> None:
+    service = _service()
+    service._available_symbols_cache = [{"symbol": "BTC/USDT"}]
+    service._available_symbols_cache_updated_at = data_service_module.datetime.now(
+        data_service_module.UTC
+    )
+
+    class FailingRestClient:
+        async def get_available_symbols(self) -> list[dict[str, Any]]:
+            raise AssertionError("fresh available-symbol cache should not call REST")
+
+    service.rest_client = FailingRestClient()
+
+    symbols = await service.get_available_symbols()
+
+    assert symbols == [{"symbol": "BTC/USDT"}]
+
+
+@pytest.mark.asyncio
+async def test_available_symbols_returns_stale_cache_while_refreshing_background() -> None:
+    service = _service()
+    service._available_symbols_cache = [{"symbol": "BTC/USDT"}]
+    service._available_symbols_cache_updated_at = data_service_module.datetime.now(
+        data_service_module.UTC
+    ) - timedelta(seconds=data_service_module.AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS + 1.0)
+    release_refresh = asyncio.Event()
+    rest_calls: list[str] = []
+
+    class SlowRestClient:
+        async def get_available_symbols(self) -> list[dict[str, Any]]:
+            rest_calls.append("called")
+            await release_refresh.wait()
+            return [{"symbol": "ETH/USDT"}]
+
+    service.rest_client = SlowRestClient()
+
+    started_at = time.monotonic()
+    symbols = await asyncio.wait_for(service.get_available_symbols(), timeout=0.05)
+    elapsed = time.monotonic() - started_at
+
+    assert symbols == [{"symbol": "BTC/USDT"}]
+    assert elapsed < 0.05
+    await asyncio.sleep(0)
+    assert rest_calls == ["called"]
+
+    release_refresh.set()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if service._available_symbols_cache == [{"symbol": "ETH/USDT"}]:
+            break
+
+    assert service._available_symbols_cache == [{"symbol": "ETH/USDT"}]
 
 
 @pytest.mark.asyncio

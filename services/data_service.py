@@ -83,6 +83,7 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
     10.0,
     float(_MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds),
 )
+AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
 
 
 class DataService:
@@ -129,6 +130,9 @@ class DataService:
         self._sentiment_refresh_task: asyncio.Task | None = None
         self._ticker_persisted_at: dict[str, datetime] = {}
         self._ticker_persist_inflight: set[str] = set()
+        self._available_symbols_cache: list[dict[str, Any]] = []
+        self._available_symbols_cache_updated_at: datetime | None = None
+        self._available_symbols_refresh_task: asyncio.Task | None = None
 
         # Register ticker callback for real-time price updates
         self.ws_client.on_ticker(self._on_ticker_update)
@@ -210,7 +214,7 @@ class DataService:
         """Start all data feed connections."""
         # Fetch all available USDT pairs for auto mode WS subscription
         try:
-            available = await self.rest_client.get_available_symbols()
+            available = await self._refresh_available_symbols_cache()
             all_symbols = [s["symbol"] for s in available]
             self.ws_client._subscribe_symbols = all_symbols if all_symbols else settings.symbols
             self._kline_coverage_symbols = self._normalize_symbols(all_symbols)
@@ -1697,7 +1701,62 @@ class DataService:
 
     async def get_available_symbols(self) -> list[dict[str, Any]]:
         """Return all available USDT trading pairs from OKX."""
-        return await self.rest_client.get_available_symbols()
+        cached = self._available_symbols_cache_if_usable()
+        if cached:
+            return cached
+        stale_cached = self._available_symbols_cache_if_any()
+        if stale_cached:
+            self._schedule_available_symbols_refresh()
+            return stale_cached
+        return await self._refresh_available_symbols_cache()
+
+    def _available_symbols_cache_if_usable(self) -> list[dict[str, Any]]:
+        cached = getattr(self, "_available_symbols_cache", None)
+        updated_at = getattr(self, "_available_symbols_cache_updated_at", None)
+        if not cached or not isinstance(updated_at, datetime):
+            return []
+        age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
+        if age_seconds > AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS:
+            return []
+        return [dict(item) for item in cached if isinstance(item, dict)]
+
+    async def _refresh_available_symbols_cache(self) -> list[dict[str, Any]]:
+        existing = getattr(self, "_available_symbols_refresh_task", None)
+        current_task = asyncio.current_task()
+        if existing is not None and existing is not current_task and not existing.done():
+            result = await existing
+            return [dict(item) for item in result if isinstance(item, dict)]
+
+        task = asyncio.create_task(self.rest_client.get_available_symbols())
+        self._available_symbols_refresh_task = task
+        try:
+            symbols = await task
+            normalized = [dict(item) for item in symbols if isinstance(item, dict)]
+            if normalized:
+                self._available_symbols_cache = normalized
+                self._available_symbols_cache_updated_at = datetime.now(UTC)
+            return normalized or self._available_symbols_cache_if_any()
+        finally:
+            if getattr(self, "_available_symbols_refresh_task", None) is task:
+                self._available_symbols_refresh_task = None
+
+    def _available_symbols_cache_if_any(self) -> list[dict[str, Any]]:
+        cached = getattr(self, "_available_symbols_cache", None)
+        if not cached:
+            return []
+        return [dict(item) for item in cached if isinstance(item, dict)]
+
+    def _schedule_available_symbols_refresh(self) -> None:
+        existing = getattr(self, "_available_symbols_refresh_task", None)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._available_symbols_refresh_task = loop.create_task(
+            self._refresh_available_symbols_cache()
+        )
 
     def get_market_state(self) -> dict[str, Any]:
         """Get a snapshot of current market state for the dashboard."""
