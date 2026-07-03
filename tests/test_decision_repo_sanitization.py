@@ -223,13 +223,29 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
         stop_loss_pct=0.05,
         take_profit_pct=0.10,
     )
+    ai_completed_raw = append_decision_stage(
+        {},
+        DecisionStage.AI_ANALYSIS,
+        DecisionStageStatus.COMPLETED,
+        "AI 已完成分析并生成裁决。",
+    )
+    ai_completed = SimpleNamespace(
+        id=5,
+        was_executed=False,
+        execution_reason="AI 已完成分析并生成裁决。",
+        raw_llm_response=ai_completed_raw,
+        position_size_pct=0.25,
+        suggested_leverage=5.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+    )
     update_raw = append_decision_stage(
         {"execution_parameters": {"position_size_pct": 0.004}},
         DecisionStage.RISK_CHECK,
         DecisionStageStatus.SKIPPED,
         "轮次结束未进入下单",
     )
-    session = FakeSession(rows=[unresolved, executed, terminal, exchange_pending])
+    session = FakeSession(rows=[unresolved, executed, terminal, exchange_pending, ai_completed])
     repo = DecisionRepository(session)  # type: ignore[arg-type]
 
     updated = await repo.finalize_unresolved_decisions(
@@ -238,10 +254,11 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
             (2, "不应覆盖已成交", update_raw),
             (3, "不应覆盖已终态", update_raw),
             (4, "不应覆盖已进入 OKX 提交", update_raw),
+            (5, "轮次结束未进入下单", update_raw),
         ]
     )
 
-    assert updated == 1
+    assert updated == 2
     assert unresolved.execution_reason == "轮次结束未进入下单"
     assert unresolved.raw_llm_response["decision_state_machine"]["summary"]["final_stage"] == (
         DecisionStage.RISK_CHECK
@@ -254,4 +271,8 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
     assert terminal.execution_reason == "已有明确终态"
     assert exchange_pending.execution_reason == "正在提交 OKX：等待交易所回报"
     assert exchange_pending.raw_llm_response == exchange_pending_raw
+    assert ai_completed.execution_reason == "轮次结束未进入下单"
+    assert ai_completed.raw_llm_response["decision_state_machine"]["summary"]["final_stage"] == (
+        DecisionStage.RISK_CHECK
+    )
     assert session.flush_count == 1

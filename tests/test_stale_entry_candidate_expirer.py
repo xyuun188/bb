@@ -139,6 +139,38 @@ async def test_stale_entry_expirer_repairs_old_expired_reason_with_pending_state
 
 
 @pytest.mark.asyncio
+async def test_stale_entry_expirer_repairs_ai_analysis_completed_state() -> None:
+    raw = append_decision_stage(
+        {
+            "opportunity_score": {
+                "score": 0.7,
+                "min_score_required": 0.8,
+                "expected_net_return_pct": 0.2,
+            }
+        },
+        DecisionStage.AI_ANALYSIS,
+        DecisionStageStatus.COMPLETED,
+        "AI analysis completed.",
+    )
+    waiting = [_row(raw=raw)]
+    waiting[0].execution_reason = "AI analysis completed."
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        waiting,
+        [],
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    state = decision_state_from_raw(waiting[0].raw_llm_response)["summary"]
+    assert state["final_stage"] == DecisionStage.RISK_CHECK
+    assert state["final_status"] == DecisionStageStatus.SKIPPED
+
+
+@pytest.mark.asyncio
 async def test_stale_entry_expirer_does_not_duplicate_terminal_state() -> None:
     raw = append_decision_stage(
         {

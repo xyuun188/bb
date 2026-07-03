@@ -54,8 +54,24 @@ TERMINAL_STATUSES = {
     DecisionStageStatus.BLOCKED,
     DecisionStageStatus.FAILED,
     DecisionStageStatus.SKIPPED,
-    DecisionStageStatus.COMPLETED,
 }
+
+COMPLETED_TERMINAL_STAGES = {
+    DecisionStage.EXCHANGE_CONFIRM,
+    DecisionStage.LOCAL_SYNC,
+}
+
+
+def is_decision_terminal_state(stage: str | None, status: str | None) -> bool:
+    """Return whether a final stage/status pair represents a closed decision."""
+
+    final_stage = str(stage or "")
+    final_status = str(status or "")
+    if final_status in TERMINAL_STATUSES:
+        return True
+    if final_status == DecisionStageStatus.COMPLETED:
+        return final_stage in COMPLETED_TERMINAL_STAGES
+    return False
 
 
 ORDERED_STAGES = (

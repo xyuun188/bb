@@ -4,6 +4,7 @@ from services.decision_state import (
     DecisionStageStatus,
     append_decision_stage,
     decision_state_from_raw,
+    is_decision_terminal_state,
 )
 from services.strategy_arbitration import arbitrate_decision
 
@@ -55,6 +56,25 @@ def test_decision_state_preserves_stage_duration() -> None:
 
     assert event["duration_sec"] == 2.346
     assert summary["duration_sec"] == 2.346
+
+
+def test_completed_status_is_terminal_only_for_execution_closure() -> None:
+    assert not is_decision_terminal_state(
+        DecisionStage.AI_ANALYSIS,
+        DecisionStageStatus.COMPLETED,
+    )
+    assert not is_decision_terminal_state(
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.PENDING,
+    )
+    assert is_decision_terminal_state(
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+    )
+    assert is_decision_terminal_state(
+        DecisionStage.LOCAL_SYNC,
+        DecisionStageStatus.COMPLETED,
+    )
 
 
 def _decision(action: Action) -> DecisionOutput:

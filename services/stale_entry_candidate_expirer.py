@@ -20,11 +20,11 @@ from models.decision import AIDecision
 from models.trade import Order
 from services.decision_freshness import ENTRY_DECISION_MAX_AGE_SECONDS
 from services.decision_state import (
-    TERMINAL_STATUSES,
     DecisionStage,
     DecisionStageStatus,
     append_decision_stage,
     decision_state_from_raw,
+    is_decision_terminal_state,
 )
 from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
@@ -359,7 +359,8 @@ def _needs_terminal_state_repair(row: Any) -> bool:
     if not isinstance(summary, dict):
         return True
     final_status = str(summary.get("final_status") or "")
-    return final_status not in TERMINAL_STATUSES
+    final_stage = str(summary.get("final_stage") or "")
+    return not is_decision_terminal_state(final_stage, final_status)
 
 
 def _merge_open_state_repairs(

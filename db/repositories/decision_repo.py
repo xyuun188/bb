@@ -145,7 +145,6 @@ class DecisionRepository(BaseRepository):
                     DecisionStageStatus.BLOCKED,
                     DecisionStageStatus.FAILED,
                     DecisionStageStatus.SKIPPED,
-                    DecisionStageStatus.COMPLETED,
                 }
                 and str(row.execution_reason or "").strip()
             ):
