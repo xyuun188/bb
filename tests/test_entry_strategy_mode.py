@@ -34,6 +34,8 @@ def test_strategy_mode_builds_roster_when_portfolio_underfilled() -> None:
 
     assert result["strategy"] == "portfolio_roster_build"
     assert result["posture"] == "diversified_positive_expectancy"
+    assert result["strategy_profile_id"] == "baseline_current"
+    assert result["strategy_learning_sizing"]["profile_id"] == "baseline_current"
     assert result["min_opportunity_score"] == 0.65
     assert result["portfolio_roster"]["underfilled"] is True
     assert result["portfolio_roster"]["gap"] == 7
@@ -303,6 +305,8 @@ async def test_strategy_mode_context_does_not_block_on_slow_strategy_learning(
 
     assert elapsed < 0.5
     assert result["strategy_learning_cache_status"] == "baseline_timeout"
+    assert result["strategy_profile_id"] == "baseline_current"
+    assert result["strategy_learning_sizing"]["profile_id"] == "baseline_current"
     assert "dynamic_position_capacity" in result
     tasks = service._strategy_learning_context_refresh_tasks
     assert tasks["paper"].done() is False

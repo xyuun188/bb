@@ -130,6 +130,28 @@ def test_attach_profit_first_trade_plan_writes_raw_response_snapshot() -> None:
     assert raw["profit_first_entry_exit_binding"]["exit_decisions_must_reference_plan"] is True
 
 
+def test_baseline_strategy_context_keeps_complete_entry_tradeable() -> None:
+    decision = _complete_decision()
+    decision.raw_response.pop("strategy_learning_context", None)
+    decision.raw_response["strategy_mode"] = {
+        "strategy_profile_id": "baseline_current",
+        "strategy_profile_version": 1,
+        "strategy_learning_sizing": {
+            "profile_id": "baseline_current",
+            "position_size_multiplier": 1.0,
+            "probe_fraction": 0.0,
+            "max_probe_size_pct": 0.0,
+        },
+    }
+
+    plan = build_profit_first_trade_plan(decision)
+
+    assert plan.strategy_profile_id == "baseline_current"
+    assert "strategy_profile_id" not in plan.missing_required_fields
+    assert plan.decision_lane != "shadow_only"
+    assert plan.is_complete_for_real_trade is True
+
+
 def test_no_entry_reason_taxonomy_uses_canonical_categories() -> None:
     assert (
         normalize_no_entry_reason(

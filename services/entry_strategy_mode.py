@@ -20,6 +20,8 @@ DRAWDOWN_LIGHT_RISK_USDT = 30.0
 DRAWDOWN_HARD_PAUSE_USDT = 80.0
 PORTFOLIO_MIN_POSITION_GROUPS_TARGET = 10
 PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN = 6
+BASELINE_STRATEGY_PROFILE_ID = "baseline_current"
+BASELINE_STRATEGY_PROFILE_VERSION = 1
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -209,6 +211,9 @@ class EntryStrategyModeContextPolicy:
             "strategy": strategy,
             "posture": posture,
             "reason": reason,
+            "strategy_profile_id": BASELINE_STRATEGY_PROFILE_ID,
+            "strategy_profile_version": BASELINE_STRATEGY_PROFILE_VERSION,
+            "strategy_profile_source": "entry_strategy_mode_baseline",
             "preferred_direction": "neutral",
             "allow_long": allow_long,
             "allow_short": allow_short,
@@ -245,6 +250,21 @@ class EntryStrategyModeContextPolicy:
             "min_opportunity_score": round(min_opportunity_score, 4),
             "dynamic_opportunity_score_enabled": True,
             "max_entry_stop_loss_usdt": round(max_entry_stop_loss_usdt, 4),
+            "strategy_learning_sizing": {
+                "profile_id": BASELINE_STRATEGY_PROFILE_ID,
+                "position_size_multiplier": 1.0,
+                "probe_fraction": 0.0,
+                "max_probe_size_pct": 0.0,
+                "side_overrides": {},
+                "side_weights": {},
+                "profit_first_context": {
+                    "profile_id": BASELINE_STRATEGY_PROFILE_ID,
+                    "objective": "maximize_realized_net_pnl",
+                    "source": "entry_strategy_mode_baseline",
+                },
+                "profit_first_runtime_feedback_applied": False,
+                "reason": "基础策略上下文用于归因，不改变仓位。",
+            },
             "goal": "maximize_realized_net_profit",
             "execution_policy": (
                 "Auto-select strategy; global regime is advisory only; rank entries by "
