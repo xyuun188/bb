@@ -967,6 +967,98 @@ class ExecutionService:
             result.raw_response = raw_response
             return result
 
+        async def policy_evaluation_failed_result(
+            *,
+            blocker: str,
+            reason: str,
+            error_type: str,
+            error: str | None = None,
+        ) -> ExecutionResult:
+            data: dict[str, Any] = {
+                "blocker": blocker,
+                "error_type": error_type,
+                "mode": model_mode,
+            }
+            if error:
+                data["error"] = error
+            await mark_stage(
+                DecisionStage.RISK_CHECK,
+                DecisionStageStatus.FAILED,
+                reason,
+                data,
+            )
+            raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw_response = dict(raw_response)
+            if decision.is_entry:
+                opportunity = raw_response.get("opportunity_score")
+                if not isinstance(opportunity, dict):
+                    opportunity = {}
+                opportunity = dict(opportunity)
+                opportunity["selected_for_execution"] = False
+                opportunity["selection_reason"] = reason
+                opportunity["execution_final_state"] = DecisionStageStatus.FAILED
+                opportunity["execution_final_blocker"] = blocker
+                raw_response["opportunity_score"] = opportunity
+            review = raw_response.get("high_risk_review")
+            if isinstance(review, dict) and str(review.get("status") or "") == "pending":
+                review = dict(review)
+                review.update(
+                    {
+                        "status": (
+                            "cancelled_blocked"
+                            if error_type == "cancelled"
+                            else "error_blocked"
+                        ),
+                        "approved": False,
+                        "reason": reason,
+                    }
+                )
+                if error:
+                    review["error"] = error
+                raw_response["high_risk_review"] = review
+            raw_response.update(
+                {
+                    "execution_policy_terminal": True,
+                    "policy_blocker": blocker,
+                    "stage_status": DecisionStageStatus.FAILED,
+                    "reason": reason,
+                    **data,
+                }
+            )
+            decision.raw_response = raw_response
+            attach_execution_parameters("policy_evaluation_failed")
+            if decision_db_id is not None:
+                await mark_decision_reason(decision_db_id, reason)
+                await mark_decision_raw_response(decision_db_id, decision.raw_response)
+            await log_risk_event(
+                "warning",
+                symbol,
+                f"[{model_name}] {reason}",
+                model_name,
+            )
+            if position_review_alert_context(decision):
+                await log_position_review_risk_result(
+                    decision,
+                    model_name,
+                    f"未执行：{reason}",
+                )
+            results["decisions"].append(
+                {
+                    "model": model_name,
+                    "symbol": symbol,
+                    "action": decision.action.value,
+                    "approved": True,
+                    "confidence": decision.confidence,
+                    "executed": False,
+                    "execution_status": DecisionStageStatus.FAILED,
+                    "reason": reason,
+                    "is_paper": (model_mode == "paper"),
+                }
+            )
+            result = rejected_execution_result(decision, reason)
+            result.raw_response = decision.raw_response
+            return result
+
         request_symbol = normalize_trading_symbol(symbol)
         decision_symbol = normalize_trading_symbol(decision.symbol)
         if request_symbol and decision_symbol and request_symbol != decision_symbol:
@@ -1012,22 +1104,64 @@ class ExecutionService:
                 )
 
         if decision.is_exit:
-            exit_policy_result = await evaluate_exit_policy(
-                decision,
-                model_name,
-                open_positions,
-                refresh_positions=refresh_exit_positions,
-            )
+            try:
+                exit_policy_result = await evaluate_exit_policy(
+                    decision,
+                    model_name,
+                    open_positions,
+                    refresh_positions=refresh_exit_positions,
+                )
+            except asyncio.CancelledError:
+                return await policy_evaluation_failed_result(
+                    blocker="exit_policy_cancelled",
+                    reason=(
+                        "执行前平仓风控检查被外层超时保护取消，系统未提交 OKX 订单；"
+                        "本轮按未执行处理，下一轮持仓复盘会重新检查最新仓位和行情。"
+                    ),
+                    error_type="cancelled",
+                )
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=180)
+                return await policy_evaluation_failed_result(
+                    blocker="exit_policy_error",
+                    reason=(
+                        f"执行前平仓风控检查异常：{error_text}。"
+                        "系统未提交 OKX 订单，下一轮会重新检查最新仓位和行情。"
+                    ),
+                    error_type="exception",
+                    error=error_text,
+                )
             if not exit_policy_result.passed:
                 return await block_before_submit(exit_policy_result)
 
         if decision.is_entry:
-            entry_policy_result = await evaluate_entry_policy(
-                decision,
-                model_name,
-                model_mode,
-                open_positions,
-            )
+            try:
+                entry_policy_result = await evaluate_entry_policy(
+                    decision,
+                    model_name,
+                    model_mode,
+                    open_positions,
+                )
+            except asyncio.CancelledError:
+                return await policy_evaluation_failed_result(
+                    blocker="entry_policy_cancelled",
+                    reason=(
+                        "执行前开仓风控检查被外层超时保护取消，系统未提交 OKX 订单；"
+                        "本轮按未执行处理，下一轮会用最新行情重新分析。"
+                    ),
+                    error_type="cancelled",
+                )
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=180)
+                return await policy_evaluation_failed_result(
+                    blocker="entry_policy_error",
+                    reason=(
+                        f"执行前开仓风控检查异常：{error_text}。"
+                        "系统未提交 OKX 订单，下一轮会用最新行情重新分析。"
+                    ),
+                    error_type="exception",
+                    error=error_text,
+                )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
             profit_first_contract_result = _profit_first_entry_contract_result(decision)

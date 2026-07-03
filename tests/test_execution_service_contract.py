@@ -21,6 +21,8 @@ async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
 def _test_execution_service(
     *,
     okx_executor_provider,
+    entry_policy_evaluator=None,
+    exit_policy_evaluator=None,
     raw_updates: list[dict[str, Any] | None] | None = None,
     reasons: list[str | None] | None = None,
     stages: list[tuple[str, str, str]] | None = None,
@@ -85,8 +87,8 @@ def _test_execution_service(
         account_update_persister=_noop_async,
         account_balance_provider=lambda _model: _noop_async(),
         decision_outcome_marker=_noop_async,
-        entry_policy_evaluator=allow_entry,
-        exit_policy_evaluator=allow_entry,
+        entry_policy_evaluator=entry_policy_evaluator or allow_entry,
+        exit_policy_evaluator=exit_policy_evaluator or allow_entry,
         execution_skills_provider=lambda **_kwargs: [],
         execution_skills_attacher=lambda *_args, **_kwargs: None,
         execution_skills_block_reason_provider=lambda *_args, **_kwargs: None,
@@ -334,6 +336,64 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
     assert reasons and "执行链交易对不一致" in reasons[-1]
     assert raw_updates[-1]["policy_blocker"] == "execution_symbol_mismatch"
     assert results["decisions"][0]["execution_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_execution_service_marks_entry_policy_cancellation_terminal_before_okx_submit() -> None:
+    calls: dict[str, int] = {"okx": 0}
+    raw_updates: list[dict[str, Any] | None] = []
+    reasons: list[str | None] = []
+    stages: list[tuple[str, str, str]] = []
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        calls["okx"] += 1
+        raise AssertionError("cancelled entry policy must stop before OKX executor")
+
+    async def cancelled_entry(*_args: Any, **_kwargs: Any) -> PolicyGateResult:
+        raise asyncio.CancelledError()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        entry_policy_evaluator=cancelled_entry,
+        raw_updates=raw_updates,
+        reasons=reasons,
+        stages=stages,
+    )
+    decision = _entry_decision()
+    decision.raw_response = {
+        "high_risk_review": {
+            "triggered": True,
+            "status": "pending",
+            "approved": None,
+        }
+    }
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    result = await service.execute_candidate(
+        "SPK/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        132211,
+        results,
+        open_positions=[],
+    )
+
+    assert calls["okx"] == 0
+    assert result is not None
+    assert result.status == OrderStatus.REJECTED
+    assert results["decisions"][0]["execution_status"] == DecisionStageStatus.FAILED
+    assert reasons and "风控检查被外层超时保护取消" in str(reasons[-1])
+    assert raw_updates
+    final_raw = raw_updates[-1] or {}
+    assert final_raw["policy_blocker"] == "entry_policy_cancelled"
+    assert final_raw["stage_status"] == DecisionStageStatus.FAILED
+    assert final_raw["high_risk_review"]["status"] == "cancelled_blocked"
+    assert final_raw["high_risk_review"]["approved"] is False
+    assert any(
+        stage == DecisionStage.RISK_CHECK and status == DecisionStageStatus.FAILED
+        for stage, status, _reason in stages
+    )
 
 
 @pytest.mark.asyncio

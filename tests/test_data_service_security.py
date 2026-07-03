@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -366,6 +367,82 @@ async def test_indicator_snapshot_uses_cached_klines_before_okx_fetch(
 
     assert features["close"] == 100.5
     assert fetch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_indicator_snapshot_nonblocking_returns_stale_cache_and_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._indicator_snapshot_cache["BTC/USDT"] = {
+        "updated_at": data_service_module.datetime.now(data_service_module.UTC)
+        - timedelta(seconds=999),
+        "data": {
+            "close": 100.5,
+            "indicator_snapshot_available": True,
+        },
+    }
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_schedule_indicator_snapshot_refresh",
+        lambda symbol: scheduled.append(symbol),
+    )
+
+    features = await service._get_indicator_snapshot("BTC/USDT", block_on_remote=False)
+
+    assert features["close"] == pytest.approx(100.5)
+    assert features["indicator_snapshot_stale"] is True
+    assert features["indicator_snapshot_refresh_in_background"] is True
+    assert scheduled == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_indicator_snapshot_nonblocking_does_not_wait_for_remote_without_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    remote_started = asyncio.Event()
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self,
+            symbol: str,
+            timeframe: str = "1h",
+            limit: int = 100,
+        ) -> list[list[float]]:
+            remote_started.set()
+            await asyncio.sleep(60)
+            return []
+
+    async def no_cached_klines(
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> list[list[float]]:
+        return []
+
+    service.rest_client = FakeRestClient()
+    service._load_recent_cached_klines = no_cached_klines  # type: ignore[method-assign]
+    monkeypatch.setattr(data_service_module, "compute_all_indicators", lambda df: df)
+    monkeypatch.setattr(
+        data_service_module,
+        "extract_latest_features",
+        lambda df: {"close": float(df["close"].iloc[-1])},
+    )
+
+    features = await asyncio.wait_for(
+        service._get_indicator_snapshot("BTC/USDT", block_on_remote=False),
+        timeout=0.2,
+    )
+
+    assert features["indicator_snapshot_available"] is False
+    assert features["indicator_snapshot_refresh_in_background"] is True
+    task = service._indicator_snapshot_tasks.get("BTC/USDT")
+    assert task is not None
+    await asyncio.wait_for(remote_started.wait(), timeout=0.2)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

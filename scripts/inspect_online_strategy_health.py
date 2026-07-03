@@ -1259,11 +1259,21 @@ def market_analysis_progress_aggregate(decisions):
         "market_round_time_budget_stats": stats(
             [safe_float(row.get("market_round_time_budget_seconds")) for row in rows]
         ),
+        "market_symbol_start_reserve_stats": stats_present(
+            [row.get("market_symbol_start_reserve_seconds") for row in rows]
+        ),
+        "remaining_market_ai_budget_stats": stats_present(
+            [row.get("remaining_market_ai_budget_seconds") for row in rows]
+        ),
         "budget_used_ratio_before_ai_stats": stats(
             [safe_float(row.get("budget_used_ratio_before_ai")) for row in rows]
         ),
         "market_ai_budget_used_ratio_before_symbol_stats": stats_present(
             [row.get("market_ai_budget_used_ratio_before_symbol") for row in rows]
+        ),
+        "can_start_another_market_symbol_counts": counter_rows(
+            Counter(str(bool(row.get("can_start_another_market_symbol"))) for row in rows),
+            4,
         ),
         "latest": pick(
             latest,
@@ -1276,6 +1286,9 @@ def market_analysis_progress_aggregate(decisions):
                 "full_round_elapsed_seconds_before_ai",
                 "market_ai_elapsed_seconds_before_symbol",
                 "market_round_time_budget_seconds",
+                "market_symbol_start_reserve_seconds",
+                "remaining_market_ai_budget_seconds",
+                "can_start_another_market_symbol",
                 "budget_used_ratio_before_ai",
                 "market_ai_budget_used_ratio_before_symbol",
                 "budget_clock_scope",

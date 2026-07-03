@@ -114,6 +114,12 @@ def test_strategy_health_summary_report_uses_compact_market_diagnostics() -> Non
                 "ranked_market_symbol_count_stats": {"count": 3, "median": 8},
                 "full_round_elapsed_before_ai_stats": {"count": 3, "median": 45.0},
                 "market_ai_elapsed_before_symbol_stats": {"count": 3, "median": 8.5},
+                "market_symbol_start_reserve_stats": {"count": 3, "median": 14.0},
+                "remaining_market_ai_budget_stats": {"count": 3, "median": 22.0},
+                "can_start_another_market_symbol_counts": [
+                    {"value": "True", "count": 2},
+                    {"value": "False", "count": 1},
+                ],
                 "budget_used_ratio_before_ai_stats": {"count": 3, "median": 0.72},
                 "market_ai_budget_used_ratio_before_symbol_stats": {
                     "count": 3,
@@ -125,6 +131,9 @@ def test_strategy_health_summary_report_uses_compact_market_diagnostics() -> Non
                     "ranked_market_symbol_count": 8,
                     "market_ai_elapsed_seconds_before_symbol": 8.5,
                     "full_round_elapsed_seconds_before_ai": 45.0,
+                    "market_symbol_start_reserve_seconds": 14.0,
+                    "remaining_market_ai_budget_seconds": 22.0,
+                    "can_start_another_market_symbol": True,
                     "budget_clock_scope": "market_ai_phase",
                     "large_unused_payload": "kept because aggregate is already compact",
                 },
@@ -183,6 +192,16 @@ def test_strategy_health_summary_report_uses_compact_market_diagnostics() -> Non
     assert diagnostics["market_analysis_progress"]["latest"]["processed_index"] == 0
     assert (
         diagnostics["market_analysis_progress"]["latest"]["budget_clock_scope"] == "market_ai_phase"
+    )
+    assert (
+        diagnostics["market_analysis_progress"]["latest"][
+            "market_symbol_start_reserve_seconds"
+        ]
+        == 14.0
+    )
+    assert (
+        diagnostics["market_analysis_progress"]["latest"]["can_start_another_market_symbol"]
+        is True
     )
     assert (
         diagnostics["market_analysis_progress"]["market_ai_elapsed_before_symbol_stats"]["median"]
@@ -866,6 +885,12 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                 "ranked_market_symbol_count_stats": {"count": 4, "median": 8},
                 "full_round_elapsed_before_ai_stats": {"count": 4, "median": 58.0},
                 "market_ai_elapsed_before_symbol_stats": {"count": 4, "median": 9.0},
+                "market_symbol_start_reserve_stats": {"count": 4, "median": 12.5},
+                "remaining_market_ai_budget_stats": {"count": 4, "median": 18.0},
+                "can_start_another_market_symbol_counts": [
+                    {"value": "False", "count": 3},
+                    {"value": "True", "count": 1},
+                ],
                 "budget_used_ratio_before_ai_stats": {"count": 4, "median": 0.83},
                 "market_ai_budget_used_ratio_before_symbol_stats": {
                     "count": 4,
@@ -878,6 +903,9 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                     "remaining_after_this_symbol": 7,
                     "market_ai_elapsed_seconds_before_symbol": 9.0,
                     "full_round_elapsed_seconds_before_ai": 58.0,
+                    "market_symbol_start_reserve_seconds": 12.5,
+                    "remaining_market_ai_budget_seconds": 18.0,
+                    "can_start_another_market_symbol": False,
                     "budget_clock_scope": "market_ai_phase",
                 },
                 "diagnostic_boundary": "Read-only market AI throughput aggregate",
@@ -994,8 +1022,12 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert progress["latest"]["ranked_market_symbol_count"] == 8
     assert progress["budget_used_ratio_before_ai_stats"]["median"] == 0.83
     assert progress["market_ai_elapsed_before_symbol_stats"]["median"] == 9.0
+    assert progress["market_symbol_start_reserve_stats"]["median"] == 12.5
+    assert progress["remaining_market_ai_budget_stats"]["median"] == 18.0
     assert progress["market_ai_budget_used_ratio_before_symbol_stats"]["median"] == 0.33
     assert progress["latest"]["budget_clock_scope"] == "market_ai_phase"
+    assert progress["latest"]["market_symbol_start_reserve_seconds"] == 12.5
+    assert progress["latest"]["can_start_another_market_symbol"] is False
     latest = diagnostics["latest_candidate_funnel"]
     assert latest["analysis_scope"] == "market"
     assert latest["scan_symbol_count"] == 120

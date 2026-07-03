@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -135,6 +136,7 @@ class HighRiskReviewService:
             field_name="High-risk review API base",
         )
         request_timeout = max(float(self._settings.high_risk_review_timeout_seconds or 30.0), 5.0)
+        deadline = self._monotonic_seconds() + request_timeout
         primary_max_tokens = cap_completion_tokens(
             self._settings.high_risk_review_max_tokens,
             floor=HIGH_RISK_REVIEW_TOKEN_FLOOR,
@@ -161,6 +163,11 @@ class HighRiskReviewService:
             attempt_specs,
             start=1,
         ):
+            remaining_timeout = deadline - self._monotonic_seconds()
+            if remaining_timeout <= 0:
+                raise TimeoutError(
+                    "high-risk review exceeded total timeout before a usable response"
+                )
             max_tokens = int(cast(int, attempt["max_tokens"]))
             _payload, content, metadata = await self.call_model(
                 api_base=api_base,
@@ -169,7 +176,7 @@ class HighRiskReviewService:
                 messages=cast(list[dict[str, str]], attempt["messages"]),
                 use_json_mode=bool(attempt["use_json_mode"]),
                 max_tokens=max_tokens,
-                request_timeout=request_timeout,
+                request_timeout=min(request_timeout, remaining_timeout),
             )
             attempts.append(
                 {
@@ -204,6 +211,9 @@ class HighRiskReviewService:
             )[:500],
             attempts=attempts,
         )
+
+    def _monotonic_seconds(self) -> float:
+        return asyncio.get_running_loop().time()
 
     async def call_model(
         self,

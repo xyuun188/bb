@@ -586,6 +586,8 @@ class DataService:
         symbol: str,
         *,
         wait_for_sentiment: bool = True,
+        block_on_remote_indicators: bool = True,
+        block_on_remote_derivatives: bool = True,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -621,10 +623,22 @@ class DataService:
             bounded_snapshot("ticker", self._get_ticker_snapshot(symbol))
         )
         indicators_task = asyncio.create_task(
-            bounded_snapshot("indicators", self._get_indicator_snapshot(symbol))
+            bounded_snapshot(
+                "indicators",
+                self._get_feature_indicator_snapshot(
+                    symbol,
+                    block_on_remote=block_on_remote_indicators,
+                ),
+            )
         )
         derivatives_task = asyncio.create_task(
-            bounded_snapshot("derivatives", self._get_derivatives_snapshot(symbol))
+            bounded_snapshot(
+                "derivatives",
+                self._get_feature_derivatives_snapshot(
+                    symbol,
+                    block_on_remote=block_on_remote_derivatives,
+                ),
+            )
         )
         gather_results: tuple[Any, Any, Any, Any] = await asyncio.gather(
             ticker_task,
@@ -876,24 +890,81 @@ class DataService:
         merged = list(dict.fromkeys([*configured, *subscribed, *fallback]))
         return merged[: max(int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP), 1)]
 
-    async def _get_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def _get_feature_indicator_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
+        getter = self._get_indicator_snapshot
+        try:
+            return await getter(symbol, block_on_remote=block_on_remote)
+        except TypeError as exc:
+            if "block_on_remote" not in safe_error_text(exc):
+                raise
+            return await getter(symbol)
+
+    async def _get_feature_derivatives_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
+        getter = self._get_derivatives_snapshot
+        try:
+            return await getter(symbol, block_on_remote=block_on_remote)
+        except TypeError as exc:
+            if "block_on_remote" not in safe_error_text(exc):
+                raise
+            return await getter(symbol)
+
+    async def _get_indicator_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         cache = self._indicator_snapshot_cache_map()
         cached = cache.get(normalized)
         if self._is_fresh_indicator_cache(cached):
             self._schedule_kline_background_refresh(normalized)
             return dict(cached.get("data") or {})
+        if isinstance(cached, dict) and not block_on_remote:
+            self._schedule_indicator_snapshot_refresh(normalized)
+            data = dict(cached.get("data") or {})
+            if data:
+                data["indicator_snapshot_stale"] = True
+                data["indicator_snapshot_refresh_in_background"] = True
+                return data
 
         tasks = self._indicator_snapshot_task_map()
         existing_task = tasks.get(normalized)
         if existing_task and not existing_task.done():
-            result = await existing_task
-            return dict(result or {})
+            if block_on_remote:
+                result = await asyncio.shield(existing_task)
+                return dict(result or {})
+            return {
+                "indicator_snapshot_available": False,
+                "indicator_snapshot_refresh_in_background": True,
+            }
+
+        if not block_on_remote:
+            cached_features = await self._indicator_features_from_cached_klines(normalized)
+            if cached_features:
+                self._store_indicator_snapshot_cache(normalized, cached_features)
+                self._schedule_kline_background_refresh(normalized)
+                return cached_features
+            self._schedule_indicator_snapshot_refresh(normalized)
+            return {
+                "indicator_snapshot_available": False,
+                "indicator_snapshot_refresh_in_background": True,
+            }
 
         task = asyncio.create_task(self._build_indicator_snapshot(normalized))
         tasks[normalized] = task
         try:
-            result = await task
+            result = await asyncio.shield(task)
             return dict(result or {})
         finally:
             if tasks.get(normalized) is task:
@@ -1000,6 +1071,25 @@ class DataService:
 
             task.add_done_callback(cleanup)
 
+    def _schedule_indicator_snapshot_refresh(self, symbol: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        normalized = self._normalize_symbols([symbol])[0]
+        tasks = self._indicator_snapshot_task_map()
+        existing = tasks.get(normalized)
+        if existing and not existing.done():
+            return
+        task = loop.create_task(self._build_indicator_snapshot(normalized))
+        tasks[normalized] = task
+
+        def cleanup(_task: asyncio.Task, refresh_symbol: str = normalized) -> None:
+            if tasks.get(refresh_symbol) is _task:
+                tasks.pop(refresh_symbol, None)
+
+        task.add_done_callback(cleanup)
+
     async def _refresh_klines_in_background(
         self,
         symbol: str,
@@ -1018,23 +1108,7 @@ class DataService:
 
     async def _build_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
         try:
-            cached_results = await asyncio.gather(
-                *(
-                    self._load_recent_cached_klines(symbol, timeframe, limit)
-                    for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
-                ),
-                return_exceptions=True,
-            )
-            cached_klines_by_timeframe = {
-                timeframe: rows
-                for (timeframe, _limit), rows in zip(
-                    KLINE_PERSIST_TIMEFRAME_LIMITS.items(),
-                    cached_results,
-                    strict=False,
-                )
-                if isinstance(rows, list) and rows
-            }
-            cached_features = self._indicator_features_from_timeframes(cached_klines_by_timeframe)
+            cached_features = await self._indicator_features_from_cached_klines(symbol)
             if cached_features:
                 self._store_indicator_snapshot_cache(symbol, cached_features)
                 self._schedule_kline_background_refresh(symbol)
@@ -1063,6 +1137,25 @@ class DataService:
         except Exception as e:
             logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))
             return {}
+
+    async def _indicator_features_from_cached_klines(self, symbol: str) -> dict[str, Any]:
+        cached_results = await asyncio.gather(
+            *(
+                self._load_recent_cached_klines(symbol, timeframe, limit)
+                for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
+            ),
+            return_exceptions=True,
+        )
+        cached_klines_by_timeframe = {
+            timeframe: rows
+            for (timeframe, _limit), rows in zip(
+                KLINE_PERSIST_TIMEFRAME_LIMITS.items(),
+                cached_results,
+                strict=False,
+            )
+            if isinstance(rows, list) and rows
+        }
+        return self._indicator_features_from_timeframes(cached_klines_by_timeframe)
 
     def _indicator_features_from_timeframes(
         self,
@@ -1374,7 +1467,12 @@ class DataService:
         except Exception as exc:
             logger.debug("persist klines failed", symbol=symbol, error=safe_error_text(exc))
 
-    async def _get_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def _get_derivatives_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
         now = datetime.now(UTC)
         normalized = self._normalize_symbols([symbol])[0]
         cache = getattr(self, "_derivatives_cache", None)
@@ -1394,17 +1492,33 @@ class DataService:
                 and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
             ):
                 self._schedule_derivatives_background_refresh(normalized)
-                return dict(cached.get("data") or {})
+                data = dict(cached.get("data") or {})
+                if data:
+                    data["derivatives_snapshot_stale"] = True
+                    data["derivatives_refresh_in_background"] = True
+                return data
+            if not block_on_remote:
+                self._schedule_derivatives_background_refresh(normalized)
+                data = dict(cached.get("data") or {})
+                if data:
+                    data["derivatives_snapshot_stale"] = True
+                    data["derivatives_refresh_in_background"] = True
+                    return data
 
         tasks = self._derivatives_refresh_task_map()
         existing_task = tasks.get(normalized)
         if existing_task and not existing_task.done():
-            result = await existing_task
-            return dict(result or {})
+            if block_on_remote:
+                result = await asyncio.shield(existing_task)
+                return dict(result or {})
+            return {"derivatives_refresh_in_background": True}
+        if not block_on_remote:
+            self._schedule_derivatives_background_refresh(normalized)
+            return {"derivatives_refresh_in_background": True}
         task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
         tasks[normalized] = task
         try:
-            result = await task
+            result = await asyncio.shield(task)
             return dict(result or {})
         finally:
             if tasks.get(normalized) is task:

@@ -2820,20 +2820,38 @@ class TradingService:
         symbol: str,
         *,
         wait_for_sentiment: bool = True,
+        block_on_remote_indicators: bool = True,
+        block_on_remote_derivatives: bool = True,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
         getter = self.data_service.get_feature_vector
         try:
             parameters = inspect.signature(getter).parameters
-            accepts_options = "wait_for_sentiment" in parameters or any(
+            accepts_var_kwargs = any(
                 param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+            )
+            accepts_options = "wait_for_sentiment" in parameters or accepts_var_kwargs
+            accepts_indicator_option = (
+                "block_on_remote_indicators" in parameters or accepts_var_kwargs
+            )
+            accepts_derivatives_option = (
+                "block_on_remote_derivatives" in parameters or accepts_var_kwargs
             )
         except (TypeError, ValueError):
             accepts_options = True
+            accepts_indicator_option = True
+            accepts_derivatives_option = True
 
+        kwargs: dict[str, Any] = {}
         if accepts_options:
-            return await getter(symbol, wait_for_sentiment=wait_for_sentiment)
+            kwargs["wait_for_sentiment"] = wait_for_sentiment
+        if accepts_indicator_option:
+            kwargs["block_on_remote_indicators"] = block_on_remote_indicators
+        if accepts_derivatives_option:
+            kwargs["block_on_remote_derivatives"] = block_on_remote_derivatives
+        if kwargs:
+            return await getter(symbol, **kwargs)
         return await getter(symbol)
 
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
@@ -3038,7 +3056,12 @@ class TradingService:
         """
         try:
             fresh = await asyncio.wait_for(
-                self._get_feature_vector_snapshot(symbol, wait_for_sentiment=False),
+                self._get_feature_vector_snapshot(
+                    symbol,
+                    wait_for_sentiment=False,
+                    block_on_remote_indicators=False,
+                    block_on_remote_derivatives=False,
+                ),
                 timeout=8.0,
             )
             if self._is_valid_feature_vector(fresh):
@@ -3059,7 +3082,12 @@ class TradingService:
     async def _fresh_feature_vector_for_price_recheck(self, symbol: str) -> Any | None:
         try:
             fresh = await asyncio.wait_for(
-                self._get_feature_vector_snapshot(symbol, wait_for_sentiment=False),
+                self._get_feature_vector_snapshot(
+                    symbol,
+                    wait_for_sentiment=False,
+                    block_on_remote_indicators=False,
+                    block_on_remote_derivatives=False,
+                ),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
             if self._is_valid_feature_vector(fresh):
@@ -3184,7 +3212,8 @@ class TradingService:
         completed = int(completed_valid_count or 0)
         exact_met = bool(eligible and completed >= quorum)
         near_quorum_met = bool(eligible and not exact_met and completed >= near_quorum)
-        met = bool(exact_met or near_quorum_met)
+        budget_ready_met = bool(eligible and completed >= configured)
+        met = bool(exact_met or near_quorum_met or budget_ready_met)
         return met, {
             "read_only": True,
             "is_entry_gate": False,
@@ -3192,9 +3221,11 @@ class TradingService:
             "met": met,
             "exact_met": exact_met,
             "near_quorum_met": near_quorum_met,
+            "budget_ready_met": budget_ready_met,
             "completed_valid_count": completed,
             "quorum": int(quorum),
             "near_quorum": int(near_quorum),
+            "budget_ready_quorum": int(configured),
             "allowed_deficit": int(allowed_deficit),
             "total_fetch_count": int(total),
             "configured_market_symbol_limit": int(configured),
@@ -4919,7 +4950,20 @@ class TradingService:
                 async with sem:
                     try:
                         return sym, await asyncio.wait_for(
-                            self._get_feature_vector_snapshot(sym, wait_for_sentiment=False),
+                            self._get_feature_vector_snapshot(
+                                sym,
+                                wait_for_sentiment=False,
+                                block_on_remote_indicators=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
+                                block_on_remote_derivatives=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
+                            ),
                             timeout=feature_timeout,
                         )
                     except TimeoutError:
@@ -7951,6 +7995,8 @@ class TradingService:
                         self._get_feature_vector_snapshot(
                             normalized_symbol or symbol,
                             wait_for_sentiment=False,
+                            block_on_remote_indicators=False,
+                            block_on_remote_derivatives=False,
                         ),
                         timeout=feature_timeout,
                     )
@@ -9106,7 +9152,12 @@ class TradingService:
 
         try:
             fresh = await asyncio.wait_for(
-                self._get_feature_vector_snapshot(normalized, wait_for_sentiment=False),
+                self._get_feature_vector_snapshot(
+                    normalized,
+                    wait_for_sentiment=False,
+                    block_on_remote_indicators=False,
+                    block_on_remote_derivatives=False,
+                ),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
             price = self._price_from_feature_like(fresh)

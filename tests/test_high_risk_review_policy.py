@@ -180,6 +180,31 @@ class GateReviewer:
         self.failures.append(reason)
 
 
+class DeadlineReviewer(HighRiskReviewService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.now = 0.0
+        self.calls: list[float] = []
+
+    def _monotonic_seconds(self) -> float:
+        return self.now
+
+    async def call_model(
+        self,
+        *,
+        api_base: str,
+        api_key: str,
+        model: str,
+        messages: list[dict[str, str]],
+        use_json_mode: bool,
+        max_tokens: int,
+        request_timeout: float,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        self.calls.append(request_timeout)
+        self.now = 13.0
+        return ({}, "", {"finish_reason": "length"})
+
+
 class LeakyGateReviewer(GateReviewer):
     def __init__(self, leaked_value: str) -> None:
         super().__init__()
@@ -332,6 +357,24 @@ async def test_high_risk_review_runtime_caps_oversized_setting(
     )
 
     assert reviewer.calls[0]["max_tokens"] == HIGH_RISK_REVIEW_TOKEN_CAP
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_retries_share_total_timeout_budget(
+    high_risk_settings: None,
+) -> None:
+    reviewer = DeadlineReviewer()
+
+    with pytest.raises(TimeoutError, match="exceeded total timeout"):
+        await reviewer.review_trade(
+            {"symbol": "BTC/USDT", "side": "long"},
+            api_base="https://api.deepseek.com",
+            api_key=settings.high_risk_review_api_key,
+            model="deepseek-reasoner",
+        )
+
+    assert len(reviewer.calls) == 1
+    assert reviewer.calls[0] == 12.0
 
 
 @pytest.mark.asyncio

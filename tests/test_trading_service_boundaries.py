@@ -714,6 +714,8 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     assert met is True
     assert diagnostics["quorum"] == 16
     assert diagnostics["is_entry_gate"] is False
+    assert diagnostics["budget_ready_quorum"] == 8
+    assert diagnostics["budget_ready_met"] is True
 
     near_met, near_diagnostics = service._auto_scan_feature_fetch_early_quorum(
         completed_valid_count=15,
@@ -727,9 +729,23 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     assert near_diagnostics["exact_met"] is False
     assert near_diagnostics["near_quorum_met"] is True
     assert near_diagnostics["near_quorum"] == 15
+    assert near_diagnostics["budget_ready_met"] is True
+
+    budget_ready_met, budget_ready_diagnostics = service._auto_scan_feature_fetch_early_quorum(
+        completed_valid_count=8,
+        total_fetch_count=48,
+        configured_limit=8,
+        run_market_analysis=True,
+        run_position_analysis=False,
+        auto_scan=True,
+    )
+    assert budget_ready_met is True
+    assert budget_ready_diagnostics["exact_met"] is False
+    assert budget_ready_diagnostics["near_quorum_met"] is False
+    assert budget_ready_diagnostics["budget_ready_met"] is True
 
     not_met, _diagnostics = service._auto_scan_feature_fetch_early_quorum(
-        completed_valid_count=14,
+        completed_valid_count=7,
         total_fetch_count=48,
         configured_limit=8,
         run_market_analysis=True,

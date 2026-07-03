@@ -6,9 +6,9 @@ into a unified FeatureVector dataclass consumed by all AI models.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import math
 from typing import Any
 
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
@@ -72,6 +72,8 @@ class FeatureVector:
     indicator_price_gap_pct: float = 0.0
     price_reconciliation_warning: str = ""
     indicator_snapshot_available: bool = False
+    indicator_snapshot_stale: bool = False
+    indicator_snapshot_refresh_in_background: bool = False
 
     # --- Technical indicators (from latest candle) ---
     rsi_14: float = 50.0
@@ -114,6 +116,8 @@ class FeatureVector:
     orderbook_ask_depth: float = 0.0
     orderbook_imbalance: float = 0.0
     liquidation_risk_score: float = 0.0
+    derivatives_snapshot_stale: bool = False
+    derivatives_refresh_in_background: bool = False
     sector_relative_strength: float = 0.0
 
     # --- Sentiment data ---
