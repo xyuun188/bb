@@ -550,6 +550,36 @@ async def test_kline_coverage_refresh_rotates_symbols_and_timeframes(
     }
 
 
+def test_kline_coverage_targets_all_subscribed_symbols_even_above_config_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._kline_coverage_symbols = ["BTC/USDT", "ETH/USDT"]
+    service.ws_client = type(
+        "Ws",
+        (),
+        {
+            "_subscribe_symbols": [
+                "BTC/USDT",
+                "ETH/USDT",
+                "SOL/USDT",
+                "ADA/USDT",
+                "FIL/USDT",
+            ]
+        },
+    )()
+
+    monkeypatch.setattr(data_service_module, "KLINE_COVERAGE_REFRESH_SYMBOL_CAP", 2)
+
+    assert service._kline_coverage_target_symbols()[:5] == [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "ADA/USDT",
+        "FIL/USDT",
+    ]
+
+
 def test_feature_vector_keeps_market_feature_source_timeframes() -> None:
     from data_feed.feature_vector import build_feature_vector
 

@@ -209,9 +209,7 @@ class DataService:
             available = await self.rest_client.get_available_symbols()
             all_symbols = [s["symbol"] for s in available]
             self.ws_client._subscribe_symbols = all_symbols if all_symbols else settings.symbols
-            self._kline_coverage_symbols = self._normalize_symbols(
-                all_symbols[: max(int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP), 1)]
-            )
+            self._kline_coverage_symbols = self._normalize_symbols(all_symbols)
             logger.info(
                 "ws subscribing to all symbols", count=len(self.ws_client._subscribe_symbols)
             )
@@ -888,7 +886,13 @@ class DataService:
         )
         fallback = self._normalize_symbols(settings.symbols)
         merged = list(dict.fromkeys([*configured, *subscribed, *fallback]))
-        return merged[: max(int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP), 1)]
+        target_limit = max(
+            int(KLINE_COVERAGE_REFRESH_SYMBOL_CAP),
+            len(configured),
+            len(subscribed),
+            1,
+        )
+        return merged[:target_limit]
 
     async def _get_feature_indicator_snapshot(
         self,
