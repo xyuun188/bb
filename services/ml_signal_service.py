@@ -654,6 +654,11 @@ def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
     hindsight ``best_action`` is still hold are useful for audit, but they dilute
     the directional profit labels and keep readiness degraded. Sample-count gates
     should block live influence when there are not enough trade-opportunity rows.
+
+    Missed-opportunity holds are useful as counterfactual opportunity discovery,
+    but they are not directional decisions. Keep them as a minority supplement in
+    the same chronological stream so the walk-forward holdout cannot be dominated
+    by recent low-confidence holds that only prove "a move happened".
     """
 
     capped_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
@@ -662,54 +667,52 @@ def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
         deduped.setdefault(_shadow_row_id(row), row)
     recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
     trainable_rows = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
-    if len(trainable_rows) <= capped_limit:
-        return sorted(trainable_rows, key=_shadow_sort_key, reverse=True)
 
     selected: list[Any] = []
     selected_ids: set[Any] = set()
+    missed_count = 0
+    directional_count = 0
 
-    def add_from(candidates: list[Any], target_count: int, *, quality_first: bool = False) -> None:
-        source = _sort_shadow_quality_first(candidates) if quality_first else candidates
-        for candidate in source:
-            if len(selected) >= capped_limit or len(selected) >= target_count:
-                return
-            candidate_id = _shadow_row_id(candidate)
-            if candidate_id in selected_ids:
-                continue
-            selected.append(candidate)
-            selected_ids.add(candidate_id)
+    def can_add_missed() -> bool:
+        if directional_count <= 0:
+            return False
+        projected_total = len(selected) + 1
+        projected_missed = missed_count + 1
+        if projected_total <= 0:
+            return False
+        missed_share = projected_missed / projected_total
+        missed_to_directional = projected_missed / max(directional_count, 1)
+        return (
+            missed_share <= TRAINING_MAX_MISSED_OPPORTUNITY_SHARE
+            and missed_to_directional <= TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO
+        )
 
-    non_hold_target = int(capped_limit * TRAINING_MIN_NON_HOLD_SHARE)
-    missed_share_cap = int(capped_limit * TRAINING_MAX_MISSED_OPPORTUNITY_SHARE)
-    non_hold = [
-        row
-        for row in trainable_rows
-        if _shadow_action(row, "decision_action") in {"long", "short"}
-    ]
-    missed_opportunities = [
-        row
-        for row in trainable_rows
-        if _shadow_action(row, "decision_action") == "hold"
-        and bool(getattr(row, "missed_opportunity", False))
-        and _shadow_action(row, "best_action") in {"long", "short"}
-    ]
-    missed_target = min(
-        len(missed_opportunities),
-        max(
-            missed_share_cap,
-            int(len(non_hold) * TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO),
-        ),
-    )
-    add_from(
-        non_hold,
-        max(non_hold_target, min(len(non_hold), capped_limit)),
-        quality_first=True,
-    )
-    add_from(
-        missed_opportunities,
-        min(capped_limit, len(selected) + min(missed_target, capped_limit - len(selected))),
-        quality_first=True,
-    )
+    def add(candidate: Any) -> None:
+        nonlocal directional_count, missed_count
+        candidate_id = _shadow_row_id(candidate)
+        if candidate_id in selected_ids or len(selected) >= capped_limit:
+            return
+        selected.append(candidate)
+        selected_ids.add(candidate_id)
+        if _shadow_action(candidate, "decision_action") in {"long", "short"}:
+            directional_count += 1
+        elif bool(getattr(candidate, "missed_opportunity", False)):
+            missed_count += 1
+
+    for row in trainable_rows:
+        if len(selected) >= capped_limit:
+            break
+        action = _shadow_action(row, "decision_action")
+        if action in {"long", "short"}:
+            add(row)
+            continue
+        if (
+            action == "hold"
+            and bool(getattr(row, "missed_opportunity", False))
+            and _shadow_action(row, "best_action") in {"long", "short"}
+            and can_add_missed()
+        ):
+            add(row)
     return sorted(selected[:capped_limit], key=_shadow_sort_key, reverse=True)
 
 
@@ -729,11 +732,24 @@ def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
     weight_total = float(
         frame.get("sample_weight", pd.Series([1.0] * len(frame))).astype(float).sum()
     )
+    missed_count = (
+        int(frame.get("missed_opportunity", pd.Series([], dtype=bool)).astype(bool).sum())
+        if sample_count
+        else 0
+    )
+    directional_count = (
+        int(frame.get("decision_action", pd.Series([], dtype=str)).isin(["long", "short"]).sum())
+        if sample_count
+        else 0
+    )
     return {
         "sample_count": sample_count,
         "decision_action_counts": counts("decision_action"),
         "best_action_counts": counts("best_action"),
         "data_quality_status_counts": counts("data_quality_status"),
+        "directional_decision_count": directional_count,
+        "missed_opportunity_count": missed_count,
+        "missed_opportunity_share": round(missed_count / max(sample_count, 1), 4),
         "effective_weight": round(weight_total, 4),
         "effective_weight_ratio": round(weight_total / max(sample_count, 1), 4),
     }

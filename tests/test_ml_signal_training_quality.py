@@ -139,10 +139,12 @@ def _shadow_row(
     missed: bool = False,
     confidence: float = 0.7,
     feature_snapshot: dict[str, object] | None = None,
+    created_at: datetime | None = None,
 ) -> SimpleNamespace:
+    row_created_at = created_at or datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC)
     return SimpleNamespace(
         id=row_id,
-        created_at=datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC),
+        created_at=row_created_at,
         symbol=f"TEST{row_id}/USDT",
         analysis_type="market",
         decision_action=action,
@@ -153,7 +155,7 @@ def _shadow_row(
         short_return_pct=0.14 if best_action == "short" else -0.05,
         best_action=best_action,
         missed_opportunity=missed,
-        due_at=datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC) + timedelta(minutes=30),
+        due_at=row_created_at + timedelta(minutes=30),
     )
 
 
@@ -614,10 +616,10 @@ def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     missed_count = sum(bool(row.missed_opportunity) for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 18
+    assert len(selected) == 12
     assert len(set(selected_ids)) == len(selected_ids)
     assert non_hold_count == 8
-    assert missed_count == 10
+    assert missed_count == 4
     assert best_trade_count == len(selected)
     assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
 
@@ -678,13 +680,14 @@ def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality
     noisy_selected = [row for row in selected if row.decision_confidence < 0.05]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 20
+    assert len(selected) == 18
     assert len(noisy_selected) == 0
     assert non_hold_count == 12
     assert best_trade_count == len(selected)
 
 
 def test_shadow_training_selection_includes_low_confidence_missed_hold_opportunities() -> None:
+    base_time = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
     noisy_missed_holds = [
         _shadow_row(
             30_000 - idx,
@@ -692,6 +695,7 @@ def test_shadow_training_selection_includes_low_confidence_missed_hold_opportuni
             best_action="long" if idx % 2 == 0 else "short",
             missed=True,
             confidence=0.01,
+            created_at=base_time - timedelta(hours=2, minutes=idx),
         )
         for idx in range(40)
     ]
@@ -701,6 +705,7 @@ def test_shadow_training_selection_includes_low_confidence_missed_hold_opportuni
             action="long" if idx % 2 == 0 else "short",
             best_action="long" if idx % 2 == 0 else "short",
             confidence=0.82,
+            created_at=base_time - timedelta(minutes=idx),
         )
         for idx in range(8)
     ]
@@ -710,9 +715,9 @@ def test_shadow_training_selection_includes_low_confidence_missed_hold_opportuni
         limit=20,
     )
 
-    assert len(selected) == 15
+    assert len(selected) == 12
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 7
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 4
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
 
 
@@ -734,9 +739,55 @@ def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds
 
     selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows], limit=20)
 
-    assert len(selected) == 12
+    assert selected == []
     assert not any(row.id in {item.id for item in noisy_holds} for row in selected)
-    assert all(row.missed_opportunity for row in selected)
+
+
+def test_shadow_training_selection_caps_recent_missed_hold_bursts() -> None:
+    base_time = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    recent_missed_rows = [
+        _shadow_row(
+            30_000 - idx,
+            action="hold",
+            best_action="long" if idx % 2 == 0 else "short",
+            missed=True,
+            confidence=0.01,
+            created_at=base_time - timedelta(minutes=idx),
+        )
+        for idx in range(40)
+    ]
+    directional_rows = [
+        _shadow_row(
+            20_000 - idx,
+            action="long" if idx % 2 == 0 else "short",
+            best_action="long" if idx % 2 == 0 else "short",
+            confidence=0.82,
+            created_at=base_time - timedelta(hours=1, minutes=idx),
+        )
+        for idx in range(20)
+    ]
+    older_missed_rows = [
+        _shadow_row(
+            10_000 - idx,
+            action="hold",
+            best_action="long" if idx % 2 == 0 else "short",
+            missed=True,
+            confidence=0.01,
+            created_at=base_time - timedelta(hours=2, minutes=idx),
+        )
+        for idx in range(40)
+    ]
+
+    selected = select_shadow_training_rows(
+        [*recent_missed_rows, *directional_rows, *older_missed_rows],
+        limit=60,
+    )
+
+    newest_quartile = selected[: max(int(len(selected) * 0.25), 1)]
+    assert len(selected) == 30
+    assert sum(row.decision_action in {"long", "short"} for row in selected) == 20
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 10
+    assert all(row.decision_action in {"long", "short"} for row in newest_quartile)
 
 
 def test_train_from_frame_reports_training_window_composition() -> None:
@@ -923,12 +974,12 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 15
+    assert len(selected) == 12
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 7
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 4
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
     assert not any(row.id >= 10_000 for row in selected)
 

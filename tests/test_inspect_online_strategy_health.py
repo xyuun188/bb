@@ -295,6 +295,9 @@ def test_strategy_health_entry_only_report_is_compact_and_keeps_guards() -> None
                 "sample_count": 19971,
                 "decision_action_counts": {"hold": 12000, "long": 3000, "short": 4971},
                 "data_quality_status_counts": {"included": 4800, "downweighted": 15171},
+                "directional_decision_count": 7971,
+                "missed_opportunity_count": 4100,
+                "missed_opportunity_share": 0.2053,
             },
         },
         "closed_position_pnl_diagnostics": {
@@ -622,6 +625,12 @@ def test_strategy_health_entry_only_report_is_compact_and_keeps_guards() -> None
             "hold"
         ]
         == 12000
+    )
+    assert (
+        compact["local_ml_readiness"]["training_window_composition"][
+            "missed_opportunity_share"
+        ]
+        == 0.2053
     )
     assert compact["market_entry_final_skip_kind_counts"]["executed"] == 1
     assert len(compact["entry_examples"]) == 2
