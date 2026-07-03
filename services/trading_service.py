@@ -1146,11 +1146,16 @@ class TradingService:
             if isinstance(last_failure_at, datetime)
             else None
         )
-        status = "pending"
-        if isinstance(last_failure_at, datetime) and (
+        fresh_success_available = (
+            isinstance(last_success_age_seconds, (int, float))
+            and last_success_age_seconds <= stale_after_seconds
+        )
+        failure_after_success = isinstance(last_failure_at, datetime) and (
             not isinstance(last_success_at, datetime) or last_failure_at > last_success_at
-        ):
-            status = "warning"
+        )
+        status = "pending"
+        if failure_after_success:
+            status = "degraded" if fresh_success_available else "warning"
         elif isinstance(last_success_at, datetime):
             status = (
                 "stale"
@@ -1180,6 +1185,10 @@ class TradingService:
                 round(last_failure_age_seconds, 3)
                 if last_failure_age_seconds is not None
                 else None
+            ),
+            "fresh_success_available": bool(fresh_success_available),
+            "last_failure_covered_by_fresh_success": bool(
+                failure_after_success and fresh_success_available
             ),
             "last_error": getattr(self, "_okx_authoritative_sync_last_error", None),
             "last_duration_seconds": getattr(

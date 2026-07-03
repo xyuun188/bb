@@ -604,6 +604,33 @@ async def test_okx_authoritative_sync_loop_records_failures(
     assert "OKX timeout" in status["last_error"]
 
 
+def test_okx_authoritative_sync_recent_success_downgrades_later_timeout() -> None:
+    service = TradingService.__new__(TradingService)
+    now = datetime(2026, 7, 3, 12, 0, tzinfo=UTC)
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_started_at = now - timedelta(seconds=6)
+    service._okx_authoritative_sync_last_success_at = now - timedelta(seconds=40)
+    service._okx_authoritative_sync_last_failure_at = now - timedelta(seconds=5)
+    service._okx_authoritative_sync_last_error = "TimeoutError"
+    service._okx_authoritative_sync_last_duration_seconds = 10.0
+    service._okx_authoritative_sync_last_result_count = 1
+    service._okx_authoritative_sync_last_result_kinds = {"snapshot_update": 1}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_degraded_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 3
+    service._okx_authoritative_sync_failure_count = 1
+    service._okx_authoritative_sync_task = None
+    service._okx_order_fact_sync_status_payload = lambda _now=None: {"status": "ok"}
+
+    status = service._okx_authoritative_sync_status_payload(now)
+
+    assert status["status"] == "degraded"
+    assert status["fresh_success_available"] is True
+    assert status["last_failure_covered_by_fresh_success"] is True
+    assert service._okx_authoritative_sync_entry_block_reason(now) is None
+
+
 def test_successful_runtime_round_clears_recovered_scope_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -1556,6 +1583,37 @@ async def test_entry_execution_policy_blocks_entries_when_okx_sync_is_unhealthy(
     assert result.blocker == "okx_authoritative_sync_unhealthy"
     assert result.data["stage_status"] == "blocked"
     assert result.data["execution_blocker"] == "okx_authoritative_sync_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_entry_execution_policy_allows_degraded_okx_sync_with_fresh_snapshot() -> None:
+    service = TradingService.__new__(TradingService)
+    service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "degraded",
+        "last_error": "TimeoutError",
+        "last_requires_attention_count": 0,
+        "fresh_success_available": True,
+        "last_failure_covered_by_fresh_success": True,
+        "source": "okx_private_api_current_positions",
+    }
+
+    class FakeEntryExecutionPipeline:
+        async def evaluate(self, decision, model_name, model_mode, open_positions):
+            assert decision.is_entry
+            return PolicyGateResult.allow({"intent": "entry-passthrough"})
+
+    service.entry_execution_pipeline = FakeEntryExecutionPipeline()
+
+    result = await service.evaluate_entry_execution_policy(
+        _decision(Action.LONG),
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is True
+    assert result.data["intent"] == "entry-passthrough"
 
 
 @pytest.mark.asyncio
