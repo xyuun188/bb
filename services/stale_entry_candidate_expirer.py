@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 from collections.abc import Awaitable, Callable
@@ -11,13 +12,20 @@ from typing import Any
 
 import structlog
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm.attributes import flag_modified
 
 from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_freshness import ENTRY_DECISION_MAX_AGE_SECONDS
-from services.decision_state import DecisionStage, DecisionStageStatus
+from services.decision_state import (
+    TERMINAL_STATUSES,
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+    decision_state_from_raw,
+)
 from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from web_dashboard.api.text_sanitize import sanitize_text
@@ -49,10 +57,12 @@ def _legacy_sql_like_patterns(pattern: str) -> tuple[str, ...]:
 WAITING_ENTRY_PATTERNS = (
     *_legacy_sql_like_patterns("已进入本轮开仓候选排序%"),
     *_legacy_sql_like_patterns("本轮还在分析或排队中%"),
+    *_legacy_sql_like_patterns("候选排序超时后复核%"),
 )
 PENDING_EXECUTION_PATTERNS = (
     *_legacy_sql_like_patterns("正在提交 OKX%"),
     *_legacy_sql_like_patterns("本轮执行仍在处理中%"),
+    *_legacy_sql_like_patterns("%开仓信号已经进入 OKX 下单流程，但在 45 秒内%"),
     "Execution still pending this round%",
 )
 
@@ -111,6 +121,15 @@ class StaleEntryCandidateExpirer:
                     cutoff=None,
                     reason_patterns=PENDING_EXECUTION_PATTERNS,
                 )
+                open_state_rows = await self._load_stale_open_state_rows(
+                    session,
+                    cutoff=waiting_cutoff,
+                )
+                waiting_rows, pending_rows = _merge_open_state_repairs(
+                    waiting_rows,
+                    pending_rows,
+                    open_state_rows,
+                )
 
                 async def order_count_provider(decision_id: int) -> int:
                     count = (
@@ -152,12 +171,23 @@ class StaleEntryCandidateExpirer:
         current_time = now or datetime.utcnow()
         expired = 0
         for row in waiting_rows:
+            if not _needs_terminal_state_repair(row):
+                continue
             reason = self._waiting_expiration_reason(row)
-            self._apply_reason(row, reason)
+            self._apply_reason(
+                row,
+                reason,
+                stage=DecisionStage.RISK_CHECK,
+                status=DecisionStageStatus.SKIPPED,
+                skip_kind="stale_entry_candidate_expired",
+                terminal=True,
+            )
             expired += 1
 
         for row in pending_rows:
             if not pending_execution_is_stale(row, current_time):
+                continue
+            if not _needs_terminal_state_repair(row):
                 continue
             order_count = await order_count_provider(int(row.id))
             if order_count > 0:
@@ -165,9 +195,36 @@ class StaleEntryCandidateExpirer:
                     "本地订单记录已生成，但成交或撤单状态还没有最终确认。"
                     "请以执行记录中的最新订单状态为准。"
                 )
+                self._apply_reason(
+                    row,
+                    reason,
+                    stage=DecisionStage.EXCHANGE_CONFIRM,
+                    status=DecisionStageStatus.PENDING,
+                    skip_kind="pending_exchange_order_status",
+                    terminal=False,
+                    selected_for_execution=True,
+                )
             else:
                 reason = pending_execution_failed_reason(row.symbol, row.action)
-            self._apply_reason(row, reason)
+                self._apply_reason(
+                    row,
+                    reason,
+                    stage=DecisionStage.EXCHANGE_SUBMIT,
+                    status=DecisionStageStatus.FAILED,
+                    skip_kind="pending_entry_execution_expired",
+                    terminal=True,
+                )
+                row.raw_llm_response = append_decision_stage(
+                    _safe_raw_response(row.raw_llm_response),
+                    DecisionStage.LOCAL_SYNC,
+                    DecisionStageStatus.SKIPPED,
+                    "没有成交结果，本地持仓未改动。",
+                    {
+                        "skip_kind": "pending_entry_execution_expired",
+                        "fallback_final_state": True,
+                        "error_type": "missing_execution_result",
+                    },
+                )
             expired += 1
 
         if expired and flush_callback is not None:
@@ -189,6 +246,25 @@ class StaleEntryCandidateExpirer:
         if cutoff is not None:
             stmt = stmt.where(AIDecision.created_at <= cutoff)
         return list((await session.execute(stmt)).scalars().all())
+
+    async def _load_stale_open_state_rows(
+        self,
+        session: Any,
+        *,
+        cutoff: datetime,
+    ) -> list[AIDecision]:
+        stmt = (
+            select(AIDecision)
+            .where(
+                AIDecision.was_executed.is_(False),
+                AIDecision.action.in_(["long", "short", "open_long", "open_short"]),
+                AIDecision.created_at <= cutoff,
+            )
+            .order_by(AIDecision.id.desc())
+            .limit(500)
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        return [row for row in rows if _needs_terminal_state_repair(row)]
 
     def _waiting_expiration_reason(self, row: Any) -> str:
         raw = _safe_raw_response(row.raw_llm_response)
@@ -226,16 +302,44 @@ class StaleEntryCandidateExpirer:
             "行情快照已经过期。为避免追单，本次旧信号不再执行，下一轮重新分析。"
         )
 
-    def _apply_reason(self, row: Any, reason: str) -> None:
+    def _apply_reason(
+        self,
+        row: Any,
+        reason: str,
+        *,
+        stage: str,
+        status: str,
+        skip_kind: str,
+        terminal: bool,
+        selected_for_execution: bool = False,
+    ) -> None:
         clean_reason = str(sanitize_text(reason) or reason)
         raw = _safe_raw_response(row.raw_llm_response)
         opportunity = raw.get("opportunity_score")
         if not isinstance(opportunity, dict):
             opportunity = {}
-        opportunity["selected_for_execution"] = False
+        opportunity["selected_for_execution"] = bool(selected_for_execution)
         opportunity["selection_reason"] = clean_reason
+        opportunity["execution_final_state"] = status
+        opportunity["execution_final_blocker"] = skip_kind
         raw["opportunity_score"] = opportunity
+        raw["skip_kind"] = skip_kind
+        raw["reason"] = clean_reason
+        raw["execution_skipped"] = bool(terminal)
+        raw["stale_entry_candidate_expired"] = bool(terminal)
+        raw = append_decision_stage(
+            raw,
+            stage,
+            status,
+            clean_reason,
+            {
+                "skip_kind": skip_kind,
+                "fallback_final_state": bool(terminal),
+                "selected_for_execution": bool(selected_for_execution),
+            },
+        )
         row.raw_llm_response = raw
+        _mark_raw_response_modified(row)
         row.execution_reason = clean_reason
 
 
@@ -247,6 +351,45 @@ def _safe_raw_response(value: Any) -> dict[str, Any]:
         except Exception:
             raw = {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _needs_terminal_state_repair(row: Any) -> bool:
+    raw = _safe_raw_response(getattr(row, "raw_llm_response", None))
+    summary = decision_state_from_raw(raw).get("summary")
+    if not isinstance(summary, dict):
+        return True
+    final_status = str(summary.get("final_status") or "")
+    return final_status not in TERMINAL_STATUSES
+
+
+def _merge_open_state_repairs(
+    waiting_rows: list[Any],
+    pending_rows: list[Any],
+    open_state_rows: list[Any],
+) -> tuple[list[Any], list[Any]]:
+    waiting_by_id = {int(getattr(row, "id", 0) or 0): row for row in waiting_rows}
+    pending_by_id = {int(getattr(row, "id", 0) or 0): row for row in pending_rows}
+    for row in open_state_rows:
+        row_id = int(getattr(row, "id", 0) or 0)
+        if not row_id or row_id in waiting_by_id or row_id in pending_by_id:
+            continue
+        if _is_pending_submit_row(row):
+            pending_by_id[row_id] = row
+        else:
+            waiting_by_id[row_id] = row
+    return list(waiting_by_id.values()), list(pending_by_id.values())
+
+
+def _is_pending_submit_row(row: Any) -> bool:
+    reason = str(getattr(row, "execution_reason", "") or "").strip()
+    if reason and is_pending_execution_reason(reason):
+        return True
+    return _pending_execution_started_at(row) is not None
+
+
+def _mark_raw_response_modified(row: Any) -> None:
+    with contextlib.suppress(Exception):
+        flag_modified(row, "raw_llm_response")
 
 
 def pending_execution_is_stale(row: Any, now: datetime | None = None) -> bool:

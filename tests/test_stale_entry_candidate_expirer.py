@@ -6,13 +6,18 @@ from typing import Any
 
 import pytest
 
-from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+    decision_state_from_raw,
+)
 from services.stale_entry_candidate_expirer import (
     StaleEntryCandidateExpirer,
     action_label,
     is_pending_execution_reason,
-    pending_execution_is_stale,
     pending_execution_failed_reason,
+    pending_execution_is_stale,
 )
 
 
@@ -88,6 +93,78 @@ async def test_stale_entry_candidate_expirer_marks_waiting_rows() -> None:
     assert flushed
     assert "机会评分 0.7000 低于执行门槛 0.80" in waiting[0].execution_reason
     assert waiting[0].raw_llm_response["opportunity_score"]["selected_for_execution"] is False
+    state = decision_state_from_raw(waiting[0].raw_llm_response)["summary"]
+    assert state["final_stage"] == DecisionStage.RISK_CHECK
+    assert state["final_status"] == DecisionStageStatus.SKIPPED
+    assert waiting[0].raw_llm_response["skip_kind"] == "stale_entry_candidate_expired"
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_expirer_repairs_old_expired_reason_with_pending_state() -> None:
+    raw = append_decision_stage(
+        {
+            "opportunity_score": {
+                "score": 0.7,
+                "min_score_required": 0.8,
+                "expected_net_return_pct": 0.2,
+            }
+        },
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.PENDING,
+        "已进入执行前严重风险检查。",
+    )
+    waiting = [
+        _row(
+            raw=raw,
+        )
+    ]
+    waiting[0].execution_reason = (
+        "候选排序超时后复核：BTC/USDT 本次做多机会评分 0.7000 "
+        "低于执行门槛 0.80，旧信号不再执行，下一轮重新分析。"
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        waiting,
+        [],
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    state = decision_state_from_raw(waiting[0].raw_llm_response)["summary"]
+    assert state["final_stage"] == DecisionStage.RISK_CHECK
+    assert state["final_status"] == DecisionStageStatus.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_expirer_does_not_duplicate_terminal_state() -> None:
+    raw = append_decision_stage(
+        {
+            "opportunity_score": {
+                "score": 0.7,
+                "min_score_required": 0.8,
+                "expected_net_return_pct": 0.2,
+            }
+        },
+        DecisionStage.RISK_CHECK,
+        DecisionStageStatus.SKIPPED,
+        "候选排序超时后复核：旧信号不再执行，下一轮重新分析。",
+    )
+    waiting = [_row(raw=raw)]
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        waiting,
+        [],
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 0
+    assert len(waiting[0].raw_llm_response["decision_state_machine"]["stages"]) == 1
 
 
 @pytest.mark.asyncio
@@ -107,9 +184,19 @@ async def test_stale_entry_candidate_expirer_marks_pending_rows_by_order_state()
     assert expired == 2
     assert "45 秒内没有生成本地订单记录" in pending_without_order.execution_reason
     assert "本地订单记录已生成" in pending_with_order.execution_reason
+    without_order_state = decision_state_from_raw(pending_without_order.raw_llm_response)[
+        "summary"
+    ]
+    with_order_state = decision_state_from_raw(pending_with_order.raw_llm_response)["summary"]
+    assert without_order_state["final_stage"] == DecisionStage.LOCAL_SYNC
+    assert without_order_state["final_status"] == DecisionStageStatus.SKIPPED
+    assert pending_without_order.raw_llm_response["skip_kind"] == "pending_entry_execution_expired"
     assert (
-        pending_with_order.raw_llm_response["opportunity_score"]["selected_for_execution"] is False
+        pending_with_order.raw_llm_response["opportunity_score"]["selected_for_execution"] is True
     )
+    assert with_order_state["final_stage"] == DecisionStage.EXCHANGE_CONFIRM
+    assert with_order_state["final_status"] == DecisionStageStatus.PENDING
+    assert pending_with_order.raw_llm_response["skip_kind"] == "pending_exchange_order_status"
 
 
 @pytest.mark.asyncio
@@ -167,6 +254,9 @@ async def test_pending_execution_expiry_prefers_exchange_submit_stage_time() -> 
     assert expired == 1
     assert "45 秒内没有生成本地订单记录" in pending_row.execution_reason
     assert pending_execution_is_stale(pending_row, now)
+    state = decision_state_from_raw(pending_row.raw_llm_response)["summary"]
+    assert state["final_stage"] == DecisionStage.LOCAL_SYNC
+    assert state["final_status"] == DecisionStageStatus.SKIPPED
 
 
 @pytest.mark.asyncio
