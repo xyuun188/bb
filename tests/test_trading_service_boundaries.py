@@ -699,6 +699,12 @@ def test_market_scope_skips_sync_position_price_refresh_before_ai() -> None:
     assert TradingService._should_refresh_position_prices_before_review("full") is True
 
 
+def test_market_scope_skips_pending_exit_recovery_before_ai() -> None:
+    assert TradingService._should_recover_pending_exits_for_scope("market") is False
+    assert TradingService._should_recover_pending_exits_for_scope("position") is True
+    assert TradingService._should_recover_pending_exits_for_scope("full") is True
+
+
 def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)

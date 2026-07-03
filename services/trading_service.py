@@ -5012,17 +5012,32 @@ class TradingService:
                 )
             self._set_loop_stage("load_open_positions")
             open_positions = await self.okx_sync_service.get_open_positions_context()
-            await self._recover_pending_exit_decisions(
-                results,
-                open_positions,
-                round_decision_ids,
-            )
+            if self._should_recover_pending_exits_for_scope(analysis_scope):
+                self._set_loop_stage("recover_pending_exits")
+                await self._recover_pending_exit_decisions(
+                    results,
+                    open_positions,
+                    round_decision_ids,
+                )
+            else:
+                results.setdefault("pending_exit_recovery", {})[
+                    "market_round_skipped"
+                ] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "reason": (
+                        "market-only 开仓扫描不执行 pending exit 恢复；该恢复任务由 position/full "
+                        "轮处理，避免平仓补偿任务阻塞开仓候选扫描。"
+                    ),
+                }
+            self._set_loop_stage("new_pair_pause_check")
             new_pair_pause_reason = await self._new_pair_analysis_pause_reason(
                 ENSEMBLE_TRADER_NAME,
                 open_positions=open_positions,
             )
             if account_pause_reason:
                 new_pair_pause_reason = account_pause_reason
+            self._set_loop_stage("record_new_pair_pause_state")
             await self._record_new_pair_pause_state(ENSEMBLE_TRADER_NAME, new_pair_pause_reason)
             if new_pair_pause_reason and run_market_analysis:
                 new_pair_market_pause_applied = True
@@ -6328,6 +6343,10 @@ class TradingService:
 
     @staticmethod
     def _should_refresh_position_prices_before_review(analysis_scope: str) -> bool:
+        return analysis_scope in {"full", "position"}
+
+    @staticmethod
+    def _should_recover_pending_exits_for_scope(analysis_scope: str) -> bool:
         return analysis_scope in {"full", "position"}
 
     async def start(self) -> None:
@@ -9816,6 +9835,8 @@ class TradingService:
             "sync_exchange_positions": "\u540c\u6b65 OKX \u4ed3\u4f4d/\u4fdd\u62a4\u5355",
             "load_open_positions": "\u8bfb\u53d6\u672c\u5730\u6301\u4ed3",
             "recover_pending_exits": "\u8865\u6267\u884c\u672a\u5b8c\u6210\u5e73\u4ed3",
+            "new_pair_pause_check": "\u68c0\u67e5\u65b0\u5f00\u4ed3\u6682\u505c\u72b6\u6001",
+            "record_new_pair_pause_state": "\u8bb0\u5f55\u65b0\u5f00\u4ed3\u6682\u505c\u72b6\u6001",
             "select_symbols": "\u7b5b\u9009\u672c\u8f6e\u5206\u6790\u5e01\u79cd",
             "fetch_features": "\u83b7\u53d6\u884c\u60c5\u6307\u6807",
             "refresh_position_prices": "\u5237\u65b0\u6301\u4ed3\u4ef7\u683c",
