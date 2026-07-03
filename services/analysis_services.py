@@ -446,9 +446,12 @@ class PositionReviewService(_ScopedAnalysisService):
         round_deadline = self._resolve_round_deadline(round_deadline_monotonic)
 
         set_loop_stage("enforce_sl_tp")
+        sl_tp_kwargs: dict[str, Any] = {}
+        if self._callable_accepts_keyword(enforce_sl_tp, "open_positions"):
+            sl_tp_kwargs["open_positions"] = open_positions
         sl_tp_results = await self._wait_stage(
             "enforce_sl_tp",
-            enforce_sl_tp(feature_vectors),
+            enforce_sl_tp(feature_vectors, **sl_tp_kwargs),
             results=results,
             round_deadline=round_deadline,
         )
@@ -471,17 +474,42 @@ class PositionReviewService(_ScopedAnalysisService):
             )
 
         set_loop_stage("review_open_positions")
-        refreshed_open_positions = await self._wait_stage(
-            "get_open_positions_context",
-            get_open_positions_context(),
-            results=results,
-            round_deadline=round_deadline,
-        )
-        if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
-            if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
-                return open_positions, review_blocked_keys
-        elif isinstance(refreshed_open_positions, list):
-            open_positions = refreshed_open_positions
+        if sl_tp_results:
+            refreshed_open_positions = await self._wait_stage(
+                "get_open_positions_context",
+                get_open_positions_context(),
+                results=results,
+                round_deadline=round_deadline,
+            )
+            if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
+                if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
+                    return open_positions, review_blocked_keys
+            elif isinstance(refreshed_open_positions, list):
+                open_positions = refreshed_open_positions
+        elif open_positions:
+            results.setdefault("position_review_diagnostics", []).append(
+                {
+                    "stage": "get_open_positions_context",
+                    "kind": "reused_round_open_positions",
+                    "message": (
+                        "本轮持仓复盘没有触发快速平仓，继续复用轮次开始时已加载的持仓上下文，"
+                        "避免重复同步等待 OKX 当前持仓。"
+                    ),
+                    "open_position_count": len(open_positions or []),
+                }
+            )
+        else:
+            refreshed_open_positions = await self._wait_stage(
+                "get_open_positions_context",
+                get_open_positions_context(),
+                results=results,
+                round_deadline=round_deadline,
+            )
+            if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
+                if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
+                    return open_positions, review_blocked_keys
+            elif isinstance(refreshed_open_positions, list):
+                open_positions = refreshed_open_positions
         review_kwargs = {
             "results": results,
             "round_decision_ids": round_decision_ids,

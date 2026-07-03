@@ -2046,9 +2046,16 @@ class TradingService:
     async def enforce_sl_tp_for_position_review(
         self,
         feature_vectors: dict[str, Any],
+        *,
+        open_positions: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Enforce stop-loss/take-profit through a position-review boundary."""
 
+        if open_positions is not None and self._callable_accepts_keyword(
+            self._enforce_sl_tp,
+            "open_positions",
+        ):
+            return await self._enforce_sl_tp(feature_vectors, open_positions=open_positions)
         return await self._enforce_sl_tp(feature_vectors)
 
     async def open_positions_context_for_position_review(self) -> list[dict[str, Any]]:
@@ -2995,6 +3002,17 @@ class TradingService:
         except (TypeError, ValueError):
             return False
         return max(price, close, bid, ask) > 0
+
+    @staticmethod
+    def _callable_accepts_keyword(callback: Any, keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            return True
+        return any(
+            param.kind == inspect.Parameter.VAR_KEYWORD or name == keyword
+            for name, param in parameters.items()
+        )
 
     async def _get_feature_vector_snapshot(
         self,
@@ -7674,10 +7692,16 @@ class TradingService:
             policy = EntrySuspiciousSymbolPolicy(self._normalize_position_symbol)
         return policy.reason(symbol)
 
-    async def _enforce_sl_tp(self, feature_vectors: dict) -> list[dict]:
+    async def _enforce_sl_tp(
+        self,
+        feature_vectors: dict,
+        *,
+        open_positions: list[dict[str, Any]] | None = None,
+    ) -> list[dict]:
         """Run fast non-AI protection for open positions before slow AI review."""
         auto_closes: list[dict[str, Any]] = []
-        open_positions = await self.okx_sync_service.get_open_positions_context()
+        if open_positions is None:
+            open_positions = await self.okx_sync_service.get_open_positions_context()
         if not open_positions:
             return auto_closes
 

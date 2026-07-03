@@ -1979,6 +1979,27 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
 
 
 @pytest.mark.asyncio
+async def test_trading_service_sl_tp_boundary_forwards_round_positions_when_supported():
+    service = TradingService.__new__(TradingService)
+    open_positions = [{"model_name": "ensemble_trader", "symbol": "BTC/USDT"}]
+    calls: list[tuple[Any, ...]] = []
+
+    async def enforce_sl_tp(feature_vectors, *, open_positions=None):
+        calls.append(("sl_tp", sorted(feature_vectors), open_positions))
+        return [{"symbol": "BTC/USDT"}]
+
+    service._enforce_sl_tp = enforce_sl_tp  # type: ignore[method-assign]
+
+    result = await service.enforce_sl_tp_for_position_review(
+        {"BTC/USDT": object()},
+        open_positions=open_positions,
+    )
+
+    assert result == [{"symbol": "BTC/USDT"}]
+    assert calls == [("sl_tp", ["BTC/USDT"], open_positions)]
+
+
+@pytest.mark.asyncio
 async def test_fast_sl_tp_delegates_execution_to_execution_service_boundary():
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
@@ -8795,6 +8816,75 @@ async def test_position_review_service_records_claim_skip_for_review_candidates(
     assert reasons == [(789, stages[0][4])]
     assert results["decisions"][0]["execution_status"] == "skipped"
     assert "另一条分析流程" in results["decisions"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_position_review_reuses_round_positions_when_fast_sl_tp_has_no_action():
+    decision = _decision(Action.CLOSE_LONG)
+    assessment = SimpleNamespace(warnings=[])
+    calls: list[tuple[Any, ...]] = []
+    initial_positions = [
+        {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"}
+    ]
+
+    async def enforce_sl_tp(feature_vectors, *, open_positions=None):
+        calls.append(("sl_tp_positions", open_positions is initial_positions))
+        return []
+
+    async def open_positions_context():
+        calls.append(("open_positions_refresh",))
+        return [{"model_name": "ensemble_trader", "symbol": "ETH/USDT", "side": "short"}]
+
+    async def review_open_positions(
+        open_positions,
+        feature_vectors,
+        *,
+        results,
+        round_decision_ids,
+        position_entry_pause_reason,
+        max_groups_override,
+    ):
+        calls.append(("review_positions", open_positions is initial_positions))
+        return [("BTC/USDT", "ensemble_trader", decision, assessment, 777)], set()
+
+    async def claim_symbol(_symbol, _owner):
+        return False
+
+    async def record_stage(*args, **kwargs):
+        return {}
+
+    async def mark_reason(*args, **kwargs):
+        return None
+
+    service = PositionReviewService(
+        loop_stage_setter=lambda _stage: None,
+        sl_tp_enforcer=enforce_sl_tp,
+        open_positions_context_provider=open_positions_context,
+        position_reviewer=review_open_positions,
+        analysis_symbol_claimer=claim_symbol,
+        symbol_normalizer=lambda symbol: symbol,
+        candidate_executor=lambda *args, **kwargs: asyncio.sleep(0),
+        decision_stage_recorder=record_stage,
+        decision_reason_marker=mark_reason,
+    )
+    results: dict[str, Any] = {"executions": [], "decisions": []}
+
+    open_positions, _blocked = await service.review_open_positions(
+        feature_vectors={"BTC/USDT": object()},
+        results=results,
+        round_decision_ids=set(),
+        open_positions=initial_positions,
+        position_entry_pause_reason=None,
+        max_groups_override=1,
+        claimed_analysis_symbols=[],
+    )
+
+    assert open_positions is initial_positions
+    assert calls == [
+        ("sl_tp_positions", True),
+        ("review_positions", True),
+    ]
+    assert results["position_review_diagnostics"][0]["kind"] == "reused_round_open_positions"
 
 
 @pytest.mark.asyncio
