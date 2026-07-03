@@ -1053,6 +1053,33 @@ class TradingService:
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
         return min(market_budget, watchdog_ceiling)
 
+    def market_symbol_start_reserve_seconds(
+        self,
+        strategy_context: dict[str, Any] | None = None,
+        market_symbol_count: int | None = None,
+    ) -> float:
+        """Return remaining time needed before starting another market AI symbol."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        batch_timeout = max(8.0, float(settings.ai_batch_expert_timeout_seconds or 18.0))
+        decision_timeout = max(0.0, float(settings.ai_decision_maker_timeout_seconds or 0.0))
+        local_tools_timeout = max(0.0, float(settings.local_ai_tools_timeout_seconds or 0.0))
+        model_reserve = max(
+            8.0,
+            batch_timeout * 0.60
+            + min(decision_timeout, 10.0) * 0.15
+            + min(local_tools_timeout, 6.0) * 0.25,
+        )
+        budget_seconds = self.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=market_symbol_count,
+        )
+        return round(
+            min(max(model_reserve, interval * 0.20), max(6.0, budget_seconds * 0.45)),
+            3,
+        )
+
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
 
@@ -1753,13 +1780,18 @@ class TradingService:
         strategy_context: dict[str, Any] | None = None,
         market_symbol_count: int | None = None,
     ) -> bool:
-        return (
-            self._round_elapsed_seconds(market_ai_started_at)
-            >= self.market_round_time_budget_seconds(
-                strategy_context=strategy_context,
-                market_symbol_count=market_symbol_count,
-            )
+        elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
+        budget_seconds = self.market_round_time_budget_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=market_symbol_count,
         )
+        if elapsed_seconds >= budget_seconds:
+            return True
+        reserve_seconds = self.market_symbol_start_reserve_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=market_symbol_count,
+        )
+        return (budget_seconds - elapsed_seconds) < reserve_seconds
 
     async def _runtime_heartbeat_loop(self) -> None:
         """Keep split-process dashboard heartbeat fresh while a round is busy."""
@@ -4270,6 +4302,11 @@ class TradingService:
             strategy_context=strategy_context,
             market_symbol_count=market_total,
         )
+        start_reserve_seconds = self.market_symbol_start_reserve_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=market_total,
+        )
+        remaining_budget_seconds = max(budget_seconds - market_ai_elapsed_seconds, 0.0)
         return {
             "read_only": True,
             "is_entry_gate": False,
@@ -4281,6 +4318,11 @@ class TradingService:
             "full_round_elapsed_seconds_before_ai": round(full_round_elapsed_seconds, 3),
             "market_ai_elapsed_seconds_before_symbol": round(market_ai_elapsed_seconds, 3),
             "market_round_time_budget_seconds": round(budget_seconds, 3),
+            "market_symbol_start_reserve_seconds": round(start_reserve_seconds, 3),
+            "remaining_market_ai_budget_seconds": round(remaining_budget_seconds, 3),
+            "can_start_another_market_symbol": bool(
+                remaining_budget_seconds >= start_reserve_seconds
+            ),
             "base_market_round_time_budget_seconds": round(base_budget_seconds, 3),
             "market_round_time_budget_policy": (
                 "portfolio_roster_underfilled_extension"
@@ -5246,8 +5288,16 @@ class TradingService:
                         strategy_context=strategy_mode_context,
                         market_symbol_count=len(market_feature_items),
                     )
+                    start_reserve_seconds = self.market_symbol_start_reserve_seconds(
+                        strategy_context=strategy_mode_context,
+                        market_symbol_count=len(market_feature_items),
+                    )
                     market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
                     full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
+                    remaining_budget_seconds = max(
+                        budget_seconds - market_ai_elapsed_seconds,
+                        0.0,
+                    )
                     warning = (
                         "本轮市场 AI 分析已达到调度时间预算，剩余候选顺延到后续轮次；"
                         "这不是开仓门槛，只用于防止单轮分析拖住系统心跳。"
@@ -5258,6 +5308,8 @@ class TradingService:
                         market_ai_elapsed_seconds=round(market_ai_elapsed_seconds, 3),
                         full_round_elapsed_seconds=round(full_round_elapsed_seconds, 3),
                         budget_seconds=round(budget_seconds, 3),
+                        remaining_budget_seconds=round(remaining_budget_seconds, 3),
+                        start_reserve_seconds=round(start_reserve_seconds, 3),
                         skipped_count=len(remaining),
                         skipped_symbols=remaining[:10],
                     )
@@ -5270,6 +5322,11 @@ class TradingService:
                             "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
                             "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
                             "budget_seconds": round(budget_seconds, 3),
+                            "remaining_budget_seconds": round(remaining_budget_seconds, 3),
+                            "market_symbol_start_reserve_seconds": round(
+                                start_reserve_seconds,
+                                3,
+                            ),
                             "skipped_symbols": remaining[:20],
                         }
                     )
@@ -5754,6 +5811,24 @@ class TradingService:
                     "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
                     "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
                     "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
+                    "remaining_budget_seconds": round(
+                        max(
+                            self.market_round_time_budget_seconds(
+                                strategy_context=strategy_mode_context,
+                                market_symbol_count=len(market_feature_items),
+                            )
+                            - market_ai_elapsed_seconds,
+                            0.0,
+                        ),
+                        3,
+                    ),
+                    "market_symbol_start_reserve_seconds": round(
+                        self.market_symbol_start_reserve_seconds(
+                            strategy_context=strategy_mode_context,
+                            market_symbol_count=len(market_feature_items),
+                        ),
+                        3,
+                    ),
                     "budget_clock_scope": "market_ai_phase",
                     "processed_symbols": int(results.get("symbols_processed") or 0),
                     "deferred_symbols": market_round_skipped_by_budget[:50],

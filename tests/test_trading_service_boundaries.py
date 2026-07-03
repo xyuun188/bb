@@ -4756,7 +4756,15 @@ def test_market_round_time_budget_expands_when_roster_underfilled(
         == pytest.approx(63.0)
     )
 
-    started_at = datetime.now(UTC) - timedelta(seconds=40)
+    assert (
+        service.market_symbol_start_reserve_seconds(
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        == pytest.approx(24.0)
+    )
+
+    started_at = datetime.now(UTC) - timedelta(seconds=38)
     assert service._market_ai_budget_exhausted(started_at) is True
     assert (
         service._market_ai_budget_exhausted(
@@ -4765,6 +4773,17 @@ def test_market_round_time_budget_expands_when_roster_underfilled(
             market_symbol_count=8,
         )
         is False
+    )
+
+    started_at = datetime.now(UTC) - timedelta(seconds=40)
+    assert service._market_ai_budget_exhausted(started_at) is True
+    assert (
+        service._market_ai_budget_exhausted(
+            started_at,
+            strategy_context=strategy_context,
+            market_symbol_count=8,
+        )
+        is True
     )
 
     progress = service._market_analysis_progress_snapshot(
@@ -4778,6 +4797,9 @@ def test_market_round_time_budget_expands_when_roster_underfilled(
 
     assert progress["market_round_time_budget_seconds"] == 63.0
     assert progress["base_market_round_time_budget_seconds"] == 27.0
+    assert progress["market_symbol_start_reserve_seconds"] == pytest.approx(24.0)
+    assert progress["remaining_market_ai_budget_seconds"] < 24.0
+    assert progress["can_start_another_market_symbol"] is False
     assert (
         progress["market_round_time_budget_policy"]
         == "portfolio_roster_underfilled_extension"
