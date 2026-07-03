@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
 from services.strategy_learning import (
     AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS,
     StrategyLearningEngine,
@@ -61,6 +62,13 @@ def _position(
         created_at=now - timedelta(hours=created_hours_ago),
         closed_at=now - timedelta(hours=closed_hours_ago),
         entry_raw=entry_raw,
+    )
+
+
+def _okx_order(exchange_order_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        exchange_order_id=exchange_order_id,
+        okx_sync_status=OKX_SYNC_CONFIRMED,
     )
 
 
@@ -125,7 +133,7 @@ def test_strategy_learning_excludes_untrusted_closed_position_facts() -> None:
         window_hours=24,
         positions=[trusted, dirty],
         open_positions=[],
-        orders=[],
+        orders=[_okx_order("entry-ok"), _okx_order("close-ok")],
         decisions=[],
         shadows=[],
         memories=[],
@@ -138,6 +146,32 @@ def test_strategy_learning_excludes_untrusted_closed_position_facts() -> None:
     assert feedback["trade_fact_quarantine"]["excluded_position_count"] == 1
     assert feedback["trade_fact_quarantine"]["reason_counts"] == {
         "missing_close_exchange_order_id": 1
+    }
+
+
+def test_strategy_learning_excludes_position_when_linked_order_is_missing() -> None:
+    compiler = StrategyLearningEngine().compiler
+    dirty = _position(side="long", pnl=9.0, position_id=103)
+    dirty.entry_exchange_order_id = "entry-missing"
+    dirty.close_exchange_order_id = "close-missing"
+
+    feedback = compiler.compile(
+        mode="paper",
+        window_hours=24,
+        positions=[dirty],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=[],
+        memories=[],
+        reflections=[],
+    ).to_dict()
+
+    assert feedback["totals"]["training_trade_count"] == 0
+    assert feedback["totals"]["net_pnl"] == 0
+    assert feedback["trade_fact_quarantine"]["excluded_position_count"] == 1
+    assert feedback["trade_fact_quarantine"]["reason_counts"] == {
+        "entry_order_not_okx_confirmed": 1
     }
 
 
@@ -157,7 +191,7 @@ def test_strategy_learning_deduplicates_authoritative_closed_position_pairs() ->
         window_hours=24,
         positions=[first, second],
         open_positions=[],
-        orders=[],
+        orders=[_okx_order("entry-dup"), _okx_order("close-dup")],
         decisions=[],
         shadows=[],
         memories=[],

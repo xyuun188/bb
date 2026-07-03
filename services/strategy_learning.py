@@ -45,7 +45,10 @@ from services.profit_first_ranking import ProfitFirstRankingService
 from services.runtime_entry_filters import RuntimeEntryFilters, default_entry_filters
 from services.shadow_missed_opportunity_closed_loop import summarize_shadow_missed_opportunities
 from services.text_integrity import sanitize_runtime_text
-from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
+from services.trade_fact_trust import (
+    closed_position_trade_fact_untrusted_reason_with_orders,
+    orders_by_exchange_id,
+)
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -1135,6 +1138,7 @@ class StrategyFeedbackCompiler:
         max_open_positions: int = 20,
     ) -> StrategyFeedback:
         manual_orders = [order for order in orders if is_manual_close_order(order)]
+        confirmed_orders_by_exchange_id = orders_by_exchange_id(orders)
         manual_position_ids: set[int] = set()
         untrusted_fact_position_ids: set[int] = set()
         untrusted_fact_reasons: dict[str, int] = {}
@@ -1143,7 +1147,10 @@ class StrategyFeedbackCompiler:
             if position_has_manual_close_order(position, manual_orders):
                 manual_position_ids.add(_safe_int(getattr(position, "id", None), 0))
                 continue
-            untrusted_reason = closed_position_trade_fact_untrusted_reason(position)
+            untrusted_reason = closed_position_trade_fact_untrusted_reason_with_orders(
+                position,
+                confirmed_orders_by_exchange_id,
+            )
             if untrusted_reason is not None:
                 untrusted_fact_position_ids.add(_safe_int(getattr(position, "id", None), 0))
                 untrusted_fact_reasons[untrusted_reason] = (

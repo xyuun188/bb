@@ -12,12 +12,12 @@ from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
 from services.okx_order_fact_sync import (
+    OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_NO_FILL_REJECTED,
-    OKX_SYNC_ORDER_ONLY,
     OKX_SYNC_OKX_ONLY,
-    OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
+    OKX_SYNC_ORDER_ONLY,
     OKX_SYNC_POSITION_CONFIRMED,
     OKX_SYNC_UNVERIFIED,
     PHASE3_DEFAULT_ORDER_SYNC_START,
@@ -288,7 +288,7 @@ class _NoHistoryExecutor:
     async def initialize(self) -> None:
         return None
 
-    async def _get_ccxt(self) -> "_NoHistoryExecutor":
+    async def _get_ccxt(self) -> _NoHistoryExecutor:
         return self
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1493,6 +1493,85 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts
         assert report["confirmed_count"] == 0
         assert report["closed_position_pnl_repaired_count"] == 1
         assert row["realized_pnl"] == pytest.approx(7.93)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_confirmed_order_columns_from_stored_okx_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-stored-fill-order-repair.db').as_posix()}",
+    )
+    await init_db()
+    filled_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=12)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SAND/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1455.0,
+                    price=0.0498,
+                    status="filled",
+                    fee=0.0289836,
+                    exchange_order_id="sand-close-okx",
+                    filled_at=filled_at,
+                    created_at=filled_at,
+                    okx_inst_id="SAND-USDT-SWAP",
+                    okx_trade_ids="trade-sand-close-okx",
+                    okx_fill_contracts=291.0,
+                    okx_fill_pnl=-7.245,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        "fills_history_confirmed": True,
+                        "order_id": "sand-close-okx",
+                        "trade_ids": ["trade-sand-close-okx"],
+                        "inst_id": "SAND-USDT-SWAP",
+                        "contracts": 291.0,
+                        "contract_size": 10.0,
+                        "base_quantity": 2910.0,
+                        "avg_price": 0.0498,
+                        "fee_abs": 0.0289836,
+                        "fill_pnl": -7.245,
+                        "timestamp": filled_at.isoformat(),
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_NoHistoryExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "sand-close-okx"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["confirmed_count"] == 1
+        assert row["quantity"] == pytest.approx(2910.0)
+        assert row["price"] == pytest.approx(0.0498)
+        assert row["fee"] == pytest.approx(0.0289836)
+        assert row["okx_fill_contracts"] == pytest.approx(291.0)
+        assert row["okx_fill_pnl"] == pytest.approx(-7.245)
+        assert row["okx_sync_status"] == OKX_SYNC_CONFIRMED
+        assert row["okx_raw_fills"]["fills_history_confirmed"] is True
     finally:
         await close_db()
 

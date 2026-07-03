@@ -347,6 +347,69 @@ def test_okx_daily_reconciliation_warning_info_only_residuals_do_not_block_entry
     assert report["requires_attention"] is False
 
 
+def test_okx_daily_reconciliation_quarantined_integrity_warnings_do_not_block_training() -> None:
+    card = _card("okx_trade_fact_integrity", "warning")
+    card["details"] = {
+        "issue_count": 2,
+        "critical_count": 0,
+        "warning_count": 2,
+        "severity_counts": {"warning": 2},
+        "issues": [
+            {
+                "kind": "order_position_missing",
+                "severity": "warning",
+                "order_id": 3078,
+                "symbol": "FIL/USDT",
+            },
+            {
+                "kind": "position_order_link_missing_local_order",
+                "severity": "warning",
+                "position_id": 928,
+                "symbol": "ENA/USDT",
+            },
+        ],
+        "position_fact_link_repair": {
+            "candidate_link_count": 2,
+            "diagnostics": [
+                {"position_id": 928, "status": "manual_review"},
+                {"position_id": 973, "status": "manual_review"},
+            ],
+        },
+        "okx_authoritative_sync": {
+            "okx_pull_available": True,
+            "status": "ok",
+            "issue_count": 0,
+            "manual_review_count": 0,
+            "repairable_count": 0,
+            "severity_counts": {},
+        },
+        "runtime_okx_entry_gate": {
+            "entry_blocked": False,
+            "status": "ok",
+            "sync_status": "ok",
+            "last_requires_attention_count": 0,
+        },
+    }
+
+    report = report_script.build_report(
+        [
+            _card("okx_reconciliation", "ok"),
+            card,
+            _card("position_price_integrity", "ok"),
+            _card("trade_execution_contract", "ok"),
+        ],
+        generated_at=datetime(2026, 7, 3, 10, 30, tzinfo=UTC),
+    )
+
+    assert report["status"] == "warning"
+    assert report["issue_ledger"]["summary"]["unresolved"] == 1
+    assert report["can_open_new_entries"] is True
+    assert report["can_refresh_training"] is True
+    assert report["requires_attention"] is False
+    assert report["operational_gates"]["entry_blockers"] == []
+    assert report["operational_gates"]["training_blockers"] == []
+
+
 def test_okx_daily_reconciliation_unresolved_warning_exits_warning() -> None:
     report = report_script.build_report(
         [

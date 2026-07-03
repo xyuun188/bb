@@ -30,6 +30,7 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
+from services.manual_close_marker import is_manual_close_order
 from services.okx_native_facts import (
     OkxNativeAccountBill,
     OkxNativeFactsClient,
@@ -39,7 +40,6 @@ from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
     find_current_position_entry_confirmation,
 )
-from services.manual_close_marker import is_manual_close_order
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 
 logger = structlog.get_logger(__name__)
@@ -217,7 +217,6 @@ class OkxOrderFactSyncService:
         since_naive = _db_naive_since(since)
         local_orders = await self._load_local_orders(since_naive)
         local_positions = await self._load_local_positions(since_naive)
-        refresh_orders = [order for order in local_orders if _order_needs_okx_fact_refresh(order)]
         external_refresh_orders = [
             order for order in local_orders if _order_needs_okx_pull(order)
         ]
@@ -690,6 +689,11 @@ class OkxOrderFactSyncService:
                     confirmed_count += 1
                     samples.append(_sample(order, kind="local_order_close_fill_recovered"))
                     continue
+                if _order_has_authoritative_stored_okx_fill_fact(order):
+                    _apply_close_fill_confirmation_to_order(order, now=now)
+                    confirmed_count += 1
+                    samples.append(_sample(order, kind="local_order_stored_fill_repaired"))
+                    continue
                 if _order_has_okx_execution_result_fact(order):
                     _apply_execution_result_confirmation_to_order(order, now=now)
                     confirmed_count += 1
@@ -767,7 +771,7 @@ class OkxOrderFactSyncService:
                 confirmed_count += 1
                 samples.append(_sample(order, kind="local_order_execution_result_confirmed"))
                 continue
-            if _order_has_fills_history_confirmed(order) and _order_has_confirmed_okx_fill_fact(order):
+            if _order_has_authoritative_stored_okx_fill_fact(order):
                 _apply_close_fill_confirmation_to_order(order, now=now)
                 confirmed_count += 1
                 samples.append(_sample(order, kind="local_order_stored_fill_confirmed"))
@@ -1777,6 +1781,7 @@ def _apply_execution_result_confirmation_to_order(order: Order, *, now: datetime
         if str(item or "").strip()
     ]
     contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    base_quantity = _stored_fill_base_quantity(raw)
     avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
     fee_abs = _safe_float(raw.get("fee_abs") or getattr(order, "fee", None), 0.0)
     fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
@@ -1785,6 +1790,8 @@ def _apply_execution_result_confirmation_to_order(order: Order, *, now: datetime
         order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
     if contracts > 0:
         order.okx_fill_contracts = contracts
+    if base_quantity > 0:
+        order.quantity = base_quantity
     if avg_price > 0:
         order.price = avg_price
     if fee_abs >= 0:
@@ -1809,6 +1816,7 @@ def _apply_close_fill_confirmation_to_order(order: Order, *, now: datetime) -> N
         if str(item or "").strip()
     ]
     contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    base_quantity = _stored_fill_base_quantity(raw)
     avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
     fee_abs = _safe_float(raw.get("fee_abs") or getattr(order, "fee", None), 0.0)
     fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
@@ -1818,6 +1826,8 @@ def _apply_close_fill_confirmation_to_order(order: Order, *, now: datetime) -> N
         order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
     if contracts > 0:
         order.okx_fill_contracts = contracts
+    if base_quantity > 0:
+        order.quantity = base_quantity
     if avg_price > 0:
         order.price = avg_price
     if fee_abs >= 0:
@@ -1901,7 +1911,7 @@ def _order_needs_okx_pull(order: Order) -> bool:
         "canceled",
     }:
         return False
-    if _order_has_fills_history_confirmed(order):
+    if _order_has_fills_history_confirmed(order) and _order_has_confirmed_okx_fill_fact(order):
         return False
     return True
 
@@ -1913,21 +1923,53 @@ def _order_has_fills_history_confirmed(order: Order) -> bool:
 
 
 def _order_has_confirmed_okx_fill_fact(order: Order) -> bool:
+    if not _order_has_authoritative_stored_okx_fill_fact(order):
+        return False
     raw = getattr(order, "okx_raw_fills", None)
     raw = raw if isinstance(raw, dict) else {}
-    if not str(getattr(order, "exchange_order_id", "") or "").strip():
+    expected_quantity = _stored_fill_base_quantity(raw)
+    local_quantity = _safe_float(getattr(order, "quantity", None), 0.0)
+    if expected_quantity > 0 and not _relative_close_enough(
+        local_quantity,
+        expected_quantity,
+        0.001,
+    ):
+        return False
+    expected_price = _safe_float(raw.get("avg_price") or raw.get("average"), 0.0)
+    local_price = _safe_float(getattr(order, "price", None), 0.0)
+    if expected_price > 0 and local_price > 0 and not _relative_close_enough(
+        local_price,
+        expected_price,
+        0.001,
+    ):
+        return False
+    expected_fee = _safe_float(raw.get("fee_abs"), -1.0)
+    local_fee = _safe_float(getattr(order, "fee", None), -1.0)
+    if expected_fee >= 0 and local_fee >= 0 and not _relative_close_enough(
+        local_fee,
+        expected_fee,
+        0.001,
+    ):
+        return False
+    return True
+
+
+def _order_has_authoritative_stored_okx_fill_fact(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if raw.get("fills_history_confirmed") is not True:
+        return False
+    order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    raw_order_id = str(raw.get("order_id") or "").strip()
+    if not order_id or not raw_order_id or order_id != raw_order_id:
         return False
     if not str(getattr(order, "okx_inst_id", "") or raw.get("inst_id") or "").strip():
         return False
     if _safe_float(getattr(order, "okx_fill_contracts", None) or raw.get("contracts"), 0.0) <= 0:
         return False
-    if _safe_float(getattr(order, "price", None) or raw.get("avg_price"), 0.0) <= 0:
+    if _safe_float(raw.get("avg_price") or raw.get("average") or getattr(order, "price", None), 0.0) <= 0:
         return False
-    return bool(
-        raw.get("fills_history_confirmed")
-        or raw.get("execution_result_confirmed")
-        or sync_status_is_confirmed(getattr(order, "okx_sync_status", None))
-    )
+    return True
 
 
 def sync_status_is_confirmed(value: Any) -> bool:
@@ -3339,6 +3381,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _stored_fill_base_quantity(raw: dict[str, Any]) -> float:
+    base_quantity = _safe_float(
+        raw.get("base_quantity") or raw.get("filled_base_quantity"),
+        0.0,
+    )
+    if base_quantity > 0:
+        return base_quantity
+    contracts = _safe_float(raw.get("contracts") or raw.get("filled_contracts"), 0.0)
+    contract_size = _safe_float(
+        raw.get("contract_size") or raw.get("contractSize"),
+        0.0,
+    )
+    if contracts > 0:
+        return contracts * (contract_size if contract_size > 0 else 1.0)
+    return 0.0
+
+
+def _relative_close_enough(left: float, right: float, tolerance_ratio: float) -> bool:
+    tolerance = max(abs(left), abs(right), 1e-12) * max(tolerance_ratio, 0.0)
+    return abs(left - right) <= tolerance
 
 
 def _datetime_from_ms(value: Any) -> datetime | None:
