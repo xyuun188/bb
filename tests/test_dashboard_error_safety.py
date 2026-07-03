@@ -229,6 +229,34 @@ def test_dashboard_execution_account_uses_okx_equity_not_cash_for_today_pnl(
     assert payload["today_total_pnl"] == pytest.approx(-0.20)
 
 
+def test_dashboard_execution_account_keeps_stale_cached_balance_usable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+
+    payload = dashboard._build_execution_account_status(
+        "paper",
+        paper_summary={"available_balance": 100.0, "positions": []},
+        okx_account={
+            "free": 200.0,
+            "used": 10.0,
+            "total": 250.0,
+            "cash": 250.0,
+            "equity": 260.0,
+            "allocatable": 260.0,
+            "error": "OKX balance snapshot request timed out",
+            "stale": True,
+            "stale_age_seconds": 8.0,
+        },
+        pnl_summary={},
+    )
+
+    assert payload["account_equity"] == 260.0
+    assert payload["available_balance"] == 200.0
+    assert payload["balance_error"] == "OKX balance snapshot request timed out"
+    assert payload["risk_paused"] is False
+
+
 @pytest.mark.asyncio
 async def test_dashboard_pnl_history_uses_only_okx_equity_snapshots(
     tmp_path,

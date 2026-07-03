@@ -738,6 +738,48 @@ async def test_settings_okx_snapshot_timeout_returns_chinese_error(
 
 
 @pytest.mark.asyncio
+async def test_settings_okx_snapshot_uses_trading_service_cache_before_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import executor.okx_executor as okx_executor_module
+
+    class FailingExecutor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("settings snapshot should not create a new OKX executor")
+
+    settings_api_module._OKX_BALANCE_CACHE.clear()
+    settings_api_module._OKX_BALANCE_ERROR_CACHE.clear()
+    monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
+    monkeypatch.setattr(settings, "okx_paper_api_secret", "paper-secret")
+    monkeypatch.setattr(settings, "okx_paper_passphrase", "paper-pass")
+    monkeypatch.setattr(settings_api_module._dash, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(
+        settings_api_module._dash,
+        "_trading_service",
+        SimpleNamespace(
+            peek_okx_balance_snapshot_for_mode=lambda mode, allow_stale=True: {
+                "free": 21.0,
+                "used": 4.0,
+                "total": 25.0,
+                "cash": 25.0,
+                "equity": 26.0,
+                "allocatable": 26.0,
+                "error": "OKX balance snapshot request timed out",
+                "stale": True,
+            }
+        ),
+    )
+    monkeypatch.setattr(okx_executor_module, "OKXExecutor", FailingExecutor)
+
+    snapshot = await settings_api_module._get_okx_usdt_snapshot("paper")
+
+    assert snapshot["allocatable_balance"] == 26.0
+    assert snapshot["available_balance"] == 21.0
+    assert snapshot["balance_error"] is None
+    assert snapshot["stale"] is True
+
+
+@pytest.mark.asyncio
 async def test_dashboard_login_session_allows_remote_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

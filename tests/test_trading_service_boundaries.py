@@ -3586,6 +3586,46 @@ async def test_paper_balance_snapshot_refuses_virtual_account_without_okx() -> N
 
 
 @pytest.mark.asyncio
+async def test_okx_balance_snapshot_reuses_fresh_cache_between_calls() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._okx_live = None
+    service._okx_balance_snapshot_cache = {}
+    service._okx_balance_snapshot_locks = {}
+
+    class CountingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_balance_snapshot(self, _asset: str) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "free": 12.0,
+                "used": 3.0,
+                "total": 15.0,
+                "cash": 15.0,
+                "equity": 16.0,
+                "allocatable": 16.0,
+            }
+
+    executor = CountingExecutor()
+    service._okx_paper = executor
+
+    first = await service._get_okx_balance_snapshot_for_mode("paper")
+    second = await service._get_okx_balance_snapshot_for_mode("paper")
+
+    assert first == second == {
+        "free": 12.0,
+        "used": 3.0,
+        "total": 15.0,
+        "cash": 15.0,
+        "equity": 16.0,
+        "allocatable": 16.0,
+    }
+    assert executor.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)

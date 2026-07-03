@@ -272,7 +272,8 @@ PRE_AGENT_SKILLS_ROLLBACK_MODE = False
 AGENT_SKILLS_TRADING_EFFECTS_ENABLED = True
 LOCAL_QUANT_PROMPT_ENABLED = True
 LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
-OKX_BALANCE_SNAPSHOT_CACHE_SECONDS = 120.0
+OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
+OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
 ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
 MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
 ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
@@ -906,6 +907,7 @@ class TradingService:
         self._pnl_history: dict[str, list[dict]] = {}  # model_name -> [{time, equity}, ...]
         self._new_pair_pause_reasons: dict[str, str] = {}
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
+        self._okx_balance_snapshot_locks: dict[str, asyncio.Lock] = {}
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
@@ -1937,6 +1939,27 @@ class TradingService:
 
         return await self._get_okx_balance_snapshot_for_mode(mode)
 
+    def peek_okx_balance_snapshot_for_mode(
+        self,
+        mode: str,
+        *,
+        allow_stale: bool = True,
+    ) -> dict[str, Any] | None:
+        """Return the last cached OKX balance snapshot without making a network call."""
+
+        selected_mode = "live" if mode == "live" else "paper"
+        fresh_snapshot = self._cached_okx_balance_snapshot(
+            selected_mode,
+            max_age_seconds=OKX_BALANCE_SNAPSHOT_FRESH_SECONDS,
+        )
+        if fresh_snapshot or not allow_stale:
+            return fresh_snapshot
+        return self._cached_okx_balance_snapshot(
+            selected_mode,
+            max_age_seconds=OKX_BALANCE_SNAPSHOT_STALE_SECONDS,
+            stale_reason="cached OKX balance snapshot",
+        )
+
     async def completed_shadow_backtest_total(self) -> int:
         """Return completed shadow-backtest count through a public dashboard boundary."""
 
@@ -2324,11 +2347,16 @@ class TradingService:
     ) -> None:
         """Persist account update through an explicit execution boundary."""
 
-        await self.account_accounting_service.persist_account_update(
-            model_name,
-            decision_model_name,
-            execution_result,
-        )
+        try:
+            await self.account_accounting_service.persist_account_update(
+                model_name,
+                decision_model_name,
+                execution_result,
+            )
+        finally:
+            self._invalidate_okx_balance_snapshot_cache_for_model(
+                decision_model_name or model_name
+            )
 
     async def get_account_balance(self, model_name: str) -> float:
         """Return account balance through an explicit execution boundary."""
@@ -6589,6 +6617,7 @@ class TradingService:
                 "manual close failed to persist account update",
                 error=safe_error_text(exc),
             )
+        self._invalidate_okx_balance_snapshot_cache_for_model(model_name)
         try:
             self.increment_trade_count()
         except Exception as exc:
@@ -8268,40 +8297,88 @@ class TradingService:
         """Return the actual OKX free USDT balance used to cap new entries."""
         return await self.account_accounting_service.okx_available_balance_for_mode(mode)
 
+    def _okx_balance_snapshot_lock_for_mode(self, mode: str) -> asyncio.Lock:
+        locks = getattr(self, "_okx_balance_snapshot_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._okx_balance_snapshot_locks = locks
+        return locks.setdefault(mode, asyncio.Lock())
+
+    def _cached_okx_balance_snapshot(
+        self,
+        mode: str,
+        *,
+        max_age_seconds: float,
+        stale_reason: str | None = None,
+        include_error: bool = False,
+    ) -> dict[str, Any] | None:
+        cache = getattr(self, "_okx_balance_snapshot_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        cached = cache.get(mode)
+        if not isinstance(cached, dict):
+            return None
+        fetched_at = cached.get("fetched_at")
+        if not isinstance(fetched_at, datetime):
+            return None
+        age = (datetime.now(UTC) - fetched_at).total_seconds()
+        if age > max_age_seconds:
+            return None
+        snapshot = dict(cached.get("snapshot") or {})
+        if not snapshot:
+            return None
+        if stale_reason is not None:
+            snapshot["stale"] = True
+            snapshot["stale_age_seconds"] = round(age, 3)
+            snapshot["stale_reason"] = stale_reason
+            if include_error:
+                snapshot["error"] = stale_reason
+            logger.warning(
+                "using cached OKX balance snapshot",
+                mode=mode,
+                age_seconds=round(age, 3),
+                reason=stale_reason,
+            )
+        return snapshot
+
+    def _invalidate_okx_balance_snapshot_cache_for_mode(self, mode: str) -> None:
+        selected_mode = "live" if mode == "live" else "paper"
+        cache = getattr(self, "_okx_balance_snapshot_cache", None)
+        if isinstance(cache, dict):
+            cache.pop(selected_mode, None)
+
+    def _invalidate_okx_balance_snapshot_cache_for_model(self, model_name: str | None) -> None:
+        selected_mode = mode_manager.mode.value
+        model_modes = getattr(self, "_model_execution_modes", None)
+        if isinstance(model_modes, dict):
+            mapped_mode = model_modes.get(str(model_name or ""))
+            if mapped_mode in {"paper", "live"}:
+                selected_mode = mapped_mode
+        self._invalidate_okx_balance_snapshot_cache_for_mode(selected_mode)
+
     async def _get_okx_balance_snapshot_for_mode(self, mode: str) -> dict[str, Any] | None:
         """Return OKX USDT balance fields for allocation and order sizing."""
         selected_mode = "live" if mode == "live" else "paper"
 
         def remember_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+            stored_snapshot = dict(snapshot)
+            stored_snapshot.pop("stale", None)
+            stored_snapshot.pop("stale_age_seconds", None)
+            stored_snapshot.pop("stale_reason", None)
+            stored_snapshot.pop("error", None)
             self._okx_balance_snapshot_cache[selected_mode] = {
-                "snapshot": dict(snapshot),
+                "snapshot": stored_snapshot,
                 "fetched_at": datetime.now(UTC),
             }
-            return snapshot
+            return dict(stored_snapshot)
 
         def cached_snapshot(reason: str) -> dict[str, Any] | None:
-            cached = self._okx_balance_snapshot_cache.get(selected_mode)
-            if not isinstance(cached, dict):
-                return None
-            fetched_at = cached.get("fetched_at")
-            if not isinstance(fetched_at, datetime):
-                return None
-            age = (datetime.now(UTC) - fetched_at).total_seconds()
-            if age > OKX_BALANCE_SNAPSHOT_CACHE_SECONDS:
-                return None
-            snapshot = dict(cached.get("snapshot") or {})
-            if not snapshot:
-                return None
-            snapshot["stale"] = True
-            snapshot["stale_age_seconds"] = round(age, 3)
-            snapshot["stale_reason"] = reason
-            logger.warning(
-                "using cached OKX balance snapshot",
-                mode=selected_mode,
-                age_seconds=round(age, 3),
-                reason=reason,
+            return self._cached_okx_balance_snapshot(
+                selected_mode,
+                max_age_seconds=OKX_BALANCE_SNAPSHOT_STALE_SECONDS,
+                stale_reason=reason,
+                include_error=True,
             )
-            return snapshot
 
         async def fresh_executor_snapshot(reason: str) -> dict[str, Any] | None:
             """Fallback matching the settings connection test path.
@@ -8325,6 +8402,7 @@ class TradingService:
                         error=safe_error_text(snapshot.get("error")),
                     )
                     return None
+                snapshot = remember_snapshot(snapshot)
                 snapshot["fallback_executor"] = True
                 snapshot["fallback_reason"] = reason
                 logger.warning(
@@ -8332,7 +8410,7 @@ class TradingService:
                     mode=selected_mode,
                     original_reason=reason,
                 )
-                return remember_snapshot(snapshot)
+                return snapshot
             except TimeoutError:
                 logger.warning(
                     "fresh OKX balance snapshot fallback timed out",
@@ -8363,45 +8441,56 @@ class TradingService:
             if selected_mode == "live"
             else getattr(self, "_okx_paper", None)
         )
-        if not executor:
+        fresh_cached = self._cached_okx_balance_snapshot(
+            selected_mode,
+            max_age_seconds=OKX_BALANCE_SNAPSHOT_FRESH_SECONDS,
+        )
+        if fresh_cached:
+            return fresh_cached
+        lock = self._okx_balance_snapshot_lock_for_mode(selected_mode)
+        async with lock:
+            fresh_cached = self._cached_okx_balance_snapshot(
+                selected_mode,
+                max_age_seconds=OKX_BALANCE_SNAPSHOT_FRESH_SECONDS,
+            )
+            if fresh_cached:
+                return fresh_cached
             try:
-                executor = await self._get_okx_executor_for_mode(selected_mode)
+                if not executor:
+                    executor = await self._get_okx_executor_for_mode(selected_mode)
             except Exception as exc:
                 reason = f"executor unavailable: {safe_error_text(exc)}"
                 fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
                 if fallback_snapshot:
                     return fallback_snapshot
                 return None
-        try:
-            snapshot = await asyncio.wait_for(
-                executor.get_balance_snapshot("USDT"),
-                timeout=8.0,
-            )
-            if snapshot.get("error"):
-                reason = safe_error_text(snapshot.get("error"))
+            try:
+                snapshot = await asyncio.wait_for(executor.get_balance_snapshot("USDT"), timeout=8.0)
+                if snapshot.get("error"):
+                    reason = safe_error_text(snapshot.get("error"))
+                    fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                    if fallback_snapshot:
+                        return fallback_snapshot
+                    return None
+                return remember_snapshot(snapshot)
+            except TimeoutError:
+                logger.warning("timed out fetching OKX balance snapshot", mode=selected_mode)
+                reason = "OKX balance snapshot request timed out"
                 fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
                 if fallback_snapshot:
                     return fallback_snapshot
                 return None
-            return remember_snapshot(snapshot)
-        except TimeoutError:
-            logger.warning("timed out fetching OKX balance snapshot", mode=selected_mode)
-            reason = "OKX balance snapshot request timed out"
-            fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
-            if fallback_snapshot:
-                return fallback_snapshot
-            return None
-        except Exception as exc:
-            logger.warning(
-                "failed to fetch OKX balance snapshot",
-                mode=selected_mode,
-                error=safe_error_text(exc),
-            )
-            reason = safe_error_text(exc)
-            fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
-            if fallback_snapshot:
-                return fallback_snapshot
-            return None
+            except Exception as exc:
+                logger.warning(
+                    "failed to fetch OKX balance snapshot",
+                    mode=selected_mode,
+                    error=safe_error_text(exc),
+                )
+                reason = safe_error_text(exc)
+                fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                if fallback_snapshot:
+                    return fallback_snapshot
+                return None
 
     async def _sync_paper_after_okx(
         self,

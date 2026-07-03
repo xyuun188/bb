@@ -447,6 +447,46 @@ async def test_dashboard_okx_balance_snapshot_fallback_logs(
     ]
 
 
+async def test_dashboard_okx_balance_snapshot_prefers_trading_service_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    dashboard_fallback_events: list[dict[str, Any]],
+) -> None:
+    class CachedTradingService(FakeBalanceTradingService):
+        def peek_okx_balance_snapshot_for_mode(
+            self,
+            mode: str,
+            allow_stale: bool = True,
+        ) -> dict[str, Any]:
+            assert mode == "paper"
+            return {
+                "free": 8.0,
+                "used": 1.0,
+                "total": 9.0,
+                "cash": 9.0,
+                "equity": 10.0,
+                "allocatable": 10.0,
+                "error": "OKX balance snapshot request timed out",
+                "stale": True,
+            }
+
+    monkeypatch.setattr(dashboard, "_trading_service", CachedTradingService())
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+
+    result = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert result == {
+        "free": 8.0,
+        "used": 1.0,
+        "total": 9.0,
+        "cash": 9.0,
+        "equity": 10.0,
+        "allocatable": 10.0,
+        "stale": True,
+    }
+    assert dashboard_fallback_events == []
+
+
 async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],

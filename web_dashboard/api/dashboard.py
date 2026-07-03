@@ -1437,36 +1437,35 @@ def _build_execution_account_status(
     pnl_summary = pnl_summary or {}
     max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
     okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
-    okx_available = (
-        None if okx_error else (_safe_float(okx_account.get("free"), None) if okx_account else None)
+    raw_okx_available = _safe_float(okx_account.get("free"), None) if okx_account else None
+    raw_okx_used = _safe_float(okx_account.get("used"), 0.0) if okx_account else None
+    raw_okx_total = (
+        _safe_float(okx_account.get("total"), raw_okx_available) if okx_account else None
     )
-    okx_used = (
-        None if okx_error else (_safe_float(okx_account.get("used"), 0.0) if okx_account else None)
+    raw_okx_cash = _safe_float(okx_account.get("cash"), raw_okx_total) if okx_account else None
+    raw_okx_equity = _safe_float(okx_account.get("equity"), raw_okx_total) if okx_account else None
+    raw_okx_allocatable = (
+        _safe_float(okx_account.get("allocatable"), raw_okx_equity or raw_okx_total or raw_okx_available)
+        if okx_account
+        else None
     )
-    okx_total = (
-        None
-        if okx_error
-        else (_safe_float(okx_account.get("total"), okx_available) if okx_account else None)
-    )
-    okx_cash = (
-        None
-        if okx_error
-        else (_safe_float(okx_account.get("cash"), okx_total) if okx_account else None)
-    )
-    okx_equity = (
-        None
-        if okx_error
-        else (_safe_float(okx_account.get("equity"), okx_total) if okx_account else None)
-    )
-    okx_allocatable = (
-        None
-        if okx_error
-        else (
-            _safe_float(okx_account.get("allocatable"), okx_equity or okx_total or okx_available)
-            if okx_account
-            else None
+    okx_error_blocks_balance = bool(
+        okx_error
+        and max(
+            _safe_float(raw_okx_available, 0.0),
+            _safe_float(raw_okx_total, 0.0),
+            _safe_float(raw_okx_cash, 0.0),
+            _safe_float(raw_okx_equity, 0.0),
+            _safe_float(raw_okx_allocatable, 0.0),
         )
+        <= 0
     )
+    okx_available = None if okx_error_blocks_balance else raw_okx_available
+    okx_used = None if okx_error_blocks_balance else raw_okx_used
+    okx_total = None if okx_error_blocks_balance else raw_okx_total
+    okx_cash = None if okx_error_blocks_balance else raw_okx_cash
+    okx_equity = None if okx_error_blocks_balance else raw_okx_equity
+    okx_allocatable = None if okx_error_blocks_balance else raw_okx_allocatable
     okx_snapshot_for_balance = (
         {
             "free": okx_available,
@@ -1476,7 +1475,7 @@ def _build_execution_account_status(
             "equity": okx_equity,
             "allocatable": okx_allocatable,
         }
-        if okx_account and not okx_error
+        if okx_account and not okx_error_blocks_balance
         else None
     )
     parsed_account_equity = balance_from_snapshot(okx_snapshot_for_balance)
@@ -1500,7 +1499,7 @@ def _build_execution_account_status(
     pause_reason = _translate_pause_reason(pause_reason)
     if not okx_error and not okx_balance_available:
         okx_error = "OKX balance unavailable"
-    if okx_error and not pause_reason:
+    if okx_error and not pause_reason and not okx_balance_available:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
     total_pnl_for_risk = 0.0
@@ -1901,6 +1900,26 @@ def _dashboard_okx_executor_for_mode(mode: str) -> Any | None:
     if not callable(getter):
         return None
     return getter("live" if mode == "live" else "paper")
+
+
+def _trading_service_cached_okx_balance_snapshot(mode: str) -> dict[str, Any] | None:
+    if not _trading_service:
+        return None
+    peeker = getattr(_trading_service, "peek_okx_balance_snapshot_for_mode", None)
+    if not callable(peeker):
+        return None
+    selected_mode = "live" if mode == "live" else "paper"
+    try:
+        snapshot = peeker(selected_mode, allow_stale=True)
+    except TypeError:
+        snapshot = peeker(selected_mode)
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    result = dict(snapshot)
+    result.pop("error", None)
+    result.pop("balance_error", None)
+    result.pop("error_cached", None)
+    return result
 
 
 async def _fetch_dashboard_okx_positions_uncached(selected_mode: str) -> list[dict[str, Any]]:
@@ -2445,6 +2464,20 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         error_cached = cached_failure(now)
         if error_cached:
             return error_cached
+
+        shared_snapshot = _trading_service_cached_okx_balance_snapshot(selected_mode)
+        if shared_snapshot:
+            if not (
+                shared_snapshot.get("stale")
+                or shared_snapshot.get("error")
+                or shared_snapshot.get("balance_error")
+            ):
+                _dashboard_okx_balance_cache[selected_mode] = (
+                    datetime.now(UTC),
+                    copy.deepcopy(shared_snapshot),
+                )
+                _dashboard_okx_balance_error_cache.pop(selected_mode, None)
+            return shared_snapshot
 
         executor = initial_executor
         if executor:

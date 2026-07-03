@@ -244,6 +244,27 @@ def _make_okx_executor(cls: Any, mode: str):
         return cls(mode=mode)
 
 
+def _trading_service_cached_okx_snapshot(mode: str) -> dict[str, Any] | None:
+    trading_service = getattr(_dash, "_trading_service", None)
+    if not trading_service:
+        return None
+    peeker = getattr(trading_service, "peek_okx_balance_snapshot_for_mode", None)
+    if not callable(peeker):
+        return None
+    selected_mode = "live" if mode == "live" else "paper"
+    try:
+        snapshot = peeker(selected_mode, allow_stale=True)
+    except TypeError:
+        snapshot = peeker(selected_mode)
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    result = dict(snapshot)
+    result.pop("error", None)
+    result.pop("balance_error", None)
+    result.pop("error_cached", None)
+    return result
+
+
 async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
     """Fetch the real OKX USDT balance snapshot for paper/demo or live mode."""
     mode = "live" if mode == "live" else "paper"
@@ -274,6 +295,18 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
         cached = _cached_okx_snapshot(mode, allow_stale=False)
         if cached and not force:
             return cached
+
+        shared_snapshot = None if force else _trading_service_cached_okx_snapshot(mode)
+        if shared_snapshot:
+            normalized = _okx_balance_result_from_raw_snapshot(mode, shared_snapshot)
+            if not (
+                shared_snapshot.get("stale")
+                or shared_snapshot.get("error")
+                or shared_snapshot.get("balance_error")
+            ):
+                _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+                _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+            return normalized
 
         dashboard_cached = (
             None if force else getattr(_dash, "_dashboard_okx_balance_cache", {}).get(mode)
@@ -351,7 +384,7 @@ async def _execution_account_status(mode: str) -> dict:
     okx_snapshot = await _get_okx_usdt_snapshot(mode)
     okx_available = okx_snapshot.get("available_balance")
     okx_allocatable = okx_snapshot.get("allocatable_balance")
-    okx_balance_available = not okx_snapshot.get("balance_error") and bool(
+    okx_balance_available = bool(
         okx_snapshot.get("equity_balance")
         or okx_snapshot.get("total_balance")
         or okx_allocatable
@@ -377,7 +410,7 @@ async def _execution_account_status(mode: str) -> dict:
         pause_reason = getattr(_dash._trading_service, "_new_pair_pause_reasons", {}).get(
             ENSEMBLE_TRADER_NAME
         )
-    if okx_snapshot.get("balance_error") and not pause_reason:
+    if okx_snapshot.get("balance_error") and not pause_reason and not okx_balance_available:
         pause_reason = (
             f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
         )
