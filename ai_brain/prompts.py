@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _SENSITIVE_KEY_PARTS = ("api", "key", "secret", "token", "password", "authorization")
 
 
@@ -481,56 +480,68 @@ def build_batch_experts_user_prompt(
         ).get("profit_first_context")
         or {}
     )
+    strategy_summary = {
+        "strategy": strategy_mode.get("strategy"),
+        "posture": strategy_mode.get("posture"),
+        "profile": strategy_mode.get("strategy_profile_id") or strategy_mode.get("profile_id"),
+        "allow_long": strategy_mode.get("allow_long"),
+        "allow_short": strategy_mode.get("allow_short"),
+        "blocked": strategy_mode.get("blocked_directions"),
+        "profit_first": compact_value(profit_first_guidance, depth=1, dict_limit=6),
+    }
     payload = {
-        "entry_candidate_evidence": context.get("entry_candidate_evidence") or {},
-        "memory_feedback": context.get("memory_feedback") or {},
-        "market": feature_context,
+        "evidence": compact_value(
+            context.get("entry_candidate_evidence") or {},
+            depth=2,
+            dict_limit=10,
+            list_limit=2,
+        ),
+        "memory": compact_value(
+            context.get("memory_feedback") or {},
+            depth=1,
+            dict_limit=8,
+            list_limit=2,
+        ),
+        "market": _short_text(feature_context, 420),
         "analysis_type": "position" if context.get("review_positions") else "market",
-        "open_positions": context.get("open_positions", [])[:4],
-        "market_regime": context.get("market_regime") or {},
-        "strategy_mode": strategy_mode,
-        "profit_first_guidance": compact_value(profit_first_guidance, depth=2, dict_limit=10),
-        "direction_competition": context.get("direction_competition") or {},
+        "positions": compact_value(context.get("open_positions", [])[:2], depth=1, dict_limit=8),
+        "regime": compact_value(context.get("market_regime") or {}, depth=1, dict_limit=8),
+        "strategy": compact_value(strategy_summary, depth=2, dict_limit=8),
+        "direction": compact_value(
+            context.get("direction_competition") or {},
+            depth=1,
+            dict_limit=8,
+        ),
         "ml_signal": (
-            context.get("ml_signal") if context.get("ml_signal_prompt_enabled", True) else {}
+            compact_value(context.get("ml_signal"), depth=1, dict_limit=8)
+            if context.get("ml_signal_prompt_enabled", True)
+            else {}
         ),
         "local_ai_tools": (
-            context.get("local_ai_tools")
+            compact_value(context.get("local_ai_tools"), depth=1, dict_limit=8)
             if context.get("local_ai_tools_prompt_enabled", True)
             else {}
         ),
-        "portfolio_profit_protection": context.get("portfolio_profit_protection") or {},
-        "entry_candidate_policy": (
-            "For market entries, every expert must use entry_candidate_evidence as prompt evidence, not as a hard ban. "
-            "Compare long vs short by expected net profit, loss probability, payoff quality, realized PnL history, "
-            "and tail risk. If high_profit_potential=true, explicitly say whether larger size/leverage is justified; "
-            "if evidence is weak, explain hold; if evidence is usable, propose side/size/leverage. "
-            "Use memory_feedback to correct habits: repeated missed opportunities may justify a small probe when "
-            "current EV is positive and hard risk is absent; repeated realized losses require stronger confirmation "
-            "or smaller size. Read profit_first_guidance for recent source/lane/exit lessons: missed-positive-shadow "
-            "means quality opportunities should not be ignored, tiny-probe fee drag means weak entries should stay "
-            "shadow/small, exit_too_early means winners may need more hold room, exit_too_late means weaker losers "
-            "should be cut faster. Use memory_feedback.decision_habit: probe_when_ev_ok makes passive HOLD require "
-            "evidence; strict_confirm makes the side need stronger current proof."
+        "portfolio": compact_value(
+            context.get("portfolio_profit_protection") or {},
+            depth=1,
+            dict_limit=8,
         ),
-        "position_review_rule": (
-            "If analysis_type=position, close/reduce requires concrete evidence: hard stop/take-profit, key level "
-            "failure, confirmed momentum reversal, severe risk deterioration, or meaningful net profit with weakened "
-            "continuation. If portfolio_profit_protection.active=true, the current symbol is being reviewed because "
-            "account-level floating profit reached a lock-profit line; explicitly pick continue_hold, partial_lock_profit, "
-            "or full_close and explain why. Normal early noise, tiny floating loss/profit, low volume alone, or vague "
-            "reduce-risk wording must be hold."
+        "rules": (
+            "Judge EV after fee/slippage, payoff quality, loss probability, liquidity, tail risk. "
+            "missed_ok=small probe only if EV>0 and no hard risk; loss_history=stricter/smaller. "
+            "position_expert holds when no matching position. Hard risk may veto; weak evidence holds."
         ),
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    max_payload_chars = 1000
-    return f"""BATCH_EXPERT_JSON_V7
-Return one minified JSON object only. No markdown, no prose, no <think>.
+    max_payload_chars = 760
+    return f"""BATCH_EXPERT_JSON_V8
+Return one minified JSON object only. No markdown, no prose, no <think>. Keep it short enough to finish in one response.
 Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
 Each expert value must contain exactly:
-{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文40-80字，包含方向/收益/风险中的两个具体证据","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}}
-Rules: weak evidence=hold; hard risk can veto; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; use small probe only when EV is positive and hard risk is absent.
+{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}}
+Rules: weak evidence=hold; hard risk can veto; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; use small probe only when EV is positive and hard risk is absent; cross_check_for must be null in batch mode.
 Payload JSON, truncated to {max_payload_chars} chars:
 {text[:max_payload_chars]}
 JSON:"""

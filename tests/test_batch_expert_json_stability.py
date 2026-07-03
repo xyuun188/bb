@@ -22,17 +22,20 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         {"review_positions": True, "open_positions": [{"symbol": "BTC/USDT"}]},
     )
 
-    assert "BATCH_EXPERT_JSON_V7" in prompt
+    assert "BATCH_EXPERT_JSON_V8" in prompt
     assert (
         "Required experts: trend_expert, momentum_expert, sentiment_expert, position_expert, risk_expert"
         in prompt
     )
     assert "do not copy one expert's opinion into all experts" in prompt
     assert "weak evidence=hold" in prompt
+    assert "cross_check_for must be null in batch mode" in prompt
+    assert "12-28字" in prompt
     assert '"action":"hold","confidence":0.50' not in prompt
     assert "daily_target" not in prompt
     assert "STRICT_COMPACT_BATCH_JSON_V3" not in prompt
-    assert "Payload JSON, truncated to 1000 chars" in prompt
+    assert "Payload JSON, truncated to 760 chars" in prompt
+    assert len(prompt) < 1800
 
 
 def test_batch_expert_prompt_can_scope_to_provider_group() -> None:

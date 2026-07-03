@@ -954,8 +954,8 @@ def _build_fast_expert_user_prompt(
     )
 
 
-BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested JSON object. No markdown, no prose, no <think>.
-Use short Chinese reasoning. Prefer hold when evidence is weak."""
+BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested minified JSON object. No markdown, no prose, no <think>.
+Use 12-28 Chinese chars per reasoning. Set cross_check_for to null. Prefer hold when evidence is weak."""
 
 
 class LLMAgent(AbstractAIModel):
