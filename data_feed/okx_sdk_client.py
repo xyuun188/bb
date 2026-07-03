@@ -15,6 +15,7 @@ import structlog
 
 from config.settings import settings
 from core.exceptions import ConfigError, ExchangeAPIError
+from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
 
@@ -34,6 +35,12 @@ def _requests_proxies() -> dict[str, str] | None:
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}
+
+
+def _requests_headers(mode: str) -> dict[str, str] | None:
+    if settings.is_okx_demo(mode):
+        return {"x-simulated-trading": "1"}
+    return None
 
 
 def _is_suspicious_contract_base(base: str | None) -> bool:
@@ -158,8 +165,14 @@ async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
         result = api.get_tickers(instType=instType)
         if result.get("code") != "0":
             _raise_okx_api_error(result)
+        supported_swap_inst_ids = (
+            _fetch_supported_swap_inst_ids(mode) if str(instType).upper() == "SWAP" else None
+        )
         tickers = {}
         for t in result.get("data", []):
+            inst_id = str(t.get("instId") or "").strip().upper()
+            if supported_swap_inst_ids is not None and inst_id not in supported_swap_inst_ids:
+                continue
             symbol = t.get("instId", "").replace("-", "/")
             last = float(t.get("last", 0))
             open24h = float(t.get("open24h", 0))
@@ -179,38 +192,64 @@ async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
     return await asyncio.to_thread(_sync)
 
 
+def _fetch_supported_swap_inst_ids(mode: str) -> set[str] | None:
+    import requests
+
+    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    try:
+        resp = requests.get(
+            url,
+            timeout=10,
+            proxies=_requests_proxies(),
+            headers=_requests_headers(mode),
+        )
+        data = resp.json()
+        if data.get("code") != "0":
+            _raise_okx_api_error(data)
+    except Exception as exc:
+        logger.warning(
+            "fetch OKX instrument metadata failed; using unfiltered SDK tickers",
+            mode=mode,
+            error=safe_error_text(exc),
+        )
+        return None
+    return {
+        str(inst.get("instId") or "").strip().upper()
+        for inst in supported_usdt_swap_instruments(data.get("data", []))
+    }
+
+
 async def get_available_symbols(mode: str = "paper") -> list[dict[str, str]]:
     """Get available OKX USDT perpetual swaps via public endpoint."""
     import requests
 
     def _sync():
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-        resp = requests.get(url, timeout=10, proxies=_requests_proxies())
+        resp = requests.get(
+            url,
+            timeout=10,
+            proxies=_requests_proxies(),
+            headers=_requests_headers(mode),
+        )
         data = resp.json()
         if data.get("code") != "0":
             _raise_okx_api_error(data)
         symbols = []
-        for inst in data.get("data", []):
+        for inst in supported_usdt_swap_instruments(data.get("data", [])):
             inst_id = inst.get("instId", "")
-            if (
-                inst.get("settleCcy") == "USDT"
-                and inst.get("ctType") == "linear"
-                and inst.get("state") == "live"
-                and inst_id.endswith("-USDT-SWAP")
-            ):
-                base = inst_id.removesuffix("-USDT-SWAP")
-                if _is_suspicious_contract_base(base):
-                    continue
-                symbols.append(
-                    {
-                        "symbol": f"{base}/USDT",
-                        "base": base,
-                        "quote": "USDT",
-                        "type": "swap",
-                        "id": inst_id,
-                        "ccxt_symbol": f"{base}/USDT:USDT",
-                    }
-                )
+            base = inst_id.removesuffix("-USDT-SWAP")
+            if _is_suspicious_contract_base(base):
+                continue
+            symbols.append(
+                {
+                    "symbol": f"{base}/USDT",
+                    "base": base,
+                    "quote": "USDT",
+                    "type": "swap",
+                    "id": inst_id,
+                    "ccxt_symbol": f"{base}/USDT:USDT",
+                }
+            )
 
         priority = {
             "BTC": 0,

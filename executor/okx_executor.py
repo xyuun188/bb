@@ -23,6 +23,7 @@ from core.exceptions import (
     OrderPlacementError,
     RateLimitError,
 )
+from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from core.symbols import (
     normalize_trading_symbol,
@@ -227,18 +228,7 @@ class OKXExecutor(AbstractExecutor):
         self._ensure_rest_url()
         response = await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
-        filtered = [
-            item
-            for item in instruments
-            if item.get("instType") == "SWAP"
-            and item.get("state") == "live"
-            and item.get("ctType") == "linear"
-            and item.get("settleCcy") == "USDT"
-            and item.get("instId", "").endswith("-USDT-SWAP")
-            and item.get("ctVal")
-            and item.get("minSz")
-            and item.get("tickSz")
-        ]
+        filtered = supported_usdt_swap_instruments(instruments)
         markets = self._exchange.parse_markets(filtered)
         self._exchange.set_markets(markets)
         if not self._exchange.markets:

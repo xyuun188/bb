@@ -14,6 +14,7 @@ import ccxt.async_support as ccxt_async
 import structlog
 
 from config.settings import settings
+from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from core.symbols import (
     normalize_trading_symbol,
@@ -146,18 +147,7 @@ class OKXRestClient:
         self._ensure_rest_url()
         response = await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
-        filtered = [
-            item
-            for item in instruments
-            if item.get("instType") == "SWAP"
-            and item.get("state") == "live"
-            and item.get("ctType") == "linear"
-            and item.get("settleCcy") == "USDT"
-            and item.get("instId", "").endswith("-USDT-SWAP")
-            and item.get("ctVal")
-            and item.get("minSz")
-            and item.get("tickSz")
-        ]
+        filtered = supported_usdt_swap_instruments(instruments)
         markets = self._exchange.parse_markets(filtered)
         self._exchange.set_markets(markets)
 
@@ -175,6 +165,10 @@ class OKXRestClient:
         target_inst_ids = {
             inst_id for symbol in symbols or [] if (inst_id := okx_inst_id_from_symbol(symbol))
         }
+        exchange = self._exchange
+        if not target_inst_ids:
+            exchange = await self._get_exchange()
+        supported_inst_ids = target_inst_ids or self._loaded_market_inst_ids(exchange)
         response = await self._ccxt_call("publicGetMarketTickers", {"instType": "SWAP"})
         rows = response.get("data", []) if isinstance(response, dict) else []
         tickers: dict[str, dict[str, Any]] = {}
@@ -182,7 +176,7 @@ class OKXRestClient:
             if not isinstance(row, dict):
                 continue
             inst_id = str(row.get("instId") or "").strip().upper()
-            if target_inst_ids and inst_id not in target_inst_ids:
+            if supported_inst_ids and inst_id not in supported_inst_ids:
                 continue
             ticker = self._native_ticker_to_ccxt_shape(row)
             symbol = str(ticker.get("symbol") or "").strip()
@@ -191,6 +185,20 @@ class OKXRestClient:
             if inst_id:
                 tickers[inst_id] = ticker
         return tickers
+
+    def _loaded_market_inst_ids(self, exchange: Any | None = None) -> set[str]:
+        source = exchange or self._exchange
+        if source is None:
+            return set()
+        markets = getattr(source, "markets", None) or {}
+        inst_ids: set[str] = set()
+        for market_id, market in markets.items():
+            if not isinstance(market, dict):
+                continue
+            inst_id = str(market.get("id") or market_id or "").strip().upper()
+            if inst_id:
+                inst_ids.add(inst_id)
+        return inst_ids
 
     async def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1h", limit: int = 100

@@ -162,6 +162,35 @@ async def test_fetch_tickers_filters_by_okx_native_inst_ids(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_fetch_tickers_without_targets_keeps_loaded_market_universe(monkeypatch) -> None:
+    client = OKXRestClient()
+    exchange = _PepeMarketExchange()
+    calls: list[tuple[str, tuple]] = []
+
+    async def fake_exchange():
+        return exchange
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        calls.append((method_name, args))
+        return {
+            "data": [
+                {"instId": "PEPE-USDT-SWAP", "last": "0.000002", "volCcy24h": "100"},
+                {"instId": "PLTR-USDT-SWAP", "last": "64.46", "volCcy24h": "200"},
+            ]
+        }
+
+    monkeypatch.setattr(client, "_get_exchange", fake_exchange)
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    tickers = await client.fetch_tickers()
+
+    assert calls == [
+        ("publicGetMarketTickers", ({"instType": "SWAP"},)),
+    ]
+    assert set(tickers) == {"PEPE/USDT", "PEPE-USDT-SWAP"}
+
+
+@pytest.mark.asyncio
 async def test_fetch_positions_uses_okx_native_positions(monkeypatch) -> None:
     client = OKXRestClient()
     calls: list[tuple[str, tuple]] = []
