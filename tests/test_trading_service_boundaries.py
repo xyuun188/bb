@@ -324,6 +324,98 @@ async def test_okx_authoritative_sync_loop_reconciles_current_positions(
 
 
 @pytest.mark.asyncio
+async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    calls: list[dict[str, Any]] = []
+    order_fact_started: list[bool] = []
+    never_finish = asyncio.Event()
+
+    class FakeOkxSyncService:
+        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+            calls.append(
+                {
+                    "reason": reason,
+                    "timeout_seconds": timeout_seconds,
+                    "lock_wait_seconds": lock_wait_seconds,
+                }
+            )
+            return [
+                {
+                    "kind": "snapshot_update",
+                    "symbol": "BTC/USDT",
+                    "side": "long",
+                    "note": "updated from OKX",
+                }
+            ]
+
+    class SlowOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            order_fact_started.append(True)
+            await never_finish.wait()
+            return {"status": "ok", "okx_pull_available": True, "unverified_count": 0}
+
+    def factory(**_kwargs: Any) -> SlowOrderFactSyncService:
+        return SlowOrderFactSyncService()
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+    service.okx_sync_service = FakeOkxSyncService()
+    service.okx_order_fact_sync_factory = factory
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_started_at = None
+    service._okx_authoritative_sync_last_success_at = None
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_duration_seconds = None
+    service._okx_authoritative_sync_last_result_count = None
+    service._okx_authoritative_sync_last_result_kinds = {}
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_degraded_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    service._okx_authoritative_sync_success_count = 0
+    service._okx_authoritative_sync_failure_count = 0
+    service._okx_order_fact_sync_task = None
+    service._okx_order_fact_sync_last_started_at = None
+    service._okx_order_fact_sync_last_finished_at = None
+    service._okx_order_fact_sync_last_row = None
+    service._okx_order_fact_sync_last_error = None
+    service._okx_order_fact_sync_success_count = 0
+    service._okx_order_fact_sync_failure_count = 0
+
+    await service._okx_authoritative_sync_loop()
+
+    status = service._okx_authoritative_sync_status_payload()
+    assert calls == [
+        {
+            "reason": "auto okx authoritative sync",
+            "timeout_seconds": 8.0,
+            "lock_wait_seconds": 0.1,
+        }
+    ]
+    assert status["status"] == "ok"
+    assert status["last_result_kinds"] == {"snapshot_update": 1}
+    assert status["last_requires_attention_count"] == 0
+    assert status["last_duration_seconds"] is not None
+    assert status["last_duration_seconds"] < 1.0
+    assert status["order_fact_sync"]["task_running"] is True
+
+    task = service._okx_order_fact_sync_task
+    assert task is not None
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gate() -> None:
     service = TradingService.__new__(TradingService)
     service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]

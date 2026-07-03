@@ -920,6 +920,13 @@ class TradingService:
         self._position_analysis_task: asyncio.Task | None = None
         self._runtime_heartbeat_task: asyncio.Task | None = None
         self._okx_authoritative_sync_task: asyncio.Task | None = None
+        self._okx_order_fact_sync_task: asyncio.Task | None = None
+        self._okx_order_fact_sync_last_started_at: datetime | None = None
+        self._okx_order_fact_sync_last_finished_at: datetime | None = None
+        self._okx_order_fact_sync_last_row: dict[str, Any] | None = None
+        self._okx_order_fact_sync_last_error: str | None = None
+        self._okx_order_fact_sync_success_count = 0
+        self._okx_order_fact_sync_failure_count = 0
         self._okx_authoritative_sync_started_at: datetime | None = None
         self._okx_authoritative_sync_last_success_at: datetime | None = None
         self._okx_authoritative_sync_last_failure_at: datetime | None = None
@@ -1193,7 +1200,48 @@ class TradingService:
             ),
             "success_count": int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0),
+            "order_fact_sync": self._okx_order_fact_sync_status_payload(now),
             "source": "okx_private_api_current_positions",
+        }
+
+    def _okx_order_fact_sync_status_payload(
+        self,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return diagnostics for the non-blocking OKX order-fact sync."""
+
+        now = now or datetime.now(UTC)
+        task = getattr(self, "_okx_order_fact_sync_task", None)
+        started_at = getattr(self, "_okx_order_fact_sync_last_started_at", None)
+        finished_at = getattr(self, "_okx_order_fact_sync_last_finished_at", None)
+        last_row = getattr(self, "_okx_order_fact_sync_last_row", None)
+        last_finished_age_seconds = (
+            max((now - finished_at).total_seconds(), 0.0)
+            if isinstance(finished_at, datetime)
+            else None
+        )
+        status = "pending"
+        if task is not None and not task.done():
+            status = "running"
+        elif isinstance(last_row, dict):
+            status = str(last_row.get("status") or "ok").lower() or "ok"
+        elif getattr(self, "_okx_order_fact_sync_last_error", None):
+            status = "degraded"
+        return {
+            "status": status,
+            "task_running": bool(task is not None and not task.done()),
+            "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            "last_finished_at": (
+                finished_at.isoformat() if isinstance(finished_at, datetime) else None
+            ),
+            "last_finished_age_seconds": (
+                round(last_finished_age_seconds, 3)
+                if last_finished_age_seconds is not None
+                else None
+            ),
+            "last_error": getattr(self, "_okx_order_fact_sync_last_error", None),
+            "success_count": int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0),
+            "failure_count": int(getattr(self, "_okx_order_fact_sync_failure_count", 0) or 0),
         }
 
     def _okx_authoritative_sync_entry_block_reason(
@@ -1375,6 +1423,66 @@ class TradingService:
             "note": note,
             "order_fact_sync": report,
         }
+
+    def _start_okx_order_fact_sync_background(self) -> None:
+        """Start optional OKX order-fact sync without delaying current-position sync."""
+
+        if getattr(self, "okx_order_fact_sync_factory", None) is None:
+            return
+        task = getattr(self, "_okx_order_fact_sync_task", None)
+        if task is not None and not task.done():
+            return
+        self._okx_order_fact_sync_last_started_at = datetime.now(UTC)
+        task = asyncio.create_task(self._sync_okx_order_facts_for_loop())
+        self._okx_order_fact_sync_task = task
+        task.add_done_callback(self._consume_okx_order_fact_sync_result)
+
+    def _consume_okx_order_fact_sync_result(self, task: asyncio.Task) -> None:
+        """Persist optional order-fact sync outcome as diagnostics only."""
+
+        if task.cancelled():
+            return
+        finished_at = datetime.now(UTC)
+        self._okx_order_fact_sync_last_finished_at = finished_at
+        try:
+            row = task.result()
+        except Exception as exc:
+            error = safe_error_text(exc, limit=180)
+            self._okx_order_fact_sync_last_error = error
+            self._okx_order_fact_sync_failure_count = (
+                int(getattr(self, "_okx_order_fact_sync_failure_count", 0) or 0) + 1
+            )
+            self._okx_order_fact_sync_last_row = {
+                "kind": "order_fact_sync",
+                "symbol": None,
+                "side": None,
+                "exchange_order_id": None,
+                "requires_attention": False,
+                "degraded": True,
+                "status": "degraded",
+                "okx_pull_available": False,
+                "error": error,
+                "note": (
+                    "OKX 订单事实后台同步降级：本轮未能拉取原生订单/成交数据；"
+                    "当前持仓对账已独立完成，本次降级不作为当前状态差异阻断新开仓。"
+                ),
+            }
+        else:
+            self._okx_order_fact_sync_last_error = None
+            self._okx_order_fact_sync_success_count = (
+                int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0) + 1
+            )
+            self._okx_order_fact_sync_last_row = row if isinstance(row, dict) else {
+                "kind": "order_fact_sync",
+                "requires_attention": False,
+                "degraded": True,
+                "status": "degraded",
+                "okx_pull_available": False,
+                "error": "invalid_order_fact_sync_result",
+                "note": "OKX 订单事实后台同步返回了无效结果；当前持仓对账不受影响。",
+            }
+        if getattr(self, "_okx_order_fact_sync_task", None) is task:
+            self._okx_order_fact_sync_task = None
 
     def strategy_learning_context_timeout_seconds(self) -> float:
         """Return the hard budget for strategy-learning context in the trading loop."""
@@ -1633,9 +1741,10 @@ class TradingService:
                     timeout=self.round_start_reconcile_timeout_seconds() + 2.0,
                 )
                 result = list(position_result) if isinstance(position_result, list) else []
-                if getattr(self, "okx_order_fact_sync_factory", None) is not None:
-                    order_fact_result = await self._sync_okx_order_facts_for_loop()
+                order_fact_result = getattr(self, "_okx_order_fact_sync_last_row", None)
+                if isinstance(order_fact_result, dict):
                     result.append(order_fact_result)
+                self._start_okx_order_fact_sync_background()
                 finished_at = datetime.now(UTC)
                 self._okx_authoritative_sync_last_success_at = finished_at
                 self._okx_authoritative_sync_last_error = None
@@ -5810,10 +5919,11 @@ class TradingService:
         self._write_runtime_heartbeat()
         await self._stop_ml_auto_train_loop()
         for task in (
-            self._position_analysis_task,
-            self._market_analysis_task,
-            self._runtime_heartbeat_task,
-            self._okx_authoritative_sync_task,
+            getattr(self, "_position_analysis_task", None),
+            getattr(self, "_market_analysis_task", None),
+            getattr(self, "_runtime_heartbeat_task", None),
+            getattr(self, "_okx_authoritative_sync_task", None),
+            getattr(self, "_okx_order_fact_sync_task", None),
         ):
             if task and not task.done():
                 task.cancel()
@@ -5825,6 +5935,7 @@ class TradingService:
         self._market_analysis_task = None
         self._runtime_heartbeat_task = None
         self._okx_authoritative_sync_task = None
+        self._okx_order_fact_sync_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self.okx_executor, self._okx_paper, self._okx_live):
