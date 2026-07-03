@@ -21,6 +21,9 @@ def _service() -> DataService:
     service._indicator_remote_refresh_semaphore = asyncio.Semaphore(
         max(1, int(data_service_module.INDICATOR_REMOTE_REFRESH_CONCURRENCY))
     )
+    service._indicator_snapshot_build_semaphore = asyncio.Semaphore(
+        max(1, int(data_service_module.INDICATOR_SNAPSHOT_BUILD_CONCURRENCY))
+    )
     service._kline_fetch_tasks = {}
     service._kline_background_refresh_tasks = {}
     service._kline_refresh_scheduled_at = {}
@@ -234,6 +237,100 @@ async def test_feature_vector_can_skip_initial_sentiment_wait_for_market_scan(
             await asyncio.gather(task, return_exceptions=True)
 
     assert fv.current_price == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
+async def test_market_feature_vector_does_not_build_indicators_from_cached_klines() -> None:
+    service = _service()
+    service.ws_client = type(
+        "Ws",
+        (),
+        {
+            "latest_tickers": {
+                "BTC/USDT": {
+                    "last_price": 100.0,
+                    "bid": 99.0,
+                    "ask": 101.0,
+                    "timestamp": int(time.time() * 1000),
+                    "source": "websocket",
+                }
+            }
+        },
+    )()
+    service._last_sentiment_update = None
+    service._sentiment_refresh_task = None
+    build_attempted = False
+
+    async def noop_sentiment(_symbols):
+        return None
+
+    async def cached_kline_build(_symbol):
+        nonlocal build_attempted
+        build_attempted = True
+        return {"indicator_snapshot_available": True, "close": 100.0}
+
+    service.refresh_sentiment = noop_sentiment  # type: ignore[method-assign]
+    service._indicator_features_from_cached_klines = cached_kline_build  # type: ignore[method-assign]
+
+    fv = await service.get_feature_vector(
+        "BTC/USDT",
+        wait_for_sentiment=False,
+        block_on_remote_indicators=False,
+        allow_cached_indicator_build=False,
+        allow_indicator_background_refresh=False,
+    )
+
+    assert fv.current_price == pytest.approx(100.0)
+    assert fv.indicator_snapshot_available is False
+    assert build_attempted is False
+    assert service._indicator_snapshot_tasks.get("BTC/USDT") is None
+
+
+@pytest.mark.asyncio
+async def test_normal_feature_vector_can_build_indicators_from_cached_klines() -> None:
+    service = _service()
+    service.ws_client = type(
+        "Ws",
+        (),
+        {
+            "latest_tickers": {
+                "BTC/USDT": {
+                    "last_price": 100.0,
+                    "bid": 99.0,
+                    "ask": 101.0,
+                    "timestamp": int(time.time() * 1000),
+                    "source": "websocket",
+                }
+            }
+        },
+    )()
+    service._last_sentiment_update = None
+    service._sentiment_refresh_task = None
+
+    async def noop_sentiment(_symbols):
+        return None
+
+    async def cached_kline_build(_symbol):
+        return {
+            "indicator_snapshot_available": True,
+            "technical_indicator_timeframe": "1h",
+            "close": 100.0,
+            "volume_ratio": 1.2,
+        }
+
+    service.refresh_sentiment = noop_sentiment  # type: ignore[method-assign]
+    service._indicator_features_from_cached_klines = cached_kline_build  # type: ignore[method-assign]
+
+    fv = await service.get_feature_vector(
+        "BTC/USDT",
+        wait_for_sentiment=False,
+        block_on_remote_indicators=False,
+    )
+
+    assert fv.current_price == pytest.approx(100.0)
+    assert fv.indicator_snapshot_available is True
+    assert fv.technical_indicator_timeframe == "1h"
+    assert fv.volume_ratio == pytest.approx(1.2)
 
 
 @pytest.mark.asyncio
@@ -728,6 +825,104 @@ async def test_ticker_snapshot_refreshes_stale_ws_cache_from_swap_rest() -> None
     assert snapshot["source"] == "rest"
     assert snapshot["inst_type"] == "SWAP"
     assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5666)
+
+
+@pytest.mark.asyncio
+async def test_ticker_snapshot_can_defer_rest_for_market_batch_scan() -> None:
+    service = _service()
+    stale_timestamp_ms = int(
+        (time.time() - data_service_module.TICKER_CACHE_MAX_AGE_SECONDS - 60) * 1000
+    )
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "timestamp": stale_timestamp_ms,
+            }
+        }
+
+    class FakeRestClient:
+        def __init__(self) -> None:
+            self.symbols: list[str] = []
+
+        async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            self.symbols.append(symbol)
+            return {
+                "last": 0.5666,
+                "bid": 0.5665,
+                "ask": 0.5667,
+                "timestamp": int(time.time() * 1000),
+            }
+
+    service.ws_client = FakeWsClient()
+    rest_client = FakeRestClient()
+    service.rest_client = rest_client
+
+    snapshot = await service._get_ticker_snapshot("PROS/USDT", block_on_remote=False)
+
+    assert rest_client.symbols == []
+    assert snapshot["last_price"] == pytest.approx(0.3902)
+    assert snapshot["stale"] is True
+    assert snapshot["ticker_remote_refresh_deferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_feature_vector_can_defer_ticker_rest_for_market_batch_scan() -> None:
+    service = _service()
+    stale_timestamp_ms = int(
+        (time.time() - data_service_module.TICKER_CACHE_MAX_AGE_SECONDS - 60) * 1000
+    )
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "timestamp": stale_timestamp_ms,
+            }
+        }
+
+    class FakeRestClient:
+        def __init__(self) -> None:
+            self.symbols: list[str] = []
+
+        async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            self.symbols.append(symbol)
+            return {
+                "last": 0.5666,
+                "bid": 0.5665,
+                "ask": 0.5667,
+                "timestamp": int(time.time() * 1000),
+            }
+
+    async def noop_sentiment(_symbols):
+        return None
+
+    service.ws_client = FakeWsClient()
+    rest_client = FakeRestClient()
+    service.rest_client = rest_client
+    service._last_sentiment_update = None
+    service._sentiment_refresh_task = None
+    service.refresh_sentiment = noop_sentiment  # type: ignore[method-assign]
+
+    vector = await service.get_feature_vector(
+        "PROS/USDT",
+        wait_for_sentiment=False,
+        block_on_remote_ticker=False,
+        block_on_remote_indicators=False,
+        allow_cached_indicator_build=False,
+        allow_indicator_background_refresh=False,
+    )
+
+    assert rest_client.symbols == []
+    assert vector.current_price == pytest.approx(0.3902)
+    assert vector.price_source == "stale_websocket"
 
 
 @pytest.mark.asyncio

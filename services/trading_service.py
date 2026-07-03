@@ -1830,6 +1830,7 @@ class TradingService:
         self,
         *,
         mode: str,
+        analysis_scope: str | None = None,
         strategy_learning: Any,
         context: dict[str, Any],
         open_positions: list[dict[str, Any]],
@@ -1850,7 +1851,7 @@ class TradingService:
             )
             learned_context["strategy_learning_cache_status"] = "fresh"
             learned_context["strategy_learning_runtime_timeout_seconds"] = (
-                self.strategy_learning_context_wait_timeout_seconds()
+                self.strategy_learning_context_wait_timeout_seconds(analysis_scope)
             )
             self._strategy_learning_context_cache_store()[selected_mode] = {
                 "created_at": datetime.now(UTC),
@@ -3032,8 +3033,11 @@ class TradingService:
         symbol: str,
         *,
         wait_for_sentiment: bool = True,
+        block_on_remote_ticker: bool = True,
         block_on_remote_indicators: bool = True,
         block_on_remote_derivatives: bool = True,
+        allow_cached_indicator_build: bool = True,
+        allow_indicator_background_refresh: bool = True,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
@@ -3044,24 +3048,40 @@ class TradingService:
                 param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
             )
             accepts_options = "wait_for_sentiment" in parameters or accepts_var_kwargs
+            accepts_ticker_option = "block_on_remote_ticker" in parameters or accepts_var_kwargs
             accepts_indicator_option = (
                 "block_on_remote_indicators" in parameters or accepts_var_kwargs
             )
             accepts_derivatives_option = (
                 "block_on_remote_derivatives" in parameters or accepts_var_kwargs
             )
+            accepts_cached_indicator_build_option = (
+                "allow_cached_indicator_build" in parameters or accepts_var_kwargs
+            )
+            accepts_indicator_background_refresh_option = (
+                "allow_indicator_background_refresh" in parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             accepts_options = True
+            accepts_ticker_option = True
             accepts_indicator_option = True
             accepts_derivatives_option = True
+            accepts_cached_indicator_build_option = True
+            accepts_indicator_background_refresh_option = True
 
         kwargs: dict[str, Any] = {}
         if accepts_options:
             kwargs["wait_for_sentiment"] = wait_for_sentiment
+        if accepts_ticker_option:
+            kwargs["block_on_remote_ticker"] = block_on_remote_ticker
         if accepts_indicator_option:
             kwargs["block_on_remote_indicators"] = block_on_remote_indicators
         if accepts_derivatives_option:
             kwargs["block_on_remote_derivatives"] = block_on_remote_derivatives
+        if accepts_cached_indicator_build_option:
+            kwargs["allow_cached_indicator_build"] = allow_cached_indicator_build
+        if accepts_indicator_background_refresh_option:
+            kwargs["allow_indicator_background_refresh"] = allow_indicator_background_refresh
         if kwargs:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
@@ -3905,13 +3925,15 @@ class TradingService:
             )
         try:
             self._safe_set_strategy_context_stage("strategy_context:learning")
+            current_scope = _analysis_scope_context.get()
+            wait_timeout = self.strategy_learning_context_wait_timeout_seconds(current_scope)
             refresh_task = self._start_strategy_learning_context_refresh(
                 mode=selected_mode,
+                analysis_scope=current_scope,
                 strategy_learning=strategy_learning,
                 context=context,
                 open_positions=open_positions or [],
             )
-            wait_timeout = self.strategy_learning_context_wait_timeout_seconds()
             done, _pending = await asyncio.wait(
                 {refresh_task},
                 timeout=wait_timeout,
@@ -5243,12 +5265,27 @@ class TradingService:
                             self._get_feature_vector_snapshot(
                                 sym,
                                 wait_for_sentiment=False,
+                                block_on_remote_ticker=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
                                 block_on_remote_indicators=not (
                                     run_market_analysis
                                     and not run_position_analysis
                                     and mode_manager.is_auto_scan
                                 ),
                                 block_on_remote_derivatives=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
+                                allow_cached_indicator_build=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
+                                allow_indicator_background_refresh=not (
                                     run_market_analysis
                                     and not run_position_analysis
                                     and mode_manager.is_auto_scan

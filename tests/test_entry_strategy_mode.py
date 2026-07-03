@@ -410,6 +410,39 @@ def test_strategy_learning_context_wait_timeout_is_shorter_for_market_scope(
 
 
 @pytest.mark.asyncio
+async def test_strategy_learning_refresh_records_market_scope_wait_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+    service._strategy_learning_context_refresh_tasks = {}
+    service._strategy_learning_context_cache = {}
+    service._json_safe_payload = lambda payload: dict(payload)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_context_timeout_seconds",
+        lambda _self: 10.0,
+    )
+
+    class Learning:
+        async def apply_to_strategy_context(self, **kwargs: Any) -> dict[str, Any]:
+            return dict(kwargs["strategy_context"])
+
+    task = service._start_strategy_learning_context_refresh(
+        mode="paper",
+        analysis_scope="market",
+        strategy_learning=Learning(),
+        context={"strategy_profile_id": "baseline_current"},
+        open_positions=[],
+    )
+
+    result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result["strategy_learning_runtime_timeout_seconds"] == pytest.approx(3.0)
+    cached = service._strategy_learning_context_cache["paper"]["context"]
+    assert cached["strategy_learning_runtime_timeout_seconds"] == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
 async def test_strategy_mode_context_uses_cached_learning_context_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

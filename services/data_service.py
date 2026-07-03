@@ -57,6 +57,10 @@ KLINE_COVERAGE_REFRESH_BATCH_SIZE = _MARKET_DATA_PARAMS.kline_coverage_refresh_b
 KLINE_COVERAGE_REFRESH_SYMBOL_CAP = _MARKET_DATA_PARAMS.kline_coverage_refresh_symbol_cap
 KLINE_COVERAGE_INITIAL_DELAY_SECONDS = _MARKET_DATA_PARAMS.kline_coverage_initial_delay_seconds
 INDICATOR_REMOTE_REFRESH_CONCURRENCY = _MARKET_DATA_PARAMS.indicator_remote_refresh_concurrency
+INDICATOR_SNAPSHOT_BUILD_CONCURRENCY = max(
+    1,
+    min(4, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)),
+)
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -584,8 +588,11 @@ class DataService:
         symbol: str,
         *,
         wait_for_sentiment: bool = True,
+        block_on_remote_ticker: bool = True,
         block_on_remote_indicators: bool = True,
         block_on_remote_derivatives: bool = True,
+        allow_cached_indicator_build: bool = True,
+        allow_indicator_background_refresh: bool = True,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -618,7 +625,13 @@ class DataService:
                 return {}
 
         ticker_task = asyncio.create_task(
-            bounded_snapshot("ticker", self._get_ticker_snapshot(symbol))
+            bounded_snapshot(
+                "ticker",
+                self._get_feature_ticker_snapshot(
+                    symbol,
+                    block_on_remote=block_on_remote_ticker,
+                ),
+            )
         )
         indicators_task = asyncio.create_task(
             bounded_snapshot(
@@ -626,6 +639,8 @@ class DataService:
                 self._get_feature_indicator_snapshot(
                     symbol,
                     block_on_remote=block_on_remote_indicators,
+                    allow_cached_build=allow_cached_indicator_build,
+                    allow_background_refresh=allow_indicator_background_refresh,
                 ),
             )
         )
@@ -713,7 +728,12 @@ class DataService:
             return
         self._sentiment_refresh_task = asyncio.create_task(self.refresh_sentiment(symbols))
 
-    async def _get_ticker_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def _get_ticker_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         ticker = dict(
             self.ws_client.latest_tickers.get(symbol, {})
@@ -743,6 +763,19 @@ class DataService:
                 symbol=normalized,
                 age_seconds=self._ticker_snapshot_age_seconds(ticker),
             )
+        if not block_on_remote:
+            if ticker:
+                ticker["source"] = ticker.get("source") or "stale_websocket"
+                ticker["stale"] = True
+                ticker["ticker_remote_refresh_deferred"] = True
+                ticker["age_seconds"] = self._ticker_snapshot_age_seconds(ticker)
+                if ticker_consistency_issue:
+                    ticker["market_data_quality_issue"] = ticker_consistency_issue
+                return ticker
+            return {
+                "ticker_snapshot_available": False,
+                "ticker_remote_refresh_deferred": True,
+            }
         try:
             raw_ticker = await self.rest_client.fetch_ticker(normalized)
             ticker_info = raw_ticker.get("info") or {}
@@ -899,12 +932,46 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        allow_cached_build: bool = True,
+        allow_background_refresh: bool = True,
     ) -> dict[str, Any]:
         getter = self._get_indicator_snapshot
         try:
-            return await getter(symbol, block_on_remote=block_on_remote)
+            return await getter(
+                symbol,
+                block_on_remote=block_on_remote,
+                allow_cached_build=allow_cached_build,
+                allow_background_refresh=allow_background_refresh,
+            )
         except TypeError as exc:
-            if "block_on_remote" not in safe_error_text(exc):
+            error_text = safe_error_text(exc)
+            if "allow_background_refresh" in error_text:
+                try:
+                    return await getter(
+                        symbol,
+                        block_on_remote=block_on_remote,
+                        allow_cached_build=allow_cached_build,
+                    )
+                except TypeError as nested_exc:
+                    nested_text = safe_error_text(nested_exc)
+                    if "allow_cached_build" in nested_text:
+                        try:
+                            return await getter(symbol, block_on_remote=block_on_remote)
+                        except TypeError as final_exc:
+                            if "block_on_remote" not in safe_error_text(final_exc):
+                                raise
+                            return await getter(symbol)
+                    if "block_on_remote" not in nested_text:
+                        raise
+                    return await getter(symbol)
+            if "allow_cached_build" in error_text:
+                try:
+                    return await getter(symbol, block_on_remote=block_on_remote)
+                except TypeError as nested_exc:
+                    if "block_on_remote" not in safe_error_text(nested_exc):
+                        raise
+                    return await getter(symbol)
+            if "block_on_remote" not in error_text:
                 raise
             return await getter(symbol)
 
@@ -927,19 +994,25 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        allow_cached_build: bool = True,
+        allow_background_refresh: bool = True,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         cache = self._indicator_snapshot_cache_map()
         cached = cache.get(normalized)
         if self._is_fresh_indicator_cache(cached):
-            self._schedule_kline_background_refresh(normalized)
+            if allow_background_refresh:
+                self._schedule_kline_background_refresh(normalized)
             return dict(cached.get("data") or {})
         if isinstance(cached, dict) and not block_on_remote:
-            self._schedule_indicator_snapshot_refresh(normalized)
+            if allow_background_refresh:
+                self._schedule_indicator_snapshot_refresh(normalized)
             data = dict(cached.get("data") or {})
             if data:
                 data["indicator_snapshot_stale"] = True
-                data["indicator_snapshot_refresh_in_background"] = True
+                data["indicator_snapshot_refresh_in_background"] = bool(
+                    allow_background_refresh
+                )
                 return data
 
         tasks = self._indicator_snapshot_task_map()
@@ -954,15 +1027,19 @@ class DataService:
             }
 
         if not block_on_remote:
-            cached_features = await self._indicator_features_from_cached_klines(normalized)
-            if cached_features:
-                self._store_indicator_snapshot_cache(normalized, cached_features)
-                self._schedule_kline_background_refresh(normalized)
-                return cached_features
-            self._schedule_indicator_snapshot_refresh(normalized)
+            if allow_cached_build:
+                cached_features = await self._indicator_features_from_cached_klines(normalized)
+                if cached_features:
+                    self._store_indicator_snapshot_cache(normalized, cached_features)
+                    if allow_background_refresh:
+                        self._schedule_kline_background_refresh(normalized)
+                    return cached_features
+            if allow_background_refresh:
+                self._schedule_indicator_snapshot_refresh(normalized)
             return {
                 "indicator_snapshot_available": False,
-                "indicator_snapshot_refresh_in_background": True,
+                "indicator_snapshot_refresh_in_background": bool(allow_background_refresh),
+                "indicator_snapshot_background_refresh_deferred": not allow_background_refresh,
             }
 
         task = asyncio.create_task(self._build_indicator_snapshot(normalized))
@@ -993,6 +1070,13 @@ class DataService:
         if not isinstance(gate, asyncio.Semaphore):
             gate = asyncio.Semaphore(max(1, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)))
             self._indicator_remote_refresh_semaphore = gate
+        return gate
+
+    def _indicator_snapshot_build_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_indicator_snapshot_build_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(max(1, int(INDICATOR_SNAPSHOT_BUILD_CONCURRENCY)))
+            self._indicator_snapshot_build_semaphore = gate
         return gate
 
     def _kline_fetch_task_map(self) -> dict[tuple[str, str], asyncio.Task]:
@@ -1111,6 +1195,11 @@ class DataService:
             )
 
     async def _build_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
+        gate = self._indicator_snapshot_build_gate()
+        async with gate:
+            return await self._build_indicator_snapshot_uncached(symbol)
+
+    async def _build_indicator_snapshot_uncached(self, symbol: str) -> dict[str, Any]:
         try:
             cached_features = await self._indicator_features_from_cached_klines(symbol)
             if cached_features:
@@ -1141,6 +1230,20 @@ class DataService:
         except Exception as e:
             logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))
             return {}
+
+    async def _get_feature_ticker_snapshot(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool = True,
+    ) -> dict[str, Any]:
+        getter = self._get_ticker_snapshot
+        try:
+            return await getter(symbol, block_on_remote=block_on_remote)
+        except TypeError as exc:
+            if "block_on_remote" not in safe_error_text(exc):
+                raise
+            return await getter(symbol)
 
     async def _indicator_features_from_cached_klines(self, symbol: str) -> dict[str, Any]:
         cached_results = await asyncio.gather(
