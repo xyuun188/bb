@@ -15,7 +15,11 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.exit_arbitrator import ExitArbitrationResult, ExitArbitrator
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.profit_first_exit_binding import attach_profit_first_exit_reference
-from services.profit_first_stage2 import DefensiveProbeShadowPolicy, RecentProbePnLBrakePolicy
+from services.profit_first_stage2 import (
+    DefensiveProbeShadowPolicy,
+    RecentProbePnLBrakePolicy,
+    profit_first_real_trade_upgrade_context,
+)
 from services.profit_first_trade_plan import attach_profit_first_trade_plan
 
 
@@ -289,10 +293,8 @@ class EntryPolicy:
             else {}
         )
         profit_first_lane = str(profit_first_plan.get("decision_lane") or "").lower().strip()
-        profit_first_real_entry_upgrade = bool(
-            profit_first_plan.get("is_complete_for_real_trade")
-            and profit_first_lane in {"validated_probe", "meaningful_entry", "high_conviction"}
-        )
+        profit_first_upgrade = profit_first_real_trade_upgrade_context(raw, decision)
+        profit_first_real_entry_upgrade = bool(profit_first_upgrade.get("ready"))
         probe_brake = self.profit_first_probe_brake.evaluate(profit_first_plan, raw)
         if not probe_brake.allowed:
             return PolicyGateResult.block(
@@ -345,6 +347,7 @@ class EntryPolicy:
                     "entry_evidence_advisory": entry_evidence_advisory,
                     "profit_first_decision_lane": profit_first_lane,
                     "profit_first_real_entry_upgrade": profit_first_real_entry_upgrade,
+                    "profit_first_real_entry_upgrade_context": profit_first_upgrade,
                 },
             )
         gate_reason = self.gate_reason(decision)

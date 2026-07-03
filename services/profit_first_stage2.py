@@ -9,6 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+PROFIT_FIRST_LANE_ORDER = {
+    "shadow_only": 0,
+    "tiny_probe": 1,
+    "validated_probe": 2,
+    "meaningful_entry": 3,
+    "high_conviction": 4,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ProfitFirstStage2Decision:
@@ -69,8 +77,6 @@ class RecentProbePnLBrakePolicy:
 class DefensiveProbeShadowPolicy:
     """Keep low-quality, risk-budget-capped probes out of real execution."""
 
-    min_real_expected_profit_usdt: float = 0.25
-
     def evaluate(self, raw: dict[str, Any], decision: Any) -> ProfitFirstStage2Decision:
         if not isinstance(raw, dict):
             return ProfitFirstStage2Decision(True)
@@ -106,19 +112,16 @@ class DefensiveProbeShadowPolicy:
         dynamic_reasons = {str(item).lower() for item in dynamic.get("reasons") or []}
         risk_budget_capped = limiting_factor == "risk_budget" or "limited_by_risk_budget" in dynamic_reasons
 
-        real_trade_upgrade = bool(
-            lane == "validated_probe"
-            and bool(plan.get("is_complete_for_real_trade"))
-            and expected_net_return > 0.0
-        )
+        upgrade = profit_first_real_trade_upgrade_context(raw, decision)
+        real_trade_upgrade = bool(upgrade.get("ready"))
         should_shadow = bool(
             low_payoff
             and not high_quality
             and quality_tier not in {"strong_probe", "quality_override", "high_profit", "elite"}
             and final_leverage <= 1.0
             and risk_budget_capped
-            and expected_profit < self.min_real_expected_profit_usdt
             and not real_trade_upgrade
+            and not bool(evidence_score.get("tradeable_probe"))
         )
         data = {
             "lane": lane,
@@ -131,6 +134,7 @@ class DefensiveProbeShadowPolicy:
             "dynamic_leverage_limiting_factor": limiting_factor,
             "risk_budget_capped": risk_budget_capped,
             "profit_first_real_trade_upgrade": real_trade_upgrade,
+            "profit_first_real_trade_upgrade_context": upgrade,
             "tradeable_probe": bool(evidence_score.get("tradeable_probe")),
         }
         if not should_shadow:
@@ -146,7 +150,6 @@ class DefensiveProbeShadowPolicy:
                 **data,
                 "skip_kind": "profit_first_defensive_probe_shadow",
                 "shadow_only": True,
-                "min_real_expected_profit_usdt": self.min_real_expected_profit_usdt,
             },
         )
 
@@ -241,3 +244,118 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _lane_rank(value: Any) -> int:
+    return PROFIT_FIRST_LANE_ORDER.get(str(value or "").lower().strip(), 0)
+
+
+def profit_first_real_trade_upgrade_context(raw: dict[str, Any], decision: Any) -> dict[str, Any]:
+    plan = raw.get("profit_first_trade_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    opportunity = raw.get("opportunity_score")
+    opportunity = opportunity if isinstance(opportunity, dict) else {}
+    evidence_score = opportunity.get("evidence_score")
+    evidence_score = evidence_score if isinstance(evidence_score, dict) else {}
+    sizing = raw.get("profit_risk_sizing")
+    sizing = sizing if isinstance(sizing, dict) else {}
+    ladder = sizing.get("profit_first_position_ladder")
+    ladder = ladder if isinstance(ladder, dict) else {}
+    dynamic = raw.get("dynamic_leverage_decision")
+    if not isinstance(dynamic, dict):
+        dynamic = sizing.get("dynamic_leverage_decision")
+    dynamic = dynamic if isinstance(dynamic, dict) else {}
+
+    plan_lane = str(plan.get("decision_lane") or "").lower().strip()
+    ladder_lane = str(ladder.get("lane") or "").lower().strip()
+    quality_tier = str(sizing.get("quality_tier") or "").lower().strip()
+    plan_complete = bool(plan.get("is_complete_for_real_trade"))
+    tradeable_probe = bool(evidence_score.get("tradeable_probe"))
+    evidence_tier = str(evidence_score.get("tier") or "").lower().strip()
+    evidence_shadow_only = bool(evidence_score.get("shadow_only"))
+    evidence_size_multiplier = _safe_float(evidence_score.get("size_multiplier"), 0.0)
+    strategy_quality_override = bool(sizing.get("strategy_quality_override"))
+    meaningful_size_reason = str(sizing.get("meaningful_size_reason") or "").strip()
+    notional_floor_applied = bool(sizing.get("notional_floor_applied"))
+    target_min_notional = _safe_float(sizing.get("target_min_notional_usdt"), 0.0)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    position_size_pct = max(
+        _safe_float(sizing.get("position_size_pct")),
+        _safe_float(getattr(decision, "position_size_pct", None)),
+    )
+    expected_net_return = max(
+        _safe_float(opportunity.get("expected_net_return_pct"), 0.0),
+        _safe_float(plan.get("expected_net_return_pct"), 0.0),
+    )
+    expected_profit = max(
+        _safe_float(sizing.get("expected_profit_usdt"), 0.0),
+        _safe_float(plan.get("expected_profit_usdt"), 0.0),
+    )
+    if expected_profit <= 0.0 and final_notional > 0.0 and expected_net_return > 0.0:
+        expected_profit = final_notional * expected_net_return / 100.0
+    final_leverage = _safe_float(
+        dynamic.get("final_integer_leverage"),
+        _safe_float(getattr(decision, "suggested_leverage", None), 0.0),
+    )
+    structure_reasons: list[str] = []
+    if max(_lane_rank(plan_lane), _lane_rank(ladder_lane)) >= _lane_rank("validated_probe"):
+        structure_reasons.append("validated_profit_first_lane")
+    if tradeable_probe:
+        structure_reasons.append("tradeable_probe")
+    if (
+        evidence_tier in {"exploration", "small", "medium", "normal"}
+        and not evidence_shadow_only
+        and evidence_size_multiplier > 0.0
+    ):
+        structure_reasons.append(f"evidence_tier:{evidence_tier}")
+    if strategy_quality_override:
+        structure_reasons.append("strategy_quality_override")
+    if quality_tier in {
+        "good_probe",
+        "strong_probe",
+        "quality_override",
+        "roster_fill",
+        "high_profit",
+        "elite",
+        "winner_add",
+    }:
+        structure_reasons.append(f"quality_tier:{quality_tier}")
+    if meaningful_size_reason:
+        structure_reasons.append("meaningful_size_reason")
+    if notional_floor_applied or target_min_notional > 0.0:
+        structure_reasons.append("notional_floor")
+
+    economically_viable = bool(
+        plan_complete
+        and expected_net_return > 0.0
+        and position_size_pct > 0.0
+        and final_leverage > 0.0
+        and (
+            expected_profit > 0.0
+            or final_notional > 0.0
+            or _lane_rank(plan_lane) >= _lane_rank("validated_probe")
+        )
+    )
+    ready = bool(economically_viable and structure_reasons)
+    return {
+        "ready": ready,
+        "economically_viable": economically_viable,
+        "plan_complete": plan_complete,
+        "plan_lane": plan_lane,
+        "ladder_lane": ladder_lane,
+        "quality_tier": quality_tier,
+        "tradeable_probe": tradeable_probe,
+        "evidence_tier": evidence_tier,
+        "evidence_shadow_only": evidence_shadow_only,
+        "evidence_size_multiplier": evidence_size_multiplier,
+        "strategy_quality_override": strategy_quality_override,
+        "meaningful_size_reason": meaningful_size_reason,
+        "notional_floor_applied": notional_floor_applied,
+        "target_min_notional_usdt": target_min_notional,
+        "final_notional_usdt": final_notional,
+        "position_size_pct": position_size_pct,
+        "final_integer_leverage": final_leverage,
+        "expected_net_return_pct": expected_net_return,
+        "expected_profit_usdt": expected_profit,
+        "structure_reasons": structure_reasons,
+    }
