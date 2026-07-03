@@ -21,6 +21,7 @@ from core.model_runtime import (
 )
 from core.safe_output import safe_error_text, safe_response_error_text
 from core.url_safety import normalize_http_base_url
+from services.execution_reason_localizer import localize_execution_reason
 
 logger = structlog.get_logger(__name__)
 
@@ -197,7 +198,10 @@ class HighRiskReviewService:
         return HighRiskReviewResult(
             approved=bool(parsed.get("approved")),
             confidence=_safe_float(parsed.get("confidence"), 0.0),
-            reason=str(parsed.get("reason") or "")[:500],
+            reason=_normalize_review_reason(
+                parsed.get("reason"),
+                approved=bool(parsed.get("approved")),
+            )[:500],
             attempts=attempts,
         )
 
@@ -448,6 +452,83 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _contains_cjk(value: Any) -> bool:
+    text = str(value or "")
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _normalize_review_reason(value: Any, *, approved: bool) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return (
+            "风险仍在可控范围内，可谨慎执行。"
+            if approved
+            else "预期净收益偏弱、风险收益不对称或证据存在冲突。"
+        )
+    localized = localize_execution_reason(text)
+    if _contains_cjk(localized):
+        return str(localized)
+
+    lower = text.lower()
+    clauses: list[str] = []
+    if any(
+        token in lower
+        for token in (
+            "expected net profit is poor",
+            "expected profit is poor",
+            "expected return is poor",
+            "too little expected profit",
+            "low payoff",
+        )
+    ):
+        clauses.append("预期净收益偏弱")
+    if any(
+        token in lower
+        for token in (
+            "risk is asymmetric",
+            "asymmetric risk",
+            "asymmetric payoff",
+            "tail risk",
+            "loss probability",
+        )
+    ):
+        clauses.append("风险收益不对称")
+    if any(
+        token in lower
+        for token in (
+            "evidence conflicts",
+            "evidence conflict",
+            "direction conflict",
+            "signal conflict",
+            "conflicting evidence",
+        )
+    ):
+        clauses.append("证据存在冲突")
+    if not clauses and approved and any(
+        token in lower
+        for token in (
+            "approved",
+            "approve",
+            "allowed",
+            "allow",
+            "pass",
+            "acceptable",
+            "controlled",
+        )
+    ):
+        clauses.append("风险仍在可控范围内")
+    if clauses:
+        unique_clauses = list(dict.fromkeys(clauses))
+        if unique_clauses == ["风险仍在可控范围内"]:
+            return "风险仍在可控范围内，可谨慎执行。"
+        return "、".join(unique_clauses) + "。"
+    return (
+        "风险仍在可控范围内，可谨慎执行。"
+        if approved
+        else "复核模型认为当前收益风险比不够理想。"
+    )
 
 
 def _has_thinking_tag(value: Any) -> bool:

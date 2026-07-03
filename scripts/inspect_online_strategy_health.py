@@ -327,6 +327,18 @@ ENTRY_EVIDENCE_RELIEF_KEYS = (
 
 def entry_skip_kind(decision):
     raw = safe_dict(decision.raw_llm_response)
+    explicit_skip_kind = str(
+        getattr(decision, "skip_kind", "") or raw.get("skip_kind") or ""
+    ).lower().strip()
+    if explicit_skip_kind:
+        if explicit_skip_kind == "high_risk_review":
+            return "high_risk_review_blocked"
+        return explicit_skip_kind
+    policy_blocker = str(
+        getattr(decision, "policy_blocker", "") or raw.get("policy_blocker") or ""
+    ).lower().strip()
+    if policy_blocker == "high_risk_review":
+        return "high_risk_review_blocked"
     shadow = safe_dict(raw.get("entry_evidence_shadow_only"))
     if shadow.get("skip_kind"):
         return str(shadow.get("skip_kind"))
@@ -2237,6 +2249,11 @@ def _compact_entry_skip_kind(item):
     item = safe_dict(item)
     if item.get("executed"):
         return "executed"
+    explicit_skip_kind = str(item.get("skip_kind") or item.get("policy_blocker") or "").lower()
+    if explicit_skip_kind:
+        if explicit_skip_kind == "high_risk_review":
+            return "high_risk_review_blocked"
+        return explicit_skip_kind
     reason = str(item.get("reason") or "")
     state_data = safe_dict(item.get("state"))
     final_stage = str(state_data.get("final_stage") or "").lower()
@@ -3997,6 +4014,11 @@ def _compact_entry_skip_kind(item: dict | None) -> str:
     item = item if isinstance(item, dict) else {}
     if item.get("executed"):
         return "executed"
+    explicit_skip_kind = str(item.get("skip_kind") or item.get("policy_blocker") or "").lower()
+    if explicit_skip_kind:
+        if explicit_skip_kind == "high_risk_review":
+            return "high_risk_review_blocked"
+        return explicit_skip_kind
     reason = str(item.get("reason") or "")
     state = item.get("state") if isinstance(item.get("state"), dict) else {}
     final_stage = str(state.get("final_stage") or "").lower()

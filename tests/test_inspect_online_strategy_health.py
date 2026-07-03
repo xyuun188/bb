@@ -721,6 +721,19 @@ def test_strategy_health_entry_only_report_is_compact_and_keeps_guards() -> None
     assert "Read-only compact market entry" in compact["diagnostic_boundary"]
 
 
+def test_compact_entry_skip_kind_prefers_explicit_high_risk_review_blocker() -> None:
+    assert (
+        inspect_online_strategy_health._compact_entry_skip_kind(
+            {
+                "skip_kind": "high_risk_review",
+                "state": {"final_stage": "candidate_rank", "final_status": "completed"},
+                "reason": "",
+            }
+        )
+        == "high_risk_review_blocked"
+    )
+
+
 def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards() -> None:
     report = {
         "window_minutes": 60,

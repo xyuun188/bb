@@ -90,6 +90,15 @@ def ml_ai_direction_conflict(decision: DecisionOutput) -> bool:
     ml_signal = _safe_dict(raw.get("ml_signal"))
     predictions = _safe_list(ml_signal.get("predictions"))
     primary = _safe_dict(predictions[0]) if predictions else {}
+    if not primary:
+        return False
+    if not bool(ml_signal.get("influence_enabled", True)):
+        return False
+    readiness = _safe_dict(ml_signal.get("readiness"))
+    if readiness.get("allow_live_position_influence") is False:
+        return False
+    if primary.get("ml_influence_enabled") is False:
+        return False
     ml_side = str(primary.get("best_side") or "").lower()
     return ml_side in {"long", "short"} and ml_side != entry_side_value(decision)
 

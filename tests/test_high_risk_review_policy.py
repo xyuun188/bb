@@ -334,6 +334,42 @@ async def test_high_risk_review_runtime_caps_oversized_setting(
     assert reviewer.calls[0]["max_tokens"] == HIGH_RISK_REVIEW_TOKEN_CAP
 
 
+@pytest.mark.asyncio
+async def test_high_risk_review_normalizes_english_reason_to_chinese(
+    high_risk_settings: None,
+) -> None:
+    class EnglishReasonReviewer(HighRiskReviewService):
+        async def call_model(
+            self,
+            *,
+            api_base: str,
+            api_key: str,
+            model: str,
+            messages: list[dict[str, str]],
+            use_json_mode: bool,
+            max_tokens: int,
+            request_timeout: float,
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            return (
+                {},
+                (
+                    '{"approved": false, "confidence": 0.34, '
+                    '"reason": "Expected net profit is poor, risk is asymmetric, or evidence conflicts."}'
+                ),
+                {"finish_reason": "stop"},
+            )
+
+    result = await EnglishReasonReviewer().review_trade(
+        {"symbol": "BTC/USDT", "side": "long"},
+        api_base="https://api.deepseek.com",
+        api_key=settings.high_risk_review_api_key,
+        model="deepseek-reasoner",
+    )
+
+    assert result.approved is False
+    assert result.reason == "预期净收益偏弱、风险收益不对称、证据存在冲突。"
+
+
 def test_high_risk_review_extracts_json_from_reasoning_and_list_content() -> None:
     reviewer = HighRiskReviewService()
 
@@ -571,6 +607,52 @@ async def test_high_risk_review_local_probe_does_not_skip_weak_loss_profile(
     assert review["hard_review_required"] is True
     assert "expert_disagreement:100%" in reviewer.calls[0]["prompt"]["trigger_reasons"]
     assert "today_recovery_after_loss" in reviewer.calls[0]["prompt"]["trigger_reasons"]
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_ignores_learning_only_ml_direction_conflict(
+    high_risk_settings: None,
+) -> None:
+    reviewer = GateReviewer(
+        HighRiskReviewResult(
+            approved=False,
+            confidence=0.3,
+            reason="预期净收益偏弱。",
+            attempts=[{"attempt": 1}],
+        )
+    )
+    gate = _gate_with_today_loss(reviewer)
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ADA/USDT",
+        action=Action.LONG,
+        confidence=0.74,
+        reasoning="unit test",
+        position_size_pct=0.02,
+        suggested_leverage=2.0,
+        raw_response={
+            "opportunity_score": {
+                "expected_net_return_pct": 0.245415,
+                "profit_quality_ratio": 0.303787,
+                "server_profit_loss_probability": 0.5197,
+                "tail_risk_score": 0.250354,
+            },
+            "quant_profit_probe": {"loss_probability": 0.5197},
+            "ml_signal": {
+                "influence_enabled": False,
+                "readiness": {"allow_live_position_influence": False},
+                "predictions": [{"best_side": "short"}],
+            },
+        },
+    )
+
+    reason = await gate.evaluate(decision, "paper", [])
+
+    assert reason is None
+    assert reviewer.calls == []
+    review = _raw_response(decision)["high_risk_review"]
+    assert review["status"] == "skipped_advisory_only"
+    assert review["advisory_reasons"] == ["today_recovery_after_loss"]
 
 
 @pytest.mark.asyncio

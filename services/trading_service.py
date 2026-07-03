@@ -8448,6 +8448,16 @@ class TradingService:
         if fresh_cached:
             return fresh_cached
         lock = self._okx_balance_snapshot_lock_for_mode(selected_mode)
+        if lock.locked():
+            refresh_cached = cached_snapshot("OKX balance refresh already in progress")
+            if refresh_cached:
+                return refresh_cached
+            refresh_fallback = await fresh_executor_snapshot(
+                "shared OKX balance refresh already in progress"
+            )
+            if refresh_fallback:
+                refresh_fallback["refresh_in_progress"] = True
+                return refresh_fallback
         async with lock:
             fresh_cached = self._cached_okx_balance_snapshot(
                 selected_mode,

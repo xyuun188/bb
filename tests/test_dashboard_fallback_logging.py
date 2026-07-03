@@ -437,14 +437,7 @@ async def test_dashboard_okx_balance_snapshot_fallback_logs(
         "equity": 7.0,
         "allocatable": 7.0,
     }
-    assert dashboard_fallback_events == [
-        {
-            "event": "dashboard summary okx balance fallback",
-            "error": FAKE_BEARER_ERROR,
-            "mode": "paper",
-            "source": "trading_service_executor",
-        }
-    ]
+    assert dashboard_fallback_events == []
 
 
 async def test_dashboard_okx_balance_snapshot_prefers_trading_service_cache(
@@ -508,12 +501,6 @@ async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
     assert dashboard_fallback_events == [
         {
             "event": "dashboard summary okx balance fallback",
-            "error": FAKE_BEARER_ERROR,
-            "mode": "paper",
-            "source": "trading_service_executor",
-        },
-        {
-            "event": "dashboard summary okx balance fallback",
             "error": "standalone balance unavailable",
             "mode": "paper",
             "source": "isolated_executor",
@@ -543,10 +530,7 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
     assert first == second
     assert first["error_cached"] is True
     assert CountingFailingStandaloneBalanceExecutor.created == 1
-    assert [event["source"] for event in dashboard_fallback_events] == [
-        "trading_service_executor",
-        "isolated_executor",
-    ]
+    assert [event["source"] for event in dashboard_fallback_events] == ["isolated_executor"]
 
 
 async def test_dashboard_okx_position_cache_is_bound_to_executor(

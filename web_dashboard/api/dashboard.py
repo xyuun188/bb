@@ -2466,6 +2466,19 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
     error_cached = cached_failure(now)
     if error_cached:
         return error_cached
+    shared_snapshot = _trading_service_cached_okx_balance_snapshot(selected_mode)
+    if shared_snapshot:
+        if not (
+            shared_snapshot.get("stale")
+            or shared_snapshot.get("error")
+            or shared_snapshot.get("balance_error")
+        ):
+            _dashboard_okx_balance_cache[selected_mode] = (
+                datetime.now(UTC),
+                copy.deepcopy(shared_snapshot),
+            )
+            _dashboard_okx_balance_error_cache.pop(selected_mode, None)
+        return shared_snapshot
 
     def cache_failure(
         exc: Exception,
@@ -2500,6 +2513,12 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         return dict(snapshot)
 
     lock = _dashboard_okx_balance_locks.setdefault(selected_mode, asyncio.Lock())
+    if lock.locked():
+        stale_cached = cached_success(now, fresh_only=False)
+        if stale_cached:
+            stale_cached["stale"] = True
+            stale_cached["refresh_in_progress"] = True
+            return stale_cached
     async with lock:
         now = datetime.now(UTC)
         fresh_cached = cached_success(now, fresh_only=True)
@@ -2523,7 +2542,8 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                 _dashboard_okx_balance_error_cache.pop(selected_mode, None)
             return shared_snapshot
 
-        executor = initial_executor
+        # Read-only dashboard refreshes should not queue behind the shared trading executor.
+        executor = None
         if executor:
             try:
                 snapshot = await fetch_with_executor(executor)
