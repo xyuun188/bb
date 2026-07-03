@@ -3,6 +3,61 @@ Prompt templates for the LLM-based trading agent.
 Designed for OpenAI-compatible chat completion API.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
+
+_SENSITIVE_KEY_PARTS = ("api", "key", "secret", "token", "password", "authorization")
+
+
+def _short_text(value: Any, limit: int = 80) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def compact_value(
+    value: Any,
+    *,
+    depth: int = 2,
+    dict_limit: int = 14,
+    list_limit: int = 3,
+):
+    """Compact nested prompt payloads without leaking sensitive values."""
+
+    if isinstance(value, str):
+        return _short_text(value, 80)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if depth <= 0:
+        return _short_text(value, 80)
+    if isinstance(value, dict):
+        compact = {}
+        for key, item in list(value.items())[:dict_limit]:
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if key_lower == "daily_target" or any(
+                part in key_lower for part in _SENSITIVE_KEY_PARTS
+            ):
+                continue
+            compact[key_text] = compact_value(
+                item,
+                depth=depth - 1,
+                dict_limit=dict_limit,
+                list_limit=list_limit,
+            )
+        return compact
+    if isinstance(value, (list, tuple)):
+        return [
+            compact_value(
+                item,
+                depth=depth - 1,
+                dict_limit=dict_limit,
+                list_limit=list_limit,
+            )
+            for item in list(value)[:list_limit]
+        ]
+    return _short_text(value, 80)
+
 SYSTEM_PROMPT = """You are a professional cryptocurrency quantitative trading AI. Your task is to analyze real-time market data, technical indicators, and news sentiment to make precise trading decisions.
 
 ## Your Role
@@ -221,7 +276,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
     import json
 
     def short_text(value, limit: int = 80) -> str:
-        return " ".join(str(value or "").split())[:limit]
+        return _short_text(value, limit)
 
     def normalized_symbol(value) -> str:
         return str(value or "").replace("-", "/").upper().strip()
@@ -232,43 +287,6 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             if sep and key.strip().lower() == "symbol":
                 return normalized_symbol(value)
         return normalized_symbol(context.get("symbol"))
-
-    sensitive_key_parts = ("api", "key", "secret", "token", "password", "authorization")
-
-    def compact_value(value, *, depth: int = 2, dict_limit: int = 14, list_limit: int = 3):
-        if isinstance(value, str):
-            return short_text(value, 80)
-        if isinstance(value, (int, float, bool)) or value is None:
-            return value
-        if depth <= 0:
-            return short_text(value, 80)
-        if isinstance(value, dict):
-            compact = {}
-            for key, item in list(value.items())[:dict_limit]:
-                key_text = str(key)
-                key_lower = key_text.lower()
-                if key_lower == "daily_target" or any(
-                    part in key_lower for part in sensitive_key_parts
-                ):
-                    continue
-                compact[key_text] = compact_value(
-                    item,
-                    depth=depth - 1,
-                    dict_limit=dict_limit,
-                    list_limit=list_limit,
-                )
-            return compact
-        if isinstance(value, (list, tuple)):
-            return [
-                compact_value(
-                    item,
-                    depth=depth - 1,
-                    dict_limit=dict_limit,
-                    list_limit=list_limit,
-                )
-                for item in list(value)[:list_limit]
-            ]
-        return short_text(value, 80)
 
     def compact_position(item):
         if not isinstance(item, dict):

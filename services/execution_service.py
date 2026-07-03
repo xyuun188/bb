@@ -1050,6 +1050,11 @@ class ExecutionService:
                 "正在提交 OKX 订单并等待交易所返回结果。",
                 {"mode": model_mode},
             )
+            if decision.is_entry and decision_db_id is not None:
+                await mark_decision_pending_execution(
+                    decision_db_id,
+                    "风控复核已通过，系统正在向 OKX 提交订单并等待交易所回报。",
+                )
 
         override_balance = None
         try:

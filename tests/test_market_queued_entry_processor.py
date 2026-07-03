@@ -9,10 +9,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
-from services.market_queued_entry_processor import (
-    QUEUED_ENTRY_PENDING_REASON,
-    MarketQueuedEntryProcessor,
-)
+from services.market_queued_entry_processor import MarketQueuedEntryProcessor
 
 
 def _decision(symbol: str = "BTC/USDT") -> DecisionOutput:
@@ -163,7 +160,11 @@ async def test_market_queued_entry_processor_keeps_capacity_on_confirmed_executi
     assert result.execution_attempted is True
     assert result.execution_confirmed is True
     assert staged_counts["reserved"]["ensemble_trader"] == 1
-    assert ("pending", 8, QUEUED_ENTRY_PENDING_REASON) in calls
+    assert (
+        "reason",
+        8,
+        "本轮还在分析或排队中：候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
+    ) in calls
     assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
     assert ("release", "ensemble_trader", "BTC/USDT") not in calls
 

@@ -129,9 +129,12 @@ class MarketQueuedEntryProcessor:
         )
         if decision_db_id is not None:
             await self.mark_decision_raw_response(decision_db_id, raw_response)
-            await self.mark_decision_pending_execution(
+            await self.mark_decision_reason(
                 decision_db_id,
-                QUEUED_ENTRY_PENDING_REASON,
+                (
+                    "本轮还在分析或排队中：候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；"
+                    "尚未开始向 OKX 提交订单。"
+                ),
             )
 
         try:

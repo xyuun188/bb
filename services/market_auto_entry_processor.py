@@ -155,7 +155,13 @@ class MarketAutoEntryProcessor:
         )
         if decision_db_id is not None:
             await self.mark_decision_raw_response(decision_db_id, raw_response)
-            await self.mark_decision_pending_execution(decision_db_id, immediate_plan.reason)
+            await self.mark_decision_reason(
+                decision_db_id,
+                (
+                    "本轮还在分析或排队中：开仓候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；"
+                    "尚未开始向 OKX 提交订单。"
+                ),
+            )
 
         self.set_loop_stage(f"execute:{symbol}")
         try:

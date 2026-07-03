@@ -217,7 +217,11 @@ async def test_market_auto_entry_processor_allows_weak_evidence_probe_to_continu
     assert ("reserve", "ensemble_trader", "BTC/USDT") in calls
     assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
     assert ("ensure", 12, "BTC/USDT", "ensemble_trader", "long") in calls
-    assert not any(call[0] == "reason" for call in calls)
+    assert (
+        "reason",
+        12,
+        "本轮还在分析或排队中：开仓候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
+    ) in calls
 
 
 @pytest.mark.asyncio
@@ -266,7 +270,11 @@ async def test_market_auto_entry_processor_keeps_legacy_tradeable_weak_probe_exe
     assert ("reserve", "ensemble_trader", "BTC/USDT") in calls
     assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
     assert ("ensure", 12, "BTC/USDT", "ensemble_trader", "long") in calls
-    assert not any(call[0] == "reason" for call in calls)
+    assert (
+        "reason",
+        12,
+        "本轮还在分析或排队中：开仓候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
+    ) in calls
 
 
 @pytest.mark.asyncio
@@ -410,7 +418,11 @@ async def test_market_auto_entry_processor_keeps_capacity_on_confirmed_execution
     assert result.execution_confirmed is True
     assert staged_counts["reserved"]["ensemble_trader"] == 1
     assert ("release", "ensemble_trader", "BTC/USDT") not in calls
-    assert ("pending", 9, "强信号") in calls
+    assert (
+        "reason",
+        9,
+        "本轮还在分析或排队中：开仓候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
+    ) in calls
     assert ("ensure", 9, "BTC/USDT", "ensemble_trader", "long") in calls
 
 

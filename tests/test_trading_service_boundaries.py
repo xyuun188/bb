@@ -1467,8 +1467,8 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
         )
         return None
 
-    async def mark_pending(decision_id, reason):
-        calls.append(("pending", decision_id, reason))
+    async def mark_reason(decision_id, reason):
+        calls.append(("reason", decision_id, reason))
 
     async def ensure_final(decision_id, symbol, model_name, decision_arg, results):
         calls.append(("ensure", decision_id, symbol, model_name, decision_arg.action.value))
@@ -1480,7 +1480,7 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
     service._try_claim_analysis_symbol = claim_symbol  # type: ignore[method-assign]
     service._normalize_position_symbol = normalize_symbol  # type: ignore[method-assign]
     service._execute_candidate = execute_candidate  # type: ignore[method-assign]
-    service._mark_decision_pending_execution = mark_pending  # type: ignore[method-assign]
+    service._mark_decision_reason = mark_reason  # type: ignore[method-assign]
     service.decision_final_state_ensurer = SimpleNamespace(ensure=ensure_final)
 
     service.set_loop_stage("position")
@@ -1516,7 +1516,11 @@ async def test_trading_service_position_review_boundaries_call_internal_owners()
         ("review", 1, ["BTC/USDT"], 0, 1, "paused", 3),
         ("claim", "BTC/USDT", "position"),
         ("normalize", "BTC/USDT"),
-        ("pending", 456, "持仓复盘候选已进入执行链路，系统正在进行风控复核、OKX 提交和本地订单同步。"),
+        (
+            "reason",
+            456,
+            "本轮还在分析或排队中：持仓复盘候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
+        ),
         ("execute", "BTC/USDT", "ensemble_trader", "close_long", True, 456, 1),
         ("ensure", 456, "BTC/USDT", "ensemble_trader", "close_long"),
     ]
@@ -5837,6 +5841,11 @@ async def test_execution_service_serializes_candidate_execution():
     assert ("balance", "paper", "BTC/USDT") in calls
     assert ("execution_skills", "paper", 123.0) in calls
     assert ("skill_block", 0, True) in calls
+    assert (
+        "pending",
+        123,
+        "风控复核已通过，系统正在向 OKX 提交订单并等待交易所回报。",
+    ) in calls
     assert ("place_order", "ensemble_trader", "long", 123.0) in calls
     assert ("increment_trade_count",) in calls
     assert ("persist_position", "ensemble_trader", "paper") in calls
@@ -8291,8 +8300,8 @@ async def test_execute_position_review_candidate_waits_for_handoff_after_outer_t
     decision = _decision(Action.LONG)
     assessment = SimpleNamespace(warnings=[])
 
-    async def mark_pending(decision_id, reason):
-        calls.append(("pending", decision_id, reason))
+    async def mark_reason(decision_id, reason):
+        calls.append(("reason", decision_id, reason))
 
     async def execute_candidate(
         symbol,
@@ -8321,7 +8330,7 @@ async def test_execute_position_review_candidate_waits_for_handoff_after_outer_t
     async def ensure_final(decision_id, symbol, model_name, decision_arg, results):
         calls.append(("ensure", decision_id, symbol, model_name, decision_arg.action.value))
 
-    service._mark_decision_pending_execution = mark_pending  # type: ignore[method-assign]
+    service._mark_decision_reason = mark_reason  # type: ignore[method-assign]
     service._execute_candidate = execute_candidate  # type: ignore[method-assign]
     service.decision_final_state_ensurer = SimpleNamespace(ensure=ensure_final)
 

@@ -1749,10 +1749,11 @@ class TradingService:
         """Execute a position-review candidate through an explicit boundary."""
 
         pending_reason = (
-            "持仓复盘候选已进入执行链路，系统正在进行风控复核、OKX 提交和本地订单同步。"
+            "本轮还在分析或排队中：持仓复盘候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；"
+            "尚未开始向 OKX 提交订单。"
         )
         if decision_db_id is not None:
-            await self._mark_decision_pending_execution(decision_db_id, pending_reason)
+            await self._mark_decision_reason(decision_db_id, pending_reason)
         try:
             execution_result = await await_entry_execution_handoff(
                 self._execute_candidate(
