@@ -122,6 +122,44 @@ def test_position_hold_keeps_decision_maker_for_add_or_direction_signal() -> Non
     assert "decision_maker_fast_path" not in preliminary.raw_response
 
 
+def test_entry_with_non_actionable_profit_evidence_skips_slow_decision_maker() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+    preliminary = _decision(
+        Action.LONG,
+        raw={
+            "opportunity_score": {
+                "expected_net_return_pct": -0.11,
+                "profit_quality_ratio": -0.07,
+            },
+            "entry_candidate_evidence": {
+                "long": {
+                    "expected_net_return_pct": -0.10,
+                    "profit_quality_ratio": -0.05,
+                }
+            },
+        },
+    )
+    opinions = {
+        "trend_expert": _decision(Action.LONG, 0.70),
+        "momentum_expert": _decision(Action.LONG, 0.68),
+    }
+
+    should_call = coordinator._should_call_decision_maker(
+        preliminary,
+        opinions,
+        [],
+        {},
+    )
+
+    assert should_call is False
+    fast_path = preliminary.raw_response["decision_maker_fast_path"]
+    assert fast_path["mode"] == "pre_screened_non_actionable_entry"
+    assert fast_path["blockers"] == [
+        "non_positive_expected_net",
+        "non_positive_profit_quality",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_position_hold_blocks_decision_maker_entry_when_add_evidence_denies() -> None:
     coordinator = EnsembleCoordinator(_FakeRegistry())

@@ -207,13 +207,29 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
         stop_loss_pct=0.05,
         take_profit_pct=0.10,
     )
+    exchange_pending_raw = append_decision_stage(
+        {},
+        DecisionStage.EXCHANGE_SUBMIT,
+        DecisionStageStatus.PENDING,
+        "正在提交 OKX",
+    )
+    exchange_pending = SimpleNamespace(
+        id=4,
+        was_executed=False,
+        execution_reason="正在提交 OKX：等待交易所回报",
+        raw_llm_response=exchange_pending_raw,
+        position_size_pct=0.25,
+        suggested_leverage=5.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+    )
     update_raw = append_decision_stage(
         {"execution_parameters": {"position_size_pct": 0.004}},
         DecisionStage.RISK_CHECK,
         DecisionStageStatus.SKIPPED,
         "轮次结束未进入下单",
     )
-    session = FakeSession(rows=[unresolved, executed, terminal])
+    session = FakeSession(rows=[unresolved, executed, terminal, exchange_pending])
     repo = DecisionRepository(session)  # type: ignore[arg-type]
 
     updated = await repo.finalize_unresolved_decisions(
@@ -221,6 +237,7 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
             (1, "轮次结束未进入下单", update_raw),
             (2, "不应覆盖已成交", update_raw),
             (3, "不应覆盖已终态", update_raw),
+            (4, "不应覆盖已进入 OKX 提交", update_raw),
         ]
     )
 
@@ -235,4 +252,6 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
     assert unresolved.position_size_pct == 0.004
     assert executed.execution_reason == "filled"
     assert terminal.execution_reason == "已有明确终态"
+    assert exchange_pending.execution_reason == "正在提交 OKX：等待交易所回报"
+    assert exchange_pending.raw_llm_response == exchange_pending_raw
     assert session.flush_count == 1

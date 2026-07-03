@@ -1218,6 +1218,8 @@ class EnsembleCoordinator:
                 }
                 preliminary.raw_response = raw
                 return True
+            if self._entry_screened_before_decision_maker(preliminary, raw):
+                return False
             if self._fast_path_entry_without_decision_maker(
                 preliminary, opinions, cross_validations, raw
             ):
@@ -1260,6 +1262,78 @@ class EnsembleCoordinator:
             isinstance(d, DecisionOutput) and not d.is_hold and float(d.confidence or 0.0) >= 0.82
             for d in opinions.values()
         )
+
+    def _entry_screened_before_decision_maker(
+        self,
+        preliminary: DecisionOutput,
+        raw: dict[str, Any],
+    ) -> bool:
+        """Skip the slow final trader when existing profit gates already make entry non-actionable."""
+
+        if not preliminary.is_entry:
+            return False
+        direction = "long" if preliminary.action == Action.LONG else "short"
+        blockers: list[str] = []
+        evidence: dict[str, Any] = {}
+
+        ml_gate = self._safe_dict(raw.get("ml_profit_quality_gate"))
+        if ml_gate.get("enabled") and ml_gate.get("allow") is False:
+            blockers.append(str(ml_gate.get("status") or "ml_profit_quality_blocked"))
+            evidence["ml_profit_quality_gate"] = {
+                "status": ml_gate.get("status"),
+                "reason": ml_gate.get("reason"),
+            }
+
+        local_gate = self._safe_dict(raw.get("local_ai_tools_gate"))
+        if not local_gate and isinstance(ml_gate.get("local_ai_tools_gate"), dict):
+            local_gate = self._safe_dict(ml_gate.get("local_ai_tools_gate"))
+        if local_gate.get("enabled") and local_gate.get("allow") is False:
+            blockers.append(str(local_gate.get("status") or "local_ai_tools_blocked"))
+            evidence["local_ai_tools_gate"] = {
+                "status": local_gate.get("status"),
+                "reason": local_gate.get("reason"),
+            }
+
+        opportunity = self._safe_dict(raw.get("opportunity_score"))
+        entry_evidence = self._safe_dict(raw.get("entry_candidate_evidence"))
+        side_evidence = self._safe_dict(entry_evidence.get(direction))
+        expected_values = [
+            self._safe_float(payload.get("expected_net_return_pct"), None)
+            for payload in (opportunity, side_evidence)
+            if "expected_net_return_pct" in payload
+        ]
+        expected_values = [value for value in expected_values if value is not None]
+        profit_quality_values = [
+            self._safe_float(payload.get("profit_quality_ratio"), None)
+            for payload in (opportunity, side_evidence)
+            if "profit_quality_ratio" in payload
+        ]
+        profit_quality_values = [value for value in profit_quality_values if value is not None]
+        if expected_values and max(expected_values) <= 0:
+            blockers.append("non_positive_expected_net")
+        if profit_quality_values and max(profit_quality_values) <= 0:
+            blockers.append("non_positive_profit_quality")
+
+        if not blockers:
+            return False
+
+        raw["decision_maker_fast_path"] = {
+            "applied": True,
+            "mode": "pre_screened_non_actionable_entry",
+            "reason": (
+                "现有收益质量证据已经显示该开仓不可执行，跳过最终交易员慢调用；"
+                "后续风险检查和候选过滤仍按原规则给出终态。"
+            ),
+            "direction": direction,
+            "blockers": blockers,
+            "expected_net_return_pct": round(max(expected_values), 6) if expected_values else None,
+            "profit_quality_ratio": (
+                round(max(profit_quality_values), 6) if profit_quality_values else None
+            ),
+            "evidence": evidence,
+        }
+        preliminary.raw_response = raw
+        return True
 
     def _position_hold_fast_path_without_decision_maker(
         self,
@@ -3768,19 +3842,6 @@ class EnsembleCoordinator:
         ):
             return False
 
-        same_direction = [
-            (name, d)
-            for name, d in decisions.items()
-            if isinstance(d, DecisionOutput) and d.action == action and d.confidence >= 0.55
-        ]
-        directional_support = [
-            (name, d) for name, d in same_direction if name not in MARKET_DIRECTION_EXCLUDED_EXPERTS
-        ]
-        technical_support = [
-            (name, d)
-            for name, d in same_direction
-            if name in ENTRY_DIRECTION_SUPPORT_EXPERTS and d.confidence >= 0.55
-        ]
         aligned_validations = sum(
             1
             for v in cross_validations
@@ -4368,7 +4429,6 @@ class EnsembleCoordinator:
             )
         ]
         technical_names = ENTRY_DIRECTION_SUPPORT_EXPERTS
-        technical_same = [(name, d) for name, d in same_direction if name in technical_names]
         source_policy = self._expert_source_policy_from_decisions(
             decisions,
             action,

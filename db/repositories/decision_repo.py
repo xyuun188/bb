@@ -7,7 +7,7 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision
-from services.decision_state import DecisionStageStatus, decision_state_from_raw
+from services.decision_state import DecisionStage, DecisionStageStatus, decision_state_from_raw
 from services.text_integrity import sanitize_runtime_text
 
 
@@ -97,9 +97,6 @@ class DecisionRepository(BaseRepository):
                 AIDecision.execution_reason.is_(None),
                 AIDecision.execution_reason == "",
                 AIDecision.execution_reason.like("已进入本轮开仓候选排序%"),
-                AIDecision.execution_reason.like("本轮执行仍在处理中%"),
-                AIDecision.execution_reason.like("正在提交 OKX%"),
-                AIDecision.execution_reason.like("Execution still pending this round%"),
                 AIDecision.execution_reason.like("本轮还在分析或排队中%"),
             ),
         )
@@ -135,6 +132,13 @@ class DecisionRepository(BaseRepository):
                 current_machine.get("summary") if isinstance(current_machine, dict) else {}
             )
             current_status = str(current_summary.get("final_status") or "")
+            current_stage = str(current_summary.get("final_stage") or "")
+            if current_stage in {
+                DecisionStage.EXCHANGE_SUBMIT,
+                DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStage.LOCAL_SYNC,
+            }:
+                continue
             if (
                 current_status
                 in {

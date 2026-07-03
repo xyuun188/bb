@@ -68,6 +68,29 @@ def _decision(action: Action) -> DecisionOutput:
     )
 
 
+@pytest.mark.asyncio
+async def test_round_unresolved_decision_finalizer_fills_reason_and_terminal_state() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, Any]] = []
+
+    class _DecisionPersistence:
+        async def fill_missing_reasons(self, decision_ids, reason):
+            calls.append(("fill", sorted(decision_ids), reason))
+
+        async def finalize_unresolved_decisions(self, decisions, reason):
+            calls.append(("finalize", sorted(decisions), reason))
+
+    service.decision_persistence = _DecisionPersistence()
+    decision = _decision(Action.LONG)
+
+    await service._finalize_round_unresolved_decisions({7}, {7: decision}, "轮次被取消")
+
+    assert calls == [
+        ("fill", [7], "轮次被取消"),
+        ("finalize", [7], "轮次被取消"),
+    ]
+
+
 def test_trading_service_detects_policy_skipped_execution_result() -> None:
     result = ExecutionResult(
         order_id="rejected",
@@ -665,8 +688,21 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     assert diagnostics["quorum"] == 16
     assert diagnostics["is_entry_gate"] is False
 
-    not_met, _diagnostics = service._auto_scan_feature_fetch_early_quorum(
+    near_met, near_diagnostics = service._auto_scan_feature_fetch_early_quorum(
         completed_valid_count=15,
+        total_fetch_count=48,
+        configured_limit=8,
+        run_market_analysis=True,
+        run_position_analysis=False,
+        auto_scan=True,
+    )
+    assert near_met is True
+    assert near_diagnostics["exact_met"] is False
+    assert near_diagnostics["near_quorum_met"] is True
+    assert near_diagnostics["near_quorum"] == 15
+
+    not_met, _diagnostics = service._auto_scan_feature_fetch_early_quorum(
+        completed_valid_count=14,
         total_fetch_count=48,
         configured_limit=8,
         run_market_analysis=True,

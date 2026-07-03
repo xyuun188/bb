@@ -3137,15 +3137,24 @@ class TradingService:
         )
         breadth_target = max(configured * 2, math.ceil(max(selected_target, configured) / 3))
         quorum = min(total, max(configured, breadth_target))
+        allowed_deficit = max(1, math.ceil(configured * 0.12))
+        near_quorum = max(configured, quorum - allowed_deficit)
         eligible = bool(auto_scan and run_market_analysis and not run_position_analysis and total)
-        met = bool(eligible and int(completed_valid_count or 0) >= quorum)
+        completed = int(completed_valid_count or 0)
+        exact_met = bool(eligible and completed >= quorum)
+        near_quorum_met = bool(eligible and not exact_met and completed >= near_quorum)
+        met = bool(exact_met or near_quorum_met)
         return met, {
             "read_only": True,
             "is_entry_gate": False,
             "eligible": eligible,
             "met": met,
-            "completed_valid_count": int(completed_valid_count or 0),
+            "exact_met": exact_met,
+            "near_quorum_met": near_quorum_met,
+            "completed_valid_count": completed,
             "quorum": int(quorum),
+            "near_quorum": int(near_quorum),
+            "allowed_deficit": int(allowed_deficit),
             "total_fetch_count": int(total),
             "configured_market_symbol_limit": int(configured),
             "selected_market_feature_fetch_count": int(selected_target),
@@ -5857,12 +5866,8 @@ class TradingService:
             self._set_loop_stage("publish_results")
             self._recent_decisions = results.get("decisions", [])[-20:]
             self._recent_executions = results.get("executions", [])[-20:]
-            await self._fill_missing_decision_reasons(
+            await self._finalize_round_unresolved_decisions(
                 round_decision_ids,
-                "本轮已经结束，但这条候选没有进入下单阶段，也没有拿到最终执行结果。"
-                "系统已跳过本次旧信号，下一轮会用最新行情重新排序和评估。",
-            )
-            await self._finalize_unresolved_decision_states(
                 round_decisions,
                 "本轮已经结束，但这条候选没有进入下单阶段，也没有拿到最终执行结果。"
                 "系统已跳过本次旧信号，下一轮会用最新行情重新排序和评估。",
@@ -5885,15 +5890,18 @@ class TradingService:
                 scope=analysis_scope,
                 elapsed_seconds=round(self._round_elapsed_seconds(round_start), 3),
             )
+            await self._finalize_round_unresolved_decisions(
+                round_decision_ids,
+                round_decisions,
+                "本轮分析/执行任务被外层超时保护取消；尚未进入 OKX 提交阶段的旧候选已写入终态，"
+                "下一轮会用最新行情重新分析和排序。",
+            )
             raise
         except Exception as e:
             error_text = safe_error_text(e, limit=180)
             self._set_loop_stage("error", error_text)
-            await self._fill_missing_decision_reasons(
+            await self._finalize_round_unresolved_decisions(
                 round_decision_ids,
-                f"\u672c\u8f6e\u6267\u884c\u5f02\u5e38\u4e2d\u65ad\uff0c\u672a\u80fd\u5b8c\u6210\u6700\u7ec8\u72b6\u6001\u56de\u5199\uff1a{safe_error_text(e, limit=120)}",
-            )
-            await self._finalize_unresolved_decision_states(
                 round_decisions,
                 f"本轮执行异常中断，未能完成最终状态回写：{safe_error_text(e, limit=120)}",
             )
@@ -9272,6 +9280,15 @@ class TradingService:
         reason: str,
     ) -> None:
         await self.decision_persistence.fill_missing_reasons(decision_ids, reason)
+
+    async def _finalize_round_unresolved_decisions(
+        self,
+        decision_ids: set[int] | list[int],
+        decisions: dict[int, DecisionOutput],
+        reason: str,
+    ) -> None:
+        await self._fill_missing_decision_reasons(decision_ids, reason)
+        await self._finalize_unresolved_decision_states(decisions, reason)
 
     async def _finalize_unresolved_decision_states(
         self,
