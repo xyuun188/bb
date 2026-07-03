@@ -1225,6 +1225,49 @@ def market_analysis_progress(decision):
     return safe_dict(raw.get("market_analysis_progress"))
 
 
+def market_stage_duration_aggregate(rows):
+    stage_totals = {}
+    stage_max = {}
+    stage_counts = Counter()
+    sample_count = 0
+    for row in rows:
+        durations = row.get("runtime_stage_durations")
+        if not isinstance(durations, list):
+            continue
+        for item in durations:
+            if not isinstance(item, dict):
+                continue
+            stage = str(item.get("stage") or "").strip()
+            if not stage:
+                continue
+            duration = safe_float(item.get("duration_seconds"))
+            if duration <= 0:
+                continue
+            sample_count += 1
+            stage_counts[stage] += 1
+            stage_totals[stage] = stage_totals.get(stage, 0.0) + duration
+            stage_max[stage] = max(stage_max.get(stage, 0.0), duration)
+    top = sorted(stage_totals, key=lambda key: stage_totals[key], reverse=True)[:8]
+    return {
+        "read_only": True,
+        "is_entry_gate": False,
+        "sample_count": sample_count,
+        "top_stage_total_seconds": [
+            {
+                "stage": stage,
+                "count": int(stage_counts[stage]),
+                "total_seconds": round(stage_totals[stage], 3),
+                "max_seconds": round(stage_max[stage], 3),
+            }
+            for stage in top
+        ],
+        "diagnostic_boundary": (
+            "Read-only stage timing aggregate. Use it to locate pre-AI slow paths before "
+            "changing scan breadth, model budgets, entry gates, sizing, leverage, or risk logic."
+        ),
+    }
+
+
 def market_analysis_progress_aggregate(decisions):
     rows = [market_analysis_progress(decision) for decision in decisions]
     rows = [row for row in rows if row]
@@ -1282,6 +1325,7 @@ def market_analysis_progress_aggregate(decisions):
             Counter(str(bool(row.get("can_start_another_market_symbol"))) for row in rows),
             4,
         ),
+        "stage_duration_aggregate": market_stage_duration_aggregate(rows),
         "latest": pick(
             latest,
             (
@@ -1299,6 +1343,7 @@ def market_analysis_progress_aggregate(decisions):
                 "budget_used_ratio_before_ai",
                 "market_ai_budget_used_ratio_before_symbol",
                 "budget_clock_scope",
+                "runtime_stage_durations",
                 "diagnostic_boundary",
             ),
         ),

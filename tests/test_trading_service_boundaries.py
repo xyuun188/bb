@@ -161,8 +161,11 @@ def test_parallel_market_position_runtime_state_is_isolated(
 
     assert payload["market_round_active"] is True
     assert payload["market_current_stage"] == "fetch_features"
+    assert payload["market_stage_durations"]
+    assert payload["market_stage_durations"][-1]["stage"] == "starting"
     assert payload["position_round_active"] is False
     assert payload["position_current_stage"] == "idle"
+    assert payload["position_stage_durations"]
     assert payload["round_active"] is True
     assert payload["current_stage"] == "fetch_features"
     assert payload["okx_authoritative_sync"]["status"] == "pending"
@@ -796,6 +799,153 @@ async def test_paused_market_scope_does_not_start_market_round(
 
 async def _async_value(value: Any) -> Any:
     return value
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_maintenance_runs_in_background_for_market_round() -> None:
+    service = TradingService.__new__(TradingService)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    limits: list[int] = []
+
+    class SlowShadowBacktestService:
+        async def update_due(self, limit: int = 200) -> int:
+            limits.append(limit)
+            started.set()
+            await release.wait()
+            return 7
+
+    service.shadow_backtest_service = SlowShadowBacktestService()
+    service._shadow_backtest_update_task = None
+    results: dict[str, Any] = {}
+
+    await service._update_shadow_backtests_for_round(
+        analysis_scope="market",
+        results=results,
+    )
+
+    assert results["shadow_backtest_maintenance"]["started_in_background"] is True
+    assert results["shadow_backtest_maintenance"]["is_entry_gate"] is False
+    assert results["shadow_backtest_maintenance"]["update_limit"] == (
+        trading_service.SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT
+    )
+    assert service._shadow_backtest_update_task is not None
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert limits == [trading_service.SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT]
+
+    release.set()
+    await asyncio.wait_for(service._shadow_backtest_update_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    status = service._shadow_backtest_maintenance_status()
+    assert status["running"] is False
+    assert status["last_completed_count"] == 7
+    assert status["success_count"] == 1
+    assert status["failure_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_maintenance_reuses_running_background_task() -> None:
+    service = TradingService.__new__(TradingService)
+    release = asyncio.Event()
+    calls = 0
+
+    class SlowShadowBacktestService:
+        async def update_due(self, limit: int = 200) -> int:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return 1
+
+    service.shadow_backtest_service = SlowShadowBacktestService()
+    service._shadow_backtest_update_task = None
+    first_results: dict[str, Any] = {}
+    second_results: dict[str, Any] = {}
+
+    await service._update_shadow_backtests_for_round(
+        analysis_scope="market",
+        results=first_results,
+    )
+    await asyncio.sleep(0)
+    await service._update_shadow_backtests_for_round(
+        analysis_scope="market",
+        results=second_results,
+    )
+
+    assert calls == 1
+    assert second_results["shadow_backtest_maintenance"]["running"] is True
+    assert "started_in_background" not in second_results["shadow_backtest_maintenance"]
+
+    release.set()
+    await asyncio.wait_for(service._shadow_backtest_update_task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_maintenance_runs_in_background_for_market_round() -> None:
+    service = TradingService.__new__(TradingService)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class SlowStaleEntryExpirer:
+        async def expire(self) -> int:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return 5
+
+    service.stale_entry_candidate_expirer = SlowStaleEntryExpirer()
+    service._stale_entry_expire_task = None
+    results: dict[str, Any] = {}
+
+    await service._update_stale_entry_candidates_for_round(results=results)
+
+    assert results["stale_entry_maintenance"]["started_in_background"] is True
+    assert results["stale_entry_maintenance"]["is_entry_gate"] is False
+    assert service._stale_entry_expire_task is not None
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert calls == 1
+
+    release.set()
+    await asyncio.wait_for(service._stale_entry_expire_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    status = service._stale_entry_candidate_maintenance_status()
+    assert status["running"] is False
+    assert status["last_expired_count"] == 5
+    assert status["success_count"] == 1
+    assert status["failure_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_maintenance_reuses_running_background_task() -> None:
+    service = TradingService.__new__(TradingService)
+    release = asyncio.Event()
+    calls = 0
+
+    class SlowStaleEntryExpirer:
+        async def expire(self) -> int:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return 1
+
+    service.stale_entry_candidate_expirer = SlowStaleEntryExpirer()
+    service._stale_entry_expire_task = None
+    first_results: dict[str, Any] = {}
+    second_results: dict[str, Any] = {}
+
+    await service._update_stale_entry_candidates_for_round(results=first_results)
+    await asyncio.sleep(0)
+    await service._update_stale_entry_candidates_for_round(results=second_results)
+
+    assert calls == 1
+    assert second_results["stale_entry_maintenance"]["running"] is True
+    assert "started_in_background" not in second_results["stale_entry_maintenance"]
+
+    release.set()
+    await asyncio.wait_for(service._stale_entry_expire_task, timeout=1.0)
 
 
 def test_ai_entry_candidate_evidence_exposes_profile_recency_to_model() -> None:

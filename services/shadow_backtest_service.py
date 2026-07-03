@@ -255,15 +255,16 @@ class ShadowBacktestService:
                 error=safe_error_text(exc),
             )
 
-    async def update_due(self) -> None:
+    async def update_due(self, limit: int = 200) -> int:
         """Complete due shadow samples using latest OKX swap price."""
         try:
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
-                rows = await repo.get_due_shadow_backtests(limit=200)
+                rows = await repo.get_due_shadow_backtests(limit=max(1, int(limit or 1)))
                 if not rows:
-                    return
+                    return 0
                 price_cache: dict[str, float] = {}
+                completed_count = 0
                 for row in rows:
                     symbol = self.symbol_normalizer(row.symbol) or row.symbol
                     if symbol not in price_cache:
@@ -305,6 +306,7 @@ class ShadowBacktestService:
                         missed_opportunity=missed,
                         note=note,
                     )
+                    completed_count += 1
                     quarantine_result = quarantine_completed_shadow_row(row)
                     if quarantine_result.get("applied"):
                         logger.info(
@@ -324,8 +326,10 @@ class ShadowBacktestService:
                             threshold=threshold,
                         )
                 logger.info("shadow backtests updated", count=len(rows))
+                return completed_count
         except Exception as exc:
             logger.debug("failed to update shadow backtests", error=safe_error_text(exc))
+            return 0
 
     def _completion_note(
         self,

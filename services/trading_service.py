@@ -13,7 +13,7 @@ import math
 from collections import Counter
 from collections.abc import Awaitable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -213,6 +213,8 @@ class _AnalysisRuntimeState:
     last_started_at: datetime | None = None
     last_finished_at: datetime | None = None
     last_error: str | None = None
+    current_stage_started_at: datetime | None = None
+    recent_stage_durations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def active(self) -> bool:
@@ -278,6 +280,9 @@ LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
 OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
 OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
 ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
+SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
+SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
+STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_all_due"
 MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
 ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
 DISCRETIONARY_CLOSE_CONFIDENCE = 0.66
@@ -912,6 +917,20 @@ class TradingService:
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._okx_balance_snapshot_locks: dict[str, asyncio.Lock] = {}
         self._okx_balance_snapshot_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._shadow_backtest_update_task: asyncio.Task | None = None
+        self._shadow_backtest_update_last_started_at: datetime | None = None
+        self._shadow_backtest_update_last_finished_at: datetime | None = None
+        self._shadow_backtest_update_last_count: int | None = None
+        self._shadow_backtest_update_last_error: str | None = None
+        self._shadow_backtest_update_success_count = 0
+        self._shadow_backtest_update_failure_count = 0
+        self._stale_entry_expire_task: asyncio.Task | None = None
+        self._stale_entry_expire_last_started_at: datetime | None = None
+        self._stale_entry_expire_last_finished_at: datetime | None = None
+        self._stale_entry_expire_last_count: int | None = None
+        self._stale_entry_expire_last_error: str | None = None
+        self._stale_entry_expire_success_count = 0
+        self._stale_entry_expire_failure_count = 0
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
@@ -1554,6 +1573,168 @@ class TradingService:
             }
         if getattr(self, "_okx_order_fact_sync_task", None) is task:
             self._okx_order_fact_sync_task = None
+
+    async def _run_shadow_backtest_update(self, *, limit: int) -> int:
+        self._shadow_backtest_update_last_started_at = datetime.now(UTC)
+        return await self.shadow_backtest_service.update_due(limit=limit)
+
+    def _shadow_backtest_maintenance_status(self) -> dict[str, Any]:
+        task = getattr(self, "_shadow_backtest_update_task", None)
+        started_at = getattr(self, "_shadow_backtest_update_last_started_at", None)
+        finished_at = getattr(self, "_shadow_backtest_update_last_finished_at", None)
+        running_seconds = None
+        if isinstance(started_at, datetime) and (not isinstance(finished_at, datetime) or finished_at < started_at):
+            running_seconds = round(max((datetime.now(UTC) - started_at).total_seconds(), 0.0), 3)
+        return {
+            "read_only": True,
+            "is_entry_gate": False,
+            "running": bool(task is not None and not task.done()),
+            "running_seconds": running_seconds,
+            "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            "last_finished_at": (
+                finished_at.isoformat() if isinstance(finished_at, datetime) else None
+            ),
+            "last_completed_count": getattr(self, "_shadow_backtest_update_last_count", None),
+            "last_error": getattr(self, "_shadow_backtest_update_last_error", None),
+            "success_count": int(getattr(self, "_shadow_backtest_update_success_count", 0) or 0),
+            "failure_count": int(getattr(self, "_shadow_backtest_update_failure_count", 0) or 0),
+            "diagnostic_boundary": (
+                "影子复盘维护只负责训练/记忆回灌，不是开仓门槛；market-only 轮次只触发后台刷新，"
+                "不能同步拖慢 market AI 启动。"
+            ),
+        }
+
+    def _consume_shadow_backtest_update_result(self, task: asyncio.Task) -> None:
+        finished_at = datetime.now(UTC)
+        self._shadow_backtest_update_last_finished_at = finished_at
+        try:
+            completed_count = int(task.result() or 0)
+        except asyncio.CancelledError:
+            if getattr(self, "_shadow_backtest_update_task", None) is task:
+                self._shadow_backtest_update_task = None
+            return
+        except Exception as exc:
+            self._shadow_backtest_update_last_error = safe_error_text(exc, limit=180)
+            self._shadow_backtest_update_failure_count = (
+                int(getattr(self, "_shadow_backtest_update_failure_count", 0) or 0) + 1
+            )
+        else:
+            self._shadow_backtest_update_last_error = None
+            self._shadow_backtest_update_last_count = completed_count
+            self._shadow_backtest_update_success_count = (
+                int(getattr(self, "_shadow_backtest_update_success_count", 0) or 0) + 1
+            )
+        if getattr(self, "_shadow_backtest_update_task", None) is task:
+            self._shadow_backtest_update_task = None
+
+    async def _update_shadow_backtests_for_round(
+        self,
+        *,
+        analysis_scope: str,
+        results: dict[str, Any],
+    ) -> None:
+        """Run shadow-backtest maintenance without blocking market entry discovery."""
+
+        task = getattr(self, "_shadow_backtest_update_task", None)
+        if task is not None and not task.done():
+            results["shadow_backtest_maintenance"] = self._shadow_backtest_maintenance_status()
+            return
+
+        update_limit = (
+            SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT
+            if analysis_scope == "market"
+            else SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT
+        )
+        task = asyncio.create_task(
+            self._run_shadow_backtest_update(
+                limit=update_limit,
+            )
+        )
+        self._shadow_backtest_update_task = task
+        task.add_done_callback(self._consume_shadow_backtest_update_result)
+        results["shadow_backtest_maintenance"] = {
+            **self._shadow_backtest_maintenance_status(),
+            "started_in_background": True,
+            "update_limit": update_limit,
+        }
+
+    async def _run_stale_entry_candidate_expire(self) -> int:
+        self._stale_entry_expire_last_started_at = datetime.now(UTC)
+        return await self.stale_entry_candidate_expirer.expire()
+
+    def _stale_entry_candidate_maintenance_status(self) -> dict[str, Any]:
+        task = getattr(self, "_stale_entry_expire_task", None)
+        started_at = getattr(self, "_stale_entry_expire_last_started_at", None)
+        finished_at = getattr(self, "_stale_entry_expire_last_finished_at", None)
+        running_seconds = None
+        if isinstance(started_at, datetime) and (
+            not isinstance(finished_at, datetime) or finished_at < started_at
+        ):
+            running_seconds = round(max((datetime.now(UTC) - started_at).total_seconds(), 0.0), 3)
+        return {
+            "read_only": True,
+            "is_entry_gate": False,
+            "running": bool(task is not None and not task.done()),
+            "running_seconds": running_seconds,
+            "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            "last_finished_at": (
+                finished_at.isoformat() if isinstance(finished_at, datetime) else None
+            ),
+            "last_expired_count": getattr(self, "_stale_entry_expire_last_count", None),
+            "last_error": getattr(self, "_stale_entry_expire_last_error", None),
+            "success_count": int(getattr(self, "_stale_entry_expire_success_count", 0) or 0),
+            "failure_count": int(getattr(self, "_stale_entry_expire_failure_count", 0) or 0),
+            "maintenance_scope": STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION,
+            "diagnostic_boundary": (
+                "过期开仓候选维护只负责补齐旧候选终态和清理旧等待状态，不是开仓门槛；"
+                "交易主轮次只触发后台单飞维护，不能同步拖慢 market AI 或持仓复盘。"
+            ),
+        }
+
+    def _consume_stale_entry_candidate_expire_result(self, task: asyncio.Task) -> None:
+        finished_at = datetime.now(UTC)
+        self._stale_entry_expire_last_finished_at = finished_at
+        try:
+            expired_count = int(task.result() or 0)
+        except asyncio.CancelledError:
+            if getattr(self, "_stale_entry_expire_task", None) is task:
+                self._stale_entry_expire_task = None
+            return
+        except Exception as exc:
+            self._stale_entry_expire_last_error = safe_error_text(exc, limit=180)
+            self._stale_entry_expire_failure_count = (
+                int(getattr(self, "_stale_entry_expire_failure_count", 0) or 0) + 1
+            )
+        else:
+            self._stale_entry_expire_last_error = None
+            self._stale_entry_expire_last_count = expired_count
+            self._stale_entry_expire_success_count = (
+                int(getattr(self, "_stale_entry_expire_success_count", 0) or 0) + 1
+            )
+        if getattr(self, "_stale_entry_expire_task", None) is task:
+            self._stale_entry_expire_task = None
+
+    async def _update_stale_entry_candidates_for_round(
+        self,
+        *,
+        results: dict[str, Any],
+    ) -> None:
+        """Trigger stale-entry cleanup without spending the trading round budget."""
+
+        task = getattr(self, "_stale_entry_expire_task", None)
+        if task is not None and not task.done():
+            results["stale_entry_maintenance"] = (
+                self._stale_entry_candidate_maintenance_status()
+            )
+            return
+
+        task = asyncio.create_task(self._run_stale_entry_candidate_expire())
+        self._stale_entry_expire_task = task
+        task.add_done_callback(self._consume_stale_entry_candidate_expire_result)
+        results["stale_entry_maintenance"] = {
+            **self._stale_entry_candidate_maintenance_status(),
+            "started_in_background": True,
+        }
 
     def strategy_learning_context_timeout_seconds(self) -> float:
         """Return the hard budget for strategy-learning context in the trading loop."""
@@ -2860,9 +3041,42 @@ class TradingService:
             resolved_scope = "full"
         return self._analysis_runtime[resolved_scope]
 
+    @staticmethod
+    def _stage_duration_event(
+        *,
+        stage: str,
+        started_at: datetime | None,
+        finished_at: datetime,
+    ) -> dict[str, Any] | None:
+        if not stage or started_at is None:
+            return None
+        duration = max((finished_at - started_at).total_seconds(), 0.0)
+        return {
+            "stage": stage,
+            "duration_seconds": round(duration, 3),
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+        }
+
+    @staticmethod
+    def _recent_stage_durations(state: _AnalysisRuntimeState) -> list[dict[str, Any]]:
+        rows = getattr(state, "recent_stage_durations", None)
+        return list(rows[-24:]) if isinstance(rows, list) else []
+
+    def _stage_durations_for_scope(self, scope: str) -> list[dict[str, Any]]:
+        runtime = getattr(self, "_analysis_runtime", None)
+        if not isinstance(runtime, dict):
+            return []
+        state = runtime.get(scope)
+        if not isinstance(state, _AnalysisRuntimeState):
+            return []
+        return self._recent_stage_durations(state)
+
     def _start_runtime_round(self, scope: str, started_at: datetime) -> None:
         state = self._runtime_state(scope)
         state.current_stage = "starting"
+        state.current_stage_started_at = started_at
+        state.recent_stage_durations.clear()
         state.last_started_at = started_at
         state.last_finished_at = None
         state.last_error = None
@@ -2878,8 +3092,17 @@ class TradingService:
 
     def _finish_runtime_round(self, scope: str, finished_at: datetime, *, ok: bool) -> None:
         state = self._runtime_state(scope)
+        event = self._stage_duration_event(
+            stage=state.current_stage,
+            started_at=state.current_stage_started_at,
+            finished_at=finished_at,
+        )
+        if event is not None:
+            state.recent_stage_durations.append(event)
+            del state.recent_stage_durations[:-24]
         state.last_finished_at = finished_at
         state.current_stage = "idle" if ok else "error"
+        state.current_stage_started_at = finished_at
         if ok:
             state.last_error = None
         if scope == "market":
@@ -2918,7 +3141,18 @@ class TradingService:
     ) -> None:
         resolved_scope = scope or _analysis_scope_context.get() or "full"
         state = self._runtime_state(resolved_scope)
+        now = datetime.now(UTC)
+        if state.current_stage != stage:
+            event = self._stage_duration_event(
+                stage=state.current_stage,
+                started_at=state.current_stage_started_at,
+                finished_at=now,
+            )
+            if event is not None:
+                state.recent_stage_durations.append(event)
+                del state.recent_stage_durations[:-24]
         state.current_stage = stage
+        state.current_stage_started_at = now
         if error is not None:
             state.last_error = str(error)[:300]
             if resolved_scope == "full":
@@ -2988,6 +3222,8 @@ class TradingService:
                 "position_current_stage": position_state.current_stage,
                 "position_round_active": position_state.active,
                 "position_last_error": position_state.last_error,
+                "market_stage_durations": self._recent_stage_durations(market_state),
+                "position_stage_durations": self._recent_stage_durations(position_state),
                 "last_round_started_at": (
                     self._last_round_started_at.isoformat() if self._last_round_started_at else None
                 ),
@@ -3018,6 +3254,8 @@ class TradingService:
                 ),
                 "last_round_error": last_round_error,
                 "okx_authoritative_sync": okx_authoritative_sync,
+                "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
+                "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
             }
             path = settings.data_dir / "trading_runtime_status.json"
             tmp_path = path.with_suffix(".json.tmp")
@@ -4369,6 +4607,7 @@ class TradingService:
                 6,
             ),
             "budget_clock_scope": "market_ai_phase",
+            "runtime_stage_durations": self._stage_durations_for_scope("market"),
             "diagnostic_boundary": (
                 "Read-only market AI throughput diagnostics; it explains how many ranked "
                 "symbols this round can analyze before soft scheduling budget is exhausted. "
@@ -4732,8 +4971,12 @@ class TradingService:
 
         try:
             self._set_loop_stage("shadow_backtests")
-            await self.shadow_backtest_service.update_due()
-            await self.stale_entry_candidate_expirer.expire()
+            await self._update_shadow_backtests_for_round(
+                analysis_scope=analysis_scope,
+                results=results,
+            )
+            self._set_loop_stage("stale_entry_maintenance")
+            await self._update_stale_entry_candidates_for_round(results=results)
 
             # 0. Refresh per-model execution mode mapping from current config
             self._refresh_model_modes()
@@ -6116,6 +6359,8 @@ class TradingService:
             getattr(self, "_runtime_heartbeat_task", None),
             getattr(self, "_okx_authoritative_sync_task", None),
             getattr(self, "_okx_order_fact_sync_task", None),
+            getattr(self, "_shadow_backtest_update_task", None),
+            getattr(self, "_stale_entry_expire_task", None),
         ):
             if task and not task.done():
                 task.cancel()
@@ -6128,6 +6373,8 @@ class TradingService:
         self._runtime_heartbeat_task = None
         self._okx_authoritative_sync_task = None
         self._okx_order_fact_sync_task = None
+        self._shadow_backtest_update_task = None
+        self._stale_entry_expire_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self.okx_executor, self._okx_paper, self._okx_live):
@@ -9541,6 +9788,7 @@ class TradingService:
             "idle": "\u7a7a\u95f2\uff0c\u7b49\u5f85\u4e0b\u4e00\u8f6e\u5206\u6790",
             "starting": "\u51c6\u5907\u5f00\u59cb\u672c\u8f6e\u5206\u6790",
             "shadow_backtests": "\u66f4\u65b0\u5f71\u5b50\u590d\u76d8",
+            "stale_entry_maintenance": "\u6e05\u7406\u8fc7\u671f\u5f00\u4ed3\u5019\u9009",
             "sync_exchange_positions": "\u540c\u6b65 OKX \u4ed3\u4f4d/\u4fdd\u62a4\u5355",
             "load_open_positions": "\u8bfb\u53d6\u672c\u5730\u6301\u4ed3",
             "recover_pending_exits": "\u8865\u6267\u884c\u672a\u5b8c\u6210\u5e73\u4ed3",
@@ -9597,6 +9845,8 @@ class TradingService:
             "position_current_stage": position_state.current_stage,
             "position_round_active": position_state.active,
             "position_last_error": position_state.last_error,
+            "market_stage_durations": self._recent_stage_durations(market_state),
+            "position_stage_durations": self._recent_stage_durations(position_state),
             "last_round_started_at": (
                 self._last_round_started_at.isoformat() if self._last_round_started_at else None
             ),
@@ -9630,6 +9880,8 @@ class TradingService:
             "position_loop_interval_seconds": round(self.position_loop_interval_seconds(), 3),
             "market_round_time_budget_seconds": round(self.market_round_time_budget_seconds(), 3),
             "okx_authoritative_sync": self._okx_authoritative_sync_status_payload(now),
+            "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
+            "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
         }
         self._write_runtime_heartbeat()
         return stats
