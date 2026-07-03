@@ -71,7 +71,14 @@ def attach_profit_first_exit_reference(
             "missing_original_exit_plan_reference": False,
         }
     else:
-        plan_failure_reason = _plan_failure_reason(raw, close_evidence)
+        plan_failure_reason = _plan_failure_reason(
+            raw,
+            close_evidence,
+            matched_position=match,
+            target_exit_plan_id=target_exit_plan_id,
+            target_entry_order_id=target_entry_order_id,
+            target_okx_pos_id=target_okx_pos_id,
+        )
         raw["profit_first_exit_reference"] = {
             "exit_plan_id": "",
             "source": "missing_matched_open_position_exit_plan",
@@ -253,7 +260,15 @@ def _fallback_reference_from_decision(
     }
 
 
-def _plan_failure_reason(raw: dict[str, Any], close_evidence: dict[str, Any]) -> str:
+def _plan_failure_reason(
+    raw: dict[str, Any],
+    close_evidence: dict[str, Any],
+    *,
+    matched_position: dict[str, Any],
+    target_exit_plan_id: str,
+    target_entry_order_id: str,
+    target_okx_pos_id: str,
+) -> str:
     for value in (
         raw.get("profit_first_plan_failure_reason"),
         raw.get("plan_failure_reason"),
@@ -263,7 +278,30 @@ def _plan_failure_reason(raw: dict[str, Any], close_evidence: dict[str, Any]) ->
         text = str(value or "").strip()
         if text:
             return text[:240]
-    return ""
+    if matched_position:
+        return (
+            "匹配到本地持仓，但该持仓缺少 Profit-First exit plan；本次平仓按原始计划缺失归因处理，"
+            "不能作为干净训练样本直接晋级。"
+        )
+    if target_exit_plan_id:
+        return (
+            "平仓决策携带 exit_plan_id，但当前持仓快照未匹配到对应 Profit-First exit plan；"
+            "按计划引用缺失归因处理。"
+        )
+    if target_entry_order_id:
+        return (
+            "平仓决策携带入场订单号，但当前持仓快照未匹配到对应 Profit-First exit plan；"
+            "按计划引用缺失归因处理。"
+        )
+    if target_okx_pos_id:
+        return (
+            "平仓决策携带 OKX 持仓标识，但当前持仓快照未匹配到对应 Profit-First exit plan；"
+            "按计划引用缺失归因处理。"
+        )
+    return (
+        "当前持仓快照没有可用的 Profit-First exit plan 引用；本次平仓保留执行事实，"
+        "但按计划缺失样本隔离归因。"
+    )
 
 
 def _normalize_symbol(value: Any) -> str:

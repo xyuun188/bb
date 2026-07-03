@@ -3304,36 +3304,6 @@ class TradingService:
         perf_timeout = self.strategy_learning_perf_timeout_seconds()
         account_timeout = self.strategy_learning_account_timeout_seconds()
 
-        daily_state = await self._bounded_strategy_context_value(
-            "daily_perf",
-            self.daily_performance_service.state(selected_mode),
-            {},
-            perf_timeout,
-        )
-        side_perf = await self._bounded_strategy_context_value(
-            "today_side_perf",
-            self._today_side_performance(selected_mode),
-            {},
-            perf_timeout,
-        )
-        side_perf_multiday = await self._bounded_strategy_context_value(
-            "multiday_side_perf",
-            self._multiday_side_performance(selected_mode),
-            {},
-            perf_timeout,
-        )
-        symbol_side_perf = await self._bounded_strategy_context_value(
-            "symbol_side_perf",
-            self._recent_symbol_side_performance(selected_mode),
-            {},
-            perf_timeout,
-        )
-        model_contribution_perf = await self._bounded_strategy_context_value(
-            "model_contribution_perf",
-            self._recent_model_contribution_performance(selected_mode),
-            {},
-            perf_timeout,
-        )
         if not open_positions:
             try:
                 self._safe_set_strategy_context_stage("strategy_context:open_positions")
@@ -3347,11 +3317,50 @@ class TradingService:
         position_group_count = self.entry_symbol_universe.open_position_group_count(
             open_positions or []
         )
-        account_equity = await self._bounded_strategy_context_value(
-            "account_equity",
-            self.allocated_order_balance(selected_mode),
-            0.0,
-            account_timeout,
+        (
+            daily_state,
+            side_perf,
+            side_perf_multiday,
+            symbol_side_perf,
+            model_contribution_perf,
+            account_equity,
+        ) = await asyncio.gather(
+            self._bounded_strategy_context_value(
+                "daily_perf",
+                self.daily_performance_service.state(selected_mode),
+                {},
+                perf_timeout,
+            ),
+            self._bounded_strategy_context_value(
+                "today_side_perf",
+                self._today_side_performance(selected_mode),
+                {},
+                perf_timeout,
+            ),
+            self._bounded_strategy_context_value(
+                "multiday_side_perf",
+                self._multiday_side_performance(selected_mode),
+                {},
+                perf_timeout,
+            ),
+            self._bounded_strategy_context_value(
+                "symbol_side_perf",
+                self._recent_symbol_side_performance(selected_mode),
+                {},
+                perf_timeout,
+            ),
+            self._bounded_strategy_context_value(
+                "model_contribution_perf",
+                self._recent_model_contribution_performance(selected_mode),
+                {},
+                perf_timeout,
+            ),
+            self._bounded_strategy_context_value(
+                "account_equity",
+                self.allocated_order_balance(selected_mode),
+                0.0,
+                account_timeout,
+            ),
         )
         context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
@@ -3369,6 +3378,7 @@ class TradingService:
         context["strategy_context_runtime"] = {
             "perf_timeout_seconds": perf_timeout,
             "account_timeout_seconds": account_timeout,
+            "parallel_context_fetch": True,
         }
         strategy_learning = getattr(self, "strategy_learning_service", None)
         if strategy_learning is None:

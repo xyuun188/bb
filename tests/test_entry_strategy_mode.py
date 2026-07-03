@@ -189,6 +189,84 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 1.0}}
     assert result["portfolio_roster"]["market_symbol_min"] == 12
     assert result["portfolio_roster"]["market_symbol_min_is_batch_size"] is False
+    assert result["strategy_context_runtime"]["parallel_context_fetch"] is True
+
+
+@pytest.mark.asyncio
+async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+
+    class Daily:
+        async def state(self, mode: str) -> dict[str, Any]:
+            assert mode == "paper"
+            await asyncio.sleep(0.05)
+            return {"today_total_pnl": 1.0}
+
+    class Exposure:
+        def context(self, open_positions):
+            return {"count": len(open_positions), "dominant_side": "neutral"}
+
+    async def side_perf(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        await asyncio.sleep(0.05)
+        return {"long": {"pnl": 1.0}}
+
+    async def symbol_side_perf(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        await asyncio.sleep(0.05)
+        return {"ETH/USDT|long": {"pnl": 2.0}}
+
+    async def contribution_perf(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        await asyncio.sleep(0.05)
+        return {"server_profit_model": {"pnl": 3.0}}
+
+    async def balance(mode: str) -> float:
+        assert mode == "paper"
+        await asyncio.sleep(0.05)
+        return 1_000.0
+
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "_write_runtime_heartbeat",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_perf_timeout_seconds",
+        lambda _self: 0.5,
+    )
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_account_timeout_seconds",
+        lambda _self: 0.5,
+    )
+    service.daily_performance_service = Daily()
+    service._today_side_performance = side_perf
+    service._multiday_side_performance = side_perf
+    service._recent_symbol_side_performance = symbol_side_perf
+    service._recent_model_contribution_performance = contribution_perf
+    service.entry_position_exposure = Exposure()
+    service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
+    service.allocated_order_balance = balance
+    service.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
+    service.strategy_learning_service = None
+
+    started_at = asyncio.get_running_loop().time()
+    result = await service._strategy_mode_context(
+        "paper",
+        {"mode": "uptrend_continuation", "confidence": 0.6},
+        open_positions=[{"symbol": "ETH/USDT"}],
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert elapsed < 0.18
+    assert result["account_equity"] == 1_000.0
+    assert result["symbol_side_performance"] == {"ETH/USDT|long": {"pnl": 2.0}}
+    assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 3.0}}
+    assert result["strategy_context_runtime"]["parallel_context_fetch"] is True
 
 
 @pytest.mark.asyncio

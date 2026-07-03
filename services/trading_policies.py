@@ -27,6 +27,58 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _exit_binding_positions(
+    refreshed_positions: list[dict[str, Any]] | None,
+    original_positions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep local Profit-First metadata when exchange refresh returns a thinner snapshot."""
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for position in [*(refreshed_positions or []), *(original_positions or [])]:
+        if not isinstance(position, dict):
+            continue
+        key = (
+            str(position.get("model_name") or ""),
+            str(position.get("symbol") or ""),
+            str(position.get("side") or ""),
+            str(position.get("okx_pos_id") or position.get("entry_exchange_order_id") or ""),
+        )
+        has_profit_first_ref = bool(
+            position.get("profit_first_exit_plan_id")
+            or (
+                isinstance(position.get("profit_first_exit_plan"), dict)
+                and position["profit_first_exit_plan"].get("exit_plan_id")
+            )
+            or (
+                isinstance(position.get("profit_first_trade_plan"), dict)
+                and position["profit_first_trade_plan"].get("exit_plan_id")
+            )
+            or any(
+                isinstance(leg, dict)
+                and (leg.get("profit_first_exit_plan_id") or leg.get("exit_plan_id"))
+                for leg in _safe_list(position.get("entry_legs"))
+            )
+        )
+        if key in seen and not has_profit_first_ref:
+            continue
+        if key in seen and has_profit_first_ref:
+            merged = [
+                item
+                for item in merged
+                if (
+                    str(item.get("model_name") or ""),
+                    str(item.get("symbol") or ""),
+                    str(item.get("side") or ""),
+                    str(item.get("okx_pos_id") or item.get("entry_exchange_order_id") or ""),
+                )
+                != key
+            ]
+        seen.add(key)
+        merged.append(position)
+    return merged
+
+
 @dataclass(slots=True)
 class PolicyGateResult:
     passed: bool
@@ -513,13 +565,14 @@ class ExitPolicy:
                 "exit_arbitration": arbitration_data,
             }
 
+        original_exit_positions = list(open_positions or [])
         exit_positions = open_positions or []
         if refresh_positions and self.exit_position_snapshot is not None:
             exit_positions = await self.exit_position_snapshot.refresh_positions(open_positions)
         context = context.with_refreshed_positions(exit_positions)
         attach_profit_first_exit_reference(
             decision,
-            exit_positions,
+            _exit_binding_positions(exit_positions, original_exit_positions),
             model_name=model_name,
         )
 

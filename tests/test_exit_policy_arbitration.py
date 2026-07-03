@@ -164,6 +164,61 @@ async def test_exit_policy_can_skip_snapshot_refresh_for_fast_local_paths() -> N
 
 
 @pytest.mark.asyncio
+async def test_exit_policy_binds_exit_plan_from_original_snapshot_when_refresh_is_thin() -> None:
+    class Snapshot:
+        async def refresh_positions(self, open_positions):
+            if open_positions is not None:
+                open_positions[:] = [
+                    {
+                        "model_name": "ensemble_trader",
+                        "symbol": "BTC/USDT",
+                        "side": "long",
+                        "entry_exchange_order_id": "entry-1",
+                    }
+                ]
+            return open_positions or []
+
+    class Cooldown:
+        def recent_exit_cooldown_reason(self, model_name, decision):
+            return None
+
+    policy = ExitPolicy(
+        exit_position_matcher=AlwaysMatch(),
+        exit_position_snapshot=Snapshot(),
+        exit_cooldown=Cooldown(),
+    )
+    decision = _decision({"close_evidence": {"entry_exchange_order_id": "entry-1"}})
+
+    result = await policy.evaluate(
+        decision,
+        "ensemble_trader",
+        [
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "entry_exchange_order_id": "entry-1",
+                "profit_first_exit_plan": {"exit_plan_id": "pfep-original"},
+                "profit_first_trade_plan": {
+                    "plan_version": "profit-first-v3.1",
+                    "decision_lane": "small",
+                },
+            }
+        ],
+    )
+
+    assert result.passed is True
+    assert decision.raw_response["profit_first_exit_reference"]["exit_plan_id"] == "pfep-original"
+    assert (
+        decision.raw_response["profit_first_exit_reference"][
+            "missing_original_exit_plan_reference"
+        ]
+        is False
+    )
+    assert decision.raw_response["close_evidence"]["profit_first_exit_plan_id"] == "pfep-original"
+
+
+@pytest.mark.asyncio
 async def test_exit_policy_uses_volatility_aware_cooldown_from_real_policy() -> None:
     first = datetime(2026, 6, 8, tzinfo=UTC)
     current = first + timedelta(seconds=350)

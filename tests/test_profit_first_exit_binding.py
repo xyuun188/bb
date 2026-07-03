@@ -58,6 +58,34 @@ def test_exit_reference_records_missing_plan_reason() -> None:
     assert raw["profit_first_exit_reference"]["plan_failure_reason"]
 
 
+def test_exit_reference_records_default_failure_reason_when_position_has_no_plan() -> None:
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.8,
+        reasoning="close without original plan",
+        raw_response={},
+    )
+
+    raw = attach_profit_first_exit_reference(
+        decision,
+        [
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "ETH/USDT",
+                "side": "long",
+                "entry_exchange_order_id": "entry-missing-plan",
+            }
+        ],
+        model_name="ensemble_trader",
+    )
+
+    assert raw["profit_first_exit_reference"]["missing_original_exit_plan_reference"] is True
+    assert raw["profit_first_exit_reference"]["plan_failure_reason"]
+    assert raw["close_evidence"]["profit_first_plan_failure_reason"]
+
+
 def test_exit_reference_prefers_exact_entry_exchange_order_id_match() -> None:
     decision = DecisionOutput(
         model_name="ensemble_trader",
