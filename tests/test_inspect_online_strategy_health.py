@@ -883,6 +883,7 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                 "diagnostic_boundary": "Read-only market AI throughput aggregate",
             },
             "latest_candidate_funnel": {
+                "analysis_scope": "market",
                 "scan_symbol_count": 120,
                 "feature_fetch_requested_count": 12,
                 "feature_fetch_budget": {
@@ -892,6 +893,13 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
                     "selected_total_feature_fetch_count": 48,
                     "pool_min": 48,
                     "pool_max": 64,
+                    "early_quorum": {
+                        "read_only": True,
+                        "is_entry_gate": False,
+                        "met": True,
+                        "quorum": 16,
+                    },
+                    "early_quorum_cancelled_pending": True,
                     "unused_large_payload": ["omit"],
                 },
                 "feature_valid_count": 12,
@@ -989,10 +997,14 @@ def test_strategy_health_market_symbol_only_report_is_compact_and_keeps_guards()
     assert progress["market_ai_budget_used_ratio_before_symbol_stats"]["median"] == 0.33
     assert progress["latest"]["budget_clock_scope"] == "market_ai_phase"
     latest = diagnostics["latest_candidate_funnel"]
+    assert latest["analysis_scope"] == "market"
     assert latest["scan_symbol_count"] == 120
     assert latest["feature_valid_count"] == 12
     assert latest["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48
     assert latest["feature_fetch_budget"]["is_entry_gate"] is False
+    assert latest["feature_fetch_budget"]["early_quorum"]["met"] is True
+    assert latest["feature_fetch_budget"]["early_quorum"]["quorum"] == 16
+    assert latest["feature_fetch_budget"]["early_quorum_cancelled_pending"] is True
     assert "unused_large_payload" not in latest["feature_fetch_budget"]
     assert latest["rank_fallback_filtered_fill_count"] == 1
     assert latest["rank_fallback_filtered_fill_policy"]["read_only"] is True

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections import Counter
 from collections.abc import Awaitable
 from contextvars import ContextVar
@@ -2945,6 +2946,51 @@ class TradingService:
         )
         return selected
 
+    def _auto_scan_feature_fetch_early_quorum(
+        self,
+        *,
+        completed_valid_count: int,
+        total_fetch_count: int,
+        configured_limit: int,
+        run_market_analysis: bool,
+        run_position_analysis: bool,
+        auto_scan: bool,
+        feature_fetch_budget_diagnostics: dict[str, Any] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        configured = max(1, int(configured_limit or 0))
+        total = max(0, int(total_fetch_count or 0))
+        diagnostics = self._safe_dict(feature_fetch_budget_diagnostics)
+        if not diagnostics:
+            diagnostics = self._safe_dict(
+                getattr(self, "_last_auto_feature_fetch_budget_diagnostics", None)
+            )
+        selected_target = int(
+            diagnostics.get("selected_market_feature_fetch_count")
+            or diagnostics.get("target_market_feature_fetch_count")
+            or total
+            or configured
+        )
+        breadth_target = max(configured * 2, math.ceil(max(selected_target, configured) / 3))
+        quorum = min(total, max(configured, breadth_target))
+        eligible = bool(auto_scan and run_market_analysis and not run_position_analysis and total)
+        met = bool(eligible and int(completed_valid_count or 0) >= quorum)
+        return met, {
+            "read_only": True,
+            "is_entry_gate": False,
+            "eligible": eligible,
+            "met": met,
+            "completed_valid_count": int(completed_valid_count or 0),
+            "quorum": int(quorum),
+            "total_fetch_count": int(total),
+            "configured_market_symbol_limit": int(configured),
+            "selected_market_feature_fetch_count": int(selected_target),
+            "reason": (
+                "market-only auto scan may start AI analysis after enough valid feature "
+                "snapshots are available for broad ranking; slow remaining feature sources "
+                "are cancelled and retried by later rotation rounds"
+            ),
+        }
+
     async def _price_action_black_swan_false_positive(
         self,
         decision: DecisionOutput,
@@ -3893,22 +3939,21 @@ class TradingService:
         open_position_filter: Any,
         unclaimed_filter: Any | None,
         fetch_symbols: list[str],
+        feature_fetch_budget_diagnostics: dict[str, Any] | None,
         feature_vectors: dict[str, Any],
         invalid_symbols: list[str],
         market_feature_vectors_before_rank: dict[str, Any],
         market_feature_vectors_after_rank: dict[str, Any],
         market_feature_vectors_after_dedupe: dict[str, Any],
+        rank_diagnostics: dict[str, Any] | None,
         analysis_budget_context: dict[str, Any],
         market_symbol_budget: int,
         run_market_analysis: bool,
         mode_is_auto_scan: bool,
+        analysis_scope: str,
     ) -> dict[str, Any]:
-        rank_diagnostics = self._safe_dict(
-            getattr(self, "_last_auto_feature_rank_diagnostics", None)
-        )
-        feature_fetch_budget = self._safe_dict(
-            getattr(self, "_last_auto_feature_fetch_budget_diagnostics", None)
-        )
+        rank_diagnostics = self._safe_dict(rank_diagnostics)
+        feature_fetch_budget = self._safe_dict(feature_fetch_budget_diagnostics)
         recent_dedupe = self._safe_dict(
             self._safe_dict(analysis_budget_context).get("recent_market_analysis_dedupe")
         )
@@ -3919,6 +3964,7 @@ class TradingService:
             "read_only": True,
             "is_entry_gate": False,
             "mode": "auto" if mode_is_auto_scan else "manual",
+            "analysis_scope": analysis_scope,
             "run_market_analysis": bool(run_market_analysis),
             "scan_symbol_count": len(scan_symbols or []),
             "blocked_filter_count": len(getattr(blocked_filter, "skipped", []) or []),
@@ -4412,6 +4458,8 @@ class TradingService:
         claimed_analysis_symbols: list[str] = []
         claimed_symbol_keys: set[str] = set()
         published_dashboard_update = False
+        feature_fetch_budget_diagnostics: dict[str, Any] = {}
+        rank_diagnostics_snapshot: dict[str, Any] = {}
         scope_token = _analysis_scope_context.set(analysis_scope)
         self._start_runtime_round(analysis_scope, round_start)
         self._set_loop_stage("starting")
@@ -4580,6 +4628,9 @@ class TradingService:
                     position_scan_symbols,
                     configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
                 )
+                feature_fetch_budget_diagnostics = self._safe_dict(
+                    getattr(self, "_last_auto_feature_fetch_budget_diagnostics", None)
+                )
             unclaimed_filter_for_funnel = unclaimed_filter if run_market_analysis else None
             if not fetch_symbols:
                 diagnostics = {
@@ -4662,23 +4713,15 @@ class TradingService:
                 batch_timeout,
                 max(8.0, float(settings.decision_interval_seconds) * 0.80),
             )
-            done, pending = await asyncio.wait(tasks, timeout=batch_timeout)
-            if pending:
-                await drain_cancelled_tasks(pending)
-                logger.warning(
-                    "feature vector batch reached time budget; cancelling slow sources",
-                    symbol_count=len(fetch_symbols),
-                    completed=len(done),
-                    pending=len(pending),
-                    timeout_seconds=round(batch_timeout, 3),
-                )
-                results.setdefault("warnings", []).append(
-                    {
-                        "model": ENSEMBLE_TRADER_NAME,
-                        "symbol": "ALL",
-                        "warning": ("本轮行情特征批量拉取超时，系统已跳过剩余候选并进入下一轮。"),
-                    }
-                )
+            early_timeout = min(
+                batch_timeout,
+                max(
+                    feature_timeout + 1.0,
+                    float(settings.decision_interval_seconds or 0.0) * 0.25,
+                ),
+            )
+            feature_fetch_started = asyncio.get_running_loop().time()
+            done, pending = await asyncio.wait(tasks, timeout=early_timeout)
             fv_results = []
             for task in done:
                 try:
@@ -4687,9 +4730,88 @@ class TradingService:
                     continue
                 except Exception as exc:
                     logger.warning(
-                        "feature vector task failed after batch wait",
+                        "feature vector task failed after early wait",
                         error=safe_error_text(exc),
                     )
+            early_valid_count = sum(
+                1
+                for _symbol, fv in fv_results
+                if fv is not None and self._is_valid_feature_vector(fv)
+            )
+            early_quorum_met, early_quorum_diagnostics = (
+                self._auto_scan_feature_fetch_early_quorum(
+                    completed_valid_count=early_valid_count,
+                    total_fetch_count=len(fetch_symbols),
+                    configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
+                    run_market_analysis=run_market_analysis,
+                    run_position_analysis=run_position_analysis,
+                    auto_scan=mode_manager.is_auto_scan,
+                    feature_fetch_budget_diagnostics=feature_fetch_budget_diagnostics,
+                )
+            )
+            early_quorum_diagnostics.update(
+                {
+                    "early_wait_seconds": round(
+                        asyncio.get_running_loop().time() - feature_fetch_started,
+                        3,
+                    ),
+                    "early_timeout_seconds": round(early_timeout, 3),
+                    "batch_timeout_seconds": round(batch_timeout, 3),
+                    "pending_after_early_wait": len(pending),
+                }
+            )
+            if pending and not early_quorum_met:
+                remaining_timeout = max(
+                    batch_timeout - (asyncio.get_running_loop().time() - feature_fetch_started),
+                    0.0,
+                )
+                more_done, pending = await asyncio.wait(pending, timeout=remaining_timeout)
+                for task in more_done:
+                    try:
+                        fv_results.append(task.result())
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as exc:
+                        logger.warning(
+                            "feature vector task failed after batch wait",
+                            error=safe_error_text(exc),
+                        )
+            feature_fetch_budget_diagnostics.update(
+                {
+                    "early_quorum": early_quorum_diagnostics,
+                    "early_quorum_cancelled_pending": bool(pending and early_quorum_met),
+                }
+            )
+            self._last_auto_feature_fetch_budget_diagnostics = dict(
+                feature_fetch_budget_diagnostics
+            )
+            results["feature_fetch_early_quorum"] = early_quorum_diagnostics
+            if pending:
+                await drain_cancelled_tasks(pending)
+                if early_quorum_met:
+                    logger.info(
+                        "feature vector early quorum reached; cancelling slow sources",
+                        symbol_count=len(fetch_symbols),
+                        completed=len(tasks) - len(pending),
+                        pending=len(pending),
+                        early_quorum=early_quorum_diagnostics,
+                    )
+                elif not early_quorum_met:
+                    logger.warning(
+                    "feature vector batch reached time budget; cancelling slow sources",
+                    symbol_count=len(fetch_symbols),
+                    completed=len(tasks) - len(pending),
+                    pending=len(pending),
+                    timeout_seconds=round(batch_timeout, 3),
+                    early_quorum_met=early_quorum_met,
+                )
+                results.setdefault("warnings", []).append(
+                    {
+                        "model": ENSEMBLE_TRADER_NAME,
+                        "symbol": "ALL",
+                        "warning": ("本轮行情特征批量拉取超时，系统已跳过剩余候选并进入下一轮。"),
+                    }
+                )
             feature_vectors = {s: fv for s, fv in fv_results if fv is not None}
             invalid_symbols = [
                 s for s, fv in feature_vectors.items() if not self._is_valid_feature_vector(fv)
@@ -4756,6 +4878,9 @@ class TradingService:
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, market_symbol_budget
                     )
+                    rank_diagnostics_snapshot = self._safe_dict(
+                        getattr(self, "_last_auto_feature_rank_diagnostics", None)
+                    )
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
                 elif len(market_feature_vectors) > market_symbol_budget:
                     allowed_keys = {
@@ -4800,15 +4925,18 @@ class TradingService:
                 open_position_filter=open_position_filter,
                 unclaimed_filter=unclaimed_filter_for_funnel,
                 fetch_symbols=list(fetch_symbols or []),
+                feature_fetch_budget_diagnostics=feature_fetch_budget_diagnostics,
                 feature_vectors=feature_vectors,
                 invalid_symbols=invalid_symbols,
                 market_feature_vectors_before_rank=market_feature_vectors_before_rank,
                 market_feature_vectors_after_rank=market_feature_vectors_after_rank,
                 market_feature_vectors_after_dedupe=market_feature_vectors_after_dedupe,
+                rank_diagnostics=rank_diagnostics_snapshot,
                 analysis_budget_context=analysis_budget_context,
                 market_symbol_budget=market_symbol_budget,
                 run_market_analysis=run_market_analysis,
                 mode_is_auto_scan=mode_manager.is_auto_scan,
+                analysis_scope=analysis_scope,
             )
             results["market_candidate_funnel"] = market_candidate_funnel
             results["analysis_budget"] = analysis_budget_context
@@ -4847,7 +4975,24 @@ class TradingService:
             )
 
             self._set_loop_stage("refresh_position_prices")
-            await self.okx_sync_service.refresh_position_prices(feature_vectors)
+            if self._should_refresh_position_prices_before_review(analysis_scope):
+                await self.okx_sync_service.refresh_position_prices(feature_vectors)
+                results["position_price_refresh"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "skipped": False,
+                    "reason": "position/full round refreshes persisted open-position prices before review",
+                }
+            else:
+                results["position_price_refresh"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "skipped": True,
+                    "reason": (
+                        "market-only round skips synchronous open-position price refresh; "
+                        "position review and background OKX sync own persisted position pricing"
+                    ),
+                }
 
             # 2.5 Enforce stop-loss / take-profit before AI decisions
             review_blocked_keys: set[tuple[str, str]] = set()
@@ -5607,6 +5752,10 @@ class TradingService:
 
     @staticmethod
     def _should_run_full_reconciliation_at_round_start(analysis_scope: str) -> bool:
+        return analysis_scope in {"full", "position"}
+
+    @staticmethod
+    def _should_refresh_position_prices_before_review(analysis_scope: str) -> bool:
         return analysis_scope in {"full", "position"}
 
     async def start(self) -> None:

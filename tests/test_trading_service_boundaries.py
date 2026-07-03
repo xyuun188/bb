@@ -528,6 +528,55 @@ def test_market_scope_skips_full_reconciliation_at_round_start() -> None:
     assert TradingService._should_run_full_reconciliation_at_round_start("full") is True
 
 
+def test_market_scope_skips_sync_position_price_refresh_before_ai() -> None:
+    assert TradingService._should_refresh_position_prices_before_review("market") is False
+    assert TradingService._should_refresh_position_prices_before_review("position") is True
+    assert TradingService._should_refresh_position_prices_before_review("full") is True
+
+
+def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service._last_auto_feature_fetch_budget_diagnostics = {
+        "selected_market_feature_fetch_count": 48,
+    }
+
+    met, diagnostics = service._auto_scan_feature_fetch_early_quorum(
+        completed_valid_count=16,
+        total_fetch_count=48,
+        configured_limit=8,
+        run_market_analysis=True,
+        run_position_analysis=False,
+        auto_scan=True,
+    )
+    assert met is True
+    assert diagnostics["quorum"] == 16
+    assert diagnostics["is_entry_gate"] is False
+
+    not_met, _diagnostics = service._auto_scan_feature_fetch_early_quorum(
+        completed_valid_count=15,
+        total_fetch_count=48,
+        configured_limit=8,
+        run_market_analysis=True,
+        run_position_analysis=False,
+        auto_scan=True,
+    )
+    assert not_met is False
+
+    position_scope_met, position_scope_diagnostics = (
+        service._auto_scan_feature_fetch_early_quorum(
+            completed_valid_count=48,
+            total_fetch_count=48,
+            configured_limit=8,
+            run_market_analysis=True,
+            run_position_analysis=True,
+            auto_scan=True,
+        )
+    )
+    assert position_scope_met is False
+    assert position_scope_diagnostics["eligible"] is False
+
+
 @pytest.mark.asyncio
 async def test_paused_market_scope_does_not_start_market_round(
     monkeypatch: pytest.MonkeyPatch,
@@ -4197,6 +4246,11 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
         open_position_filter=empty_filter,
         unclaimed_filter=skipped,
         fetch_symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        feature_fetch_budget_diagnostics={
+            "read_only": True,
+            "is_entry_gate": False,
+            "selected_market_feature_fetch_count": 48,
+        },
         feature_vectors={"BTC/USDT": object(), "ETH/USDT": object()},
         invalid_symbols=["SOL/USDT"],
         market_feature_vectors_before_rank={
@@ -4206,17 +4260,21 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
         },
         market_feature_vectors_after_rank={"BTC/USDT": object(), "ETH/USDT": object()},
         market_feature_vectors_after_dedupe={"BTC/USDT": object()},
+        rank_diagnostics=service._last_auto_feature_rank_diagnostics,
         analysis_budget_context=analysis_budget,
         market_symbol_budget=2,
         run_market_analysis=True,
         mode_is_auto_scan=True,
+        analysis_scope="market",
     )
     decision = _decision(Action.HOLD)
     service._attach_market_candidate_funnel(decision, funnel)
 
     assert funnel["read_only"] is True
     assert funnel["is_entry_gate"] is False
+    assert funnel["analysis_scope"] == "market"
     assert funnel["scan_symbol_count"] == 3
+    assert funnel["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48
     assert funnel["feature_valid_count"] == 2
     assert funnel["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48
     assert funnel["feature_fetch_budget"]["is_entry_gate"] is False

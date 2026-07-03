@@ -1562,6 +1562,28 @@ def compact_candidate_funnel(funnel):
             ),
         )
 
+    def compact_feature_fetch_budget(value):
+        return pick(
+            safe_dict(value),
+            (
+                "read_only",
+                "is_entry_gate",
+                "total_candidates",
+                "position_symbols",
+                "market_candidates",
+                "configured_market_symbol_limit",
+                "target_market_feature_fetch_count",
+                "max_market_feature_fetch_count",
+                "selected_market_feature_fetch_count",
+                "selected_total_feature_fetch_count",
+                "pool_multiplier",
+                "pool_min",
+                "pool_max",
+                "early_quorum",
+                "early_quorum_cancelled_pending",
+            ),
+        )
+
     def compact_rank_item(item):
         item = safe_dict(item)
         metrics = safe_dict(item.get("filter_metrics"))
@@ -1605,12 +1627,14 @@ def compact_candidate_funnel(funnel):
             "read_only",
             "is_entry_gate",
             "mode",
+            "analysis_scope",
             "run_market_analysis",
             "scan_symbol_count",
             "blocked_filter_count",
             "open_position_filtered_count",
             "unclaimed_filtered_count",
             "feature_fetch_requested_count",
+            "feature_fetch_budget",
             "feature_valid_count",
             "feature_invalid_count",
             "market_feature_before_rank_count",
@@ -1629,6 +1653,9 @@ def compact_candidate_funnel(funnel):
         ),
     )
     compact["market_budget_rotation"] = safe_dict(funnel.get("market_budget_rotation"))
+    compact["feature_fetch_budget"] = compact_feature_fetch_budget(
+        funnel.get("feature_fetch_budget")
+    )
     compact["rank_fallback_filtered_fill_policy"] = compact_fallback_policy(
         funnel.get("rank_fallback_filtered_fill_policy")
     )
@@ -3219,6 +3246,8 @@ def _compact_candidate_funnel(funnel: dict) -> dict:
                 "pool_multiplier",
                 "pool_min",
                 "pool_max",
+                "early_quorum",
+                "early_quorum_cancelled_pending",
             ),
         )
 
@@ -3277,6 +3306,7 @@ def _compact_candidate_funnel(funnel: dict) -> dict:
             "read_only",
             "is_entry_gate",
             "mode",
+            "analysis_scope",
             "run_market_analysis",
             "scan_symbol_count",
             "blocked_filter_count",
