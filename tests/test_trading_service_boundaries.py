@@ -151,6 +151,37 @@ def test_parallel_market_position_runtime_state_is_isolated(
 
 
 @pytest.mark.asyncio
+async def test_okx_balance_snapshot_returns_stale_cache_and_refreshes_in_background() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 123.0, "equity": 456.0},
+            "fetched_at": datetime.now(UTC)
+            - timedelta(seconds=trading_service.OKX_BALANCE_SNAPSHOT_FRESH_SECONDS + 1),
+        }
+    }
+    service._okx_balance_snapshot_locks = {}
+    service._okx_balance_snapshot_refresh_tasks = {}
+    refresh_calls: list[str] = []
+
+    async def fake_refresh(mode: str) -> None:
+        refresh_calls.append(mode)
+        await asyncio.sleep(0)
+
+    service._refresh_okx_balance_snapshot_for_mode = fake_refresh  # type: ignore[method-assign]
+
+    snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
+
+    assert snapshot is not None
+    assert snapshot["free"] == 123.0
+    assert snapshot["stale"] is True
+    assert snapshot["refresh_in_background"] is True
+    task = service._okx_balance_snapshot_refresh_tasks["paper"]
+    await task
+    assert refresh_calls == ["paper"]
+
+
+@pytest.mark.asyncio
 async def test_stop_writes_inactive_runtime_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

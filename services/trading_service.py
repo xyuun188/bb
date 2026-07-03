@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
+from collections.abc import Awaitable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Awaitable
+from typing import Any
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -152,8 +153,8 @@ from services.ml_signal_service import AUTO_TRAIN_CHECK_INTERVAL_SECONDS, MLSign
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.model_promotion_policy import load_latest_paper_observation_report
 from services.new_pair_loss_pause import NewPairLossPausePolicy
-from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.okx_order_fact_sync import OkxOrderFactSyncService
+from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -908,6 +909,7 @@ class TradingService:
         self._new_pair_pause_reasons: dict[str, str] = {}
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._okx_balance_snapshot_locks: dict[str, asyncio.Lock] = {}
+        self._okx_balance_snapshot_refresh_tasks: dict[str, asyncio.Task] = {}
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
@@ -8357,7 +8359,12 @@ class TradingService:
                 selected_mode = mapped_mode
         self._invalidate_okx_balance_snapshot_cache_for_mode(selected_mode)
 
-    async def _get_okx_balance_snapshot_for_mode(self, mode: str) -> dict[str, Any] | None:
+    async def _get_okx_balance_snapshot_for_mode(
+        self,
+        mode: str,
+        *,
+        allow_stale_while_refresh: bool = True,
+    ) -> dict[str, Any] | None:
         """Return OKX USDT balance fields for allocation and order sizing."""
         selected_mode = "live" if mode == "live" else "paper"
 
@@ -8459,6 +8466,11 @@ class TradingService:
             if refresh_fallback:
                 refresh_fallback["refresh_in_progress"] = True
                 return refresh_fallback
+        stale_cached = cached_snapshot("OKX balance snapshot refresh scheduled")
+        if stale_cached and allow_stale_while_refresh:
+            self._schedule_okx_balance_snapshot_refresh(selected_mode)
+            stale_cached["refresh_in_background"] = True
+            return stale_cached
         async with lock:
             fresh_cached = self._cached_okx_balance_snapshot(
                 selected_mode,
@@ -8502,6 +8514,38 @@ class TradingService:
                 if fallback_snapshot:
                     return fallback_snapshot
                 return None
+
+    def _schedule_okx_balance_snapshot_refresh(self, mode: str) -> None:
+        selected_mode = "live" if mode == "live" else "paper"
+        tasks = getattr(self, "_okx_balance_snapshot_refresh_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._okx_balance_snapshot_refresh_tasks = tasks
+        current = tasks.get(selected_mode)
+        if current is not None and not current.done():
+            return
+        tasks[selected_mode] = asyncio.create_task(
+            self._refresh_okx_balance_snapshot_for_mode(selected_mode)
+        )
+
+    async def _refresh_okx_balance_snapshot_for_mode(self, mode: str) -> None:
+        try:
+            await self._get_okx_balance_snapshot_for_mode(
+                mode,
+                allow_stale_while_refresh=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "background OKX balance snapshot refresh failed",
+                mode=mode,
+                error=safe_error_text(exc),
+            )
+        finally:
+            tasks = getattr(self, "_okx_balance_snapshot_refresh_tasks", None)
+            if isinstance(tasks, dict):
+                task = asyncio.current_task()
+                if tasks.get(mode) is task:
+                    tasks.pop(mode, None)
 
     async def _sync_paper_after_okx(
         self,
