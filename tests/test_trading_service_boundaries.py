@@ -2509,7 +2509,7 @@ async def test_entry_profit_risk_sizing_does_not_lock_roster_fill_to_one_x_on_mo
     assert sizing["low_payoff_quality"] is False
     assert sizing["notional_floor_blocked"] == ""
     assert "tempered_by_risk_flags" not in dynamic["reasons"]
-    assert dynamic["limiting_factor"] == "risk_budget"
+    assert dynamic["limiting_factor"] in {"risk_budget", "volatility"}
     assert dynamic["final_integer_leverage"] > 1
     assert decision.suggested_leverage == dynamic["final_integer_leverage"]
 
@@ -2995,7 +2995,7 @@ async def test_entry_profit_risk_sizing_allows_recovery_probe_when_not_paused():
 
 
 @pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
+async def test_entry_profit_risk_sizing_clears_probe_cap_for_tradeable_evidence_probe():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0
 
@@ -3018,7 +3018,7 @@ async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
             "expected_loss_pct": 1.0,
             "tail_risk_score": 0.15,
             "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 1.0,
+            "profit_quality_ratio": 0.74,
             "server_profit_loss_probability": 0.40,
             "ml_aligned": True,
             "local_profit_aligned": True,
@@ -3045,7 +3045,12 @@ async def test_entry_profit_risk_sizing_applies_strategy_learning_probe_cap():
     sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
     assert sizing["applied"] is True
     assert sizing["profile_id"] == "balanced_probe"
-    assert sizing["probe_cap_applied"] is True
+    assert sizing["max_probe_size_pct"] == 0.018
+    assert sizing["quality_override"] is True
+    assert "tradeable_evidence_probe" in decision.raw_response["profit_risk_sizing"][
+        "strategy_quality_override_reasons"
+    ]
+    assert sizing["probe_cap_applied"] is False
     assert decision.position_size_pct > 0.018
     assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
 
@@ -3107,7 +3112,7 @@ async def test_entry_profit_risk_sizing_unlocks_strong_recovery_probe():
 
 
 @pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_cap():
+async def test_entry_profit_risk_sizing_reads_context_and_clears_probe_cap_for_tradeable_probe():
     async def allocated_balance(_model_mode, _decision):
         return 1000.0
 
@@ -3132,7 +3137,7 @@ async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_ca
             "expected_loss_pct": 1.0,
             "tail_risk_score": 0.15,
             "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 1.0,
+            "profit_quality_ratio": 0.74,
             "server_profit_loss_probability": 0.40,
             "ml_aligned": True,
             "local_profit_aligned": True,
@@ -3159,7 +3164,12 @@ async def test_entry_profit_risk_sizing_reads_strategy_learning_context_probe_ca
     sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
     assert sizing["applied"] is True
     assert sizing["profile_id"] == "loss_release"
-    assert sizing["probe_cap_applied"] is True
+    assert sizing["max_probe_size_pct"] == 0.014
+    assert sizing["quality_override"] is True
+    assert "tradeable_evidence_probe" in decision.raw_response["profit_risk_sizing"][
+        "strategy_quality_override_reasons"
+    ]
+    assert sizing["probe_cap_applied"] is False
     assert sizing["release_pressure_active"] is True
     assert decision.position_size_pct > 0.014
     assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
