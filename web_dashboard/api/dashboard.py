@@ -98,14 +98,14 @@ _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
-_dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], int | None]] = {}
-_dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, int | None]] = {}
+_dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], Any | None]] = {}
+_dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, Any | None]] = {}
 _dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, Any]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
 _dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
-_dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any], int | None]] = {}
+_dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any], Any | None]] = {}
 _dashboard_okx_balance_locks: dict[str, asyncio.Lock] = {}
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
@@ -174,6 +174,30 @@ def _dashboard_okx_error_text(exc: Exception, *, resource: str) -> str:
     if "authorization" in lower or "api key" in lower or "signature" in lower:
         return f"OKX {resource}鉴权失败：{error}"
     return f"OKX {resource}读取失败：{error}"
+
+
+def _dashboard_okx_position_error_state(mode: str | None = None) -> dict[str, Any] | None:
+    selected_mode = "live" if (mode or mode_manager.mode.value) == "live" else "paper"
+    cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
+    if not cached_error:
+        return None
+    cached_at, cached_text, cached_executor_identity = cached_error
+    age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+    if age_seconds > _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS:
+        return None
+    executor = _dashboard_okx_executor_for_mode(selected_mode)
+    executor_identity = executor
+    if cached_executor_identity is not executor_identity:
+        return None
+    return {
+        "mode": selected_mode,
+        "error": cached_text,
+        "age_seconds": round(age_seconds, 3),
+    }
+
+
+def _dashboard_okx_positions_temporarily_unavailable(mode: str | None = None) -> bool:
+    return _dashboard_okx_position_error_state(mode) is not None
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
@@ -1170,6 +1194,9 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         exchange_symbols = None
     else:
         exchange_symbols = symbols_result
+    exchange_temporarily_unavailable = bool(
+        not exchange_marks and _dashboard_okx_positions_temporarily_unavailable(selected_mode)
+    )
 
     try:
         async with get_session_ctx() as session:
@@ -1287,20 +1314,30 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                 abs(min(float(pos.realized_pnl or 0.0), 0.0)) for pos in today_trusted_closed_rows
             )
             fallback_margin_by_key: dict[tuple[str, str], float] = {}
+            fallback_unrealized_by_key: dict[tuple[str, str], float] = {}
             for pos in position_rows:
                 if not pos.is_open:
                     continue
                 key = _dashboard_position_key(pos.symbol, pos.side)
-                if exchange_symbols is None or key[0] not in exchange_symbols:
+                if not exchange_temporarily_unavailable and (
+                    exchange_symbols is None or key[0] not in exchange_symbols
+                ):
                     continue
                 fallback_margin_by_key[key] = fallback_margin_by_key.get(
                     key, 0.0
                 ) + _local_position_margin(pos)
+                fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(
+                    key, 0.0
+                ) + (_safe_float(pos.unrealized_pnl, 0.0) or 0.0)
             if exchange_marks:
                 exchange_totals = _exchange_position_totals(exchange_marks, fallback_margin_by_key)
                 open_count = int(exchange_totals["open_count"])
                 unrealized_pnl = float(exchange_totals["unrealized_pnl"])
                 used_margin = float(exchange_totals["used_margin"])
+            elif exchange_temporarily_unavailable:
+                open_count = len(fallback_margin_by_key)
+                unrealized_pnl = float(sum(fallback_unrealized_by_key.values()))
+                used_margin = float(sum(fallback_margin_by_key.values()))
     except Exception as exc:
         _log_dashboard_fallback(
             "execution pnl database summary fallback",
@@ -1922,8 +1959,11 @@ def _trading_service_cached_okx_balance_snapshot(mode: str) -> dict[str, Any] | 
     return result
 
 
-async def _fetch_dashboard_okx_positions_uncached(selected_mode: str) -> list[dict[str, Any]]:
-    executor = _dashboard_okx_executor_for_mode(selected_mode)
+async def _fetch_dashboard_okx_positions_uncached(
+    selected_mode: str,
+    executor: Any | None = None,
+) -> list[dict[str, Any]]:
+    executor = executor if executor is not None else _dashboard_okx_executor_for_mode(selected_mode)
     if executor:
         fetch_strict = getattr(executor, "get_positions_strict", None)
         if callable(fetch_strict):
@@ -1962,13 +2002,14 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
     """
 
     selected_mode = "live" if selected_mode == "live" else "paper"
-    executor_identity = id(_dashboard_okx_executor_for_mode(selected_mode))
+    executor = _dashboard_okx_executor_for_mode(selected_mode)
+    executor_identity = executor
     now = datetime.now(UTC)
     cached = _dashboard_okx_position_cache.get(selected_mode)
     if cached:
         cached_at, cached_value, cached_executor_identity = cached
         if (
-            cached_executor_identity == executor_identity
+            cached_executor_identity is executor_identity
             and (now - cached_at).total_seconds() <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
         ):
             return copy.deepcopy(cached_value)
@@ -1977,7 +2018,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
     if cached_error:
         cached_at, cached_text, cached_executor_identity = cached_error
         if (
-            cached_executor_identity == executor_identity
+            cached_executor_identity is executor_identity
             and (now - cached_at).total_seconds()
             <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
         ):
@@ -1992,7 +2033,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
         if cached:
             cached_at, cached_value, cached_executor_identity = cached
             if (
-                cached_executor_identity == executor_identity
+                cached_executor_identity is executor_identity
                 and (now - cached_at).total_seconds() <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
             ):
                 return copy.deepcopy(cached_value)
@@ -2000,7 +2041,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
         if cached_error:
             cached_at, cached_text, cached_executor_identity = cached_error
             if (
-                cached_executor_identity == executor_identity
+                cached_executor_identity is executor_identity
                 and
                 (now - cached_at).total_seconds()
                 <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
@@ -2010,7 +2051,10 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
                 raise RuntimeError(cached_text)
 
         try:
-            positions = await _fetch_dashboard_okx_positions_uncached(selected_mode)
+            positions = await _fetch_dashboard_okx_positions_uncached(
+                selected_mode,
+                executor=executor,
+            )
         except Exception as exc:
             _dashboard_okx_position_error_cache[selected_mode] = (
                 datetime.now(UTC),
@@ -2380,7 +2424,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
     """Fetch the OKX balance snapshot used by dashboard summary with bounded retries."""
     selected_mode = "live" if selected_mode == "live" else "paper"
     initial_executor = _dashboard_okx_executor_for_mode(selected_mode)
-    executor_identity = id(initial_executor) if initial_executor is not None else None
+    executor_identity = initial_executor
 
     def cached_success(now: datetime, *, fresh_only: bool) -> dict[str, Any] | None:
         cached = _dashboard_okx_balance_cache.get(selected_mode)
@@ -2402,7 +2446,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             return None
         cached_at, cached_value, cached_executor_identity = cached_error
         if (
-            cached_executor_identity != executor_identity
+            cached_executor_identity is not executor_identity
             or (now - cached_at).total_seconds()
             > _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS
         ):
@@ -2427,7 +2471,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         exc: Exception,
         *,
         source: str,
-        identity: int | None = executor_identity,
+        identity: Any | None = executor_identity,
     ) -> dict[str, Any]:
         error = _dashboard_okx_error_text(exc, resource="余额")
         failure = {
@@ -2573,6 +2617,8 @@ async def _get_display_open_position_symbols(mode: str | None = None) -> set[str
     """Return OKX symbols that should be shown as currently held on the dashboard."""
     exchange_symbols = await _get_exchange_open_position_symbols(mode)
     if exchange_symbols is None:
+        if _dashboard_okx_positions_temporarily_unavailable(mode):
+            return await _get_open_position_symbols(mode)
         return set()
     return {symbol for symbol in exchange_symbols if symbol}
 
@@ -2749,6 +2795,9 @@ async def _get_display_open_positions_snapshot(
 
     selected_mode = mode or mode_manager.mode.value
     exchange_mark_map = await _get_exchange_position_mark_map(selected_mode)
+    exchange_temporarily_unavailable = bool(
+        not exchange_mark_map and _dashboard_okx_positions_temporarily_unavailable(selected_mode)
+    )
     exchange_symbols = (
         {symbol for symbol, _side in exchange_mark_map.keys()} if exchange_mark_map else None
     )
@@ -2782,7 +2831,7 @@ async def _get_display_open_positions_snapshot(
                 exchange_synced = bool(
                     exchange_symbols is not None and exchange_key in exchange_mark_map
                 )
-                if not exchange_synced:
+                if not exchange_synced and not exchange_temporarily_unavailable:
                     continue
 
                 local_quantity = sum(
@@ -2865,6 +2914,9 @@ async def _get_display_open_positions_snapshot(
                         ],
                         "merged_local_position_count": len(group_rows),
                         "exchange_synced": exchange_synced,
+                        "exchange_temporarily_unavailable": bool(
+                            exchange_temporarily_unavailable and not exchange_synced
+                        ),
                         "close_status": "open",
                         "close_status_label": "持有中",
                         "close_status_source": "position",
@@ -2949,6 +3001,7 @@ async def _get_display_open_positions_snapshot(
                         else False
                     ),
                     "exchange_synced": True,
+                    "exchange_temporarily_unavailable": False,
                     "close_status": "open",
                     "close_status_label": "持有中",
                     "close_status_source": "okx_current_position",
@@ -3477,6 +3530,11 @@ async def get_positions(
     page_size = max(1, min(int(page_size or 20), 100))
     positions = []
     exchange_mark_map = {} if closed_only else await _get_exchange_position_mark_map(mode)
+    exchange_temporarily_unavailable = bool(
+        not closed_only
+        and not exchange_mark_map
+        and _dashboard_okx_positions_temporarily_unavailable(mode)
+    )
     exchange_symbols = (
         {symbol for symbol, _side in exchange_mark_map.keys()} if exchange_mark_map else None
     )
@@ -3912,7 +3970,9 @@ async def get_positions(
                 exchange_synced = bool(
                     exchange_symbols is not None and exchange_key in exchange_mark_map
                 )
-            display_is_open = bool(p.is_open and exchange_synced)
+            display_is_open = bool(
+                p.is_open and (exchange_synced or exchange_temporarily_unavailable)
+            )
             if open_only and not display_is_open:
                 continue
             matched_close = close_order_match_by_position_id.get(p.id)
@@ -3958,6 +4018,9 @@ async def get_positions(
                     "is_open": display_is_open,
                     "db_is_open": p.is_open,
                     "exchange_synced": exchange_synced,
+                    "exchange_temporarily_unavailable": bool(
+                        p.is_open and exchange_temporarily_unavailable and not exchange_synced
+                    ),
                     "close_status": close_status,
                     "close_status_label": close_status_label,
                     "close_status_source": close_status_source,

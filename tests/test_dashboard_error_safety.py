@@ -811,6 +811,229 @@ async def test_execution_pnl_summary_does_not_use_local_open_position_when_okx_h
 
 
 @pytest.mark.asyncio
+async def test_display_open_position_symbols_fall_back_to_local_when_okx_temporarily_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-open-symbol-fallback.db').as_posix()}",
+    )
+    await init_db()
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    dashboard._dashboard_okx_position_error_cache["paper"] = (
+        datetime.now(UTC),
+        "OKX 持仓响应超时，已优先返回缓存数据",
+        None,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode=None: _async_value(None),
+    )
+
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="FALL/USDT",
+                    side="long",
+                    quantity=12.0,
+                    entry_price=1.0,
+                    current_price=1.1,
+                    leverage=2.0,
+                    unrealized_pnl=1.2,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=datetime(2026, 7, 3, 1, 0, tzinfo=UTC),
+                )
+            )
+
+        symbols = await dashboard._get_display_open_position_symbols("paper")
+    finally:
+        await close_db()
+
+    assert symbols == {"FALL/USDT"}
+
+
+@pytest.mark.asyncio
+async def test_display_open_positions_snapshot_keeps_local_rows_when_okx_temporarily_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-open-position-fallback.db').as_posix()}",
+    )
+    await init_db()
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_data_service", None)
+    monkeypatch.setattr(dashboard, "_exchange_mark_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    dashboard._dashboard_okx_position_error_cache["paper"] = (
+        datetime.now(UTC),
+        "OKX 持仓响应超时，已优先返回缓存数据",
+        None,
+    )
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode=None: _async_value({}))
+
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="HOME/USDT",
+                    side="long",
+                    quantity=100.0,
+                    entry_price=1.0,
+                    current_price=1.2,
+                    leverage=2.0,
+                    unrealized_pnl=20.0,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=datetime(2026, 7, 3, 1, 5, tzinfo=UTC),
+                )
+            )
+
+        rows = await dashboard._get_display_open_positions_snapshot("paper")
+    finally:
+        await close_db()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["symbol"] == "HOME/USDT"
+    assert row["is_open"] is True
+    assert row["exchange_synced"] is False
+    assert row["exchange_temporarily_unavailable"] is True
+    assert row["quantity"] == pytest.approx(100.0)
+    assert row["unrealized_pnl"] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_execution_pnl_summary_uses_local_open_position_when_okx_temporarily_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-local-open-fallback.db').as_posix()}",
+    )
+    await init_db()
+
+    async def okx_snapshot(_mode: str):
+        return {"equity": 4998.15, "total": 4998.15, "free": 4998.15}
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_snapshot_for_mode", okx_snapshot)
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    dashboard._dashboard_okx_position_error_cache["paper"] = (
+        datetime.now(UTC),
+        "OKX 持仓响应超时，已优先返回缓存数据",
+        None,
+    )
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode=None: _async_value({}))
+    monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", lambda _mode=None: _async_value(None))
+
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="HOME/USDT",
+                    side="long",
+                    quantity=100.0,
+                    entry_price=1.0,
+                    current_price=1.2,
+                    leverage=2.0,
+                    unrealized_pnl=20.0,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
+                )
+            )
+
+        summary = await dashboard._get_execution_pnl_summary("paper")
+    finally:
+        await close_db()
+
+    assert summary["open_positions"] == 1
+    assert summary["unrealized_pnl"] == pytest.approx(20.0)
+    assert summary["used_margin"] == pytest.approx(50.0)
+    assert summary["total_pnl"] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_get_positions_open_only_keeps_local_rows_when_okx_temporarily_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-get-positions-fallback.db').as_posix()}",
+    )
+    await init_db()
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_data_service", None)
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    dashboard._dashboard_okx_position_error_cache["paper"] = (
+        datetime.now(UTC),
+        "OKX 持仓响应超时，已优先返回缓存数据",
+        None,
+    )
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode=None: _async_value({}))
+    monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", lambda _mode=None: _async_value(None))
+    monkeypatch.setattr(dashboard, "_get_public_ticker_map", lambda _symbols: _async_value({}))
+
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="KEEP/USDT",
+                    side="short",
+                    quantity=8.0,
+                    entry_price=10.0,
+                    current_price=9.5,
+                    leverage=4.0,
+                    unrealized_pnl=4.0,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=datetime(2026, 7, 3, 2, 0, tzinfo=UTC),
+                )
+            )
+
+        payload = await dashboard.get_positions(mode="paper", open_only=True)
+    finally:
+        await close_db()
+
+    assert payload["count"] == 1
+    assert len(payload["positions"]) == 1
+    row = payload["positions"][0]
+    assert row["symbol"] == "KEEP/USDT"
+    assert row["is_open"] is True
+    assert row["exchange_synced"] is False
+    assert row["exchange_temporarily_unavailable"] is True
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_records_include_okx_authoritative_ledger_positions(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

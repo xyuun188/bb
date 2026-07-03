@@ -44,6 +44,7 @@ RETRY_DELAY = 1.0  # seconds
 RATE_LIMIT_TOKENS = 10  # max requests per second
 RATE_LIMIT_PERIOD = 1.0
 OKX_REST_CALL_TIMEOUT = 10.0
+OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 ATTACHED_PROTECTION_MIN_STOP_PCT = 0.012
@@ -122,6 +123,7 @@ class OKXExecutor(AbstractExecutor):
             "secret": creds["api_secret"],
             "enableRateLimit": True,
             "options": {
+                "adjustForTimeDifference": True,
                 "defaultType": "swap",
                 "defaultSubType": "linear",
                 "fetchMarkets": ["swap"],
@@ -142,6 +144,7 @@ class OKXExecutor(AbstractExecutor):
         self._ensure_rest_url()
 
         try:
+            await self._sync_time_difference()
             if self._load_markets_on_initialize:
                 await self._load_usdt_swap_markets()
             self._connected = True
@@ -155,6 +158,38 @@ class OKXExecutor(AbstractExecutor):
         except Exception:
             await self.shutdown()
             raise
+
+    async def _sync_time_difference(self) -> None:
+        if self._exchange is None:
+            return
+        loader = getattr(self._exchange, "load_time_difference", None)
+        if not callable(loader):
+            return
+        try:
+            self._ensure_rest_url()
+            await asyncio.wait_for(
+                loader(),
+                timeout=OKX_TIME_DIFFERENCE_SYNC_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OKX time difference sync failed",
+                mode=self.executor_mode,
+                error=safe_error_text(exc),
+            )
+
+    @staticmethod
+    def _is_time_difference_error(error: Any) -> bool:
+        text = safe_error_text(error).lower()
+        return any(
+            marker in text
+            for marker in (
+                "50102",
+                "timestamp request expired",
+                "invalid nonce",
+                "time difference",
+            )
+        )
 
     def _ensure_rest_url(self) -> None:
         """Repair CCXT OKX URL fields before every exchange call."""
@@ -377,11 +412,34 @@ class OKXExecutor(AbstractExecutor):
                 await asyncio.sleep(RETRY_DELAY * (2**attempt))
                 last_error = e
             except ccxt_async.NetworkError as e:
-                logger.warning("network error", attempt=attempt, error=safe_error_text(e))
+                message = safe_error_text(e)
+                if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        "OKX network time drift detected; resyncing and retrying",
+                        method=method_name,
+                        attempt=attempt,
+                        error=message,
+                    )
+                    await self._sync_time_difference()
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
+                logger.warning("network error", attempt=attempt, error=message)
                 await asyncio.sleep(RETRY_DELAY * (2**attempt))
                 last_error = e
             except ccxt_async.ExchangeError as e:
                 message = safe_error_text(e)
+                if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        "OKX exchange time drift detected; resyncing and retrying",
+                        method=method_name,
+                        attempt=attempt,
+                        error=message,
+                    )
+                    await self._sync_time_difference()
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
                 logger.error("exchange error", error=message)
                 raise ExchangeAPIError(message) from e
             except Exception as e:

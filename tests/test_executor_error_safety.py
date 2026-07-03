@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import ccxt.async_support as ccxt_async
 import pytest
 
 import executor.okx_executor as okx_module
@@ -118,6 +119,46 @@ class _NativeBalanceOnlyCcxt:
                 }
             ]
         }
+
+
+class _InitTimeSyncCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.options = dict(config.get("options") or {})
+        self.markets: dict[str, Any] = {}
+        self.load_time_difference_calls = 0
+
+    def set_sandbox_mode(self, _enabled: bool) -> None:
+        return None
+
+    async def load_time_difference(self) -> int:
+        self.load_time_difference_calls += 1
+        return 123
+
+    async def close(self) -> None:
+        return None
+
+
+class _TimestampExpiredOnceCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.position_calls = 0
+        self.load_time_difference_calls = 0
+
+    async def load_time_difference(self) -> int:
+        self.load_time_difference_calls += 1
+        return 123
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.position_calls += 1
+        if self.position_calls == 1:
+            raise ccxt_async.NetworkError('okx {"msg":"Timestamp request expired","code":"50102"}')
+        return {"data": []}
 
 
 def _native_position_row(
@@ -907,6 +948,51 @@ def _executor(exchange: Any) -> OKXExecutor:
     executor._connected = True
     executor._exchange = exchange
     return executor
+
+
+@pytest.mark.asyncio
+async def test_okx_initialize_enables_and_loads_time_difference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: dict[str, Any] = {}
+
+    def fake_okx(config: dict[str, Any]) -> _InitTimeSyncCcxt:
+        exchange = _InitTimeSyncCcxt(config)
+        created["exchange"] = exchange
+        return exchange
+
+    monkeypatch.setattr(ccxt_async, "okx", fake_okx)
+    monkeypatch.setattr(
+        type(okx_module.settings),
+        "get_okx_credentials",
+        lambda _self, _mode: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"},
+    )
+    monkeypatch.setattr(type(okx_module.settings), "is_okx_demo", lambda _self, _mode: False)
+
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    try:
+        await executor.initialize()
+    finally:
+        await executor.shutdown()
+
+    exchange = created["exchange"]
+    assert exchange.options["adjustForTimeDifference"] is True
+    assert exchange.load_time_difference_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_with_retry_resyncs_time_difference_after_timestamp_expired() -> None:
+    exchange = _TimestampExpiredOnceCcxt()
+    executor = _executor(exchange)
+
+    result = await executor._with_retry(
+        exchange.privateGetAccountPositions,
+        {"instType": "SWAP"},
+    )
+
+    assert result == {"data": []}
+    assert exchange.position_calls == 2
+    assert exchange.load_time_difference_calls == 1
 
 
 def _exit_decision() -> DecisionOutput:
