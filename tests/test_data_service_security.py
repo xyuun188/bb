@@ -150,6 +150,92 @@ async def test_feature_vector_source_timeouts_do_not_block_analysis(
 
 
 @pytest.mark.asyncio
+async def test_feature_vector_fetches_sentiment_concurrently_with_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._last_sentiment_update = None
+    service._sentiment_refresh_task = None
+    service.ws_client = type("Ws", (), {"latest_tickers": {}})()
+    monkeypatch.setattr(data_service_module.settings, "sentiment_blocking_timeout_seconds", 1.0)
+    monkeypatch.setattr(data_service_module, "FEATURE_SNAPSHOT_TIMEOUT_SECONDS", 1.0)
+
+    sentiment_started = asyncio.Event()
+    sentiment_done = asyncio.Event()
+    ticker_started_before_sentiment_done = False
+
+    async def slow_sentiment(_symbols):
+        sentiment_started.set()
+        await asyncio.sleep(0.05)
+        service._sentiment_cache["BTC/USDT"] = {"news_sentiment_avg": 0.25}
+        sentiment_done.set()
+
+    async def ticker_source(_symbol):
+        nonlocal ticker_started_before_sentiment_done
+        await sentiment_started.wait()
+        ticker_started_before_sentiment_done = not sentiment_done.is_set()
+        return {"last_price": 100.0, "bid": 99.0, "ask": 101.0}
+
+    async def indicator_source(_symbol):
+        return {"close": 100.0}
+
+    async def derivatives_source(_symbol):
+        return {}
+
+    service.refresh_sentiment = slow_sentiment  # type: ignore[method-assign]
+    service._get_ticker_snapshot = ticker_source  # type: ignore[method-assign]
+    service._get_indicator_snapshot = indicator_source  # type: ignore[method-assign]
+    service._get_derivatives_snapshot = derivatives_source  # type: ignore[method-assign]
+
+    fv = await asyncio.wait_for(service.get_feature_vector("BTC/USDT"), timeout=1.0)
+
+    assert fv.current_price == pytest.approx(100.0)
+    assert ticker_started_before_sentiment_done is True
+
+
+@pytest.mark.asyncio
+async def test_feature_vector_can_skip_initial_sentiment_wait_for_market_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._last_sentiment_update = None
+    service._sentiment_refresh_task = None
+    service.ws_client = type("Ws", (), {"latest_tickers": {}})()
+    monkeypatch.setattr(data_service_module.settings, "sentiment_blocking_timeout_seconds", 1.0)
+    monkeypatch.setattr(data_service_module, "FEATURE_SNAPSHOT_TIMEOUT_SECONDS", 1.0)
+
+    async def slow_sentiment(_symbols):
+        await asyncio.sleep(60)
+
+    async def ticker_source(_symbol):
+        return {"last_price": 100.0, "bid": 99.0, "ask": 101.0}
+
+    async def indicator_source(_symbol):
+        return {"close": 100.0}
+
+    async def derivatives_source(_symbol):
+        return {}
+
+    service.refresh_sentiment = slow_sentiment  # type: ignore[method-assign]
+    service._get_ticker_snapshot = ticker_source  # type: ignore[method-assign]
+    service._get_indicator_snapshot = indicator_source  # type: ignore[method-assign]
+    service._get_derivatives_snapshot = derivatives_source  # type: ignore[method-assign]
+
+    try:
+        fv = await asyncio.wait_for(
+            service.get_feature_vector("BTC/USDT", wait_for_sentiment=False),
+            timeout=0.2,
+        )
+    finally:
+        task = service._sentiment_refresh_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert fv.current_price == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
 async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

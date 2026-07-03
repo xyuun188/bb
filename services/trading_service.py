@@ -7,6 +7,7 @@ into the main trading loop.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 from collections import Counter
@@ -2773,6 +2774,27 @@ class TradingService:
             return False
         return max(price, close, bid, ask) > 0
 
+    async def _get_feature_vector_snapshot(
+        self,
+        symbol: str,
+        *,
+        wait_for_sentiment: bool = True,
+    ) -> Any:
+        """Read a feature vector while preserving compatibility with older test doubles."""
+
+        getter = self.data_service.get_feature_vector
+        try:
+            parameters = inspect.signature(getter).parameters
+            accepts_options = "wait_for_sentiment" in parameters or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_options = True
+
+        if accepts_options:
+            return await getter(symbol, wait_for_sentiment=wait_for_sentiment)
+        return await getter(symbol)
+
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
         resolved_scope = scope or _analysis_scope_context.get() or "full"
         if resolved_scope not in self._analysis_runtime:
@@ -2975,7 +2997,7 @@ class TradingService:
         """
         try:
             fresh = await asyncio.wait_for(
-                self.data_service.get_feature_vector(symbol),
+                self._get_feature_vector_snapshot(symbol, wait_for_sentiment=False),
                 timeout=8.0,
             )
             if self._is_valid_feature_vector(fresh):
@@ -2996,7 +3018,7 @@ class TradingService:
     async def _fresh_feature_vector_for_price_recheck(self, symbol: str) -> Any | None:
         try:
             fresh = await asyncio.wait_for(
-                self.data_service.get_feature_vector(symbol),
+                self._get_feature_vector_snapshot(symbol, wait_for_sentiment=False),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
             if self._is_valid_feature_vector(fresh):
@@ -4837,7 +4859,7 @@ class TradingService:
                 async with sem:
                     try:
                         return sym, await asyncio.wait_for(
-                            self.data_service.get_feature_vector(sym),
+                            self._get_feature_vector_snapshot(sym, wait_for_sentiment=False),
                             timeout=feature_timeout,
                         )
                     except TimeoutError:
@@ -7834,7 +7856,10 @@ class TradingService:
                     break
                 try:
                     fv = await asyncio.wait_for(
-                        self.data_service.get_feature_vector(normalized_symbol or symbol),
+                        self._get_feature_vector_snapshot(
+                            normalized_symbol or symbol,
+                            wait_for_sentiment=False,
+                        ),
                         timeout=feature_timeout,
                     )
                 except TimeoutError:
@@ -8989,7 +9014,7 @@ class TradingService:
 
         try:
             fresh = await asyncio.wait_for(
-                self.data_service.get_feature_vector(normalized),
+                self._get_feature_vector_snapshot(normalized, wait_for_sentiment=False),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
             price = self._price_from_feature_like(fresh)

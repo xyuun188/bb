@@ -581,9 +581,19 @@ class DataService:
             return 0.0
         return max(min(score / 4.0, 1.0), -1.0)
 
-    async def get_feature_vector(self, symbol: str) -> FeatureVector:
+    async def get_feature_vector(
+        self,
+        symbol: str,
+        *,
+        wait_for_sentiment: bool = True,
+    ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
-        await self._ensure_sentiment_for_analysis(symbol)
+        sentiment_task = asyncio.create_task(
+            self._ensure_sentiment_for_analysis(
+                symbol,
+                wait_for_initial=wait_for_sentiment,
+            )
+        )
 
         async def bounded_snapshot(name: str, coro) -> dict[str, Any]:
             timeout = max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5)
@@ -616,13 +626,14 @@ class DataService:
         derivatives_task = asyncio.create_task(
             bounded_snapshot("derivatives", self._get_derivatives_snapshot(symbol))
         )
-        gather_results: tuple[Any, Any, Any] = await asyncio.gather(
+        gather_results: tuple[Any, Any, Any, Any] = await asyncio.gather(
             ticker_task,
             indicators_task,
             derivatives_task,
+            sentiment_task,
             return_exceptions=True,
         )
-        ticker_result, indicators_result, derivatives_result = gather_results
+        ticker_result, indicators_result, derivatives_result, _sentiment_result = gather_results
         ticker = ticker_result if isinstance(ticker_result, dict) else {}
         indicators = indicators_result if isinstance(indicators_result, dict) else {}
         derivatives = derivatives_result if isinstance(derivatives_result, dict) else {}
@@ -646,7 +657,12 @@ class DataService:
             derivatives=derivatives,
         )
 
-    async def _ensure_sentiment_for_analysis(self, symbol: str) -> None:
+    async def _ensure_sentiment_for_analysis(
+        self,
+        symbol: str,
+        *,
+        wait_for_initial: bool = True,
+    ) -> None:
         """Refresh sentiment without blocking every trading decision."""
         now = datetime.now(UTC)
         cached = symbol in self._sentiment_cache
@@ -664,11 +680,11 @@ class DataService:
         task = self._sentiment_refresh_task
         if task is None:
             return
+        timeout = max(float(settings.sentiment_blocking_timeout_seconds or 0.0), 0.0)
+        if not wait_for_initial or timeout <= 0:
+            return
         try:
-            await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=max(float(settings.sentiment_blocking_timeout_seconds or 0.0), 0.0),
-            )
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except TimeoutError:
             logger.info(
                 "sentiment refresh still running; continue with neutral cache", symbol=symbol
