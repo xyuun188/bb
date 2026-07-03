@@ -391,6 +391,24 @@ async def test_strategy_mode_context_does_not_block_on_slow_strategy_learning(
     tasks["paper"].cancel()
 
 
+def test_strategy_learning_context_wait_timeout_is_shorter_for_market_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.TradingService,
+        "strategy_learning_context_timeout_seconds",
+        lambda _self: 10.0,
+    )
+
+    market_timeout = service.strategy_learning_context_wait_timeout_seconds("market")
+    position_timeout = service.strategy_learning_context_wait_timeout_seconds("position")
+
+    assert 0.5 <= market_timeout <= 3.0
+    assert market_timeout < position_timeout
+    assert position_timeout == 10.0
+
+
 @pytest.mark.asyncio
 async def test_strategy_mode_context_uses_cached_learning_context_on_timeout(
     monkeypatch: pytest.MonkeyPatch,

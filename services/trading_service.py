@@ -1743,6 +1743,19 @@ class TradingService:
         configured = float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_timeout_seconds)
         return max(0.5, min(configured, interval * 0.20))
 
+    def strategy_learning_context_wait_timeout_seconds(
+        self,
+        analysis_scope: str | None = None,
+    ) -> float:
+        """Return how long the current round may wait for learning context."""
+
+        base_timeout = self.strategy_learning_context_timeout_seconds()
+        scope = analysis_scope or _analysis_scope_context.get()
+        if scope == "market":
+            interval = max(10.0, float(settings.decision_interval_seconds or 60))
+            return max(0.5, min(base_timeout, interval * 0.06, 3.0))
+        return base_timeout
+
     def strategy_learning_perf_timeout_seconds(self) -> float:
         """Return the short budget for historical performance context."""
 
@@ -1837,7 +1850,7 @@ class TradingService:
             )
             learned_context["strategy_learning_cache_status"] = "fresh"
             learned_context["strategy_learning_runtime_timeout_seconds"] = (
-                self.strategy_learning_context_timeout_seconds()
+                self.strategy_learning_context_wait_timeout_seconds()
             )
             self._strategy_learning_context_cache_store()[selected_mode] = {
                 "created_at": datetime.now(UTC),
@@ -3898,9 +3911,10 @@ class TradingService:
                 context=context,
                 open_positions=open_positions or [],
             )
+            wait_timeout = self.strategy_learning_context_wait_timeout_seconds()
             done, _pending = await asyncio.wait(
                 {refresh_task},
-                timeout=self.strategy_learning_context_timeout_seconds(),
+                timeout=wait_timeout,
             )
             if not done:
                 raise TimeoutError()
@@ -3927,13 +3941,13 @@ class TradingService:
                             "后台继续刷新，不阻塞开仓决策。"
                         ),
                         "strategy_learning_runtime_timeout_seconds": (
-                            self.strategy_learning_context_timeout_seconds()
+                            wait_timeout
                         ),
                     }
                 )
                 logger.warning(
                     "strategy learning context timed out; using cached strategy context",
-                    timeout_seconds=round(self.strategy_learning_context_timeout_seconds(), 3),
+                    timeout_seconds=round(wait_timeout, 3),
                 )
                 return self._refresh_dynamic_capacity(
                     open_positions=open_positions or [],
@@ -3947,11 +3961,11 @@ class TradingService:
                 "不会因为学习慢查询阻塞市场扫描。"
             )
             context["strategy_learning_runtime_timeout_seconds"] = (
-                self.strategy_learning_context_timeout_seconds()
+                wait_timeout
             )
             logger.warning(
                 "strategy learning context timed out; using baseline strategy context",
-                timeout_seconds=round(self.strategy_learning_context_timeout_seconds(), 3),
+                timeout_seconds=round(wait_timeout, 3),
             )
             return self._refresh_dynamic_capacity(
                 open_positions=open_positions or [],
