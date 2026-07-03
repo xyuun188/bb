@@ -102,6 +102,14 @@ def _created_sort_value(position: Any) -> float:
     return value.timestamp()
 
 
+def _position_has_entry_order_id(position: Any, target_order_id: str) -> bool:
+    order_id = str(target_order_id or "").strip()
+    if not order_id:
+        return False
+    existing = getattr(position, "entry_exchange_order_id", None)
+    return order_id in set(_split_exchange_order_ids(existing))
+
+
 class PositionExecutionPersistenceService:
     """Persist open/close position records while preserving execution semantics."""
 
@@ -268,51 +276,38 @@ class PositionExecutionPersistenceService:
             side=side,
             execution_mode=execution_mode,
         )
-        if existing_positions:
-            primary = sorted(
-                existing_positions,
-                key=_created_sort_value,
-            )[0]
-            old_qty = max(float(getattr(primary, "quantity", 0.0) or 0.0), 0.0)
-            add_qty = max(float(result.quantity or 0.0), 0.0)
-            total_qty = old_qty + add_qty
-            old_entry = float(getattr(primary, "entry_price", result.price) or result.price)
-            entry_price = (
-                ((old_entry * old_qty) + (float(result.price) * add_qty)) / total_qty
-                if total_qty > 0
-                else float(result.price)
+        if entry_exchange_order_id:
+            primary = next(
+                (
+                    position
+                    for position in existing_positions
+                    if _position_has_entry_order_id(position, entry_exchange_order_id)
+                ),
+                None,
             )
-            primary.quantity = total_qty
-            primary.entry_price = entry_price
-            primary.current_price = result.price
-            primary.leverage = decision.suggested_leverage
-            primary.unrealized_pnl = (
-                (result.price - entry_price) * total_qty
-                if side == "long"
-                else (entry_price - result.price) * total_qty
-            )
-            primary.realized_pnl = float(getattr(primary, "realized_pnl", 0.0) or 0.0)
-            primary.stop_loss_price = (
-                entry_price * (1 - decision.stop_loss_pct)
-                if side == "long"
-                else entry_price * (1 + decision.stop_loss_pct)
-            )
-            primary.take_profit_price = (
-                entry_price * (1 + decision.take_profit_pct)
-                if side == "long"
-                else entry_price * (1 - decision.take_profit_pct)
-            )
-            primary.is_open = True
-            if okx_inst_id:
-                primary.okx_inst_id = okx_inst_id
-            if okx_pos_id:
-                primary.okx_pos_id = okx_pos_id
-            if entry_exchange_order_id:
-                primary.entry_exchange_order_id = _merge_exchange_order_ids(
-                    getattr(primary, "entry_exchange_order_id", None),
-                    entry_exchange_order_id,
+            if primary is not None:
+                primary.current_price = result.price
+                primary.leverage = decision.suggested_leverage
+                primary.is_open = True
+                if okx_inst_id:
+                    primary.okx_inst_id = okx_inst_id
+                if okx_pos_id:
+                    primary.okx_pos_id = okx_pos_id
+                primary.stop_loss_price = (
+                    float(getattr(primary, "entry_price", result.price) or result.price)
+                    * (1 - decision.stop_loss_pct)
+                    if side == "long"
+                    else float(getattr(primary, "entry_price", result.price) or result.price)
+                    * (1 + decision.stop_loss_pct)
                 )
-            return
+                primary.take_profit_price = (
+                    float(getattr(primary, "entry_price", result.price) or result.price)
+                    * (1 + decision.take_profit_pct)
+                    if side == "long"
+                    else float(getattr(primary, "entry_price", result.price) or result.price)
+                    * (1 - decision.take_profit_pct)
+                )
+                return
         await repo.open_position(payload)
 
     async def _persist_exit(

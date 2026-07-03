@@ -427,30 +427,33 @@ class OkxAuthoritativeSyncService:
                 target_order_ids=target_order_ids,
             ),
         )
-        exchange_order_contexts = await _timed_stage(
+        optional_timeout = min(self.timeout_seconds, 3.0)
+        exchange_order_contexts = await _optional_timed_stage(
             stages,
             attempt=attempt,
             stage="okx_order_history_contexts",
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=optional_timeout,
             operation=self._fetch_order_history_contexts(
                 executor,
                 exchange_fills=exchange_fills,
                 local_exchange_order_ids=target_order_ids,
                 priority_order_ids=priority_order_ids,
             ),
+            default={},
         )
         instrument_contract_sizes: dict[str, float] = {}
         if symbols or target_inst_ids:
-            instrument_contract_sizes = await _timed_stage(
+            instrument_contract_sizes = await _optional_timed_stage(
                 stages,
                 attempt=attempt,
                 stage="okx_contract_sizes",
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=optional_timeout,
                 operation=self._fetch_contract_sizes(
                     executor,
                     symbols=symbols,
                     inst_ids=target_inst_ids,
                 ),
+                default={},
             )
         return (
             exchange_positions,
@@ -1181,6 +1184,48 @@ async def _timed_stage(
         )
         stages.append(record)
         raise
+    record.update(
+        {
+            "status": "ok",
+            "duration_seconds": round((datetime.now(UTC) - started_at).total_seconds(), 6),
+            "result_count": _result_count(result),
+        }
+    )
+    stages.append(record)
+    return result
+
+
+async def _optional_timed_stage(
+    stages: list[dict[str, Any]],
+    *,
+    attempt: int,
+    stage: str,
+    timeout_seconds: float,
+    operation: Any,
+    default: Any,
+) -> Any:
+    started_at = datetime.now(UTC)
+    record: dict[str, Any] = {
+        "stage": stage,
+        "attempt": attempt,
+        "timeout_seconds": round(float(timeout_seconds), 3),
+        "started_at": started_at.isoformat(),
+        "optional": True,
+    }
+    try:
+        result = await asyncio.wait_for(operation, timeout=timeout_seconds)
+    except Exception as exc:
+        record.update(
+            {
+                "status": "warning",
+                "duration_seconds": round((datetime.now(UTC) - started_at).total_seconds(), 6),
+                "error": safe_error_text(exc, limit=180),
+                "error_type": type(exc).__name__,
+                "default_applied": True,
+            }
+        )
+        stages.append(record)
+        return default
     record.update(
         {
             "status": "ok",

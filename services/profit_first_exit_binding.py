@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -21,16 +22,35 @@ def attach_profit_first_exit_reference(
         decision.raw_response = raw
         return raw
 
+    close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
+    close_evidence = dict(close_evidence)
+    target_exit_plan_id = _first_text(
+        close_evidence.get("profit_first_exit_plan_id"),
+        raw.get("profit_first_exit_plan_id"),
+        raw.get("exit_plan_id"),
+    )
+    target_entry_order_id = _first_text(
+        close_evidence.get("target_entry_exchange_order_id"),
+        close_evidence.get("entry_exchange_order_id"),
+        raw.get("target_entry_exchange_order_id"),
+        raw.get("entry_exchange_order_id"),
+    )
+    target_okx_pos_id = _first_text(
+        close_evidence.get("okx_pos_id"),
+        raw.get("okx_pos_id"),
+        raw.get("position_id"),
+    )
     side = "long" if decision.action == Action.CLOSE_LONG else "short"
     match = _matching_position(
         open_positions or [],
         model_name=model_name,
         symbol=decision.symbol,
         side=side,
+        target_exit_plan_id=target_exit_plan_id,
+        target_entry_order_id=target_entry_order_id,
+        target_okx_pos_id=target_okx_pos_id,
     )
     reference = _reference_from_position(match)
-    close_evidence = raw.get("close_evidence") if isinstance(raw.get("close_evidence"), dict) else {}
-    close_evidence = dict(close_evidence)
     if reference.get("exit_plan_id"):
         close_evidence["profit_first_exit_plan_id"] = reference["exit_plan_id"]
         raw["profit_first_exit_reference"] = {
@@ -59,8 +79,12 @@ def _matching_position(
     model_name: str | None,
     symbol: str,
     side: str,
+    target_exit_plan_id: str = "",
+    target_entry_order_id: str = "",
+    target_okx_pos_id: str = "",
 ) -> dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
+    candidates: list[tuple[int, float, dict[str, Any]]] = []
     for position in open_positions:
         if not isinstance(position, dict):
             continue
@@ -70,7 +94,20 @@ def _matching_position(
             continue
         if str(position.get("side") or "").lower() != side:
             continue
-        return position
+        score = 0
+        reference = _reference_from_position(position)
+        if reference.get("exit_plan_id"):
+            score += 5
+        if target_exit_plan_id and str(reference.get("exit_plan_id") or "").strip() == target_exit_plan_id:
+            score += 100
+        if target_entry_order_id and _position_has_entry_order_id(position, target_entry_order_id):
+            score += 80
+        if target_okx_pos_id and str(position.get("okx_pos_id") or "").strip() == target_okx_pos_id:
+            score += 60
+        candidates.append((score, _created_sort_value(position), position))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][2]
     return {}
 
 
@@ -95,6 +132,10 @@ def _reference_from_position(position: dict[str, Any]) -> dict[str, Any]:
         "entry_side": position.get("side") or trade_plan.get("side") or "",
         "entry_plan_version": trade_plan.get("plan_version") or "",
         "entry_decision_lane": trade_plan.get("decision_lane") or "",
+        "entry_exchange_order_id": _first_text(
+            position.get("entry_exchange_order_id"),
+            _first_text(*(leg.get("exchange_order_id") for leg in _entry_legs(position))),
+        ),
         "max_hold_minutes": exit_plan.get("max_hold_minutes") or trade_plan.get("max_hold_minutes"),
         "profit_drawdown_exit_pct": exit_plan.get("profit_drawdown_exit_pct")
         or trade_plan.get("profit_drawdown_exit_pct"),
@@ -121,3 +162,44 @@ def _normalize_symbol(value: Any) -> str:
         if len(parts) >= 2:
             return f"{parts[0]}/{parts[1]}"
     return text
+
+
+def _entry_legs(position: dict[str, Any]) -> list[dict[str, Any]]:
+    legs = position.get("entry_legs")
+    return [leg for leg in legs if isinstance(leg, dict)] if isinstance(legs, list) else []
+
+
+def _position_has_entry_order_id(position: dict[str, Any], target_order_id: str) -> bool:
+    order_id = str(target_order_id or "").strip()
+    if not order_id:
+        return False
+    if str(position.get("entry_exchange_order_id") or "").strip() == order_id:
+        return True
+    for leg in _entry_legs(position):
+        if str(leg.get("exchange_order_id") or "").strip() == order_id:
+            return True
+    return False
+
+
+def _created_sort_value(position: dict[str, Any]) -> float:
+    raw_value = position.get("created_at")
+    if isinstance(raw_value, datetime):
+        value = raw_value
+    elif isinstance(raw_value, str):
+        try:
+            value = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+    else:
+        return 0.0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.timestamp()
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""

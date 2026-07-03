@@ -288,6 +288,11 @@ class EntryPolicy:
             if isinstance(raw.get("profit_first_trade_plan"), dict)
             else {}
         )
+        profit_first_lane = str(profit_first_plan.get("decision_lane") or "").lower().strip()
+        profit_first_real_entry_upgrade = bool(
+            profit_first_plan.get("is_complete_for_real_trade")
+            and profit_first_lane in {"validated_probe", "meaningful_entry", "high_conviction"}
+        )
         probe_brake = self.profit_first_probe_brake.evaluate(profit_first_plan, raw)
         if not probe_brake.allowed:
             return PolicyGateResult.block(
@@ -318,9 +323,12 @@ class EntryPolicy:
             opportunity_data.get("evidence_score"), dict
         ):
             evidence_score = opportunity_data["evidence_score"]
-        if decision.position_size_pct <= 0 or (
-            evidence_tier == "blocked" and not bool(evidence_score.get("tradeable_probe"))
-        ):
+        should_wait_for_evidence = decision.position_size_pct <= 0 or (
+            evidence_tier == "blocked"
+            and not bool(evidence_score.get("tradeable_probe"))
+            and not profit_first_real_entry_upgrade
+        )
+        if should_wait_for_evidence:
             return PolicyGateResult.block(
                 "entry_evidence_wait",
                 (
@@ -335,6 +343,8 @@ class EntryPolicy:
                     "evidence_tier": evidence_tier,
                     "evidence_score": evidence_score,
                     "entry_evidence_advisory": entry_evidence_advisory,
+                    "profit_first_decision_lane": profit_first_lane,
+                    "profit_first_real_entry_upgrade": profit_first_real_entry_upgrade,
                 },
             )
         gate_reason = self.gate_reason(decision)

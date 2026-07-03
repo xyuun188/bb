@@ -58,6 +58,41 @@ def test_exit_reference_records_missing_plan_reason() -> None:
     assert raw["profit_first_exit_reference"]["plan_failure_reason"]
 
 
+def test_exit_reference_prefers_exact_entry_exchange_order_id_match() -> None:
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.8,
+        reasoning="close newest lot",
+        raw_response={"close_evidence": {"entry_exchange_order_id": "entry-new"}},
+    )
+
+    raw = attach_profit_first_exit_reference(
+        decision,
+        [
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "entry_exchange_order_id": "entry-old",
+                "profit_first_exit_plan": {"exit_plan_id": "pfep-old"},
+            },
+            {
+                "model_name": "ensemble_trader",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "entry_exchange_order_id": "entry-new",
+                "profit_first_exit_plan": {"exit_plan_id": "pfep-new"},
+            },
+        ],
+        model_name="ensemble_trader",
+    )
+
+    assert raw["profit_first_exit_reference"]["exit_plan_id"] == "pfep-new"
+    assert raw["close_evidence"]["profit_first_exit_plan_id"] == "pfep-new"
+
+
 def test_open_position_snapshot_carries_profit_first_exit_plan() -> None:
     decision = DecisionOutput(
         model_name="ensemble_trader",
@@ -91,3 +126,4 @@ def test_open_position_snapshot_carries_profit_first_exit_plan() -> None:
 
     assert positions[0]["profit_first_exit_plan_id"] == "pfep-sol"
     assert positions[0]["profit_first_exit_plan"]["exit_plan_id"] == "pfep-sol"
+    assert positions[0]["entry_exchange_order_id"] == "order-1"

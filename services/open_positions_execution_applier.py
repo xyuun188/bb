@@ -70,11 +70,33 @@ class OpenPositionsExecutionApplier:
             else {}
         )
         side = "long" if decision.action == Action.LONG else "short"
-        existing = self._matching_entry_position(open_positions, model_name, decision, side)
+        entry_exchange_order_id = self._entry_exchange_order_id(execution_result)
+        existing = self._matching_entry_position(
+            open_positions,
+            model_name,
+            decision,
+            side,
+            entry_exchange_order_id=entry_exchange_order_id,
+        )
         if existing is not None:
-            self._merge_entry(existing, decision, execution_result, trade_plan, exit_plan)
+            self._refresh_existing_entry(
+                existing,
+                decision,
+                execution_result,
+                trade_plan,
+                exit_plan,
+                entry_exchange_order_id=entry_exchange_order_id,
+            )
             return
 
+        entry_leg = {
+            "quantity": execution_result.quantity,
+            "price": execution_result.price,
+            "exchange_order_id": entry_exchange_order_id,
+            "profit_first_exit_plan_id": (
+                exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
+            ),
+        }
         open_positions.append(
             {
                 "model_name": model_name,
@@ -100,6 +122,8 @@ class OpenPositionsExecutionApplier:
                 "profit_first_exit_plan_id": (
                     exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
                 ),
+                "entry_exchange_order_id": entry_exchange_order_id,
+                "entry_legs": [entry_leg],
             }
         )
 
@@ -109,52 +133,46 @@ class OpenPositionsExecutionApplier:
         model_name: str,
         decision: DecisionOutput,
         side: str,
+        *,
+        entry_exchange_order_id: str,
     ) -> dict[str, Any] | None:
+        if not entry_exchange_order_id:
+            return None
         for position in open_positions:
-            if self._matches_position(position, model_name, decision, side):
+            if (
+                self._matches_position(position, model_name, decision, side)
+                and self._position_has_entry_order_id(position, entry_exchange_order_id)
+            ):
                 return position
         return None
 
-    def _merge_entry(
+    def _refresh_existing_entry(
         self,
         position: dict[str, Any],
         decision: DecisionOutput,
         execution_result: ExecutionResult,
         trade_plan: dict[str, Any],
         exit_plan: dict[str, Any],
+        *,
+        entry_exchange_order_id: str,
     ) -> None:
-        old_qty = max(float(position.get("quantity") or 0.0), 0.0)
-        add_qty = max(float(execution_result.quantity or 0.0), 0.0)
-        if add_qty <= 0:
-            return
-        old_entry = float(position.get("entry_price") or execution_result.price or 0.0)
-        add_entry = float(execution_result.price or old_entry or 0.0)
-        total_qty = old_qty + add_qty
-        entry_price = (
-            ((old_entry * old_qty) + (add_entry * add_qty)) / total_qty
-            if total_qty > 0
-            else add_entry
-        )
         side = "long" if decision.action == Action.LONG else "short"
         position["symbol"] = decision.symbol
         position["side"] = side
-        position["quantity"] = total_qty
-        position["entry_price"] = entry_price
         position["current_price"] = execution_result.price
         position["stop_loss"] = (
-            entry_price * (1 - decision.stop_loss_pct)
+            float(position.get("entry_price") or execution_result.price or 0.0)
+            * (1 - decision.stop_loss_pct)
             if side == "long"
-            else entry_price * (1 + decision.stop_loss_pct)
+            else float(position.get("entry_price") or execution_result.price or 0.0)
+            * (1 + decision.stop_loss_pct)
         )
         position["take_profit"] = (
-            entry_price * (1 + decision.take_profit_pct)
+            float(position.get("entry_price") or execution_result.price or 0.0)
+            * (1 + decision.take_profit_pct)
             if side == "long"
-            else entry_price * (1 - decision.take_profit_pct)
-        )
-        position["unrealized_pnl"] = (
-            (execution_result.price - entry_price) * total_qty
-            if side == "long"
-            else (entry_price - execution_result.price) * total_qty
+            else float(position.get("entry_price") or execution_result.price or 0.0)
+            * (1 - decision.take_profit_pct)
         )
         position["is_open"] = True
         position["profit_first_trade_plan"] = trade_plan
@@ -162,19 +180,34 @@ class OpenPositionsExecutionApplier:
         position["profit_first_exit_plan_id"] = (
             exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
         )
-        history = position.get("entry_legs")
-        if not isinstance(history, list):
-            history = []
-        history.append(
-            {
-                "quantity": add_qty,
-                "price": execution_result.price,
-                "exchange_order_id": execution_result.exchange_order_id,
-                "profit_first_exit_plan_id": position.get("profit_first_exit_plan_id") or "",
-            }
-        )
-        position["entry_legs"] = history[-20:]
-        position["merged_entry_count"] = int(position.get("merged_entry_count") or 1) + 1
+        if entry_exchange_order_id:
+            position["entry_exchange_order_id"] = entry_exchange_order_id
+
+    @staticmethod
+    def _entry_exchange_order_id(execution_result: ExecutionResult) -> str:
+        return str(
+            getattr(execution_result, "exchange_order_id", None)
+            or getattr(execution_result, "order_id", None)
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _position_has_entry_order_id(position: dict[str, Any], target_order_id: str) -> bool:
+        order_id = str(target_order_id or "").strip()
+        if not order_id:
+            return False
+        top_level = str(position.get("entry_exchange_order_id") or "").strip()
+        if top_level == order_id:
+            return True
+        legs = position.get("entry_legs")
+        if not isinstance(legs, list):
+            return False
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            if str(leg.get("exchange_order_id") or "").strip() == order_id:
+                return True
+        return False
 
     def _apply_exit(
         self,

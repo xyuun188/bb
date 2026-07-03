@@ -80,12 +80,20 @@ class DefensiveProbeShadowPolicy:
         if lane not in {"tiny_probe", "validated_probe"}:
             return ProfitFirstStage2Decision(True, data={"lane": lane})
 
+        opportunity = raw.get("opportunity_score")
+        opportunity = opportunity if isinstance(opportunity, dict) else {}
+        evidence_score = opportunity.get("evidence_score")
+        evidence_score = evidence_score if isinstance(evidence_score, dict) else {}
         sizing = raw.get("profit_risk_sizing")
         sizing = sizing if isinstance(sizing, dict) else {}
         low_payoff = bool(sizing.get("low_payoff_quality"))
         quality_tier = str(sizing.get("quality_tier") or "").lower().strip()
         high_quality = bool(sizing.get("high_quality_entry"))
         expected_profit = _safe_float(sizing.get("expected_profit_usdt"), 0.0)
+        expected_net_return = max(
+            _safe_float(opportunity.get("expected_net_return_pct"), 0.0),
+            _safe_float(plan.get("expected_net_return_pct"), 0.0),
+        )
         dynamic = raw.get("dynamic_leverage_decision")
         if not isinstance(dynamic, dict):
             dynamic = sizing.get("dynamic_leverage_decision")
@@ -98,6 +106,11 @@ class DefensiveProbeShadowPolicy:
         dynamic_reasons = {str(item).lower() for item in dynamic.get("reasons") or []}
         risk_budget_capped = limiting_factor == "risk_budget" or "limited_by_risk_budget" in dynamic_reasons
 
+        real_trade_upgrade = bool(
+            lane == "validated_probe"
+            and bool(plan.get("is_complete_for_real_trade"))
+            and expected_net_return > 0.0
+        )
         should_shadow = bool(
             low_payoff
             and not high_quality
@@ -105,6 +118,7 @@ class DefensiveProbeShadowPolicy:
             and final_leverage <= 1.0
             and risk_budget_capped
             and expected_profit < self.min_real_expected_profit_usdt
+            and not real_trade_upgrade
         )
         data = {
             "lane": lane,
@@ -112,9 +126,12 @@ class DefensiveProbeShadowPolicy:
             "quality_tier": quality_tier,
             "high_quality_entry": high_quality,
             "expected_profit_usdt": expected_profit,
+            "expected_net_return_pct": expected_net_return,
             "final_integer_leverage": final_leverage,
             "dynamic_leverage_limiting_factor": limiting_factor,
             "risk_budget_capped": risk_budget_capped,
+            "profit_first_real_trade_upgrade": real_trade_upgrade,
+            "tradeable_probe": bool(evidence_score.get("tradeable_probe")),
         }
         if not should_shadow:
             return ProfitFirstStage2Decision(True, data=data)

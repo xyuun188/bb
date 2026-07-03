@@ -3395,6 +3395,137 @@ async def test_entry_policy_keeps_low_payoff_risk_budget_probe_shadow_only() -> 
     assert calls == ["sizing"]
 
 
+@pytest.mark.asyncio
+async def test_entry_policy_allows_validated_probe_upgrade_past_evidence_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = _decision(Action.SHORT)
+    decision.position_size_pct = 0.02
+    decision.suggested_leverage = 1.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "analysis_type": "entry_candidate",
+        "current_price": 100.0,
+        "opportunity_score": {
+            "score": 1.2,
+            "min_score_required": 0.7,
+            "side": "short",
+            "expected_net_return_pct": 0.28,
+            "profit_quality_ratio": 0.58,
+            "tail_risk_score": 0.42,
+            "server_profit_loss_probability": 0.36,
+            "evidence_score": {
+                "tier": "blocked",
+                "effective_score": 30.0,
+                "size_multiplier": 0.0,
+                "tradeable_probe": False,
+            },
+        },
+        "profit_first_trade_plan": {
+            "decision_lane": "validated_probe",
+            "is_complete_for_real_trade": True,
+            "expected_net_return_pct": 0.28,
+        },
+        "profit_risk_sizing": {
+            "position_size_pct": 0.01,
+        },
+    }
+    monkeypatch.setattr(
+        "services.trading_policies.attach_profit_first_trade_plan",
+        lambda current_decision, **_kwargs: current_decision.raw_response,
+    )
+
+    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
+        return None
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_entry_policy_allows_validated_probe_upgrade_past_defensive_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = _decision(Action.SHORT)
+    decision.position_size_pct = 0.02
+    decision.suggested_leverage = 1.0
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.raw_response = {
+        "analysis_type": "entry_candidate",
+        "current_price": 100.0,
+        "opportunity_score": {
+            "score": 1.4,
+            "min_score_required": 0.7,
+            "side": "short",
+            "expected_net_return_pct": 0.22,
+            "fee_pct": 0.05,
+            "slippage_pct": 0.04,
+            "expected_loss_pct": 0.18,
+            "profit_quality_ratio": 0.55,
+            "reward_risk_ratio": 0.95,
+            "server_profit_loss_probability": 0.4,
+            "tail_risk_score": 0.44,
+            "evidence_score": {"tier": "blocked", "effective_score": 34.0, "tradeable_probe": False},
+        },
+        "profit_first_trade_plan": {
+            "decision_lane": "validated_probe",
+            "is_complete_for_real_trade": True,
+            "expected_net_return_pct": 0.22,
+        },
+        "profit_risk_sizing": {
+            "low_payoff_quality": True,
+            "quality_tier": "base",
+            "high_quality_entry": False,
+            "position_size_pct": 0.006,
+            "final_notional_usdt": 30.0,
+            "planned_stop_loss_usdt": 1.5,
+            "max_stop_loss_usdt": 1.5,
+            "expected_profit_usdt": 0.12,
+            "dynamic_leverage_decision": {
+                "final_integer_leverage": 1,
+                "limiting_factor": "risk_budget",
+                "reasons": ["limited_by_risk_budget"],
+            },
+            "profit_first_position_ladder": {
+                "lane": "validated_probe",
+                "adjusted_size_pct": 0.006,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        "services.trading_policies.attach_profit_first_trade_plan",
+        lambda current_decision, **_kwargs: current_decision.raw_response,
+    )
+
+    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
+        return None
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
+    assert result.passed is True
+
+
 def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:
     calls: list[str] = []
     decision = _decision(Action.SHORT)

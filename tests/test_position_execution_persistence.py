@@ -206,7 +206,7 @@ async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_merges_same_symbol_side_add_entry_and_links_order_ids() -> None:
+async def test_persist_entry_keeps_same_symbol_side_add_entry_as_new_position() -> None:
     session = FakeSession()
     existing = _position(
         id=1,
@@ -229,16 +229,59 @@ async def test_persist_entry_merges_same_symbol_side_add_entry_and_links_order_i
         execution_mode="paper",
     )
 
+    assert existing.quantity == 1.0
+    assert existing.entry_price == 90.0
+    assert repo.opened == [
+        {
+            "model_name": "ensemble_trader",
+            "execution_mode": "paper",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 3.0,
+            "entry_price": 100.0,
+            "current_price": 100.0,
+            "leverage": 3.0,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "stop_loss_price": 98.0,
+            "take_profit_price": 104.0,
+            "okx_inst_id": "BTC-USDT-SWAP",
+            "okx_pos_id": "btc-net",
+            "entry_exchange_order_id": "new-entry",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persist_entry_ignores_duplicate_exchange_order_id_callback() -> None:
+    session = FakeSession()
+    existing = _position(
+        id=1,
+        quantity=1.0,
+        entry_price=90.0,
+        current_price=95.0,
+        entry_exchange_order_id="dup-entry",
+    )
+    repo = FakeTradeRepo([existing])
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.LONG),
+        result=_result(
+            price=100.0,
+            quantity=3.0,
+            exchange_order_id="dup-entry",
+            raw_response={"info": {"instId": "BTC-USDT-SWAP", "posId": "btc-net"}},
+        ),
+        execution_mode="paper",
+    )
+
     assert repo.opened == []
-    assert existing.quantity == 4.0
-    assert existing.entry_price == pytest.approx(97.5)
+    assert existing.quantity == 1.0
     assert existing.current_price == 100.0
-    assert existing.unrealized_pnl == pytest.approx(10.0)
-    assert existing.stop_loss_price == pytest.approx(95.55)
-    assert existing.take_profit_price == pytest.approx(101.4)
     assert existing.okx_inst_id == "BTC-USDT-SWAP"
     assert existing.okx_pos_id == "btc-net"
-    assert existing.entry_exchange_order_id == "old-entry,new-entry"
+    assert existing.entry_exchange_order_id == "dup-entry"
 
 
 @pytest.mark.asyncio

@@ -114,6 +114,42 @@ class _FillTimeoutExecutor(_FakeExecutor):
         return _SlowFillCcxt()
 
 
+class _SlowOptionalStageService(OkxAuthoritativeSyncService):
+    async def _fetch_order_history_contexts(
+        self,
+        executor: Any,
+        *,
+        exchange_fills: list[OkxFillGroup],
+        local_exchange_order_ids: set[str],
+        priority_order_ids: set[str] | None = None,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        import asyncio
+
+        await asyncio.sleep(0.75)
+        return await super()._fetch_order_history_contexts(
+            executor,
+            exchange_fills=exchange_fills,
+            local_exchange_order_ids=local_exchange_order_ids,
+            priority_order_ids=priority_order_ids,
+        )
+
+    async def _fetch_contract_sizes(
+        self,
+        executor: Any,
+        *,
+        symbols: set[str],
+        inst_ids: set[str],
+    ) -> dict[str, float]:
+        import asyncio
+
+        await asyncio.sleep(0.75)
+        return await super()._fetch_contract_sizes(
+            executor,
+            symbols=symbols,
+            inst_ids=inst_ids,
+        )
+
+
 @pytest.mark.asyncio
 async def test_okx_authoritative_sync_reports_exchange_and_local_mismatches(
     tmp_path,
@@ -290,6 +326,54 @@ async def test_okx_authoritative_sync_reports_exact_timeout_stage(
         ]
         assert stages[-1]["status"] == "error"
         assert stages[-1]["error_type"] == "TimeoutError"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_soft_fails_optional_enrichment_stages(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-optional-stage.db').as_posix()}",
+    )
+    await init_db()
+    now = datetime.now(UTC)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1.0,
+                    price=100.0,
+                    status="filled",
+                    exchange_order_id="okx-only-fill",
+                    filled_at=now - timedelta(minutes=5),
+                    created_at=now - timedelta(minutes=5),
+                )
+            )
+
+        report = await _SlowOptionalStageService(
+            mode="paper",
+            executor_factory=_FakeExecutor,
+            timeout_seconds=0.001,
+            max_pull_attempts=1,
+        ).collect()
+
+        assert report["okx_pull_available"] is True
+        assert report["pull_success_attempt"] == 1
+        warning_stages = [
+            item for item in report["pull_stages"] if item["stage"] in {"okx_order_history_contexts", "okx_contract_sizes"}
+        ]
+        assert all(item["status"] == "warning" for item in warning_stages)
     finally:
         await close_db()
 
