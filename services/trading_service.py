@@ -279,6 +279,8 @@ LOCAL_QUANT_PROMPT_ENABLED = True
 LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
 OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
 OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
+MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 5.0
+NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
 ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
@@ -755,6 +757,10 @@ class TradingService:
         self.new_pair_loss_pause = NewPairLossPausePolicy(
             balance_snapshot_provider=self._get_okx_balance_snapshot_for_mode,
         )
+        self._open_positions_context_cache: dict[str, Any] = {}
+        self._open_positions_context_refresh_task: asyncio.Task | None = None
+        self._new_pair_pause_context_cache: dict[str, Any] = {}
+        self._new_pair_pause_context_refresh_task: asyncio.Task | None = None
         self.shadow_backtest_service = ShadowBacktestService(
             latest_price_provider=self._latest_price_for_symbol,
             symbol_normalizer=self._normalize_position_symbol,
@@ -1759,10 +1765,13 @@ class TradingService:
     def strategy_learning_perf_timeout_seconds(self) -> float:
         """Return the short budget for historical performance context."""
 
-        return max(
+        timeout = max(
             0.2,
             float(DEFAULT_TRADING_PARAMS.strategy_learning.runtime_perf_timeout_seconds),
         )
+        if _analysis_scope_context.get() == "market":
+            return min(timeout, 0.35)
+        return timeout
 
     def strategy_learning_account_timeout_seconds(self) -> float:
         """Return the short budget for account-equity context."""
@@ -1776,7 +1785,7 @@ class TradingService:
         """Update strategy-context diagnostics without breaking the trading decision path."""
 
         try:
-            self._set_loop_stage(stage)
+            self._set_loop_stage(stage, heartbeat=False)
         except Exception:
             logger.debug("strategy context stage update skipped", stage=stage)
 
@@ -1786,15 +1795,19 @@ class TradingService:
         awaitable: Any,
         fallback: Any,
         timeout_seconds: float,
+        timings: dict[str, Any] | None = None,
     ) -> Any:
         """Read optional strategy context without letting slow IO block the round."""
 
         task = asyncio.ensure_future(awaitable)
+        started_monotonic = asyncio.get_running_loop().time()
+        status = "ok"
         try:
             self._safe_set_strategy_context_stage(f"strategy_context:{label}")
             done, pending = await asyncio.wait({task}, timeout=max(float(timeout_seconds), 0.0))
             if pending:
                 await drain_cancelled_tasks(pending, timeout_seconds=0.05)
+                status = "timeout"
                 logger.warning(
                     "strategy context stage timed out; using baseline value",
                     stage=label,
@@ -1803,12 +1816,21 @@ class TradingService:
                 return fallback
             return next(iter(done)).result()
         except Exception as exc:
+            status = "error"
             logger.warning(
                 "strategy context stage failed; using baseline value",
                 stage=label,
                 error=safe_error_text(exc),
             )
             return fallback
+        finally:
+            if timings is not None:
+                elapsed = max(asyncio.get_running_loop().time() - started_monotonic, 0.0)
+                timings[label] = {
+                    "duration_seconds": round(elapsed, 6),
+                    "timeout_seconds": round(max(float(timeout_seconds), 0.0), 6),
+                    "status": status,
+                }
 
     def _strategy_learning_refresh_tasks(self) -> dict[str, asyncio.Task]:
         tasks = getattr(self, "_strategy_learning_context_refresh_tasks", None)
@@ -3189,6 +3211,7 @@ class TradingService:
         error: str | None = None,
         *,
         scope: str | None = None,
+        heartbeat: bool = True,
     ) -> None:
         resolved_scope = scope or _analysis_scope_context.get() or "full"
         state = self._runtime_state(resolved_scope)
@@ -3209,7 +3232,8 @@ class TradingService:
             if resolved_scope == "full":
                 self._last_round_error = state.last_error
         self._current_stage = stage
-        self._write_runtime_heartbeat()
+        if heartbeat:
+            self._write_runtime_heartbeat()
 
     def _write_runtime_heartbeat(self) -> None:
         """Persist a lightweight status heartbeat for split dashboard deployments."""
@@ -3838,6 +3862,7 @@ class TradingService:
         selected_mode = "live" if mode == "live" else "paper"
         perf_timeout = self.strategy_learning_perf_timeout_seconds()
         account_timeout = self.strategy_learning_account_timeout_seconds()
+        context_fetch_timings: dict[str, Any] = {}
 
         if not open_positions:
             try:
@@ -3865,36 +3890,42 @@ class TradingService:
                 self.daily_performance_service.state(selected_mode),
                 {},
                 perf_timeout,
+                context_fetch_timings,
             ),
             self._bounded_strategy_context_value(
                 "today_side_perf",
                 self._today_side_performance(selected_mode),
                 {},
                 perf_timeout,
+                context_fetch_timings,
             ),
             self._bounded_strategy_context_value(
                 "multiday_side_perf",
                 self._multiday_side_performance(selected_mode),
                 {},
                 perf_timeout,
+                context_fetch_timings,
             ),
             self._bounded_strategy_context_value(
                 "symbol_side_perf",
                 self._recent_symbol_side_performance(selected_mode),
                 {},
                 perf_timeout,
+                context_fetch_timings,
             ),
             self._bounded_strategy_context_value(
                 "model_contribution_perf",
                 self._recent_model_contribution_performance(selected_mode),
                 {},
                 perf_timeout,
+                context_fetch_timings,
             ),
             self._bounded_strategy_context_value(
                 "account_equity",
-                self.allocated_order_balance(selected_mode),
+                self._strategy_context_account_equity(selected_mode),
                 0.0,
                 account_timeout,
+                context_fetch_timings,
             ),
         )
         context = self._entry_strategy_mode_context_policy().build(
@@ -3910,10 +3941,17 @@ class TradingService:
             account_config=settings.get_execution_account_config(selected_mode),
         )
         context["account_equity"] = account_equity
+        if _analysis_scope_context.get() == "market":
+            context["account_equity_source"] = getattr(
+                self,
+                "_last_strategy_context_account_equity_source",
+                "unknown",
+            )
         context["strategy_context_runtime"] = {
             "perf_timeout_seconds": perf_timeout,
             "account_timeout_seconds": account_timeout,
             "parallel_context_fetch": True,
+            "fetch_timings": context_fetch_timings,
         }
         strategy_learning = getattr(self, "strategy_learning_service", None)
         if strategy_learning is None:
@@ -3926,6 +3964,63 @@ class TradingService:
         try:
             self._safe_set_strategy_context_stage("strategy_context:learning")
             current_scope = _analysis_scope_context.get()
+            if current_scope == "market":
+                cached_context = self._recent_strategy_learning_context(selected_mode)
+                refresh_task = self._start_strategy_learning_context_refresh(
+                    mode=selected_mode,
+                    analysis_scope=current_scope,
+                    strategy_learning=strategy_learning,
+                    context=context,
+                    open_positions=open_positions or [],
+                )
+                if cached_context:
+                    cached_context.update(
+                        {
+                            "strategy_learning_cache_status": "stale_background_refresh",
+                            "strategy_learning_error": (
+                                "市场扫描轮使用最近一次策略学习上下文，后台刷新学习结果，"
+                                "不让慢学习查询阻塞开仓候选发现。"
+                            ),
+                            "strategy_learning_runtime_timeout_seconds": 0.0,
+                        }
+                    )
+                    return self._refresh_dynamic_capacity(
+                        open_positions=open_positions or [],
+                        strategy_context=cached_context,
+                        market_regime=market_regime,
+                        account_equity=account_equity,
+                    )
+                if refresh_task.done():
+                    try:
+                        learned_context = refresh_task.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "market strategy learning background refresh failed before reuse",
+                            error=safe_error_text(exc),
+                        )
+                    else:
+                        refreshed_context = self._refresh_dynamic_capacity(
+                            open_positions=open_positions or [],
+                            strategy_context=dict(learned_context),
+                            market_regime=market_regime,
+                            account_equity=account_equity,
+                        )
+                        self._strategy_learning_context_cache_store()[selected_mode] = {
+                            "created_at": datetime.now(UTC),
+                            "context": self._json_safe_payload(refreshed_context),
+                        }
+                        return refreshed_context
+                context["strategy_learning_cache_status"] = "baseline_background_refresh"
+                context["strategy_learning_error"] = (
+                    "市场扫描轮暂无可用策略学习缓存，已启动后台刷新，本轮使用基础策略上下文。"
+                )
+                context["strategy_learning_runtime_timeout_seconds"] = 0.0
+                return self._refresh_dynamic_capacity(
+                    open_positions=open_positions or [],
+                    strategy_context=context,
+                    market_regime=market_regime,
+                    account_equity=account_equity,
+                )
             wait_timeout = self.strategy_learning_context_wait_timeout_seconds(current_scope)
             refresh_task = self._start_strategy_learning_context_refresh(
                 mode=selected_mode,
@@ -5047,7 +5142,7 @@ class TradingService:
                     scope=analysis_scope,
                 )
             self._set_loop_stage("load_open_positions")
-            open_positions = await self.okx_sync_service.get_open_positions_context()
+            open_positions = await self._open_positions_context_for_round(analysis_scope)
             if self._should_recover_pending_exits_for_scope(analysis_scope):
                 self._set_loop_stage("recover_pending_exits")
                 await self._recover_pending_exit_decisions(
@@ -5070,6 +5165,7 @@ class TradingService:
             new_pair_pause_reason = await self._new_pair_analysis_pause_reason(
                 ENSEMBLE_TRADER_NAME,
                 open_positions=open_positions,
+                allow_background_refresh=analysis_scope == "market",
             )
             if account_pause_reason:
                 new_pair_pause_reason = account_pause_reason
@@ -8951,6 +9047,135 @@ class TradingService:
     async def _get_open_positions_context(self) -> list[dict]:
         return await self.okx_sync_service.get_open_positions_context()
 
+    async def _get_local_open_positions_context(
+        self,
+        *,
+        strict: bool = False,
+        include_profit_first_metadata: bool = True,
+    ) -> list[dict]:
+        loader = getattr(self.okx_sync_service, "get_local_open_positions_context", None)
+        if loader is None:
+            return []
+        try:
+            return await loader(
+                strict=strict,
+                include_profit_first_metadata=include_profit_first_metadata,
+            )
+        except TypeError:
+            if strict:
+                raise
+            return await loader()
+
+    async def _open_positions_context_for_round(self, analysis_scope: str) -> list[dict]:
+        if analysis_scope != "market":
+            positions = await self._get_open_positions_context()
+            self._remember_open_positions_context(positions)
+            return positions
+
+        cached = self._cached_open_positions_context()
+        if cached is not None:
+            self._schedule_open_positions_context_refresh()
+            return cached
+
+        task = getattr(self, "_open_positions_context_refresh_task", None)
+        if task is not None and not task.done():
+            fallback = self._cached_open_positions_context(ignore_age=True)
+            if fallback is not None:
+                return fallback
+
+        if self._okx_authoritative_sync_context_is_usable_for_market_scan():
+            try:
+                local_positions = await self._get_local_open_positions_context(
+                    strict=True,
+                    include_profit_first_metadata=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "failed to load local open positions for market scan; falling back to OKX",
+                    error=safe_error_text(exc),
+                )
+            else:
+                self._remember_open_positions_context(local_positions)
+                self._schedule_open_positions_context_refresh()
+                return local_positions
+
+        positions = await self._get_open_positions_context()
+        self._remember_open_positions_context(positions)
+        return positions
+
+    def _okx_authoritative_sync_context_is_usable_for_market_scan(self) -> bool:
+        payload = self._okx_authoritative_sync_status_payload()
+        status = str(payload.get("status") or "").lower()
+        if status not in {"ok", "degraded"}:
+            return False
+        if int(payload.get("last_requires_attention_count") or 0) > 0:
+            return False
+        if not payload.get("fresh_success_available"):
+            return False
+        return True
+
+    def _remember_open_positions_context(self, positions: list[dict] | None) -> None:
+        if positions is None:
+            return
+        self._open_positions_context_cache = {
+            "created_at": datetime.now(UTC),
+            "positions": [dict(position) for position in positions if isinstance(position, dict)],
+        }
+
+    def _cached_open_positions_context(
+        self,
+        *,
+        ignore_age: bool = False,
+    ) -> list[dict] | None:
+        cache = getattr(self, "_open_positions_context_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        created_at = cache.get("created_at")
+        positions = cache.get("positions")
+        if not isinstance(created_at, datetime) or not isinstance(positions, list):
+            return None
+        if not ignore_age:
+            age_seconds = (datetime.now(UTC) - created_at).total_seconds()
+            if age_seconds > MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS:
+                return None
+        return [dict(position) for position in positions if isinstance(position, dict)]
+
+    def _schedule_open_positions_context_refresh(self) -> None:
+        task = getattr(self, "_open_positions_context_refresh_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def refresh() -> None:
+            positions = await self._get_open_positions_context()
+            self._remember_open_positions_context(positions)
+
+        task = loop.create_task(refresh())
+        self._open_positions_context_refresh_task = task
+        task.add_done_callback(_consume_task_result)
+
+    async def _strategy_context_account_equity(self, mode: str) -> float:
+        selected_mode = "live" if mode == "live" else "paper"
+        if _analysis_scope_context.get() == "market":
+            cached_snapshot = self.peek_okx_balance_snapshot_for_mode(selected_mode)
+            if cached_snapshot:
+                self._last_strategy_context_account_equity_source = "cached_okx_balance_snapshot"
+                return max(tradeable_balance_from_snapshot(cached_snapshot), 0.0)
+            current_context = getattr(self, "_current_strategy_mode_context", None)
+            if isinstance(current_context, dict):
+                previous_equity = self._safe_float(current_context.get("account_equity"), 0.0)
+                if previous_equity > 0:
+                    self._last_strategy_context_account_equity_source = "previous_strategy_context"
+                    return previous_equity
+            self._last_strategy_context_account_equity_source = "market_no_cached_balance"
+            return 0.0
+        balance = await self.allocated_order_balance(selected_mode)
+        self._last_strategy_context_account_equity_source = "fresh_okx_balance_snapshot"
+        return max(float(balance or 0.0), 0.0)
+
     def _get_model_execution_mode(self, model_name: str) -> str:
         """Return the execution_mode for a model. Defaults to 'paper'."""
         if model_name == ENSEMBLE_TRADER_NAME:
@@ -8966,6 +9191,7 @@ class TradingService:
         self,
         model_name: str,
         open_positions: list[dict] | None = None,
+        allow_background_refresh: bool = False,
     ) -> str | None:
         """Pause new-symbol AI analysis when balance/risk no longer allows entries."""
         breaker = self.risk_engine.circuit_breaker
@@ -8978,14 +9204,45 @@ class TradingService:
             return okx_sync_reason
 
         model_mode = self._get_model_execution_mode(model_name)
+        cache_key = self._new_pair_pause_context_cache_key(
+            model_name=model_name,
+            model_mode=model_mode,
+            open_positions=open_positions or [],
+        )
+        cached_reason = self._cached_new_pair_pause_context_reason(cache_key)
+        if cached_reason is not None:
+            return cached_reason
+
+        if allow_background_refresh:
+            return None
+
+        return await self._refresh_new_pair_pause_context_reason(
+            cache_key=cache_key,
+            model_name=model_name,
+            model_mode=model_mode,
+            open_positions=open_positions or [],
+        )
+
+    async def _refresh_new_pair_pause_context_reason(
+        self,
+        *,
+        cache_key: tuple[Any, ...],
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict],
+    ) -> str | None:
         account_cfg = settings.get_execution_account_config(model_mode)
         okx_snapshot = await self._get_okx_balance_snapshot_for_mode(model_mode)
         if not okx_snapshot:
-            return "未获取到 OKX 可用余额快照，暂停分析新的交易对。"
+            reason = "未获取到 OKX 可用余额快照，暂停分析新的交易对。"
+            self._remember_new_pair_pause_context_reason(cache_key, reason)
+            return reason
         okx_available = tradeable_balance_from_snapshot(okx_snapshot)
         okx_allocatable = allocatable_balance_from_snapshot(okx_snapshot)
         if okx_allocatable <= 0:
-            return "未获取到 OKX 账户权益或余额，暂停分析新的交易对。"
+            reason = "未获取到 OKX 账户权益或余额，暂停分析新的交易对。"
+            self._remember_new_pair_pause_context_reason(cache_key, reason)
+            return reason
         max_loss_pct = float(account_cfg.get("max_loss_pct") or settings.max_daily_loss_pct)
         max_loss_usdt = okx_allocatable * max_loss_pct if max_loss_pct > 0 else 0.0
         allocation_state = await self.execution_allocation_state(model_mode)
@@ -8996,15 +9253,19 @@ class TradingService:
             okx_allocatable * account_guard.min_available_balance_ratio,
         )
         if okx_available <= min_available:
-            return (
+            reason = (
                 f"OKX 可交易余额过低：当前可用 {okx_available:.2f} USDT，"
                 f"最低需要 {min_available:.2f} USDT，暂停分析新的交易对。"
             )
+            self._remember_new_pair_pause_context_reason(cache_key, reason)
+            return reason
         if max_loss_usdt > 0 and total_pnl <= -max_loss_usdt:
-            return (
+            reason = (
                 f"执行账户已达到最高亏损限制：当前累计盈亏 {total_pnl:.2f} USDT，"
                 f"最高允许亏损 {max_loss_usdt:.2f} USDT（{max_loss_pct * 100:.1f}%）。暂停分析新的交易对。"
             )
+            self._remember_new_pair_pause_context_reason(cache_key, reason)
+            return reason
 
         model_positions = [
             p
@@ -9052,7 +9313,85 @@ class TradingService:
                 "recent loss streak is advisory; market scan remains active with tighter sizing",
                 reason=loss_streak_reason,
             )
+        self._remember_new_pair_pause_context_reason(cache_key, None)
         return None
+
+    def _schedule_new_pair_pause_context_refresh(
+        self,
+        *,
+        cache_key: tuple[Any, ...],
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict],
+    ) -> None:
+        task = getattr(self, "_new_pair_pause_context_refresh_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def refresh() -> None:
+            await self._refresh_new_pair_pause_context_reason(
+                cache_key=cache_key,
+                model_name=model_name,
+                model_mode=model_mode,
+                open_positions=open_positions,
+            )
+
+        task = loop.create_task(refresh())
+        self._new_pair_pause_context_refresh_task = task
+        task.add_done_callback(_consume_task_result)
+
+    def _new_pair_pause_context_cache_key(
+        self,
+        *,
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict],
+    ) -> tuple[Any, ...]:
+        normalized_positions = sorted(
+            (
+                self._normalize_position_symbol(position.get("symbol")),
+                str(position.get("side") or "").lower(),
+            )
+            for position in open_positions
+            if isinstance(position, dict) and position.get("is_open", True)
+        )
+        return (
+            str(model_name or ""),
+            "live" if model_mode == "live" else "paper",
+            tuple(normalized_positions),
+        )
+
+    def _cached_new_pair_pause_context_reason(self, cache_key: tuple[Any, ...]) -> str | None:
+        cache = getattr(self, "_new_pair_pause_context_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        entry = cache.get(cache_key)
+        if not isinstance(entry, dict):
+            return None
+        created_at = entry.get("created_at")
+        if not isinstance(created_at, datetime):
+            return None
+        age_seconds = (datetime.now(UTC) - created_at).total_seconds()
+        if age_seconds > NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS:
+            return None
+        reason = entry.get("reason")
+        return str(reason) if reason else ""
+
+    def _remember_new_pair_pause_context_reason(
+        self,
+        cache_key: tuple[Any, ...],
+        reason: str | None,
+    ) -> None:
+        self._new_pair_pause_context_cache = {
+            cache_key: {
+                "created_at": datetime.now(UTC),
+                "reason": reason or "",
+            }
+        }
 
     async def _record_new_pair_pause_state(self, model_name: str, reason: str | None) -> None:
         previous = self._new_pair_pause_reasons.get(model_name)

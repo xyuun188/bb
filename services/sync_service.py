@@ -2217,12 +2217,15 @@ class OkxSyncService:
             )
         return reconciled
 
-    async def get_open_positions_context(self) -> list[dict]:
-        """Get open positions from the active OKX account for trading context."""
+    async def get_local_open_positions_context(
+        self,
+        *,
+        strict: bool = False,
+        include_profit_first_metadata: bool = True,
+    ) -> list[dict]:
+        """Get locally known open positions without waiting for OKX current state."""
         normalize_symbol = self._required_symbol_normalizer()
         parse_float = self._required_float_parser()
-        active_okx_provider = self._required_active_okx_provider()
-        exchange_position_is_open = self._required_exchange_position_open_checker()
         local_positions: list[dict[str, Any]] = []
 
         try:
@@ -2235,16 +2238,19 @@ class OkxSyncService:
                 )
                 open_db_positions = [position for position in db_positions if position.is_open]
                 profit_first_metadata_by_position_id: dict[int, dict[str, Any]] = {}
-                entry_order_ids = sorted(
-                    {
-                        exchange_order_id
-                        for position in open_db_positions
-                        for exchange_order_id in _split_exchange_order_ids(
-                            getattr(position, "entry_exchange_order_id", None)
-                        )
-                    }
-                )
-                if entry_order_ids:
+                if include_profit_first_metadata:
+                    entry_order_ids = sorted(
+                        {
+                            exchange_order_id
+                            for position in open_db_positions
+                            for exchange_order_id in _split_exchange_order_ids(
+                                getattr(position, "entry_exchange_order_id", None)
+                            )
+                        }
+                    )
+                else:
+                    entry_order_ids = []
+                if include_profit_first_metadata and entry_order_ids:
                     order_result = await session.execute(
                         select(Order)
                         .where(
@@ -2302,6 +2308,26 @@ class OkxSyncService:
                     )
         except Exception as e:
             logger.warning("failed to load DB positions for context", error=safe_error_text(e))
+            if strict:
+                raise
+        normalized: list[dict[str, Any]] = []
+        for position_payload in local_positions or []:
+            normalized.append(
+                normalized_open_position_context(
+                    position_payload,
+                    symbol_normalizer=normalize_symbol,
+                    float_parser=parse_float,
+                )
+            )
+        return normalized
+
+    async def get_open_positions_context(self) -> list[dict]:
+        """Get open positions from the active OKX account for trading context."""
+        normalize_symbol = self._required_symbol_normalizer()
+        parse_float = self._required_float_parser()
+        active_okx_provider = self._required_active_okx_provider()
+        exchange_position_is_open = self._required_exchange_position_open_checker()
+        local_positions = await self.get_local_open_positions_context()
 
         active_okx = active_okx_provider()
         if not active_okx:

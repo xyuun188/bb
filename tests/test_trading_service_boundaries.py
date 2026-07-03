@@ -4460,6 +4460,104 @@ async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_pair_pause_context_reuses_short_lived_slow_checks() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._new_pair_pause_context_cache = {}
+    balance_calls = 0
+    allocation_calls = 0
+
+    async def balance_snapshot(_mode: str):
+        nonlocal balance_calls
+        balance_calls += 1
+        return {"free": 1000.0, "allocatable": 1000.0, "equity": 1000.0}
+
+    async def allocation_state(_mode: str):
+        nonlocal allocation_calls
+        allocation_calls += 1
+        return {"total_pnl": 0.0}
+
+    class LossPause:
+        async def cooldown_loss_pause_reason(self, *_args):
+            return None
+
+        async def recent_loss_streak_pause_reason(self, *_args):
+            return None
+
+    service._get_okx_balance_snapshot_for_mode = balance_snapshot  # type: ignore[method-assign]
+    service.execution_allocation_state = allocation_state  # type: ignore[method-assign]
+    service.new_pair_loss_pause = LossPause()
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+        position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
+    )
+
+    first = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[{"symbol": "BTC/USDT", "side": "long", "is_open": True}],
+    )
+    second = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[{"symbol": "BTC/USDT", "side": "long", "is_open": True}],
+    )
+
+    assert first is None
+    assert second == ""
+    assert balance_calls == 1
+    assert allocation_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_new_pair_pause_does_not_cache_circuit_breaker_block() -> None:
+    service = TradingService.__new__(TradingService)
+    service._new_pair_pause_context_cache = {
+        ("ensemble_trader", "paper", ()): {
+            "created_at": datetime.now(UTC),
+            "reason": "",
+        }
+    }
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(
+            is_open=True,
+            get_state=lambda: {"tripped_reason": "daily loss"},
+        )
+    )
+
+    reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
+
+    assert "风险熔断已开启" in str(reason)
+    assert "daily loss" in str(reason)
+
+
+@pytest.mark.asyncio
+async def test_market_new_pair_pause_does_not_start_slow_context_refresh() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._new_pair_pause_context_cache = {}
+    refresh_calls: list[dict[str, Any]] = []
+    service._schedule_new_pair_pause_context_refresh = (  # type: ignore[method-assign]
+        lambda **kwargs: refresh_calls.append(kwargs)
+    )
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[{"symbol": "BTC/USDT", "side": "long", "is_open": True}],
+        allow_background_refresh=True,
+    )
+
+    assert reason is None
+    assert refresh_calls == []
+
+
+@pytest.mark.asyncio
 async def test_latest_price_uses_ws_cache_before_okx_rest() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
@@ -5101,6 +5199,80 @@ def test_parallel_loop_intervals_are_not_market_throttles(
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
     assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
     assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
+
+
+@pytest.mark.asyncio
+async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> None:
+    service = TradingService.__new__(TradingService)
+    service._strategy_learning_context_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC),
+            "context": {
+                "strategy": "cached_strategy",
+                "strategy_profile_id": "cached_profile",
+                "account_equity": 200.0,
+            },
+        }
+    }
+    service._strategy_learning_context_refresh_tasks = {}
+    service._current_strategy_mode_context = {"account_equity": 200.0}
+    service._last_strategy_context_account_equity_source = ""
+    service._okx_balance_snapshot_cache = {}
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._json_safe_payload = lambda value: value
+    service._safe_set_strategy_context_stage = lambda _stage: None
+    service.strategy_learning_perf_timeout_seconds = lambda: 0.01  # type: ignore[method-assign]
+    service.strategy_learning_account_timeout_seconds = lambda: 0.01  # type: ignore[method-assign]
+    service.strategy_learning_context_wait_timeout_seconds = lambda _scope=None: 0.01  # type: ignore[method-assign]
+    service._entry_strategy_mode_context_policy = (  # type: ignore[method-assign]
+        lambda: SimpleNamespace(
+            build=lambda **_kwargs: {
+                "strategy": "baseline",
+                "strategy_profile_id": "baseline_current",
+            }
+        )
+    )
+    service.entry_position_exposure = SimpleNamespace(context=lambda _positions: {})
+    service.entry_symbol_universe = SimpleNamespace(open_position_group_count=lambda _positions: 0)
+    service.daily_performance_service = SimpleNamespace(state=lambda _mode: _async_value({}))
+    service._today_side_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
+    service._multiday_side_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
+    service._recent_symbol_side_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
+    service._recent_model_contribution_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
+    service._strategy_context_account_equity = lambda _mode: _async_value(200.0)  # type: ignore[method-assign]
+
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class SlowLearning:
+        async def apply_to_strategy_context(self, **kwargs):
+            refresh_started.set()
+            await release_refresh.wait()
+            return {**kwargs["strategy_context"], "strategy_profile_id": "fresh_profile"}
+
+    service.strategy_learning_service = SlowLearning()
+    service._refresh_dynamic_capacity = (  # type: ignore[method-assign]
+        lambda open_positions, strategy_context, market_regime, account_equity: {
+            **strategy_context,
+            "account_equity": account_equity,
+        }
+    )
+
+    token = trading_service._analysis_scope_context.set("market")
+    try:
+        result = await service._strategy_mode_context("paper", {}, [])
+    finally:
+        trading_service._analysis_scope_context.reset(token)
+
+    assert result["strategy_profile_id"] == "cached_profile"
+    assert result["strategy_learning_cache_status"] == "stale_background_refresh"
+    task = service._strategy_learning_context_refresh_tasks.get("paper")
+    assert task is not None and not task.done()
+    await asyncio.sleep(0)
+    assert refresh_started.is_set()
+    assert not task.done()
+    release_refresh.set()
+    await task
 
 
 def test_market_round_budget_is_not_used_as_outer_watchdog(
@@ -8648,6 +8820,265 @@ async def test_open_positions_context_fails_fast_without_boundaries():
 
     with pytest.raises(RuntimeError, match="symbol_normalizer"):
         await service.get_open_positions_context()
+
+
+@pytest.mark.asyncio
+async def test_local_open_positions_context_returns_db_positions_without_okx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_position_records(self, **_kwargs):
+            return [
+                SimpleNamespace(
+                    model_name="ensemble_trader",
+                    symbol="BTC/USDT",
+                    side="long",
+                    entry_price=100.0,
+                    current_price=101.5,
+                    quantity=0.25,
+                    leverage=2.0,
+                    unrealized_pnl=0.375,
+                    stop_loss_price=95.0,
+                    take_profit_price=110.0,
+                    is_open=True,
+                    created_at=None,
+                    okx_inst_id="BTC-USDT-SWAP",
+                    okx_pos_id="pos-1",
+                    entry_exchange_order_id="entry-1",
+                )
+            ]
+
+    class FakeScalarResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    execute_calls: list[str] = []
+
+    class FakeSession:
+        async def execute(self, _statement):
+            execute_calls.append("execute")
+            return FakeScalarResult()
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+    ).get_local_open_positions_context(
+        strict=True,
+        include_profit_first_metadata=False,
+    )
+
+    assert len(result) == 1
+    position = result[0]
+    assert position["model_name"] == "ensemble_trader"
+    assert position["symbol"] == "BTC/USDT"
+    assert position["side"] == "long"
+    assert position["entry_price"] == pytest.approx(100.0)
+    assert position["current_price"] == pytest.approx(101.5)
+    assert position["quantity"] == pytest.approx(0.25)
+    assert position["leverage"] == pytest.approx(2.0)
+    assert position["unrealized_pnl"] == pytest.approx(0.375)
+    assert position["stop_loss"] == pytest.approx(95.0)
+    assert position["take_profit"] == pytest.approx(110.0)
+    assert position["okx_inst_id"] == "BTC-USDT-SWAP"
+    assert position["okx_pos_id"] == "pos-1"
+    assert position["entry_exchange_order_id"] == "entry-1"
+    assert execute_calls == []
+
+
+@pytest.mark.asyncio
+async def test_market_round_reuses_short_lived_open_positions_context_cache() -> None:
+    service = TradingService.__new__(TradingService)
+    service._open_positions_context_cache = {}
+    service._open_positions_context_refresh_task = None
+    calls = 0
+
+    async def load_positions():
+        nonlocal calls
+        calls += 1
+        return [{"symbol": "BTC/USDT", "side": "long", "is_open": True}]
+
+    service._get_open_positions_context = load_positions  # type: ignore[method-assign]
+
+    first = await service._open_positions_context_for_round("market")
+    second = await service._open_positions_context_for_round("market")
+
+    assert first == second == [{"symbol": "BTC/USDT", "side": "long", "is_open": True}]
+    assert calls == 1
+    task = service._open_positions_context_refresh_task
+    if task is not None and not task.done():
+        await task
+
+
+@pytest.mark.asyncio
+async def test_position_round_refreshes_open_positions_context_authoritatively() -> None:
+    service = TradingService.__new__(TradingService)
+    service._open_positions_context_cache = {
+        "created_at": datetime.now(UTC),
+        "positions": [{"symbol": "OLD/USDT", "side": "long", "is_open": True}],
+    }
+    service._open_positions_context_refresh_task = None
+    calls = 0
+
+    async def load_positions():
+        nonlocal calls
+        calls += 1
+        return [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
+
+    service._get_open_positions_context = load_positions  # type: ignore[method-assign]
+
+    result = await service._open_positions_context_for_round("position")
+
+    assert result == [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
+    assert calls == 1
+    assert service._open_positions_context_cache["positions"] == result
+
+
+@pytest.mark.asyncio
+async def test_market_round_uses_local_positions_after_fresh_okx_sync() -> None:
+    service = TradingService.__new__(TradingService)
+    service._open_positions_context_cache = {}
+    service._open_positions_context_refresh_task = None
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_last_success_at = datetime.now(UTC)
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_degraded_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    authoritative_calls = 0
+    local_calls = 0
+
+    async def load_authoritative():
+        nonlocal authoritative_calls
+        authoritative_calls += 1
+        return [{"symbol": "AUTH/USDT", "side": "long", "is_open": True}]
+
+    async def load_local(
+        *,
+        strict: bool = False,
+        include_profit_first_metadata: bool = True,
+    ):
+        nonlocal local_calls
+        assert strict is True
+        assert include_profit_first_metadata is False
+        local_calls += 1
+        return [{"symbol": "LOCAL/USDT", "side": "short", "is_open": True}]
+
+    service._get_open_positions_context = load_authoritative  # type: ignore[method-assign]
+    service._get_local_open_positions_context = load_local  # type: ignore[method-assign]
+
+    result = await service._open_positions_context_for_round("market")
+
+    assert result == [{"symbol": "LOCAL/USDT", "side": "short", "is_open": True}]
+    assert local_calls == 1
+    assert authoritative_calls == 0
+    task = service._open_positions_context_refresh_task
+    if task is not None and not task.done():
+        await task
+    assert authoritative_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_market_round_falls_back_to_authoritative_when_local_positions_fail() -> None:
+    service = TradingService.__new__(TradingService)
+    service._open_positions_context_cache = {}
+    service._open_positions_context_refresh_task = None
+    service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
+    service._okx_authoritative_sync_task = None
+    service._okx_authoritative_sync_last_success_at = datetime.now(UTC)
+    service._okx_authoritative_sync_last_failure_at = None
+    service._okx_authoritative_sync_last_error = None
+    service._okx_authoritative_sync_last_requires_attention_count = 0
+    service._okx_authoritative_sync_last_degraded_count = 0
+    service._okx_authoritative_sync_last_samples = []
+    authoritative_calls = 0
+
+    async def load_authoritative():
+        nonlocal authoritative_calls
+        authoritative_calls += 1
+        return [{"symbol": "AUTH/USDT", "side": "long", "is_open": True}]
+
+    async def load_local(*, strict: bool = False, include_profit_first_metadata: bool = True):
+        assert strict is True
+        assert include_profit_first_metadata is False
+        raise RuntimeError("db unavailable")
+
+    service._get_open_positions_context = load_authoritative  # type: ignore[method-assign]
+    service._get_local_open_positions_context = load_local  # type: ignore[method-assign]
+
+    result = await service._open_positions_context_for_round("market")
+
+    assert result == [{"symbol": "AUTH/USDT", "side": "long", "is_open": True}]
+    assert authoritative_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_market_strategy_context_account_equity_uses_cached_balance() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 234.5, "equity": 250.0, "allocatable": 250.0},
+            "fetched_at": datetime.now(UTC) - timedelta(seconds=30),
+        }
+    }
+    service._okx_balance_snapshot_refresh_tasks = {}
+    allocated_calls = 0
+    refresh_calls: list[str] = []
+
+    async def allocated(_mode: str):
+        nonlocal allocated_calls
+        allocated_calls += 1
+        return 0.0
+
+    service.allocated_order_balance = allocated  # type: ignore[method-assign]
+    service._schedule_okx_balance_snapshot_refresh = refresh_calls.append  # type: ignore[method-assign]
+    token = trading_service._analysis_scope_context.set("market")
+    try:
+        result = await service._strategy_context_account_equity("paper")
+    finally:
+        trading_service._analysis_scope_context.reset(token)
+
+    assert result == 234.5
+    assert allocated_calls == 0
+    assert refresh_calls == []
+
+
+@pytest.mark.asyncio
+async def test_market_strategy_context_account_equity_uses_previous_context_without_cache() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {}
+    service._current_strategy_mode_context = {"account_equity": 321.0}
+    allocated_calls = 0
+
+    async def allocated(_mode: str):
+        nonlocal allocated_calls
+        allocated_calls += 1
+        return 0.0
+
+    service.allocated_order_balance = allocated  # type: ignore[method-assign]
+    token = trading_service._analysis_scope_context.set("market")
+    try:
+        result = await service._strategy_context_account_equity("paper")
+    finally:
+        trading_service._analysis_scope_context.reset(token)
+
+    assert result == 321.0
+    assert allocated_calls == 0
+    assert service._last_strategy_context_account_equity_source == "previous_strategy_context"
 
 
 @pytest.mark.asyncio
