@@ -67,6 +67,9 @@ TRAINING_MIN_NON_HOLD_SHARE = 0.25
 TRAINING_MIN_BEST_TRADE_SHARE = 1.00
 
 FEATURE_KEYS = [
+    "abnormal_wick_count_72h",
+    "abnormal_wick_max_pct",
+    "abnormal_wick_recent_hours",
     "change_24h_pct",
     "spread_pct",
     "rsi_14",
@@ -74,11 +77,14 @@ FEATURE_KEYS = [
     "macd",
     "macd_signal",
     "macd_diff",
+    "ema_12_gap_pct",
+    "ema_26_gap_pct",
     "stoch_k",
     "adx_14",
     "bb_width",
     "bb_pct",
     "atr_pct",
+    "entry_activity_volume_ratio",
     "volume_ratio",
     "returns_1",
     "returns_5",
@@ -86,15 +92,26 @@ FEATURE_KEYS = [
     "volatility_20",
     "price_vs_sma20",
     "price_vs_sma50",
+    "sector_relative_strength",
+    "indicator_price_gap_pct",
+    "liquidation_risk_score",
+    "whale_txn_count",
+    "exchange_inflow",
     "funding_rate",
+    "log_notional_24h_usdt",
     "log_volume_24h",
     "log_open_interest_value",
     "orderbook_imbalance",
     "orderbook_depth_ratio",
+    "sentiment_data_available",
+    "direct_sentiment_data_available",
     "news_sentiment_avg",
     "social_sentiment_avg",
     "social_mention_count",
     "news_article_count",
+    "direct_news_item_count",
+    "market_news_item_count",
+    "sequence_length",
     "decision_confidence",
     "horizon_minutes",
 ]
@@ -152,10 +169,17 @@ def _feature_row_from_snapshot(
 ) -> dict[str, float]:
     price = _safe_float(snapshot.get("current_price") or snapshot.get("close"), 0.0)
     atr = _safe_float(snapshot.get("atr_14"), 0.0)
+    ema_12 = _safe_float(snapshot.get("ema_12"), 0.0)
+    ema_26 = _safe_float(snapshot.get("ema_26"), 0.0)
     bid_depth = _safe_float(snapshot.get("orderbook_bid_depth"), 0.0)
     ask_depth = _safe_float(snapshot.get("orderbook_ask_depth"), 0.0)
     depth_total = max(bid_depth + ask_depth, 1e-9)
     values = {
+        "abnormal_wick_count_72h": _safe_float(snapshot.get("abnormal_wick_count_72h")),
+        "abnormal_wick_max_pct": _safe_float(snapshot.get("abnormal_wick_max_pct")),
+        "abnormal_wick_recent_hours": _safe_float(
+            snapshot.get("abnormal_wick_recent_hours"), 9999.0
+        ),
         "change_24h_pct": _safe_float(snapshot.get("change_24h_pct")),
         "spread_pct": _safe_float(snapshot.get("spread_pct")),
         "rsi_14": _safe_float(snapshot.get("rsi_14"), 50.0),
@@ -163,11 +187,17 @@ def _feature_row_from_snapshot(
         "macd": _safe_float(snapshot.get("macd")),
         "macd_signal": _safe_float(snapshot.get("macd_signal")),
         "macd_diff": _safe_float(snapshot.get("macd_diff")),
+        "ema_12_gap_pct": ((price - ema_12) / price * 100.0) if price > 0 and ema_12 > 0 else 0.0,
+        "ema_26_gap_pct": ((price - ema_26) / price * 100.0) if price > 0 and ema_26 > 0 else 0.0,
         "stoch_k": _safe_float(snapshot.get("stoch_k"), 50.0),
         "adx_14": _safe_float(snapshot.get("adx_14")),
         "bb_width": _safe_float(snapshot.get("bb_width")),
         "bb_pct": _safe_float(snapshot.get("bb_pct"), 0.5),
         "atr_pct": atr / price if price > 0 else 0.0,
+        "entry_activity_volume_ratio": _safe_float(
+            snapshot.get("entry_activity_volume_ratio"),
+            _safe_float(snapshot.get("volume_ratio"), 1.0),
+        ),
         "volume_ratio": _safe_float(snapshot.get("volume_ratio"), 1.0),
         "returns_1": _safe_float(snapshot.get("returns_1")),
         "returns_5": _safe_float(snapshot.get("returns_5")),
@@ -175,17 +205,32 @@ def _feature_row_from_snapshot(
         "volatility_20": _safe_float(snapshot.get("volatility_20")),
         "price_vs_sma20": _safe_float(snapshot.get("price_vs_sma20")),
         "price_vs_sma50": _safe_float(snapshot.get("price_vs_sma50")),
+        "sector_relative_strength": _safe_float(snapshot.get("sector_relative_strength")),
+        "indicator_price_gap_pct": _safe_float(snapshot.get("indicator_price_gap_pct")),
+        "liquidation_risk_score": _safe_float(snapshot.get("liquidation_risk_score")),
+        "whale_txn_count": _safe_float(snapshot.get("whale_txn_count")),
+        "exchange_inflow": _safe_float(snapshot.get("exchange_inflow")),
         "funding_rate": _safe_float(snapshot.get("funding_rate")),
+        "log_notional_24h_usdt": math.log10(
+            max(_safe_float(snapshot.get("notional_24h_usdt")), 0.0) + 1.0
+        ),
         "log_volume_24h": math.log10(max(_safe_float(snapshot.get("volume_24h")), 0.0) + 1.0),
         "log_open_interest_value": math.log10(
             max(_safe_float(snapshot.get("open_interest_value")), 0.0) + 1.0
         ),
         "orderbook_imbalance": _safe_float(snapshot.get("orderbook_imbalance")),
         "orderbook_depth_ratio": (bid_depth - ask_depth) / depth_total,
+        "sentiment_data_available": 1.0 if snapshot.get("sentiment_data_available") else 0.0,
+        "direct_sentiment_data_available": (
+            1.0 if snapshot.get("direct_sentiment_data_available") else 0.0
+        ),
         "news_sentiment_avg": _safe_float(snapshot.get("news_sentiment_avg")),
         "social_sentiment_avg": _safe_float(snapshot.get("social_sentiment_avg")),
         "social_mention_count": _safe_float(snapshot.get("social_mention_count")),
         "news_article_count": _safe_float(snapshot.get("news_article_count")),
+        "direct_news_item_count": _safe_float(snapshot.get("direct_news_item_count")),
+        "market_news_item_count": _safe_float(snapshot.get("market_news_item_count")),
+        "sequence_length": _safe_float(snapshot.get("sequence_length")),
         "decision_confidence": _safe_float(decision_confidence),
         "horizon_minutes": float(horizon_minutes),
     }
@@ -477,7 +522,10 @@ def _shadow_is_low_confidence_hold(row: Any) -> bool:
 def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
     if _shadow_action(row, "best_action") not in {"long", "short"}:
         return False
-    if _shadow_action(row, "decision_action") not in {"long", "short"}:
+    action = _shadow_action(row, "decision_action")
+    if action not in {"long", "short"} and not bool(getattr(row, "missed_opportunity", False)):
+        return False
+    if action == "hold" and _shadow_is_low_confidence_hold(row):
         return False
     return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
 

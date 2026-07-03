@@ -14,6 +14,11 @@ from models.learning import ShadowBacktest
 from scripts import evaluate_ml_training_windows as ml_window_eval
 from scripts import train_ml_signal_model as train_ml_signal_script
 from services import ml_signal_service as ml_signal_module
+from services.artifact_retirement_audit import (
+    PHASE3_ARTIFACT_POLICY_ID,
+    PHASE3_REQUIRED_PROMOTION_FLOW,
+    PHASE3_REQUIRED_TRAINING_POLICY,
+)
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
@@ -25,11 +30,6 @@ from services.ml_signal_service import (
     train_from_frame,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
-from services.artifact_retirement_audit import (
-    PHASE3_ARTIFACT_POLICY_ID,
-    PHASE3_REQUIRED_PROMOTION_FLOW,
-    PHASE3_REQUIRED_TRAINING_POLICY,
-)
 from services.training_data_quality import DATA_QUALITY_VERSION
 
 
@@ -297,7 +297,16 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
         decision_action="short",
         decision_confidence=0.72,
         horizon_minutes=30,
-        feature_snapshot={"current_price": 100.0, "spread_pct": 0.01},
+        feature_snapshot={
+            "current_price": 100.0,
+            "spread_pct": 0.01,
+            "abnormal_wick_count_72h": 2,
+            "entry_activity_volume_ratio": 1.8,
+            "notional_24h_usdt": 9999.0,
+            "liquidation_risk_score": 0.42,
+            "direct_sentiment_data_available": True,
+            "direct_news_item_count": 3,
+        },
         long_return_pct=-0.12,
         short_return_pct=0.18,
         best_action="short",
@@ -310,6 +319,12 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     assert frame.loc[0, "decision_action"] == "short"
     assert frame.loc[0, "best_action"] == "short"
     assert bool(frame.loc[0, "missed_opportunity"]) is False
+    assert frame.loc[0, "abnormal_wick_count_72h"] == 2.0
+    assert frame.loc[0, "entry_activity_volume_ratio"] == 1.8
+    assert frame.loc[0, "log_notional_24h_usdt"] > 3.0
+    assert frame.loc[0, "liquidation_risk_score"] == 0.42
+    assert frame.loc[0, "direct_sentiment_data_available"] == 1.0
+    assert frame.loc[0, "direct_news_item_count"] == 3.0
 
 
 @pytest.mark.asyncio
@@ -574,7 +589,7 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert result["candidate_readiness"]["allow_live_position_influence"] is True
 
 
-def test_shadow_training_selection_uses_only_best_trade_samples() -> None:
+def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -> None:
     recent_hold_rows = [_shadow_row(10_000 - idx) for idx in range(20)]
     trade_rows = [
         _shadow_row(
@@ -596,10 +611,12 @@ def test_shadow_training_selection_uses_only_best_trade_samples() -> None:
 
     selected_ids = [row.id for row in selected]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
+    missed_count = sum(bool(row.missed_opportunity) for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 8
+    assert len(selected) == 18
     assert len(set(selected_ids)) == len(selected_ids)
     assert non_hold_count == 8
+    assert missed_count == 10
     assert best_trade_count == len(selected)
     assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
 
@@ -660,13 +677,13 @@ def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality
     noisy_selected = [row for row in selected if row.decision_confidence < 0.05]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 12
+    assert len(selected) == 20
     assert len(noisy_selected) == 0
-    assert non_hold_count == len(selected)
+    assert non_hold_count == 12
     assert best_trade_count == len(selected)
 
 
-def test_shadow_training_selection_excludes_missed_hold_opportunities_from_profit_model() -> None:
+def test_shadow_training_selection_excludes_low_confidence_missed_hold_opportunities() -> None:
     noisy_missed_holds = [
         _shadow_row(
             30_000 - idx,
@@ -715,8 +732,9 @@ def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds
 
     selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows], limit=20)
 
-    assert len(selected) == 0
+    assert len(selected) == 12
     assert not any(row.id in {item.id for item in noisy_holds} for row in selected)
+    assert all(row.missed_opportunity for row in selected)
 
 
 def test_train_from_frame_reports_training_window_composition() -> None:
@@ -781,11 +799,12 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 8
+    assert len(selected) == 20
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
-    assert sum(row.decision_action in {"long", "short"} for row in selected) == len(selected)
+    assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 12
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
     assert not any(row.id >= 10_000 for row in selected)
 
