@@ -125,6 +125,7 @@ TAIL_LOSS_THRESHOLD_PCT = _EXECUTION_COST_PARAMS.local_ml_tail_loss_threshold_pc
 MIN_PROFIT_EDGE_PCT = _LOCAL_ML_PARAMS.min_profit_edge_pct
 MIN_PROFIT_SIGNAL_WIN_RATE = _LOCAL_ML_PARAMS.min_profit_signal_win_rate
 MIN_TRAINING_SAMPLES = _LOCAL_ML_PARAMS.min_training_samples
+TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER = 1.35
 ML_INFLUENCE_MIN_SAMPLE_COUNT = _LOCAL_ML_PARAMS.influence_min_sample_count
 ML_INFLUENCE_MIN_TEST_COUNT = _LOCAL_ML_PARAMS.influence_min_test_count
 ML_INFLUENCE_MIN_AUC = _LOCAL_ML_PARAMS.influence_min_auc
@@ -301,6 +302,19 @@ def _positive_proba(model: Pipeline, x: pd.DataFrame) -> np.ndarray:
     return np.zeros(len(x), dtype=float)
 
 
+def _optional_positive_proba(model: Any, x: pd.DataFrame, *, default: float = 0.0) -> np.ndarray:
+    if model is None:
+        return np.full(len(x), float(default), dtype=float)
+    try:
+        return _positive_proba(model, x)
+    except Exception as exc:
+        logger.debug(
+            "failed to score optional ML probability model",
+            error=safe_error_text(exc),
+        )
+        return np.full(len(x), float(default), dtype=float)
+
+
 def _safe_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
     try:
         if int(pd.Series(y_true).nunique()) < 2:
@@ -357,26 +371,50 @@ def _weighted_mean(values: pd.Series, weights: pd.Series | None = None) -> float
 def _side_return_calibration(train: pd.DataFrame, side: str) -> dict[str, Any]:
     return_col = f"{side}_return_pct"
     win_col = f"{side}_win"
+    tail_col = f"{side}_tail_loss"
     returns = train[return_col].astype(float)
     wins = train[win_col].astype(int) == 1
+    tail_losses = (
+        train[tail_col].astype(int) == 1
+        if tail_col in train.columns
+        else pd.Series(False, index=train.index)
+    )
     weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
+    total_weight = float(weights.sum())
     unconditional = _weighted_mean(returns, weights) or 0.0
     win_avg = _weighted_mean(returns[wins], weights[wins]) if bool(wins.any()) else None
     non_win_avg = (
         _weighted_mean(returns[~wins], weights[~wins]) if bool((~wins).any()) else None
     )
+    tail_loss_avg = (
+        _weighted_mean(returns[tail_losses], weights[tail_losses])
+        if bool(tail_losses.any())
+        else None
+    )
+    tail_loss_rate = (
+        float(weights[tail_losses].sum()) / total_weight if total_weight > 0 else 0.0
+    )
     if win_avg is None:
         win_avg = max(unconditional, WIN_RETURN_THRESHOLD_PCT)
     if non_win_avg is None:
         non_win_avg = min(unconditional, 0.0)
+    if tail_loss_avg is None:
+        tail_loss_avg = min(non_win_avg, -TAIL_LOSS_THRESHOLD_PCT)
     return {
         "side": side,
         "win_avg_return_pct": round(float(win_avg), 8),
         "non_win_avg_return_pct": round(float(non_win_avg), 8),
+        "tail_loss_avg_return_pct": round(float(tail_loss_avg), 8),
+        "tail_loss_rate": round(tail_loss_rate, 8),
+        "tail_loss_threshold_pct": round(float(TAIL_LOSS_THRESHOLD_PCT), 8),
+        "tail_loss_penalty_multiplier": round(
+            float(TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER), 8
+        ),
         "unconditional_avg_return_pct": round(float(unconditional), 8),
         "win_sample_count": int(wins.sum()),
         "non_win_sample_count": int((~wins).sum()),
-        "policy": "classifier_probability_times_empirical_payoff",
+        "tail_loss_sample_count": int(tail_losses.sum()),
+        "policy": "classifier_probability_times_empirical_payoff_minus_excess_tail_loss",
     }
 
 
@@ -385,6 +423,7 @@ def _expected_return_from_win_probability(
     calibration: dict[str, Any] | None,
     *,
     fallback: float = 0.0,
+    tail_loss_probability: float | None = None,
 ) -> float:
     if not isinstance(calibration, dict):
         return float(fallback)
@@ -393,13 +432,29 @@ def _expected_return_from_win_probability(
     if win_avg is None or non_win_avg is None:
         return float(fallback)
     probability = _clamp(float(win_probability))
-    return float(probability * win_avg + (1.0 - probability) * non_win_avg)
+    expected = float(probability * win_avg + (1.0 - probability) * non_win_avg)
+    if tail_loss_probability is None:
+        return expected
+    tail_prob = _clamp(float(tail_loss_probability))
+    baseline_tail_prob = _clamp(_safe_float(calibration.get("tail_loss_rate"), 0.0))
+    tail_avg_loss = abs(_safe_float(calibration.get("tail_loss_avg_return_pct"), 0.0))
+    excess_tail_probability = max(tail_prob - baseline_tail_prob, 0.0)
+    if excess_tail_probability <= 0 or tail_avg_loss <= 0:
+        return expected
+    return float(
+        expected
+        - excess_tail_probability
+        * tail_avg_loss
+        * TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER
+    )
 
 
 def _calibrated_expected_scores(
     win_scores: np.ndarray,
     raw_expected_scores: np.ndarray,
     calibration: dict[str, Any] | None,
+    *,
+    tail_loss_scores: np.ndarray | None = None,
 ) -> np.ndarray:
     return np.array(
         [
@@ -407,6 +462,9 @@ def _calibrated_expected_scores(
                 float(score),
                 calibration,
                 fallback=float(raw_expected_scores[index]),
+                tail_loss_probability=(
+                    None if tail_loss_scores is None else float(tail_loss_scores[index])
+                ),
             )
             for index, score in enumerate(win_scores)
         ],
@@ -857,6 +915,14 @@ def train_from_frame(
         raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
 
     frame = frame.sort_values("id").reset_index(drop=True)
+    if "long_tail_loss" not in frame.columns:
+        frame["long_tail_loss"] = (
+            frame["long_return_pct"].astype(float) < -TAIL_LOSS_THRESHOLD_PCT
+        ).astype(int)
+    if "short_tail_loss" not in frame.columns:
+        frame["short_tail_loss"] = (
+            frame["short_return_pct"].astype(float) < -TAIL_LOSS_THRESHOLD_PCT
+        ).astype(int)
     split = max(int(len(frame) * _LOCAL_ML_PARAMS.train_split_ratio), 1)
     if len(frame) - split < _LOCAL_ML_PARAMS.min_test_rows:
         split = max(len(frame) - _LOCAL_ML_PARAMS.min_test_rows, 1)
@@ -869,16 +935,26 @@ def train_from_frame(
 
     long_classifier = _make_classifier(train["long_win"])
     short_classifier = _make_classifier(train["short_win"])
+    long_tail_classifier = _make_classifier(train["long_tail_loss"])
+    short_tail_classifier = _make_classifier(train["short_tail_loss"])
     long_regressor = _make_regressor(train["long_return_pct"])
     short_regressor = _make_regressor(train["short_return_pct"])
 
     long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
     short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
+    long_tail_classifier.fit(
+        x_train, train["long_tail_loss"], model__sample_weight=train_weights
+    )
+    short_tail_classifier.fit(
+        x_train, train["short_tail_loss"], model__sample_weight=train_weights
+    )
     long_regressor.fit(x_train, train["long_return_pct"], model__sample_weight=train_weights)
     short_regressor.fit(x_train, train["short_return_pct"], model__sample_weight=train_weights)
 
     long_scores = _positive_proba(long_classifier, x_test)
     short_scores = _positive_proba(short_classifier, x_test)
+    long_tail_scores = _positive_proba(long_tail_classifier, x_test)
+    short_tail_scores = _positive_proba(short_tail_classifier, x_test)
     raw_long_expected_scores = long_regressor.predict(x_test)
     raw_short_expected_scores = short_regressor.predict(x_test)
     expected_return_calibration = {
@@ -889,11 +965,13 @@ def train_from_frame(
         long_scores,
         raw_long_expected_scores,
         _safe_dict(expected_return_calibration.get("long")),
+        tail_loss_scores=long_tail_scores,
     )
     short_expected_scores = _calibrated_expected_scores(
         short_scores,
         raw_short_expected_scores,
         _safe_dict(expected_return_calibration.get("short")),
+        tail_loss_scores=short_tail_scores,
     )
     long_pred = (long_scores >= 0.50).astype(int)
     short_pred = (short_scores >= 0.50).astype(int)
@@ -960,6 +1038,12 @@ def train_from_frame(
             ),
             "top_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=True),
             "bottom_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=False),
+            "top_long_tail_loss_rate": _bucket_win_rate(
+                test["long_tail_loss"], long_expected_scores, top=True
+            ),
+            "bottom_long_tail_loss_rate": _bucket_win_rate(
+                test["long_tail_loss"], long_expected_scores, top=False
+            ),
             "top_short_avg_return_pct": _bucket_return(
                 test["short_return_pct"], short_expected_scores, top=True
             ),
@@ -968,6 +1052,12 @@ def train_from_frame(
             ),
             "top_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=True),
             "bottom_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=False),
+            "top_short_tail_loss_rate": _bucket_win_rate(
+                test["short_tail_loss"], short_expected_scores, top=True
+            ),
+            "bottom_short_tail_loss_rate": _bucket_win_rate(
+                test["short_tail_loss"], short_expected_scores, top=False
+            ),
         },
         "score_bucket_diagnostics": _score_bucket_diagnostics(
             test,
@@ -994,6 +1084,8 @@ def train_from_frame(
     bundle = {
         "long_classifier": long_classifier,
         "short_classifier": short_classifier,
+        "long_tail_classifier": long_tail_classifier,
+        "short_tail_classifier": short_tail_classifier,
         "long_regressor": long_regressor,
         "short_regressor": short_regressor,
         "metadata": metadata,
@@ -1412,35 +1504,91 @@ class MLSignalService:
             short_win_rate = float(_positive_proba(self._bundle["short_classifier"], x)[0])
             raw_long_expected = float(self._bundle["long_regressor"].predict(x)[0])
             raw_short_expected = float(self._bundle["short_regressor"].predict(x)[0])
+            long_calibration = _safe_dict(expected_return_calibration.get("long"))
+            short_calibration = _safe_dict(expected_return_calibration.get("short"))
+            long_tail_model = self._bundle.get("long_tail_classifier")
+            short_tail_model = self._bundle.get("short_tail_classifier")
+            long_tail_loss_probability = (
+                float(
+                    _optional_positive_proba(
+                        long_tail_model,
+                        x,
+                        default=_safe_float(long_calibration.get("tail_loss_rate"), 0.0),
+                    )[0]
+                )
+                if long_tail_model is not None
+                else None
+            )
+            short_tail_loss_probability = (
+                float(
+                    _optional_positive_proba(
+                        short_tail_model,
+                        x,
+                        default=_safe_float(short_calibration.get("tail_loss_rate"), 0.0),
+                    )[0]
+                )
+                if short_tail_model is not None
+                else None
+            )
             long_expected = _expected_return_from_win_probability(
                 long_win_rate,
-                _safe_dict(expected_return_calibration.get("long")),
+                long_calibration,
                 fallback=raw_long_expected,
+                tail_loss_probability=long_tail_loss_probability,
             )
             short_expected = _expected_return_from_win_probability(
                 short_win_rate,
-                _safe_dict(expected_return_calibration.get("short")),
+                short_calibration,
                 fallback=raw_short_expected,
+                tail_loss_probability=short_tail_loss_probability,
             )
             best_side = "long" if long_expected >= short_expected else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_expected = long_expected if best_side == "long" else short_expected
+            best_tail_loss_probability = (
+                long_tail_loss_probability
+                if best_side == "long"
+                else short_tail_loss_probability
+            )
+            best_tail_loss_baseline = _safe_float(
+                (long_calibration if best_side == "long" else short_calibration).get(
+                    "tail_loss_rate"
+                ),
+                0.0,
+            )
             profit_edge = abs(long_expected - short_expected)
             profit_quality = _profit_quality_score(best_expected, best_win, profit_edge)
             side_influence = _safe_dict(influence.get(best_side))
             risk_score = _clamp(
                 max(-best_expected, 0.0) / max(WIN_RETURN_THRESHOLD_PCT, 1e-9)
                 + max(MIN_PROFIT_SIGNAL_WIN_RATE - best_win, 0.0)
+                + max((best_tail_loss_probability or 0.0) - best_tail_loss_baseline, 0.0)
             )
             predictions.append(
                 {
                     "horizon_minutes": int(horizon),
                     "long_win_rate": round(long_win_rate, 4),
                     "short_win_rate": round(short_win_rate, 4),
+                    "long_tail_loss_probability": (
+                        None
+                        if long_tail_loss_probability is None
+                        else round(long_tail_loss_probability, 4)
+                    ),
+                    "short_tail_loss_probability": (
+                        None
+                        if short_tail_loss_probability is None
+                        else round(short_tail_loss_probability, 4)
+                    ),
+                    "tail_loss_threshold_pct": round(float(TAIL_LOSS_THRESHOLD_PCT), 4),
                     "long_expected_return_pct": round(long_expected, 4),
                     "short_expected_return_pct": round(short_expected, 4),
                     "best_side": best_side,
                     "best_win_rate": round(best_win, 4),
+                    "best_tail_loss_probability": (
+                        None
+                        if best_tail_loss_probability is None
+                        else round(best_tail_loss_probability, 4)
+                    ),
                     "best_expected_return_pct": round(best_expected, 4),
                     "profit_edge_pct": round(profit_edge, 4),
                     "profit_quality_score": round(profit_quality, 4),

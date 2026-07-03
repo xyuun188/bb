@@ -287,6 +287,10 @@ def test_strategy_health_entry_only_report_is_compact_and_keeps_guards() -> None
                 "short_pr_auc": 0.364,
                 "top_long_avg_return_pct": -0.058,
                 "top_short_avg_return_pct": -0.076,
+                "top_long_tail_loss_rate": 0.42,
+                "bottom_long_tail_loss_rate": 0.31,
+                "top_short_tail_loss_rate": 0.58,
+                "bottom_short_tail_loss_rate": 0.35,
                 "training_data_version": "2026-06-23.v3",
                 "required_training_data_version": "2026-06-23.v3",
                 "large_unused_metric": "omit",
@@ -620,6 +624,7 @@ def test_strategy_health_entry_only_report_is_compact_and_keeps_guards() -> None
     assert len(compact["closed_position_pnl_diagnostics"]["samples"]) == 5
     assert compact["local_ml_readiness"]["allow_live_position_influence"] is False
     assert "large_unused_metric" not in compact["local_ml_readiness"]["metrics"]
+    assert compact["local_ml_readiness"]["metrics"]["top_short_tail_loss_rate"] == 0.58
     assert (
         compact["local_ml_readiness"]["training_window_composition"]["decision_action_counts"][
             "hold"

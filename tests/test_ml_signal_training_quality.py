@@ -810,6 +810,13 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert composition["best_action_counts"] == {"short": 80, "long": 40}
     assert composition["data_quality_status_counts"] == {"downweighted": 40, "included": 80}
     assert composition["effective_weight_ratio"] == pytest.approx((40 * 0.25 + 80) / 120)
+    assert "top_long_tail_loss_rate" in metadata["metrics"]
+    assert "top_short_tail_loss_rate" in metadata["metrics"]
+    assert (
+        metadata["expected_return_calibration"]["long"]["policy"]
+        == "classifier_probability_times_empirical_payoff_minus_excess_tail_loss"
+    )
+    assert "tail_loss_rate" in metadata["expected_return_calibration"]["short"]
 
 
 def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:
@@ -865,8 +872,12 @@ def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights(
             "short_accuracy": 0.7,
             "top_long_avg_return_pct": 0.2,
             "bottom_long_avg_return_pct": -0.1,
+            "top_long_tail_loss_rate": 0.22,
+            "bottom_long_tail_loss_rate": 0.31,
             "top_short_avg_return_pct": 0.2,
             "bottom_short_avg_return_pct": -0.1,
+            "top_short_tail_loss_rate": 0.28,
+            "bottom_short_tail_loss_rate": 0.35,
             "top_long_win_rate": 0.7,
             "bottom_long_win_rate": 0.3,
             "top_short_win_rate": 0.7,
@@ -879,6 +890,7 @@ def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights(
     assert readiness["metrics"]["dirty_sample_ratio"] == 0.005
     assert readiness["metrics"]["benign_downweighted_sample_count"] == 395
     assert readiness["metrics"]["contamination_downweighted_sample_count"] == 5
+    assert readiness["metrics"]["top_short_tail_loss_rate"] == 0.28
     assert "dirty_sample_ratio_high" not in {
         item["code"] for item in readiness["blocking_reasons"]
     }
@@ -932,6 +944,70 @@ def test_ml_signal_predict_uses_calibrated_expected_return_before_raw_regressor(
     assert primary["best_side"] == "long"
     assert primary["long_expected_return_pct"] == pytest.approx(0.7)
     assert primary["short_expected_return_pct"] == pytest.approx(-0.16)
+
+
+def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
+    metadata = {
+        "version": datetime.now(UTC).isoformat(),
+        "trained_at": datetime.now(UTC).isoformat(),
+        "sample_count": 1200,
+        "test_count": 240,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+        },
+        "metrics": {
+            "long_auc": 0.7,
+            "short_auc": 0.7,
+            "long_pr_auc": 0.7,
+            "short_pr_auc": 0.7,
+            "long_accuracy": 0.7,
+            "short_accuracy": 0.7,
+            "top_long_avg_return_pct": 0.2,
+            "bottom_long_avg_return_pct": -0.1,
+            "top_short_avg_return_pct": 0.2,
+            "bottom_short_avg_return_pct": -0.1,
+            "top_long_win_rate": 0.7,
+            "bottom_long_win_rate": 0.3,
+            "top_short_win_rate": 0.7,
+            "bottom_short_win_rate": 0.3,
+        },
+        "expected_return_calibration": {
+            "long": {
+                "win_avg_return_pct": 0.7,
+                "non_win_avg_return_pct": -0.3,
+                "tail_loss_rate": 0.10,
+                "tail_loss_avg_return_pct": -2.0,
+            },
+            "short": {
+                "win_avg_return_pct": 0.7,
+                "non_win_avg_return_pct": -0.3,
+                "tail_loss_rate": 0.10,
+                "tail_loss_avg_return_pct": -2.0,
+            },
+        },
+    }
+    service = MLSignalService()
+    service._bundle = {
+        "metadata": metadata,
+        "long_classifier": _Classifier(0.6),
+        "short_classifier": _Classifier(0.6),
+        "long_tail_classifier": _Classifier(0.10),
+        "short_tail_classifier": _Classifier(0.55),
+        "long_regressor": _Regressor(0.3),
+        "short_regressor": _Regressor(0.3),
+        "feature_keys": FEATURE_KEYS,
+    }
+    service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+
+    prediction = service.predict({"current_price": 100.0, "spread_pct": 0.01}, horizons=(30,))
+    primary = prediction["predictions"][0]
+
+    assert primary["best_side"] == "long"
+    assert primary["long_expected_return_pct"] == pytest.approx(0.3)
+    assert primary["short_expected_return_pct"] == pytest.approx(-0.915)
+    assert primary["short_tail_loss_probability"] == pytest.approx(0.55)
+    assert primary["best_tail_loss_probability"] == pytest.approx(0.10)
 
 
 @pytest.mark.asyncio

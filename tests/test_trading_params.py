@@ -171,7 +171,7 @@ def test_training_data_quality_uses_central_trading_params() -> None:
     params = DEFAULT_TRADING_PARAMS.training_data_quality
 
     assert training_data_quality._QUALITY_PARAMS == params
-    assert training_data_quality.DATA_QUALITY_VERSION.endswith(".v3")
+    assert training_data_quality.DATA_QUALITY_VERSION.startswith("2026-07-03.")
 
 
 def test_local_ml_training_uses_central_trading_params() -> None:

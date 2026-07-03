@@ -287,9 +287,21 @@ def build_ml_readiness_report(
             "bottom_long_avg_return_pct": _safe_float(
                 metrics.get("bottom_long_avg_return_pct"), None
             ),
+            "top_long_tail_loss_rate": _safe_float(
+                metrics.get("top_long_tail_loss_rate"), None
+            ),
+            "bottom_long_tail_loss_rate": _safe_float(
+                metrics.get("bottom_long_tail_loss_rate"), None
+            ),
             "top_short_avg_return_pct": _safe_float(metrics.get("top_short_avg_return_pct"), None),
             "bottom_short_avg_return_pct": _safe_float(
                 metrics.get("bottom_short_avg_return_pct"), None
+            ),
+            "top_short_tail_loss_rate": _safe_float(
+                metrics.get("top_short_tail_loss_rate"), None
+            ),
+            "bottom_short_tail_loss_rate": _safe_float(
+                metrics.get("bottom_short_tail_loss_rate"), None
             ),
             "trained_at": trained_at.isoformat() if trained_at else None,
             "model_age_seconds": None if age_seconds is None else round(age_seconds, 1),
