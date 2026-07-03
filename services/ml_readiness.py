@@ -159,7 +159,12 @@ def build_ml_readiness_report(
     total_samples = int(totals.get("total") or sample_count or 0)
     excluded_count = int(totals.get("excluded") or 0)
     downweighted_count = int(totals.get("downweighted") or 0)
-    dirty_count = excluded_count + downweighted_count
+    contamination_downweighted_count = totals.get("contamination_downweighted")
+    if contamination_downweighted_count is None:
+        contamination_downweighted_count = downweighted_count
+    contamination_downweighted_count = int(contamination_downweighted_count or 0)
+    benign_downweighted_count = int(totals.get("benign_downweighted") or 0)
+    dirty_count = excluded_count + contamination_downweighted_count
     dirty_ratio = dirty_count / max(total_samples, 1)
     trained_at = _parse_datetime(metadata.get("trained_at") or metadata.get("version"))
     age_seconds = None
@@ -271,6 +276,8 @@ def build_ml_readiness_report(
             "test_count": test_count,
             "quarantined_sample_count": excluded_count,
             "downweighted_sample_count": downweighted_count,
+            "benign_downweighted_sample_count": benign_downweighted_count,
+            "contamination_downweighted_sample_count": contamination_downweighted_count,
             "dirty_sample_ratio": round(dirty_ratio, 4),
             "long_auc": _safe_float(metrics.get("long_auc"), None),
             "short_auc": _safe_float(metrics.get("short_auc"), None),

@@ -23,6 +23,10 @@ MIN_AVG_REALIZED_RETURN_PCT = 0.02
 MAX_FALSE_SIGNAL_LOSS_PCT = -0.18
 MIN_TIMESERIES_SEQUENCE_LENGTH = 30
 MAX_WORST_SAMPLE_COUNT = 8
+_SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
+    "hold_missed_opportunity_downweighted",
+    "very_low_decision_confidence",
+}
 QualityStatus = Literal["included", "downweighted", "excluded"]
 SampleKind = Literal["shadow", "trade", "sequence", "text_sentiment"]
 _RETRAIN_TARGETS = (
@@ -125,6 +129,22 @@ def _sample_guard_reasons(sample: dict[str, Any], *text_values: Any) -> list[str
     if _has_future_leakage(sample, *text_values):
         reasons.append("future_leakage")
     return reasons
+
+
+def _is_benign_downweighted_sample(kind: str, sample: dict[str, Any]) -> bool:
+    if kind != "shadow":
+        return False
+    if _safe_str(sample.get("data_quality_status")) != "downweighted":
+        return False
+    reasons = {
+        _safe_str(reason)
+        for reason in sample.get("quality_reasons") or []
+        if _safe_str(reason)
+    }
+    return bool(
+        "hold_missed_opportunity_downweighted" in reasons
+        and reasons.issubset(_SHADOW_BENIGN_DOWNWEIGHT_REASONS)
+    )
 
 
 def _repair_provenance_reason(sample: dict[str, Any]) -> str:
@@ -1276,11 +1296,20 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
         kind_trainable_timeframe_counts: Counter[str] = Counter()
         kind_source_counts: Counter[str] = Counter()
         kind_trainable_source_counts: Counter[str] = Counter()
+        benign_downweighted = 0
+        contamination_downweighted = 0
         for sample in samples:
             status = _safe_str(sample.get("data_quality_status")) or "unknown"
             trainable = status != "excluded"
             status_counts[status] += 1
             totals[status] += 1
+            if status == "downweighted":
+                if _is_benign_downweighted_sample(kind, sample):
+                    benign_downweighted += 1
+                    totals["benign_downweighted"] += 1
+                else:
+                    contamination_downweighted += 1
+                    totals["contamination_downweighted"] += 1
             weight = float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0)
             weight_total += weight
             if trainable:
@@ -1310,6 +1339,8 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
             "total": total,
             "included": int(status_counts.get("included", 0)),
             "downweighted": int(status_counts.get("downweighted", 0)),
+            "benign_downweighted": int(benign_downweighted),
+            "contamination_downweighted": int(contamination_downweighted),
             "excluded": int(status_counts.get("excluded", 0)),
             "effective_weight": round(weight_total, 4),
             "effective_weight_ratio": round(weight_total / max(total, 1), 4),
@@ -1334,6 +1365,8 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
             "total": total_count,
             "included": int(totals.get("included", 0)),
             "downweighted": int(totals.get("downweighted", 0)),
+            "benign_downweighted": int(totals.get("benign_downweighted", 0)),
+            "contamination_downweighted": int(totals.get("contamination_downweighted", 0)),
             "excluded": int(totals.get("excluded", 0)),
             "effective_weight": round(trainable_weight_total, 4),
             "effective_weight_ratio": round(trainable_weight_total / max(total_count, 1), 4),

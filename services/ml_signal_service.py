@@ -65,6 +65,8 @@ TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE = 1.00
 TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE = 1.25
 TRAINING_MIN_NON_HOLD_SHARE = 0.25
 TRAINING_MIN_BEST_TRADE_SHARE = 1.00
+TRAINING_MAX_MISSED_OPPORTUNITY_SHARE = 0.35
+TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO = 0.75
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -339,6 +341,79 @@ def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float |
     return float(pd.Series(y_win).iloc[idx].mean())
 
 
+def _weighted_mean(values: pd.Series, weights: pd.Series | None = None) -> float | None:
+    series = pd.Series(values).astype(float)
+    if series.empty:
+        return None
+    if weights is None:
+        return float(series.mean())
+    weight_series = pd.Series(weights).astype(float).reindex(series.index).fillna(0.0)
+    total_weight = float(weight_series.sum())
+    if total_weight <= 0:
+        return float(series.mean())
+    return float((series * weight_series).sum() / total_weight)
+
+
+def _side_return_calibration(train: pd.DataFrame, side: str) -> dict[str, Any]:
+    return_col = f"{side}_return_pct"
+    win_col = f"{side}_win"
+    returns = train[return_col].astype(float)
+    wins = train[win_col].astype(int) == 1
+    weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
+    unconditional = _weighted_mean(returns, weights) or 0.0
+    win_avg = _weighted_mean(returns[wins], weights[wins]) if bool(wins.any()) else None
+    non_win_avg = (
+        _weighted_mean(returns[~wins], weights[~wins]) if bool((~wins).any()) else None
+    )
+    if win_avg is None:
+        win_avg = max(unconditional, WIN_RETURN_THRESHOLD_PCT)
+    if non_win_avg is None:
+        non_win_avg = min(unconditional, 0.0)
+    return {
+        "side": side,
+        "win_avg_return_pct": round(float(win_avg), 8),
+        "non_win_avg_return_pct": round(float(non_win_avg), 8),
+        "unconditional_avg_return_pct": round(float(unconditional), 8),
+        "win_sample_count": int(wins.sum()),
+        "non_win_sample_count": int((~wins).sum()),
+        "policy": "classifier_probability_times_empirical_payoff",
+    }
+
+
+def _expected_return_from_win_probability(
+    win_probability: float,
+    calibration: dict[str, Any] | None,
+    *,
+    fallback: float = 0.0,
+) -> float:
+    if not isinstance(calibration, dict):
+        return float(fallback)
+    win_avg = _safe_float(calibration.get("win_avg_return_pct"), None)
+    non_win_avg = _safe_float(calibration.get("non_win_avg_return_pct"), None)
+    if win_avg is None or non_win_avg is None:
+        return float(fallback)
+    probability = _clamp(float(win_probability))
+    return float(probability * win_avg + (1.0 - probability) * non_win_avg)
+
+
+def _calibrated_expected_scores(
+    win_scores: np.ndarray,
+    raw_expected_scores: np.ndarray,
+    calibration: dict[str, Any] | None,
+) -> np.ndarray:
+    return np.array(
+        [
+            _expected_return_from_win_probability(
+                float(score),
+                calibration,
+                fallback=float(raw_expected_scores[index]),
+            )
+            for index, score in enumerate(win_scores)
+        ],
+        dtype=float,
+    )
+
+
 def _profit_quality_score(expected_return_pct: float, win_rate: float, edge_pct: float) -> float:
     """Score signal quality by expected PnL first, using win rate only as a sanity check."""
     expected_component = max(expected_return_pct, 0.0)
@@ -520,12 +595,12 @@ def _shadow_is_low_confidence_hold(row: Any) -> bool:
 
 
 def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
-    if _shadow_action(row, "best_action") not in {"long", "short"}:
-        return False
     action = _shadow_action(row, "decision_action")
-    if action not in {"long", "short"} and not bool(getattr(row, "missed_opportunity", False)):
-        return False
-    if action == "hold" and _shadow_is_low_confidence_hold(row):
+    best_action = _shadow_action(row, "best_action")
+    if action in {"long", "short"}:
+        return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
+    missed = bool(getattr(row, "missed_opportunity", False)) and best_action in {"long", "short"}
+    if not missed:
         return False
     return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
 
@@ -586,9 +661,9 @@ def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
     for row in rows:
         deduped.setdefault(_shadow_row_id(row), row)
     recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
-    trainable_best_trade = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
-    if len(trainable_best_trade) <= capped_limit:
-        return sorted(trainable_best_trade, key=_shadow_sort_key, reverse=True)
+    trainable_rows = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
+    if len(trainable_rows) <= capped_limit:
+        return sorted(trainable_rows, key=_shadow_sort_key, reverse=True)
 
     selected: list[Any] = []
     selected_ids: set[Any] = set()
@@ -605,17 +680,34 @@ def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
             selected_ids.add(candidate_id)
 
     non_hold_target = int(capped_limit * TRAINING_MIN_NON_HOLD_SHARE)
-    best_trade_target = int(capped_limit * TRAINING_MIN_BEST_TRADE_SHARE)
+    missed_share_cap = int(capped_limit * TRAINING_MAX_MISSED_OPPORTUNITY_SHARE)
     non_hold = [
         row
-        for row in trainable_best_trade
+        for row in trainable_rows
         if _shadow_action(row, "decision_action") in {"long", "short"}
     ]
-
-    add_from(non_hold, min(non_hold_target, len(non_hold)), quality_first=True)
+    missed_opportunities = [
+        row
+        for row in trainable_rows
+        if _shadow_action(row, "decision_action") == "hold"
+        and bool(getattr(row, "missed_opportunity", False))
+        and _shadow_action(row, "best_action") in {"long", "short"}
+    ]
+    missed_target = min(
+        len(missed_opportunities),
+        max(
+            missed_share_cap,
+            int(len(non_hold) * TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO),
+        ),
+    )
     add_from(
-        trainable_best_trade,
-        min(best_trade_target, len(trainable_best_trade)),
+        non_hold,
+        max(non_hold_target, min(len(non_hold), capped_limit)),
+        quality_first=True,
+    )
+    add_from(
+        missed_opportunities,
+        min(capped_limit, len(selected) + min(missed_target, capped_limit - len(selected))),
         quality_first=True,
     )
     return sorted(selected[:capped_limit], key=_shadow_sort_key, reverse=True)
@@ -771,8 +863,22 @@ def train_from_frame(
 
     long_scores = _positive_proba(long_classifier, x_test)
     short_scores = _positive_proba(short_classifier, x_test)
-    long_expected_scores = long_regressor.predict(x_test)
-    short_expected_scores = short_regressor.predict(x_test)
+    raw_long_expected_scores = long_regressor.predict(x_test)
+    raw_short_expected_scores = short_regressor.predict(x_test)
+    expected_return_calibration = {
+        "long": _side_return_calibration(train, "long"),
+        "short": _side_return_calibration(train, "short"),
+    }
+    long_expected_scores = _calibrated_expected_scores(
+        long_scores,
+        raw_long_expected_scores,
+        _safe_dict(expected_return_calibration.get("long")),
+    )
+    short_expected_scores = _calibrated_expected_scores(
+        short_scores,
+        raw_short_expected_scores,
+        _safe_dict(expected_return_calibration.get("short")),
+    )
     long_pred = (long_scores >= 0.50).astype(int)
     short_pred = (short_scores >= 0.50).astype(int)
 
@@ -812,9 +918,12 @@ def train_from_frame(
         "win_return_threshold_pct": WIN_RETURN_THRESHOLD_PCT,
         "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
+        "expected_return_calibration": expected_return_calibration,
         "training_objective": (
-            "Predict executable net return after round-trip fee/slippage cost; "
-            "win rate is auxiliary and tail-loss samples are tracked for risk."
+            "Predict executable net return after round-trip fee/slippage cost. "
+            "Expected return is calibrated from classifier win probability and "
+            "the training window's empirical win/non-win payoff; tail-loss samples "
+            "are tracked for risk."
         ),
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
@@ -1279,13 +1388,24 @@ class MLSignalService:
         )
 
         predictions = []
+        expected_return_calibration = _safe_dict(metadata.get("expected_return_calibration"))
         for horizon in horizons:
             row = _feature_row_from_feature_vector(features, horizon_minutes=horizon)
             x = pd.DataFrame([row], columns=FEATURE_KEYS)
             long_win_rate = float(_positive_proba(self._bundle["long_classifier"], x)[0])
             short_win_rate = float(_positive_proba(self._bundle["short_classifier"], x)[0])
-            long_expected = float(self._bundle["long_regressor"].predict(x)[0])
-            short_expected = float(self._bundle["short_regressor"].predict(x)[0])
+            raw_long_expected = float(self._bundle["long_regressor"].predict(x)[0])
+            raw_short_expected = float(self._bundle["short_regressor"].predict(x)[0])
+            long_expected = _expected_return_from_win_probability(
+                long_win_rate,
+                _safe_dict(expected_return_calibration.get("long")),
+                fallback=raw_long_expected,
+            )
+            short_expected = _expected_return_from_win_probability(
+                short_win_rate,
+                _safe_dict(expected_return_calibration.get("short")),
+                fallback=raw_short_expected,
+            )
             best_side = "long" if long_expected >= short_expected else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_expected = long_expected if best_side == "long" else short_expected

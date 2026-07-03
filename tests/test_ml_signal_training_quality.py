@@ -19,6 +19,7 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_PROMOTION_FLOW,
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
+from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
@@ -30,7 +31,7 @@ from services.ml_signal_service import (
     train_from_frame,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
-from services.training_data_quality import DATA_QUALITY_VERSION
+from services.training_data_quality import DATA_QUALITY_VERSION, quality_report
 
 
 def _service_with_metadata(metadata: dict) -> MLSignalService:
@@ -683,7 +684,7 @@ def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality
     assert best_trade_count == len(selected)
 
 
-def test_shadow_training_selection_excludes_low_confidence_missed_hold_opportunities() -> None:
+def test_shadow_training_selection_includes_low_confidence_missed_hold_opportunities() -> None:
     noisy_missed_holds = [
         _shadow_row(
             30_000 - idx,
@@ -709,8 +710,9 @@ def test_shadow_training_selection_excludes_low_confidence_missed_hold_opportuni
         limit=20,
     )
 
-    assert len(selected) == 8
-    assert all(row.decision_action in {"long", "short"} for row in selected)
+    assert len(selected) == 15
+    assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 7
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
 
 
@@ -759,6 +761,128 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert composition["effective_weight_ratio"] == pytest.approx((40 * 0.25 + 80) / 120)
 
 
+def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:
+    report = quality_report(
+        {
+            "shadow": [
+                {
+                    "data_quality_status": "downweighted",
+                    "sample_weight": 0.25,
+                    "quality_reasons": [
+                        "hold_missed_opportunity_downweighted",
+                        "very_low_decision_confidence",
+                    ],
+                },
+                {
+                    "data_quality_status": "downweighted",
+                    "sample_weight": 0.25,
+                    "quality_reasons": ["wide_spread_feature"],
+                },
+            ]
+        }
+    )
+
+    totals = report["totals"]
+    assert totals["downweighted"] == 2
+    assert totals["benign_downweighted"] == 1
+    assert totals["contamination_downweighted"] == 1
+
+
+def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights() -> None:
+    metadata = {
+        "version": "2026-07-03T00:00:00+00:00",
+        "trained_at": "2026-07-03T00:00:00+00:00",
+        "sample_count": 1000,
+        "test_count": 250,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {
+                "total": 1000,
+                "included": 600,
+                "downweighted": 400,
+                "benign_downweighted": 395,
+                "contamination_downweighted": 5,
+                "excluded": 0,
+            },
+        },
+        "metrics": {
+            "long_auc": 0.7,
+            "short_auc": 0.7,
+            "long_pr_auc": 0.7,
+            "short_pr_auc": 0.7,
+            "long_accuracy": 0.7,
+            "short_accuracy": 0.7,
+            "top_long_avg_return_pct": 0.2,
+            "bottom_long_avg_return_pct": -0.1,
+            "top_short_avg_return_pct": 0.2,
+            "bottom_short_avg_return_pct": -0.1,
+            "top_long_win_rate": 0.7,
+            "bottom_long_win_rate": 0.3,
+            "top_short_win_rate": 0.7,
+            "bottom_short_win_rate": 0.3,
+        },
+    }
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+
+    assert readiness["metrics"]["dirty_sample_ratio"] == 0.005
+    assert readiness["metrics"]["benign_downweighted_sample_count"] == 395
+    assert readiness["metrics"]["contamination_downweighted_sample_count"] == 5
+    assert "dirty_sample_ratio_high" not in {
+        item["code"] for item in readiness["blocking_reasons"]
+    }
+
+
+def test_ml_signal_predict_uses_calibrated_expected_return_before_raw_regressor() -> None:
+    metadata = {
+        "version": datetime.now(UTC).isoformat(),
+        "trained_at": datetime.now(UTC).isoformat(),
+        "sample_count": 1200,
+        "test_count": 240,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+        },
+        "metrics": {
+            "long_auc": 0.7,
+            "short_auc": 0.7,
+            "long_pr_auc": 0.7,
+            "short_pr_auc": 0.7,
+            "long_accuracy": 0.7,
+            "short_accuracy": 0.7,
+            "top_long_avg_return_pct": 0.2,
+            "bottom_long_avg_return_pct": -0.1,
+            "top_short_avg_return_pct": 0.2,
+            "bottom_short_avg_return_pct": -0.1,
+            "top_long_win_rate": 0.7,
+            "bottom_long_win_rate": 0.3,
+            "top_short_win_rate": 0.7,
+            "bottom_short_win_rate": 0.3,
+        },
+        "expected_return_calibration": {
+            "long": {"win_avg_return_pct": 1.0, "non_win_avg_return_pct": -0.5},
+            "short": {"win_avg_return_pct": 0.8, "non_win_avg_return_pct": -0.4},
+        },
+    }
+    service = MLSignalService()
+    service._bundle = {
+        "metadata": metadata,
+        "long_classifier": _Classifier(0.8),
+        "short_classifier": _Classifier(0.2),
+        "long_regressor": _Regressor(-9.0),
+        "short_regressor": _Regressor(9.0),
+        "feature_keys": FEATURE_KEYS,
+    }
+    service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+
+    prediction = service.predict({"current_price": 100.0, "spread_pct": 0.01}, horizons=(30,))
+    primary = prediction["predictions"][0]
+
+    assert primary["best_side"] == "long"
+    assert primary["long_expected_return_pct"] == pytest.approx(0.7)
+    assert primary["short_expected_return_pct"] == pytest.approx(-0.16)
+
+
 @pytest.mark.asyncio
 async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_sources(
     monkeypatch: pytest.MonkeyPatch,
@@ -799,12 +923,12 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 20
+    assert len(selected) == 15
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 12
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 7
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
     assert not any(row.id >= 10_000 for row in selected)
 
