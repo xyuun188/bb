@@ -140,29 +140,9 @@ class EntryFeatureRankerPolicy:
             if symbol in self.major_symbols
             else params.tradable_alt_min_notional_usdt
         )
-        analysis_volume_floor = max(
-            min(
-                max(
-                    float(self.min_entry_volume_ratio_provider() or 0.0),
-                    params.tradable_volume_provider_floor,
-                )
-                * params.tradable_volume_multiplier,
-                params.tradable_volume_cap,
-            ),
-            params.tradable_volume_floor,
-        )
-        analysis_adx_floor = max(
-            min(
-                max(
-                    float(self.min_entry_adx_provider() or 0.0)
-                    - params.tradable_adx_provider_offset,
-                    params.tradable_adx_provider_floor,
-                ),
-                params.tradable_adx_cap,
-            ),
-            params.tradable_adx_floor,
-        )
-        if volume_ratio < analysis_volume_floor:
+        tradable_volume_floor = params.tradable_volume_floor
+        tradable_adx_floor = params.tradable_adx_floor
+        if volume_ratio < tradable_volume_floor:
             return False
         if notional_24h < min_notional:
             return False
@@ -170,7 +150,7 @@ class EntryFeatureRankerPolicy:
             return False
         if change_24h > params.tradable_max_day_change_pct:
             return False
-        return not (symbol not in self.major_symbols and adx_14 < analysis_adx_floor)
+        return not (symbol not in self.major_symbols and adx_14 < tradable_adx_floor)
 
     def is_auto_analysis_candidate_feature(self, feature: Any) -> bool:
         params = self.params
@@ -187,29 +167,9 @@ class EntryFeatureRankerPolicy:
             if symbol in self.major_symbols
             else params.analysis_alt_min_notional_usdt
         )
-        soft_volume_floor = max(
-            min(
-                max(
-                    float(self.min_entry_volume_ratio_provider() or 0.0),
-                    params.analysis_volume_provider_floor,
-                )
-                * params.analysis_volume_multiplier,
-                params.analysis_volume_cap,
-            ),
-            params.analysis_volume_floor,
-        )
-        soft_adx_floor = max(
-            min(
-                max(
-                    float(self.min_entry_adx_provider() or 0.0)
-                    - params.analysis_adx_provider_offset,
-                    params.analysis_adx_provider_floor,
-                ),
-                params.analysis_adx_cap,
-            ),
-            params.analysis_adx_floor,
-        )
-        if volume_ratio < soft_volume_floor:
+        analysis_volume_floor = params.analysis_volume_floor
+        analysis_adx_floor = params.analysis_adx_floor
+        if volume_ratio < analysis_volume_floor:
             return False
         if notional_24h < min_notional:
             return False
@@ -217,7 +177,7 @@ class EntryFeatureRankerPolicy:
             return False
         if change_24h > params.analysis_max_day_change_pct:
             return False
-        return not (symbol not in self.major_symbols and adx_14 < soft_adx_floor)
+        return not (symbol not in self.major_symbols and adx_14 < analysis_adx_floor)
 
     def rank(
         self,
@@ -499,50 +459,12 @@ class EntryFeatureRankerPolicy:
             if symbol in self.major_symbols
             else params.analysis_alt_min_notional_usdt
         )
-        tradable_volume_floor = max(
-            min(
-                max(
-                    float(self.min_entry_volume_ratio_provider() or 0.0),
-                    params.tradable_volume_provider_floor,
-                )
-                * params.tradable_volume_multiplier,
-                params.tradable_volume_cap,
-            ),
-            params.tradable_volume_floor,
-        )
-        analysis_volume_floor = max(
-            min(
-                max(
-                    float(self.min_entry_volume_ratio_provider() or 0.0),
-                    params.analysis_volume_provider_floor,
-                )
-                * params.analysis_volume_multiplier,
-                params.analysis_volume_cap,
-            ),
-            params.analysis_volume_floor,
-        )
-        tradable_adx_floor = max(
-            min(
-                max(
-                    float(self.min_entry_adx_provider() or 0.0)
-                    - params.tradable_adx_provider_offset,
-                    params.tradable_adx_provider_floor,
-                ),
-                params.tradable_adx_cap,
-            ),
-            params.tradable_adx_floor,
-        )
-        analysis_adx_floor = max(
-            min(
-                max(
-                    float(self.min_entry_adx_provider() or 0.0)
-                    - params.analysis_adx_provider_offset,
-                    params.analysis_adx_provider_floor,
-                ),
-                params.analysis_adx_cap,
-            ),
-            params.analysis_adx_floor,
-        )
+        runtime_entry_volume_ratio = max(float(self.min_entry_volume_ratio_provider() or 0.0), 0.0)
+        runtime_entry_adx = max(float(self.min_entry_adx_provider() or 0.0), 0.0)
+        tradable_volume_floor = params.tradable_volume_floor
+        analysis_volume_floor = params.analysis_volume_floor
+        tradable_adx_floor = params.tradable_adx_floor
+        analysis_adx_floor = params.analysis_adx_floor
 
         tradable_reasons: list[str] = []
         analysis_reasons: list[str] = []
@@ -592,6 +514,8 @@ class EntryFeatureRankerPolicy:
                     feature,
                     "entry_activity_volume_timeframe",
                 ),
+                "runtime_entry_volume_ratio_advisory": round(runtime_entry_volume_ratio, 4),
+                "runtime_entry_adx_advisory": round(runtime_entry_adx, 2),
                 "adx": round(adx_14, 2),
                 "volatility_20": round(volatility_20, 4),
                 "change_24h": round(change_24h, 4),

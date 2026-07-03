@@ -37,7 +37,7 @@ def _feature(symbol: str, **overrides):
 def test_entry_feature_ranker_classifies_hard_and_soft_candidates() -> None:
     ranker = _ranker()
     hard = _feature("SOL/USDT")
-    soft = _feature("DOGE/USDT", volume_ratio=0.10, volume_24h=10_000.0, adx_14=9.0)
+    soft = _feature("DOGE/USDT", volume_ratio=0.07, volume_24h=10_000.0, adx_14=9.0)
 
     assert ranker.is_auto_tradeable_feature(hard) is True
     assert ranker.is_auto_analysis_candidate_feature(hard) is True
@@ -106,6 +106,8 @@ def test_entry_feature_ranker_uses_entry_activity_volume_for_candidate_filter() 
     assert metrics["volume_ratio_source"] == "entry_activity_volume_ratio"
     assert metrics["trend_volume_ratio"] == pytest.approx(0.01)
     assert metrics["entry_activity_volume_timeframe"] == "1m"
+    assert metrics["runtime_entry_volume_ratio_advisory"] == pytest.approx(0.30)
+    assert metrics["runtime_entry_adx_advisory"] == pytest.approx(14.0)
     preview = result.diagnostics["ranked_symbol_sample"][0]
     assert preview["volume_ratio"] == pytest.approx(0.40)
     assert preview["volume_ratio_source"] == "entry_activity_volume_ratio"
@@ -151,7 +153,7 @@ def test_entry_feature_ranker_uses_secondary_fill_when_hard_candidates_are_not_e
             "SOL/USDT": _feature("SOL/USDT"),
             "DOGE/USDT": _feature(
                 "DOGE/USDT",
-                volume_ratio=0.10,
+                volume_ratio=0.07,
                 volume_24h=10_000.0,
                 adx_14=9.0,
             ),
