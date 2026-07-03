@@ -78,6 +78,9 @@ SKIP_SUFFIXES = {
     ".7z",
     ".rar",
 }
+SKIP_PATH_PREFIXES = (
+    "docs/superpowers/plans/",
+)
 SKIP_NAME_PARTS = (
     "\u670d\u52a1\u5668\u4fe1\u606f",  # server info
     "\u670d\u52a1\u5668\u8d44\u6599",  # server data
@@ -387,6 +390,9 @@ EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
 
 def should_upload(path: Path) -> bool:
     rel = path.relative_to(ROOT)
+    rel_name = rel.as_posix()
+    if any(rel_name.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+        return False
     parts = rel.parts
     if any(part in SKIP_DIRS for part in parts[:-1]):
         return False

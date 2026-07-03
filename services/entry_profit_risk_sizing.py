@@ -17,7 +17,7 @@ from config.settings import settings
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.entry_direction_metrics import selected_entry_metrics
 from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
-from services.entry_sizing import apply_evidence_sizing_policy
+from services.entry_sizing import apply_evidence_sizing_policy, evidence_is_tradeable_probe
 from services.profit_first_position_ladder import ProfitFirstPositionLadderPolicy
 from services.profit_first_trade_plan import classify_decision_lane
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -972,6 +972,11 @@ class EntryProfitRiskSizingPolicy:
             }
         )
         aligned_source_count = max(legacy_aligned_source_count, evidence_aligned_source_count)
+        evidence_tradeable_probe = bool(
+            bool(evidence_score.get("tradeable_probe"))
+            or evidence_is_tradeable_probe(evidence_score, evidence_effective_score)
+        )
+        evidence_shadow_only = bool(evidence_score.get("shadow_only"))
         if weak_history:
             weak_history_max_size = (
                 ENTRY_WEAK_HISTORY_STRONG_ALIGNED_MAX_SIZE
@@ -1030,8 +1035,19 @@ class EntryProfitRiskSizingPolicy:
             evidence_effective_score=evidence_effective_score,
         )
         low_payoff_relief: dict[str, Any] = {"applied": False}
-        if roster_fill_quality and low_payoff_reasons:
-            roster_fill_soft_reasons = {
+        structured_tradeable_probe_quality = bool(
+            evidence_tradeable_probe
+            and not evidence_shadow_only
+            and expected_net > 0.0
+            and aligned_source_count >= 2
+            and loss_probability <= max(
+                PORTFOLIO_ROSTER_FILL_MAX_LOSS_PROBABILITY,
+                _ENTRY_RISK_SIZING_PARAMS.good_probe_max_loss_probability,
+            )
+            and tail_risk <= ENTRY_MEANINGFUL_SIZE_MAX_TAIL_RISK
+        )
+        if low_payoff_reasons and (roster_fill_quality or structured_tradeable_probe_quality):
+            soft_reasons = {
                 "score_below_required",
                 "expected_net_below_min",
                 "profit_quality_below_min",
@@ -1041,15 +1057,19 @@ class EntryProfitRiskSizingPolicy:
             remaining_low_payoff_reasons = [
                 reason
                 for reason in low_payoff_reasons
-                if reason not in roster_fill_soft_reasons
+                if reason not in soft_reasons
             ]
             relieved_low_payoff_reasons = [
-                reason for reason in low_payoff_reasons if reason in roster_fill_soft_reasons
+                reason for reason in low_payoff_reasons if reason in soft_reasons
             ]
             if relieved_low_payoff_reasons:
                 low_payoff_relief = {
                     "applied": True,
-                    "reason": "portfolio_roster_fill_quality",
+                    "reason": (
+                        "portfolio_roster_fill_quality"
+                        if roster_fill_quality
+                        else "structured_tradeable_probe_quality"
+                    ),
                     "relieved_reasons": relieved_low_payoff_reasons,
                     "remaining_reasons": remaining_low_payoff_reasons,
                     "expected_net_return_pct": round(expected_net, 6),
@@ -1057,6 +1077,9 @@ class EntryProfitRiskSizingPolicy:
                     "loss_probability": round(loss_probability, 6),
                     "tail_risk_score": round(tail_risk, 6),
                     "aligned_source_count": aligned_source_count,
+                    "evidence_tradeable_probe": evidence_tradeable_probe,
+                    "evidence_shadow_only": evidence_shadow_only,
+                    "evidence_tier": str(evidence_score.get("tier") or ""),
                 }
                 low_payoff_reasons = remaining_low_payoff_reasons
         low_payoff_quality = bool(low_payoff_reasons)
@@ -1113,12 +1136,15 @@ class EntryProfitRiskSizingPolicy:
         )
         if high_quality_strategy_signal:
             quality_override_reasons.append("high_quality_entry")
+        if structured_tradeable_probe_quality and not low_payoff_quality:
+            quality_override_reasons.append("tradeable_evidence_probe")
         strategy_quality_override = bool(
             quality_entry_recovery_override
             or
             (
             strong_positive_strategy_signal
             or high_quality_strategy_signal
+            or (structured_tradeable_probe_quality and not low_payoff_quality)
             or (
                 high_quality_entry
                 and not low_payoff_quality

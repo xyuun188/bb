@@ -912,6 +912,8 @@ def test_entry_evidence_maps_45_to_exploration_tier():
     assert evidence["tier"] == "exploration"
     assert evidence["hard_block"] is False
     assert evidence["size_multiplier"] == 0.1
+    assert evidence["tradeable_probe"] is True
+    assert evidence["shadow_only"] is False
 
 
 def test_entry_evidence_allows_strong_aligned_signal():
@@ -1307,3 +1309,64 @@ async def test_high_quality_entry_escapes_learning_probe_micro_size() -> None:
     assert sizing["notional_floor_applied"] is True
     assert sizing["profit_first_position_ladder"]["lane"] == "meaningful_entry"
     assert decision.position_size_pct >= 0.06
+
+
+@pytest.mark.asyncio
+async def test_tradeable_exploration_probe_relaxes_low_payoff_shadow_sizing() -> None:
+    service = _service()
+
+    async def fake_balance(*args, **kwargs):
+        return 1000.0
+
+    service.account_accounting_service = SimpleNamespace(allocated_order_balance=fake_balance)
+
+    class FakeExistingWinnerContext:
+        def context(self, *args, **kwargs):
+            return {"has_winner": False}
+
+    service.entry_existing_winner_context = FakeExistingWinnerContext()
+    service.entry_low_payoff_quality = EntryLowPayoffQualityPolicy()
+    service.entry_stress_stop = EntryStressStopPolicy()
+    service.entry_stop_loss_budget = EntryStopLossBudgetPolicy()
+
+    decision = _decision(
+        Action.LONG,
+        {
+            "opportunity_score": {
+                "score": 0.62,
+                "min_score_required": 0.95,
+                "expected_net_return_pct": 0.24,
+                "expected_loss_pct": 0.22,
+                "tail_risk_score": 0.34,
+                "raw_expected_return_pct": 0.24,
+                "profit_quality_ratio": 0.28,
+                "server_profit_loss_probability": 0.49,
+                "ml_aligned": True,
+                "local_profit_aligned": True,
+                "timeseries_aligned": True,
+                "evidence_score": {
+                    "tier": "exploration",
+                    "effective_score": 47.0,
+                    "size_multiplier": 0.10,
+                    "max_size_pct": 0.01,
+                    "tradeable_probe": False,
+                    "shadow_only": False,
+                    "aligned_support_sources": ["server_profit", "timeseries", "ai"],
+                },
+            },
+        },
+        confidence=0.68,
+    )
+    decision.position_size_pct = 0.08
+    decision.suggested_leverage = 3.0
+    decision.stop_loss_pct = 0.012
+    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 0.6}
+
+    await service._apply_entry_profit_risk_sizing(decision, "paper", [])
+
+    sizing = _raw_response(decision)["profit_risk_sizing"]
+    assert sizing["low_payoff_relief"]["applied"] is True
+    assert sizing["low_payoff_relief"]["reason"] == "structured_tradeable_probe_quality"
+    assert sizing["low_payoff_quality"] is False
+    assert sizing["strategy_quality_override"] is True
+    assert "tradeable_evidence_probe" in sizing["strategy_quality_override_reasons"]

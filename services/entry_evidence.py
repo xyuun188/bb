@@ -982,6 +982,13 @@ def build_entry_evidence_score(
             ENTRY_EVIDENCE_MAJOR_CONFLICT_SIZE_CAP,
         )
 
+    if (
+        tier in {"exploration", "small", "medium", "normal"}
+        and size_multiplier > 0.0
+        and not hard_block_reasons
+    ):
+        tradeable_probe = True
+
     final_shadow_only = bool(
         tier in {"weak_conflict_probe", "degraded_missing_probe"} and not tradeable_probe
     )
