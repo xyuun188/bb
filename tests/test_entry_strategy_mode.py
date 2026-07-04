@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -138,6 +139,7 @@ def test_strategy_mode_waits_in_choppy_market() -> None:
 @pytest.mark.asyncio
 async def test_trading_service_strategy_mode_context_delegates_to_policy() -> None:
     service = object.__new__(TradingService)
+    synced_profiles: dict[str, Any] = {}
 
     class Daily:
         async def state(self, mode: str) -> dict[str, Any]:
@@ -172,6 +174,9 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     service.entry_position_exposure = Exposure()
     service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
     service.allocated_order_balance = balance
+    service.entry_market_hold_penalty = SimpleNamespace(
+        sync_recent_loss_profiles=lambda profiles: synced_profiles.update(profiles)
+    )
     service.entry_strategy_mode_context = EntryStrategyModeContextPolicy(
         target_position_groups=3,
         roster_fill_market_symbol_min=12,
@@ -186,6 +191,7 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     assert result["strategy"] == "portfolio_roster_build"
     assert result["position_exposure"]["count"] == 1
     assert result["symbol_side_performance"] == {"BTC/USDT|long": {"pnl": 1.0}}
+    assert synced_profiles == {"BTC/USDT|long": {"pnl": 1.0}}
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 1.0}}
     assert result["portfolio_roster"]["market_symbol_min"] == 12
     assert result["portfolio_roster"]["market_symbol_min_is_batch_size"] is False

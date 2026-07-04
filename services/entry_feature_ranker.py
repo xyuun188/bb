@@ -49,7 +49,7 @@ class EntryFeatureRankerPolicy:
     params: Any = DEFAULT_TRADING_PARAMS.entry_feature_ranker
 
     def feature_opportunity_score(self, feature: Any) -> float:
-        if self._missing_indicator_snapshot(feature):
+        if self._missing_indicator_snapshot(feature) and not self._has_basic_market_anchor(feature):
             return 0.0
         params = self.params
         try:
@@ -111,6 +111,11 @@ class EntryFeatureRankerPolicy:
                 else 0.0
             )
         )
+        incomplete_indicator_penalty = (
+            params.incomplete_indicator_snapshot_penalty
+            if self._uses_fallback_indicator_snapshot(feature)
+            else 0.0
+        )
 
         return (
             liquidity
@@ -123,11 +128,12 @@ class EntryFeatureRankerPolicy:
             + band_bonus
             - low_activity_penalty
             - extreme_vol_penalty
+            - incomplete_indicator_penalty
         )
 
     def is_auto_tradeable_feature(self, feature: Any) -> bool:
         params = self.params
-        parsed = self._parse_filter_inputs(feature)
+        parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=False)
         if parsed is None:
             return False
         symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14 = parsed
@@ -154,7 +160,7 @@ class EntryFeatureRankerPolicy:
 
     def is_auto_analysis_candidate_feature(self, feature: Any) -> bool:
         params = self.params
-        parsed = self._parse_filter_inputs(feature)
+        parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=True)
         if parsed is None:
             return False
         symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14 = parsed
@@ -460,14 +466,14 @@ class EntryFeatureRankerPolicy:
         return EntryFeatureRankResult(selected=selected, diagnostics=diagnostics)
 
     def _can_fill_underfilled_analysis(self, feature: Any, diagnostic: dict[str, Any]) -> bool:
-        if self._missing_indicator_snapshot(feature):
+        if self._missing_indicator_snapshot(feature) and not self._has_basic_market_anchor(feature):
             return False
         symbol = str(getattr(feature, "symbol", "") or "").upper()
         if symbol and self.suspicious_symbol_reason(symbol):
             return False
         reasons = set(diagnostic.get("analysis_reasons") or [])
         severe_reasons = {
-            "missing_indicator_snapshot",
+            "missing_market_anchor_snapshot",
             "suspicious_symbol",
             "invalid_feature_values",
             "recent_abnormal_wick",
@@ -507,11 +513,11 @@ class EntryFeatureRankerPolicy:
 
     def _feature_filter_diagnostic(self, feature: Any) -> dict[str, Any]:
         params = self.params
-        parsed = self._parse_filter_inputs(feature)
+        parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=True)
         symbol = str(getattr(feature, "symbol", "") or "").upper()
         if parsed is None:
             reason = (
-                "missing_indicator_snapshot"
+                "missing_market_anchor_snapshot"
                 if self._missing_indicator_snapshot(feature)
                 else (
                     "suspicious_symbol"
@@ -548,6 +554,9 @@ class EntryFeatureRankerPolicy:
 
         tradable_reasons: list[str] = []
         analysis_reasons: list[str] = []
+        if self._uses_fallback_indicator_snapshot(feature):
+            tradable_reasons.append("fallback_indicator_snapshot")
+            analysis_reasons.append("fallback_indicator_snapshot")
         if abnormal_wick:
             tradable_reasons.append("recent_abnormal_wick")
             analysis_reasons.append("recent_abnormal_wick")
@@ -605,6 +614,11 @@ class EntryFeatureRankerPolicy:
                 "analysis_min_notional": round(analysis_min_notional, 2),
                 "tradable_adx_floor": round(tradable_adx_floor, 2),
                 "analysis_adx_floor": round(analysis_adx_floor, 2),
+                "indicator_snapshot_quality": (
+                    "fallback_market_anchor"
+                    if self._uses_fallback_indicator_snapshot(feature)
+                    else "full_indicator_snapshot"
+                ),
             },
         }
 
@@ -628,12 +642,16 @@ class EntryFeatureRankerPolicy:
     def _parse_filter_inputs(
         self,
         feature: Any,
+        *,
+        allow_incomplete_indicator: bool = False,
     ) -> tuple[str, float, float, float, float, float, float] | None:
         try:
             symbol = str(getattr(feature, "symbol", "") or "").upper()
             if self.suspicious_symbol_reason(symbol):
                 return None
-            if self._missing_indicator_snapshot(feature):
+            if self._missing_indicator_snapshot(feature) and not (
+                allow_incomplete_indicator and self._has_basic_market_anchor(feature)
+            ):
                 return None
             current_price = float(
                 getattr(feature, "current_price", 0) or getattr(feature, "close", 0) or 0
@@ -645,6 +663,8 @@ class EntryFeatureRankerPolicy:
             adx_14 = float(getattr(feature, "adx_14", 0) or 0)
         except (TypeError, ValueError):
             return None
+        if current_price <= 0:
+            return None
         return symbol, current_price, volume_24h, volume_ratio, volatility_20, change_24h, adx_14
 
     @staticmethod
@@ -655,6 +675,26 @@ class EntryFeatureRankerPolicy:
         if isinstance(marker, str):
             marker = marker.strip().lower() in {"1", "true", "yes", "y"}
         return not bool(marker)
+
+    def _uses_fallback_indicator_snapshot(self, feature: Any) -> bool:
+        return self._missing_indicator_snapshot(feature) and self._has_basic_market_anchor(feature)
+
+    def _has_basic_market_anchor(self, feature: Any) -> bool:
+        current_price = _feature_float(feature, "current_price") or _feature_float(feature, "close")
+        if current_price <= 0:
+            return False
+        notional_24h = self._feature_notional_24h_usdt(
+            feature,
+            current_price,
+            _feature_float(feature, "volume_24h"),
+        )
+        if notional_24h <= 0:
+            return False
+        return bool(
+            self._entry_activity_volume_ratio(feature) > 0
+            or abs(_feature_float(feature, "change_24h_pct")) > 0
+            or _feature_float(feature, "adx_14") > 0
+        )
 
     @staticmethod
     def _entry_activity_volume_ratio(feature: Any) -> float:

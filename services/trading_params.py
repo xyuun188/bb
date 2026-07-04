@@ -245,6 +245,7 @@ class EntryFeatureRankerParams:
     analysis_adx_floor: float = 8.0
     analysis_max_volatility: float = 0.18
     analysis_max_day_change_pct: float = 32.0
+    incomplete_indicator_snapshot_penalty: float = 24.0
 
 
 @dataclass(frozen=True, slots=True)

@@ -185,6 +185,9 @@ class _LinkedOrderPnlComponents:
     close_fee: float
     close_quantity: float
     entry_quantity: float
+    quantity_match_source: str = ""
+    quantity_mismatch: bool = False
+    source: str = "okx_linked_order_net_pnl"
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,7 +602,7 @@ def _build_group_from_positions(
             - pnl_components.entry_fee
             - pnl_components.close_fee
         )
-        pnl_source = "okx_linked_order_net_pnl"
+        pnl_source = pnl_components.source
     elif not realized_pnl:
         realized_pnl = sum(
             _safe_float(row.pnl)
@@ -632,6 +635,8 @@ def _build_group_from_positions(
         gaps.append("linked_order_not_okx_confirmed")
     if pnl_components is None and entry_ids and close_ids:
         gaps.append("incomplete_okx_linked_order_pnl_components")
+    if pnl_components is not None and pnl_components.quantity_mismatch:
+        gaps.append("okx_fill_position_quantity_mismatch")
     evidence_complete = not gaps and bool(close_ids) and bool(entry_ids)
     status = "partial" if len(positions) > 1 and not evidence_complete else "full"
     status_label = "部分平仓" if status == "partial" else "全部平仓"
@@ -690,30 +695,92 @@ def _confirmed_linked_order_pnl_components(
     for order_id in entry_ids:
         row = fills_by_order_id.get(order_id)
         if row is None or not row.okx_confirmed or row.quantity <= 0:
-            return None
+            continue
         entry_rows.append(row)
 
-    close_quantity = sum(row.quantity for row in close_rows)
-    if closed_quantity > 0 and not _quantities_match(
-        close_quantity,
-        closed_quantity,
-        tolerance_ratio=0.02,
-    ):
-        return None
-    entry_quantity = sum(row.quantity for row in entry_rows)
-    if entry_quantity <= 0:
-        return None
+    close_units = _linked_fill_unit_sums(close_rows)
+    entry_units = _linked_fill_unit_sums(entry_rows)
+    close_quantity, entry_quantity, unit_source, quantity_mismatch = _best_pnl_quantity_units(
+        closed_quantity=closed_quantity,
+        close_units=close_units,
+        entry_units=entry_units,
+    )
     close_gross_pnl = sum(_safe_float(row.pnl, 0.0) or 0.0 for row in close_rows)
     close_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in close_rows)
     entry_fee = sum(abs(_safe_float(row.fee, 0.0) or 0.0) for row in entry_rows)
-    entry_fee *= min(max(close_quantity, 0.0) / entry_quantity, 1.0)
+    if entry_quantity > 0:
+        entry_fee *= min(max(close_quantity, 0.0) / entry_quantity, 1.0)
+        source = "okx_linked_order_net_pnl"
+    else:
+        source = "okx_close_fill_net_pnl_partial"
     return _LinkedOrderPnlComponents(
         close_fill_pnl=close_gross_pnl,
         entry_fee=entry_fee,
         close_fee=close_fee,
         close_quantity=close_quantity,
         entry_quantity=entry_quantity,
+        quantity_match_source=unit_source,
+        quantity_mismatch=quantity_mismatch,
+        source=source,
     )
+
+
+def _linked_fill_unit_sums(rows: list[OkxLinkedFillRow]) -> dict[str, float]:
+    base_quantity = sum(max(_safe_float(row.quantity, 0.0) or 0.0, 0.0) for row in rows)
+    contracts = sum(max(_safe_float(row.contracts, 0.0) or 0.0, 0.0) for row in rows)
+    if contracts <= 0:
+        contracts = sum(
+            (
+                max(_safe_float(row.quantity, 0.0) or 0.0, 0.0)
+                / max(_safe_float(row.contract_size, 0.0) or 0.0, 1.0)
+            )
+            for row in rows
+            if (_safe_float(row.contract_size, 0.0) or 0.0) > 0
+        )
+    return {
+        "base_quantity": base_quantity,
+        "contracts": contracts,
+    }
+
+
+def _best_pnl_quantity_units(
+    *,
+    closed_quantity: float,
+    close_units: dict[str, float],
+    entry_units: dict[str, float],
+) -> tuple[float, float, str, bool]:
+    """Choose the quantity unit used to allocate entry fee for OKX PnL."""
+
+    closed_quantity = max(_safe_float(closed_quantity, 0.0) or 0.0, 0.0)
+    candidates = (
+        (
+            "base_quantity",
+            max(close_units.get("base_quantity", 0.0), 0.0),
+            max(entry_units.get("base_quantity", 0.0), 0.0),
+        ),
+        (
+            "contracts",
+            max(close_units.get("contracts", 0.0), 0.0),
+            max(entry_units.get("contracts", 0.0), 0.0),
+        ),
+    )
+    for name, close_quantity_value, entry_quantity_value in candidates:
+        if (
+            closed_quantity > 0
+            and close_quantity_value > 0
+            and _quantities_match(close_quantity_value, closed_quantity, tolerance_ratio=0.02)
+        ):
+            return close_quantity_value, entry_quantity_value, name, False
+
+    for name, close_quantity_value, entry_quantity_value in candidates:
+        if close_quantity_value > 0 and entry_quantity_value > 0:
+            return close_quantity_value, entry_quantity_value, name, True
+
+    for name, close_quantity_value, entry_quantity_value in candidates:
+        if close_quantity_value > 0:
+            return close_quantity_value, entry_quantity_value, name, True
+
+    return closed_quantity, 0.0, "position_quantity", True
 
 
 def _funding_fee_components_for_group(

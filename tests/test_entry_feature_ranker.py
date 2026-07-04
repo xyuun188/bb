@@ -120,6 +120,9 @@ def test_entry_feature_ranker_rejects_missing_indicator_snapshot_without_fallbac
     ranker = _ranker()
     missing = _feature(
         "SOL/USDT",
+        current_price=0.0,
+        close=0.0,
+        volume_24h=0.0,
         volume_ratio=1.0,
         adx_14=20.0,
         indicator_snapshot_available=False,
@@ -141,9 +144,40 @@ def test_entry_feature_ranker_rejects_missing_indicator_snapshot_without_fallbac
     reason_counts = {
         item["reason"]: item["count"] for item in result.diagnostics["filtered_out_reason_counts"]
     }
-    assert reason_counts["missing_indicator_snapshot"] == 1
+    assert reason_counts["missing_market_anchor_snapshot"] == 1
     filtered = result.diagnostics["filtered_symbol_sample"][0]
-    assert filtered["filter_reasons"] == ["missing_indicator_snapshot"]
+    assert filtered["filter_reasons"] == ["missing_market_anchor_snapshot"]
+
+
+def test_entry_feature_ranker_analyzes_missing_indicator_when_market_anchor_exists() -> None:
+    ranker = _ranker()
+    fallback = _feature(
+        "LAB/USDT",
+        current_price=2.5,
+        volume_24h=900_000.0,
+        volume_ratio=1.0,
+        adx_14=20.0,
+        change_24h_pct=-22.0,
+        indicator_snapshot_available=False,
+        technical_indicator_timeframe="",
+        short_returns_timeframe="",
+    )
+
+    result = ranker.rank(
+        {"LAB/USDT": fallback},
+        1,
+        recent_hold_penalty=lambda _symbol: 0.0,
+        recent_analysis_penalty=lambda _symbol: 0.0,
+        no_opportunity_rotation_penalty=lambda _symbol, _feature: 0.0,
+    )
+
+    assert list(result.selected) == ["LAB/USDT"]
+    assert result.diagnostics["tradable_candidates"] == 0
+    assert result.diagnostics["secondary_candidates"] == 1
+    selected = result.diagnostics["symbols"][0]
+    assert selected["selection_tier"] == "secondary_fill"
+    assert "fallback_indicator_snapshot" in selected["filter_reasons"]
+    assert selected["filter_metrics"]["indicator_snapshot_quality"] == "fallback_market_anchor"
 
 
 def test_entry_feature_ranker_uses_secondary_fill_when_hard_candidates_are_not_enough() -> None:

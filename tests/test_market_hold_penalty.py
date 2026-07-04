@@ -8,6 +8,7 @@ from services.entry_market_hold_penalty import (
     MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS,
     MARKET_RECENT_ANALYSIS_MAX_PENALTY,
     MARKET_RECENT_HOLD_MAX_PENALTY,
+    MARKET_RECENT_LOSS_MAX_PENALTY,
     EntryMarketHoldPenaltyPolicy,
 )
 from services.trading_service import TradingService
@@ -59,6 +60,55 @@ def test_recent_hold_penalty_is_capped_and_decays() -> None:
     penalty = policy.recent_hold_penalty("BTC/USDT")
 
     assert 0 < penalty < MARKET_RECENT_HOLD_MAX_PENALTY
+
+
+def test_recent_loss_profiles_create_front_rank_rotation_penalty() -> None:
+    clock = Clock(datetime(2026, 6, 10, 10, 0, tzinfo=UTC))
+    policy = _policy(clock)
+
+    policy.sync_recent_loss_profiles(
+        {
+            "LINK/USDT|all": {
+                "cooldown": True,
+                "pnl": -3.2,
+                "loss": 3.2,
+                "today_loss": 1.0,
+                "largest_loss": 2.0,
+                "cooldown_remaining_hours": 0.5,
+                "cooldown_reason": "recent_realized_loss",
+            }
+        }
+    )
+
+    penalty = policy.recent_hold_penalty("link/usdt")
+
+    assert 0 < penalty <= MARKET_RECENT_LOSS_MAX_PENALTY
+    assert policy.recent_loss_symbols["LINK/USDT"]["reason"] == "recent_realized_loss"
+
+
+def test_recent_loss_penalty_decays_and_expires() -> None:
+    clock = Clock(datetime(2026, 6, 10, 10, 0, tzinfo=UTC))
+    policy = _policy(clock)
+    policy.sync_recent_loss_profiles(
+        {
+            "LINK/USDT|short": {
+                "cooldown": True,
+                "pnl": -2.0,
+                "loss": 2.0,
+                "cooldown_remaining_hours": 1.0,
+            }
+        }
+    )
+    initial_penalty = policy.recent_loss_penalty("LINK/USDT")
+
+    clock.now += timedelta(minutes=30)
+    decayed_penalty = policy.recent_loss_penalty("LINK/USDT")
+    clock.now += timedelta(minutes=31)
+    expired_penalty = policy.recent_loss_penalty("LINK/USDT")
+
+    assert 0 < decayed_penalty < initial_penalty
+    assert expired_penalty == 0.0
+    assert "LINK/USDT" not in policy.recent_loss_symbols
 
 
 def test_recent_analysis_penalty_is_capped_and_decays() -> None:
@@ -136,3 +186,22 @@ def test_trading_service_market_hold_penalty_delegates_to_policy() -> None:
     assert service._recent_market_hold_penalty("BTC/USDT") > 0.0
     service._clear_market_no_opportunity_symbol("BTC/USDT")
     assert service._recent_market_hold_penalty("BTC/USDT") == 0.0
+
+
+def test_clear_symbol_removes_recent_loss_rotation_penalty() -> None:
+    clock = Clock(datetime(2026, 6, 10, 10, 0, tzinfo=UTC))
+    policy = _policy(clock)
+    policy.sync_recent_loss_profiles(
+        {
+            "LINK/USDT|all": {
+                "cooldown": True,
+                "pnl": -2.0,
+                "loss": 2.0,
+                "cooldown_remaining_hours": 1.0,
+            }
+        }
+    )
+
+    policy.clear_symbol("LINK/USDT")
+
+    assert policy.recent_loss_penalty("LINK/USDT") == 0.0

@@ -18,6 +18,8 @@ MARKET_NO_OPPORTUNITY_STREAK_THRESHOLD = 2
 MARKET_NO_OPPORTUNITY_MAX_PENALTY = 240.0
 MARKET_RECENT_HOLD_DECAY_MINUTES = 45.0
 MARKET_RECENT_HOLD_MAX_PENALTY = 42.0
+MARKET_RECENT_LOSS_DEFAULT_DECAY_MINUTES = 75.0
+MARKET_RECENT_LOSS_MAX_PENALTY = 180.0
 MARKET_RECENT_ANALYSIS_DECAY_MINUTES = 30.0
 MARKET_RECENT_ANALYSIS_DEDUPE_SECONDS = 75.0
 MARKET_RECENT_ANALYSIS_MAX_PENALTY = 18.0
@@ -47,6 +49,7 @@ class EntryMarketHoldPenaltyPolicy:
     min_entry_adx_provider: FloatProvider
     now_provider: DatetimeProvider = _utcnow
     recent_hold_symbols: dict[str, datetime] = field(default_factory=dict)
+    recent_loss_symbols: dict[str, dict[str, Any]] = field(default_factory=dict)
     no_opportunity_symbols: dict[str, dict[str, Any]] = field(default_factory=dict)
     recent_analyzed_symbols: dict[str, datetime] = field(default_factory=dict)
 
@@ -123,19 +126,73 @@ class EntryMarketHoldPenaltyPolicy:
         if normalized:
             self.no_opportunity_symbols.pop(normalized, None)
             self.recent_hold_symbols.pop(normalized, None)
+            self.recent_loss_symbols.pop(normalized, None)
+
+    def sync_recent_loss_profiles(self, profiles: dict[str, Any] | None) -> None:
+        if not isinstance(profiles, dict):
+            return
+        now = self.now_provider()
+        active_symbols: set[str] = set()
+        for key, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            symbol = self._symbol_from_profile_key(str(key or ""))
+            normalized = self._normalized(symbol)
+            if not normalized or not self._profile_has_recent_loss_pressure(profile):
+                continue
+            remaining_minutes = self._profile_cooldown_remaining_minutes(profile)
+            loss = abs(_safe_float(profile.get("loss"), 0.0))
+            today_loss = abs(_safe_float(profile.get("today_loss"), 0.0))
+            largest_loss = abs(_safe_float(profile.get("largest_loss"), 0.0))
+            severity = min(max(loss + today_loss + largest_loss, 0.0) / 5.0, 1.0)
+            self.recent_loss_symbols[normalized] = {
+                "last_seen_at": now,
+                "expires_at": now + timedelta(minutes=remaining_minutes),
+                "penalty": MARKET_RECENT_LOSS_MAX_PENALTY * max(severity, 0.35),
+                "reason": str(profile.get("cooldown_reason") or "")[:220],
+                "loss": loss,
+                "today_loss": today_loss,
+                "largest_loss": largest_loss,
+            }
+            active_symbols.add(normalized)
+        self.recent_loss_symbols = {
+            symbol: state
+            for symbol, state in self.recent_loss_symbols.items()
+            if symbol in active_symbols or self._recent_loss_state_active(state, now)
+        }
 
     def recent_hold_penalty(self, symbol: str) -> float:
         normalized = self._normalized(symbol)
         seen_at = self.recent_hold_symbols.get(normalized or "")
+        loss_penalty = self.recent_loss_penalty(symbol)
         if not seen_at:
-            return 0.0
+            return loss_penalty
         age_minutes = (self.now_provider() - seen_at).total_seconds() / 60.0
         if age_minutes >= MARKET_RECENT_HOLD_DECAY_MINUTES:
-            return 0.0
-        return max(
+            return loss_penalty
+        hold_penalty = max(
             0.0,
             MARKET_RECENT_HOLD_MAX_PENALTY * (1.0 - age_minutes / MARKET_RECENT_HOLD_DECAY_MINUTES),
         )
+        return max(hold_penalty, loss_penalty)
+
+    def recent_loss_penalty(self, symbol: str) -> float:
+        normalized = self._normalized(symbol)
+        state = self.recent_loss_symbols.get(normalized or "")
+        if not isinstance(state, dict):
+            return 0.0
+        now = self.now_provider()
+        if not self._recent_loss_state_active(state, now):
+            self.recent_loss_symbols.pop(normalized or "", None)
+            return 0.0
+        expires_at = state.get("expires_at")
+        last_seen_at = state.get("last_seen_at")
+        if not isinstance(expires_at, datetime) or not isinstance(last_seen_at, datetime):
+            return 0.0
+        total_seconds = max((expires_at - last_seen_at).total_seconds(), 1.0)
+        remaining_seconds = max((expires_at - now).total_seconds(), 0.0)
+        decay = min(max(remaining_seconds / total_seconds, 0.0), 1.0)
+        return max(_safe_float(state.get("penalty"), 0.0), 0.0) * decay
 
     def recent_analysis_penalty(self, symbol: str) -> float:
         normalized = self._normalized(symbol)
@@ -309,3 +366,38 @@ class EntryMarketHoldPenaltyPolicy:
             ),
             "adx_14": _safe_float(getattr(feature_vector, "adx_14", 0.0), 0.0),
         }
+
+    @staticmethod
+    def _symbol_from_profile_key(key: str) -> str:
+        if "|" not in key:
+            return key.strip()
+        symbol, _side = key.split("|", 1)
+        return symbol.strip()
+
+    @staticmethod
+    def _profile_has_recent_loss_pressure(profile: dict[str, Any]) -> bool:
+        if not bool(profile.get("cooldown")):
+            return False
+        if _safe_float(profile.get("pnl"), 0.0) < 0:
+            return True
+        return any(
+            _safe_float(profile.get(field), 0.0) > 0.0
+            for field in ("loss", "today_loss", "largest_loss")
+        )
+
+    @staticmethod
+    def _profile_cooldown_remaining_minutes(profile: dict[str, Any]) -> float:
+        remaining_hours = _safe_float(profile.get("cooldown_remaining_hours"), 0.0)
+        if remaining_hours > 0:
+            return max(remaining_hours * 60.0, 1.0)
+        last_loss_age_hours = _safe_float(profile.get("last_loss_age_hours"), 0.0)
+        remaining = MARKET_RECENT_LOSS_DEFAULT_DECAY_MINUTES - max(
+            last_loss_age_hours * 60.0,
+            0.0,
+        )
+        return max(remaining, 1.0)
+
+    @staticmethod
+    def _recent_loss_state_active(state: dict[str, Any], now: datetime) -> bool:
+        expires_at = state.get("expires_at")
+        return isinstance(expires_at, datetime) and expires_at > now

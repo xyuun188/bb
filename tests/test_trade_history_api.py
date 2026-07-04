@@ -412,6 +412,178 @@ async def test_dashboard_position_history_prefers_confirmed_okx_close_fill_net_p
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_uses_okx_contract_units_when_local_quantity_differs(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-contract-unit-pnl.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 3, 18, 16, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 3, 18, 21, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "PEPE/USDT",
+                    "side": "short",
+                    "quantity": 1.8,
+                    "entry_price": 0.00000257,
+                    "current_price": 0.00000257,
+                    "leverage": 1.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.0,
+                    "is_open": False,
+                    "okx_inst_id": "PEPE-USDT-SWAP",
+                    "entry_exchange_order_id": "pepe-entry",
+                    "close_exchange_order_id": "pepe-close",
+                    "closed_at": closed_at,
+                    "created_at": opened_at,
+                }
+            )
+            for order_id, side, fee, fill_pnl, ts in (
+                ("pepe-entry", "sell", 0.023094, 0.0, opened_at),
+                ("pepe-close", "buy", 0.023166, -0.144, closed_at),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "ensemble_trader",
+                        "execution_mode": "paper",
+                        "symbol": "PEPE/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": 18_000_000.0,
+                        "price": 0.00000257,
+                        "status": "filled",
+                        "fee": fee,
+                        "exchange_order_id": order_id,
+                        "filled_at": ts,
+                        "created_at": ts,
+                        "okx_inst_id": "PEPE-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": 1.8,
+                        "okx_fill_pnl": fill_pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "PEPE-USDT-SWAP",
+                            "contracts": 1.8,
+                            "base_quantity": 18_000_000.0,
+                            "avg_price": 0.00000257,
+                            "fee_abs": fee,
+                            "fill_pnl": fill_pnl,
+                            "timestamp": ts.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    row = payload["positions"][0]
+    assert row["realized_pnl"] == pytest.approx(-0.19026)
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
+    assert row["evidence_complete"] is True
+    assert "okx_fill_position_quantity_mismatch" not in row["evidence_gaps"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_position_history_prefers_okx_net_pnl_for_fragment_quantity_mismatch(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-fragment-pnl.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 2, 1, 14, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 3, 11, 47, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "YFI/USDT",
+                    "side": "short",
+                    "quantity": 0.0781,
+                    "entry_price": 1758.0,
+                    "current_price": 1810.0,
+                    "leverage": 1.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": -4.2005304,
+                    "is_open": False,
+                    "okx_inst_id": "YFI-USDT-SWAP",
+                    "entry_exchange_order_id": "yfi-entry",
+                    "close_exchange_order_id": "yfi-close",
+                    "closed_at": closed_at,
+                    "created_at": opened_at,
+                }
+            )
+            for order_id, side, price, fee, fill_pnl, ts in (
+                ("yfi-entry", "sell", 1758.0, 0.1372998, 0.0, opened_at),
+                ("yfi-close", "buy", 1810.0, 0.141361, -8.1224, closed_at),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "ensemble_trader",
+                        "execution_mode": "paper",
+                        "symbol": "YFI/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": 0.1562,
+                        "price": price,
+                        "status": "filled",
+                        "fee": fee,
+                        "exchange_order_id": order_id,
+                        "filled_at": ts,
+                        "created_at": ts,
+                        "okx_inst_id": "YFI-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": 1562.0,
+                        "okx_fill_pnl": fill_pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "YFI-USDT-SWAP",
+                            "contracts": 1562.0,
+                            "base_quantity": 0.1562,
+                            "avg_price": price,
+                            "fee_abs": fee,
+                            "fill_pnl": fill_pnl,
+                            "timestamp": ts.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    row = payload["positions"][0]
+    assert row["realized_pnl"] == pytest.approx(-8.4010608)
+    assert row["pnl_source"] == "okx_linked_order_net_pnl"
+    assert row["evidence_complete"] is False
+    assert "okx_fill_position_quantity_mismatch" in row["evidence_gaps"]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fills(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -3765,6 +3765,22 @@ class TradingService:
             fv,
         )
 
+    def _sync_market_recent_loss_profiles(self, profiles: dict[str, Any] | None) -> None:
+        if not isinstance(profiles, dict) or not profiles:
+            return
+        policy = getattr(self, "entry_market_hold_penalty", None)
+        if policy is None:
+            if not hasattr(self, "_normalize_position_symbol"):
+                return
+            policy = self._entry_market_hold_penalty_policy()
+        try:
+            policy.sync_recent_loss_profiles(profiles)
+        except Exception as exc:
+            logger.warning(
+                "failed to sync market recent loss profiles",
+                error=safe_error_text(exc),
+            )
+
     def _entry_market_regime_context_policy(self) -> EntryMarketRegimeContextPolicy:
         policy = getattr(self, "entry_market_regime_context", None)
         if policy is not None:
@@ -3940,6 +3956,7 @@ class TradingService:
             account_equity=account_equity,
             account_config=settings.get_execution_account_config(selected_mode),
         )
+        self._sync_market_recent_loss_profiles(symbol_side_perf)
         context["account_equity"] = account_equity
         if _analysis_scope_context.get() == "market":
             context["account_equity_source"] = getattr(
