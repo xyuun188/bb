@@ -1087,6 +1087,142 @@ async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
 
 
 @pytest.mark.asyncio
+async def test_position_history_rebuilds_reused_posid_from_confirmed_order_lifecycles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'lab-reused-posid-ledger.db').as_posix()}",
+    )
+    await init_db()
+    pos_id = "lab-reused-pos"
+    first_open_a = datetime(2026, 7, 4, 9, 18, 29, tzinfo=UTC)
+    first_open_b = datetime(2026, 7, 4, 9, 25, 32, tzinfo=UTC)
+    first_close_a = datetime(2026, 7, 4, 9, 30, 30, tzinfo=UTC)
+    first_close_b = datetime(2026, 7, 4, 9, 32, 17, tzinfo=UTC)
+    first_close_c = datetime(2026, 7, 4, 9, 33, 57, tzinfo=UTC)
+    second_open = datetime(2026, 7, 4, 9, 34, 38, tzinfo=UTC)
+    second_close = datetime(2026, 7, 4, 9, 39, 37, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            for row in (
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "quantity": 1.9,
+                    "entry_price": 9.69473684,
+                    "current_price": 8.97,
+                    "realized_pnl": 1.176,
+                    "entry_exchange_order_id": "lab-entry-a",
+                    "close_exchange_order_id": "lab-close-a",
+                    "created_at": first_open_a,
+                    "closed_at": first_close_a,
+                },
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "quantity": 16.0,
+                    "entry_price": 9.67694678,
+                    "current_price": 8.7,
+                    "realized_pnl": 14.845,
+                    "entry_exchange_order_id": "lab-entry-b",
+                    "close_exchange_order_id": "lab-close-b",
+                    "created_at": first_open_a,
+                    "closed_at": first_close_b,
+                },
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "quantity": 40.1,
+                    "entry_price": 8.48,
+                    "current_price": 8.71,
+                    "realized_pnl": -9.075,
+                    "entry_exchange_order_id": "lab-entry-b,lab-entry-c",
+                    "close_exchange_order_id": "lab-close-d",
+                    "created_at": second_open,
+                    "closed_at": second_close,
+                },
+            ):
+                await repo.open_position(
+                    {
+                        "execution_mode": "paper",
+                        "symbol": "LAB/USDT",
+                        "side": "short",
+                        "leverage": 1.0,
+                        "unrealized_pnl": 0.0,
+                        "is_open": False,
+                        "okx_inst_id": "LAB-USDT-SWAP",
+                        "okx_pos_id": pos_id,
+                        **row,
+                    }
+                )
+
+            for order_id, side, quantity, price, fee, ts, pnl in (
+                ("lab-entry-a", "sell", 1.9, 9.69473684, 0.00921, first_open_a, 0.0),
+                ("lab-entry-b", "sell", 35.7, 9.67694678, 0.1727335, first_open_b, 0.0),
+                ("lab-close-a", "buy", 1.9, 8.97, 0.0085215, first_close_a, 1.34490691),
+                ("lab-close-b", "buy", 16.0, 8.7, 0.0696, first_close_b, 15.64553191),
+                ("lab-close-c", "buy", 19.7, 8.03, 0.0790955, first_close_c, 32.46256117),
+                ("lab-entry-c", "sell", 40.1, 8.48, 0.0680096, second_open, 0.0),
+                ("lab-close-d", "buy", 40.1, 8.71, 0.1746355, second_close, -9.223),
+            ):
+                raw_fills = {
+                    "order_id": order_id,
+                    "trade_ids": [f"trade-{order_id}"],
+                    "inst_id": "LAB-USDT-SWAP",
+                    "contracts": quantity * 10.0,
+                    "contract_size": 0.1,
+                    "base_quantity": quantity,
+                    "avg_price": price,
+                    "fee_abs": fee,
+                    "fill_pnl": pnl,
+                    "timestamp": ts.isoformat(),
+                    "fills_history_confirmed": True,
+                }
+                await repo.create_order(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "LAB/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": quantity,
+                        "price": price,
+                        "status": "filled",
+                        "fee": fee,
+                        "exchange_order_id": order_id,
+                        "filled_at": ts,
+                        "created_at": ts,
+                        "okx_inst_id": "LAB-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": quantity * 10.0,
+                        "okx_fill_pnl": pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": raw_fills,
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    lab_rows = [row for row in payload["positions"] if row["symbol"] == "LAB/USDT"]
+    assert len(lab_rows) == 2
+    by_close = {tuple(row["close_order_ids"]): row for row in lab_rows}
+    first = by_close[("lab-close-a", "lab-close-b", "lab-close-c")]
+    second = by_close[("lab-close-d",)]
+    assert first["quantity"] == pytest.approx(37.6)
+    assert first["realized_pnl"] == pytest.approx(
+        1.34490691 + 15.64553191 + 32.46256117 - 0.00921 - 0.1727335 - 0.0085215 - 0.0696 - 0.0790955
+    )
+    assert first["linked_order_count"] == 5
+    assert second["quantity"] == pytest.approx(40.1)
+    assert second["realized_pnl"] == pytest.approx(-9.223 - 0.0680096 - 0.1746355)
+    assert second["linked_order_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_trade_positions_api_groups_closed_positions_with_okx_ledger(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

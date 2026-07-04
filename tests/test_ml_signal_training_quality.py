@@ -1202,6 +1202,96 @@ def test_ml_signal_status_marks_ready_only_when_all_readiness_metrics_pass() -> 
     assert status["readiness"]["metrics"]["long_pr_auc"] == 0.58
 
 
+def test_ml_signal_status_allows_directional_partial_live_influence() -> None:
+    service = _service_with_metadata(
+        {
+            "version": datetime.now(UTC).isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
+            "sample_count": 1200,
+            "test_count": 240,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+            },
+            "metrics": {
+                "long_auc": 0.64,
+                "short_auc": 0.55,
+                "long_pr_auc": 0.61,
+                "short_pr_auc": 0.42,
+                "long_accuracy": 0.62,
+                "short_accuracy": 0.51,
+                "top_long_avg_return_pct": 0.22,
+                "bottom_long_avg_return_pct": -0.03,
+                "top_short_avg_return_pct": -0.08,
+                "bottom_short_avg_return_pct": -0.02,
+                "top_long_win_rate": 0.75,
+                "bottom_long_win_rate": 0.38,
+                "top_short_win_rate": 0.42,
+                "bottom_short_win_rate": 0.51,
+            },
+        }
+    )
+
+    status = service.status()
+
+    assert status["readiness_state"] == "partial_ready"
+    assert status["status"] == "ready"
+    assert status["allow_live_position_influence"] is True
+    assert status["readiness"]["live_enabled_sides"] == ["long"]
+    assert status["readiness"]["blocking_reasons"] == []
+    short_codes = {
+        item["code"] for item in status["readiness"]["side_blocking_reasons"]["short"]
+    }
+    assert "short_pr_auc_below_threshold" in short_codes
+    assert "short_top_return_not_above_bottom" in short_codes
+
+
+def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> None:
+    metadata = {
+        "version": datetime.now(UTC).isoformat(),
+        "trained_at": datetime.now(UTC).isoformat(),
+        "sample_count": 1200,
+        "test_count": 240,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+        },
+        "metrics": {
+            "long_auc": 0.64,
+            "short_auc": 0.55,
+            "long_pr_auc": 0.61,
+            "short_pr_auc": 0.42,
+            "long_accuracy": 0.62,
+            "short_accuracy": 0.51,
+            "top_long_avg_return_pct": 0.22,
+            "bottom_long_avg_return_pct": -0.03,
+            "top_short_avg_return_pct": -0.08,
+            "bottom_short_avg_return_pct": -0.02,
+            "top_long_win_rate": 0.75,
+            "bottom_long_win_rate": 0.38,
+            "top_short_win_rate": 0.42,
+            "bottom_short_win_rate": 0.51,
+        },
+    }
+    service = _service_with_metadata(metadata)
+    service._bundle.update(
+        {
+            "long_classifier": _Classifier(0.84),
+            "short_classifier": _Classifier(0.20),
+            "long_regressor": _Regressor(0.24),
+            "short_regressor": _Regressor(0.02),
+        }
+    )
+
+    prediction = service.predict({"current_price": 100.0, "atr_14": 1.0}, horizons=(10,))
+
+    assert prediction["readiness_state"] == "partial_ready"
+    assert prediction["allow_live_position_influence"] is True
+    assert prediction["predictions"][0]["best_side"] == "long"
+    assert prediction["predictions"][0]["ml_influence_enabled"] is True
+    assert prediction["predictions"][0]["profit_signal"] is True
+
+
 def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_influence() -> None:
     stale_quality_metadata = {
         "version": datetime.now(UTC).isoformat(),

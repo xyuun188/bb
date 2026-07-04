@@ -2511,6 +2511,19 @@ class TradingService:
     ) -> float | None:
         """Return allocated order balance through an explicit execution boundary."""
 
+        selected_mode = "live" if model_mode == "live" else "paper"
+        if _analysis_scope_context.get() == "market":
+            cached_snapshot = self.peek_okx_balance_snapshot_for_mode(selected_mode)
+            if cached_snapshot:
+                return max(tradeable_balance_from_snapshot(cached_snapshot), 0.0)
+            self._schedule_okx_balance_snapshot_refresh_for_new_pair_pause(selected_mode)
+            logger.warning(
+                "market entry sizing skipped fresh OKX balance pull because cache is cold",
+                mode=selected_mode,
+                symbol=getattr(decision, "symbol", None),
+                policy="background_refresh_and_no_order_until_balance_cache",
+            )
+            return 0.0
         return await self.account_accounting_service.allocated_order_balance(
             model_mode,
             decision,
@@ -9204,6 +9217,37 @@ class TradingService:
                 return cfg.get("execution_mode", "paper")
         return "paper"
 
+    def _okx_balance_snapshot_for_new_pair_pause_context(
+        self,
+        model_mode: str,
+    ) -> dict[str, Any] | None:
+        """Use only cached OKX balance for scan-pause checks.
+
+        A cold or slow OKX balance request must not turn into a global
+        market-scan pause. Execution sizing and order submission still fetch or
+        validate balance before any real order can be sent.
+        """
+
+        try:
+            return self.peek_okx_balance_snapshot_for_mode(model_mode, allow_stale=True)
+        except Exception as exc:
+            logger.warning(
+                "failed to read cached OKX balance snapshot for new-pair pause context",
+                mode=model_mode,
+                error=safe_error_text(exc),
+            )
+            return None
+
+    def _schedule_okx_balance_snapshot_refresh_for_new_pair_pause(self, model_mode: str) -> None:
+        try:
+            self._schedule_okx_balance_snapshot_refresh(model_mode)
+        except Exception as exc:
+            logger.debug(
+                "failed to schedule OKX balance refresh for new-pair pause context",
+                mode=model_mode,
+                error=safe_error_text(exc),
+            )
+
     async def _new_pair_analysis_pause_reason(
         self,
         model_name: str,
@@ -9249,11 +9293,16 @@ class TradingService:
         open_positions: list[dict],
     ) -> str | None:
         account_cfg = settings.get_execution_account_config(model_mode)
-        okx_snapshot = await self._get_okx_balance_snapshot_for_mode(model_mode)
+        okx_snapshot = self._okx_balance_snapshot_for_new_pair_pause_context(model_mode)
         if not okx_snapshot:
-            reason = "未获取到 OKX 可用余额快照，暂停分析新的交易对。"
-            self._remember_new_pair_pause_context_reason(cache_key, reason)
-            return reason
+            self._schedule_okx_balance_snapshot_refresh_for_new_pair_pause(model_mode)
+            logger.warning(
+                "OKX balance snapshot unavailable for scan pause check; market scan continues",
+                mode=model_mode,
+                policy="advisory_cache_miss_execution_gate_will_recheck",
+            )
+            self._remember_new_pair_pause_context_reason(cache_key, None)
+            return None
         okx_available = tradeable_balance_from_snapshot(okx_snapshot)
         okx_allocatable = allocatable_balance_from_snapshot(okx_snapshot)
         if okx_allocatable <= 0:

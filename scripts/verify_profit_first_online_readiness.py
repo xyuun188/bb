@@ -203,6 +203,10 @@ def _remote_validation_command(remote_app_dir: str) -> str:
         )
 
         gate = go_no_go.get("go_no_go") if isinstance(go_no_go.get("go_no_go"), dict) else {{}}
+        runtime_can_attempt_orders = (
+            service_state.get("paper") == "active"
+            and control_state.get("paused") is False
+        )
         report = {{
             "report_type": "profit_first_online_readiness",
             "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -216,6 +220,16 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             "remote_app_dir": str(Path.cwd()),
             "service_state": service_state,
             "control_state": control_state,
+            "order_submission_runtime": {{
+                "paper_service_active": service_state.get("paper") == "active",
+                "dashboard_service_active": service_state.get("dashboard") == "active",
+                "control_paused": bool(control_state.get("paused")),
+                "runtime_can_attempt_orders": bool(runtime_can_attempt_orders),
+                "governance_can_submit_orders_field_scope": (
+                    "read_only_governance_report_capability; "
+                    "false here does not mean the trading runtime is unable to submit orders"
+                ),
+            }},
             "governance": {{
                 "command_returncode": governance_run["returncode"],
                 "status": governance.get("status", "unavailable"),

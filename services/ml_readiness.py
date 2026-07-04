@@ -172,9 +172,9 @@ def build_ml_readiness_report(
         age_seconds = max(((now or datetime.now(UTC)) - trained_at).total_seconds(), 0.0)
     data_quality_version = quality.get("data_quality_version")
 
-    blockers: list[dict[str, Any]] = []
+    global_blockers: list[dict[str, Any]] = []
     if sample_count < ML_READINESS_MIN_SAMPLE_COUNT:
-        blockers.append(
+        global_blockers.append(
             _reason(
                 "sample_count_below_threshold",
                 "Training sample count is below the influence threshold.",
@@ -183,7 +183,7 @@ def build_ml_readiness_report(
             )
         )
     if test_count < ML_READINESS_MIN_TEST_COUNT:
-        blockers.append(
+        global_blockers.append(
             _reason(
                 "test_count_below_threshold",
                 "Holdout test sample count is below the influence threshold.",
@@ -191,10 +191,13 @@ def build_ml_readiness_report(
                 required=ML_READINESS_MIN_TEST_COUNT,
             )
         )
-    for side in ("long", "short"):
-        blockers.extend(_side_metric_blockers(metrics, side))
+    side_blockers = {side: _side_metric_blockers(metrics, side) for side in ("long", "short")}
+    side_enabled = {
+        side: not bool(blockers) and bool(_safe_dict(influence.get(side)).get("enabled", True))
+        for side, blockers in side_blockers.items()
+    }
     if dirty_ratio > ML_READINESS_MAX_DIRTY_SAMPLE_RATIO:
-        blockers.append(
+        global_blockers.append(
             _reason(
                 "dirty_sample_ratio_high",
                 "Excluded/downweighted sample ratio is too high for live influence.",
@@ -203,7 +206,7 @@ def build_ml_readiness_report(
             )
         )
     if data_quality_version != DATA_QUALITY_VERSION:
-        blockers.append(
+        global_blockers.append(
             _reason(
                 "training_data_version_stale",
                 "Model was trained with an older data-quality contract.",
@@ -212,7 +215,7 @@ def build_ml_readiness_report(
             )
         )
     if age_seconds is None or age_seconds > ML_READINESS_MAX_MODEL_AGE_SECONDS:
-        blockers.append(
+        global_blockers.append(
             _reason(
                 "model_stale",
                 "Model is too old or missing a valid trained_at timestamp.",
@@ -221,6 +224,19 @@ def build_ml_readiness_report(
             )
         )
 
+    live_enabled_sides = [side for side, enabled in side_enabled.items() if enabled]
+    partial_live_influence_allowed = bool(
+        not global_blockers and live_enabled_sides and influence.get("enabled")
+    )
+    blockers = (
+        global_blockers
+        if partial_live_influence_allowed
+        else [
+            *global_blockers,
+            *side_blockers["long"],
+            *side_blockers["short"],
+        ]
+    )
     maturity_blocked = any(
         item["code"]
         in {
@@ -231,8 +247,8 @@ def build_ml_readiness_report(
         }
         for item in blockers
     )
-    if not blockers and influence.get("enabled"):
-        state = "ready"
+    if partial_live_influence_allowed:
+        state = "ready" if len(live_enabled_sides) == 2 else "partial_ready"
     elif maturity_blocked:
         state = "learning_only"
     elif blockers:
@@ -254,7 +270,9 @@ def build_ml_readiness_report(
     )
     return {
         "state": state,
-        "allow_live_position_influence": state == "ready",
+        "allow_live_position_influence": partial_live_influence_allowed,
+        "live_enabled_sides": live_enabled_sides,
+        "side_blocking_reasons": side_blockers,
         "blocking_reasons": blockers,
         "next_training_conditions": {
             "min_interval_seconds": min_interval_seconds,

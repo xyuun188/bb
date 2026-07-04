@@ -937,6 +937,8 @@ class OkxAuthoritativeSyncService:
             if fill.order_id in linked_position_order_ids:
                 continue
             if fill.order_id in local_exchange_order_ids:
+                if _fill_covered_by_local_position_lifecycle(fill, local_positions):
+                    continue
                 linked_protection = _linked_protection_fill_context(
                     fill,
                     order_contexts=exchange_order_contexts,
@@ -997,6 +999,48 @@ def _linked_position_order_ids(local_positions: list[Position]) -> set[str]:
             | _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
         )
     }
+
+
+def _fill_covered_by_local_position_lifecycle(
+    fill: OkxFillGroup,
+    local_positions: list[Position],
+) -> bool:
+    order_id = str(getattr(fill, "order_id", "") or "").strip()
+    inst_id = str(getattr(fill, "inst_id", "") or "").strip().upper()
+    if not order_id or not inst_id or fill.timestamp is None:
+        return False
+    fill_time = _parse_datetime(fill.timestamp)
+    if fill_time is None:
+        return False
+    fill_side = str(getattr(fill, "side", "") or "").lower().strip()
+    symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id)
+    for position in local_positions:
+        if bool(getattr(position, "is_open", False)):
+            continue
+        position_inst_id = (
+            str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            or okx_inst_id_from_symbol(str(getattr(position, "symbol", "") or ""))
+            or ""
+        )
+        if position_inst_id != inst_id:
+            continue
+        position_symbol = normalize_trading_symbol(getattr(position, "symbol", None))
+        if position_symbol and symbol and position_symbol != symbol:
+            continue
+        opened_at = _parse_datetime(getattr(position, "created_at", None))
+        closed_at = _parse_datetime(getattr(position, "closed_at", None))
+        if opened_at is None or closed_at is None:
+            continue
+        window_start = opened_at - timedelta(seconds=180)
+        window_end = closed_at + timedelta(seconds=180)
+        if fill_time < window_start or fill_time > window_end:
+            continue
+        side = str(getattr(position, "side", "") or "").lower().strip()
+        if side == "short" and fill_side in {"sell", "buy"}:
+            return True
+        if side == "long" and fill_side in {"buy", "sell"}:
+            return True
+    return False
 
 
 def _linked_protection_fill_context(

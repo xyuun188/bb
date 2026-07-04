@@ -64,6 +64,22 @@ def _okx_clean() -> dict[str, Any]:
     }
 
 
+def _trading_runtime_clean() -> dict[str, Any]:
+    return {
+        "available": True,
+        "running": True,
+        "heartbeat_age_seconds": 12.0,
+        "decision_interval": 30,
+        "okx_authoritative_sync": {
+            "status": "ok",
+            "last_requires_attention_count": 0,
+            "last_success_age_seconds": 20.0,
+            "stale_after_seconds": 180.0,
+            "last_success_at": "2026-07-04T00:00:00+00:00",
+        },
+    }
+
+
 def _specialist() -> dict[str, Any]:
     return {
         "available": True,
@@ -119,11 +135,68 @@ def test_paper_resume_observation_blocks_on_okx_difference() -> None:
     okx["issues"] = [{"kind": "okx_open_position_missing_locally"}]
 
     report = evaluate_phase3_paper_resume_observation_inputs(
-        **_ready_inputs(okx_authoritative_sync=okx)
+        **_ready_inputs(
+            okx_authoritative_sync=okx,
+            trading_runtime_status=_trading_runtime_clean(),
+        )
     )
 
     assert report["status"] == "critical"
     assert "okx_authoritative_sync_has_post_resume_differences" in {
+        item["code"] for item in report["blockers"]
+    }
+
+
+def test_paper_resume_observation_warns_on_read_only_okx_pull_timeout_when_runtime_is_clean() -> None:
+    okx = _okx_clean()
+    okx.update(
+        {
+            "status": "warning",
+            "okx_pull_available": False,
+            "fetch_errors": ["positions: TimeoutError"],
+            "error": "TimeoutError",
+        }
+    )
+
+    report = evaluate_phase3_paper_resume_observation_inputs(
+        **_ready_inputs(
+            okx_authoritative_sync=okx,
+            trading_runtime_status=_trading_runtime_clean(),
+        )
+    )
+
+    assert report["status"] == "warming_up"
+    assert report["blockers"] == []
+    assert report["summary"]["runtime_okx_sync_clean"] is True
+    assert "okx_runtime_authoritative_sync_clean_after_resume" in report["passed_checks"]
+    assert "okx_authoritative_audit_pull_degraded_runtime_clean" in {
+        item["code"] for item in report["warnings"]
+    }
+
+
+def test_paper_resume_observation_blocks_on_okx_pull_timeout_when_runtime_is_not_clean() -> None:
+    okx = _okx_clean()
+    okx.update(
+        {
+            "status": "warning",
+            "okx_pull_available": False,
+            "fetch_errors": ["positions: TimeoutError"],
+            "error": "TimeoutError",
+        }
+    )
+    runtime = _trading_runtime_clean()
+    runtime["okx_authoritative_sync"]["status"] = "stale"
+
+    report = evaluate_phase3_paper_resume_observation_inputs(
+        **_ready_inputs(
+            okx_authoritative_sync=okx,
+            trading_runtime_status=runtime,
+        )
+    )
+
+    assert report["status"] == "critical"
+    assert report["summary"]["runtime_okx_sync_clean"] is False
+    assert "okx_authoritative_sync_unhealthy_after_resume" in {
         item["code"] for item in report["blockers"]
     }
 

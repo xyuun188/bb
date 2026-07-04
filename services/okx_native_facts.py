@@ -8,9 +8,10 @@ guards.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import Any
 
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 
@@ -127,6 +128,9 @@ class OkxNativeFactsClient:
         max_pages: int = DEFAULT_MAX_FILL_PAGES,
         account_wide_fallback: bool = True,
         account_wide_only: bool = False,
+        target_orders_first: bool = False,
+        target_orders_only: bool = False,
+        target_order_query_limit: int | None = None,
         strict: bool = False,
     ) -> list[OkxNativeFillGroup]:
         ccxt = await self.executor._get_ccxt()
@@ -157,6 +161,51 @@ class OkxNativeFactsClient:
         last_error: Exception | None = None
         successful_read = False
 
+        def append_rows(page_rows: Iterable[dict[str, Any]]) -> None:
+            for row in page_rows:
+                key = _fill_row_identity(row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+        async def fetch_target_order_rows() -> None:
+            nonlocal last_error, successful_read
+            if not target_order_ids:
+                return
+            known_order_ids = {
+                str(row.get("ordId") or row.get("order") or "").strip()
+                for row in rows
+                if str(row.get("ordId") or row.get("order") or "").strip()
+            }
+            query_limit = _target_order_query_limit(target_order_query_limit)
+            for order_id in sorted(target_order_ids - known_order_ids)[:query_limit]:
+                try:
+                    page_rows = await self._fetch_fill_history_pages(
+                        fetch_fills,
+                        {"instType": "SWAP", "ordId": order_id, "limit": str(page_limit)},
+                        since_ms=since_ms,
+                        side=side,
+                        target_inst_ids=set(),
+                        page_limit=page_limit,
+                        max_pages=page_count,
+                    )
+                    successful_read = True
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                append_rows(page_rows)
+
+        if target_orders_first or target_orders_only:
+            await fetch_target_order_rows()
+        if target_orders_only:
+            if strict and last_error is not None and not successful_read:
+                raise last_error
+            return group_okx_native_fill_rows(
+                rows,
+                symbol_normalizer=self.symbol_normalizer,
+            )
+
         for params in params_list:
             inst_id = str(params.get("instId") or "").strip().upper()
             try:
@@ -175,12 +224,7 @@ class OkxNativeFactsClient:
                 if inst_id:
                     failed_inst_ids.add(inst_id)
                 continue
-            for row in page_rows:
-                key = _fill_row_identity(row)
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(row)
+            append_rows(page_rows)
 
         if (
             account_wide_fallback
@@ -200,48 +244,18 @@ class OkxNativeFactsClient:
                 successful_read = True
             except Exception as exc:
                 if strict:
-                    raise last_error or exc
+                    error = last_error or exc
+                    raise error from exc
                 page_rows = []
-            for row in page_rows:
-                key = _fill_row_identity(row)
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(row)
+            append_rows(page_rows)
         elif strict and last_error is not None and not successful_read:
             raise last_error
 
-        if target_order_ids:
-            known_order_ids = {
-                str(row.get("ordId") or row.get("order") or "").strip()
-                for row in rows
-                if str(row.get("ordId") or row.get("order") or "").strip()
-            }
-            for order_id in sorted(target_order_ids - known_order_ids)[
-                :DEFAULT_MAX_TARGET_ORDER_QUERIES
-            ]:
-                try:
-                    page_rows = await self._fetch_fill_history_pages(
-                        fetch_fills,
-                        {"instType": "SWAP", "ordId": order_id, "limit": str(page_limit)},
-                        since_ms=since_ms,
-                        side=side,
-                        target_inst_ids=set(),
-                        page_limit=page_limit,
-                        max_pages=page_count,
-                    )
-                    successful_read = True
-                except Exception as exc:
-                    last_error = exc
-                    if strict and not successful_read:
-                        raise
-                    continue
-                for row in page_rows:
-                    key = _fill_row_identity(row)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    rows.append(row)
+        if not target_orders_first:
+            await fetch_target_order_rows()
+
+        if strict and last_error is not None and not successful_read:
+            raise last_error
 
         return group_okx_native_fill_rows(
             rows,
@@ -1249,6 +1263,12 @@ def _limit(value: int) -> int:
 
 def _max_pages(value: int) -> int:
     return max(1, min(int(value or DEFAULT_MAX_FILL_PAGES), 20))
+
+
+def _target_order_query_limit(value: int | None) -> int:
+    if value is None:
+        return DEFAULT_MAX_TARGET_ORDER_QUERIES
+    return max(1, min(int(value or 1), DEFAULT_MAX_TARGET_ORDER_QUERIES))
 
 
 def _oldest_timestamp_ms(rows: Iterable[dict[str, Any]]) -> float:

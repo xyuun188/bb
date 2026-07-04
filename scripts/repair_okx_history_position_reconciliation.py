@@ -23,6 +23,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
+
 from sqlalchemy import select  # noqa: E402
 
 from core.symbols import normalize_trading_symbol  # noqa: E402
@@ -283,7 +291,7 @@ def _json_safe(value: Any) -> Any:
 async def backup_repairs(repairs: list[RepairItem], backup_dir: Path = BACKUP_DIR) -> Path | None:
     if not repairs:
         return None
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(backup_dir.mkdir, parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     path = backup_dir / f"positions-before-okx-history-repair-{timestamp}.jsonl"
     rows = []
@@ -318,8 +326,10 @@ async def backup_repairs(repairs: list[RepairItem], backup_dir: Path = BACKUP_DI
                     "planned_repair": _report_item(item),
                 }
             )
-    path.write_text(
-        "\n".join(json.dumps(_json_safe(row), ensure_ascii=False) for row in rows) + "\n",
+    content = "\n".join(json.dumps(_json_safe(row), ensure_ascii=False) for row in rows) + "\n"
+    await asyncio.to_thread(
+        path.write_text,
+        content,
         encoding="utf-8",
     )
     return path

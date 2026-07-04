@@ -114,6 +114,47 @@ class _FillTimeoutExecutor(_FakeExecutor):
         return _SlowFillCcxt()
 
 
+class _LifecycleCoveredFillCcxt(_FakeCcxt):
+    def __init__(self, *, timestamp_ms: int) -> None:
+        super().__init__(timestamp_ms=timestamp_ms)
+
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        assert params["instType"] == "SWAP"
+        return {
+            "data": [
+                {
+                    "ordId": "lab-partial-close",
+                    "tradeId": "lab-partial-close-trade",
+                    "instId": "LAB-USDT-SWAP",
+                    "side": "buy",
+                    "posSide": "net",
+                    "fillSz": "197",
+                    "fillPx": "8.03",
+                    "fee": "-0.0790955",
+                    "fillPnl": "32.46256117",
+                    "ts": str(self.timestamp_ms),
+                }
+            ]
+        }
+
+    async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "data": [
+                {"instId": "LAB-USDT-SWAP", "ctVal": "0.1"},
+            ]
+        }
+
+
+class _LifecycleCoveredFillExecutor(_FakeExecutor):
+    timestamp_ms = int(datetime(2026, 7, 4, 9, 33, 57, tzinfo=UTC).timestamp() * 1000)
+
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+    async def _get_ccxt(self) -> _LifecycleCoveredFillCcxt:
+        return _LifecycleCoveredFillCcxt(timestamp_ms=self.timestamp_ms)
+
+
 class _SlowOptionalStageService(OkxAuthoritativeSyncService):
     async def _fetch_order_history_contexts(
         self,
@@ -1113,6 +1154,85 @@ async def test_okx_authoritative_sync_uses_context_entry_order_outside_window(
         assert "okx_fill_not_linked_to_position" not in kinds
         assert "local_order_not_found_in_recent_okx_fills" not in kinds
         assert report["issue_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_does_not_block_lifecycle_covered_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-lifecycle-covered.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 4, 9, 18, 29, tzinfo=UTC)
+    partial_close_at = datetime(2026, 7, 4, 9, 33, 57, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 4, 9, 39, 37, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="LAB/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=19.7,
+                        price=8.03,
+                        status="filled",
+                        exchange_order_id="lab-partial-close",
+                        filled_at=partial_close_at,
+                        created_at=partial_close_at,
+                        okx_inst_id="LAB-USDT-SWAP",
+                        okx_fill_contracts=197.0,
+                        okx_sync_status="okx_confirmed",
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": "lab-partial-close",
+                            "inst_id": "LAB-USDT-SWAP",
+                            "contracts": 197.0,
+                            "contract_size": 0.1,
+                            "base_quantity": 19.7,
+                            "avg_price": 8.03,
+                            "fee_abs": 0.0790955,
+                            "fill_pnl": 32.46256117,
+                            "timestamp": partial_close_at.isoformat(),
+                        },
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="LAB/USDT",
+                        side="short",
+                        quantity=40.1,
+                        entry_price=8.48,
+                        current_price=8.71,
+                        realized_pnl=-9.4656451,
+                        is_open=False,
+                        okx_inst_id="LAB-USDT-SWAP",
+                        okx_pos_id="3712750691686252544",
+                        entry_exchange_order_id="lab-entry",
+                        close_exchange_order_id="lab-final-close",
+                        created_at=opened_at,
+                        closed_at=closed_at,
+                    ),
+                ]
+            )
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_LifecycleCoveredFillExecutor,
+        ).collect()
+
+        kinds = {issue["kind"] for issue in report["issues"]}
+        assert "okx_fill_not_linked_to_position" not in kinds
     finally:
         await close_db()
 

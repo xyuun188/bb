@@ -176,6 +176,8 @@ class _LedgerPositionFragment:
     okx_pos_id: str | None
     entry_exchange_order_id: str | None
     close_exchange_order_id: str | None
+    source_position_ids: list[int] = field(default_factory=list)
+    strict_order_lifecycle: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,10 @@ def build_okx_position_ledger_groups(
         closed_positions,
         orders_by_id,
     )
+    closed_positions = _append_confirmed_order_lifecycle_fragments(
+        closed_positions,
+        orders_by_id,
+    )
     closed_positions = [
         position
         for position in closed_positions
@@ -228,6 +234,9 @@ def build_okx_position_ledger_groups(
             or datetime.min.replace(tzinfo=UTC),
         )
         rows = _deduplicate_superseded_position_rows(rows)
+        rows = _drop_rows_superseded_by_generated_lifecycle(rows)
+        if not rows:
+            continue
         group = _build_group_from_positions(key, rows, orders_by_id, funding_bills)
         result.append(group)
     return sorted(
@@ -247,6 +256,7 @@ def _group_closed_positions_by_lifecycle(
         key=lambda item: (
             _position_base_key(item),
             _as_utc(getattr(item, "created_at", None)) or datetime.min.replace(tzinfo=UTC),
+            -len(_position_order_key(item, "close_exchange_order_id")),
             _as_utc(getattr(item, "closed_at", None)) or datetime.min.replace(tzinfo=UTC),
             int(getattr(item, "id", 0) or 0),
         ),
@@ -275,6 +285,10 @@ def _position_belongs_to_lifecycle_group(
     if position_pos_id and group_pos_ids:
         if position_pos_id not in group_pos_ids:
             return False
+        if _position_lifecycle_anchor(position) and any(
+            _position_lifecycle_anchor(row) for row in rows
+        ):
+            return _position_lifecycle_anchor_matches_group(position, rows)
         return _position_order_sets_overlap(position, rows) or _position_time_window_matches_group(
             position,
             rows,
@@ -321,6 +335,345 @@ def _position_time_window_matches_group(position: Position, rows: list[Position]
     opened_near = min(abs((opened - item).total_seconds()) for item in group_opened) <= 300
     closed_near = min(abs((closed - item).total_seconds()) for item in group_closed) <= 1800
     return bool(opened_near and closed_near)
+
+
+def _position_lifecycle_anchor(position: Position) -> tuple[str, ...]:
+    close_ids = _position_order_key(position, "close_exchange_order_id")
+    if close_ids:
+        return ("close", *close_ids)
+    entry_ids = _position_order_key(position, "entry_exchange_order_id")
+    if entry_ids:
+        return ("entry", *entry_ids)
+    return ()
+
+
+def _position_lifecycle_anchor_matches_group(
+    position: Position,
+    rows: list[Position],
+) -> bool:
+    if _is_generated_order_lifecycle_fragment(position) or any(
+        _is_generated_order_lifecycle_fragment(row) for row in rows
+    ):
+        return _generated_order_lifecycle_matches_group(position, rows)
+    anchor = _position_lifecycle_anchor(position)
+    if not anchor:
+        return _position_time_window_matches_group(position, rows)
+    position_close = set(_position_order_key(position, "close_exchange_order_id"))
+    group_close = {
+        token for row in rows for token in _position_order_key(row, "close_exchange_order_id")
+    }
+    if position_close and group_close:
+        return bool(position_close & group_close)
+    row_anchors = {_position_lifecycle_anchor(row) for row in rows}
+    if anchor in row_anchors:
+        return True
+    if _position_order_sets_overlap(position, rows):
+        return True
+    return _position_time_window_matches_group(position, rows)
+
+
+def _is_generated_order_lifecycle_fragment(position: Position) -> bool:
+    return isinstance(position, _LedgerPositionFragment) and getattr(position, "model_name", "") == "okx_authoritative_sync"
+
+
+def _generated_order_lifecycle_matches_group(position: Position, rows: list[Position]) -> bool:
+    position_close = set(_position_order_key(position, "close_exchange_order_id"))
+    group_close = {
+        token for row in rows for token in _position_order_key(row, "close_exchange_order_id")
+    }
+    if position_close and group_close:
+        return bool(position_close & group_close)
+    return _position_time_window_matches_group(position, rows)
+
+
+def _append_confirmed_order_lifecycle_fragments(
+    positions: list[Position],
+    orders_by_id: dict[str, Order],
+) -> list[Position]:
+    result: list[Position] = list(positions)
+    seen_anchors = {
+        (
+            _position_base_key(position),
+            _position_order_key(position, "entry_exchange_order_id"),
+            _position_order_key(position, "close_exchange_order_id"),
+        )
+        for position in positions
+        if _position_order_key(position, "entry_exchange_order_id")
+        and _position_order_key(position, "close_exchange_order_id")
+    }
+    for key, rows in _positions_by_base_key(positions).items():
+        side = key[2]
+        expected_entry_side = "sell" if side == "short" else "buy" if side == "long" else ""
+        expected_close_side = "buy" if side == "short" else "sell" if side == "long" else ""
+        if not expected_entry_side or not expected_close_side:
+            continue
+        relevant_orders = [
+            order
+            for order in orders_by_id.values()
+            if _order_matches_position_base(order, key) and _order_is_okx_confirmed(order)
+        ]
+        entry_orders = [
+            order
+            for order in relevant_orders
+            if str(getattr(order, "side", "") or "").lower() == expected_entry_side
+            and _order_time(order) is not None
+        ]
+        close_orders = [
+            order
+            for order in relevant_orders
+            if str(getattr(order, "side", "") or "").lower() == expected_close_side
+            and _order_time(order) is not None
+            and (_order_realized_pnl(order) is not None or _order_has_close_evidence(order))
+        ]
+        if not entry_orders or not close_orders:
+            continue
+        for fragment in _confirmed_order_lifecycle_fragments_for_base(
+            key,
+            rows,
+            entry_orders=entry_orders,
+            close_orders=close_orders,
+        ):
+            anchor = (
+                key,
+                _position_order_key(fragment, "entry_exchange_order_id"),
+                _position_order_key(fragment, "close_exchange_order_id"),
+            )
+            if anchor in seen_anchors:
+                continue
+            result.append(fragment)
+            seen_anchors.add(anchor)
+    return result
+
+
+def _positions_by_base_key(positions: list[Position]) -> dict[tuple[str, str, str], list[Position]]:
+    result: dict[tuple[str, str, str], list[Position]] = {}
+    for position in positions:
+        result.setdefault(_position_base_key(position), []).append(position)
+    return result
+
+
+def _order_matches_position_base(order: Order, key: tuple[str, str, str]) -> bool:
+    mode, symbol, _side = key
+    if str(getattr(order, "execution_mode", "") or "") != mode:
+        return False
+    order_inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+    order_symbol = symbol_from_okx_inst_id(order_inst_id) or normalize_trading_symbol(
+        getattr(order, "symbol", None)
+    )
+    return order_symbol == symbol
+
+
+def _order_is_okx_confirmed(order: Order) -> bool:
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
+    return sync_status in {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    }
+
+
+def _order_has_close_evidence(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    return bool(raw.get("fills_history_confirmed") or raw.get("execution_result_confirmed"))
+
+
+def _confirmed_order_lifecycle_fragments_for_base(
+    key: tuple[str, str, str],
+    positions: list[Position],
+    *,
+    entry_orders: list[Order],
+    close_orders: list[Order],
+) -> list[Position]:
+    side = key[2]
+    entry_side = "sell" if side == "short" else "buy" if side == "long" else ""
+    close_side = "buy" if side == "short" else "sell" if side == "long" else ""
+    if not entry_side or not close_side:
+        return []
+    order_stream = sorted(
+        [*entry_orders, *close_orders],
+        key=lambda order: _order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+    active_entries: list[Order] = []
+    active_closes: list[Order] = []
+    open_quantity = 0.0
+    max_quantity = 0.0
+    fragments: list[Position] = []
+    for order in order_stream:
+        order_side = str(getattr(order, "side", "") or "").lower()
+        quantity = _order_quantity(order)
+        if quantity <= 0:
+            continue
+        if order_side == entry_side:
+            if open_quantity <= max(quantity * 0.001, 1e-12):
+                active_entries = []
+                active_closes = []
+                open_quantity = 0.0
+                max_quantity = 0.0
+            active_entries.append(order)
+            open_quantity += quantity
+            max_quantity = max(max_quantity, open_quantity)
+            continue
+        if order_side != close_side or open_quantity <= 0:
+            continue
+        active_closes.append(order)
+        open_quantity -= min(quantity, open_quantity)
+        if open_quantity > max(max_quantity * 0.01, 1e-12):
+            continue
+        fragment = _position_fragment_from_order_lifecycle(
+            positions[0],
+            positions,
+            active_entries,
+            active_closes,
+            quantity=max_quantity,
+            okx_pos_id=_okx_pos_id_for_order_lifecycle(
+                positions,
+                entry_orders=active_entries,
+                close_orders=active_closes,
+            ),
+        )
+        if fragment is not None:
+            fragments.append(fragment)
+        active_entries = []
+        active_closes = []
+        open_quantity = 0.0
+        max_quantity = 0.0
+    return fragments
+
+
+def _position_fragment_from_order_lifecycle(
+    position: Position,
+    source_positions: list[Position],
+    entry_orders: list[Order],
+    close_orders: list[Order],
+    *,
+    quantity: float,
+    okx_pos_id: str,
+) -> Position | None:
+    if not entry_orders or not close_orders or quantity <= 0:
+        return None
+    entry_price = _weighted_average(
+        (_order_quantity(order), _safe_float(getattr(order, "price", None), 0.0))
+        for order in entry_orders
+    )
+    close_price = _weighted_average(
+        (_order_quantity(order), _safe_float(getattr(order, "price", None), 0.0))
+        for order in close_orders
+    )
+    realized_pnl = sum(_order_realized_pnl(order) or 0.0 for order in close_orders)
+    return _LedgerPositionFragment(
+        id=getattr(position, "id", None),
+        model_name="okx_authoritative_sync",
+        execution_mode=str(getattr(position, "execution_mode", "") or ""),
+        symbol=str(getattr(position, "symbol", "") or ""),
+        side=str(getattr(position, "side", "") or "").lower(),
+        quantity=quantity,
+        entry_price=entry_price or _safe_float(getattr(position, "entry_price", None), 0.0) or 0.0,
+        current_price=close_price
+        or _safe_float(getattr(position, "current_price", None), 0.0)
+        or 0.0,
+        leverage=_safe_float(getattr(position, "leverage", None), 1.0) or 1.0,
+        unrealized_pnl=0.0,
+        realized_pnl=realized_pnl,
+        is_open=False,
+        closed_at=max(
+            (_order_time(order) for order in close_orders if _order_time(order) is not None),
+            default=None,
+        ),
+        created_at=min(
+            (_order_time(order) for order in entry_orders if _order_time(order) is not None),
+            default=None,
+        ),
+        okx_inst_id=getattr(position, "okx_inst_id", None)
+        or getattr(entry_orders[0], "okx_inst_id", None)
+        or getattr(close_orders[0], "okx_inst_id", None),
+        okx_pos_id=okx_pos_id or getattr(position, "okx_pos_id", None),
+        entry_exchange_order_id=",".join(
+            str(getattr(order, "exchange_order_id", "") or "").strip()
+            for order in entry_orders
+            if str(getattr(order, "exchange_order_id", "") or "").strip()
+        )
+        or None,
+        close_exchange_order_id=",".join(
+            str(getattr(order, "exchange_order_id", "") or "").strip()
+            for order in close_orders
+            if str(getattr(order, "exchange_order_id", "") or "").strip()
+        )
+        or None,
+        source_position_ids=_source_position_ids_for_order_lifecycle(
+            source_positions,
+            entry_orders=entry_orders,
+            close_orders=close_orders,
+        ),
+        strict_order_lifecycle=True,
+    )
+
+
+def _okx_pos_id_for_order_lifecycle(
+    positions: list[Position],
+    *,
+    entry_orders: list[Order],
+    close_orders: list[Order],
+) -> str:
+    entry_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip() for order in entry_orders
+    } - {""}
+    close_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip() for order in close_orders
+    } - {""}
+    opened_at_values = [_order_time(order) for order in entry_orders]
+    closed_at_values = [_order_time(order) for order in close_orders]
+    opened_at = min((value for value in opened_at_values if value is not None), default=None)
+    closed_at = max((value for value in closed_at_values if value is not None), default=None)
+    scored: list[tuple[int, str]] = []
+    for position in positions:
+        pos_id = _position_pos_id(position)
+        if not pos_id:
+            continue
+        score = 0
+        position_entries = set(_position_order_key(position, "entry_exchange_order_id"))
+        position_closes = set(_position_order_key(position, "close_exchange_order_id"))
+        if position_entries & entry_ids:
+            score += 3
+        if position_closes & close_ids:
+            score += 3
+        position_opened = _as_utc(getattr(position, "created_at", None))
+        position_closed = _as_utc(getattr(position, "closed_at", None))
+        if opened_at and position_opened and abs((position_opened - opened_at).total_seconds()) <= 600:
+            score += 1
+        if closed_at and position_closed and abs((position_closed - closed_at).total_seconds()) <= 1800:
+            score += 1
+        if score > 0:
+            scored.append((score, pos_id))
+    if not scored:
+        return ""
+    return sorted(scored, key=lambda item: item[0], reverse=True)[0][1]
+
+
+def _source_position_ids_for_order_lifecycle(
+    positions: list[Position],
+    *,
+    entry_orders: list[Order],
+    close_orders: list[Order],
+) -> list[int]:
+    entry_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip() for order in entry_orders
+    } - {""}
+    close_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip() for order in close_orders
+    } - {""}
+    source_ids: list[int] = []
+    for position in positions:
+        row_id = getattr(position, "id", None)
+        if row_id is None:
+            continue
+        row_entries = set(_position_order_key(position, "entry_exchange_order_id"))
+        row_closes = set(_position_order_key(position, "close_exchange_order_id"))
+        if (row_entries and row_entries.issubset(entry_ids)) or (
+            row_closes and row_closes.issubset(close_ids)
+        ):
+            source_ids.append(int(row_id))
+    return _ordered_ints(source_ids)
 
 
 def _split_polluted_sequential_lifecycle_positions(
@@ -499,6 +852,11 @@ def _position_fragment_from_order_pair(
         or None,
         close_exchange_order_id=str(getattr(close_order, "exchange_order_id", "") or "").strip()
         or None,
+        source_position_ids=[
+            int(position.id)
+            for position in [position]
+            if getattr(position, "id", None) is not None
+        ],
     )
 
 
@@ -511,7 +869,8 @@ def _build_group_from_positions(
     mode, symbol, side, lifecycle_open = key
     inst_id = _position_inst_id(positions[0]) or okx_inst_id_from_symbol(symbol) or ""
     metric_positions = _metric_positions_for_group(positions)
-    position_ids = [int(pos.id) for pos in positions if getattr(pos, "id", None) is not None]
+    position_ids = _position_ids_for_group(positions)
+    order_positions = _strict_lifecycle_positions_for_group(positions) or positions
     opened_at_values = [
         _as_utc(pos.created_at) for pos in metric_positions if _as_utc(pos.created_at)
     ]
@@ -523,12 +882,12 @@ def _build_group_from_positions(
 
     entry_ids = _ordered_tokens(
         token
-        for pos in positions
+        for pos in order_positions
         for token in _split_exchange_order_ids(getattr(pos, "entry_exchange_order_id", None))
     )
     close_ids = _ordered_tokens(
         token
-        for pos in positions
+        for pos in order_positions
         for token in _split_exchange_order_ids(getattr(pos, "close_exchange_order_id", None))
     )
 
@@ -924,6 +1283,18 @@ def _deduplicate_superseded_position_rows(positions: list[Position]) -> list[Pos
     )
 
 
+def _drop_rows_superseded_by_generated_lifecycle(positions: list[Position]) -> list[Position]:
+    generated = [row for row in positions if _is_generated_order_lifecycle_fragment(row)]
+    if not generated:
+        return positions
+    return [
+        row
+        for row in positions
+        if _is_generated_order_lifecycle_fragment(row)
+        or not any(_position_supersedes(candidate, row) for candidate in generated)
+    ]
+
+
 def _metric_positions_for_group(positions: list[Position]) -> list[Position]:
     authoritative_rows = [
         position
@@ -931,6 +1302,25 @@ def _metric_positions_for_group(positions: list[Position]) -> list[Position]:
         if _is_okx_authoritative_position_history_row(position)
     ]
     return authoritative_rows or positions
+
+
+def _strict_lifecycle_positions_for_group(positions: list[Position]) -> list[Position]:
+    return [
+        position
+        for position in positions
+        if bool(getattr(position, "strict_order_lifecycle", False))
+    ]
+
+
+def _position_ids_for_group(positions: list[Position]) -> list[int]:
+    ids: list[int] = []
+    for position in positions:
+        source_ids = getattr(position, "source_position_ids", None)
+        if isinstance(source_ids, list):
+            ids.extend(int(item) for item in source_ids if item is not None)
+        elif getattr(position, "id", None) is not None:
+            ids.append(int(position.id))
+    return _ordered_ints(ids)
 
 
 def _drop_superseded_authoritative_position_rows(positions: list[Position]) -> list[Position]:
@@ -964,6 +1354,8 @@ def _authoritative_position_history_row_supersedes(
     audit evidence only and must not be summed into the ledger PnL.
     """
 
+    if _is_generated_order_lifecycle_fragment(other) and not _is_generated_order_lifecycle_fragment(candidate):
+        return False
     if not _is_okx_authoritative_position_history_row(candidate):
         return False
     if _position_base_key(candidate) != _position_base_key(other):
@@ -978,12 +1370,19 @@ def _authoritative_position_history_row_supersedes(
     candidate_close = set(_position_order_key(candidate, "close_exchange_order_id"))
     other_entry = set(_position_order_key(other, "entry_exchange_order_id"))
     other_close = set(_position_order_key(other, "close_exchange_order_id"))
+    if _is_generated_order_lifecycle_fragment(candidate) and other_close:
+        candidate_close_covers = candidate_close.issuperset(other_close)
+        candidate_entry_overlaps = not other_entry or bool(candidate_entry & other_entry)
+        if candidate_close_covers and candidate_entry_overlaps:
+            return True
     if not candidate_close:
         return False
     if other_close and not other_close.issubset(candidate_close):
         return False
     if other_entry and candidate_entry and not other_entry.issubset(candidate_entry):
-        return False
+        close_covered = bool(other_close and other_close.issubset(candidate_close))
+        if not close_covered:
+            return False
     if other_entry and not candidate_entry:
         return False
 
@@ -991,8 +1390,17 @@ def _authoritative_position_history_row_supersedes(
     other_opened = _as_utc(getattr(other, "created_at", None))
     candidate_closed = _as_utc(getattr(candidate, "closed_at", None))
     other_closed = _as_utc(getattr(other, "closed_at", None))
-    if candidate_opened and other_opened:
-        if abs((candidate_opened - other_opened).total_seconds()) > 5:
+    order_coverage_proves_lifecycle = bool(
+        other_close
+        and other_close.issubset(candidate_close)
+        and (
+            not other_entry
+            or not candidate_entry
+            or bool(other_entry & candidate_entry)
+        )
+    )
+    if candidate_opened and other_opened and not order_coverage_proves_lifecycle:
+        if abs((candidate_opened - other_opened).total_seconds()) > 60:
             return False
     elif not (
         (candidate_entry and other_entry and bool(candidate_entry & other_entry))
@@ -1000,7 +1408,7 @@ def _authoritative_position_history_row_supersedes(
     ):
         return False
     if candidate_closed and other_closed and candidate_closed < other_closed:
-        if abs((candidate_closed - other_closed).total_seconds()) > 5:
+        if abs((candidate_closed - other_closed).total_seconds()) > 60:
             return False
 
     candidate_quantity = abs(_safe_float(getattr(candidate, "quantity", None)))
@@ -1052,11 +1460,25 @@ def _duplicate_position_key(position: Position) -> tuple[Any, ...]:
 
 
 def _position_supersedes(candidate: Position, other: Position) -> bool:
+    if _is_generated_order_lifecycle_fragment(other) and not _is_generated_order_lifecycle_fragment(candidate):
+        return False
     candidate_entry = set(_position_order_key(candidate, "entry_exchange_order_id"))
     candidate_close = set(_position_order_key(candidate, "close_exchange_order_id"))
     other_entry = set(_position_order_key(other, "entry_exchange_order_id"))
     other_close = set(_position_order_key(other, "close_exchange_order_id"))
-    if not _same_position_lifecycle(candidate, other):
+    if _is_generated_order_lifecycle_fragment(candidate) and _is_generated_order_lifecycle_fragment(other):
+        return bool(
+            candidate_close
+            and other_close
+            and candidate_close.issuperset(other_close)
+            and candidate_close != other_close
+        )
+    if not _same_position_lifecycle(candidate, other) and not _position_order_lifecycle_covers(
+        candidate_entry=candidate_entry,
+        candidate_close=candidate_close,
+        other_entry=other_entry,
+        other_close=other_close,
+    ):
         return False
     if (
         candidate_entry == other_entry
@@ -1074,6 +1496,22 @@ def _position_supersedes(candidate: Position, other: Position) -> bool:
     close_covers = not other_close or candidate_close.issuperset(other_close)
     strictly_more = candidate_entry != other_entry or candidate_close != other_close
     return bool(entry_covers and close_covers and strictly_more)
+
+
+def _position_order_lifecycle_covers(
+    *,
+    candidate_entry: set[str],
+    candidate_close: set[str],
+    other_entry: set[str],
+    other_close: set[str],
+) -> bool:
+    if not candidate_entry or not candidate_close:
+        return False
+    if other_entry and not other_entry.issubset(candidate_entry):
+        return False
+    if other_close and not other_close.issubset(candidate_close):
+        return False
+    return bool(other_entry or other_close)
 
 
 def _same_position_quantity(left: Position, right: Position) -> bool:
@@ -1203,7 +1641,9 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
     quantity = _first_positive(
         raw.get("base_quantity"), getattr(order, "quantity", None), default=0.0
     )
-    if quantity <= 0 and contracts > 0:
+    if contracts > 0 and contract_size > 0:
+        quantity = contracts * contract_size
+    elif quantity <= 0 and contracts > 0:
         quantity = contracts * (contract_size if contract_size > 0 else 1.0)
     price = _first_positive(
         raw.get("avg_price"), raw.get("average"), getattr(order, "price", None), default=0.0
@@ -1281,7 +1721,9 @@ def _order_quantity(order: Order) -> float:
         getattr(order, "quantity", None),
         default=0.0,
     )
-    if quantity <= 0 and contracts > 0:
+    if contracts > 0 and contract_size > 0:
+        quantity = contracts * contract_size
+    elif quantity <= 0 and contracts > 0:
         quantity = contracts * (contract_size if contract_size > 0 else 1.0)
     return quantity
 
@@ -1352,6 +1794,21 @@ def _ordered_tokens(values: Any) -> list[str]:
         if token and token not in seen:
             result.append(token)
             seen.add(token)
+    return result
+
+
+def _ordered_ints(values: Any) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            item = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
     return result
 
 

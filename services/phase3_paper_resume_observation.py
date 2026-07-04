@@ -54,6 +54,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _blocker_codes(blockers: list[Any]) -> set[str]:
     codes: set[str] = set()
     for item in blockers:
@@ -123,12 +132,76 @@ def _report_age_ok(report: dict[str, Any], max_age_seconds: int) -> tuple[bool, 
     return age is not None and age <= max_age_seconds, age
 
 
+def _load_trading_runtime_status() -> dict[str, Any]:
+    """Read the split-process trading heartbeat without touching the engine."""
+
+    path = settings.data_dir / "trading_runtime_status.json"
+    try:
+        if not path.exists():
+            return {"available": False, "reason": "missing_runtime_heartbeat"}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {"available": False, "reason": "invalid_runtime_heartbeat"}
+        heartbeat_at = _parse_utc_datetime(payload.get("heartbeat_at"))
+        if heartbeat_at is not None:
+            payload["heartbeat_age_seconds"] = round(_age_seconds(heartbeat_at) or 0.0, 3)
+        else:
+            payload["heartbeat_age_seconds"] = round(
+                max(_now().timestamp() - path.stat().st_mtime, 0.0),
+                3,
+            )
+        payload["available"] = True
+        return payload
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "runtime_heartbeat_read_failed",
+            "error": safe_error_text(exc, limit=180),
+        }
+
+
+def _runtime_okx_sync_clean_for_entry(trading_runtime: dict[str, Any]) -> bool:
+    """Return true when live runtime has recent clean OKX current-state evidence."""
+
+    runtime = _safe_dict(trading_runtime)
+    if not runtime.get("available") or not bool(runtime.get("running")):
+        return False
+    decision_interval = _safe_float(runtime.get("decision_interval"), 60.0)
+    heartbeat_fresh_limit = max(decision_interval * 4.0, 180.0)
+    heartbeat_age = runtime.get("heartbeat_age_seconds")
+    if (
+        heartbeat_age is None
+        or _safe_float(heartbeat_age, heartbeat_fresh_limit + 1.0) > heartbeat_fresh_limit
+    ):
+        return False
+
+    sync = _safe_dict(runtime.get("okx_authoritative_sync"))
+    status = str(sync.get("status") or "").lower()
+    if status not in {"ok", "degraded"}:
+        return False
+    if _safe_int(sync.get("last_requires_attention_count")) > 0:
+        return False
+
+    success_age = sync.get("last_success_age_seconds")
+    stale_after = _safe_float(
+        sync.get("stale_after_seconds"),
+        max(decision_interval * 3.0, 180.0),
+    )
+    if isinstance(success_age, (int, float)):
+        return float(success_age) <= stale_after
+    success_at = _parse_utc_datetime(sync.get("last_success_at"))
+    if success_at is None:
+        return bool(sync.get("fresh_success_available"))
+    return (_now() - success_at).total_seconds() <= stale_after
+
+
 def evaluate_phase3_paper_resume_observation_inputs(
     *,
     sample_summary: dict[str, Any],
     platform_server: dict[str, Any],
     platform_runtime: dict[str, Any],
     okx_authoritative_sync: dict[str, Any],
+    trading_runtime_status: dict[str, Any] | None = None,
     specialist_shadow_evaluation: dict[str, Any],
     latest_preflight: dict[str, Any],
     min_created_shadow_samples: int = DEFAULT_MIN_CREATED_SHADOW_SAMPLES,
@@ -141,6 +214,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
     platform = _safe_dict(platform_server)
     runtime = _safe_dict(platform_runtime)
     okx_sync = _safe_dict(okx_authoritative_sync)
+    trading_runtime = _safe_dict(trading_runtime_status)
     specialist = _safe_dict(specialist_shadow_evaluation)
     preflight = _safe_dict(latest_preflight)
 
@@ -189,11 +263,47 @@ def evaluate_phase3_paper_resume_observation_inputs(
     elif bool(preflight):
         passed.append("latest_preflight_ready")
 
-    if okx_sync.get("okx_pull_available") is False or str(okx_sync.get("status") or "").lower() in {
+    okx_issue_count = _safe_int(okx_sync.get("issue_count"))
+    okx_audit_unhealthy = okx_sync.get("okx_pull_available") is False or str(
+        okx_sync.get("status") or ""
+    ).lower() in {
         "critical",
         "error",
         "unavailable",
-    }:
+    }
+    runtime_okx_clean = _runtime_okx_sync_clean_for_entry(trading_runtime)
+    if okx_issue_count > 0:
+        blockers.append(
+            _blocker(
+                "okx_authoritative_sync_has_post_resume_differences",
+                "OKX/local differences appeared during the post-resume observation window.",
+                evidence={
+                    "issue_count": okx_sync.get("issue_count"),
+                    "issues": _safe_list(okx_sync.get("issues"))[:8],
+                },
+            )
+        )
+    elif okx_audit_unhealthy and runtime_okx_clean:
+        runtime_sync = _safe_dict(trading_runtime.get("okx_authoritative_sync"))
+        warnings.append(
+            _warning(
+                "okx_authoritative_audit_pull_degraded_runtime_clean",
+                (
+                    "Read-only OKX audit pull is degraded, but the live trading runtime has "
+                    "recent clean OKX current-state evidence."
+                ),
+                evidence={
+                    "audit_status": okx_sync.get("status"),
+                    "okx_pull_available": okx_sync.get("okx_pull_available"),
+                    "fetch_errors": okx_sync.get("fetch_errors"),
+                    "error": okx_sync.get("error"),
+                    "runtime_okx_status": runtime_sync.get("status"),
+                    "runtime_last_success_at": runtime_sync.get("last_success_at"),
+                },
+            )
+        )
+        passed.append("okx_runtime_authoritative_sync_clean_after_resume")
+    elif okx_audit_unhealthy:
         blockers.append(
             _blocker(
                 "okx_authoritative_sync_unhealthy_after_resume",
@@ -202,17 +312,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
                     "status": okx_sync.get("status"),
                     "fetch_errors": okx_sync.get("fetch_errors"),
                     "error": okx_sync.get("error"),
-                },
-            )
-        )
-    elif _safe_int(okx_sync.get("issue_count")) > 0:
-        blockers.append(
-            _blocker(
-                "okx_authoritative_sync_has_post_resume_differences",
-                "OKX/local differences appeared during the post-resume observation window.",
-                evidence={
-                    "issue_count": okx_sync.get("issue_count"),
-                    "issues": _safe_list(okx_sync.get("issues"))[:8],
+                    "runtime_okx_sync_clean": runtime_okx_clean,
                 },
             )
         )
@@ -355,6 +455,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
             "specialist_eligible_shadow_count": specialist_eligible_count,
             "phase3_quant_child_endpoint_count": len(child_endpoints),
             "okx_issue_count": _safe_int(okx_sync.get("issue_count")),
+            "runtime_okx_sync_clean": runtime_okx_clean,
             "specialist_report_age_seconds": (
                 None if specialist_age is None else round(specialist_age, 3)
             ),
@@ -364,6 +465,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "inputs": {
             "platform_server": platform,
             "platform_runtime": runtime,
+            "trading_runtime_status": trading_runtime,
             "okx_authoritative_sync": okx_sync,
             "specialist_shadow_evaluation": specialist,
             "latest_preflight": preflight,
@@ -409,6 +511,7 @@ class Phase3PaperResumeObservationService:
     sample_summary_provider: ReportProvider | None = None
     platform_server_provider: ReportProvider | None = None
     platform_runtime_provider: ReportProvider | None = None
+    trading_runtime_provider: ReportProvider | None = None
     okx_sync_provider: ReportProvider | None = None
     specialist_shadow_provider: ReportProvider | None = None
     latest_preflight_provider: ReportProvider | None = None
@@ -434,6 +537,11 @@ class Phase3PaperResumeObservationService:
             self.platform_runtime_provider,
             collect_platform_runtime_status,
         )
+        trading_runtime = await self._collect(
+            "trading_runtime_status",
+            self.trading_runtime_provider,
+            _load_trading_runtime_status,
+        )
         okx_sync = await self._collect(
             "okx_authoritative_sync",
             self.okx_sync_provider,
@@ -454,6 +562,7 @@ class Phase3PaperResumeObservationService:
             platform_server=platform_server,
             platform_runtime=platform_runtime,
             okx_authoritative_sync=okx_sync,
+            trading_runtime_status=trading_runtime,
             specialist_shadow_evaluation=specialist,
             latest_preflight=preflight,
             min_created_shadow_samples=self.min_created_shadow_samples,

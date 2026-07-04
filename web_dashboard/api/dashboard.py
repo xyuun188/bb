@@ -180,6 +180,18 @@ def _dashboard_okx_error_text(exc: Exception, *, resource: str) -> str:
     return f"OKX {resource}读取失败：{error}"
 
 
+def _dashboard_okx_balance_refreshing_snapshot(selected_mode: str) -> dict[str, Any]:
+    """Return a non-error snapshot while OKX balance warms in the background."""
+
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    return {
+        "balance_source": _dashboard_okx_account_label(selected_mode),
+        "source": "background_refresh",
+        "refresh_in_progress": True,
+        "balance_status": "refresh_pending",
+    }
+
+
 def _consume_dashboard_refresh_task(
     tasks: dict[str, asyncio.Task[Any]],
     selected_mode: str,
@@ -2353,6 +2365,11 @@ async def _dashboard_closed_position_ledger_rows(
 
     from models.account import OkxAccountBill
     from models.trade import Order, Position
+    from services.okx_order_fact_sync import (
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+    )
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
 
     if model_names:
@@ -2416,8 +2433,16 @@ async def _dashboard_closed_position_ledger_rows(
         order_rows = [
             order
             for order in order_rows
-            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-            & linked_order_ids
+            if (
+                _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+                & linked_order_ids
+            )
+            or str(getattr(order, "okx_sync_status", "") or "").strip()
+            in {
+                OKX_SYNC_CONFIRMED,
+                OKX_SYNC_OKX_ONLY,
+                OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+            }
         ]
     account_bill_rows = await _dashboard_okx_account_bill_rows(
         session,
@@ -2660,6 +2685,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             stale_cached["stale"] = True
             stale_cached["refresh_in_progress"] = True
             return stale_cached
+        return _dashboard_okx_balance_refreshing_snapshot(selected_mode)
     async with lock:
         now = datetime.now(UTC)
         fresh_cached = cached_success(now, fresh_only=True)
@@ -2687,6 +2713,8 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             stale_cached["refresh_in_progress"] = True
             _start_dashboard_okx_balance_refresh(selected_mode)
             return stale_cached
+        _start_dashboard_okx_balance_refresh(selected_mode)
+        return _dashboard_okx_balance_refreshing_snapshot(selected_mode)
 
         try:
             snapshot = await _fetch_dashboard_okx_balance_uncached(selected_mode)

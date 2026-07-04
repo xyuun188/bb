@@ -215,9 +215,9 @@ class OkxTradeFactIntegrityService:
             default=0.0,
         )
         expected_base_quantity = (
-            raw_base_quantity
-            if raw_base_quantity > 0
-            else raw_contracts * contract_size if raw_contracts > 0 else 0.0
+            raw_contracts * contract_size
+            if raw_contracts > 0 and contract_size > 0
+            else raw_base_quantity if raw_base_quantity > 0 else raw_contracts
         )
         if (
             local_quantity > 0
@@ -630,7 +630,6 @@ def _weighted_split_exit_price(chunks: Any) -> float:
 
 def _raw_exchange_symbol(raw: dict[str, Any], *, fallback: Any = "") -> str:
     data = raw if isinstance(raw, dict) else {}
-    info = data.get("info") if isinstance(data.get("info"), dict) else {}
     native_symbol = _native_exchange_symbol(data)
     if native_symbol:
         return native_symbol

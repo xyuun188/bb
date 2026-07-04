@@ -25,8 +25,19 @@ from services.okx_order_fact_sync import (
     OkxOrderFactSyncService,
     _apply_position_history_payload,
     _db_naive_since,
+    _stored_fill_base_quantity,
 )
 from web_dashboard.api.trades import get_trade_detail, get_trades
+
+
+def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_quantity() -> None:
+    assert _stored_fill_base_quantity(
+        {
+            "contracts": 160.0,
+            "contract_size": 0.1,
+            "base_quantity": 15.265700483091791,
+        }
+    ) == pytest.approx(16.0)
 
 
 class _FillCcxt:
@@ -134,9 +145,11 @@ class _FillCcxt:
             }
         ]
         self.account_bill_rows: list[dict[str, str]] = []
+        self.fill_history_params: list[dict[str, Any]] = []
         self.order_history_params: list[dict[str, Any]] = []
 
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.fill_history_params.append(dict(params))
         order_id = str(params.get("ordId") or "")
         if order_id:
             return {"data": [row for row in self.rows if row["ordId"] == order_id]}
@@ -200,6 +213,19 @@ class _FillCcxt:
 class _PositionHistoryBusyCcxt(_FillCcxt):
     async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         raise TimeoutError("positions-history busy")
+
+
+class _OrderHistoryBusyCcxt(_FillCcxt):
+    async def privateGetTradeOrdersHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        raise TimeoutError("orders-history busy")
+
+
+class _AccountWideFillBusyCcxt(_FillCcxt):
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        if params.get("ordId"):
+            return await super().privateGetTradeFillsHistory(params)
+        self.fill_history_params.append(dict(params))
+        raise TimeoutError("account-wide fills-history busy")
 
 
 class _FundingBillCcxt(_FillCcxt):
@@ -296,6 +322,46 @@ class _PositionHistoryBusyExecutor:
         return None
 
     async def _get_ccxt(self) -> _PositionHistoryBusyCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _OrderHistoryBusyExecutor:
+    ccxt_instances: list[_OrderHistoryBusyCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _OrderHistoryBusyCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _OrderHistoryBusyCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _AccountWideFillBusyExecutor:
+    ccxt_instances: list[_AccountWideFillBusyCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _AccountWideFillBusyCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _AccountWideFillBusyCcxt:
         return self.ccxt
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -540,6 +606,90 @@ class _CurrentPositionNoFillExecutor:
         return None
 
     async def _get_ccxt(self) -> _CurrentPositionNoFillCcxt:
+        return self.ccxt
+
+    async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class _PartialCloseCurrentPositionCcxt:
+    def __init__(self) -> None:
+        self.position_ts = int(
+            (PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=3)).timestamp() * 1000
+        )
+        self.close_ts = self.position_ts + 60_000
+        self.entry_order_id = "3711253572185980928"
+        self.close_order_id = "3712882834810830848"
+
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        order_id = str(params.get("ordId") or "")
+        rows = [
+            {
+                "ordId": self.close_order_id,
+                "tradeId": "pepe-close-trade",
+                "instId": "PEPE-USDT-SWAP",
+                "side": "sell",
+                "posSide": "net",
+                "fillSz": "0.3",
+                "fillPx": "0.000002728",
+                "fee": "-0.004092",
+                "fillPnl": "0.387",
+                "ts": str(self.close_ts),
+            }
+        ]
+        if order_id:
+            rows = [row for row in rows if row["ordId"] == order_id]
+        return {"data": rows}
+
+    async def privateGetTradeOrdersHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "data": [
+                {
+                    "instId": "PEPE-USDT-SWAP",
+                    "posId": "pepe-position",
+                    "tradeId": "pepe-entry-trade",
+                    "posSide": "net",
+                    "pos": "0.1",
+                    "ctVal": "10000000",
+                    "avgPx": "0.000002599",
+                    "markPx": "0.00000272",
+                    "upl": "0.12",
+                    "cTime": str(self.position_ts),
+                    "uTime": str(self.close_ts),
+                }
+            ]
+        }
+
+    async def privateGetAccountBills(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def privateGetAccountBillsArchive(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"instId": "PEPE-USDT-SWAP", "ctVal": "10000000"}]}
+
+
+class _PartialCloseCurrentPositionExecutor:
+    ccxt_instances: list[_PartialCloseCurrentPositionCcxt] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _PartialCloseCurrentPositionCcxt()
+        self.__class__.ccxt_instances.append(self.ccxt)
+
+    async def initialize(self) -> None:
+        return None
+
+    async def _get_ccxt(self) -> _PartialCloseCurrentPositionCcxt:
         return self.ccxt
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1152,6 +1302,203 @@ async def test_order_fact_sync_slow_account_bills_do_not_starve_core_order_facts
 
 
 @pytest.mark.asyncio
+async def test_order_fact_sync_order_history_timeout_keeps_core_fill_confirmation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-order-history-timeout.db').as_posix()}",
+    )
+    await init_db()
+    _OrderHistoryBusyExecutor.ccxt_instances.clear()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1.0,
+                    price=0.03,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id="phase3-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            timeout_seconds=2.0,
+            executor_factory=_OrderHistoryBusyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "phase3-order"
+                    )
+                )
+            ).first()._mapping
+
+        assert report["okx_pull_available"] is True
+        assert report["status"] == "warning"
+        assert any("orders_history" in item for item in report["optional_stage_errors"])
+        assert report["confirmed_count"] == 1
+        assert row["okx_sync_status"] == OKX_SYNC_CONFIRMED
+        assert row["quantity"] == pytest.approx(12.0)
+        assert row["price"] == pytest.approx(0.0345)
+        assert row["fee"] == pytest.approx(0.02)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_account_wide_fill_timeout_keeps_target_order_confirmation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-account-wide-fill-timeout.db').as_posix()}",
+    )
+    await init_db()
+    _AccountWideFillBusyExecutor.ccxt_instances.clear()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1.0,
+                    price=0.03,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id="phase3-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            timeout_seconds=2.0,
+            executor_factory=_AccountWideFillBusyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "phase3-order"
+                    )
+                )
+            ).first()._mapping
+
+        ccxt = _AccountWideFillBusyExecutor.ccxt_instances[-1]
+        assert report["okx_pull_available"] is True
+        assert report["status"] == "warning"
+        assert any(
+            "fills_history_account_context" in item
+            for item in report["optional_stage_errors"]
+        )
+        assert report["confirmed_count"] == 1
+        assert report["unverified_count"] == 0
+        assert row["okx_sync_status"] == OKX_SYNC_CONFIRMED
+        assert row["okx_raw_fills"]["fills_history_confirmed"] is True
+        assert ccxt.fill_history_params[0].get("ordId") == "phase3-order"
+        assert any("ordId" not in params for params in ccxt.fill_history_params)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_prioritizes_target_order_fill_lookup_over_inst_scan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-target-order-first.db').as_posix()}",
+    )
+    await init_db()
+    _Executor.ccxt_instances.clear()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=1.0,
+                    price=0.03,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id="phase3-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            timeout_seconds=2.0,
+            executor_factory=_Executor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        ccxt = _Executor.ccxt_instances[-1]
+        assert report["okx_pull_available"] is True
+        assert report["confirmed_count"] == 1
+        assert ccxt.fill_history_params[0] == {
+            "instType": "SWAP",
+            "ordId": "phase3-order",
+            "limit": "100",
+            "begin": str(int(PHASE3_DEFAULT_ORDER_SYNC_START.timestamp() * 1000)),
+        }
+        assert any(
+            "ordId" not in params and "instId" not in params
+            for params in ccxt.fill_history_params
+        )
+        assert not any(
+            "instId" in params and "ordId" not in params
+            for params in ccxt.fill_history_params
+        )
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_persists_okx_funding_account_bills(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1353,8 +1700,10 @@ async def test_order_fact_sync_persists_funding_bills_even_when_okx_pull_times_o
     finally:
         await close_db()
 
-    assert report["okx_pull_available"] is False
-    assert "OKX pull timeout" in report["error"]
+    assert report["okx_pull_available"] is True
+    assert report["error"] is None
+    assert any("positions: OKX pull timeout" in item for item in report["optional_stage_errors"])
+    assert report["status"] == "warning"
     assert report["account_bill_error"] is None
     assert report["account_bill_checked_count"] == 1
     assert report["account_bill_backfilled_count"] == 1
@@ -1445,7 +1794,7 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_okx_close_fill(
 
 
 @pytest.mark.asyncio
-async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts(
+async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts_with_funding_fee(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1546,6 +1895,22 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts
                         closed_at=closed_at,
                         created_at=opened_at,
                     ),
+                    OkxAccountBill(
+                        mode="paper",
+                        bill_id="ai16z-funding",
+                        inst_id="AI16Z-USDT-SWAP",
+                        pos_side="short",
+                        ccy="USDT",
+                        bill_type="8",
+                        bill_sub_type="173",
+                        bill_ts=opened_at + timedelta(minutes=5),
+                        balance_change=-0.2,
+                        pnl=-0.2,
+                        fee=0.0,
+                        funding_fee=-0.2,
+                        source="okx_account_bills",
+                        raw_bill={"subType": "173", "pnl": "-0.2"},
+                    ),
                 ]
             )
 
@@ -1566,7 +1931,7 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts
 
         assert report["confirmed_count"] == 0
         assert report["closed_position_pnl_repaired_count"] == 1
-        assert row["realized_pnl"] == pytest.approx(7.93)
+        assert row["realized_pnl"] == pytest.approx(7.73)
     finally:
         await close_db()
 
@@ -1595,7 +1960,7 @@ async def test_order_fact_sync_repairs_confirmed_order_columns_from_stored_okx_f
                     symbol="SAND/USDT",
                     side="buy",
                     order_type="market",
-                    quantity=1455.0,
+                    quantity=2910.0,
                     price=0.0498,
                     status="filled",
                     fee=0.0289836,
@@ -1614,7 +1979,7 @@ async def test_order_fact_sync_repairs_confirmed_order_columns_from_stored_okx_f
                         "inst_id": "SAND-USDT-SWAP",
                         "contracts": 291.0,
                         "contract_size": 10.0,
-                        "base_quantity": 2910.0,
+                        "base_quantity": 1455.0,
                         "avg_price": 0.0498,
                         "fee_abs": 0.0289836,
                         "fill_pnl": -7.245,
@@ -1646,6 +2011,7 @@ async def test_order_fact_sync_repairs_confirmed_order_columns_from_stored_okx_f
         assert row["okx_fill_pnl"] == pytest.approx(-7.245)
         assert row["okx_sync_status"] == OKX_SYNC_CONFIRMED
         assert row["okx_raw_fills"]["fills_history_confirmed"] is True
+        assert row["okx_raw_fills"]["base_quantity"] == pytest.approx(2910.0)
     finally:
         await close_db()
 
@@ -1770,9 +2136,10 @@ async def test_order_fact_sync_repairs_stored_okx_facts_when_okx_pull_times_out(
                 )
             ).first()._mapping
 
-        assert report["okx_pull_available"] is False
+        assert report["okx_pull_available"] is True
         assert report["status"] == "warning"
-        assert "OKX pull timeout" in report["error"]
+        assert report["error"] is None
+        assert any("positions: OKX pull timeout" in item for item in report["optional_stage_errors"])
         assert report["closed_position_pnl_repaired_count"] == 1
         assert row["realized_pnl"] == pytest.approx(7.93)
     finally:
@@ -1838,8 +2205,10 @@ async def test_order_fact_sync_does_not_recount_already_recovered_execution_fact
             cold_start_marker_path=None,
         ).sync()
 
-        assert report["okx_pull_available"] is False
-        assert report["local_checked"] == 0
+        assert report["okx_pull_available"] is True
+        assert report["local_checked"] == 1
+        assert report["error"] is None
+        assert any("positions: OKX pull timeout" in item for item in report["optional_stage_errors"])
         assert report["confirmed_count"] == 0
         assert report["unverified_count"] == 0
     finally:
@@ -2000,7 +2369,9 @@ async def test_order_fact_sync_recovers_close_fill_decision_fact_when_okx_pull_t
                 )
             ).first()._mapping
 
-        assert report["okx_pull_available"] is False
+        assert report["okx_pull_available"] is True
+        assert report["error"] is None
+        assert any("positions: OKX pull timeout" in item for item in report["optional_stage_errors"])
         assert report["confirmed_count"] == 1
         assert report["closed_position_pnl_repaired_count"] == 1
         assert close_order["okx_sync_status"] == OKX_SYNC_CONFIRMED
@@ -2391,7 +2762,7 @@ async def test_order_fact_sync_keeps_okx_execution_result_confirmed_when_history
                 )
             ).one()._mapping
 
-        assert report["confirmed_count"] == 1
+        assert report["confirmed_count"] == 0
         assert report["unverified_count"] == 0
         assert row["okx_sync_status"] == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
         assert row["okx_state"] == "execution_result_confirmed"
@@ -2634,6 +3005,76 @@ async def test_order_fact_sync_updates_existing_open_position_cache_from_okx_cur
         assert position["is_open"] is True
         assert position["entry_exchange_order_id"] == "stale-local-order,3695537280216961024"
         assert position["close_exchange_order_id"] is None
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_links_reduce_only_partial_close_to_open_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-partial-close-link.db').as_posix()}",
+    )
+    await init_db()
+    position_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=2)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="PEPE/USDT",
+                    side="long",
+                    quantity=4000000.0,
+                    entry_price=0.000002599,
+                    current_price=0.0000026,
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=position_time,
+                    okx_inst_id="PEPE-USDT-SWAP",
+                    okx_pos_id="pepe-position",
+                    entry_exchange_order_id="3711253572185980928",
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_PartialCloseCurrentPositionExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            position = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "pepe-position"
+                    )
+                )
+            ).one()._mapping
+            close_order = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "3712882834810830848"
+                    )
+                )
+            ).one()._mapping
+
+        assert report["okx_pull_available"] is True
+        assert report["current_position_updated_count"] == 2
+        assert position["is_open"] is True
+        assert position["quantity"] == pytest.approx(1000000.0)
+        assert position["close_exchange_order_id"] == "3712882834810830848"
+        assert position["realized_pnl"] == pytest.approx(0.382908)
+        assert close_order["okx_sync_status"] == OKX_SYNC_OKX_ONLY
+        assert close_order["okx_raw_fills"].get("order_rows", []) == []
     finally:
         await close_db()
 

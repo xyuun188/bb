@@ -515,6 +515,10 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%"
         )
+    if top_return <= bottom_return:
+        hard_reasons.append(
+            f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%"
+        )
     if top_win <= bottom_win:
         hard_reasons.append(f"高分组胜率 {top_win:.3f} 未优于低分组 {bottom_win:.3f}")
 

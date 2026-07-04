@@ -4431,10 +4431,59 @@ async def test_okx_balance_snapshot_returns_stale_cache_while_refresh_in_progres
 
 
 @pytest.mark.asyncio
-async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
+async def test_market_allocated_order_balance_uses_cached_okx_snapshot_without_fresh_pull() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 88.0, "allocatable": 100.0, "equity": 100.0},
+            "fetched_at": datetime.now(UTC),
+        }
+    }
+
+    class Accounting:
+        async def allocated_order_balance(self, *_args, **_kwargs):
+            raise AssertionError("market sizing must not perform a fresh OKX balance pull")
+
+    service.account_accounting_service = Accounting()
+    token = trading_service._analysis_scope_context.set("market")
+    try:
+        balance = await service.allocated_order_balance("paper")
+    finally:
+        trading_service._analysis_scope_context.reset(token)
+
+    assert balance == 88.0
+
+
+@pytest.mark.asyncio
+async def test_market_allocated_order_balance_schedules_refresh_when_cache_is_cold() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {}
+    refresh_calls: list[str] = []
+    service._schedule_okx_balance_snapshot_refresh_for_new_pair_pause = (  # type: ignore[method-assign]
+        lambda mode: refresh_calls.append(mode)
+    )
+
+    class Accounting:
+        async def allocated_order_balance(self, *_args, **_kwargs):
+            raise AssertionError("cold market sizing must not block on OKX balance")
+
+    service.account_accounting_service = Accounting()
+    token = trading_service._analysis_scope_context.set("market")
+    try:
+        balance = await service.allocated_order_balance("paper")
+    finally:
+        trading_service._analysis_scope_context.reset(token)
+
+    assert balance == 0.0
+    assert refresh_calls == ["paper"]
+
+
+@pytest.mark.asyncio
+async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advisory() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._get_model_execution_mode = lambda _model_name: "paper"
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
     service.execution_allocation_state = lambda _mode: _async_value({"total_pnl": 0.0})
     service.paper_executor = None
     service._okx_paper = None
@@ -4448,6 +4497,10 @@ async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
         circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
         position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
     )
+    refresh_calls: list[str] = []
+    service._schedule_okx_balance_snapshot_refresh_for_new_pair_pause = (  # type: ignore[method-assign]
+        lambda mode: refresh_calls.append(mode)
+    )
 
     snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
     reason = await service._new_pair_analysis_pause_reason(
@@ -4456,24 +4509,25 @@ async def test_paper_new_pair_pause_requires_okx_balance_snapshot() -> None:
     )
 
     assert snapshot is None
-    assert reason
+    assert reason is None
+    assert refresh_calls == ["paper"]
 
 
 @pytest.mark.asyncio
-async def test_new_pair_pause_context_reuses_short_lived_slow_checks() -> None:
+async def test_new_pair_pause_context_reuses_short_lived_cached_balance_checks() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._normalize_position_symbol = lambda symbol: str(symbol or "")
     service._get_model_execution_mode = lambda _model_name: "paper"
     service._okx_authoritative_sync_entry_block_reason = lambda: None
     service._new_pair_pause_context_cache = {}
-    balance_calls = 0
     allocation_calls = 0
-
-    async def balance_snapshot(_mode: str):
-        nonlocal balance_calls
-        balance_calls += 1
-        return {"free": 1000.0, "allocatable": 1000.0, "equity": 1000.0}
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 1000.0, "allocatable": 1000.0, "equity": 1000.0},
+            "fetched_at": datetime.now(UTC),
+        }
+    }
 
     async def allocation_state(_mode: str):
         nonlocal allocation_calls
@@ -4487,7 +4541,6 @@ async def test_new_pair_pause_context_reuses_short_lived_slow_checks() -> None:
         async def recent_loss_streak_pause_reason(self, *_args):
             return None
 
-    service._get_okx_balance_snapshot_for_mode = balance_snapshot  # type: ignore[method-assign]
     service.execution_allocation_state = allocation_state  # type: ignore[method-assign]
     service.new_pair_loss_pause = LossPause()
     service.risk_engine = SimpleNamespace(
@@ -4506,7 +4559,6 @@ async def test_new_pair_pause_context_reuses_short_lived_slow_checks() -> None:
 
     assert first is None
     assert second == ""
-    assert balance_calls == 1
     assert allocation_calls == 1
 
 

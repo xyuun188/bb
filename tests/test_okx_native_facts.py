@@ -576,6 +576,121 @@ async def test_native_facts_client_targets_missing_order_ids_after_bounded_pull(
 
 
 @pytest.mark.asyncio
+async def test_native_facts_client_can_prioritize_target_order_ids_before_broad_pull() -> None:
+    timestamp = int(datetime.now(UTC).timestamp() * 1000)
+    ccxt = _PagedFillCcxt(
+        {
+            "": [
+                {
+                    "billId": "bill-visible",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "visible",
+                    "tradeId": "trade-visible",
+                    "side": "buy",
+                    "fillSz": "1",
+                    "fillPx": "10",
+                    "ts": str(timestamp),
+                }
+            ],
+            "target-a": [
+                {
+                    "billId": "bill-target-a",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "target-a",
+                    "tradeId": "trade-target-a",
+                    "side": "buy",
+                    "fillSz": "2",
+                    "fillPx": "11",
+                    "ts": str(timestamp),
+                }
+            ],
+            "target-b": [
+                {
+                    "billId": "bill-target-b",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "target-b",
+                    "tradeId": "trade-target-b",
+                    "side": "buy",
+                    "fillSz": "3",
+                    "fillPx": "12",
+                    "ts": str(timestamp),
+                }
+            ],
+            "target-c": [
+                {
+                    "billId": "bill-target-c",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "target-c",
+                    "tradeId": "trade-target-c",
+                    "side": "buy",
+                    "fillSz": "4",
+                    "fillPx": "13",
+                    "ts": str(timestamp),
+                }
+            ],
+        }
+    )
+
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_fill_groups(
+        account_wide_only=True,
+        order_ids=["target-c", "target-a", "target-b"],
+        target_orders_first=True,
+        target_order_query_limit=2,
+    )
+
+    assert {group.order_id for group in groups} == {"target-a", "target-b", "visible"}
+    assert ccxt.params == [
+        {"instType": "SWAP", "ordId": "target-a", "limit": "100"},
+        {"instType": "SWAP", "ordId": "target-b", "limit": "100"},
+        {"instType": "SWAP", "limit": "100"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_facts_client_target_orders_only_skips_account_pull() -> None:
+    timestamp = int(datetime.now(UTC).timestamp() * 1000)
+    ccxt = _PagedFillCcxt(
+        {
+            "": [
+                {
+                    "billId": "bill-visible",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "visible",
+                    "tradeId": "trade-visible",
+                    "side": "buy",
+                    "fillSz": "1",
+                    "fillPx": "10",
+                    "ts": str(timestamp),
+                }
+            ],
+            "target-a": [
+                {
+                    "billId": "bill-target-a",
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "target-a",
+                    "tradeId": "trade-target-a",
+                    "side": "buy",
+                    "fillSz": "2",
+                    "fillPx": "11",
+                    "ts": str(timestamp),
+                }
+            ],
+        }
+    )
+
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_fill_groups(
+        account_wide_only=True,
+        order_ids=["target-a"],
+        target_orders_only=True,
+    )
+
+    assert [group.order_id for group in groups] == ["target-a"]
+    assert ccxt.params == [
+        {"instType": "SWAP", "ordId": "target-a", "limit": "100"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_native_facts_client_fetches_order_history_context_by_order_id() -> None:
     timestamp = int(datetime.now(UTC).timestamp() * 1000)
     fill = group_okx_native_fill_rows(

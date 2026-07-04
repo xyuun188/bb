@@ -418,25 +418,28 @@ async def test_public_ticker_map_works_without_data_service(
     assert result["BTC/USDT"]["volume_24h"] == 1234.0
 
 
-async def test_dashboard_okx_balance_snapshot_fallback_logs(
+async def test_dashboard_okx_balance_cold_cache_returns_refresh_pending(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
 ) -> None:
+    refresh_calls: list[str] = []
     monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_locks", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_okx_balance_refresh",
+        lambda mode: refresh_calls.append(mode),
+    )
     monkeypatch.setattr(dashboard, "OKXExecutor", SuccessfulStandaloneBalanceExecutor)
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
-    assert result == {
-        "free": 5.0,
-        "used": 1.0,
-        "total": 6.0,
-        "cash": 6.0,
-        "equity": 7.0,
-        "allocatable": 7.0,
-    }
+    assert result["refresh_in_progress"] is True
+    assert result["balance_status"] == "refresh_pending"
+    assert result["source"] == "background_refresh"
+    assert refresh_calls == ["paper"]
     assert dashboard_fallback_events == []
 
 
@@ -480,7 +483,7 @@ async def test_dashboard_okx_balance_snapshot_prefers_trading_service_cache(
     assert dashboard_fallback_events == []
 
 
-async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
+async def test_dashboard_okx_balance_background_refresh_records_failure(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
 ) -> None:
@@ -488,6 +491,16 @@ async def test_dashboard_okx_balance_snapshot_logs_standalone_failure(
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
     monkeypatch.setattr(dashboard, "OKXExecutor", FailingStandaloneBalanceExecutor)
+
+    with pytest.raises(RuntimeError, match="standalone balance unavailable"):
+        await dashboard._refresh_dashboard_okx_balance_cache("paper")
+
+    cached = dashboard._dashboard_okx_balance_error_cache["paper"][1]
+    assert cached["error_cached"] is True
+    assert cached["source"] == "background_refresh"
+    assert "standalone balance unavailable" in cached["balance_error"]
+    assert dashboard_fallback_events == []
+    return
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
@@ -512,6 +525,37 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
 ) -> None:
+    service = FakeBalanceTradingService()
+    cached_failure = {
+        "error": "cached failure",
+        "balance_error": "cached failure",
+        "balance_source": "OKX",
+        "source": "background_refresh",
+        "error_cached": True,
+    }
+    refresh_calls: list[str] = []
+    monkeypatch.setattr(dashboard, "_trading_service", service)
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_balance_error_cache",
+        {"paper": (datetime.now(UTC), cached_failure, service.okx_paper)},
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_okx_balance_refresh",
+        lambda mode: refresh_calls.append(mode),
+    )
+
+    first = await dashboard._get_dashboard_okx_account_snapshot("paper")
+    second = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert first == second
+    assert first["error_cached"] is True
+    assert refresh_calls == []
+    assert dashboard_fallback_events == []
+    return
+
     class CountingFailingStandaloneBalanceExecutor(FailingStandaloneBalanceExecutor):
         created = 0
 
