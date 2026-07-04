@@ -199,6 +199,18 @@ class _FundingFeeComponents:
     source: str
 
 
+@dataclass(frozen=True, slots=True)
+class _StoredSettlementComponents:
+    close_fill_pnl: float
+    entry_fee: float
+    close_fee: float
+    funding_fee: float
+    realized_pnl: float
+    source: str
+    status: str
+    preferred: bool
+
+
 def build_okx_position_ledger_groups(
     positions: list[Position],
     orders: list[Order],
@@ -940,6 +952,7 @@ def _build_group_from_positions(
     realized_pnl = sum(
         _safe_float(getattr(pos, "realized_pnl", None)) for pos in metric_positions
     )
+    stored_settlement = _stored_position_settlement_components(metric_positions)
     pnl_components = _confirmed_linked_order_pnl_components(
         linked_fills=linked_fills,
         entry_ids=entry_ids,
@@ -954,7 +967,19 @@ def _build_group_from_positions(
         opened_at=opened_at,
         closed_at=closed_at,
     )
-    if pnl_components is not None:
+    if stored_settlement is not None and stored_settlement.preferred:
+        realized_pnl = stored_settlement.realized_pnl
+        pnl_source = stored_settlement.source
+        funding_components = _FundingFeeComponents(
+            funding_fee=stored_settlement.funding_fee,
+            bill_count=funding_components.bill_count,
+            source=(
+                "position_settlement_snapshot"
+                if abs(stored_settlement.funding_fee) > 1e-12
+                else funding_components.source
+            ),
+        )
+    elif pnl_components is not None:
         realized_pnl = (
             pnl_components.close_fill_pnl
             + funding_components.funding_fee
@@ -962,6 +987,18 @@ def _build_group_from_positions(
             - pnl_components.close_fee
         )
         pnl_source = pnl_components.source
+    elif stored_settlement is not None:
+        realized_pnl = stored_settlement.realized_pnl
+        pnl_source = stored_settlement.source
+        funding_components = _FundingFeeComponents(
+            funding_fee=stored_settlement.funding_fee,
+            bill_count=funding_components.bill_count,
+            source=(
+                "position_settlement_snapshot"
+                if abs(stored_settlement.funding_fee) > 1e-12
+                else funding_components.source
+            ),
+        )
     elif not realized_pnl:
         realized_pnl = sum(
             _safe_float(row.pnl)
@@ -1025,9 +1062,30 @@ def _build_group_from_positions(
         trainable=evidence_complete,
         evidence_gaps=gaps,
         pnl_source=pnl_source,
-        close_fill_pnl=pnl_components.close_fill_pnl if pnl_components is not None else 0.0,
-        entry_fee=pnl_components.entry_fee if pnl_components is not None else 0.0,
-        close_fee=pnl_components.close_fee if pnl_components is not None else 0.0,
+        close_fill_pnl=(
+            stored_settlement.close_fill_pnl
+            if stored_settlement is not None
+            and (stored_settlement.preferred or pnl_components is None)
+            else pnl_components.close_fill_pnl
+            if pnl_components is not None
+            else 0.0
+        ),
+        entry_fee=(
+            stored_settlement.entry_fee
+            if stored_settlement is not None
+            and (stored_settlement.preferred or pnl_components is None)
+            else pnl_components.entry_fee
+            if pnl_components is not None
+            else 0.0
+        ),
+        close_fee=(
+            stored_settlement.close_fee
+            if stored_settlement is not None
+            and (stored_settlement.preferred or pnl_components is None)
+            else pnl_components.close_fee
+            if pnl_components is not None
+            else 0.0
+        ),
         funding_fee=funding_components.funding_fee,
         funding_bill_count=funding_components.bill_count,
         funding_fee_source=funding_components.source,
@@ -1081,6 +1139,63 @@ def _confirmed_linked_order_pnl_components(
         quantity_match_source=unit_source,
         quantity_mismatch=quantity_mismatch,
         source=source,
+    )
+
+
+def _stored_position_settlement_components(
+    positions: list[Position],
+) -> _StoredSettlementComponents | None:
+    settlement_positions = [
+        position
+        for position in positions
+        if str(getattr(position, "settlement_source", "") or "").strip()
+        or str(getattr(position, "settlement_status", "") or "").strip()
+    ]
+    if not settlement_positions or len(settlement_positions) != len(positions):
+        return None
+    close_fill_pnl = sum(
+        _safe_float(getattr(position, "close_fill_pnl", None), 0.0)
+        for position in settlement_positions
+    )
+    entry_fee = sum(
+        abs(_safe_float(getattr(position, "entry_fee", None), 0.0))
+        for position in settlement_positions
+    )
+    close_fee = sum(
+        abs(_safe_float(getattr(position, "close_fee", None), 0.0))
+        for position in settlement_positions
+    )
+    funding_fee = sum(
+        _safe_float(getattr(position, "funding_fee", None), 0.0)
+        for position in settlement_positions
+    )
+    realized_pnl = close_fill_pnl + funding_fee - entry_fee - close_fee
+    status_values = {
+        str(getattr(position, "settlement_status", "") or "").strip()
+        for position in settlement_positions
+    } - {""}
+    source_values = [
+        str(getattr(position, "settlement_source", "") or "").strip()
+        for position in settlement_positions
+        if str(getattr(position, "settlement_source", "") or "").strip()
+    ]
+    preferred_statuses = {"reconciled", "settled", "okx_position_history"}
+    preferred = bool(status_values and status_values.issubset(preferred_statuses))
+    status = ",".join(sorted(status_values)) if status_values else "provisional"
+    source = (
+        "position_settlement_snapshot"
+        if len(set(source_values)) != 1
+        else f"position_settlement_snapshot:{source_values[0]}"
+    )
+    return _StoredSettlementComponents(
+        close_fill_pnl=close_fill_pnl,
+        entry_fee=entry_fee,
+        close_fee=close_fee,
+        funding_fee=funding_fee,
+        realized_pnl=realized_pnl,
+        source=source,
+        status=status,
+        preferred=preferred,
     )
 
 

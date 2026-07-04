@@ -187,6 +187,13 @@ from services.position_review_priority import PositionReviewPriorityPolicy
 from services.position_review_result_recorder import PositionReviewResultRecorder
 from services.position_review_risk_alert import PositionReviewRiskAlertPolicy
 from services.position_review_risk_assessment import PositionReviewRiskAssessmentPolicy
+from services.position_settlement import (
+    apply_position_settlement_snapshot,
+    build_position_settlement_snapshot,
+    funding_fee_from_payload,
+    proportional_signed_value,
+    settlement_payload_fields,
+)
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
@@ -7465,7 +7472,7 @@ class TradingService:
             )
             from services.okx_realized_pnl import gross_pnl_with_okx_override
 
-            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+            gross_pnl, gross_pnl_source = gross_pnl_with_okx_override(
                 side=str(position.side or "").lower(),
                 entry_price=position.entry_price,
                 exit_price=result.price,
@@ -7473,7 +7480,31 @@ class TradingService:
                 okx_payload=getattr(result, "raw_response", None),
                 okx_total_qty=result.quantity,
             )
-            realized_pnl = gross_pnl - entry_fee - close_fee
+            raw_funding_fee, funding_fee_source = funding_fee_from_payload(
+                getattr(result, "raw_response", None)
+            )
+            funding_fee = proportional_signed_value(
+                raw_funding_fee,
+                close_qty,
+                result.quantity,
+            )
+            settlement = build_position_settlement_snapshot(
+                close_fill_pnl=gross_pnl,
+                entry_fee=entry_fee,
+                close_fee=close_fee,
+                funding_fee=funding_fee,
+                status="provisional",
+                source="manual_close_execution",
+                synced_at=result.timestamp,
+                raw={
+                    "gross_pnl_source": gross_pnl_source,
+                    "funding_fee_source": funding_fee_source,
+                    "close_exchange_order_id": self._manual_close_exchange_order_id(result),
+                    "close_quantity": close_qty,
+                    "result_quantity": result.quantity,
+                },
+            )
+            realized_pnl = settlement.realized_pnl
             tolerance = max(position_qty * 1e-9, 1e-8)
             closes_position = position_qty - close_qty <= tolerance
 
@@ -7498,7 +7529,7 @@ class TradingService:
                 position.is_open = False
                 position.current_price = result.price
                 position.unrealized_pnl = 0.0
-                position.realized_pnl = realized_pnl
+                apply_position_settlement_snapshot(position, settlement)
                 position.closed_at = result.timestamp
                 try:
                     self.position_profit_peaks.remove(model_name, position.symbol, position.side)
@@ -7529,12 +7560,12 @@ class TradingService:
                         "current_price": result.price,
                         "leverage": position.leverage,
                         "unrealized_pnl": 0.0,
-                        "realized_pnl": realized_pnl,
                         "stop_loss_price": position.stop_loss_price,
                         "take_profit_price": position.take_profit_price,
                         "is_open": False,
                         "closed_at": result.timestamp,
                         "created_at": position.created_at,
+                        **settlement_payload_fields(settlement),
                     }
                 )
             await session.flush()

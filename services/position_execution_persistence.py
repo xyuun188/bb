@@ -21,6 +21,13 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
+from services.position_settlement import (
+    apply_position_settlement_snapshot,
+    build_position_settlement_snapshot,
+    funding_fee_from_payload,
+    proportional_signed_value,
+    settlement_payload_fields,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -387,7 +394,7 @@ class PositionExecutionPersistenceService:
                 close_qty = position.quantity
             close_fee = self._proportional_fee(result.fee, close_qty, result.quantity)
             entry_fee = await self._entry_fee_provider(session, position, close_qty)
-            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+            gross_pnl, gross_pnl_source = gross_pnl_with_okx_override(
                 side=side,
                 entry_price=position.entry_price,
                 exit_price=result.price,
@@ -395,7 +402,31 @@ class PositionExecutionPersistenceService:
                 okx_payload=getattr(result, "raw_response", None),
                 okx_total_qty=result.quantity,
             )
-            pnl = gross_pnl - entry_fee - close_fee
+            raw_funding_fee, funding_fee_source = funding_fee_from_payload(
+                getattr(result, "raw_response", None)
+            )
+            funding_fee = proportional_signed_value(
+                raw_funding_fee,
+                close_qty,
+                getattr(result, "quantity", 0.0),
+            )
+            settlement = build_position_settlement_snapshot(
+                close_fill_pnl=gross_pnl,
+                entry_fee=entry_fee,
+                close_fee=close_fee,
+                funding_fee=funding_fee,
+                status="provisional",
+                source="system_execution",
+                synced_at=getattr(result, "timestamp", None),
+                raw={
+                    "gross_pnl_source": gross_pnl_source,
+                    "funding_fee_source": funding_fee_source,
+                    "close_exchange_order_id": close_exchange_order_id,
+                    "close_quantity": close_qty,
+                    "result_quantity": getattr(result, "quantity", None),
+                },
+            )
+            pnl = settlement.realized_pnl
             total_pnl += pnl
             if not closes_position:
                 position.quantity -= close_qty
@@ -410,13 +441,13 @@ class PositionExecutionPersistenceService:
                     "current_price": result.price,
                     "leverage": position.leverage,
                     "unrealized_pnl": 0.0,
-                    "realized_pnl": pnl,
                     "stop_loss_price": position.stop_loss_price,
                     "take_profit_price": position.take_profit_price,
                     "is_open": False,
                     "closed_at": result.timestamp,
                     "created_at": position.created_at,
                 }
+                closed_payload.update(settlement_payload_fields(settlement))
                 okx_inst_id = getattr(position, "okx_inst_id", None) or result_okx_inst_id
                 okx_pos_id = getattr(position, "okx_pos_id", None) or result_okx_pos_id
                 entry_exchange_order_id = getattr(position, "entry_exchange_order_id", None)
@@ -443,7 +474,7 @@ class PositionExecutionPersistenceService:
                 position.is_open = False
                 position.current_price = result.price
                 position.unrealized_pnl = 0.0
-                position.realized_pnl = pnl
+                apply_position_settlement_snapshot(position, settlement)
                 position.closed_at = result.timestamp
                 if result_okx_inst_id and not getattr(position, "okx_inst_id", None):
                     position.okx_inst_id = result_okx_inst_id

@@ -43,6 +43,11 @@ from services.okx_position_confirmation import (
     find_current_position_entry_confirmation,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
+from services.position_settlement import (
+    apply_position_settlement_snapshot,
+    build_position_settlement_snapshot,
+    settlement_payload_fields,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1378,15 +1383,23 @@ class OkxOrderFactSyncService:
                 contract_sizes=contract_sizes,
                 orders_by_id=orders_by_id,
                 account_bills=account_bills,
+                now=now,
             )
             if repaired is None:
                 skipped += 1
                 continue
             current = _safe_float(getattr(position, "realized_pnl", None), 0.0)
-            if abs(current - repaired) <= 0.000001:
+            repaired_pnl = repaired.realized_pnl
+            current_status = str(getattr(position, "settlement_status", "") or "").strip()
+            current_source = str(getattr(position, "settlement_source", "") or "").strip()
+            if (
+                abs(current - repaired_pnl) <= 0.000001
+                and current_status == repaired.status
+                and current_source == repaired.source
+            ):
                 skipped += 1
                 continue
-            position.realized_pnl = repaired
+            apply_position_settlement_snapshot(position, repaired)
             position.updated_at = now
             updated += 1
             samples.append(
@@ -1396,8 +1409,12 @@ class OkxOrderFactSyncService:
                     "symbol": getattr(position, "symbol", None),
                     "side": getattr(position, "side", None),
                     "old_realized_pnl": current,
-                    "realized_pnl": repaired,
+                    "realized_pnl": repaired_pnl,
+                    "close_fill_pnl": repaired.close_fill_pnl,
+                    "entry_fee": repaired.entry_fee,
+                    "close_fee": repaired.close_fee,
                     "funding_fee": _closed_position_funding_fee(position, account_bills),
+                    "settlement_status": repaired.status,
                     "close_exchange_order_id": getattr(position, "close_exchange_order_id", None),
                 }
             )
@@ -2565,6 +2582,21 @@ def _position_from_history_row(
     entry_price = _safe_float(row.get("openAvgPx") or row.get("avgPx"), 0.0)
     close_price = _safe_float(row.get("closeAvgPx") or row.get("closePx"), 0.0)
     realized_pnl = _safe_float(row.get("realizedPnl"), 0.0)
+    settlement = build_position_settlement_snapshot(
+        close_fill_pnl=realized_pnl,
+        entry_fee=0.0,
+        close_fee=0.0,
+        funding_fee=0.0,
+        status="okx_position_history",
+        source="okx_position_history",
+        synced_at=now,
+        raw={
+            "formula": "okx_position_history.realizedPnl",
+            "realizedPnl": row.get("realizedPnl"),
+            "entry_order_ids": list(entry_order_ids),
+            "close_order_ids": list(close_order_ids),
+        },
+    )
     return {
         "model_name": "okx_authoritative_sync",
         "execution_mode": mode,
@@ -2575,7 +2607,7 @@ def _position_from_history_row(
         "current_price": close_price or entry_price,
         "leverage": _position_history_leverage(row),
         "unrealized_pnl": 0.0,
-        "realized_pnl": realized_pnl,
+        **settlement_payload_fields(settlement),
         "is_open": False,
         "closed_at": closed_at,
         "created_at": created_at,
@@ -2600,6 +2632,20 @@ def _position_from_fill_pair(
         _fill_base_quantity(entry_fill, contract_size),
         _fill_base_quantity(close_fill, contract_size),
     )
+    settlement = build_position_settlement_snapshot(
+        close_fill_pnl=_safe_float(close_fill.fill_pnl, 0.0),
+        entry_fee=_safe_float(entry_fill.fee_abs, 0.0),
+        close_fee=_safe_float(close_fill.fee_abs, 0.0),
+        funding_fee=0.0,
+        status="reconciled",
+        source="okx_fill_pair",
+        synced_at=now,
+        raw={
+            "entry_order_id": entry_fill.order_id,
+            "close_order_id": close_fill.order_id,
+            "funding_fee_source": "not_loaded_for_fill_pair",
+        },
+    )
     return {
         "model_name": "okx_authoritative_sync",
         "execution_mode": mode,
@@ -2610,12 +2656,7 @@ def _position_from_fill_pair(
         "current_price": close_fill.avg_price,
         "leverage": 1.0,
         "unrealized_pnl": 0.0,
-        "realized_pnl": (
-            _safe_float(entry_fill.fill_pnl, 0.0)
-            + _safe_float(close_fill.fill_pnl, 0.0)
-            - _safe_float(entry_fill.fee_abs, 0.0)
-            - _safe_float(close_fill.fee_abs, 0.0)
-        ),
+        **settlement_payload_fields(settlement),
         "is_open": False,
         "closed_at": close_fill.timestamp or now,
         "created_at": entry_fill.timestamp or now,
@@ -2635,7 +2676,8 @@ def _closed_position_realized_pnl_from_close_facts(
     contract_sizes: dict[str, float],
     orders_by_id: dict[str, Order],
     account_bills: list[OkxAccountBill],
-) -> float | None:
+    now: datetime,
+) -> Any | None:
     quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
     if quantity <= 0 or not close_ids:
         return None
@@ -2674,7 +2716,21 @@ def _closed_position_realized_pnl_from_close_facts(
         return None
     entry_fee = _entry_fee_from_linked_orders(position, orders_by_id, close_quantity=quantity)
     funding_fee = _closed_position_funding_fee(position, account_bills)
-    return close_gross_pnl + funding_fee - entry_fee - close_fee
+    return build_position_settlement_snapshot(
+        close_fill_pnl=close_gross_pnl,
+        entry_fee=entry_fee,
+        close_fee=close_fee,
+        funding_fee=funding_fee,
+        status="reconciled",
+        source="okx_order_fact_sync",
+        synced_at=now,
+        raw={
+            "close_order_ids": sorted(close_ids),
+            "close_quantity": close_quantity,
+            "position_quantity": quantity,
+            "funding_fee_source": "okx_account_bills",
+        },
+    )
 
 
 async def _account_bills_for_closed_positions(
@@ -2894,6 +2950,14 @@ def _apply_position_history_payload(position: Position, payload: dict[str, Any],
     position.leverage = float(payload["leverage"])
     position.unrealized_pnl = 0.0
     position.realized_pnl = float(payload["realized_pnl"])
+    position.close_fill_pnl = float(payload.get("close_fill_pnl") or 0.0)
+    position.entry_fee = abs(float(payload.get("entry_fee") or 0.0))
+    position.close_fee = abs(float(payload.get("close_fee") or 0.0))
+    position.funding_fee = float(payload.get("funding_fee") or 0.0)
+    position.settlement_status = payload.get("settlement_status")
+    position.settlement_source = payload.get("settlement_source")
+    position.settlement_synced_at = payload.get("settlement_synced_at")
+    position.settlement_raw = payload.get("settlement_raw")
     position.is_open = False
     position.closed_at = payload["closed_at"]
     position.created_at = payload["created_at"]

@@ -49,6 +49,16 @@ class Position(Base, TimestampMixin):
     leverage: Mapped[float] = mapped_column(Float, default=1.0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    close_fill_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    close_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    funding_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    settlement_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    settlement_source: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    settlement_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    settlement_raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)

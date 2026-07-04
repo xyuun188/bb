@@ -18,6 +18,10 @@ from core.symbols import (
 )
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.position_settlement import (
+    build_position_settlement_snapshot,
+    settlement_payload_fields,
+)
 
 FILLED_STATUS = "filled"
 ORDER_MATCH_WINDOW = timedelta(minutes=10)
@@ -176,6 +180,22 @@ async def apply_missing_closed_position_plan(
 ) -> Position:
     """Create the missing closed position described by the plan."""
 
+    settlement = build_position_settlement_snapshot(
+        close_fill_pnl=plan.gross_pnl,
+        entry_fee=plan.entry_fee_allocated,
+        close_fee=plan.close_fee_allocated,
+        funding_fee=0.0,
+        status="provisional",
+        source="missing_closed_position_repair",
+        synced_at=plan.closed_at,
+        raw={
+            "entry_order_id": plan.entry_order_id,
+            "close_order_id": plan.close_order_id,
+            "entry_exchange_order_id": plan.entry_exchange_order_id,
+            "close_exchange_order_id": plan.close_exchange_order_id,
+            "funding_fee_source": "not_available_from_order_pair",
+        },
+    )
     position = Position(
         model_name=plan.model_name,
         execution_mode=plan.execution_mode,
@@ -186,7 +206,7 @@ async def apply_missing_closed_position_plan(
         current_price=plan.exit_price,
         leverage=plan.leverage,
         unrealized_pnl=0.0,
-        realized_pnl=plan.realized_pnl,
+        **settlement_payload_fields(settlement),
         stop_loss_price=plan.stop_loss_price,
         take_profit_price=plan.take_profit_price,
         is_open=False,

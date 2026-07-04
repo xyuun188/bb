@@ -324,6 +324,67 @@ async def test_dashboard_position_history_uses_synced_position_realized_pnl(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_prefers_closed_position_settlement_snapshot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-settlement-snapshot.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "SNAP/USDT",
+                    "side": "long",
+                    "quantity": 10.0,
+                    "entry_price": 1.0,
+                    "current_price": 1.4,
+                    "leverage": 2.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 3.67,
+                    "close_fill_pnl": 4.0,
+                    "entry_fee": 0.1,
+                    "close_fee": 0.2,
+                    "funding_fee": -0.03,
+                    "settlement_status": "reconciled",
+                    "settlement_source": "okx_order_fact_sync",
+                    "settlement_synced_at": closed_at,
+                    "settlement_raw": {
+                        "formula": "close_fill_pnl + funding_fee - entry_fee - close_fee"
+                    },
+                    "is_open": False,
+                    "okx_inst_id": "SNAP-USDT-SWAP",
+                    "entry_exchange_order_id": "snap-entry",
+                    "close_exchange_order_id": "snap-close",
+                    "closed_at": closed_at,
+                    "created_at": opened_at,
+                }
+            )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    row = payload["positions"][0]
+    assert row["realized_pnl"] == pytest.approx(3.67)
+    assert row["pnl_source"] == "position_settlement_snapshot:okx_order_fact_sync"
+    assert row["close_fill_pnl"] == pytest.approx(4.0)
+    assert row["entry_fee"] == pytest.approx(0.1)
+    assert row["close_fee"] == pytest.approx(0.2)
+    assert row["funding_fee"] == pytest.approx(-0.03)
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_prefers_confirmed_okx_close_fill_net_pnl(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

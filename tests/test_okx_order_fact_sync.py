@@ -1932,6 +1932,12 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts
         assert report["confirmed_count"] == 0
         assert report["closed_position_pnl_repaired_count"] == 1
         assert row["realized_pnl"] == pytest.approx(7.73)
+        assert row["close_fill_pnl"] == pytest.approx(7.95)
+        assert row["entry_fee"] == pytest.approx(0.01)
+        assert row["close_fee"] == pytest.approx(0.01)
+        assert row["funding_fee"] == pytest.approx(-0.2)
+        assert row["settlement_status"] == "reconciled"
+        assert row["settlement_source"] == "okx_order_fact_sync"
     finally:
         await close_db()
 
@@ -2142,6 +2148,12 @@ async def test_order_fact_sync_repairs_stored_okx_facts_when_okx_pull_times_out(
         assert any("positions: OKX pull timeout" in item for item in report["optional_stage_errors"])
         assert report["closed_position_pnl_repaired_count"] == 1
         assert row["realized_pnl"] == pytest.approx(7.93)
+        assert row["close_fill_pnl"] == pytest.approx(7.95)
+        assert row["entry_fee"] == pytest.approx(0.01)
+        assert row["close_fee"] == pytest.approx(0.01)
+        assert row["funding_fee"] == pytest.approx(0.0)
+        assert row["settlement_status"] == "reconciled"
+        assert row["settlement_source"] == "okx_order_fact_sync"
     finally:
         await close_db()
 
@@ -2381,6 +2393,12 @@ async def test_order_fact_sync_recovers_close_fill_decision_fact_when_okx_pull_t
         assert close_order["okx_fill_pnl"] == pytest.approx(-0.792)
         assert close_order["okx_raw_fills"]["fills_history_confirmed"] is True
         assert position["realized_pnl"] == pytest.approx(-0.982116)
+        assert position["close_fill_pnl"] == pytest.approx(-0.792)
+        assert position["entry_fee"] == pytest.approx(0.09486)
+        assert position["close_fee"] == pytest.approx(0.095256)
+        assert position["funding_fee"] == pytest.approx(0.0)
+        assert position["settlement_status"] == "reconciled"
+        assert position["settlement_source"] == "okx_order_fact_sync"
     finally:
         await close_db()
 

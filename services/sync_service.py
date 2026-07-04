@@ -28,6 +28,13 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.position_open_time import parse_position_time, serialize_position_time
+from services.position_settlement import (
+    apply_position_settlement_snapshot,
+    build_position_settlement_snapshot,
+    funding_fee_from_payload,
+    proportional_signed_value,
+    settlement_payload_fields,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1873,7 +1880,7 @@ class OkxSyncService:
                     close_okx_pos_id = _okx_pos_id_from_close_fill(close_fill)
                     from services.okx_realized_pnl import gross_pnl_with_okx_override
 
-                    gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+                    gross_pnl, gross_pnl_source = gross_pnl_with_okx_override(
                         side=str(pos.side or "").lower(),
                         entry_price=pos.entry_price,
                         exit_price=exit_price,
@@ -1884,13 +1891,35 @@ class OkxSyncService:
                     close_side = "buy" if pos.side == "short" else "sell"
                     entry_fee = await entry_fee_for_position(session, pos, pos.quantity)
                     calculate_position_margin(pos.entry_price * pos.quantity, pos.leverage)
-                    realized_pnl = gross_pnl - entry_fee - close_fee
+                    raw_funding_fee, funding_fee_source = funding_fee_from_payload(close_fill)
+                    funding_fee = proportional_signed_value(
+                        raw_funding_fee,
+                        pos.quantity,
+                        close_fill.get("quantity") if close_fill else pos.quantity,
+                    )
+                    settlement = build_position_settlement_snapshot(
+                        close_fill_pnl=gross_pnl,
+                        entry_fee=entry_fee,
+                        close_fee=close_fee,
+                        funding_fee=funding_fee,
+                        status="provisional",
+                        source="okx_authoritative_reconcile",
+                        synced_at=close_fill.get("timestamp") or datetime.now(UTC),
+                        raw={
+                            "gross_pnl_source": gross_pnl_source,
+                            "funding_fee_source": funding_fee_source,
+                            "close_exchange_order_id": close_order_id,
+                            "close_quantity": pos.quantity,
+                            "fill_quantity": close_fill.get("quantity") if close_fill else None,
+                        },
+                    )
+                    realized_pnl = settlement.realized_pnl
 
                     reconcile_origin = _exchange_reconcile_close_origin(pos, close_fill)
                     pos.is_open = False
                     pos.current_price = exit_price
                     pos.unrealized_pnl = 0.0
-                    pos.realized_pnl = realized_pnl
+                    apply_position_settlement_snapshot(pos, settlement)
                     pos.closed_at = close_fill.get("timestamp") or datetime.now(UTC)
                     if close_okx_inst_id:
                         pos.okx_inst_id = close_okx_inst_id
@@ -2053,7 +2082,7 @@ class OkxSyncService:
             entry_fee = await entry_fee_for_position(session, pos, closed_qty)
             from services.okx_realized_pnl import gross_pnl_with_okx_override
 
-            gross_pnl, _gross_pnl_source = gross_pnl_with_okx_override(
+            gross_pnl, gross_pnl_source = gross_pnl_with_okx_override(
                 side=str(pos.side or "").lower(),
                 entry_price=pos.entry_price,
                 exit_price=close_price,
@@ -2062,7 +2091,30 @@ class OkxSyncService:
                 okx_total_qty=(close_fill or {}).get("quantity") if close_fill else closed_qty,
             )
             close_side = "buy" if str(pos.side or "").lower() == "short" else "sell"
-            realized_pnl = gross_pnl - entry_fee - close_fee
+            raw_funding_fee, funding_fee_source = funding_fee_from_payload(close_fill)
+            funding_fee = proportional_signed_value(
+                raw_funding_fee,
+                closed_qty,
+                (close_fill or {}).get("quantity") if close_fill else closed_qty,
+            )
+            settlement = build_position_settlement_snapshot(
+                close_fill_pnl=gross_pnl,
+                entry_fee=entry_fee,
+                close_fee=close_fee,
+                funding_fee=funding_fee,
+                status="provisional",
+                source="okx_authoritative_reconcile",
+                synced_at=closed_at,
+                raw={
+                    "gross_pnl_source": gross_pnl_source,
+                    "funding_fee_source": funding_fee_source,
+                    "close_exchange_order_id": close_order_id,
+                    "close_quantity": closed_qty,
+                    "fill_quantity": (close_fill or {}).get("quantity") if close_fill else None,
+                    "partial_reduction": True,
+                },
+            )
+            realized_pnl = settlement.realized_pnl
             closed_position_payload = {
                 "model_name": pos.model_name,
                 "execution_mode": pos.execution_mode,
@@ -2073,12 +2125,12 @@ class OkxSyncService:
                 "current_price": close_price,
                 "leverage": pos.leverage,
                 "unrealized_pnl": 0.0,
-                "realized_pnl": realized_pnl,
                 "stop_loss_price": getattr(pos, "stop_loss_price", None),
                 "take_profit_price": getattr(pos, "take_profit_price", None),
                 "is_open": False,
                 "closed_at": closed_at,
                 "created_at": pos.created_at,
+                **settlement_payload_fields(settlement),
             }
             okx_inst_id = getattr(pos, "okx_inst_id", None) or close_okx_inst_id
             okx_pos_id = getattr(pos, "okx_pos_id", None) or close_okx_pos_id

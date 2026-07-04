@@ -235,6 +235,12 @@ async def test_manual_close_bypasses_ai_risk_and_persists_manual_order(
     assert state["orders"][0]["side"] == "sell"
     assert state["db_position"].is_open is False
     assert state["db_position"].realized_pnl == pytest.approx(9.7)
+    assert state["db_position"].close_fill_pnl == pytest.approx(10.0)
+    assert state["db_position"].entry_fee == pytest.approx(0.2)
+    assert state["db_position"].close_fee == pytest.approx(0.1)
+    assert state["db_position"].funding_fee == pytest.approx(0.0)
+    assert state["db_position"].settlement_status == "provisional"
+    assert state["db_position"].settlement_source == "manual_close_execution"
     assert state["account_updates"] == [pytest.approx(9.7)]
     executed_event = next(
         row for row in state["strategy_events"] if row["event_status"] == "executed"
