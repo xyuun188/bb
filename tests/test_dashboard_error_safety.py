@@ -1422,6 +1422,156 @@ async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
     assert day["symbol_pnl"][0]["realized_pnl"] == pytest.approx(7.93794089)
 
 
+@pytest.mark.asyncio
+async def test_daily_pnl_records_include_final_settlement_snapshots(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-final-settlement.db').as_posix()}",
+    )
+    await init_db()
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 6, 12, 0, tzinfo=tz or UTC)
+
+    async def okx_snapshot(_mode: str):
+        return {}
+
+    monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode: _async_value(set()),
+    )
+    monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
+
+    try:
+        async with get_session_ctx() as session:
+            pros_opened = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+            pros_closed = datetime(2026, 7, 5, 7, 19, tzinfo=UTC)
+            met_opened = datetime(2026, 7, 5, 2, 0, tzinfo=UTC)
+            met_closed = datetime(2026, 7, 5, 5, 45, tzinfo=UTC)
+            session.add_all(
+                [
+                    Position(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        execution_mode="paper",
+                        symbol="PROS/USDT",
+                        side="long",
+                        quantity=77.0,
+                        entry_price=0.42943636,
+                        current_price=0.487,
+                        leverage=1.0,
+                        realized_pnl=4.3971172,
+                        close_fill_pnl=4.4324,
+                        entry_fee=0.0165333,
+                        close_fee=0.0187495,
+                        funding_fee=0.0,
+                        settlement_status="reconciled",
+                        settlement_source="okx_stored_linked_close_orders",
+                        is_open=False,
+                        okx_inst_id="PROS-USDT-SWAP",
+                        entry_exchange_order_id="pros-entry",
+                        close_exchange_order_id="pros-close",
+                        created_at=pros_opened,
+                        closed_at=pros_closed,
+                    ),
+                    Position(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        execution_mode="paper",
+                        symbol="MET/USDT",
+                        side="short",
+                        quantity=3.0,
+                        entry_price=10.0,
+                        current_price=9.0,
+                        leverage=1.0,
+                        realized_pnl=2.7,
+                        close_fill_pnl=3.0,
+                        entry_fee=0.1,
+                        close_fee=0.2,
+                        funding_fee=0.0,
+                        settlement_status="reconciled",
+                        is_open=False,
+                        okx_inst_id="MET-USDT-SWAP",
+                        entry_exchange_order_id="met-entry",
+                        close_exchange_order_id="met-close",
+                        created_at=met_opened,
+                        closed_at=met_closed,
+                    ),
+                    Position(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        execution_mode="paper",
+                        symbol="FAKE/USDT",
+                        side="long",
+                        quantity=1.0,
+                        entry_price=1.0,
+                        current_price=101.0,
+                        leverage=1.0,
+                        realized_pnl=100.0,
+                        close_fill_pnl=100.0,
+                        settlement_status="reconciled",
+                        is_open=False,
+                        okx_inst_id="FAKE-USDT-SWAP",
+                        created_at=met_opened,
+                        closed_at=met_closed,
+                    ),
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="MET/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=3.0,
+                        price=10.0,
+                        status="filled",
+                        fee=0.0,
+                        exchange_order_id="met-entry",
+                        filled_at=met_opened,
+                        created_at=met_opened,
+                        okx_inst_id="MET-USDT-SWAP",
+                        okx_trade_ids="trade-met-entry",
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                    ),
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="MET/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=3.0,
+                        price=9.0,
+                        status="filled",
+                        fee=0.0,
+                        exchange_order_id="met-close",
+                        filled_at=met_closed,
+                        created_at=met_closed,
+                        okx_inst_id="MET-USDT-SWAP",
+                        okx_trade_ids="trade-met-close",
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                    ),
+                ]
+            )
+
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    finally:
+        await close_db()
+
+    day = next(row for row in payload["records"] if row["date"] == "2026-07-05")
+    assert day["trade_count"] == 2
+    assert day["realized_profit"] == pytest.approx(7.0971172)
+    assert day["realized_pnl"] == pytest.approx(7.0971172)
+    assert day["symbols"] == ["MET/USDT", "PROS/USDT"]
+    assert {item["symbol"] for item in day["position_details"]} == {"MET/USDT", "PROS/USDT"}
+    assert all(item["symbol"] != "FAKE/USDT" for item in day["position_details"])
+
+
 async def _async_value(value):
     return value
 

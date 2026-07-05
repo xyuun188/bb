@@ -6297,6 +6297,18 @@ def _daily_pnl_ledger_row_has_okx_realized_pnl(row: dict[str, Any]) -> bool:
         return True
     if source == "okx_fill_pnl" and bool(row.get("evidence_complete")):
         return True
+    if source.startswith("position_settlement_snapshot:okx_"):
+        return True
+    settlement_source = str(row.get("settlement_source") or "").strip()
+    if settlement_source.startswith("position_settlement_snapshot:okx_"):
+        return True
+    if source == "position_settlement_snapshot":
+        final_statuses = {"reconciled", "settled", "okx_position_history"}
+        status = str(row.get("settlement_status") or "").strip()
+        has_linked_order_evidence = bool(row.get("linked_order_count")) or (
+            bool(row.get("entry_order_ids")) and bool(row.get("close_order_ids"))
+        )
+        return status in final_statuses and has_linked_order_evidence
     return False
 
 
