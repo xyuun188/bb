@@ -792,6 +792,157 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_groups_okx_partial_closes_by_position_id(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-partial-lifecycle.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 4, 19, 15, 25, tzinfo=UTC)
+    entry_order_id = "band-entry"
+    pos_id = "band-pos-3714144287308087298"
+    entry_fee = 0.0366182
+    partial_closes = (
+        ("band-close-203", 203.0, 0.1650, 0.6034309734513242, 0.0167475, 16, 59, 55),
+        ("band-close-112", 112.0, 0.1645, 0.2769274336283168, 0.0092120, 17, 16, 10),
+        ("band-close-061", 61.0, 0.1663, 0.2606265486725654, 0.00507215, 21, 7, 27),
+        ("band-close-034", 34.0, 0.1677, 0.1928672566371676, 0.0028509, 23, 22, 36),
+    )
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.create_order(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "BAND/USDT",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": 452.0,
+                    "price": 0.1620274336283186,
+                    "status": "filled",
+                    "fee": entry_fee,
+                    "exchange_order_id": entry_order_id,
+                    "filled_at": opened_at,
+                    "created_at": opened_at,
+                    "okx_inst_id": "BAND-USDT-SWAP",
+                    "okx_trade_ids": "band-entry-trade-a,band-entry-trade-b",
+                    "okx_fill_contracts": 452.0,
+                    "okx_fill_pnl": 0.0,
+                    "okx_sync_status": OKX_SYNC_CONFIRMED,
+                    "okx_raw_fills": {
+                        "order_id": entry_order_id,
+                        "trade_ids": ["band-entry-trade-a", "band-entry-trade-b"],
+                        "inst_id": "BAND-USDT-SWAP",
+                        "contracts": 452.0,
+                        "contract_size": 1.0,
+                        "base_quantity": 452.0,
+                        "avg_price": 0.1620274336283186,
+                        "fee_abs": entry_fee,
+                        "fill_pnl": 0.0,
+                        "timestamp": opened_at.isoformat(),
+                        "fills_history_confirmed": True,
+                    },
+                }
+            )
+            for order_id, qty, price, fill_pnl, close_fee, hour, minute, second in partial_closes:
+                closed_at = datetime(2026, 7, 5, hour, minute, second, tzinfo=UTC)
+                allocated_entry_fee = entry_fee * qty / 452.0
+                await repo.open_position(
+                    {
+                        "model_name": "ensemble_trader",
+                        "execution_mode": "paper",
+                        "symbol": "BAND/USDT",
+                        "side": "long",
+                        "quantity": qty,
+                        "entry_price": 0.1620274336283186,
+                        "current_price": price,
+                        "leverage": 2.0,
+                        "unrealized_pnl": 0.0,
+                        "realized_pnl": fill_pnl - allocated_entry_fee - close_fee,
+                        "close_fill_pnl": fill_pnl,
+                        "entry_fee": allocated_entry_fee,
+                        "close_fee": close_fee,
+                        "funding_fee": 0.0,
+                        "settlement_status": "reconciled",
+                        "settlement_source": "okx_order_fact_sync",
+                        "is_open": False,
+                        "okx_inst_id": "BAND-USDT-SWAP",
+                        "okx_pos_id": pos_id,
+                        "entry_exchange_order_id": entry_order_id,
+                        "close_exchange_order_id": order_id,
+                        "closed_at": closed_at,
+                        "created_at": opened_at,
+                    }
+                )
+                await repo.create_order(
+                    {
+                        "model_name": "ensemble_trader",
+                        "execution_mode": "paper",
+                        "symbol": "BAND/USDT",
+                        "side": "sell",
+                        "order_type": "market",
+                        "quantity": qty,
+                        "price": price,
+                        "status": "filled",
+                        "fee": close_fee,
+                        "exchange_order_id": order_id,
+                        "filled_at": closed_at,
+                        "created_at": closed_at,
+                        "okx_inst_id": "BAND-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": qty,
+                        "okx_fill_pnl": fill_pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "BAND-USDT-SWAP",
+                            "contracts": qty,
+                            "contract_size": 1.0,
+                            "base_quantity": qty,
+                            "avg_price": price,
+                            "fee_abs": close_fee,
+                            "fill_pnl": fill_pnl,
+                            "timestamp": closed_at.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    expected_realized = (
+        sum(item[3] for item in partial_closes)
+        - entry_fee * 410.0 / 452.0
+        - sum(item[4] for item in partial_closes)
+    )
+    assert payload["ledger_source"] == "okx_native_grouped_cache"
+    assert payload["total"] == 1
+    row = payload["positions"][0]
+    assert row["symbol"] == "BAND/USDT"
+    assert row["close_status"] == "partial"
+    assert row["close_status_label"] == "部分平仓"
+    assert row["quantity"] == pytest.approx(410.0)
+    assert row["max_position_quantity"] == pytest.approx(452.0)
+    assert row["realized_pnl"] == pytest.approx(expected_realized)
+    assert row["linked_order_count"] == 5
+    assert row["entry_order_ids"] == [entry_order_id]
+    assert set(row["close_order_ids"]) == {item[0] for item in partial_closes}
+    assert {item["order_id"] for item in row["linked_fills"]} == {
+        entry_order_id,
+        *(item[0] for item in partial_closes),
+    }
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_adds_okx_funding_fee_from_account_bills(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

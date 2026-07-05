@@ -310,6 +310,8 @@ def _position_belongs_to_lifecycle_group(
     if position_pos_id and group_pos_ids:
         if position_pos_id not in group_pos_ids:
             return False
+        if _same_okx_position_id_lifecycle(position, rows):
+            return True
         if _position_lifecycle_anchor(position) and any(
             _position_lifecycle_anchor(row) for row in rows
         ):
@@ -328,6 +330,17 @@ def _position_belongs_to_lifecycle_group(
     if _position_order_sets_overlap(position, rows):
         return True
     return _position_time_window_matches_group(position, rows)
+
+
+def _same_okx_position_id_lifecycle(position: Position, rows: list[Position]) -> bool:
+    if _is_generated_order_lifecycle_fragment(position) or any(
+        _is_generated_order_lifecycle_fragment(row) for row in rows
+    ):
+        return False
+    position_pos_id = _position_pos_id(position)
+    if not position_pos_id:
+        return False
+    return any(_position_pos_id(row) == position_pos_id for row in rows)
 
 
 def _position_order_sets_overlap(position: Position, rows: list[Position]) -> bool:
@@ -997,6 +1010,8 @@ def _build_group_from_positions(
         close_ids=close_ids,
         closed_quantity=closed_quantity,
     )
+    if pnl_components is not None and pnl_components.entry_quantity > max_quantity:
+        max_quantity = pnl_components.entry_quantity
     funding_components = _funding_fee_components_for_group(
         account_bills=account_bills,
         mode=mode,
@@ -1072,7 +1087,11 @@ def _build_group_from_positions(
     if pnl_components is not None and pnl_components.quantity_mismatch:
         gaps.append("okx_fill_position_quantity_mismatch")
     evidence_complete = not gaps and bool(close_ids) and bool(entry_ids)
-    status = "partial" if len(positions) > 1 and not evidence_complete else "full"
+    partial_lifecycle = _group_represents_partial_lifecycle(
+        closed_quantity=closed_quantity,
+        pnl_components=pnl_components,
+    )
+    status = "partial" if partial_lifecycle or (len(positions) > 1 and not evidence_complete) else "full"
     status_label = "部分平仓" if status == "partial" else "全部平仓"
 
     group_id = _group_id(mode, inst_id or symbol, side, lifecycle_open, closed_at)
@@ -1129,6 +1148,23 @@ def _build_group_from_positions(
         funding_fee_source=funding_components.source,
         settlement_status=stored_settlement.status if stored_settlement is not None else "",
         settlement_source=stored_settlement.source if stored_settlement is not None else "",
+    )
+
+
+def _group_represents_partial_lifecycle(
+    *,
+    closed_quantity: float,
+    pnl_components: _LinkedOrderPnlComponents | None,
+) -> bool:
+    if pnl_components is None:
+        return False
+    entry_quantity = _safe_float(pnl_components.entry_quantity, 0.0) or 0.0
+    closed_quantity = _safe_float(closed_quantity, 0.0) or 0.0
+    return bool(
+        entry_quantity > 0
+        and closed_quantity > 0
+        and closed_quantity < entry_quantity
+        and not _quantities_match(closed_quantity, entry_quantity)
     )
 
 
