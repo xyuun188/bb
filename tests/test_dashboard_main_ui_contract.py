@@ -186,6 +186,16 @@ def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
     assert ".position-linked-orders-table-wrap" in style
 
 
+def test_position_history_uses_official_settlement_badge_not_pending_reconciliation() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "function isOfficialClosedPositionSettlement" in script
+    assert "function closedPositionEvidenceLabel" in script
+    assert "\\u5f85\\u5bf9\\u8d26" not in script
+    assert "\\u8ba2\\u5355\\u8865\\u5168\\u4e2d" in script
+    assert "\\u5df2\\u5b98\\u65b9\\u7ed3\\u7b97" in script
+
+
 def test_opportunity_score_ui_prefers_expected_net_return() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
@@ -450,7 +460,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
+    assert "dashboard.js?v=20260705-official-settlement-badge" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -587,8 +597,8 @@ def test_system_audit_nodes_use_state_aware_display_status() -> None:
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260624-threshold-governance-strip" in html
-    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
+    assert "dashboard.css?v=20260705-official-settlement-badge" in html
+    assert "dashboard.js?v=20260705-official-settlement-badge" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -744,8 +754,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260624-threshold-governance-strip" in html
-    assert "dashboard.js?v=20260624-threshold-governance-strip" in html
+    assert "dashboard.css?v=20260705-official-settlement-badge" in html
+    assert "dashboard.js?v=20260705-official-settlement-badge" in html
     assert "overflow-wrap: anywhere;" in style
 
 

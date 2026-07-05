@@ -556,6 +556,11 @@ def parse_args() -> argparse.Namespace:
         help="Run trading and Dashboard as separate systemd services on the online server.",
     )
     parser.add_argument(
+        "--require-model-tunnels",
+        action="store_true",
+        help="Fail the sync if loopback model tunnels do not become reachable.",
+    )
+    parser.add_argument(
         "--skip-local-ai-tools-key-sync",
         action="store_true",
         help="Do not copy the model server local AI tools API key into the platform runtime env.",
@@ -687,26 +692,48 @@ def main() -> None:
                 timeout=120,
                 check=True,
             )
+            model_tunnel_probe = "python3 -c " + _remote_quote(
+                "import socket, time\n"
+                "for port in (18000, 18001, 18002, 18003):\n"
+                "    deadline = time.time() + 20\n"
+                "    while True:\n"
+                "        try:\n"
+                "            socket.create_connection(('127.0.0.1', port), timeout=1).close(); break\n"
+                "        except OSError:\n"
+                "            if time.time() >= deadline:\n"
+                "                raise SystemExit(f'tunnel port {port} unavailable')\n"
+                "            time.sleep(1)\n"
+                "print('model-tunnels-ok')"
+            )
+            model_tunnel_failure_action = "exit 8" if args.require_model_tunnels else "true"
+            model_tunnel_restart = (
+                "set +e; "
+                f"systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}; "
+                "model_tunnel_restart_rc=$?; "
+                f"{model_tunnel_probe}; "
+                "model_tunnel_probe_rc=$?; "
+                'if [ "$model_tunnel_restart_rc" -eq 0 ] && '
+                '[ "$model_tunnel_probe_rc" -eq 0 ]; then '
+                "echo model-tunnels-ok; "
+                "else "
+                "echo model-tunnels-degraded; "
+                f"systemctl status {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} "
+                "--no-pager -l | sed -n '1,60p' || true; "
+                f"{model_tunnel_failure_action}; "
+                "fi; "
+                "set -e; "
+            )
+            model_tunnel_active_check = (
+                f"systemctl is-active {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} && "
+                if args.require_model_tunnels
+                else f"(systemctl is-active {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} || true) && "
+            )
             command = (
-                f"systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} && "
-                "python3 -c "
-                + _remote_quote(
-                    "import socket, time\n"
-                    "for port in (18000, 18001, 18002, 18003):\n"
-                    "    deadline = time.time() + 20\n"
-                    "    while True:\n"
-                    "        try:\n"
-                    "            socket.create_connection(('127.0.0.1', port), timeout=1).close(); break\n"
-                    "        except OSError:\n"
-                    "            if time.time() >= deadline:\n"
-                    "                raise SystemExit(f'tunnel port {port} unavailable')\n"
-                    "            time.sleep(1)\n"
-                    "print('model-tunnels-ok')"
-                )
-                + " && "
+                model_tunnel_restart
+                + (
                 f"systemctl restart {_remote_quote(args.service)} && "
                 f"systemctl restart {_remote_quote(args.dashboard_service)} && "
-                f"systemctl is-active {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} && "
+                f"{model_tunnel_active_check}"
                 f"systemctl is-active {_remote_quote(args.service)} && "
                 f"systemctl is-active {_remote_quote(args.dashboard_service)} && "
                 "for i in $(seq 1 30); do "
@@ -714,6 +741,7 @@ def main() -> None:
                 'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
                 "sleep 2; "
                 "done; echo dashboard-timeout; exit 7"
+                )
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return

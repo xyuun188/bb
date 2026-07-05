@@ -8031,6 +8031,25 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
 }
 
 
+function isOfficialClosedPositionSettlement(position) {
+    const status = String(position?.settlement_status || '').trim();
+    if (['reconciled', 'settled', 'okx_position_history'].includes(status)) {
+        return true;
+    }
+    const source = String(position?.settlement_source || position?.pnl_source || '').trim();
+    return source.includes('okx_position_history') || source.includes('position_settlement_snapshot');
+}
+
+function closedPositionEvidenceLabel(position) {
+    if (isOfficialClosedPositionSettlement(position)) {
+        return '\u5df2\u5b98\u65b9\u7ed3\u7b97';
+    }
+    if (position?.evidence_complete === true) {
+        return '\u5b8c\u6574';
+    }
+    return '\u8ba2\u5355\u8865\u5168\u4e2d';
+}
+
 function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalItems = 0) {
     const tbody = document.getElementById('position-history-tbody');
     const pagination = document.getElementById('position-history-pagination');
@@ -8050,9 +8069,9 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
         const linkedFills = Array.isArray(p.linked_fills) ? p.linked_fills : [];
         positionLinkedOrdersByGroup.set(groupId, { position: p, fills: linkedFills });
         const linkedCount = Number(p.linked_order_count ?? linkedFills.length ?? 0);
-        const evidenceBadge = p.evidence_complete === true
+        const evidenceBadge = isOfficialClosedPositionSettlement(p) || p.evidence_complete === true
             ? '<div class="position-ledger-badge ok">OKX</div>'
-            : '<div class="position-ledger-badge warn">\u5f85\u5bf9\u8d26</div>';
+            : '<div class="position-ledger-badge warn">\u8ba2\u5355\u8865\u5168\u4e2d</div>';
         const linkedButtonDisabled = linkedCount <= 0 ? 'disabled' : '';
         return `
         <tr>
@@ -8093,7 +8112,7 @@ function openPositionLinkedOrdersModal(groupId) {
             <div><strong>${escHtml(position.okx_inst_id || '-')}</strong><span>OKX instId</span></div>
             <div><strong>${fmtNum(position.closed_quantity ?? position.quantity)}</strong><span>\u5df2\u5e73\u6570\u91cf</span></div>
             <div><strong>${signedMoney(position.realized_pnl || 0)} USDT</strong><span>\u5df2\u5b9e\u73b0\u76c8\u4e8f</span></div>
-            <div><strong>${position.evidence_complete ? '\u5b8c\u6574' : '\u5f85\u5bf9\u8d26'}</strong><span>OKX \u8bc1\u636e</span></div>
+            <div><strong>${closedPositionEvidenceLabel(position)}</strong><span>OKX \u8bc1\u636e</span></div>
         </div>
         ${gaps.length ? `<div class="position-ledger-gaps">\u8bc1\u636e\u7f3a\u53e3\uff1a${gaps.map(item => escHtml(item)).join(' / ')}</div>` : ''}`;
     if (!fills.length) {

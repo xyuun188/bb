@@ -107,6 +107,8 @@ class OkxPositionLedgerGroup:
     funding_fee: float = 0.0
     funding_bill_count: int = 0
     funding_fee_source: str = "none"
+    settlement_status: str = ""
+    settlement_source: str = ""
     realized_pnl_formula: str = "close_fill_pnl_plus_funding_fee_minus_entry_and_close_fees"
 
     def as_dict(self, *, include_fills: bool = True) -> dict[str, Any]:
@@ -137,6 +139,8 @@ class OkxPositionLedgerGroup:
             "funding_fee": _round(self.funding_fee),
             "funding_bill_count": int(self.funding_bill_count),
             "funding_fee_source": self.funding_fee_source,
+            "settlement_status": self.settlement_status,
+            "settlement_source": self.settlement_source,
             "realized_pnl_formula": self.realized_pnl_formula,
             "opened_at": _iso(self.opened_at),
             "closed_at": _iso(self.closed_at),
@@ -1089,6 +1093,8 @@ def _build_group_from_positions(
         funding_fee=funding_components.funding_fee,
         funding_bill_count=funding_components.bill_count,
         funding_fee_source=funding_components.source,
+        settlement_status=stored_settlement.status if stored_settlement is not None else "",
+        settlement_source=stored_settlement.source if stored_settlement is not None else "",
     )
 
 

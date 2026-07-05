@@ -56,6 +56,8 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}" in source
     assert "for port in (18000, 18001, 18002, 18003)" in source
     assert "model-tunnels-ok" in source
+    assert "model-tunnels-degraded" in source
+    assert "--require-model-tunnels" in source
     assert "systemctl enable {dashboard_service} {model_tunnel_service}" in source
 
 
@@ -109,7 +111,7 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
         backup_runtime_env=False,
         emit_summary=False,
     )
-    exec(script, {})
+    exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
     cleaned = app_env.read_text(encoding="utf-8")
     assert "AI_API_BASE=" not in cleaned
