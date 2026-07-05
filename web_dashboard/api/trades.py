@@ -1194,6 +1194,10 @@ async def get_positions(mode: str | None = None):
             closed_positions=closed_positions,
             mode=selected_mode,
         )
+        position_history_rows = await dashboard_api._dashboard_okx_position_history_rows(
+            mode=selected_mode,
+            closed_rows=closed_positions,
+        )
 
     closed_ledger_rows = [
         group.as_dict(include_fills=True)
@@ -1201,6 +1205,7 @@ async def get_positions(mode: str | None = None):
             closed_positions,
             order_rows,
             account_bills=account_bill_rows,
+            position_history_rows=position_history_rows,
         )
     ]
     try:

@@ -220,16 +220,31 @@ class _StoredSettlementComponents:
     preferred: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _OfficialPositionHistoryComponents:
+    close_fill_pnl: float
+    entry_fee: float
+    close_fee: float
+    funding_fee: float
+    realized_pnl: float
+    entry_price: float
+    close_price: float
+    closed_quantity: float
+    source: str = "okx_position_history_realized_pnl"
+
+
 def build_okx_position_ledger_groups(
     positions: list[Position],
     orders: list[Order],
     account_bills: list[Any] | None = None,
+    position_history_rows: list[dict[str, Any]] | None = None,
     include_order_lifecycle_fragments: bool = True,
     require_order_lifecycle_source_positions: bool = False,
 ) -> list[OkxPositionLedgerGroup]:
     """Build OKX-style grouped historical position rows from local OKX facts."""
     orders_by_id = _orders_by_exchange_id(orders)
     funding_bills = list(account_bills or [])
+    official_position_history_rows = list(position_history_rows or [])
     closed_positions = [
         position
         for position in positions
@@ -262,7 +277,13 @@ def build_okx_position_ledger_groups(
         rows = _drop_rows_superseded_by_generated_lifecycle(rows)
         if not rows:
             continue
-        group = _build_group_from_positions(key, rows, orders_by_id, funding_bills)
+        group = _build_group_from_positions(
+            key,
+            rows,
+            orders_by_id,
+            funding_bills,
+            official_position_history_rows,
+        )
         result.append(group)
     return sorted(
         result,
@@ -928,6 +949,7 @@ def _build_group_from_positions(
     positions: list[Position],
     orders_by_id: dict[str, Order],
     account_bills: list[Any],
+    position_history_rows: list[dict[str, Any]],
 ) -> OkxPositionLedgerGroup:
     mode, symbol, side, lifecycle_open = key
     inst_id = _position_inst_id(positions[0]) or okx_inst_id_from_symbol(symbol) or ""
@@ -1020,7 +1042,32 @@ def _build_group_from_positions(
         opened_at=opened_at,
         closed_at=closed_at,
     )
-    if stored_settlement is not None and stored_settlement.preferred:
+    official_components = _official_position_history_components_for_group(
+        position_history_rows=position_history_rows,
+        mode=mode,
+        inst_id=inst_id,
+        side=side,
+        positions=positions,
+        linked_fills=linked_fills,
+        entry_ids=entry_ids,
+        closed_quantity=closed_quantity,
+    )
+    if official_components is not None:
+        realized_pnl = official_components.realized_pnl
+        pnl_source = official_components.source
+        if official_components.entry_price > 0:
+            entry_price = official_components.entry_price
+        if official_components.close_price > 0:
+            close_price = official_components.close_price
+        if official_components.closed_quantity > 0:
+            closed_quantity = official_components.closed_quantity
+        max_quantity = max(max_quantity, closed_quantity)
+        funding_components = _FundingFeeComponents(
+            funding_fee=official_components.funding_fee,
+            bill_count=funding_components.bill_count,
+            source="okx_positions_history.fundingFee",
+        )
+    elif stored_settlement is not None and stored_settlement.preferred:
         realized_pnl = stored_settlement.realized_pnl
         pnl_source = stored_settlement.source
         funding_components = _FundingFeeComponents(
@@ -1118,27 +1165,36 @@ def _build_group_from_positions(
         evidence_complete=evidence_complete,
         trainable=evidence_complete,
         evidence_gaps=gaps,
-        pnl_source=pnl_source,
-        close_fill_pnl=(
-            stored_settlement.close_fill_pnl
-            if stored_settlement is not None
-            and (stored_settlement.preferred or pnl_components is None)
+          pnl_source=pnl_source,
+          close_fill_pnl=(
+              official_components.close_fill_pnl
+              if official_components is not None
+              else
+              stored_settlement.close_fill_pnl
+              if stored_settlement is not None
+              and (stored_settlement.preferred or pnl_components is None)
             else pnl_components.close_fill_pnl
             if pnl_components is not None
             else 0.0
-        ),
-        entry_fee=(
-            stored_settlement.entry_fee
-            if stored_settlement is not None
-            and (stored_settlement.preferred or pnl_components is None)
+          ),
+          entry_fee=(
+              official_components.entry_fee
+              if official_components is not None
+              else
+              stored_settlement.entry_fee
+              if stored_settlement is not None
+              and (stored_settlement.preferred or pnl_components is None)
             else pnl_components.entry_fee
             if pnl_components is not None
             else 0.0
-        ),
-        close_fee=(
-            stored_settlement.close_fee
-            if stored_settlement is not None
-            and (stored_settlement.preferred or pnl_components is None)
+          ),
+          close_fee=(
+              official_components.close_fee
+              if official_components is not None
+              else
+              stored_settlement.close_fee
+              if stored_settlement is not None
+              and (stored_settlement.preferred or pnl_components is None)
             else pnl_components.close_fee
             if pnl_components is not None
             else 0.0
@@ -1147,7 +1203,111 @@ def _build_group_from_positions(
         funding_bill_count=funding_components.bill_count,
         funding_fee_source=funding_components.source,
         settlement_status=stored_settlement.status if stored_settlement is not None else "",
-        settlement_source=stored_settlement.source if stored_settlement is not None else "",
+        settlement_source=(
+            official_components.source
+            if official_components is not None
+            else stored_settlement.source
+            if stored_settlement is not None
+            else ""
+        ),
+    )
+
+
+def _official_position_history_components_for_group(
+    *,
+    position_history_rows: list[dict[str, Any]],
+    mode: str,
+    inst_id: str,
+    side: str,
+    positions: list[Position],
+    linked_fills: list[OkxLinkedFillRow],
+    entry_ids: list[str],
+    closed_quantity: float,
+) -> _OfficialPositionHistoryComponents | None:
+    if not position_history_rows or not inst_id:
+        return None
+    group_pos_ids = {_position_pos_id(position) for position in positions if _position_pos_id(position)}
+    best: tuple[int, dict[str, Any]] | None = None
+    for row in position_history_rows:
+        if not isinstance(row, dict):
+            continue
+        row_inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+        if row_inst_id and row_inst_id != inst_id:
+            continue
+        row_pos_id = str(row.get("posId") or row.get("pos_id") or "").strip()
+        if group_pos_ids and row_pos_id and row_pos_id not in group_pos_ids:
+            continue
+        realized_pnl = _first_present_float(
+            row,
+            ("realizedPnl", "realized_pnl", "realizedPnlInUsd", "realizedPnlUsd"),
+        )
+        if realized_pnl is None:
+            continue
+        row_closed_quantity = _first_present_float(
+            row,
+            ("closeTotalPos", "close_total_pos", "closedQuantity", "closed_quantity"),
+        )
+        quantity_matches = bool(
+            row_closed_quantity is None
+            or row_closed_quantity <= 0
+            or closed_quantity <= 0
+            or _quantities_match(row_closed_quantity, closed_quantity, tolerance_ratio=0.02)
+        )
+        row_opened = _ms_timestamp_to_datetime(row.get("cTime") or row.get("createdTime"))
+        row_updated = _ms_timestamp_to_datetime(row.get("uTime") or row.get("updatedTime"))
+        opened_values = [
+            value
+            for position in positions
+            if (value := _as_utc(getattr(position, "created_at", None))) is not None
+        ]
+        closed_values = [
+            value
+            for position in positions
+            if (value := _as_utc(getattr(position, "closed_at", None))) is not None
+        ]
+        time_matches = True
+        if row_opened and opened_values:
+            time_matches = min(abs((row_opened - value).total_seconds()) for value in opened_values) <= 300
+        if time_matches and row_updated and closed_values:
+            time_matches = min(abs((row_updated - value).total_seconds()) for value in closed_values) <= 3600
+        score = 0
+        if row_pos_id and row_pos_id in group_pos_ids:
+            score += 100
+        if quantity_matches:
+            score += 20
+        if time_matches:
+            score += 10
+        if not quantity_matches and not time_matches:
+            continue
+        if best is None or score > best[0]:
+            best = (score, row)
+    if best is None:
+        return None
+    row = best[1]
+    realized_pnl = _first_present_float(
+        row,
+        ("realizedPnl", "realized_pnl", "realizedPnlInUsd", "realizedPnlUsd"),
+    )
+    if realized_pnl is None:
+        return None
+    funding_fee = _first_present_float(row, ("fundingFee", "funding_fee")) or 0.0
+    total_fee_abs = abs(_first_present_float(row, ("fee", "fees", "totalFee", "total_fee")) or 0.0)
+    close_fill_pnl = _first_present_float(row, ("pnl", "closeFillPnl", "close_fill_pnl"))
+    if close_fill_pnl is None:
+        close_fill_pnl = realized_pnl - funding_fee + total_fee_abs
+    entry_fee = sum(abs(_safe_float(fill.fee, 0.0) or 0.0) for fill in linked_fills if fill.order_id in entry_ids)
+    if entry_fee > total_fee_abs:
+        entry_fee = 0.0
+    close_fee = max(total_fee_abs - entry_fee, 0.0)
+    return _OfficialPositionHistoryComponents(
+        close_fill_pnl=close_fill_pnl,
+        entry_fee=entry_fee,
+        close_fee=close_fee,
+        funding_fee=funding_fee,
+        realized_pnl=realized_pnl,
+        entry_price=_first_present_float(row, ("openAvgPx", "avgPx", "entry_price")) or 0.0,
+        close_price=_first_present_float(row, ("closeAvgPx", "close_price")) or 0.0,
+        closed_quantity=_first_present_float(row, ("closeTotalPos", "closed_quantity")) or 0.0,
     )
 
 
@@ -2049,6 +2209,16 @@ def _first_positive(*values: Any, default: float = 0.0) -> float:
     return default
 
 
+def _first_present_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in row:
+            continue
+        value = _safe_float(row.get(key), None)
+        if value is not None:
+            return value
+    return None
+
+
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
     try:
         if value is None or value == "":
@@ -2071,6 +2241,18 @@ def _as_utc(value: Any) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _ms_timestamp_to_datetime(value: Any) -> datetime | None:
+    number = _safe_float(value, None)
+    if number is None or number <= 0:
+        return None
+    if number > 10_000_000_000:
+        number /= 1000.0
+    try:
+        return datetime.fromtimestamp(number, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _iso(value: datetime | None) -> str | None:

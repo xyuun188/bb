@@ -29,11 +29,20 @@ def _isolate_dashboard_exchange_position_caches(monkeypatch: pytest.MonkeyPatch)
     async def empty_exchange_mark_map(_mode):
         return {}
 
+    async def empty_position_history_rows(*_args, **_kwargs):
+        return []
+
     monkeypatch.setattr(dashboard_api, "_exchange_mark_cache", {})
     monkeypatch.setattr(dashboard_api, "_exchange_open_symbol_cache", {})
     monkeypatch.setattr(dashboard_api, "_dashboard_okx_position_cache", {})
     monkeypatch.setattr(dashboard_api, "_dashboard_okx_position_error_cache", {})
     monkeypatch.setattr(dashboard_api, "_get_exchange_position_mark_map", empty_exchange_mark_map)
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        empty_position_history_rows,
+        raising=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -796,6 +805,8 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -807,11 +818,37 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     entry_order_id = "band-entry"
     pos_id = "band-pos-3714144287308087298"
     entry_fee = 0.0366182
+    official_realized_pnl = 1.245640902389385
     partial_closes = (
         ("band-close-203", 203.0, 0.1650, 0.6034309734513242, 0.0167475, 16, 59, 55),
         ("band-close-112", 112.0, 0.1645, 0.2769274336283168, 0.0092120, 17, 16, 10),
         ("band-close-061", 61.0, 0.1663, 0.2606265486725654, 0.00507215, 21, 7, 27),
         ("band-close-034", 34.0, 0.1677, 0.1928672566371676, 0.0028509, 23, 22, 36),
+    )
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "BAND-USDT-SWAP",
+                "posId": pos_id,
+                "posSide": "net",
+                "openAvgPx": "0.1620274336283186",
+                "closeAvgPx": "0.1652807317073171",
+                "closeTotalPos": "410",
+                "realizedPnl": str(official_realized_pnl),
+                "fee": "-0.07050075",
+                "fundingFee": "-0.01771056",
+                "pnl": "1.333852212389385",
+                "lever": "2.0",
+                "cTime": "1783192525444",
+                "uTime": "1783275756951",
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
     )
     try:
         async with get_session_ctx() as session:
@@ -919,11 +956,6 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     finally:
         await close_db()
 
-    expected_realized = (
-        sum(item[3] for item in partial_closes)
-        - entry_fee * 410.0 / 452.0
-        - sum(item[4] for item in partial_closes)
-    )
     assert payload["ledger_source"] == "okx_native_grouped_cache"
     assert payload["total"] == 1
     row = payload["positions"][0]
@@ -932,7 +964,11 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     assert row["close_status_label"] == "部分平仓"
     assert row["quantity"] == pytest.approx(410.0)
     assert row["max_position_quantity"] == pytest.approx(452.0)
-    assert row["realized_pnl"] == pytest.approx(expected_realized)
+    assert row["average_close_price"] == pytest.approx(0.1652807317073171)
+    assert row["realized_pnl"] == pytest.approx(official_realized_pnl)
+    assert row["funding_fee"] == pytest.approx(-0.01771056)
+    assert row["close_fill_pnl"] == pytest.approx(1.333852212389385)
+    assert row["pnl_source"] == "okx_position_history_realized_pnl"
     assert row["linked_order_count"] == 5
     assert row["entry_order_ids"] == [entry_order_id]
     assert set(row["close_order_ids"]) == {item[0] for item in partial_closes}

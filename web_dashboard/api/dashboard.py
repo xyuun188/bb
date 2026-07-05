@@ -2474,12 +2474,135 @@ async def _dashboard_closed_position_ledger_rows(
     if paginate:
         start = (page - 1) * page_size
         selected_groups = ledger_groups[start : start + page_size]
+    position_history_rows = await _dashboard_okx_position_history_rows(
+        mode=mode,
+        closed_rows=_closed_rows_for_selected_ledger_groups(closed_rows, selected_groups),
+    )
+    if position_history_rows:
+        refreshed_groups = build_okx_position_ledger_groups(
+            closed_rows,
+            order_rows,
+            account_bills=account_bill_rows,
+            position_history_rows=position_history_rows,
+            require_order_lifecycle_source_positions=True,
+        )
+        refreshed_groups = [
+            group
+            for group in refreshed_groups
+            if is_final_settlement_status(getattr(group, "settlement_status", None))
+        ]
+        refreshed_by_id = {group.group_id: group for group in refreshed_groups}
+        selected_groups = [refreshed_by_id.get(group.group_id, group) for group in selected_groups]
     return (
         [group.as_dict(include_fills=True) for group in selected_groups],
         total,
         page,
         total_pages,
     )
+
+
+def _closed_rows_for_selected_ledger_groups(
+    closed_rows: list[Any],
+    selected_groups: list[Any],
+) -> list[Any]:
+    selected_ids = {
+        int(position_id)
+        for group in selected_groups
+        for position_id in group.position_ids
+    }
+    if not selected_ids:
+        return []
+    return [
+        row
+        for row in closed_rows
+        if row.id is not None and int(row.id) in selected_ids
+    ]
+
+
+async def _dashboard_okx_position_history_rows(
+    *,
+    mode: str | None,
+    closed_rows: list[Any],
+) -> list[dict[str, Any]]:
+    if not closed_rows:
+        return []
+    selected_mode = "live" if mode == "live" else "paper"
+    pos_ids = sorted(
+        {
+            str(getattr(row, "okx_pos_id", "") or "").strip()
+            for row in closed_rows
+            if str(getattr(row, "okx_pos_id", "") or "").strip()
+        }
+    )
+    inst_ids = sorted(
+        {
+            str(getattr(row, "okx_inst_id", "") or "").strip().upper()
+            for row in closed_rows
+            if str(getattr(row, "okx_inst_id", "") or "").strip()
+        }
+    )
+    if not pos_ids or not inst_ids:
+        return []
+    opened_values = [
+        value
+        for row in closed_rows
+        if (value := _as_utc_datetime(getattr(row, "created_at", None))) is not None
+    ]
+    since = min(opened_values) - timedelta(days=1) if opened_values else datetime.now(UTC) - timedelta(days=7)
+    cache_key = (
+        "okx_position_history_rows",
+        selected_mode,
+        tuple(pos_ids[:500]),
+        tuple(inst_ids[:200]),
+        since.date().isoformat(),
+    )
+
+    async def builder() -> list[dict[str, Any]]:
+        from services.okx_native_facts import OkxNativeFactsClient
+
+        executor = _dashboard_okx_executor_for_mode(selected_mode)
+        owns_executor = executor is None
+        if owns_executor:
+            executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
+        try:
+            if owns_executor:
+                await executor.initialize()
+            rows = await asyncio.wait_for(
+                OkxNativeFactsClient(executor).fetch_position_history_rows(
+                    inst_ids=inst_ids,
+                    since=since,
+                    strict=False,
+                ),
+                timeout=12.0,
+            )
+            wanted_pos_ids = set(pos_ids)
+            return [
+                dict(row)
+                for row in rows
+                if isinstance(row, dict)
+                and str(row.get("posId") or row.get("pos_id") or "").strip() in wanted_pos_ids
+            ]
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "dashboard OKX position history official rows unavailable",
+                exc,
+                mode=selected_mode,
+                inst_id_count=len(inst_ids),
+                pos_id_count=len(pos_ids),
+            )
+            return []
+        finally:
+            if owns_executor and executor is not None:
+                try:
+                    await executor.shutdown()
+                except Exception as exc:
+                    _log_dashboard_fallback(
+                        "dashboard OKX position history executor shutdown failed",
+                        exc,
+                        mode=selected_mode,
+                    )
+
+    return await _dashboard_heavy_cached(cache_key, builder, ttl_seconds=60.0)
 
 
 def _is_live_position_open(position: dict) -> bool:
