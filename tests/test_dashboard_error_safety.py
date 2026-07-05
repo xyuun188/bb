@@ -1230,6 +1230,54 @@ async def test_daily_pnl_records_exclude_local_position_without_okx_confirmed_or
 
 
 @pytest.mark.asyncio
+async def test_daily_pnl_records_show_order_count_without_closed_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-order-count.db').as_posix()}",
+    )
+    await init_db()
+
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode: _async_value(set()),
+    )
+
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                _confirmed_okx_order(
+                    symbol="BTC/USDT",
+                    exchange_order_id="order-only-entry",
+                    side="buy",
+                    quantity=0.001,
+                    price=61805.2,
+                    filled_at=datetime(2026, 7, 3, 8, 51, tzinfo=UTC),
+                )
+            )
+
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=180)
+    finally:
+        await close_db()
+
+    day = next(row for row in payload["records"] if row["date"] == "2026-07-03")
+    assert day["trade_count"] == 0
+    assert day["filled_order_count"] == 1
+    assert day["order_count"] == 1
+    assert day["order_buy_count"] == 1
+    assert day["realized_pnl"] == 0.0
+    assert day["symbols"] == []
+    assert len(day["order_details"]) == 1
+    assert day["order_details"][0]["exchange_order_id"] == "order-only-entry"
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_records_do_not_emit_future_rows_after_phase3_clamp(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

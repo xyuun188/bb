@@ -8265,7 +8265,12 @@ function renderDailyPnlRecords(records) {
         const symbolCount = Array.isArray(row.symbol_pnl)
             ? row.symbol_pnl.length
             : (Array.isArray(row.symbols) ? row.symbols.length : 0);
-        const detailCount = Array.isArray(row.position_details) ? row.position_details.length : 0;
+        const detailCount = Array.isArray(row.order_details)
+            ? row.order_details.length
+            : (Array.isArray(row.position_details) ? row.position_details.length : 0);
+        const orderCount = Number(row.filled_order_count ?? row.order_count ?? row.trade_count ?? 0);
+        const closedCount = Number(row.closed_trade_count ?? row.trade_count ?? 0);
+        const orderWinLoss = `${closedCount}\u5e73 ${Number(row.win_count || 0)}\u80dc/${Number(row.loss_count || 0)}\u4e8f`;
         return `
         <tr>
             <td style="font-weight:700;white-space:nowrap;">${escHtml(row.date || '-')}</td>
@@ -8274,7 +8279,7 @@ function renderDailyPnlRecords(records) {
             <td style="color:${realized >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700;">${signedMoney(realized)} USDT</td>
             <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'okx_equity_pnl')}</td>
             <td>${dailyPnlEquityDisplay(row, 'okx_cumulative_equity_pnl')}</td>
-            <td>${Number(row.trade_count || 0)} <span style="color:var(--text-muted);font-size:10px;">${winLoss}</span></td>
+            <td>${orderCount} <span style="color:var(--text-muted);font-size:10px;">${orderWinLoss}</span></td>
             <td>
                 <button class="btn btn-sm js-daily-pnl-detail" data-date="${escHtml(row.date || '')}">
                     ${detailCount ? `查看 ${detailCount} 笔` : (symbolCount ? `查看 ${symbolCount} 个币种` : '查看详情')}
@@ -8294,12 +8299,30 @@ function openDailyPnlModal(date) {
 
     const details = Array.isArray(row.symbol_pnl) ? row.symbol_pnl : [];
     const positionDetails = Array.isArray(row.position_details) ? row.position_details : [];
+    const orderDetails = Array.isArray(row.order_details) ? row.order_details : [];
+    const orderCount = Number(row.filled_order_count ?? row.order_count ?? row.trade_count ?? 0);
+    const closedCount = Number(row.closed_trade_count ?? row.trade_count ?? 0);
     const total = valueNumber(row.okx_equity_pnl ?? row.total_pnl);
     const totalColor = signedMoneyColor(total);
     const snapshotNotice = dailyPnlMissingSnapshotNotice(row);
+    const orderOnlyDetails = orderDetails.length && !details.length && !positionDetails.length;
     title.textContent = `${date} 盈亏详情（北京时间）`;
-    if (!details.length && !positionDetails.length) {
-        const hasOverview = Number(row.trade_count || 0) > 0
+    if (orderOnlyDetails) {
+        body.innerHTML = `
+            <div class="daily-pnl-modal-summary">
+                <div>\u5df2\u5e73\u4ed3\u51c0\u76c8\u4e8f <strong style="color:${Number(row.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.realized_pnl || 0)} USDT</strong></div>
+                <div>OKX\u6743\u76ca\u53d8\u5316 <strong style="color:${totalColor};">${signedMoneyWithUnit(total)}</strong></div>
+                <div>\u6210\u4ea4\u8ba2\u5355 <strong>${orderCount}</strong></div>
+                <div>\u5df2\u5e73\u4ed3 <strong>${closedCount}</strong></div>
+            </div>
+            ${snapshotNotice}
+            ${renderDailyPnlOrderDetails(orderDetails)}
+        `;
+        overlay.style.display = 'flex';
+        return;
+    }
+    if (!details.length && !positionDetails.length && !orderDetails.length) {
+        const hasOverview = orderCount > 0
             || Number(row.realized_pnl || 0) !== 0
             || Number(row.unrealized_pnl || 0) !== 0
             || valueNumber(row.okx_equity_pnl ?? row.total_pnl) !== null;
@@ -8324,6 +8347,7 @@ function openDailyPnlModal(date) {
             <div>交易笔数 <strong>${Number(row.trade_count || 0)}</strong></div>
         </div>
         ${snapshotNotice}
+        ${orderDetails.length ? renderDailyPnlOrderDetails(orderDetails) : ''}
         ${positionDetails.length ? renderDailyPnlPositionDetails(positionDetails) : ''}
         <div class="table-wrap" style="margin-top:10px;">
             <table>
@@ -8355,6 +8379,44 @@ function openDailyPnlModal(date) {
         </div>
     `;
     overlay.style.display = 'flex';
+}
+
+function renderDailyPnlOrderDetails(orderDetails) {
+    return `
+        <div class="table-wrap" style="margin-top:10px;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>\u65f6\u95f4</th>
+                        <th>\u5e01\u79cd</th>
+                        <th>\u65b9\u5411</th>
+                        <th>\u72b6\u6001</th>
+                        <th>\u6570\u91cf</th>
+                        <th>\u6210\u4ea4\u4ef7</th>
+                        <th>OKX PnL</th>
+                        <th>\u624b\u7eed\u8d39</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${orderDetails.map(item => {
+                        const pnl = valueNumber(item.okx_fill_pnl);
+                        const pnlColor = pnl === null ? 'var(--text-muted)' : (pnl >= 0 ? 'var(--green)' : 'var(--red)');
+                        return `
+                            <tr>
+                                <td>${toBeijingTime(item.time || item.filled_at || item.created_at)}</td>
+                                <td style="font-weight:700;">${escHtml(item.symbol || '-')}</td>
+                                <td>${escHtml(sideLabel(item.side) || '-')}</td>
+                                <td>${escHtml(statusLabel(item.status) || '-')}</td>
+                                <td>${fmtNum(item.quantity || 0)}</td>
+                                <td>${fmtPrice(item.price)}</td>
+                                <td style="color:${pnlColor};font-weight:700;">${pnl === null ? '-' : `${signedMoney(pnl)} USDT`}</td>
+                                <td>${fmtMoney(item.fee || 0)} USDT</td>
+                            </tr>`;
+                    }).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
 }
 
 function renderDailyPnlPositionDetails(positionDetails) {

@@ -6010,6 +6010,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
 
     from db.repositories.trade_repo import TradeRepository
     from db.session import get_session_ctx
+    from models.trade import Order
 
     selected_mode = "live" if mode == "live" else "paper"
     days = min(max(int(days or 30), 1), 180)
@@ -6035,6 +6036,12 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "symbols": [],
             "symbol_pnl": {},
             "position_details": [],
+            "order_count": 0,
+            "filled_order_count": 0,
+            "rejected_order_count": 0,
+            "order_buy_count": 0,
+            "order_sell_count": 0,
+            "order_details": [],
             "cumulative_realized_pnl": 0.0,
             "cumulative_total_pnl": 0.0,
         }
@@ -6067,6 +6074,21 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         )
         from models.account import ExecutionEquitySnapshot
 
+        order_result = await session.execute(
+            select(Order)
+            .where(
+                Order.execution_mode == selected_mode,
+                Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+            )
+            .order_by(
+                Order.filled_at.desc().nullslast(),
+                Order.created_at.desc(),
+                Order.id.desc(),
+            )
+            .limit(50000)
+        )
+        order_rows = list(order_result.scalars().all())
+
         snapshot_result = await session.execute(
             select(ExecutionEquitySnapshot)
             .where(
@@ -6083,6 +6105,31 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             )
         )
         equity_snapshots = list(snapshot_result.scalars().all())
+
+    for order in order_rows:
+        order_time = _as_utc_datetime(getattr(order, "filled_at", None)) or _as_utc_datetime(
+            getattr(order, "created_at", None)
+        )
+        if order_time is None or order_time < PHASE3_CLEAN_START_UTC:
+            continue
+        if order_time < start_utc:
+            continue
+        day = order_time.astimezone(BEIJING_TZ).date().isoformat()
+        row = records.get(day)
+        if not row:
+            continue
+        status = str(getattr(order, "status", "") or "").strip().lower()
+        side = str(getattr(order, "side", "") or "").strip().lower()
+        row["order_count"] += 1
+        if status == "filled":
+            row["filled_order_count"] += 1
+        elif status == "rejected":
+            row["rejected_order_count"] += 1
+        if side == "buy":
+            row["order_buy_count"] += 1
+        elif side == "sell":
+            row["order_sell_count"] += 1
+        row["order_details"].append(_daily_pnl_order_detail(order, order_time=order_time))
 
     equity_by_date: dict[str, dict[str, Any]] = {}
     for snapshot in equity_snapshots:
@@ -6261,6 +6308,11 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             key=lambda item: item.get("closed_at") or "",
             reverse=True,
         )
+        row["order_details"] = sorted(
+            row["order_details"],
+            key=lambda item: item.get("time") or "",
+            reverse=True,
+        )
         row["symbol_pnl"] = [
             {
                 **symbol_row,
@@ -6310,6 +6362,38 @@ def _daily_pnl_ledger_row_has_okx_realized_pnl(row: dict[str, Any]) -> bool:
         )
         return status in final_statuses and has_linked_order_evidence
     return False
+
+
+def _daily_pnl_order_detail(order: Any, *, order_time: datetime | None) -> dict[str, Any]:
+    raw_pnl = _safe_float(getattr(order, "okx_fill_pnl", None), None)
+    fee = _safe_float(getattr(order, "fee", None), 0.0) or 0.0
+    net_fill_pnl = None if raw_pnl is None else float(raw_pnl) - abs(float(fee or 0.0))
+    return {
+        "id": getattr(order, "id", None),
+        "decision_id": getattr(order, "decision_id", None),
+        "symbol": str(getattr(order, "symbol", "") or ""),
+        "side": str(getattr(order, "side", "") or ""),
+        "status": str(getattr(order, "status", "") or ""),
+        "quantity": round(_safe_float(getattr(order, "quantity", None), 0.0) or 0.0, 8),
+        "price": _safe_float(getattr(order, "price", None), None),
+        "fee": round(fee, 8),
+        "okx_fill_pnl": round(float(raw_pnl), 8) if raw_pnl is not None else None,
+        "net_fill_pnl": round(net_fill_pnl, 8) if net_fill_pnl is not None else None,
+        "time": order_time.isoformat() if order_time else None,
+        "filled_at": (
+            _as_utc_datetime(getattr(order, "filled_at", None)).isoformat()
+            if _as_utc_datetime(getattr(order, "filled_at", None))
+            else None
+        ),
+        "created_at": (
+            _as_utc_datetime(getattr(order, "created_at", None)).isoformat()
+            if _as_utc_datetime(getattr(order, "created_at", None))
+            else None
+        ),
+        "exchange_order_id": str(getattr(order, "exchange_order_id", "") or ""),
+        "okx_inst_id": str(getattr(order, "okx_inst_id", "") or ""),
+        "okx_sync_status": str(getattr(order, "okx_sync_status", "") or ""),
+    }
 
 
 def _daily_pnl_ledger_position_detail(
