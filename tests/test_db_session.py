@@ -3,6 +3,36 @@ import pytest
 import db.session as session_module
 
 
+class _FakeConnection:
+    def __init__(
+        self,
+        *,
+        table_columns: dict[str, set[str]] | None = None,
+        index_names: set[str] | None = None,
+    ) -> None:
+        self.statements: list[str] = []
+        self.table_columns = table_columns or {}
+        self.index_names = index_names or set()
+
+    async def execute(self, statement, params=None):
+        statement_text = str(statement)
+        self.statements.append(statement_text)
+        if "information_schema.columns" in statement_text:
+            table_name = (params or {}).get("table_name", "")
+            return _FakeResult([(name,) for name in self.table_columns.get(table_name, set())])
+        if "pg_indexes" in statement_text:
+            return _FakeResult([(name,) for name in self.index_names])
+        return _FakeResult([])
+
+
+class _FakeResult:
+    def __init__(self, rows) -> None:
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
 class _FakeSession:
     def __init__(self) -> None:
         self.rollback_count = 0
@@ -54,3 +84,155 @@ async def test_read_session_ctx_rolls_back_on_error(monkeypatch: pytest.MonkeyPa
             raise RuntimeError("boom")
 
     assert fake_session.rollback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_schema_init_uses_advisory_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_conn = _FakeConnection()
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+
+    await session_module._lock_schema_migration_if_needed(fake_conn)
+
+    assert fake_conn.statements == [
+        "SELECT pg_advisory_xact_lock(hashtext('bb:init_db_schema'))"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_schema_init_does_not_use_advisory_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_conn = _FakeConnection()
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "sqlite+aiosqlite:///tmp/test.db",
+    )
+
+    await session_module._lock_schema_migration_if_needed(fake_conn)
+
+    assert fake_conn.statements == []
+
+
+@pytest.mark.asyncio
+async def test_postgres_trade_fact_columns_skip_existing_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection(
+        table_columns={
+            "positions": {
+                "okx_inst_id",
+                "okx_pos_id",
+                "entry_exchange_order_id",
+                "close_exchange_order_id",
+                "close_fill_pnl",
+                "entry_fee",
+                "close_fee",
+                "funding_fee",
+                "settlement_status",
+                "settlement_source",
+                "settlement_synced_at",
+                "settlement_raw",
+            },
+            "orders": {
+                "okx_inst_id",
+                "okx_trade_ids",
+                "okx_fill_contracts",
+                "okx_fill_pnl",
+                "okx_state",
+                "okx_sync_status",
+                "okx_synced_at",
+                "okx_last_error",
+                "okx_raw_fills",
+            },
+        }
+    )
+
+    await session_module._ensure_trade_fact_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+
+
+@pytest.mark.asyncio
+async def test_postgres_trade_fact_columns_add_only_missing_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection(
+        table_columns={
+            "positions": {
+                "okx_inst_id",
+                "okx_pos_id",
+                "entry_exchange_order_id",
+                "close_exchange_order_id",
+                "close_fill_pnl",
+                "entry_fee",
+                "close_fee",
+                "funding_fee",
+                "settlement_status",
+                "settlement_source",
+                "settlement_synced_at",
+                "settlement_raw",
+            },
+            "orders": {
+                "okx_trade_ids",
+                "okx_fill_contracts",
+                "okx_fill_pnl",
+                "okx_state",
+                "okx_sync_status",
+                "okx_synced_at",
+                "okx_last_error",
+                "okx_raw_fills",
+            },
+        }
+    )
+
+    await session_module._ensure_trade_fact_columns(fake_conn)
+
+    alter_statements = [
+        statement for statement in fake_conn.statements if statement.startswith("ALTER TABLE")
+    ]
+    assert alter_statements == ["ALTER TABLE orders ADD COLUMN okx_inst_id VARCHAR(64)"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_trade_fact_indexes_skip_existing_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection(
+        index_names={
+            "idx_positions_okx_inst_side",
+            "idx_positions_entry_exchange_order",
+            "idx_positions_close_exchange_order",
+            "idx_positions_closed_scan",
+            "idx_positions_created_scan",
+            "idx_positions_open_created_scan",
+            "idx_orders_filled_exchange_scan",
+            "idx_orders_decision_side_scan",
+            "idx_orders_exchange_order_id",
+            "idx_orders_okx_inst_id",
+            "idx_orders_okx_sync_status",
+        }
+    )
+
+    await session_module._ensure_trade_fact_indexes(fake_conn)
+
+    assert not any(statement.startswith("CREATE INDEX") for statement in fake_conn.statements)

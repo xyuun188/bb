@@ -104,6 +104,7 @@ async def init_db() -> None:
 
     engine = await get_engine()
     async with engine.begin() as conn:
+        await _lock_schema_migration_if_needed(conn)
         await conn.run_sync(Base.metadata.create_all)
         if "sqlite" in settings.database_url:
             await conn.execute(text("PRAGMA busy_timeout = 30000"))
@@ -191,6 +192,21 @@ async def init_db() -> None:
                 await conn.execute(text(ddl))
 
 
+async def _lock_schema_migration_if_needed(conn: Any) -> None:
+    """Serialize PostgreSQL startup DDL across split services.
+
+    Paper trading, dashboard, and helper scripts can start at nearly the same
+    time after deployment.  Each process calls init_db(), and PostgreSQL can
+    deadlock when concurrent CREATE/ALTER/CREATE INDEX statements touch the same
+    tables in different orders.  A transaction-level advisory lock keeps startup
+    idempotent while preserving the normal SQLite path used by tests/local runs.
+    """
+
+    if "postgresql" not in settings.database_url:
+        return
+    await conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('bb:init_db_schema'))"))
+
+
 async def _ensure_trade_fact_columns(conn: Any) -> None:
     """Backfill lightweight trade fact linkage columns for existing databases."""
 
@@ -233,56 +249,160 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         return
 
     if "postgresql" in settings.database_url:
-        for ddl in (
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS okx_inst_id VARCHAR(64)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS okx_pos_id VARCHAR(100)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_exchange_order_id VARCHAR(100)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_exchange_order_id VARCHAR(500)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_fill_pnl DOUBLE PRECISION",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_fee DOUBLE PRECISION",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_fee DOUBLE PRECISION",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS funding_fee DOUBLE PRECISION",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_status VARCHAR(40)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_source VARCHAR(80)",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_synced_at TIMESTAMP WITH TIME ZONE",
-            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_raw JSONB",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_inst_id VARCHAR(64)",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_trade_ids VARCHAR(500)",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_fill_contracts DOUBLE PRECISION",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_fill_pnl DOUBLE PRECISION",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_state VARCHAR(40)",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_sync_status VARCHAR(40)",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_synced_at TIMESTAMP WITH TIME ZONE",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_last_error VARCHAR(500)",
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS okx_raw_fills JSONB",
-        ):
-            await conn.execute(text(ddl))
+        position_columns = await _postgres_table_columns(conn, "positions")
+        postgres_position_columns = {
+            "okx_inst_id": "ALTER TABLE positions ADD COLUMN okx_inst_id VARCHAR(64)",
+            "okx_pos_id": "ALTER TABLE positions ADD COLUMN okx_pos_id VARCHAR(100)",
+            "entry_exchange_order_id": (
+                "ALTER TABLE positions ADD COLUMN entry_exchange_order_id VARCHAR(100)"
+            ),
+            "close_exchange_order_id": (
+                "ALTER TABLE positions ADD COLUMN close_exchange_order_id VARCHAR(500)"
+            ),
+            "close_fill_pnl": "ALTER TABLE positions ADD COLUMN close_fill_pnl DOUBLE PRECISION",
+            "entry_fee": "ALTER TABLE positions ADD COLUMN entry_fee DOUBLE PRECISION",
+            "close_fee": "ALTER TABLE positions ADD COLUMN close_fee DOUBLE PRECISION",
+            "funding_fee": "ALTER TABLE positions ADD COLUMN funding_fee DOUBLE PRECISION",
+            "settlement_status": "ALTER TABLE positions ADD COLUMN settlement_status VARCHAR(40)",
+            "settlement_source": "ALTER TABLE positions ADD COLUMN settlement_source VARCHAR(80)",
+            "settlement_synced_at": (
+                "ALTER TABLE positions ADD COLUMN settlement_synced_at TIMESTAMP WITH TIME ZONE"
+            ),
+            "settlement_raw": "ALTER TABLE positions ADD COLUMN settlement_raw JSONB",
+        }
+        for name, ddl in postgres_position_columns.items():
+            if name not in position_columns:
+                await conn.execute(text(ddl))
+
+        order_columns = await _postgres_table_columns(conn, "orders")
+        postgres_order_columns = {
+            "okx_inst_id": "ALTER TABLE orders ADD COLUMN okx_inst_id VARCHAR(64)",
+            "okx_trade_ids": "ALTER TABLE orders ADD COLUMN okx_trade_ids VARCHAR(500)",
+            "okx_fill_contracts": (
+                "ALTER TABLE orders ADD COLUMN okx_fill_contracts DOUBLE PRECISION"
+            ),
+            "okx_fill_pnl": "ALTER TABLE orders ADD COLUMN okx_fill_pnl DOUBLE PRECISION",
+            "okx_state": "ALTER TABLE orders ADD COLUMN okx_state VARCHAR(40)",
+            "okx_sync_status": "ALTER TABLE orders ADD COLUMN okx_sync_status VARCHAR(40)",
+            "okx_synced_at": (
+                "ALTER TABLE orders ADD COLUMN okx_synced_at TIMESTAMP WITH TIME ZONE"
+            ),
+            "okx_last_error": "ALTER TABLE orders ADD COLUMN okx_last_error VARCHAR(500)",
+            "okx_raw_fills": "ALTER TABLE orders ADD COLUMN okx_raw_fills JSONB",
+        }
+        for name, ddl in postgres_order_columns.items():
+            if name not in order_columns:
+                await conn.execute(text(ddl))
 
 
 async def _ensure_trade_fact_indexes(conn: Any) -> None:
-    for ddl in (
-        "CREATE INDEX IF NOT EXISTS idx_positions_okx_inst_side ON positions (okx_inst_id, side)",
-        "CREATE INDEX IF NOT EXISTS idx_positions_entry_exchange_order ON positions (entry_exchange_order_id)",
-        "CREATE INDEX IF NOT EXISTS idx_positions_close_exchange_order ON positions (close_exchange_order_id)",
-        "CREATE INDEX IF NOT EXISTS idx_positions_closed_scan ON positions (is_open, closed_at DESC, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_positions_created_scan ON positions (created_at DESC, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_positions_open_created_scan ON positions (is_open, created_at DESC, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_filled_exchange_scan ON orders (status, filled_at DESC, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_decision_side_scan ON orders (decision_id, side, status, filled_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_okx_sync_status ON orders (okx_sync_status, okx_synced_at DESC)",
-    ):
+    index_ddls = (
+        (
+            "idx_positions_okx_inst_side",
+            "CREATE INDEX IF NOT EXISTS idx_positions_okx_inst_side ON positions (okx_inst_id, side)",
+        ),
+        (
+            "idx_positions_entry_exchange_order",
+            "CREATE INDEX IF NOT EXISTS idx_positions_entry_exchange_order ON positions (entry_exchange_order_id)",
+        ),
+        (
+            "idx_positions_close_exchange_order",
+            "CREATE INDEX IF NOT EXISTS idx_positions_close_exchange_order ON positions (close_exchange_order_id)",
+        ),
+        (
+            "idx_positions_closed_scan",
+            "CREATE INDEX IF NOT EXISTS idx_positions_closed_scan ON positions (is_open, closed_at DESC, id DESC)",
+        ),
+        (
+            "idx_positions_created_scan",
+            "CREATE INDEX IF NOT EXISTS idx_positions_created_scan ON positions (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_positions_open_created_scan",
+            "CREATE INDEX IF NOT EXISTS idx_positions_open_created_scan ON positions (is_open, created_at DESC, id DESC)",
+        ),
+        (
+            "idx_orders_filled_exchange_scan",
+            "CREATE INDEX IF NOT EXISTS idx_orders_filled_exchange_scan ON orders (status, filled_at DESC, id DESC)",
+        ),
+        (
+            "idx_orders_decision_side_scan",
+            "CREATE INDEX IF NOT EXISTS idx_orders_decision_side_scan ON orders (decision_id, side, status, filled_at DESC)",
+        ),
+        (
+            "idx_orders_exchange_order_id",
+            "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
+        ),
+        (
+            "idx_orders_okx_inst_id",
+            "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
+        ),
+        (
+            "idx_orders_okx_sync_status",
+            "CREATE INDEX IF NOT EXISTS idx_orders_okx_sync_status ON orders (okx_sync_status, okx_synced_at DESC)",
+        ),
+    )
+    if "postgresql" in settings.database_url:
+        index_names = await _postgres_index_names(conn)
+        for name, ddl in index_ddls:
+            if name not in index_names:
+                await conn.execute(text(ddl))
+        return
+    for _name, ddl in index_ddls:
         await conn.execute(text(ddl))
 
 
 async def _ensure_okx_account_bill_indexes(conn: Any) -> None:
-    for ddl in (
-        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_inst_ts ON okx_account_bills (mode, inst_id, bill_ts DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_bill_ts ON okx_account_bills (mode, bill_ts DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_type_ts ON okx_account_bills (mode, bill_type, bill_sub_type, bill_ts DESC)",
-    ):
+    index_ddls = (
+        (
+            "idx_okx_account_bills_mode_inst_ts",
+            "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_inst_ts ON okx_account_bills (mode, inst_id, bill_ts DESC)",
+        ),
+        (
+            "idx_okx_account_bills_mode_bill_ts",
+            "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_bill_ts ON okx_account_bills (mode, bill_ts DESC)",
+        ),
+        (
+            "idx_okx_account_bills_mode_type_ts",
+            "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_type_ts ON okx_account_bills (mode, bill_type, bill_sub_type, bill_ts DESC)",
+        ),
+    )
+    if "postgresql" in settings.database_url:
+        index_names = await _postgres_index_names(conn)
+        for name, ddl in index_ddls:
+            if name not in index_names:
+                await conn.execute(text(ddl))
+        return
+    for _name, ddl in index_ddls:
         await conn.execute(text(ddl))
+
+
+async def _postgres_table_columns(conn: Any, table_name: str) -> set[str]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {str(row[0]) for row in result.fetchall()}
+
+
+async def _postgres_index_names(conn: Any) -> set[str]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+            """
+        )
+    )
+    return {str(row[0]) for row in result.fetchall()}
 
 
 async def close_db() -> None:
