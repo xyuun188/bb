@@ -40,6 +40,9 @@ NON_EXCHANGE_ORDER_TOKENS = {
     "rejected",
 }
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
+FINAL_LEDGER_SETTLEMENT_STATUSES = frozenset(
+    {"reconciled", "settled", "okx_position_history"}
+)
 
 
 @dataclass(slots=True)
@@ -182,6 +185,8 @@ class _LedgerPositionFragment:
     close_exchange_order_id: str | None
     source_position_ids: list[int] = field(default_factory=list)
     strict_order_lifecycle: bool = False
+    settlement_status: str = ""
+    settlement_source: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +224,8 @@ def build_okx_position_ledger_groups(
     positions: list[Position],
     orders: list[Order],
     account_bills: list[Any] | None = None,
+    include_order_lifecycle_fragments: bool = True,
+    require_order_lifecycle_source_positions: bool = False,
 ) -> list[OkxPositionLedgerGroup]:
     """Build OKX-style grouped historical position rows from local OKX facts."""
     orders_by_id = _orders_by_exchange_id(orders)
@@ -233,10 +240,12 @@ def build_okx_position_ledger_groups(
         closed_positions,
         orders_by_id,
     )
-    closed_positions = _append_confirmed_order_lifecycle_fragments(
-        closed_positions,
-        orders_by_id,
-    )
+    if include_order_lifecycle_fragments:
+        closed_positions = _append_confirmed_order_lifecycle_fragments(
+            closed_positions,
+            orders_by_id,
+            require_source_positions=require_order_lifecycle_source_positions,
+        )
     closed_positions = [
         position
         for position in closed_positions
@@ -405,6 +414,8 @@ def _generated_order_lifecycle_matches_group(position: Position, rows: list[Posi
 def _append_confirmed_order_lifecycle_fragments(
     positions: list[Position],
     orders_by_id: dict[str, Order],
+    *,
+    require_source_positions: bool = False,
 ) -> list[Position]:
     result: list[Position] = list(positions)
     seen_anchors = {
@@ -449,6 +460,8 @@ def _append_confirmed_order_lifecycle_fragments(
             entry_orders=entry_orders,
             close_orders=close_orders,
         ):
+            if require_source_positions and not getattr(fragment, "source_position_ids", None):
+                continue
             anchor = (
                 key,
                 _position_order_key(fragment, "entry_exchange_order_id"),
@@ -622,6 +635,7 @@ def _position_fragment_from_order_lifecycle(
             close_orders=close_orders,
         ),
         strict_order_lifecycle=True,
+        settlement_status=_source_position_final_settlement_status(source_positions),
     )
 
 
@@ -685,11 +699,25 @@ def _source_position_ids_for_order_lifecycle(
             continue
         row_entries = set(_position_order_key(position, "entry_exchange_order_id"))
         row_closes = set(_position_order_key(position, "close_exchange_order_id"))
-        if (row_entries and row_entries.issubset(entry_ids)) or (
-            row_closes and row_closes.issubset(close_ids)
+        if (row_entries and bool(row_entries & entry_ids)) or (
+            row_closes and bool(row_closes & close_ids)
         ):
             source_ids.append(int(row_id))
     return _ordered_ints(source_ids)
+
+
+def _source_position_final_settlement_status(positions: list[Position]) -> str:
+    statuses = [
+        str(getattr(position, "settlement_status", "") or "").strip()
+        for position in positions
+        if str(getattr(position, "settlement_status", "") or "").strip()
+    ]
+    if not statuses or any(status not in FINAL_LEDGER_SETTLEMENT_STATUSES for status in statuses):
+        return ""
+    for preferred in ("reconciled", "okx_position_history", "settled"):
+        if preferred in statuses:
+            return preferred
+    return statuses[0]
 
 
 def _split_polluted_sequential_lifecycle_positions(
@@ -873,6 +901,12 @@ def _position_fragment_from_order_pair(
             for position in [position]
             if getattr(position, "id", None) is not None
         ],
+        settlement_status=(
+            str(getattr(position, "settlement_status", "") or "").strip()
+            if str(getattr(position, "settlement_status", "") or "").strip()
+            in FINAL_LEDGER_SETTLEMENT_STATUSES
+            else ""
+        ),
     )
 
 
@@ -1155,6 +1189,8 @@ def _stored_position_settlement_components(
         position
         for position in positions
         if str(getattr(position, "settlement_source", "") or "").strip()
+        or str(getattr(position, "settlement_status", "") or "").strip()
+        in FINAL_LEDGER_SETTLEMENT_STATUSES
     ]
     if not settlement_positions or len(settlement_positions) != len(positions):
         return None
@@ -1174,7 +1210,22 @@ def _stored_position_settlement_components(
         _safe_float(getattr(position, "funding_fee", None), 0.0)
         for position in settlement_positions
     )
-    realized_pnl = close_fill_pnl + funding_fee - entry_fee - close_fee
+    component_realized_pnl = close_fill_pnl + funding_fee - entry_fee - close_fee
+    position_realized_pnl = sum(
+        _safe_float(getattr(position, "realized_pnl", None), 0.0)
+        for position in settlement_positions
+    )
+    has_component_values = any(
+        abs(_safe_float(getattr(position, "close_fill_pnl", None), 0.0)) > 1e-12
+        or abs(_safe_float(getattr(position, "entry_fee", None), 0.0)) > 1e-12
+        or abs(_safe_float(getattr(position, "close_fee", None), 0.0)) > 1e-12
+        or abs(_safe_float(getattr(position, "funding_fee", None), 0.0)) > 1e-12
+        for position in settlement_positions
+    )
+    if has_component_values:
+        realized_pnl = component_realized_pnl
+    else:
+        realized_pnl = position_realized_pnl
     status_values = {
         str(getattr(position, "settlement_status", "") or "").strip()
         for position in settlement_positions
@@ -1184,14 +1235,23 @@ def _stored_position_settlement_components(
         for position in settlement_positions
         if str(getattr(position, "settlement_source", "") or "").strip()
     ]
-    preferred_statuses = {"reconciled", "settled", "okx_position_history"}
-    preferred = bool(status_values and status_values.issubset(preferred_statuses))
-    status = ",".join(sorted(status_values)) if status_values else "provisional"
-    source = (
-        "position_settlement_snapshot"
-        if len(set(source_values)) != 1
-        else f"position_settlement_snapshot:{source_values[0]}"
+    has_okx_authoritative_source = any(value.startswith("okx_") for value in source_values)
+    preferred = bool(
+        status_values
+        and status_values.issubset(FINAL_LEDGER_SETTLEMENT_STATUSES)
+        and has_okx_authoritative_source
     )
+    status = ",".join(sorted(status_values)) if status_values else "provisional"
+    if source_values:
+        source = (
+            "position_settlement_snapshot"
+            if len(set(source_values)) != 1
+            else f"position_settlement_snapshot:{source_values[0]}"
+        )
+    elif has_component_values:
+        source = "position_settlement_snapshot"
+    else:
+        source = "position_realized_pnl"
     return _StoredSettlementComponents(
         close_fill_pnl=close_fill_pnl,
         entry_fee=entry_fee,

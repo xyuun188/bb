@@ -9,7 +9,8 @@ import pytest
 from config.settings import settings
 from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
-from models.trade import Position
+from models.trade import Order, Position
+from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
 
@@ -245,11 +246,68 @@ async def test_dashboard_closed_history_hides_unsettled_positions(
             status="reconciled",
             closed_at=closed_at,
         )
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="VISIBLE/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=3.0,
+                        price=1.0,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="unsettled-entry-visible",
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                        okx_inst_id="VISIBLE-USDT-SWAP",
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "fill_pnl": 0.0,
+                            "base_quantity": 3.0,
+                            "avg_price": 1.0,
+                            "fee_abs": 0.01,
+                            "timestamp": closed_at.isoformat(),
+                        },
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="VISIBLE/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=3.0,
+                        price=1.2,
+                        status="filled",
+                        fee=0.01,
+                        exchange_order_id="unsettled-close-visible",
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                        okx_inst_id="VISIBLE-USDT-SWAP",
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_fill_pnl=0.6,
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "fill_pnl": 0.6,
+                            "base_quantity": 3.0,
+                            "avg_price": 1.2,
+                            "fee_abs": 0.01,
+                            "timestamp": closed_at.isoformat(),
+                        },
+                    ),
+                ]
+            )
 
         payload = await get_dashboard_positions(mode="paper", closed_only=True)
 
         symbols = {row["symbol"] for row in payload["positions"]}
         assert "VISIBLE/USDT" in symbols
         assert "HIDDEN/USDT" not in symbols
+        assert [
+            row for row in payload["positions"] if row.get("settlement_status") in {"", None}
+        ] == []
     finally:
         await close_db()

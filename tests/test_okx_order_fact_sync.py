@@ -467,6 +467,17 @@ class _NoHistoryExecutor:
         return {"data": [{"instId": "ACT-USDT-SWAP", "ctVal": "10"}]}
 
 
+class _UnavailableExecutor:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    async def initialize(self) -> None:
+        raise TimeoutError("OKX pull timeout")
+
+    async def shutdown(self) -> None:
+        return None
+
+
 class _PullTimeoutExecutor(_NoHistoryExecutor):
     async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise TimeoutError("OKX pull timeout")
@@ -1308,6 +1319,179 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
         assert position["current_price"] == pytest.approx(0.0345)
         assert position["realized_pnl"] == pytest.approx(1.23)
         assert position["close_exchange_order_id"] == "phase3-order"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_closes_matching_open_position_from_okx_position_history(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-history-closes-open-position.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=9)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="SPK/USDT",
+                    side="short",
+                    quantity=12.0,
+                    entry_price=0.039,
+                    current_price=0.0345,
+                    leverage=3.0,
+                    unrealized_pnl=0.0,
+                    realized_pnl=1.21,
+                    is_open=True,
+                    closed_at=None,
+                    created_at=phase3_time,
+                    okx_inst_id="SPK-USDT-SWAP",
+                    okx_pos_id="spk-phase3-pos",
+                    close_exchange_order_id="phase3-order",
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_Executor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            position_rows = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "spk-phase3-pos"
+                    )
+                )
+            ).all()
+
+        assert report["position_history_checked_count"] == 1
+        assert report["position_history_backfilled_count"] == 0
+        assert report["position_history_updated_count"] == 1
+        assert len(position_rows) == 1
+        position = position_rows[0]._mapping
+        assert position["is_open"] is False
+        assert position["closed_at"] is not None
+        assert position["model_name"] == "okx_authoritative_sync"
+        assert position["settlement_status"] == "okx_position_history"
+        assert position["settlement_source"] == "okx_position_history"
+        assert position["realized_pnl"] == pytest.approx(1.23)
+        assert position["close_exchange_order_id"] == "phase3-order"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_closes_open_position_from_stored_linked_close_orders_when_okx_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'stored-linked-close-orders.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(days=7, minutes=4)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_at = opened_at + timedelta(hours=18)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="PROS/USDT",
+                    side="long",
+                    quantity=77.0,
+                    entry_price=0.4294363636363637,
+                    current_price=0.461,
+                    leverage=1.0,
+                    unrealized_pnl=0.0,
+                    realized_pnl=4.4136505,
+                    is_open=True,
+                    closed_at=None,
+                    created_at=opened_at,
+                    okx_inst_id="PROS-USDT-SWAP",
+                    okx_pos_id="3713396586719182848",
+                    entry_exchange_order_id="pros-entry",
+                    close_exchange_order_id="pros-close",
+                )
+            )
+            for order_id, side, price, fee, fill_pnl, filled_at in (
+                ("pros-entry", "buy", 0.4294363636363637, 0.0165333, 0.0, opened_at),
+                ("pros-close", "sell", 0.487, 0.0187495, 4.4324, closed_at),
+            ):
+                session.add(
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PROS/USDT",
+                        side=side,
+                        order_type="market",
+                        quantity=77.0,
+                        price=price,
+                        status="filled",
+                        fee=fee,
+                        exchange_order_id=order_id,
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                        okx_inst_id="PROS-USDT-SWAP",
+                        okx_trade_ids=f"trade-{order_id}",
+                        okx_fill_contracts=77.0,
+                        okx_fill_pnl=fill_pnl,
+                        okx_sync_status=OKX_SYNC_CONFIRMED,
+                        okx_raw_fills={
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "PROS-USDT-SWAP",
+                            "contracts": 77.0,
+                            "contract_size": 1.0,
+                            "base_quantity": 77.0,
+                            "avg_price": price,
+                            "fee_abs": fee,
+                            "fill_pnl": fill_pnl,
+                            "timestamp": filled_at.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    )
+                )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_UnavailableExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Position.__table__.select().where(Position.__table__.c.symbol == "PROS/USDT")
+                )
+            ).one()._mapping
+
+        assert report["okx_pull_available"] is False
+        assert report["current_position_updated_count"] == 1
+        assert row["is_open"] is False
+        assert row["closed_at"] is not None
+        assert row["settlement_status"] == "reconciled"
+        assert row["settlement_source"] == "okx_stored_linked_close_orders"
+        assert row["realized_pnl"] == pytest.approx(4.3971172)
     finally:
         await close_db()
 

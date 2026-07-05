@@ -2460,7 +2460,13 @@ async def _dashboard_closed_position_ledger_rows(
         closed_rows,
         order_rows,
         account_bills=account_bill_rows,
+        require_order_lifecycle_source_positions=True,
     )
+    ledger_groups = [
+        group
+        for group in ledger_groups
+        if is_final_settlement_status(getattr(group, "settlement_status", None))
+    ]
     total = len(ledger_groups)
     total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
     page = min(max(int(page or 1), 1), total_pages)

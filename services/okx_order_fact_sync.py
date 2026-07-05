@@ -604,6 +604,17 @@ class OkxOrderFactSyncService:
                 now=datetime.now(UTC),
                 samples=samples,
             )
+            linked_close_result = await self._close_open_positions_from_linked_close_orders(
+                session,
+                account_bills=account_bills,
+                since=since,
+                now=datetime.now(UTC),
+                samples=samples,
+            )
+            current_position_result = _combine_position_fact_summaries(
+                current_position_result,
+                linked_close_result,
+            )
             if okx_pull_available:
                 current_position_result = await self._sync_current_position_rows(
                     session,
@@ -1131,6 +1142,17 @@ class OkxOrderFactSyncService:
                 close_order_ids=close_order_ids,
             )
             if existing is None:
+                existing = await self._find_open_position_history_cache_row(
+                    session,
+                    pos_id=pos_id,
+                    inst_id=inst_id,
+                    side=side,
+                    created_at=created_at,
+                    closed_at=closed_at,
+                    entry_order_ids=entry_order_ids,
+                    close_order_ids=close_order_ids,
+                )
+            if existing is None:
                 session.add(Position(**payload))
                 backfilled += 1
                 samples.append(
@@ -1142,11 +1164,16 @@ class OkxOrderFactSyncService:
                     }
                 )
                 continue
+            was_open_position = bool(getattr(existing, "is_open", False))
             _apply_position_history_payload(existing, payload, now=now)
             updated += 1
             samples.append(
                 {
-                    "kind": "okx_position_history_updated",
+                    "kind": (
+                        "okx_position_history_closed_open_position"
+                        if was_open_position
+                        else "okx_position_history_updated"
+                    ),
                     "local_position_id": getattr(existing, "id", None),
                     "symbol": getattr(existing, "symbol", None),
                     "side": getattr(existing, "side", None),
@@ -1721,6 +1748,163 @@ class OkxOrderFactSyncService:
             samples=tuple(samples[-8:]),
         )
 
+    async def _close_open_positions_from_linked_close_orders(
+        self,
+        session: Any,
+        *,
+        account_bills: list[OkxAccountBill],
+        since: datetime,
+        now: datetime,
+        samples: list[dict[str, Any]],
+    ) -> OkxPositionFactSyncSummary:
+        since_naive = _db_naive_since(since)
+        rows = await session.execute(
+            select(Position)
+            .where(
+                Position.execution_mode == self.mode,
+                Position.is_open.is_(True),
+                Position.close_exchange_order_id.is_not(None),
+                Position.close_exchange_order_id != "",
+                or_(Position.created_at >= since_naive, Position.updated_at >= since_naive),
+            )
+            .order_by(Position.created_at.desc().nullslast(), Position.id.desc())
+            .limit(self.limit)
+        )
+        positions = list(rows.scalars().all())
+        if not positions:
+            return OkxPositionFactSyncSummary()
+
+        order_ids = {
+            order_id
+            for position in positions
+            for order_id in (
+                _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+                | _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+            )
+        }
+        if not order_ids:
+            return OkxPositionFactSyncSummary(skipped_count=len(positions))
+        order_rows = await session.execute(
+            select(Order).where(
+                Order.execution_mode == self.mode,
+                Order.exchange_order_id.in_(sorted(order_ids)),
+            )
+        )
+        orders_by_id = {
+            token: order
+            for order in order_rows.scalars().all()
+            for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+        }
+
+        checked = 0
+        updated = 0
+        skipped = 0
+        for position in positions:
+            close_ids = _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+            if not close_ids:
+                skipped += 1
+                continue
+            expected_close_side = _close_side_for_position_side(
+                str(getattr(position, "side", "") or "").lower()
+            )
+            close_orders = [orders_by_id.get(order_id) for order_id in sorted(close_ids)]
+            if any(order is None for order in close_orders) or not expected_close_side:
+                skipped += 1
+                continue
+            close_orders = [order for order in close_orders if order is not None]
+            if any(
+                str(getattr(order, "side", "") or "").lower() != expected_close_side
+                or not _order_has_confirmed_okx_fill_fact(order)
+                for order in close_orders
+            ):
+                skipped += 1
+                continue
+            checked += 1
+            close_quantity = 0.0
+            close_fill_pnl = 0.0
+            close_fee = 0.0
+            close_notional = 0.0
+            close_time: datetime | None = None
+            for order in close_orders:
+                raw = getattr(order, "okx_raw_fills", None)
+                raw = raw if isinstance(raw, dict) else {}
+                order_quantity = _stored_fill_base_quantity(raw) or abs(
+                    _safe_float(getattr(order, "quantity", None), 0.0)
+                )
+                order_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
+                fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
+                fee_abs = _order_fee_abs(order)
+                if order_quantity <= 0 or order_price <= 0:
+                    skipped += 1
+                    break
+                close_quantity += order_quantity
+                close_notional += order_quantity * order_price
+                close_fill_pnl += fill_pnl
+                close_fee += fee_abs
+                order_time = _order_time(order)
+                if order_time is not None and (close_time is None or order_time > close_time):
+                    close_time = order_time
+            else:
+                position_quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
+                if position_quantity <= 0 or close_time is None:
+                    skipped += 1
+                    continue
+                if abs(close_quantity - position_quantity) > max(position_quantity * 0.02, 1e-9):
+                    skipped += 1
+                    continue
+                close_price = close_notional / close_quantity if close_quantity > 0 else 0.0
+                orders_for_fee = dict(orders_by_id)
+                entry_fee = _entry_fee_from_linked_orders(
+                    position,
+                    orders_for_fee,
+                    close_quantity=position_quantity,
+                )
+                previous_closed_at = getattr(position, "closed_at", None)
+                position.closed_at = close_time
+                funding_fee = _closed_position_funding_fee(position, account_bills)
+                position.closed_at = previous_closed_at
+                snapshot = build_position_settlement_snapshot(
+                    close_fill_pnl=close_fill_pnl,
+                    entry_fee=entry_fee,
+                    close_fee=close_fee,
+                    funding_fee=funding_fee,
+                    status="reconciled",
+                    source="okx_stored_linked_close_orders",
+                    synced_at=now,
+                    raw={
+                        "close_order_ids": sorted(close_ids),
+                        "close_quantity": close_quantity,
+                        "position_quantity": position_quantity,
+                        "funding_fee_source": (
+                            "cached_okx_account_bills" if account_bills else "not_available_in_cache"
+                        ),
+                        "reason": "linked confirmed OKX close orders fully cover local open position",
+                    },
+                )
+                apply_position_settlement_snapshot(position, snapshot)
+                position.is_open = False
+                position.unrealized_pnl = 0.0
+                position.current_price = close_price
+                position.closed_at = close_time
+                position.updated_at = now
+                updated += 1
+                samples.append(
+                    {
+                        "kind": "open_position_closed_from_linked_okx_close_orders",
+                        "local_position_id": getattr(position, "id", None),
+                        "symbol": getattr(position, "symbol", None),
+                        "side": getattr(position, "side", None),
+                        "close_exchange_order_id": getattr(position, "close_exchange_order_id", None),
+                        "realized_pnl": snapshot.realized_pnl,
+                    }
+                )
+        return OkxPositionFactSyncSummary(
+            checked_count=checked,
+            updated_count=updated,
+            skipped_count=skipped,
+            samples=tuple(samples[-8:]),
+        )
+
     async def _load_current_position_entry_link_orders(
         self,
         session: Any,
@@ -1780,6 +1964,61 @@ class OkxOrderFactSyncService:
             .limit(100)
         )
         return _best_current_position_cache_row(result.scalars().all())
+
+    async def _find_open_position_history_cache_row(
+        self,
+        session: Any,
+        *,
+        pos_id: str,
+        inst_id: str,
+        side: str,
+        created_at: datetime,
+        closed_at: datetime,
+        entry_order_ids: list[str],
+        close_order_ids: list[str],
+    ) -> Position | None:
+        if not (entry_order_ids or close_order_ids):
+            return None
+        if pos_id:
+            result = await session.execute(
+                select(Position)
+                .where(
+                    Position.execution_mode == self.mode,
+                    Position.okx_pos_id == pos_id,
+                    Position.okx_inst_id == inst_id,
+                    Position.side == side,
+                    Position.is_open.is_(True),
+                )
+                .order_by(Position.updated_at.desc().nullslast(), Position.id.desc())
+                .limit(100)
+            )
+            existing = _best_position_history_lifecycle_match(
+                result.scalars().all(),
+                created_at=created_at,
+                closed_at=closed_at,
+                entry_order_ids=entry_order_ids,
+                close_order_ids=close_order_ids,
+            )
+            if existing is not None:
+                return existing
+        result = await session.execute(
+            select(Position)
+            .where(
+                Position.execution_mode == self.mode,
+                Position.okx_inst_id == inst_id,
+                Position.side == side,
+                Position.is_open.is_(True),
+            )
+            .order_by(Position.updated_at.desc().nullslast(), Position.id.desc())
+            .limit(100)
+        )
+        return _best_position_history_lifecycle_match(
+            result.scalars().all(),
+            created_at=created_at,
+            closed_at=closed_at,
+            entry_order_ids=entry_order_ids,
+            close_order_ids=close_order_ids,
+        )
 
     async def _find_position_history_cache_row(
         self,
