@@ -23,6 +23,7 @@ from services.execution_result_classifier import is_native_full_close_backfill_p
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
 from services.position_settlement import (
+    SETTLEMENT_STATUS_SETTLING,
     apply_position_settlement_snapshot,
     build_position_settlement_snapshot,
     funding_fee_from_payload,
@@ -421,7 +422,11 @@ class PositionExecutionPersistenceService:
                 entry_fee=entry_fee,
                 close_fee=close_fee,
                 funding_fee=funding_fee,
-                status="pending_okx_fill_backfill" if pending_okx_backfill else "provisional",
+                status=(
+                    "pending_okx_fill_backfill"
+                    if pending_okx_backfill
+                    else SETTLEMENT_STATUS_SETTLING
+                ),
                 source=(
                     "okx_native_full_close_pending_backfill"
                     if pending_okx_backfill

@@ -30,6 +30,7 @@ from models.trade import Order, Position
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.position_open_time import parse_position_time, serialize_position_time
 from services.position_settlement import (
+    SETTLEMENT_STATUS_SETTLING,
     apply_position_settlement_snapshot,
     build_position_settlement_snapshot,
     funding_fee_from_payload,
@@ -1935,7 +1936,7 @@ class OkxSyncService:
                         entry_fee=entry_fee,
                         close_fee=close_fee,
                         funding_fee=funding_fee,
-                        status="provisional",
+                        status=SETTLEMENT_STATUS_SETTLING,
                         source="okx_authoritative_reconcile",
                         synced_at=close_fill.get("timestamp") or datetime.now(UTC),
                         raw={
@@ -2237,7 +2238,7 @@ class OkxSyncService:
                 entry_fee=entry_fee,
                 close_fee=close_fee,
                 funding_fee=funding_fee,
-                status="provisional",
+                status=SETTLEMENT_STATUS_SETTLING,
                 source="okx_authoritative_reconcile",
                 synced_at=closed_at,
                 raw={

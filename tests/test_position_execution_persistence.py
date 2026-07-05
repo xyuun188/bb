@@ -342,7 +342,7 @@ async def test_persist_partial_exit_splits_closed_position_and_records_reflectio
     assert repo.opened[0]["entry_fee"] == pytest.approx(0.4)
     assert repo.opened[0]["close_fee"] == pytest.approx(1.0)
     assert repo.opened[0]["funding_fee"] == pytest.approx(0.0)
-    assert repo.opened[0]["settlement_status"] == "provisional"
+    assert repo.opened[0]["settlement_status"] == "settling"
     assert repo.opened[0]["settlement_source"] == "system_execution"
     assert result.pnl == pytest.approx(18.6)
     assert session.flush_count == 1
@@ -391,13 +391,13 @@ async def test_persist_full_exit_closes_positions_and_removes_profit_peaks() -> 
     assert first.entry_fee == pytest.approx(0.5)
     assert first.close_fee == pytest.approx(1.0)
     assert first.funding_fee == pytest.approx(0.0)
-    assert first.settlement_status == "provisional"
+    assert first.settlement_status == "settling"
     assert first.settlement_source == "system_execution"
     assert second.close_fill_pnl == pytest.approx(10.0)
     assert second.entry_fee == pytest.approx(0.5)
     assert second.close_fee == pytest.approx(1.0)
     assert second.funding_fee == pytest.approx(0.0)
-    assert second.settlement_status == "provisional"
+    assert second.settlement_status == "settling"
     assert second.settlement_source == "system_execution"
     assert first.okx_inst_id == "BTC-USDT-SWAP"
     assert second.okx_inst_id == "BTC-USDT-SWAP"

@@ -2371,6 +2371,7 @@ async def _dashboard_closed_position_ledger_rows(
         OKX_SYNC_OKX_ONLY,
     )
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
+    from services.position_settlement import is_final_settlement_status
 
     if model_names:
         closed_result = await session.execute(
@@ -2394,6 +2395,11 @@ async def _dashboard_closed_position_ledger_rows(
             offset=0,
             is_open=False,
         )
+    closed_rows = [
+        position
+        for position in closed_rows
+        if is_final_settlement_status(getattr(position, "settlement_status", None))
+    ]
     linked_order_ids = {
         token
         for position in closed_rows
@@ -5313,6 +5319,7 @@ async def get_profit_attribution(
     from models.decision import AIDecision
     from models.learning import ShadowBacktest
     from models.trade import Order, Position
+    from services.position_settlement import final_settlement_status_values
     from services.profit_attribution import (
         build_profit_attribution,
         match_entry_decisions_for_positions,
@@ -5335,6 +5342,7 @@ async def get_profit_attribution(
                 Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Position.execution_mode == selected_mode,
                 Position.is_open.is_(False),
+                Position.settlement_status.in_(final_settlement_status_values()),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )
@@ -5533,12 +5541,15 @@ async def get_model_contribution_stats(
             bucket["loss"] += abs(pnl)
 
     async with get_session_ctx() as session:
+        from services.position_settlement import final_settlement_status_values
+
         position_result = await session.execute(
             select(Position)
             .where(
                 Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Position.execution_mode == selected_mode,
                 Position.is_open.is_(False),
+                Position.settlement_status.in_(final_settlement_status_values()),
                 Position.closed_at.is_not(None),
                 Position.closed_at >= since,
             )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -259,6 +260,7 @@ class ProfitFirstRankingService:
         from db.session import get_read_session_ctx
         from models.decision import AIDecision
         from models.trade import Order, Position
+        from services.position_settlement import final_settlement_status_values
 
         session_factory = self._session_factory or get_read_session_ctx
         capped_hours = max(1, min(int(hours or DEFAULT_RANKING_HOURS), 24 * 14))
@@ -275,6 +277,7 @@ class ProfitFirstRankingService:
                 select(Position)
                 .where(
                     Position.is_open.is_(False),
+                    Position.settlement_status.in_(final_settlement_status_values()),
                     Position.closed_at.is_not(None),
                     Position.closed_at >= since,
                 )
@@ -1033,11 +1036,9 @@ def _attach_entry_decisions(
         raw = _safe_dict(_row_get(decision, "raw_llm_response"))
         if not raw:
             continue
-        try:
-            setattr(position, "entry_raw", raw)
-            setattr(position, "entry_decision_id", _row_get(decision, "id"))
-        except Exception:
-            continue
+        with suppress(Exception):
+            position.entry_raw = raw
+            position.entry_decision_id = _row_get(decision, "id")
 
 
 def _match_entry_decision(

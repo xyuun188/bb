@@ -12,6 +12,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 SETTLEMENT_FORMULA = "close_fill_pnl + funding_fee - entry_fee - close_fee"
+SETTLEMENT_STATUS_SETTLING = "settling"
+SETTLEMENT_STATUS_EXCEPTION = "settlement_exception"
+FINAL_SETTLEMENT_STATUSES = frozenset({"reconciled", "settled", "okx_position_history"})
+
+
+def final_settlement_status_values() -> tuple[str, ...]:
+    return tuple(sorted(FINAL_SETTLEMENT_STATUSES))
+
+
+def is_final_settlement_status(value: Any) -> bool:
+    return str(value or "").strip() in FINAL_SETTLEMENT_STATUSES
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:

@@ -19,6 +19,7 @@ from core.symbols import (
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.position_settlement import (
+    SETTLEMENT_STATUS_SETTLING,
     build_position_settlement_snapshot,
     settlement_payload_fields,
 )
@@ -185,7 +186,7 @@ async def apply_missing_closed_position_plan(
         entry_fee=plan.entry_fee_allocated,
         close_fee=plan.close_fee_allocated,
         funding_fee=0.0,
-        status="provisional",
+        status=SETTLEMENT_STATUS_SETTLING,
         source="missing_closed_position_repair",
         synced_at=plan.closed_at,
         raw={

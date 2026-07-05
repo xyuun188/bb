@@ -1149,7 +1149,6 @@ def _stored_position_settlement_components(
         position
         for position in positions
         if str(getattr(position, "settlement_source", "") or "").strip()
-        or str(getattr(position, "settlement_status", "") or "").strip()
     ]
     if not settlement_positions or len(settlement_positions) != len(positions):
         return None

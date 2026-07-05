@@ -31,7 +31,7 @@ from services.okx_order_fact_sync import (
 )
 from services.okx_position_ledger_view import build_okx_position_ledger_groups
 from services.position_open_time import parse_position_time
-from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
+from services.position_settlement import is_final_settlement_status
 from web_dashboard.api import dashboard as dashboard_api
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import looks_mojibake, sanitize_payload, sanitize_text
@@ -1167,7 +1167,11 @@ async def get_positions(mode: str | None = None):
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         positions = await repo.get_position_records(execution_mode=selected_mode, limit=500)
-        closed_positions = [p for p in positions if not p.is_open]
+        closed_positions = [
+            p
+            for p in positions
+            if not p.is_open and is_final_settlement_status(getattr(p, "settlement_status", None))
+        ]
         linked_order_ids = {
             token
             for position in closed_positions

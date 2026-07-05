@@ -46,6 +46,7 @@ from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 from services.position_settlement import (
     apply_position_settlement_snapshot,
     build_position_settlement_snapshot,
+    is_final_settlement_status,
     settlement_payload_fields,
 )
 
@@ -1392,6 +1393,10 @@ class OkxOrderFactSyncService:
             if _is_authoritative_position_history_position(position):
                 skipped += 1
                 continue
+            current_status = str(getattr(position, "settlement_status", "") or "").strip()
+            if not is_final_settlement_status(current_status):
+                skipped += 1
+                continue
             close_ids = _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
             if not close_ids:
                 skipped += 1
@@ -1411,7 +1416,6 @@ class OkxOrderFactSyncService:
                 continue
             current = _safe_float(getattr(position, "realized_pnl", None), 0.0)
             repaired_pnl = repaired.realized_pnl
-            current_status = str(getattr(position, "settlement_status", "") or "").strip()
             current_source = str(getattr(position, "settlement_source", "") or "").strip()
             if (
                 abs(current - repaired_pnl) <= 0.000001

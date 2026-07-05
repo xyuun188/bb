@@ -7285,12 +7285,15 @@ class StrategyLearningService:
         )
         since = max(datetime.now(UTC) - timedelta(hours=capped_hours), PHASE3_CLEAN_START_UTC)
         async with get_read_session_ctx() as session:
+            from services.position_settlement import final_settlement_status_values
+
             closed_result = await session.execute(
                 select(Position)
                 .where(
                     Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                     Position.execution_mode == selected_mode,
                     Position.is_open.is_(False),
+                    Position.settlement_status.in_(final_settlement_status_values()),
                     Position.closed_at.is_not(None),
                     Position.closed_at >= since,
                 )
