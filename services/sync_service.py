@@ -25,6 +25,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
 from models.decision import AIDecision
+from models.learning import TradeReflection
 from models.trade import Order, Position
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.position_open_time import parse_position_time, serialize_position_time
@@ -44,6 +45,8 @@ EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS = 6.0
 EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS = 8.0
 RECONCILE_ORIGIN_SYSTEM_PROTECTION = "system_protection"
 RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
+ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
+ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 
 
 def _first_value(*values: Any) -> Any:
@@ -1838,28 +1841,58 @@ class OkxSyncService:
                             )
                             continue
 
+                        quarantined = self._quarantine_orphan_local_position(
+                            session=session,
+                            pos=pos,
+                            remove_memory_position=remove_memory_position,
+                            age_seconds=age_seconds,
+                        )
                         reconciled.append(
                             {
-                                "kind": "missing_exchange_position_without_close_fill",
+                                "kind": "orphan_local_position_quarantined"
+                                if quarantined
+                                else "missing_exchange_position_without_close_fill",
                                 "source": "okx_authoritative_current_position",
                                 "model_name": pos.model_name,
                                 "symbol": pos.symbol,
                                 "side": pos.side,
                                 "exchange_order_id": None,
-                                "requires_attention": True,
+                                "requires_attention": not quarantined,
+                                "training_policy": (
+                                    "exclude_until_manual_trust" if quarantined else None
+                                ),
                                 "note": (
-                                    "OKX did not return this position and no matching close fill "
-                                    "was found; the local position remains open until an exchange "
-                                    "fill or authoritative position snapshot confirms closure."
+                                    (
+                                        "OKX current positions do not contain this local row, no "
+                                        "matching close fill or active exchange order was found, and "
+                                        "the row is older than the confirmation grace window; the "
+                                        "local row was quarantined out of the current-position truth "
+                                        "set and excluded from clean training."
+                                    )
+                                    if quarantined
+                                    else (
+                                        "OKX did not return this position and no matching close fill "
+                                        "was found; the local position remains open until an exchange "
+                                        "fill or authoritative position snapshot confirms closure."
+                                    )
                                 ),
                             }
                         )
-                        logger.warning(
-                            "skip local close because OKX close fill is missing",
-                            position_id=pos.id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                        )
+                        if quarantined:
+                            logger.warning(
+                                "quarantined orphan local position missing on OKX",
+                                position_id=pos.id,
+                                symbol=pos.symbol,
+                                side=pos.side,
+                                age_seconds=round(age_seconds, 1),
+                            )
+                        else:
+                            logger.warning(
+                                "skip local close because OKX close fill is missing",
+                                position_id=pos.id,
+                                symbol=pos.symbol,
+                                side=pos.side,
+                            )
                         continue
                     exit_price = close_fill.get("price") or pos.current_price or pos.entry_price
                     if not exit_price or exit_price <= 0:
@@ -2010,6 +2043,108 @@ class OkxSyncService:
                 "reconciled exchange-closed positions", count=len(reconciled), positions=reconciled
             )
         return reconciled
+
+    def _quarantine_orphan_local_position(
+        self,
+        *,
+        session: Any,
+        pos: Position,
+        remove_memory_position: Callable[[str, str, str], None],
+        age_seconds: float,
+    ) -> bool:
+        """Move OKX-denied local open rows out of the current-position truth set.
+
+        This deliberately does not invent an OKX close fill, close order, or PnL.
+        The row is marked closed with a synthetic quarantine close id and excluded
+        from clean training through a TradeReflection marker.
+        """
+
+        if str(getattr(pos, "execution_mode", "") or "").lower() != "paper":
+            return False
+        if not bool(getattr(pos, "is_open", False)):
+            return False
+        if str(getattr(pos, "close_exchange_order_id", "") or "").strip():
+            return False
+        position_id = int(getattr(pos, "id", 0) or 0)
+        if position_id <= 0:
+            return False
+        now = datetime.now(UTC)
+        current_price = _float_value(getattr(pos, "current_price", None), 0.0)
+        if current_price <= 0:
+            current_price = _float_value(getattr(pos, "entry_price", None), 0.0)
+        old_unrealized_pnl = _float_value(getattr(pos, "unrealized_pnl", None), 0.0)
+        pos.is_open = False
+        if current_price > 0:
+            pos.current_price = current_price
+        pos.unrealized_pnl = 0.0
+        pos.realized_pnl = 0.0
+        pos.closed_at = now
+        pos.close_exchange_order_id = f"{ORPHAN_QUARANTINE_CLOSE_PREFIX}{position_id}"
+        if hasattr(pos, "updated_at"):
+            pos.updated_at = now
+
+        plan = {
+            "position_id": position_id,
+            "symbol": str(getattr(pos, "symbol", "") or ""),
+            "side": str(getattr(pos, "side", "") or ""),
+            "model_name": str(getattr(pos, "model_name", "") or ENSEMBLE_TRADER_NAME),
+            "execution_mode": str(getattr(pos, "execution_mode", "") or "paper"),
+            "quantity": abs(_float_value(getattr(pos, "quantity", None), 0.0)),
+            "entry_price": _float_value(getattr(pos, "entry_price", None), 0.0),
+            "old_current_price": current_price,
+            "old_unrealized_pnl": old_unrealized_pnl,
+            "age_seconds": round(float(age_seconds or 0.0), 6),
+            "source": ORPHAN_QUARANTINE_REFLECTION_SOURCE,
+            "reason": (
+                "OKX current positions do not contain this local open row, and no "
+                "matching close fill or active exchange order was found after the "
+                "confirmation grace window."
+            ),
+        }
+        add = getattr(session, "add", None)
+        if callable(add):
+            add(
+                TradeReflection(
+                    position_id=position_id,
+                    model_name=plan["model_name"],
+                    execution_mode=plan["execution_mode"],
+                    symbol=plan["symbol"],
+                    side=plan["side"],
+                    entry_price=plan["entry_price"],
+                    exit_price=current_price,
+                    quantity=plan["quantity"],
+                    realized_pnl=0.0,
+                    fee_estimate=0.0,
+                    hold_minutes=max(float(age_seconds or 0.0) / 60.0, 0.0),
+                    closed_at=now,
+                    outcome="flat",
+                    mistake_summary=(
+                        "local orphan position was absent from OKX current positions"
+                    ),
+                    improvement_summary=(
+                        "exclude this non-OKX-backed local row from training and current capacity"
+                    ),
+                    expert_lessons={
+                        "source": ORPHAN_QUARANTINE_REFLECTION_SOURCE,
+                        "training_policy": "exclude_until_manual_trust",
+                        "repair_plan": plan,
+                    },
+                    source=ORPHAN_QUARANTINE_REFLECTION_SOURCE,
+                )
+            )
+        try:
+            remove_memory_position(
+                str(getattr(pos, "model_name", "") or ENSEMBLE_TRADER_NAME),
+                str(getattr(pos, "symbol", "") or ""),
+                str(getattr(pos, "side", "") or ""),
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to remove quarantined orphan position from memory",
+                position_id=position_id,
+                error=safe_error_text(exc),
+            )
+        return True
 
     async def _record_exchange_quantity_reduction(
         self,

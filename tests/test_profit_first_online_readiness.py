@@ -19,8 +19,11 @@ def test_profit_first_online_readiness_remote_command_is_read_only() -> None:
 
     assert "systemctl is-active bb-paper-trading.service || true" in command
     assert "scripts/run_profit_first_governance_report.py --stdout-only" in command
-    assert "scripts/run_phase3_go_no_go_report.py --stdout-only" in command
-    assert "scripts/plan_profit_first_recovery_repairs.py --stdout-only" in command
+    assert "scripts/run_phase3_go_no_go_report.py" in command
+    assert "scripts/plan_profit_first_recovery_repairs.py" in command
+    assert "--stdout-only" in command
+    assert "--prefer-latest --latest-only" in command
+    assert "--max-latest-age-seconds 5400" in command
     assert "scripts/plan_profit_first_historical_recovery_package.py" in command
     assert "--skip-current-blockers" in command
     assert '"recovery_repair_plan": {' in command

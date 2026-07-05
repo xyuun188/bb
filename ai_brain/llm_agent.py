@@ -270,15 +270,29 @@ def _format_strategy_mode(strategy: dict[str, Any]) -> str:
     exposure = strategy.get("position_exposure")
     exposure_text = ""
     if isinstance(exposure, dict) and exposure:
+        dominant_side = str(exposure.get("dominant_side") or "neutral").lower()
+        long_count = int(exposure.get("long_count") or 0)
+        short_count = int(exposure.get("short_count") or 0)
+        net_ratio = float(exposure.get("net_ratio") or 0.0)
         exposure_text = (
             "Current exposure: "
             f"long_notional={float(exposure.get('long_notional') or 0.0):.2f}, "
             f"short_notional={float(exposure.get('short_notional') or 0.0):.2f}, "
-            f"net_ratio={float(exposure.get('net_ratio') or 0.0):.2f}, "
-            f"long_count={int(exposure.get('long_count') or 0)}, "
-            f"short_count={int(exposure.get('short_count') or 0)}, "
-            f"dominant_side={exposure.get('dominant_side') or 'neutral'}. "
+            f"net_ratio={net_ratio:.2f}, "
+            f"long_count={long_count}, "
+            f"short_count={short_count}, "
+            f"dominant_side={dominant_side}. "
         )
+        if dominant_side in {"long", "short"}:
+            opposite = "short" if dominant_side == "long" else "long"
+            exposure_text += (
+                "Downstream execution has crowded-side protection: ordinary "
+                f"{dominant_side} additions are likely to be rejected while the portfolio "
+                "is this one-sided. Prefer hold or a symbol-specific "
+                f"{opposite} opportunity when evidence is marginal; choose the crowded side "
+                "only when expected net profit, payoff quality, and independent evidence are "
+                "clearly stronger than the opposite side. "
+            )
     return (
         "Execution strategy mode: "
         f"strategy={strategy.get('strategy') or 'unknown'}, "
@@ -288,9 +302,9 @@ def _format_strategy_mode(strategy: dict[str, Any]) -> str:
         f"blocked_directions={blocked_text}. "
         f"{exposure_text}"
         f"Reason: {strategy.get('reason') or ''} "
-        "Market regime is a soft bias only: it must not block a side and must not create global same-side entries. "
+        "Market regime is a soft bias only: it must not create global same-side entries. "
         "Always evaluate long and short independently for this symbol; choose short when downside expected profit is better. "
-        "Portfolio exposure is information for sizing and hedging, not a hard ban; add to a side when this symbol's expected profit justifies it. "
+        "Portfolio exposure must be respected before generating ordinary same-side entries; add to a crowded side only when this symbol's expected profit justifies passing later execution guards. "
         "Each symbol should be judged on trend, momentum, risk/reward, and execution quality without waiting for a perfect checklist. "
         "Final goal is realized net profit maximization: do not chase losses, but act decisively on high-quality symbol-specific opportunities."
     )
@@ -418,6 +432,7 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         f"memory_preferred={((evidence.get('memory_feedback') or {}).get('preferred_side_by_memory') if isinstance(evidence.get('memory_feedback'), dict) else 'neutral')}. "
         "This evidence is for AI judgment, not a hard execution veto. Compare long/short expected net profit, "
         "loss probability, payoff quality, realized history and tail risk before choosing action, size and leverage. "
+        "If the chosen side has non-positive expected_net, poor payoff quality, or probe_conversion_block_reasons, prefer hold or the better opposite side instead of producing a trade that will be stopped later. "
         "If review memory shows repeated missed opportunities and current EV is positive, consider a small/probe entry instead of passive hold. "
         "If realized-loss memory dominates, require stronger confirmation or reduce size/leverage. "
         "If high_profit=true and the thesis is clear, larger size and higher leverage are allowed; otherwise keep risk small."

@@ -91,6 +91,32 @@ async def test_round_unresolved_decision_finalizer_fills_reason_and_terminal_sta
     ]
 
 
+@pytest.mark.asyncio
+async def test_round_unresolved_finalizer_ignores_hold_decisions() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, Any]] = []
+
+    class _DecisionPersistence:
+        async def fill_missing_reasons(self, decision_ids, reason):
+            calls.append(("fill", sorted(decision_ids), reason))
+
+        async def finalize_unresolved_decisions(self, decisions, reason):
+            calls.append(("finalize", sorted(decisions), reason))
+
+    service.decision_persistence = _DecisionPersistence()
+
+    await service._finalize_round_unresolved_decisions(
+        {7, 8},
+        {7: _decision(Action.HOLD), 8: _decision(Action.SHORT)},
+        "round ended",
+    )
+
+    assert calls == [
+        ("fill", [8], "round ended"),
+        ("finalize", [8], "round ended"),
+    ]
+
+
 def test_trading_service_detects_policy_skipped_execution_result() -> None:
     result = ExecutionResult(
         order_id="rejected",
@@ -7178,7 +7204,7 @@ async def test_sync_service_missing_market_symbol_active_order_returns_no_active
 
 
 @pytest.mark.asyncio
-async def test_sync_service_missing_exchange_position_keeps_snapshot_open_without_close_fill(
+async def test_sync_service_quarantines_orphan_local_position_without_close_fill(
     monkeypatch: pytest.MonkeyPatch,
 ):
     created_at = datetime.now(UTC) - timedelta(days=2)
@@ -7202,10 +7228,14 @@ async def test_sync_service_missing_exchange_position_keeps_snapshot_open_withou
     )
     created_orders: list[dict[str, Any]] = []
     decision_logs: list[dict[str, Any]] = []
+    quarantine_reflections: list[Any] = []
 
     class FakeSession:
         async def refresh(self, _pos):
             return None
+
+        def add(self, row):
+            quarantine_reflections.append(row)
 
     class FakePaperOKX:
         async def get_positions_strict(self):
@@ -7279,16 +7309,21 @@ async def test_sync_service_missing_exchange_position_keeps_snapshot_open_withou
         memory_position_remover=lambda _model_name, _symbol, _side: None,
     ).reconcile_exchange_positions()
 
-    assert local_position.is_open is True
+    assert local_position.is_open is False
     assert local_position.realized_pnl == 0.0
-    assert local_position.unrealized_pnl == 0.006
-    assert local_position.closed_at is None
+    assert local_position.unrealized_pnl == 0.0
+    assert local_position.closed_at is not None
+    assert local_position.close_exchange_order_id == "okx_orphan_quarantine:1599"
     assert created_orders == []
     assert decision_logs == []
-    assert result[0]["kind"] == "missing_exchange_position_without_close_fill"
+    assert len(quarantine_reflections) == 1
+    assert quarantine_reflections[0].source == sync_module.ORPHAN_QUARANTINE_REFLECTION_SOURCE
+    assert quarantine_reflections[0].expert_lessons["training_policy"] == "exclude_until_manual_trust"
+    assert result[0]["kind"] == "orphan_local_position_quarantined"
     assert result[0]["source"] == "okx_authoritative_current_position"
-    assert result[0]["requires_attention"] is True
-    assert "no matching close fill" in result[0]["note"]
+    assert result[0]["requires_attention"] is False
+    assert result[0]["training_policy"] == "exclude_until_manual_trust"
+    assert "quarantined" in result[0]["note"]
 
 
 @pytest.mark.asyncio
@@ -8290,12 +8325,15 @@ async def test_sync_service_reconcile_exchange_positions_does_not_estimate_missi
     assert market_value_calls == []
     assert decision_logs == []
     assert created_orders == []
-    assert position.is_open is True
+    assert position.is_open is False
     assert position.current_price == 104.0
     assert position.realized_pnl == 0.0
-    assert result[0]["kind"] == "missing_exchange_position_without_close_fill"
+    assert position.unrealized_pnl == 0.0
+    assert position.close_exchange_order_id == "okx_orphan_quarantine:22"
+    assert result[0]["kind"] == "orphan_local_position_quarantined"
     assert result[0]["source"] == "okx_authoritative_current_position"
-    assert result[0]["requires_attention"] is True
+    assert result[0]["requires_attention"] is False
+    assert result[0]["training_policy"] == "exclude_until_manual_trust"
     assert result[0]["exchange_order_id"] is None
 
 

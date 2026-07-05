@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -90,3 +91,49 @@ async def test_phase3_go_no_go_cli_keeps_stdout_json_only(monkeypatch, capsys) -
     assert payload["status"] == "paper_observation_healthy"
     assert "executor log" not in captured.out
     assert "executor log that must not pollute json stdout" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_phase3_go_no_go_cli_latest_only_uses_persisted_report(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    latest_dir = tmp_path / "phase3_go_no_go_reports"
+    latest_dir.mkdir()
+    (latest_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "paper_observation_healthy",
+                "checked_at": datetime.now(UTC).isoformat(),
+                "read_only": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_collect_report():
+        raise AssertionError("fresh audit should not run in latest-only mode")
+
+    monkeypatch.setattr(report_cli, "collect_phase3_go_no_go_report", fail_collect_report)
+    monkeypatch.setattr(
+        report_cli,
+        "parse_args",
+        lambda: SimpleNamespace(
+            json_indent=0,
+            output_dir=latest_dir,
+            stdout_only=True,
+            prefer_latest=True,
+            latest_only=True,
+            max_latest_age_seconds=3600,
+            fail_on_blocked=False,
+        ),
+    )
+
+    exit_code = await report_cli._main()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["status"] == "paper_observation_healthy"
+    assert payload["report_source"] == "latest_persisted"

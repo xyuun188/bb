@@ -59,6 +59,31 @@ def is_confirmed_native_full_close_result(result: ExecutionResult | None) -> boo
     return min(after, remaining) <= tolerance
 
 
+def is_native_full_close_backfill_pending_result(result: ExecutionResult | None) -> bool:
+    """Return true when OKX flattened the position but the real fill ordId is pending."""
+
+    status = getattr(result, "status", None)
+    status_value = getattr(status, "value", status)
+    if result is None or str(status_value or "").lower() != OrderStatus.PARTIAL.value:
+        return False
+    if result.quantity <= 0 or result.price <= 0:
+        return False
+    raw_response = getattr(result, "raw_response", None)
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    if not raw.get("okx_native_close_position") or not raw.get("requires_okx_fill_backfill"):
+        return False
+    if str(result.exchange_order_id or "").strip():
+        return False
+    before = _safe_float(raw.get("position_contracts_before"), 0.0)
+    after = _safe_float(raw.get("position_contracts_after"), before)
+    remaining = _safe_float(raw.get("remaining_contracts"), after)
+    filled = _safe_float(raw.get("filled_contracts"), 0.0)
+    if before <= 0 or filled <= 0:
+        return False
+    tolerance = max(before * 0.001, 1e-8)
+    return min(after, remaining) <= tolerance
+
+
 class ExecutionResultClassifier:
     """Classify exchange execution results and normalize failure reasons."""
 
@@ -80,6 +105,11 @@ class ExecutionResultClassifier:
                 return reason
 
         if isinstance(raw, dict) and raw.get("exit_tracking"):
+            if is_native_full_close_backfill_pending_result(result):
+                return (
+                    "OKX 原生平仓已确认交易所仓位归零，但成交明细暂时还没有返回真实订单号；"
+                    "系统会先按待回填平仓释放本地容量，并由 OKX 成交同步继续补齐真实订单号、手续费和资金费。"
+                )
             reason = self._exit_tracking_reason(result, raw)
             if reason:
                 return reason
@@ -213,6 +243,8 @@ class ExecutionResultClassifier:
         return bool(isinstance(raw, dict) and raw.get("exit_tracking"))
 
     def is_exit_progress_execution(self, result: ExecutionResult | None) -> bool:
+        if is_native_full_close_backfill_pending_result(result):
+            return True
         if not self.is_exit_tracking_execution(result):
             return False
         if result is None or result.status != OrderStatus.PARTIAL:

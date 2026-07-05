@@ -1196,6 +1196,74 @@ def test_strategy_learning_defensive_probe_shadow_loop_schedules_quality_recover
     assert context["strategy_learning_sizing"]["max_probe_size_pct"] == 0.0
 
 
+def test_strategy_learning_generates_side_repair_for_crowded_and_negative_ev_events(
+    tmp_path,
+) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    engine = StrategyLearningEngine(scheduler=None)
+    engine.scheduler.state_store = state_store
+
+    payload = engine.build(
+        mode="paper",
+        window_hours=168,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[_healthy_decision("long", executed=False) for _ in range(10)],
+        shadows=[],
+        memories=[],
+        strategy_events=[
+            *[
+                _strategy_event(
+                    "decision_reason",
+                    status="skipped",
+                    action="long",
+                    reason=(
+                        "入场候选暂未满足执行条件：单边拥挤硬上限"
+                        "[crowded_side_cap]：本轮拒绝继续同方向开仓。"
+                    ),
+                )
+                for _ in range(4)
+            ],
+            *[
+                _strategy_event(
+                    "decision_reason",
+                    status="skipped",
+                    action="short",
+                    reason=(
+                        "入场候选暂未满足执行条件：实际下单方向做空"
+                        "费后预期净收益 -0.0302% 不为正。"
+                    ),
+                )
+                for _ in range(5)
+            ],
+        ],
+        max_open_positions=14,
+    )
+
+    feedback = payload["feedback"]
+    event_feedback = feedback["event_feedback"]
+    problem_keys = {item["key"] for item in feedback["problems"]}
+    backtest_rows = {
+        row["profile_id"]: row for row in payload["schedule"]["backtest"]["rows"]
+    }
+
+    assert event_feedback["crowded_side_cap_blocks"] == 4
+    assert event_feedback["crowded_side_cap_side_counts"]["long"] == 4
+    assert event_feedback["non_positive_expected_net_blocks"] == 5
+    assert event_feedback["non_positive_expected_net_side_counts"]["short"] == 5
+    assert "crowded_side_cap_loop" in problem_keys
+    assert "non_positive_expected_net_loop" in problem_keys
+    assert "long_crowded_rebalance" in backtest_rows
+    assert "short_expected_net_repair" in backtest_rows
+    assert "long_crowded_rebalance_candidate" in backtest_rows[
+        "long_crowded_rebalance"
+    ]["matched_fixes"]
+    assert "short_expected_net_repair_candidate" in backtest_rows[
+        "short_expected_net_repair"
+    ]["matched_fixes"]
+
+
 def test_strategy_learning_groups_fragmented_open_positions_by_symbol_and_side(
     tmp_path,
 ) -> None:

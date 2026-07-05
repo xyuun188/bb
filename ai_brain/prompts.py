@@ -65,6 +65,7 @@ SYSTEM_PROMPT = """You are a professional cryptocurrency quantitative trading AI
 - Be slightly aggressive when the expected profit edge is usable. Do not wait for perfect setups if price action, momentum, liquidity, and risk/reward are good enough.
 - Use review feedback as a habit correction signal: repeated missed opportunities should make you consider a small/probe entry when current EV is positive and hard risk is absent; repeated realized losses should make you demand stronger confirmation or size down.
 - The surrounding system should only override for hard safety: exchange/account limits, missing market data, no balance/margin, duplicated same-side symbol limits, critical black-swan risk, or forced stop-loss protection.
+- Do not generate trades that are predictably rejected by downstream guards: if the chosen side's fee-adjusted expected net return is non-positive, payoff quality is weak, or the portfolio is already crowded on that same side, prefer hold or the better opposite side unless symbol-specific evidence is clearly strong.
 
 ## Decision Rules
 1. **AI-led action**: Choose "long", "short", "close_long", "close_short", or "hold" directly. Global market regime, side exposure, ML, and expert reports are context, not hard bans.
@@ -224,6 +225,8 @@ Rules:
 - You may approve, hold, reverse direction, open a trade even when the preliminary decision is hold, or actively close/reduce a position.
 - Do not force long/short when evidence is poor. Borderline positive-EV entries must use small/probe sizing; never bypass hard risk into a normal-size entry.
 - If memory_feedback or entry_candidate_evidence says a side has repeated missed opportunities, do not default to HOLD solely from caution. Approve at most a small/probe entry when current expected net profit, loss probability, liquidity, and tail risk are acceptable.
+- If entry_candidate_evidence marks the chosen side as non-positive EV, low payoff quality, or probe_conversion_blocked, treat that side as not ready for real execution; choose hold or the better opposite side instead of relying on later filters to reject it.
+- If strategy/exposure shows one side is already crowded, do not add ordinary same-side entries. Same-side action needs clearly superior symbol-specific net profit and independent confirmation; otherwise hold or choose the better opposite side.
 - If memory_feedback.decision_habit marks a side as probe_when_ev_ok, treat HOLD as a decision that needs evidence; use the probe budget only when EV is positive and hard risk is absent.
 - If memory_feedback.decision_habit marks a side as strict_confirm, require stronger current evidence and smaller size/leverage even when the direction looks attractive.
 - If memory_feedback says realized loss lessons dominate, keep the habit conservative for that side: require stronger current evidence and reduce size/leverage.
@@ -416,6 +419,8 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         ),
         "rules": [
             "entry: compare long/short EV, payoff, loss_probability, tail risk; size down on weak edge.",
+            "entry: non-positive chosen-side EV, probe_conversion_blocked, or poor payoff quality should become hold/opposite-side, not a trade that downstream guards must reject.",
+            "entry: respect crowded-side exposure; ordinary same-side adds should not be generated unless symbol-specific profit evidence is clearly superior.",
             "entry: do not force trades; borderline opportunities can only be small/probe.",
             "entry: repeated missed-opportunity feedback is a reason to consider a small probe, not a reason to bypass hard risk.",
             "entry: decision_habit.probe_when_ev_ok means be selectively earlier; decision_habit.strict_confirm means demand stronger evidence.",
@@ -426,11 +431,73 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             "position: close only with should_close/hard risk/TP-SL/thesis invalidation/profit protection.",
         ],
     }
-    text = json.dumps(payload, ensure_ascii=False, default=str)
+    def dump_prompt_payload(data: dict) -> str:
+        return json.dumps(data, ensure_ascii=False, default=str, separators=(",", ":"))
+
+    def compact_prompt_payload(max_chars: int = 2200) -> str:
+        text = dump_prompt_payload(payload)
+        if len(text) <= max_chars:
+            return text
+
+        compact_payload = dict(payload)
+        compact_payload["market"] = short_text(compact_payload.get("market"), 420)
+        compact_payload["rules"] = [
+            "entry: avoid non-positive EV, poor payoff, or probe-blocked entries; hold or use better opposite side.",
+            "entry: avoid crowded same-side adds unless symbol net edge is clearly superior.",
+            "entry: probe only when EV>0 and hard risk is absent; loss feedback means stricter/smaller.",
+            "position: close only on hard risk, thesis invalidation, TP/SL, or profit protection.",
+        ]
+        text = dump_prompt_payload(compact_payload)
+        if len(text) <= max_chars:
+            return text
+
+        compact_payload["expert_opinions"] = compact_payload.get("expert_opinions", [])[:2]
+        compact_payload["cross_validations"] = compact_payload.get("cross_validations", [])[:2]
+        compact_payload["entry_candidate_evidence"] = compact_value(
+            compact_payload.get("entry_candidate_evidence") or {},
+            depth=1,
+            dict_limit=8,
+        )
+        compact_payload["memory_feedback"] = compact_value(
+            compact_payload.get("memory_feedback") or {},
+            depth=1,
+            dict_limit=6,
+        )
+        compact_payload["profit_first_guidance"] = compact_value(
+            compact_payload.get("profit_first_guidance") or {},
+            depth=1,
+            dict_limit=6,
+        )
+        text = dump_prompt_payload(compact_payload)
+        if len(text) <= max_chars:
+            return text
+
+        for key, empty_value in (
+            ("memory_feedback", {}),
+            ("profit_first_guidance", {}),
+            ("portfolio_profit_protection", {}),
+            ("opportunity_score", {}),
+            ("add_evidence", {}),
+            ("cross_validations", []),
+            ("expert_opinions", []),
+        ):
+            compact_payload[key] = empty_value
+            text = dump_prompt_payload(compact_payload)
+            if len(text) <= max_chars:
+                return text
+
+        compact_payload["market"] = short_text(compact_payload.get("market"), 180)
+        compact_payload["rules"] = [
+            "entry: positive net edge only; avoid crowded/probe-blocked entries.",
+            "position: maximize realized net profit with hard evidence.",
+        ]
+        return dump_prompt_payload(compact_payload)
+
+    text = compact_prompt_payload()
     return f"""STRICT_FINAL_DECISION_JSON_V2
 Read the compact payload and output only the schema JSON. Do not add fields.
 Reasoning must be Simplified Chinese, 12-48 chars. No markdown, no <think>.
-{text[:2200]}
+{text}
 JSON:"""
 
     return f"""请阅读下面的委员会资料，并输出最终交易裁决 JSON。
@@ -529,6 +596,8 @@ def build_batch_experts_user_prompt(
         ),
         "rules": (
             "Judge EV after fee/slippage, payoff quality, loss probability, liquidity, tail risk. "
+            "If chosen-side EV is non-positive, probe_conversion_blocked, or payoff quality is poor, return hold/opposite-side instead of a doomed entry. "
+            "If exposure is crowded on one side, avoid ordinary same-side entries unless symbol-specific profit evidence is clearly superior. "
             "missed_ok=small probe only if EV>0 and no hard risk; loss_history=stricter/smaller. "
             "position_expert holds when no matching position. Hard risk may veto; weak evidence holds."
         ),
@@ -577,6 +646,8 @@ Remember:
 - You decide the action, size, leverage, entry timing, exit timing, stop loss, and take profit.
 - The objective is realized net profit after fees/slippage, not win rate. Prefer fewer high-quality trades over many tiny wins that can be erased by one large loss.
 - Rank opportunities by expected net return, downside tail risk, fee/slippage cost, and capital efficiency. A high-confidence trade with poor payoff or large tail risk should be hold.
+- If the chosen side's expected net return after fees/slippage is non-positive, or pre-AI evidence says probe conversion is blocked, choose hold or the better opposite side instead of producing an entry that later filters must reject.
+- If current portfolio exposure is already crowded on the same side, do not add another ordinary same-side position; require clearly superior symbol-specific expected net profit and independent confirmation.
 - Always check abnormal wick/spike fields. Recent large abnormal_wick_max means the planned stop loss may fill far worse than expected, so reduce size/leverage or hold unless compensation is exceptional.
 - Default to "hold" only when expected value is poor, data/liquidity is unreliable, or hard safety risk is present.
 - Evaluate long and short independently for this symbol. Do not copy the broad market direction blindly.

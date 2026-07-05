@@ -10199,8 +10199,34 @@ class TradingService:
         decisions: dict[int, DecisionOutput],
         reason: str,
     ) -> None:
-        await self._fill_missing_decision_reasons(decision_ids, reason)
-        await self._finalize_unresolved_decision_states(decisions, reason)
+        executable_decisions = self._round_unresolved_executable_decisions(decisions)
+        executable_ids = [
+            int(decision_id)
+            for decision_id in decision_ids
+            if int(decision_id) in executable_decisions
+        ]
+        if not executable_decisions:
+            return
+        await self._fill_missing_decision_reasons(executable_ids, reason)
+        await self._finalize_unresolved_decision_states(executable_decisions, reason)
+
+    @staticmethod
+    def _round_unresolved_executable_decisions(
+        decisions: dict[int, DecisionOutput],
+    ) -> dict[int, DecisionOutput]:
+        """Only executable actions need a round-end terminal state.
+
+        Hold decisions and fast-prefilter observations are already terminal from
+        a trading perspective.  Finalizing them as "did not enter order flow"
+        pollutes dashboard reasons and teaches strategy learning that passive
+        observations were failed entry candidates.
+        """
+
+        return {
+            int(decision_id): decision
+            for decision_id, decision in decisions.items()
+            if decision_id and (decision.is_entry or decision.is_exit)
+        }
 
     async def _finalize_unresolved_decision_states(
         self,

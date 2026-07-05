@@ -1840,6 +1840,10 @@ class StrategyFeedbackCompiler:
         skip_kind_counts: dict[str, int] = {}
         defensive_probe_shadow_count = 0
         entry_evidence_shadow_only_count = 0
+        crowded_side_cap_blocks = 0
+        crowded_side_cap_side_counts: dict[str, int] = {}
+        non_positive_expected_net_blocks = 0
+        non_positive_expected_net_side_counts: dict[str, int] = {}
         covered = 0
         missing_profile = 0
         attributable_total = 0
@@ -1867,6 +1871,20 @@ class StrategyFeedbackCompiler:
                 reason=reason,
                 attribution=attribution,
             )
+            reason_category = reason_info.get("category", "other")
+            action_side = _action_side(action)
+            if reason_category == "crowded_side_cap":
+                crowded_side_cap_blocks += 1
+                if action_side in {"long", "short"}:
+                    crowded_side_cap_side_counts[action_side] = (
+                        crowded_side_cap_side_counts.get(action_side, 0) + 1
+                    )
+            if reason_category == "non_positive_expected_net":
+                non_positive_expected_net_blocks += 1
+                if action_side in {"long", "short"}:
+                    non_positive_expected_net_side_counts[action_side] = (
+                        non_positive_expected_net_side_counts.get(action_side, 0) + 1
+                    )
             type_counts[event_type] = type_counts.get(event_type, 0) + 1
             status_counts[status] = status_counts.get(status, 0) + 1
             if profile_id:
@@ -2023,6 +2041,22 @@ class StrategyFeedbackCompiler:
             ),
             "profit_first_defensive_probe_shadow_count": defensive_probe_shadow_count,
             "entry_evidence_shadow_only_count": entry_evidence_shadow_only_count,
+            "crowded_side_cap_blocks": crowded_side_cap_blocks,
+            "crowded_side_cap_side_counts": dict(
+                sorted(
+                    crowded_side_cap_side_counts.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ),
+            "non_positive_expected_net_blocks": non_positive_expected_net_blocks,
+            "non_positive_expected_net_side_counts": dict(
+                sorted(
+                    non_positive_expected_net_side_counts.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ),
             "attribution_coverage": round(coverage, 6),
             "attributable_event_coverage": round(attributable_coverage, 6),
             "attributable_events": attributable_total,
@@ -2238,6 +2272,16 @@ class StrategyFeedbackCompiler:
                 "category": "capacity_block",
                 "label": "仓位容量已满或接近上限，优先释放低质量持仓后再开新仓。",
             }
+        if (
+            "expected_net_not_positive" in lower
+            or "non_positive_expected_net" in lower
+            or ("费后预期净收益" in raw and "不为正" in raw)
+            or ("璐瑰悗棰勬湡鍑€鏀剁泭" in raw and "涓嶄负姝" in raw)
+        ):
+            return {
+                "category": "non_positive_expected_net",
+                "label": "候选方向费后预期净收益不为正，策略生成应转向更高质量或相反方向机会。",
+            }
         if any(token in lower for token in ("fallback", "expert_integrity", "partial_batch")):
             return {
                 "category": "expert_fallback_block",
@@ -2328,6 +2372,38 @@ class StrategyFeedbackCompiler:
                     ),
                 },
             )
+        crowded_side_cap_blocks = _safe_int(event_feedback.get("crowded_side_cap_blocks"), 0)
+        if crowded_side_cap_blocks:
+            add(
+                "crowded_side_cap_loop",
+                "high" if crowded_side_cap_blocks >= 3 else "medium",
+                "同向拥挤挡单持续出现，策略生成应减少拥挤方向的普通开仓，优先寻找相反方向或更高质量机会。",
+                {
+                    "crowded_side_cap_blocks": crowded_side_cap_blocks,
+                    "side_counts": _safe_dict(
+                        event_feedback.get("crowded_side_cap_side_counts")
+                    ),
+                    "policy": "generation_feedback_not_fixed_trade_threshold",
+                },
+            )
+        non_positive_expected_net_blocks = _safe_int(
+            event_feedback.get("non_positive_expected_net_blocks"),
+            0,
+        )
+        if non_positive_expected_net_blocks:
+            add(
+                "non_positive_expected_net_loop",
+                "high" if non_positive_expected_net_blocks >= 3 else "medium",
+                "开仓候选经常在费后预期净收益为负时才被后置拦截，策略生成应提前转向正期望/高盈亏质量方向。",
+                {
+                    "non_positive_expected_net_blocks": non_positive_expected_net_blocks,
+                    "side_counts": _safe_dict(
+                        event_feedback.get("non_positive_expected_net_side_counts")
+                    ),
+                    "policy": "generation_feedback_not_fixed_trade_threshold",
+                },
+            )
+
         if trade_count >= 3 and net_pnl < 0:
             add(
                 "negative_realized_pnl",
@@ -2512,6 +2588,25 @@ class StrategyCandidateGenerator:
             0.0,
             1.0,
         )
+        crowded_side_counts = _safe_dict(
+            feedback.event_feedback.get("crowded_side_cap_side_counts")
+        )
+        non_positive_net_side_counts = _safe_dict(
+            feedback.event_feedback.get("non_positive_expected_net_side_counts")
+        )
+        crowded_side = max(
+            ("long", "short"),
+            key=lambda side: _safe_int(crowded_side_counts.get(side), 0),
+        )
+        crowded_side_count = _safe_int(crowded_side_counts.get(crowded_side), 0)
+        non_positive_side = max(
+            ("long", "short"),
+            key=lambda side: _safe_int(non_positive_net_side_counts.get(side), 0),
+        )
+        non_positive_side_count = _safe_int(
+            non_positive_net_side_counts.get(non_positive_side),
+            0,
+        )
 
         if defensive_probe_shadow_loop or tiny_probe_fee_drag or missed_positive_shadow_pressure:
             profiles.append(
@@ -2531,6 +2626,89 @@ class StrategyCandidateGenerator:
                         "position_size_multiplier": 1.0,
                         "expert_integrity_mode": "strict_all_required",
                         "min_trade_count_target": trade_target,
+                    },
+                )
+            )
+
+        if "crowded_side_cap_loop" in problem_keys and crowded_side_count > 0:
+            opposite = "short" if crowded_side == "long" else "long"
+            profiles.append(
+                StrategyProfile(
+                    profile_id=f"{crowded_side}_crowded_rebalance",
+                    version=1,
+                    label=f"{crowded_side} 拥挤再平衡",
+                    status="candidate",
+                    source="feedback_generator",
+                    description=(
+                        "同向拥挤挡单持续出现时，策略生成应减少拥挤方向的普通开仓，"
+                        "把候选质量和仓位大小向更均衡/更高正期望方向迁移。"
+                    ),
+                    params={
+                        "global_min_score_delta": 0.02,
+                        "min_trade_count_target": trade_target,
+                        "portfolio_preference": {
+                            "capacity_mode": "focus",
+                            "rotation_bias": 1.25,
+                            "review_bias": 1.15,
+                        },
+                        "side_overrides": {
+                            crowded_side: {
+                                "state": "crowded",
+                                "score_adjustment": -0.16,
+                                "min_score_delta": 0.18,
+                                "size_multiplier": 0.55,
+                                "reason": "crowded-side execution blocks are recurring",
+                            },
+                            opposite: {
+                                "state": "balance_candidate",
+                                "score_adjustment": 0.04,
+                                "min_score_delta": -0.03,
+                                "size_multiplier": 1.02,
+                                "reason": "opposite side can rebalance if expected net stays positive",
+                            },
+                        },
+                        "side_weights": {crowded_side: 0.72, opposite: 1.06},
+                    },
+                )
+            )
+
+        if "non_positive_expected_net_loop" in problem_keys and non_positive_side_count > 0:
+            opposite = "short" if non_positive_side == "long" else "long"
+            profiles.append(
+                StrategyProfile(
+                    profile_id=f"{non_positive_side}_expected_net_repair",
+                    version=1,
+                    label=f"{non_positive_side} 正期望修复",
+                    status="candidate",
+                    source="feedback_generator",
+                    description=(
+                        "候选经常在费后预期净收益为负时才被后置拦截，"
+                        "本画像让策略生成提前提高该方向质量要求，并给相反方向保留轻微探索权重。"
+                    ),
+                    params={
+                        "global_min_score_delta": 0.03,
+                        "min_trade_count_target": trade_target,
+                        "entry_filters": {
+                            "quality_bias": "tighten",
+                            "missed_opportunity_bias": "neutral",
+                        },
+                        "side_overrides": {
+                            non_positive_side: {
+                                "state": "negative_expected_net_repair",
+                                "score_adjustment": -0.14,
+                                "min_score_delta": 0.20,
+                                "size_multiplier": 0.58,
+                                "reason": "chosen side often has non-positive fee-adjusted EV",
+                            },
+                            opposite: {
+                                "state": "alternative_positive_ev_candidate",
+                                "score_adjustment": 0.03,
+                                "min_score_delta": -0.02,
+                                "size_multiplier": 1.01,
+                                "reason": "opposite side may be considered when EV/payoff is better",
+                            },
+                        },
+                        "side_weights": {non_positive_side: 0.74, opposite: 1.04},
                     },
                 )
             )
@@ -3357,6 +3535,40 @@ class StrategyBacktester:
         side_overrides = _safe_dict(params.get("side_overrides"))
         for side, override in side_overrides.items():
             bucket = _safe_dict(feedback.side_performance.get(str(side)))
+            side_block_count = _safe_int(
+                _safe_dict(feedback.event_feedback.get("crowded_side_cap_side_counts")).get(
+                    str(side)
+                ),
+                0,
+            )
+            side_negative_ev_count = _safe_int(
+                _safe_dict(
+                    feedback.event_feedback.get("non_positive_expected_net_side_counts")
+                ).get(str(side)),
+                0,
+            )
+            if (
+                "crowded_side_cap_loop" in problem_keys
+                and side_block_count > 0
+                and _safe_float(_safe_dict(override).get("size_multiplier"), 1.0) < 1.0
+            ):
+                deltas.append(
+                    (
+                        f"{side}_crowded_rebalance_candidate",
+                        min(side_block_count * 0.24 + trade_gap * 0.12, 3.2),
+                    )
+                )
+            if (
+                "non_positive_expected_net_loop" in problem_keys
+                and side_negative_ev_count > 0
+                and _safe_float(_safe_dict(override).get("min_score_delta"), 0.0) > 0
+            ):
+                deltas.append(
+                    (
+                        f"{side}_expected_net_repair_candidate",
+                        min(side_negative_ev_count * 0.22 + trade_gap * 0.10, 3.0),
+                    )
+                )
             if (
                 bucket.get("state") == "degraded"
                 and _safe_float(_safe_dict(override).get("size_multiplier"), 1.0) < 1.0
@@ -4347,6 +4559,14 @@ class StrategyScheduler:
             feedback.event_feedback.get("profit_first_defensive_probe_shadow_count"),
             0,
         )
+        crowded_side_blocks = _safe_int(
+            feedback.event_feedback.get("crowded_side_cap_blocks"),
+            0,
+        )
+        non_positive_expected_net_blocks = _safe_int(
+            feedback.event_feedback.get("non_positive_expected_net_blocks"),
+            0,
+        )
         losing_open_count = _safe_int(feedback.open_position_pressure.get("losing_open_count"), 0)
         low_quality_open_count = _safe_int(
             feedback.open_position_pressure.get("low_quality_open_count"),
@@ -4445,6 +4665,7 @@ class StrategyScheduler:
                 score += defensive_probe_blocks * 0.34 + max(trade_target - trade_count, 0) * 0.14
             if side_recovery:
                 score += bad * 0.22 + large_losses * 0.08
+                score += crowded_side_blocks * 0.18 + non_positive_expected_net_blocks * 0.16
             if capacity_mode == "expand":
                 score += max_position_blocks * 0.18 + max(missed, 0) * 0.08
             if fallback_safety == "too_loose":
@@ -6037,6 +6258,20 @@ class StrategyLearningService:
             "primary_issue_keys": sorted(key for key in problem_keys if key),
             "skip_kind_counts": skip_kind_counts,
             "defensive_probe_shadow_count": defensive_probe_shadow_count,
+            "crowded_side_cap_blocks": _safe_int(
+                feedback.event_feedback.get("crowded_side_cap_blocks"),
+                0,
+            ),
+            "crowded_side_cap_side_counts": _safe_dict(
+                feedback.event_feedback.get("crowded_side_cap_side_counts")
+            ),
+            "non_positive_expected_net_blocks": _safe_int(
+                feedback.event_feedback.get("non_positive_expected_net_blocks"),
+                0,
+            ),
+            "non_positive_expected_net_side_counts": _safe_dict(
+                feedback.event_feedback.get("non_positive_expected_net_side_counts")
+            ),
             "require_quality_entry_recovery_candidate": require_quality_recovery,
             "allow_recovery_probe_candidate": bool(
                 low_trade_count and fallback_or_missed and not tiny_probe_fee_drag
@@ -6103,6 +6338,16 @@ class StrategyLearningService:
                     "Use when the dynamic payoff profile shows low payoff ratio, weak profit "
                     "factor, or large-loss distribution pressure. Do not use fixed USDT cutoffs; "
                     "derive payoff_repair_intensity from generation_guidance.payoff_repair_profile."
+                ),
+                "crowded_rebalance": (
+                    "Use when crowded-side execution blocks repeat. Prefer side_overrides and "
+                    "side_weights that reduce ordinary entries on the crowded side while keeping "
+                    "opposite-side entries conditional on positive expected net and payoff quality."
+                ),
+                "expected_net_repair": (
+                    "Use when many candidates are rejected because fee-adjusted expected net is "
+                    "not positive. Improve generation quality and side selection; do not solve it "
+                    "by fixed trade thresholds or by opening anyway."
                 ),
             },
         }

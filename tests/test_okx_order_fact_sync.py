@@ -12,10 +12,12 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
+from services.okx_native_facts import OkxNativeFillGroup
 from services.okx_order_fact_sync import (
     OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
     OKX_SYNC_NO_FILL_REJECTED,
     OKX_SYNC_OKX_ONLY,
     OKX_SYNC_ORDER_ONLY,
@@ -25,6 +27,9 @@ from services.okx_order_fact_sync import (
     OkxOrderFactSyncService,
     _apply_position_history_payload,
     _db_naive_since,
+    _matching_native_full_close_pending_fill,
+    _order_needs_okx_fact_refresh,
+    _order_needs_okx_pull,
     _stored_fill_base_quantity,
 )
 from web_dashboard.api.trades import get_trade_detail, get_trades
@@ -38,6 +43,62 @@ def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_qua
             "base_quantity": 15.265700483091791,
         }
     ) == pytest.approx(16.0)
+
+
+def test_native_full_close_pending_order_targets_and_matches_real_fill() -> None:
+    filled_at = datetime(2026, 6, 25, 20, 54, tzinfo=UTC)
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="AI16Z/USDT",
+        side="sell",
+        order_type="market",
+        quantity=366.0,
+        price=0.0513,
+        status="partial",
+        fee=0.0,
+        decision_id=132611,
+        exchange_order_id=None,
+        filled_at=filled_at,
+    )
+    order.okx_inst_id = "AI16Z-USDT-SWAP"
+    order.okx_sync_status = OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+    order.okx_raw_fills = {
+        "source": OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+        "requires_okx_fill_backfill": True,
+        "inst_id": "AI16Z-USDT-SWAP",
+        "contracts": 36.6,
+        "contract_size": 10.0,
+        "base_quantity": 366.0,
+        "timestamp": filled_at.isoformat(),
+    }
+    fill = OkxNativeFillGroup(
+        order_id="real-okx-close",
+        trade_ids=("trade-1",),
+        inst_id="AI16Z-USDT-SWAP",
+        symbol="AI16Z/USDT",
+        side="sell",
+        pos_side="long",
+        contracts=36.6,
+        avg_price=0.0513,
+        fee_abs=0.03,
+        fill_pnl=1.23,
+        timestamp_ms=filled_at.timestamp() * 1000,
+        timestamp=filled_at + timedelta(seconds=8),
+        raw_count=1,
+        rows=(),
+    )
+
+    assert _order_needs_okx_pull(order) is True
+    assert _order_needs_okx_fact_refresh(order) is True
+    assert (
+        _matching_native_full_close_pending_fill(
+            order,
+            fills=[fill],
+            contract_sizes={"AI16Z-USDT-SWAP": 10.0},
+        )
+        is fill
+    )
 
 
 class _FillCcxt:

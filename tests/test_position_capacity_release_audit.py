@@ -137,6 +137,118 @@ async def test_position_capacity_release_report_counts_executed_release_decision
 
 
 @pytest.mark.asyncio
+async def test_position_capacity_release_report_tracks_native_close_pending_backfill(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="ZRO/USDT",
+                    action="close_long",
+                    confidence=0.94,
+                    analysis_type="position",
+                    was_executed=False,
+                    execution_reason=(
+                        "OKX 原生平仓已确认交易所仓位归零，但成交明细暂时还没有返回真实订单号。"
+                    ),
+                    raw_llm_response={
+                        "analysis_type": "position_review",
+                        "exit_intent": "capital_rotation",
+                        "position_release_policy": {
+                            "forced": True,
+                            "source": "position_quality_capacity_release",
+                        },
+                        "execution_result": {
+                            "source": "exchange_not_confirmed",
+                            "status": "partial",
+                            "exchange_confirmed": False,
+                            "exit_progress": True,
+                            "raw_response": {
+                                "okx_native_close_position": True,
+                                "requires_okx_fill_backfill": True,
+                            },
+                        },
+                    },
+                    created_at=datetime.now(UTC) - timedelta(minutes=4),
+                )
+            )
+
+        report = await PositionCapacityReleaseAuditService(lookback_hours=24).report()
+
+        assert report["release_decision_count"] == 1
+        assert report["unclosed_release_decision_count"] == 0
+        assert report["release_execution_state_counts"] == {
+            "exit_progress_pending_backfill": 1
+        }
+        assert report["release_execution_block_counts"] == {
+            "okx_fill_backfill_pending": 1
+        }
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_capacity_release_report_recovers_legacy_native_backfill_snapshot(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="ZRO/USDT",
+                    action="close_long",
+                    confidence=0.94,
+                    analysis_type="position",
+                    was_executed=False,
+                    execution_reason="OKX 平仓已部分成交，系统会继续同步最终成交结果。",
+                    raw_llm_response={
+                        "analysis_type": "position_review",
+                        "exit_intent": "capital_rotation",
+                        "decision_state_machine": {
+                            "summary": {
+                                "final_stage": "local_sync",
+                                "final_status": "skipped",
+                                "failed": True,
+                            }
+                        },
+                        "position_release_policy": {
+                            "forced": True,
+                            "source": "position_quality_capacity_release",
+                        },
+                        "execution_result": {
+                            "source": "exchange_not_confirmed",
+                            "status": "partial",
+                            "exchange_confirmed": False,
+                            "exit_progress": False,
+                            "raw_response": {
+                                "okx_native_close_position": True,
+                                "requires_okx_fill_backfill": True,
+                            },
+                        },
+                    },
+                    created_at=datetime.now(UTC) - timedelta(minutes=4),
+                )
+            )
+
+        report = await PositionCapacityReleaseAuditService(lookback_hours=24).report()
+
+        assert report["unclosed_release_decision_count"] == 0
+        assert report["release_execution_state_counts"] == {
+            "exit_progress_pending_backfill": 1
+        }
+        assert report["release_execution_block_counts"] == {
+            "okx_fill_backfill_pending": 1
+        }
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_position_capacity_release_report_excludes_protected_non_execution_from_unclosed(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

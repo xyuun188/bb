@@ -266,6 +266,9 @@ class PositionCapacityReleaseAuditService:
         raw = _safe_dict(getattr(decision, "raw_llm_response", None))
         policy = _safe_dict(raw.get("position_release_policy"))
         quality = _safe_dict(raw.get("position_quality"))
+        execution_result = _safe_dict(raw.get("execution_result"))
+        execution_raw = _safe_dict(execution_result.get("raw_response"))
+        state_summary = _safe_dict(_safe_dict(raw.get("decision_state_machine")).get("summary"))
         return {
             "decision_id": int(getattr(decision, "id", 0) or 0),
             "symbol": normalize_trading_symbol(getattr(decision, "symbol", "") or ""),
@@ -283,10 +286,56 @@ class PositionCapacityReleaseAuditService:
                 "scan_reason": str(policy.get("scan_reason") or "")[:260],
             },
             "position_quality": quality,
+            "decision_state_summary": {
+                "final_stage": state_summary.get("final_stage"),
+                "final_status": state_summary.get("final_status"),
+                "failed": bool(state_summary.get("failed")),
+                "blocked": bool(state_summary.get("blocked")),
+            },
+            "execution_result": {
+                "source": execution_result.get("source"),
+                "status": execution_result.get("status"),
+                "exchange_order_id": execution_result.get("exchange_order_id"),
+                "exchange_confirmed": bool(execution_result.get("exchange_confirmed")),
+                "exit_progress": bool(execution_result.get("exit_progress")),
+                "requires_okx_fill_backfill": bool(
+                    execution_raw.get("requires_okx_fill_backfill")
+                ),
+                "okx_native_close_position": bool(
+                    execution_raw.get("okx_native_close_position")
+                ),
+            },
         }
 
     @staticmethod
     def _release_execution_state(row: dict[str, Any]) -> tuple[str, str]:
+        linked_order_count = _safe_int(row.get("linked_order_count"))
+        execution_result = _safe_dict(row.get("execution_result"))
+        if (
+            bool(row.get("was_executed"))
+            or bool(row.get("has_filled_order"))
+            or bool(execution_result.get("exchange_confirmed"))
+        ):
+            if linked_order_count <= 0 and not bool(row.get("has_filled_order")):
+                return "reported_executed_without_link", "filled_report_missing_order_link"
+            return "executed", "none"
+        if bool(execution_result.get("exit_progress")):
+            if bool(execution_result.get("requires_okx_fill_backfill")):
+                return "exit_progress_pending_backfill", "okx_fill_backfill_pending"
+            return "exit_progress", "partial_close_waiting_confirmation"
+        if bool(execution_result.get("requires_okx_fill_backfill")) and bool(
+            execution_result.get("okx_native_close_position")
+        ):
+            return "exit_progress_pending_backfill", "okx_fill_backfill_pending"
+        state_summary = _safe_dict(row.get("decision_state_summary"))
+        final_status = str(state_summary.get("final_status") or "").lower()
+        execution_source = str(execution_result.get("source") or "").lower()
+        if execution_source == "exchange_confirmed":
+            return "reported_executed_without_link", "filled_report_missing_order_link"
+        if final_status in {"skipped", "blocked"}:
+            return "protected_not_executed", "structured_stage_block"
+        if final_status == "failed":
+            return "pending_unclosed", "execution_failed_without_close_confirmation"
         if bool(row.get("was_executed")) or bool(row.get("has_filled_order")):
             return "executed", "none"
         reason = str(row.get("execution_reason") or "").lower()
@@ -410,6 +459,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         if value is None:
             return default
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
     except (TypeError, ValueError):
         return default
 

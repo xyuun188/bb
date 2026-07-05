@@ -362,9 +362,18 @@ class AnalysisBudgetPolicy:
             cap = max(runtime.market_min_exploration_symbols, runtime.market_medium_risk_cap)
             return min(base_market_limit, cap), "position_first_medium_risk"
 
+        discovery_floor = min(
+            base_market_limit,
+            max(
+                runtime.market_min_exploration_symbols,
+                math.ceil(math.sqrt(base_market_limit)),
+            ),
+        )
         base_cap = max(
             runtime.market_min_exploration_symbols,
-            min(runtime.market_low_risk_open_position_cap, math.ceil(base_market_limit * 0.15)),
+            runtime.market_low_risk_open_position_cap,
+            discovery_floor,
+            math.ceil(base_market_limit * 0.15),
         )
         policy = (
             "position_first_low_risk_underfilled"

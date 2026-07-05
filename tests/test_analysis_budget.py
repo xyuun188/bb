@@ -316,6 +316,38 @@ def test_analysis_budget_runtime_roster_fill_cannot_lower_candidate_floor() -> N
     assert result["market_limit_diagnostics"]["market_caps"]["roster_fill_market_symbol_min"] == 6
 
 
+def test_analysis_budget_low_risk_market_scan_keeps_discovery_width() -> None:
+    policy, _scans_seen = _policy()
+    strategy_context = {
+        "strategy_profile_id": "candidate_too_narrow",
+        "strategy_learning": {
+            "runtime": {
+                "target_position_groups": 4,
+                "max_open_positions": 20,
+                "analysis_budget": {
+                    "market_low_risk_open_position_cap": 2,
+                    "roster_fill_market_symbol_min": 2,
+                },
+            }
+        },
+    }
+
+    result = policy.context(
+        [_position(f"OPEN{i}/USDT") for i in range(12)],
+        {},
+        base_market_limit=12,
+        run_position_analysis=True,
+        run_market_analysis=True,
+        strategy_context=strategy_context,
+    )
+
+    assert result["risk_level"] == "low"
+    assert result["roster_underfilled"] is False
+    assert result["market_limit_policy"] == "position_first_low_risk"
+    assert result["market_symbol_limit"] == 4
+    assert result["market_symbol_limit_is_entry_gate"] is False
+
+
 def test_trading_service_analysis_budget_context_delegates_to_policy() -> None:
     service = object.__new__(TradingService)
     calls: list[dict[str, Any]] = []

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from executor.base_executor import OrderStatus
 from services.entry_fee_provider import proportional_fee
 from services.position_execution_persistence import PositionExecutionPersistenceService
 
@@ -477,6 +478,55 @@ async def test_persist_full_exit_does_not_close_on_synthetic_native_close_order_
     assert getattr(position, "close_exchange_order_id", None) in {None, ""}
     assert getattr(position, "okx_inst_id", None) is None
     assert session.flush_count == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_exit_closes_native_full_close_pending_backfill_without_synthetic_id() -> None:
+    session = FakeSession()
+    position = _position(id=1, quantity=2.0)
+    repo = FakeTradeRepo([position])
+    reflections: list[dict[str, Any]] = []
+    result = _result(
+        quantity=2.0,
+        price=110.0,
+        fee=0.0,
+        status=OrderStatus.PARTIAL,
+        order_id="okx_native_full_close_fill_pending",
+        exchange_order_id=None,
+        raw_response={
+            "exit_tracking": True,
+            "okx_native_close_position": True,
+            "requires_okx_fill_backfill": True,
+            "request_params": {"instId": "BTC-USDT-SWAP"},
+            "position_contracts_before": 2.0,
+            "position_contracts_after": 0.0,
+            "remaining_contracts": 0.0,
+            "filled_contracts": 2.0,
+            "base_quantity": 2.0,
+        },
+    )
+
+    await _service(
+        session=session,
+        repo=repo,
+        confirmed=False,
+        exit_progress=True,
+        entry_fee=0.5,
+        reflections=reflections,
+    ).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        result=result,
+        execution_mode="paper",
+    )
+
+    assert position.is_open is False
+    assert getattr(position, "close_exchange_order_id", None) in {None, ""}
+    assert position.settlement_status == "pending_okx_fill_backfill"
+    assert position.settlement_source == "okx_native_full_close_pending_backfill"
+    assert position.settlement_raw["requires_okx_fill_backfill"] is True
+    assert reflections
+    assert session.flush_count == 1
 
 
 @pytest.mark.asyncio

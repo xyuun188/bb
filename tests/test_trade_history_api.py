@@ -22,6 +22,20 @@ from web_dashboard.api.trades import (
 from web_dashboard.api.trades import get_positions as get_trade_positions
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dashboard_exchange_position_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    async def empty_exchange_mark_map(_mode):
+        return {}
+
+    monkeypatch.setattr(dashboard_api, "_exchange_mark_cache", {})
+    monkeypatch.setattr(dashboard_api, "_exchange_open_symbol_cache", {})
+    monkeypatch.setattr(dashboard_api, "_dashboard_okx_position_cache", {})
+    monkeypatch.setattr(dashboard_api, "_dashboard_okx_position_error_cache", {})
+    monkeypatch.setattr(dashboard_api, "_get_exchange_position_mark_map", empty_exchange_mark_map)
+
+
 @pytest.mark.asyncio
 async def test_trade_history_uses_matched_position_leverage_for_close_order(
     tmp_path,

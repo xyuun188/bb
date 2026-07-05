@@ -388,7 +388,7 @@ async def test_collect_existing_order_decision_link_plans_requires_unique_entry_
             position_id = int(position.id)
 
         plans = await repair_script.collect_existing_order_decision_link_plans(
-            days=5,
+            days=30,
             decision_window_seconds=120,
             position_ids=(position_id,),
         )
@@ -473,7 +473,7 @@ async def test_collect_existing_order_decision_link_plans_respects_exchange_orde
             position_id = int(position.id)
 
         plans = await repair_script.collect_existing_order_decision_link_plans(
-            days=5,
+            days=30,
             decision_window_seconds=120,
             position_ids=(position_id,),
             exchange_order_ids=("entry-avax-2",),

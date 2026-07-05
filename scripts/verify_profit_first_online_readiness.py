@@ -53,22 +53,36 @@ def _remote_validation_command(remote_app_dir: str) -> str:
         import os
         import shlex
         import subprocess
+        from concurrent.futures import ThreadPoolExecutor
         from datetime import datetime, timezone
         from pathlib import Path
 
         def run(cmd, timeout=180):
-            completed = subprocess.run(
-                cmd,
-                shell=True,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-            return {{
-                "returncode": completed.returncode,
-                "stdout": completed.stdout.strip(),
-                "stderr": completed.stderr.strip(),
-            }}
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    shell=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                return {{
+                    "returncode": completed.returncode,
+                    "stdout": completed.stdout.strip(),
+                    "stderr": completed.stderr.strip(),
+                    "timed_out": False,
+                    "timeout_seconds": timeout,
+                }}
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+                return {{
+                    "returncode": 124,
+                    "stdout": str(stdout).strip(),
+                    "stderr": (str(stderr).strip() or f"command timed out after {{timeout}} seconds"),
+                    "timed_out": True,
+                    "timeout_seconds": timeout,
+                }}
 
         def pybin():
             for candidate in (".venv/bin/python", "venv/bin/python", "python3"):
@@ -162,18 +176,31 @@ def _remote_validation_command(remote_app_dir: str) -> str:
         }}
         control_state = load_control_state()
 
-        governance_run = run(
-            f"{{python}} scripts/run_profit_first_governance_report.py --stdout-only --json-indent 0",
-            timeout=240,
-        )
-        go_no_go_run = run(
-            f"{{python}} scripts/run_phase3_go_no_go_report.py --stdout-only --json-indent 0",
-            timeout=360,
-        )
-        recovery_plan_run = run(
-            f"{{python}} scripts/plan_profit_first_recovery_repairs.py --stdout-only --json-indent 0",
-            timeout=360,
-        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            report_futures = {{
+                "governance": pool.submit(
+                    run,
+                    f"{{python}} scripts/run_profit_first_governance_report.py --stdout-only --json-indent 0",
+                    timeout=75,
+                ),
+                "go_no_go": pool.submit(
+                    run,
+                    f"{{python}} scripts/run_phase3_go_no_go_report.py "
+                    "--stdout-only --prefer-latest --latest-only "
+                    "--max-latest-age-seconds 5400 --json-indent 0",
+                    timeout=120,
+                ),
+                "recovery_plan": pool.submit(
+                    run,
+                    f"{{python}} scripts/plan_profit_first_recovery_repairs.py "
+                    "--stdout-only --prefer-latest --latest-only "
+                    "--max-latest-age-seconds 5400 --json-indent 0",
+                    timeout=120,
+                ),
+            }}
+            governance_run = report_futures["governance"].result()
+            go_no_go_run = report_futures["go_no_go"].result()
+            recovery_plan_run = report_futures["recovery_plan"].result()
         governance = (
             json.loads(governance_run["stdout"]) if governance_run["returncode"] == 0 else {{}}
         )
@@ -187,7 +214,7 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             "--stdout-only --json-indent 0 "
             + " ".join(shlex.quote(item) for item in historical_args)
         )
-        historical_package_run = run(historical_cmd, timeout=240)
+        historical_package_run = run(historical_cmd, timeout=90)
         historical_package = (
             json.loads(historical_package_run["stdout"])
             if historical_package_run["returncode"] == 0
@@ -202,7 +229,13 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             else {{}}
         )
 
-        gate = go_no_go.get("go_no_go") if isinstance(go_no_go.get("go_no_go"), dict) else {{}}
+        effective_go_no_go = go_no_go if go_no_go else latest_go_no_go_payload
+        go_no_go_source = "fresh_command" if go_no_go else "latest_persisted_fallback"
+        gate = (
+            effective_go_no_go.get("go_no_go")
+            if isinstance(effective_go_no_go.get("go_no_go"), dict)
+            else {{}}
+        )
         runtime_can_attempt_orders = (
             service_state.get("paper") == "active"
             and control_state.get("paused") is False
@@ -242,7 +275,10 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             }},
             "go_no_go": {{
                 "command_returncode": go_no_go_run["returncode"],
-                "status": go_no_go.get("status", "unavailable"),
+                "source": go_no_go_source,
+                "timed_out": bool(go_no_go_run.get("timed_out")),
+                "timeout_seconds": go_no_go_run.get("timeout_seconds"),
+                "status": effective_go_no_go.get("status", "unavailable"),
                 "gate_status": gate.get("status"),
                 "can_start_paper_with_operator_approval": gate.get("can_start_paper_with_operator_approval"),
                 "critical_blocker_count": len(gate.get("critical_blockers") or gate.get("blockers") or []),
@@ -255,6 +291,8 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             }},
             "recovery_repair_plan": {{
                 "command_returncode": recovery_plan_run["returncode"],
+                "timed_out": bool(recovery_plan_run.get("timed_out")),
+                "timeout_seconds": recovery_plan_run.get("timeout_seconds"),
                 "status": recovery_plan.get("status", "unavailable"),
                 "dry_run": recovery_plan.get("dry_run"),
                 "read_only": recovery_plan.get("read_only"),
@@ -293,6 +331,8 @@ def _remote_validation_command(remote_app_dir: str) -> str:
             }},
             "historical_recovery_package": {{
                 "command_returncode": historical_package_run["returncode"],
+                "timed_out": bool(historical_package_run.get("timed_out")),
+                "timeout_seconds": historical_package_run.get("timeout_seconds"),
                 "status": historical_package.get("status", "unavailable"),
                 "dry_run": historical_package.get("dry_run"),
                 "read_only": historical_package.get("read_only"),
@@ -368,7 +408,7 @@ def collect_online_readiness(*, remote_app_dir: str = REMOTE_APP_DIR) -> dict[st
         raw = run_remote_text(
             ssh,
             _remote_validation_command(remote_app_dir),
-            timeout=480,
+            timeout=260,
             check=True,
             max_output_chars=20000,
         )

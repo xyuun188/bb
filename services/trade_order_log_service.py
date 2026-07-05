@@ -19,7 +19,12 @@ from core.symbols import (
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
-from services.execution_result_classifier import is_confirmed_native_full_close_result
+from services.execution_result_classifier import (
+    is_confirmed_native_full_close_result,
+    is_native_full_close_backfill_pending_result,
+)
+
+OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
 
 logger = structlog.get_logger(__name__)
 
@@ -104,7 +109,7 @@ class TradeOrderLogService:
         if status_text in exchange_confirmed_statuses:
             exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
             if not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}:
-                return True
+                return not is_native_full_close_backfill_pending_result(result)
         if quantity <= 0 and status_text in active_or_filled:
             return True
         return price <= 0 and status_text in active_or_filled
@@ -158,6 +163,9 @@ class TradeOrderLogService:
         order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
         info_order_id = str(info.get("ordId") or raw.get("ordId") or raw.get("id") or "").strip()
         status = str(getattr(getattr(result, "status", None), "value", getattr(result, "status", "")) or "").lower()
+        pending_backfill_payload = TradeOrderLogService._okx_native_backfill_payload(result, raw)
+        if pending_backfill_payload:
+            return pending_backfill_payload
         state = str(info.get("state") or raw.get("status") or status or "").lower().strip()
         filled_contracts = TradeOrderLogService._safe_float(
             info.get("accFillSz") or raw.get("filled_contracts") or raw.get("filled"),
@@ -207,6 +215,51 @@ class TradeOrderLogService:
             "okx_fill_pnl": pnl,
             "okx_state": state or "filled",
             "okx_sync_status": "okx_execution_result_confirmed",
+            "okx_raw_fills": raw_fact,
+        }
+        return payload
+
+    @staticmethod
+    def _okx_native_backfill_payload(result: Any, raw: dict[str, Any]) -> dict[str, Any]:
+        if not is_native_full_close_backfill_pending_result(result):
+            return {}
+        inst_id = okx_inst_id_from_payload(raw, fallback=getattr(result, "symbol", None))
+        contracts = TradeOrderLogService._safe_float(raw.get("filled_contracts"), 0.0)
+        contract_size = TradeOrderLogService._safe_float(raw.get("contract_size"), 0.0)
+        base_quantity = TradeOrderLogService._safe_float(
+            raw.get("base_quantity") or getattr(result, "quantity", 0.0),
+            0.0,
+        )
+        timestamp = (
+            getattr(result, "timestamp", None).isoformat()
+            if getattr(result, "timestamp", None) is not None
+            else None
+        )
+        raw_fact = {
+            "source": OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+            "fills_history_confirmed": False,
+            "requires_okx_fill_backfill": True,
+            "order_id": None,
+            "inst_id": inst_id,
+            "contracts": contracts,
+            "contract_size": contract_size or None,
+            "base_quantity": base_quantity,
+            "avg_price": TradeOrderLogService._safe_float(getattr(result, "price", None), 0.0),
+            "fee_abs": TradeOrderLogService._safe_float(getattr(result, "fee", 0.0), 0.0),
+            "fill_pnl": TradeOrderLogService._safe_float(getattr(result, "pnl", 0.0), 0.0),
+            "timestamp": timestamp,
+            "position_contracts_before": raw.get("position_contracts_before"),
+            "position_contracts_after": raw.get("position_contracts_after"),
+            "remaining_contracts": raw.get("remaining_contracts"),
+            "rows": [],
+        }
+        payload: dict[str, Any] = {
+            "okx_inst_id": inst_id or None,
+            "okx_trade_ids": None,
+            "okx_fill_contracts": contracts or None,
+            "okx_fill_pnl": None,
+            "okx_state": "fill_backfill_pending",
+            "okx_sync_status": OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
             "okx_raw_fills": raw_fact,
         }
         return payload

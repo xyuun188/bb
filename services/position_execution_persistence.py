@@ -19,6 +19,7 @@ from core.symbols import (
 )
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.execution_result_classifier import is_native_full_close_backfill_pending_result
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
 from services.position_settlement import (
@@ -204,7 +205,11 @@ class PositionExecutionPersistenceService:
             "no_position",
             "okx_native_full_close",
             "okx_native_full_close_not_confirmed",
+            "okx_native_full_close_fill_pending",
         }
+        raw = getattr(result, "raw_response", None)
+        if isinstance(raw, dict) and raw.get("requires_okx_fill_backfill"):
+            return ""
         return value if value not in synthetic_ids else ""
 
     @staticmethod
@@ -369,6 +374,7 @@ class PositionExecutionPersistenceService:
                 )
             return
         exchange_backed_ids = await self._exchange_backed_id_provider(session, positions)
+        pending_okx_backfill = is_native_full_close_backfill_pending_result(result)
         positions = sorted(
             positions,
             key=lambda position: (
@@ -415,8 +421,12 @@ class PositionExecutionPersistenceService:
                 entry_fee=entry_fee,
                 close_fee=close_fee,
                 funding_fee=funding_fee,
-                status="provisional",
-                source="system_execution",
+                status="pending_okx_fill_backfill" if pending_okx_backfill else "provisional",
+                source=(
+                    "okx_native_full_close_pending_backfill"
+                    if pending_okx_backfill
+                    else "system_execution"
+                ),
                 synced_at=getattr(result, "timestamp", None),
                 raw={
                     "gross_pnl_source": gross_pnl_source,
@@ -424,6 +434,7 @@ class PositionExecutionPersistenceService:
                     "close_exchange_order_id": close_exchange_order_id,
                     "close_quantity": close_qty,
                     "result_quantity": getattr(result, "quantity", None),
+                    "requires_okx_fill_backfill": pending_okx_backfill,
                 },
             )
             pnl = settlement.realized_pnl

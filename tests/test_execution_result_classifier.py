@@ -260,6 +260,29 @@ def test_execution_confirmation_rejects_unfinished_native_full_close_without_ord
     assert policy.is_exchange_confirmed_execution(result) is False
 
 
+def test_native_full_close_backfill_pending_counts_as_exit_progress() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.PARTIAL,
+        order_id="okx_native_full_close_fill_pending",
+        exchange_order_id=None,
+        quantity=366.0,
+        raw_response={
+            "exit_tracking": True,
+            "okx_native_close_position": True,
+            "requires_okx_fill_backfill": True,
+            "position_contracts_before": 36.6,
+            "position_contracts_after": 0.0,
+            "remaining_contracts": 0.0,
+            "filled_contracts": 36.6,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is False
+    assert policy.is_exit_progress_execution(result) is True
+    assert "待回填平仓" in policy.reason_from_result(result)
+
+
 def test_exit_progress_requires_tracking_partial_and_order_id() -> None:
     policy = ExecutionResultClassifier()
 

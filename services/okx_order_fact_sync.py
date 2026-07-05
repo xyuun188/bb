@@ -75,7 +75,9 @@ OKX_SYNC_NO_FILL_REJECTED = "okx_no_fill_rejected"
 OKX_SYNC_ORDER_ONLY = "okx_order_only"
 OKX_SYNC_POSITION_CONFIRMED = "okx_position_confirmed"
 OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
+OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
 OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE = "okx_position_sync_suppression"
+NATIVE_FULL_CLOSE_BACKFILL_WINDOW_SECONDS = 20 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +535,7 @@ class OkxOrderFactSyncService:
                     writable_orders,
                     local_positions=local_positions,
                     exchange_positions=exchange_positions,
+                    fills=fills,
                     fills_by_order_id=fills_by_order_id,
                     order_rows_by_id=order_rows_by_id,
                     contract_sizes=contract_sizes,
@@ -748,6 +751,7 @@ class OkxOrderFactSyncService:
         *,
         local_positions: list[Position],
         exchange_positions: list[dict[str, Any]],
+        fills: list[OkxNativeFillGroup],
         fills_by_order_id: dict[str, OkxNativeFillGroup],
         order_rows_by_id: dict[str, dict[str, Any]],
         contract_sizes: dict[str, float],
@@ -775,6 +779,23 @@ class OkxOrderFactSyncService:
                 None,
             )
             if fill is None:
+                pending_fill = _matching_native_full_close_pending_fill(
+                    order,
+                    fills=fills,
+                    contract_sizes=contract_sizes,
+                )
+                if pending_fill is not None:
+                    self._apply_fill_to_order(
+                        order,
+                        pending_fill,
+                        now=now,
+                        sync_status=OKX_SYNC_CONFIRMED,
+                        contract_size=_contract_size_for_fill(pending_fill, contract_sizes),
+                        order_row=order_rows_by_id.get(str(pending_fill.order_id or "").strip()),
+                    )
+                    confirmed_count += 1
+                    samples.append(_sample(order, kind="native_full_close_backfill_confirmed"))
+                    continue
                 position_confirmation = None
                 for exchange_id in exchange_ids:
                     candidate = find_current_position_entry_confirmation(
@@ -2152,6 +2173,81 @@ def _order_inst_id(order: Order) -> str:
     return okx_inst_id_from_symbol(getattr(order, "symbol", None)) or ""
 
 
+def _order_requires_native_full_close_backfill(order: Order) -> bool:
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if sync_status == OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING:
+        return True
+    return bool(
+        raw.get("requires_okx_fill_backfill")
+        or raw.get("source") == OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+    )
+
+
+def _matching_native_full_close_pending_fill(
+    order: Order,
+    *,
+    fills: list[OkxNativeFillGroup],
+    contract_sizes: dict[str, float],
+) -> OkxNativeFillGroup | None:
+    if not _order_requires_native_full_close_backfill(order):
+        return None
+    if _split_exchange_order_ids(getattr(order, "exchange_order_id", None)):
+        return None
+    inst_id = _order_inst_id(order)
+    side = str(getattr(order, "side", "") or "").strip().lower()
+    if not inst_id or side not in {"buy", "sell"}:
+        return None
+    reference_time = _order_time(order)
+    if reference_time is None:
+        return None
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    target_contracts = _safe_float(
+        raw.get("contracts") or raw.get("filled_contracts") or getattr(order, "okx_fill_contracts", None),
+        0.0,
+    )
+    target_base_quantity = _safe_float(
+        raw.get("base_quantity") or raw.get("filled_base_quantity") or getattr(order, "quantity", None),
+        0.0,
+    )
+    candidates: list[tuple[float, OkxNativeFillGroup]] = []
+    for fill in fills:
+        order_id = str(getattr(fill, "order_id", "") or "").strip()
+        if not order_id:
+            continue
+        if str(getattr(fill, "inst_id", "") or "").strip().upper() != inst_id:
+            continue
+        if str(getattr(fill, "side", "") or "").strip().lower() != side:
+            continue
+        fill_time = getattr(fill, "timestamp", None)
+        if fill_time is None:
+            continue
+        delta = abs((_aware_utc(fill_time) - _aware_utc(reference_time)).total_seconds())
+        if delta > NATIVE_FULL_CLOSE_BACKFILL_WINDOW_SECONDS:
+            continue
+        contract_size = _contract_size_for_fill(fill, contract_sizes)
+        fill_base_quantity = _fill_base_quantity(fill, contract_size)
+        fill_contracts = _safe_float(getattr(fill, "contracts", None), 0.0)
+        quantity_matches = False
+        if target_contracts > 0 and fill_contracts > 0:
+            quantity_matches = _relative_close_enough(fill_contracts, target_contracts, 0.02)
+        if not quantity_matches and target_base_quantity > 0 and fill_base_quantity > 0:
+            quantity_matches = _relative_close_enough(
+                fill_base_quantity,
+                target_base_quantity,
+                0.02,
+            )
+        if not quantity_matches:
+            continue
+        candidates.append((delta, fill))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
 def _position_inst_id(position: Position) -> str:
     inst_id = str(getattr(position, "okx_inst_id", "") or "").strip().upper()
     if inst_id:
@@ -2170,6 +2266,8 @@ def _is_authoritative_position_history_position(position: Position) -> bool:
 def _order_needs_okx_fact_refresh(order: Order) -> bool:
     exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
     if not exchange_ids:
+        if _order_requires_native_full_close_backfill(order):
+            return True
         return _order_is_rejected_without_exchange_fill(order)
     status = str(getattr(order, "status", "") or "").lower().strip()
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
@@ -2215,7 +2313,7 @@ def _order_needs_local_stored_fact_recovery(order: Order) -> bool:
 def _order_needs_okx_pull(order: Order) -> bool:
     exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
     if not exchange_ids:
-        return False
+        return _order_requires_native_full_close_backfill(order)
     status = str(getattr(order, "status", "") or "").lower().strip()
     if status not in {
         "filled",
