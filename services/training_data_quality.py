@@ -42,6 +42,33 @@ _TRADE_REPAIR_SOURCES = {
     "okx_orphan_position_quarantine",
     "okx_position_link_repair",
 }
+_TRUSTED_TRADE_PNL_SOURCES = {
+    "okx_position_history_realized_pnl",
+    "okx_linked_order_net_pnl",
+    "okx_close_fill_net_pnl_partial",
+    "okx_fill_pnl",
+    "okx_order_fact_sync",
+    "okx_position_history_settlement",
+    "okx_authoritative_reconcile",
+    "position_settlement_snapshot",
+    "position_settlement_snapshot:okx_order_fact_sync",
+    "position_settlement_snapshot:okx_position_history_settlement",
+    "position_settlement_snapshot:okx_authoritative_reconcile",
+}
+_UNTRUSTED_TRADE_PNL_SOURCES = {
+    "",
+    "local_db",
+    "position_realized_pnl",
+    "reported",
+    "derived_from_prices",
+    "manual",
+}
+_TRUSTED_FUNDING_FEE_SOURCES = {
+    "okx_account_bills",
+    "okx_positions_history.fundingFee",
+    "okx_positions_history.funding_fee",
+    "position_settlement_snapshot",
+}
 
 
 @dataclass(frozen=True)
@@ -157,6 +184,49 @@ def _repair_provenance_reason(sample: dict[str, Any]) -> str:
         if candidate and any(token in candidate for token in _TRADE_REPAIR_SOURCE_MARKERS):
             return candidate
     return ""
+
+
+def _trade_pnl_source(sample: dict[str, Any]) -> str:
+    for key in ("pnl_source", "settlement_source", "realized_pnl_source"):
+        value = _safe_str(sample.get(key))
+        if value:
+            return value
+    close_raw = _safe_dict(sample.get("close_raw"))
+    for key in ("pnl_source", "settlement_source", "realized_pnl_source"):
+        value = _safe_str(close_raw.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _trade_pnl_source_trusted(source: str) -> bool:
+    normalized = _safe_str(source)
+    if normalized in _UNTRUSTED_TRADE_PNL_SOURCES:
+        return False
+    if normalized in _TRUSTED_TRADE_PNL_SOURCES:
+        return True
+    return bool(normalized.startswith("position_settlement_snapshot:okx_"))
+
+
+def _trade_funding_fee_source(sample: dict[str, Any]) -> str:
+    for key in ("funding_fee_source", "funding_source"):
+        value = _safe_str(sample.get(key))
+        if value:
+            return value
+    close_raw = _safe_dict(sample.get("close_raw"))
+    for key in ("funding_fee_source", "funding_source"):
+        value = _safe_str(close_raw.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _trade_funding_source_trusted(sample: dict[str, Any]) -> bool:
+    funding_fee = _trade_funding_fee(sample)
+    source = _trade_funding_fee_source(sample)
+    if funding_fee is None:
+        return False
+    return bool(source in _TRUSTED_FUNDING_FEE_SOURCES or source.startswith("okx_"))
 
 
 def _is_duplicate_sample(sample: dict[str, Any]) -> bool:
@@ -358,6 +428,8 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     trust_reason = _safe_str(sample.get("trade_fact_trust_reason"))
     if trust_reason:
         return _final_assessment(0.0, [f"untrusted_trade_fact:{trust_reason}"], exclude=True)
+    if sample.get("trade_fact_trusted") is False:
+        return _final_assessment(0.0, ["untrusted_trade_fact"], exclude=True)
 
     repair_source = _repair_provenance_reason(sample)
     if repair_source:
@@ -391,6 +463,20 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         fee_source = sample.get("fee")
     if fee_source is None:
         return _final_assessment(0.0, ["missing_fee_estimate"], exclude=True)
+    if source == "closed_position":
+        pnl_source = _trade_pnl_source(sample)
+        if not _trade_pnl_source_trusted(pnl_source):
+            return _final_assessment(
+                0.0,
+                [f"untrusted_realized_pnl_source:{pnl_source or 'missing'}"],
+                exclude=True,
+            )
+        if not _trade_funding_source_trusted(sample):
+            return _final_assessment(
+                0.0,
+                ["missing_or_untrusted_funding_fee_source"],
+                exclude=True,
+            )
 
     side = _safe_str(sample.get("side")).lower()
     if side not in {"long", "short"}:
@@ -703,6 +789,10 @@ def _trade_profit_learning_labels(
     cost_basis_label = _trade_cost_basis_label(sample, fee=fee)
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     fee_dominated = bool(fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple)
+    notional = _trade_notional_usdt(sample)
+    return_after_cost_pct = (
+        None if notional is None or notional <= 0 else pnl / max(notional, 1e-9) * 100.0
+    )
     return {
         "version": PROFIT_LEARNING_VERSION,
         "sample_kind": "trade",
@@ -722,9 +812,11 @@ def _trade_profit_learning_labels(
         ),
         "cost_basis_label": cost_basis_label,
         "fee_dominated": fee_dominated,
+        "realized_net_pnl_usdt": pnl,
+        "return_after_cost_pct": return_after_cost_pct,
         "fee_estimate_usdt": fee,
         "funding_fee_usdt": funding_fee,
-        "notional_usdt": _trade_notional_usdt(sample),
+        "notional_usdt": notional,
         "strategy_context": _trade_strategy_context(sample),
     }
 
@@ -819,18 +911,45 @@ def trainable_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     counters: dict[str, Counter[str]] = {}
     supervision_ready = 0
+    trade_pnls: list[float] = []
+    trade_returns: list[float] = []
+    gross_profit = 0.0
+    gross_loss = 0.0
+    win_count = 0
+    loss_count = 0
+    flat_count = 0
     for sample in samples:
         labels = _safe_dict(sample.get("profit_learning_labels"))
         if not labels:
             continue
-        if bool(labels.get("training_supervision_ready")):
+        supervision_ready_for_sample = bool(labels.get("training_supervision_ready"))
+        if supervision_ready_for_sample:
             supervision_ready += 1
+            if _safe_str(labels.get("sample_kind")) == "trade":
+                pnl = _safe_float(labels.get("realized_net_pnl_usdt"), None)
+                if pnl is None:
+                    pnl = _safe_float(sample.get("realized_pnl"), None)
+                if pnl is not None:
+                    trade_pnls.append(pnl)
+                    if pnl > 0:
+                        gross_profit += pnl
+                        win_count += 1
+                    elif pnl < 0:
+                        gross_loss += abs(pnl)
+                        loss_count += 1
+                    else:
+                        flat_count += 1
+                return_pct = _safe_float(labels.get("return_after_cost_pct"), None)
+                if return_pct is not None:
+                    trade_returns.append(return_pct)
         for key, value in labels.items():
             if key in {
                 "version",
                 "sample_kind",
                 "training_supervision_ready",
                 "strategy_context",
+                "realized_net_pnl_usdt",
+                "return_after_cost_pct",
                 "fee_estimate_usdt",
                 "funding_fee_usdt",
                 "notional_usdt",
@@ -839,8 +958,39 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             if isinstance(value, str) and value:
                 counters.setdefault(key, Counter())[value] += 1
+    avg_win = gross_profit / max(win_count, 1)
+    avg_loss = gross_loss / max(loss_count, 1)
+    profit_factor = 999.0 if gross_loss <= 0 and gross_profit > 0 else gross_profit / max(gross_loss, 1e-9)
+    small_win_big_loss_ratio = avg_loss / max(avg_win, 1e-9) if win_count and loss_count else 0.0
+    quality_warnings: list[str] = []
+    if supervision_ready == 0:
+        quality_warnings.append("no_supervision_ready_trade_samples")
+    if trade_pnls and gross_profit <= gross_loss:
+        quality_warnings.append("gross_loss_not_covered_by_profit")
+    if win_count and loss_count and avg_loss > avg_win:
+        quality_warnings.append("avg_loss_larger_than_avg_win")
     return {
         "supervision_ready_count": supervision_ready,
+        "after_fee_quality": {
+            "trade_count": len(trade_pnls),
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "flat_count": flat_count,
+            "win_rate": round(win_count / max(len(trade_pnls), 1), 6),
+            "net_realized_pnl_usdt": round(sum(trade_pnls), 6),
+            "gross_profit_usdt": round(gross_profit, 6),
+            "gross_loss_usdt": round(gross_loss, 6),
+            "profit_factor": round(profit_factor, 6),
+            "avg_net_pnl_usdt": round(sum(trade_pnls) / max(len(trade_pnls), 1), 6),
+            "avg_win_usdt": round(avg_win, 6),
+            "avg_loss_usdt": round(avg_loss, 6),
+            "avg_return_after_cost_pct": round(
+                sum(trade_returns) / max(len(trade_returns), 1),
+                6,
+            ),
+            "small_win_big_loss_ratio": round(small_win_big_loss_ratio, 6),
+            "quality_warnings": quality_warnings,
+        },
         "label_counts": {
             key: [{"value": value, "count": count} for value, count in counter.most_common(20)]
             for key, counter in counters.items()

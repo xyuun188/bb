@@ -26,24 +26,23 @@ from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
+from services.model_promotion_policy import (
+    build_phase3_promotion_recommendation,
+    build_profit_first_promotion_report,
+    load_latest_paper_observation_report,
+)
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_OKX_ONLY,
 )
-from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.okx_training_gate import okx_training_refresh_gate
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trade_fact_trust import (
-    closed_position_trade_fact_trusted,
     closed_position_trade_fact_untrusted_reason,
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.model_promotion_policy import (
-    build_profit_first_promotion_report,
-    build_phase3_promotion_recommendation,
-    load_latest_paper_observation_report,
-)
 from services.training_data_quality import annotate_training_payload
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
@@ -191,6 +190,24 @@ def _trade_fact_metadata(position: Position | None) -> dict[str, Any]:
     return {
         "trade_fact_trusted": not bool(trust_reason),
         "trade_fact_trust_reason": trust_reason,
+    }
+
+
+def _position_settlement_metadata(position: Position) -> dict[str, Any]:
+    raw = _snapshot(getattr(position, "settlement_raw", None))
+    funding_fee = getattr(position, "funding_fee", None)
+    return {
+        "pnl_source": getattr(position, "settlement_source", None) or "",
+        "settlement_status": getattr(position, "settlement_status", None) or "",
+        "settlement_source": getattr(position, "settlement_source", None) or "",
+        "close_fill_pnl": _as_float(getattr(position, "close_fill_pnl", None), 0.0),
+        "entry_fee": _as_float(getattr(position, "entry_fee", None), 0.0),
+        "close_fee": _as_float(getattr(position, "close_fee", None), 0.0),
+        "funding_fee": _as_float(funding_fee, 0.0) if funding_fee is not None else None,
+        "fee_source": raw.get("fee_source") or raw.get("fee_source_detail") or "",
+        "funding_fee_source": raw.get("funding_fee_source") or "",
+        "official_realized_pnl": raw.get("official_realized_pnl"),
+        "settlement_formula": raw.get("formula") or "",
     }
 
 
@@ -577,11 +594,6 @@ async def _decision_raw_by_position_id(position_ids: set[int]) -> dict[int, dict
         )
         positions = list(position_result.scalars().all())
         symbols = {str(row.symbol or "").strip() for row in positions if str(row.symbol or "").strip()}
-        entry_order_ids = {
-            order_id
-            for row in positions
-            for order_id in _split_exchange_order_ids(getattr(row, "entry_exchange_order_id", None))
-        }
         orders: list[Order] = []
         if symbols:
             order_result = await session.execute(
@@ -725,6 +737,7 @@ async def _load_closed_position_samples(limit: int | None) -> list[dict[str, Any
                     if _as_float(row.realized_pnl) > 0
                     else "loss" if _as_float(row.realized_pnl) < 0 else "flat"
                 ),
+                **_position_settlement_metadata(row),
                 **trade_fact_metadata,
             }
         )

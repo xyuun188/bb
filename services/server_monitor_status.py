@@ -79,6 +79,40 @@ ONLINE_PHASE3_DEFAULT_AI_MODELS = (
         "model": "BB-FinQuant-Expert-14B",
     },
 )
+ONLINE_PHASE3_TUNNEL_CONTRACTS = (
+    {
+        "name": "qwen3-32b-trade",
+        "role": "decision_maker",
+        "capability": "create_strategy",
+        "local_port": 18_000,
+        "api_base": "http://127.0.0.1:18000/v1",
+        "model": "qwen3-32b-trade",
+    },
+    {
+        "name": "phase3-quant-api",
+        "role": "quant_tool",
+        "capability": "quant_tool",
+        "local_port": 18_001,
+        "api_base": ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
+        "model": "",
+    },
+    {
+        "name": "deepseek-r1-14b-risk",
+        "role": "risk_review",
+        "capability": "risk_review",
+        "local_port": 18_002,
+        "api_base": "http://127.0.0.1:18002/v1",
+        "model": "deepseek-r1-14b-risk",
+    },
+    {
+        "name": "BB-FinQuant-Expert-14B",
+        "role": "expert_pool",
+        "capability": "finquant_expert",
+        "local_port": 18_003,
+        "api_base": "http://127.0.0.1:18003/v1",
+        "model": "BB-FinQuant-Expert-14B",
+    },
+)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 InfoLoader = Callable[[Path], Any]
@@ -802,6 +836,113 @@ def _model_ids_from_models_response(payload: dict[str, Any] | None) -> list[str]
     return model_ids
 
 
+def _platform_model_tunnel_summary(
+    ai_rows: list[dict[str, Any]],
+    local_tools: dict[str, Any],
+) -> dict[str, Any]:
+    rows_by_model = {
+        str(row.get("model") or "").strip(): row
+        for row in ai_rows
+        if isinstance(row, dict) and str(row.get("model") or "").strip()
+    }
+    tunnels: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS:
+        model = str(spec.get("model") or "").strip()
+        if model:
+            probe = rows_by_model.get(model, {})
+            available = bool(probe.get("available"))
+            endpoint_ok = bool(probe.get("endpoint_ok"))
+            status = (
+                "ok"
+                if available
+                else "model_mismatch"
+                if endpoint_ok and not bool(probe.get("model_available"))
+                else str(probe.get("status_category") or "unavailable")
+            )
+            row = {
+                "name": spec["name"],
+                "role": spec["role"],
+                "capability": spec["capability"],
+                "local_port": spec["local_port"],
+                "expected_api_base": spec["api_base"],
+                "api_base": probe.get("api_base") or spec["api_base"],
+                "model": model,
+                "available": available,
+                "endpoint_ok": endpoint_ok,
+                "model_available": bool(probe.get("model_available")),
+                "status": status,
+                "status_code": probe.get("status_code"),
+                "latency_ms": probe.get("latency_ms"),
+                "error": str(probe.get("error") or ""),
+            }
+        else:
+            health = local_tools.get("health") if isinstance(local_tools.get("health"), dict) else {}
+            status_probe = (
+                local_tools.get("status") if isinstance(local_tools.get("status"), dict) else {}
+            )
+            tunnel_contract = (
+                local_tools.get("tunnel_contract")
+                if isinstance(local_tools.get("tunnel_contract"), dict)
+                else {}
+            )
+            available = bool(local_tools.get("available"))
+            endpoint_ok = bool(health.get("ok") or status_probe.get("ok"))
+            raw_status = str(
+                tunnel_contract.get("status")
+                or health.get("status_category")
+                or status_probe.get("status_category")
+                or "unavailable"
+            )
+            status = "ok" if available else ("unavailable" if raw_status == "ok" else raw_status)
+            row = {
+                "name": spec["name"],
+                "role": spec["role"],
+                "capability": spec["capability"],
+                "local_port": spec["local_port"],
+                "expected_api_base": spec["api_base"],
+                "api_base": local_tools.get("api_base") or spec["api_base"],
+                "model": "",
+                "available": available,
+                "endpoint_ok": endpoint_ok,
+                "model_available": bool(local_tools.get("model_bundle_available")),
+                "status": status,
+                "status_code": health.get("status_code") or status_probe.get("status_code"),
+                "latency_ms": health.get("latency_ms") or status_probe.get("latency_ms"),
+                "error": str(
+                    local_tools.get("config_issue")
+                    or health.get("error")
+                    or status_probe.get("error")
+                    or ""
+                ),
+            }
+        tunnels.append(row)
+        if not row["available"]:
+            unavailable.append(row)
+
+    by_name = {str(row.get("name") or ""): row for row in tunnels}
+    can_call_expert = bool(by_name.get("BB-FinQuant-Expert-14B", {}).get("available"))
+    can_call_quant_tool = bool(by_name.get("phase3-quant-api", {}).get("available"))
+    can_call_decision = bool(by_name.get("qwen3-32b-trade", {}).get("available"))
+    blocker_codes = [
+        f"tunnel_port_{int(row['local_port'])}_{str(row['status'] or 'unavailable')}"
+        for row in unavailable
+    ]
+    return {
+        "expected_ports": [int(spec["local_port"]) for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS],
+        "ready": not unavailable,
+        "available_count": len(tunnels) - len(unavailable),
+        "unavailable_count": len(unavailable),
+        "tunnels": tunnels,
+        "unavailable_ports": [int(row["local_port"]) for row in unavailable],
+        "blocker_codes": blocker_codes,
+        "can_call_decision_maker": can_call_decision,
+        "can_call_expert": can_call_expert,
+        "can_call_quant_tool": can_call_quant_tool,
+        "can_create_strategy": bool(can_call_decision and can_call_expert and can_call_quant_tool),
+    }
+
+
 def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict[str, Any]:
     """Build a UI-compatible model runtime view from platform endpoint probes."""
 
@@ -1247,7 +1388,12 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         "error": result.get("error", ""),
                     }
                 )
-    return {"ai_models": ai_rows, "local_ai_tools": local_tools}
+    return {
+        "ai_models": ai_rows,
+        "local_ai_tools": local_tools,
+        "model_tunnels": _platform_model_tunnel_summary(ai_rows, local_tools),
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
 
 
 async def get_server_monitor_status_async() -> dict[str, Any]:

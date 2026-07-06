@@ -1049,6 +1049,61 @@ def test_llm_candidate_status_exposes_sanitized_cached_candidates(tmp_path) -> N
     assert "探针" in status["cached_candidates"][0]["description"]
 
 
+def test_llm_candidate_status_marks_infrastructure_blocker(tmp_path) -> None:
+    state_store = StrategyLearningStateStore(tmp_path / "state.json")
+    service = StrategyLearningService(state_store=state_store)
+    strategy_feedback = service._compile_feedback(
+        mode="paper",
+        hours=168,
+        rows={
+            "closed_positions": [],
+            "open_positions": [],
+            "orders": [],
+            "decisions": [_decision("long", reason="expert_integrity fallback")],
+            "shadows": [],
+            "memories": [],
+            "strategy_events": [],
+            "reflections": [],
+        },
+        open_positions=[],
+        max_open_positions=14,
+    )
+    signature = service._feedback_signature(strategy_feedback)
+    state_store.save(
+        {
+            "llm_candidate_cache": {
+                "signature": signature,
+                "generated_at": "2026-06-13T00:00:00+00:00",
+                "candidates": [],
+                "last_error": "All connection attempts failed",
+                "last_error_kind": "http_error",
+                "attempts": [
+                    {
+                        "name": "decision_maker",
+                        "model": "qwen3-32b-trade",
+                        "api_base": "http://127.0.0.1:18000/v1",
+                        "status": "failed",
+                        "error_kind": "http_error",
+                    }
+                ],
+                "model": "",
+                "source": "none",
+            }
+        }
+    )
+
+    status = service._llm_candidate_status(strategy_feedback)
+
+    assert status["candidate_count"] == 0
+    assert status["strategy_creation_blocked"] is True
+    assert status["strategy_creation_blocker"]["code"] == (
+        "strategy_creation_infrastructure_unavailable"
+    )
+    assert status["strategy_creation_blocker"]["attempt_count"] == 1
+    assert status["strategy_creation_blocker"]["failed_attempt_count"] == 1
+    assert status["next_retry_after_seconds"] == 0
+
+
 def test_strategy_learning_compiles_events_and_full_score_metrics(tmp_path) -> None:
 
     state_store = StrategyLearningStateStore(tmp_path / "state.json")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from scripts.train_local_ai_tools_models import (
     _compact_local_ai_tools_features,
     _merge_trade_samples,
     _normalize_base_url,
+    _position_settlement_metadata,
     _post_training_payload,
 )
 
@@ -77,6 +79,37 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
     assert [item["position_id"] for item in merged] == [7, 8, 9]
     assert merged[0]["hold_minutes"] == 3.0
     assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
+
+
+def test_closed_position_training_sample_preserves_settlement_truth_sources() -> None:
+    position = SimpleNamespace(
+        settlement_source="okx_position_history_settlement",
+        settlement_status="reconciled",
+        close_fill_pnl=1.2,
+        entry_fee=0.1,
+        close_fee=0.2,
+        funding_fee=-0.03,
+        settlement_raw={
+            "fee_source": "okx_positions_history.fee",
+            "funding_fee_source": "okx_positions_history.fundingFee",
+            "official_realized_pnl": 0.87,
+            "formula": "realizedPnl = closeFillPnl - fee - fundingFee",
+        },
+    )
+
+    metadata = _position_settlement_metadata(position)
+
+    assert metadata["pnl_source"] == "okx_position_history_settlement"
+    assert metadata["settlement_status"] == "reconciled"
+    assert metadata["settlement_source"] == "okx_position_history_settlement"
+    assert metadata["close_fill_pnl"] == 1.2
+    assert metadata["entry_fee"] == 0.1
+    assert metadata["close_fee"] == 0.2
+    assert metadata["funding_fee"] == -0.03
+    assert metadata["fee_source"] == "okx_positions_history.fee"
+    assert metadata["funding_fee_source"] == "okx_positions_history.fundingFee"
+    assert metadata["official_realized_pnl"] == 0.87
+    assert metadata["settlement_formula"] == "realizedPnl = closeFillPnl - fee - fundingFee"
 
 
 @pytest.mark.asyncio

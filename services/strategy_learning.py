@@ -93,6 +93,10 @@ LLM_CANDIDATE_ERROR_HTTP = "http_error"
 LLM_CANDIDATE_ERROR_INVALID_JSON = "invalid_json"
 LLM_CANDIDATE_ERROR_EMPTY = "empty_candidates"
 LLM_CANDIDATE_ERROR_UNKNOWN = "unknown"
+LLM_CANDIDATE_INFRA_ERROR_KINDS = {
+    LLM_CANDIDATE_ERROR_TIMEOUT,
+    LLM_CANDIDATE_ERROR_HTTP,
+}
 AUTO_DISABLED_PROFILE_RECONSIDER_SECONDS = 6 * 60 * 60
 NON_ATTRIBUTABLE_EVENT_TYPES = {
     "manual_close",
@@ -5477,8 +5481,19 @@ class StrategyLearningService:
         signature = self._feedback_signature(feedback)
         cache_matches = entry.get("signature") == signature
         cached_candidates = self._public_cached_llm_candidates(candidates)
+        enabled = bool(getattr(settings, "strategy_learning_llm_candidates_enabled", True))
+        configs_available = bool(self._llm_candidate_configs())
+        retry_after_seconds = self._llm_candidate_retry_after_seconds(entry, has_candidates=bool(candidates))
+        creation_blocker = self._llm_candidate_creation_blocker(
+            feedback=feedback,
+            entry=entry,
+            has_candidates=bool(candidates),
+            enabled=enabled,
+            configs_available=configs_available,
+            retry_after_seconds=retry_after_seconds,
+        )
         return {
-            "enabled": bool(getattr(settings, "strategy_learning_llm_candidates_enabled", True)),
+            "enabled": enabled,
             "signature": signature,
             "cached_signature": entry.get("signature"),
             "cached_at": entry.get("generated_at"),
@@ -5491,8 +5506,96 @@ class StrategyLearningService:
             "last_model": entry.get("model", ""),
             "attempts": _safe_list(entry.get("attempts")),
             "source": entry.get("source", "llm_structured_candidate" if candidates else "none"),
+            "model_configs_available": configs_available,
+            "strategy_creation_blocked": bool(creation_blocker),
+            "strategy_creation_blocker": creation_blocker,
+            "next_retry_after_seconds": retry_after_seconds,
             "cached_candidates": cached_candidates,
         }
+
+    @staticmethod
+    def _llm_candidate_retry_after_seconds(
+        entry: dict[str, Any],
+        *,
+        has_candidates: bool,
+    ) -> int:
+        if has_candidates or not str(entry.get("last_error") or "").strip():
+            return 0
+        generated_at = _parse_iso_datetime(entry.get("generated_at"))
+        if generated_at is None:
+            return LLM_CANDIDATE_FAILURE_RETRY_SECONDS
+        age_seconds = max((datetime.now(UTC) - generated_at).total_seconds(), 0.0)
+        return max(LLM_CANDIDATE_FAILURE_RETRY_SECONDS - int(age_seconds), 0)
+
+    @staticmethod
+    def _llm_candidate_creation_blocker(
+        *,
+        feedback: StrategyFeedback,
+        entry: dict[str, Any],
+        has_candidates: bool,
+        enabled: bool,
+        configs_available: bool,
+        retry_after_seconds: int,
+    ) -> dict[str, Any]:
+        if has_candidates:
+            return {}
+        attempts = _safe_list(entry.get("attempts"))
+        error = str(entry.get("last_error") or "").strip()
+        error_kind = str(entry.get("last_error_kind") or "").strip()
+        problem_keys = [str(item.get("key") or "") for item in feedback.problems if item.get("key")]
+        failed_attempt_count = sum(
+            1
+            for item in attempts
+            if str(_safe_dict(item).get("status") or "").strip() == "failed"
+        )
+        base = {
+            "error_kind": error_kind,
+            "last_error": error[:260],
+            "attempt_count": len(attempts),
+            "failed_attempt_count": failed_attempt_count,
+            "problem_count": len(problem_keys),
+            "retry_after_seconds": retry_after_seconds,
+        }
+        if not enabled:
+            return {
+                **base,
+                "code": "llm_candidate_generation_disabled",
+                "message": "Strategy candidate generation is disabled by configuration.",
+            }
+        if error_kind in LLM_CANDIDATE_INFRA_ERROR_KINDS:
+            return {
+                **base,
+                "code": "strategy_creation_infrastructure_unavailable",
+                "message": (
+                    "Strategy creation is blocked by model tunnel or candidate model endpoint "
+                    "connectivity, not by a lack of profitable ideas."
+                ),
+            }
+        if not configs_available:
+            return {
+                **base,
+                "code": "llm_candidate_model_config_missing",
+                "message": "No enabled LLM candidate model configuration is available.",
+            }
+        if error_kind == LLM_CANDIDATE_ERROR_EMPTY:
+            return {
+                **base,
+                "code": "llm_returned_no_valid_bounded_candidates",
+                "message": "The LLM responded, but no bounded strategy candidate passed validation.",
+            }
+        if error:
+            return {
+                **base,
+                "code": "llm_candidate_generation_failed",
+                "message": "Strategy candidate generation failed before producing candidates.",
+            }
+        if problem_keys:
+            return {
+                **base,
+                "code": "llm_candidate_generation_not_attempted",
+                "message": "Strategy feedback has problems, but no LLM candidate attempt is recorded.",
+            }
+        return {}
 
     @staticmethod
     def _public_cached_llm_candidates(candidates: list[Any]) -> list[dict[str, Any]]:

@@ -43,6 +43,11 @@ def _trade_sample(**overrides):
         "quantity": 0.1,
         "realized_pnl": 1.0,
         "fee_estimate": 0.05,
+        "funding_fee": 0.0,
+        "funding_fee_source": "okx_positions_history.fundingFee",
+        "pnl_source": "okx_position_history_realized_pnl",
+        "settlement_source": "okx_position_history_settlement",
+        "settlement_status": "reconciled",
         "position_size_pct": 0.03,
         "hold_minutes": 35.0,
         "outcome": "profit",
@@ -149,6 +154,34 @@ def test_trade_historical_repair_and_untrusted_fact_are_excluded() -> None:
         "untrusted_trade_fact:missing_close_exchange_order_id"
         in untrusted.reasons
     )
+
+
+def test_closed_position_training_requires_authoritative_pnl_and_funding_sources() -> None:
+    local_pnl = assess_trade_sample(
+        _trade_sample(
+            pnl_source="position_realized_pnl",
+            settlement_source="",
+        )
+    )
+    missing_funding = assess_trade_sample(
+        _trade_sample(
+            funding_fee=None,
+            funding_fee_source="",
+        )
+    )
+    explicit_untrusted = assess_trade_sample(
+        _trade_sample(
+            trade_fact_trusted=False,
+            trade_fact_trust_reason="",
+        )
+    )
+
+    assert local_pnl.status == "excluded"
+    assert "untrusted_realized_pnl_source:position_realized_pnl" in local_pnl.reasons
+    assert missing_funding.status == "excluded"
+    assert "missing_or_untrusted_funding_fee_source" in missing_funding.reasons
+    assert explicit_untrusted.status == "excluded"
+    assert "untrusted_trade_fact" in explicit_untrusted.reasons
 
 
 def test_trade_unknown_losing_exit_attribution_is_excluded() -> None:
@@ -298,11 +331,30 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
     assert labels["trade_profit_class"] == "cost_drag_loss"
     assert labels["size_efficiency_label"] == "too_small_fee_drag"
-    assert labels["cost_basis_label"] == "fee_only"
+    assert labels["cost_basis_label"] == "fee_plus_funding"
+    assert labels["realized_net_pnl_usdt"] == -0.12
+    assert labels["return_after_cost_pct"] == -1.0
     assert labels["strategy_context"]["decision_lane"] == "tiny_probe"
     assert trade["losing_exit_attribution"] == "position_too_small_fee_drag"
     report = payload["quality_report"]["by_kind"]["trade"]["profit_learning"]
     assert report["supervision_ready_count"] == 1
+    assert report["after_fee_quality"] == {
+        "trade_count": 1,
+        "win_count": 0,
+        "loss_count": 1,
+        "flat_count": 0,
+        "win_rate": 0.0,
+        "net_realized_pnl_usdt": -0.12,
+        "gross_profit_usdt": 0.0,
+        "gross_loss_usdt": 0.12,
+        "profit_factor": 0.0,
+        "avg_net_pnl_usdt": -0.12,
+        "avg_win_usdt": 0.0,
+        "avg_loss_usdt": 0.12,
+        "avg_return_after_cost_pct": -1.0,
+        "small_win_big_loss_ratio": 0.0,
+        "quality_warnings": ["gross_loss_not_covered_by_profit"],
+    }
     assert report["label_counts"]["losing_exit_attribution"][0]["value"] == (
         "position_too_small_fee_drag"
     )

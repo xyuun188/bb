@@ -2098,6 +2098,24 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
         ) -> httpx.Response:
             requests.append((method, url))
             request = httpx.Request(method, url)
+            if url == "http://127.0.0.1:18000/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "qwen3-32b-trade"}]},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18002/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "deepseek-r1-14b-risk"}]},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18003/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "BB-FinQuant-Expert-14B"}]},
+                    request=request,
+                )
             if url == "http://127.0.0.1:18001/health":
                 return httpx.Response(
                     200,
@@ -2119,6 +2137,12 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
     assert tools["api_base"] == "http://127.0.0.1:18001"
     assert tools["configured_api_base"] == ""
     assert ("GET", "http://127.0.0.1:18001/health") in requests
+    tunnels = result["model_tunnels"]
+    assert tunnels["ready"] is True
+    assert tunnels["can_call_expert"] is True
+    assert tunnels["can_call_quant_tool"] is True
+    assert tunnels["can_create_strategy"] is True
+    assert tunnels["unavailable_ports"] == []
 
 
 async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_port(
@@ -2161,6 +2185,13 @@ async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_por
     assert tools["tunnel_contract"]["status"] == "wrong_loopback_port"
     assert tools["tunnel_contract"]["expected"] == "http://127.0.0.1:18001"
     assert "18001" in tools["config_issue"]
+    tunnels = result["model_tunnels"]
+    assert tunnels["can_call_quant_tool"] is False
+    assert tunnels["can_create_strategy"] is False
+    assert 18001 in tunnels["unavailable_ports"]
+    quant_tunnel = next(row for row in tunnels["tunnels"] if row["local_port"] == 18001)
+    assert quant_tunnel["available"] is False
+    assert quant_tunnel["status"] != "ok"
 
 
 async def test_symbols_available_error_response_is_redacted(
