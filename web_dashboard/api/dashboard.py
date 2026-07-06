@@ -2492,7 +2492,15 @@ async def _dashboard_closed_position_ledger_rows(
             if is_final_settlement_status(getattr(group, "settlement_status", None))
         ]
         refreshed_by_id = {group.group_id: group for group in refreshed_groups}
-        selected_groups = [refreshed_by_id.get(group.group_id, group) for group in selected_groups]
+        refreshed_by_key = {
+            _dashboard_ledger_group_refresh_key(group): group for group in refreshed_groups
+        }
+        selected_groups = [
+            refreshed_by_id.get(group.group_id)
+            or refreshed_by_key.get(_dashboard_ledger_group_refresh_key(group))
+            or group
+            for group in selected_groups
+        ]
     return (
         [group.as_dict(include_fills=True) for group in selected_groups],
         total,
@@ -2517,6 +2525,17 @@ def _closed_rows_for_selected_ledger_groups(
         for row in closed_rows
         if row.id is not None and int(row.id) in selected_ids
     ]
+
+
+def _dashboard_ledger_group_refresh_key(group: Any) -> tuple[Any, ...]:
+    return (
+        getattr(group, "symbol", ""),
+        getattr(group, "inst_id", ""),
+        getattr(group, "side", ""),
+        tuple(getattr(group, "position_ids", []) or []),
+        tuple(getattr(group, "entry_order_ids", []) or []),
+        tuple(getattr(group, "close_order_ids", []) or []),
+    )
 
 
 async def _dashboard_okx_position_history_rows(

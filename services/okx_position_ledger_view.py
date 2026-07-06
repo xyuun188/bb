@@ -9,7 +9,7 @@ explicitly so they cannot be mistaken for clean training facts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symbol_from_okx_inst_id
@@ -230,6 +230,8 @@ class _OfficialPositionHistoryComponents:
     entry_price: float
     close_price: float
     closed_quantity: float
+    opened_at: datetime | None = None
+    closed_at: datetime | None = None
     source: str = "okx_position_history_realized_pnl"
 
 
@@ -361,7 +363,14 @@ def _same_okx_position_id_lifecycle(position: Position, rows: list[Position]) ->
     position_pos_id = _position_pos_id(position)
     if not position_pos_id:
         return False
-    return any(_position_pos_id(row) == position_pos_id for row in rows)
+    if not any(_position_pos_id(row) == position_pos_id for row in rows):
+        return False
+    if _position_order_sets_overlap(position, rows):
+        return True
+    position_anchor = _position_lifecycle_anchor(position)
+    if position_anchor:
+        return _position_lifecycle_anchor_matches_group(position, rows)
+    return _position_time_window_matches_group(position, rows)
 
 
 def _position_order_sets_overlap(position: Position, rows: list[Position]) -> bool:
@@ -1050,11 +1059,16 @@ def _build_group_from_positions(
         positions=positions,
         linked_fills=linked_fills,
         entry_ids=entry_ids,
+        close_ids=close_ids,
         closed_quantity=closed_quantity,
     )
     if official_components is not None:
         realized_pnl = official_components.realized_pnl
         pnl_source = official_components.source
+        if official_components.opened_at is not None:
+            opened_at = official_components.opened_at
+        if official_components.closed_at is not None:
+            closed_at = official_components.closed_at
         if official_components.entry_price > 0:
             entry_price = official_components.entry_price
         if official_components.close_price > 0:
@@ -1222,6 +1236,7 @@ def _official_position_history_components_for_group(
     positions: list[Position],
     linked_fills: list[OkxLinkedFillRow],
     entry_ids: list[str],
+    close_ids: list[str],
     closed_quantity: float,
 ) -> _OfficialPositionHistoryComponents | None:
     if not position_history_rows or not inst_id:
@@ -1247,11 +1262,17 @@ def _official_position_history_components_for_group(
             row,
             ("closeTotalPos", "close_total_pos", "closedQuantity", "closed_quantity"),
         )
+        row_closed_quantity_base = _official_closed_quantity_in_base_units(
+            row_closed_quantity,
+            linked_fills=linked_fills,
+            close_ids=close_ids,
+            local_closed_quantity=closed_quantity,
+        )
         quantity_matches = bool(
-            row_closed_quantity is None
-            or row_closed_quantity <= 0
+            row_closed_quantity_base is None
+            or row_closed_quantity_base <= 0
             or closed_quantity <= 0
-            or _quantities_match(row_closed_quantity, closed_quantity, tolerance_ratio=0.02)
+            or _quantities_match(row_closed_quantity_base, closed_quantity, tolerance_ratio=0.02)
         )
         row_opened = _ms_timestamp_to_datetime(row.get("cTime") or row.get("createdTime"))
         row_updated = _ms_timestamp_to_datetime(row.get("uTime") or row.get("updatedTime"))
@@ -1299,6 +1320,13 @@ def _official_position_history_components_for_group(
     if entry_fee > total_fee_abs:
         entry_fee = 0.0
     close_fee = max(total_fee_abs - entry_fee, 0.0)
+    row_closed_quantity = _first_present_float(row, ("closeTotalPos", "closed_quantity"))
+    closed_quantity_base = _official_closed_quantity_in_base_units(
+        row_closed_quantity,
+        linked_fills=linked_fills,
+        close_ids=close_ids,
+        local_closed_quantity=closed_quantity,
+    ) or 0.0
     return _OfficialPositionHistoryComponents(
         close_fill_pnl=close_fill_pnl,
         entry_fee=entry_fee,
@@ -1307,8 +1335,52 @@ def _official_position_history_components_for_group(
         realized_pnl=realized_pnl,
         entry_price=_first_present_float(row, ("openAvgPx", "avgPx", "entry_price")) or 0.0,
         close_price=_first_present_float(row, ("closeAvgPx", "close_price")) or 0.0,
-        closed_quantity=_first_present_float(row, ("closeTotalPos", "closed_quantity")) or 0.0,
+        closed_quantity=closed_quantity_base,
+        opened_at=_ms_timestamp_to_datetime(row.get("cTime") or row.get("createdTime")),
+        closed_at=_ms_timestamp_to_datetime(row.get("uTime") or row.get("updatedTime")),
     )
+
+
+def _official_closed_quantity_in_base_units(
+    row_closed_quantity: float | None,
+    *,
+    linked_fills: list[OkxLinkedFillRow],
+    close_ids: list[str],
+    local_closed_quantity: float,
+) -> float | None:
+    if row_closed_quantity is None or row_closed_quantity <= 0:
+        return row_closed_quantity
+    close_rows = [row for row in linked_fills if row.order_id in close_ids]
+    close_units = _linked_fill_unit_sums(close_rows)
+    base_quantity = close_units.get("base_quantity", 0.0)
+    contract_quantity = close_units.get("contracts", 0.0)
+    if base_quantity > 0 and _quantities_match(
+        row_closed_quantity,
+        base_quantity,
+        tolerance_ratio=0.02,
+    ):
+        return base_quantity
+    if contract_quantity > 0 and _quantities_match(
+        row_closed_quantity,
+        contract_quantity,
+        tolerance_ratio=0.02,
+    ):
+        if base_quantity > 0:
+            return base_quantity
+        contract_size = _weighted_average(
+            (row.contracts, row.contract_size)
+            for row in close_rows
+            if row.contracts > 0 and row.contract_size > 0
+        )
+        if contract_size > 0:
+            return row_closed_quantity * contract_size
+    if local_closed_quantity > 0 and _quantities_match(
+        row_closed_quantity,
+        local_closed_quantity,
+        tolerance_ratio=0.02,
+    ):
+        return local_closed_quantity
+    return row_closed_quantity
 
 
 def _group_represents_partial_lifecycle(
@@ -1677,7 +1749,45 @@ def _metric_positions_for_group(positions: list[Position]) -> list[Position]:
         for position in positions
         if _is_okx_authoritative_position_history_row(position)
     ]
-    return authoritative_rows or positions
+    if not authoritative_rows:
+        return positions
+    all_close_ids = {
+        token
+        for position in positions
+        for token in _position_order_key(position, "close_exchange_order_id")
+    }
+    authoritative_close_ids = {
+        token
+        for position in authoritative_rows
+        for token in _position_order_key(position, "close_exchange_order_id")
+    }
+    if all_close_ids and authoritative_close_ids and not all_close_ids.issubset(
+        authoritative_close_ids
+    ):
+        return positions
+    latest_position_close = max(
+        (
+            value
+            for position in positions
+            if (value := _as_utc(getattr(position, "closed_at", None))) is not None
+        ),
+        default=None,
+    )
+    latest_authoritative_close = max(
+        (
+            value
+            for position in authoritative_rows
+            if (value := _as_utc(getattr(position, "closed_at", None))) is not None
+        ),
+        default=None,
+    )
+    if (
+        latest_position_close is not None
+        and latest_authoritative_close is not None
+        and latest_position_close > latest_authoritative_close + timedelta(seconds=60)
+    ):
+        return positions
+    return authoritative_rows
 
 
 def _strict_lifecycle_positions_for_group(positions: list[Position]) -> list[Position]:

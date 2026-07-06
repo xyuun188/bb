@@ -979,6 +979,461 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_keeps_reused_posid_lifecycles_and_partial_updates_visible(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-visible-partials.db').as_posix()}",
+    )
+    await init_db()
+
+    def ms(value: datetime) -> str:
+        return str(int(value.timestamp() * 1000))
+
+    jup_pos_id = "jup-pos"
+    jup_open = datetime(2026, 7, 4, 9, 57, 45, tzinfo=UTC)
+    jup_close_a = datetime(2026, 7, 4, 11, 52, 28, tzinfo=UTC)
+    jup_close_b = datetime(2026, 7, 4, 12, 8, 59, tzinfo=UTC)
+    jup_close_c = datetime(2026, 7, 5, 15, 15, 10, tzinfo=UTC)
+    jup_close_d = datetime(2026, 7, 5, 16, 25, 18, tzinfo=UTC)
+    icp_pos_id = "reused-icp-pos"
+    icp_old_open = datetime(2026, 7, 4, 11, 24, 30, tzinfo=UTC)
+    icp_old_close = datetime(2026, 7, 4, 15, 57, 51, tzinfo=UTC)
+    icp_new_open = datetime(2026, 7, 5, 1, 9, 32, tzinfo=UTC)
+    icp_close_a = datetime(2026, 7, 5, 12, 54, 34, tzinfo=UTC)
+    icp_close_b = datetime(2026, 7, 5, 13, 50, 39, tzinfo=UTC)
+    icp_close_c = datetime(2026, 7, 5, 16, 21, 38, tzinfo=UTC)
+    filler_open = datetime(2026, 7, 5, 0, 0, tzinfo=UTC)
+    filler_close = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "JUP-USDT-SWAP",
+                "posId": jup_pos_id,
+                "posSide": "net",
+                "openAvgPx": "0.2324363636363637",
+                "closeAvgPx": "0.2374444444444444",
+                "closeTotalPos": "9",
+                "realizedPnl": "0.423237822727263",
+                "fee": "-0.023469",
+                "fundingFee": "-0.00402045",
+                "pnl": "0.450727272727263",
+                "cTime": ms(jup_open),
+                "uTime": ms(jup_close_d),
+            },
+            {
+                "instId": "ICP-USDT-SWAP",
+                "posId": icp_pos_id,
+                "posSide": "net",
+                "openAvgPx": "2.2060082778193859",
+                "closeAvgPx": "2.2451956456042151",
+                "closeTotalPos": "7610.7",
+                "realizedPnl": "-3.1433918435999959",
+                "fee": "-0.1693838885",
+                "fundingFee": "0.0084250449",
+                "pnl": "-2.9824329999999959",
+                "cTime": ms(icp_old_open),
+                "uTime": ms(icp_old_close),
+            },
+            {
+                "instId": "ICP-USDT-SWAP",
+                "posId": icp_pos_id,
+                "posSide": "net",
+                "openAvgPx": "2.2201334723380596",
+                "closeAvgPx": "2.1942609725186766",
+                "closeTotalPos": "2998.4",
+                "realizedPnl": "0.7160030259843799",
+                "fee": "-0.072825461",
+                "fundingFee": "0.0130674524",
+                "pnl": "0.7757610345843799",
+                "cTime": ms(icp_new_open),
+                "uTime": ms(icp_close_c),
+            },
+        ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
+
+    async def add_order(
+        repo: TradeRepository,
+        *,
+        symbol: str,
+        inst_id: str,
+        order_id: str,
+        side: str,
+        quantity: float,
+        contracts: float,
+        contract_size: float,
+        price: float,
+        fee: float,
+        filled_at: datetime,
+        pnl: float = 0.0,
+    ) -> None:
+        await repo.create_order(
+            {
+                "model_name": "ensemble_trader",
+                "execution_mode": "paper",
+                "symbol": symbol,
+                "side": side,
+                "order_type": "market",
+                "quantity": quantity,
+                "price": price,
+                "status": "filled",
+                "fee": fee,
+                "exchange_order_id": order_id,
+                "filled_at": filled_at,
+                "created_at": filled_at,
+                "okx_inst_id": inst_id,
+                "okx_trade_ids": f"trade-{order_id}",
+                "okx_fill_contracts": contracts,
+                "okx_fill_pnl": pnl,
+                "okx_sync_status": OKX_SYNC_CONFIRMED,
+                "okx_raw_fills": {
+                    "order_id": order_id,
+                    "trade_ids": [f"trade-{order_id}"],
+                    "inst_id": inst_id,
+                    "contracts": contracts,
+                    "contract_size": contract_size,
+                    "base_quantity": quantity,
+                    "avg_price": price,
+                    "fee_abs": fee,
+                    "fill_pnl": pnl,
+                    "timestamp": filled_at.isoformat(),
+                    "fills_history_confirmed": True,
+                },
+            }
+        )
+
+    async def add_closed_position(
+        repo: TradeRepository,
+        *,
+        model_name: str,
+        symbol: str,
+        inst_id: str,
+        pos_id: str | None,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        close_price: float,
+        leverage: float,
+        entry_order: str,
+        close_order: str,
+        opened_at: datetime,
+        closed_at: datetime,
+        realized_pnl: float,
+    ) -> None:
+        await repo.open_position(
+            {
+                "model_name": model_name,
+                "execution_mode": "paper",
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "current_price": close_price,
+                "leverage": leverage,
+                "unrealized_pnl": 0.0,
+                "realized_pnl": realized_pnl,
+                "settlement_status": "reconciled",
+                "settlement_source": "okx_order_fact_sync",
+                "is_open": False,
+                "okx_inst_id": inst_id,
+                "okx_pos_id": pos_id,
+                "entry_exchange_order_id": entry_order,
+                "close_exchange_order_id": close_order,
+                "closed_at": closed_at,
+                "created_at": opened_at,
+            }
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            for order_id, qty, contracts, price, fee, ts, pnl in (
+                ("jup-entry", 110.0, 11.0, 0.23243636363636364, 0.012784, jup_open, 0.0),
+                (
+                    "jup-close-a",
+                    40.0,
+                    4.0,
+                    0.2359,
+                    0.004718,
+                    jup_close_a,
+                    0.138545454545452,
+                ),
+                (
+                    "jup-close-b",
+                    30.0,
+                    3.0,
+                    0.2367,
+                    0.0035505,
+                    jup_close_b,
+                    0.127909090909089,
+                ),
+                (
+                    "jup-close-c",
+                    10.0,
+                    1.0,
+                    0.2408,
+                    0.001204,
+                    jup_close_c,
+                    0.083636363636363,
+                ),
+                (
+                    "jup-close-d",
+                    10.0,
+                    1.0,
+                    0.2425,
+                    0.0012125,
+                    jup_close_d,
+                    0.100636363636363,
+                ),
+            ):
+                await add_order(
+                    repo,
+                    symbol="JUP/USDT",
+                    inst_id="JUP-USDT-SWAP",
+                    order_id=order_id,
+                    side="buy" if order_id == "jup-entry" else "sell",
+                    quantity=qty,
+                    contracts=contracts,
+                    contract_size=10.0,
+                    price=price,
+                    fee=fee,
+                    filled_at=ts,
+                    pnl=pnl,
+                )
+            for model_name, qty, close_order, closed_at, close_price, pnl in (
+                ("okx_authoritative_sync", 40.0, "jup-close-a", jup_close_a, 0.2359, 0.12),
+                ("okx_authoritative_sync", 30.0, "jup-close-b", jup_close_b, 0.2367, 0.12),
+                ("ensemble_trader", 10.0, "jup-close-c", jup_close_c, 0.2408, 0.08),
+                ("ensemble_trader", 10.0, "jup-close-d", jup_close_d, 0.2425, 0.09),
+            ):
+                await add_closed_position(
+                    repo,
+                    model_name=model_name,
+                    symbol="JUP/USDT",
+                    inst_id="JUP-USDT-SWAP",
+                    pos_id=jup_pos_id,
+                    side="long",
+                    quantity=qty,
+                    entry_price=0.23243636363636364,
+                    close_price=close_price,
+                    leverage=1.0,
+                    entry_order="jup-entry",
+                    close_order=close_order,
+                    opened_at=jup_open,
+                    closed_at=closed_at,
+                    realized_pnl=pnl,
+                )
+
+            for order_id, side, qty, contracts, price, fee, ts, pnl in (
+                (
+                    "icp-old-entry",
+                    "sell",
+                    76.107,
+                    7610.7,
+                    2.2060082778193855,
+                    0.083946336,
+                    icp_old_open,
+                    0.0,
+                ),
+                (
+                    "icp-old-close",
+                    "buy",
+                    75.433,
+                    7543.3,
+                    2.245,
+                    0.0846735425,
+                    icp_old_close,
+                    -2.9412625792502634,
+                ),
+                (
+                    "icp-new-entry",
+                    "sell",
+                    35.97,
+                    3597.0,
+                    2.22013347233806,
+                    0.0399291005,
+                    icp_new_open,
+                    0.0,
+                ),
+                (
+                    "icp-close-a",
+                    "buy",
+                    16.186,
+                    1618.6,
+                    2.1946103422710985,
+                    0.0177609815,
+                    icp_close_a,
+                    0.4131173832638329,
+                ),
+                (
+                    "icp-close-b",
+                    "buy",
+                    8.902,
+                    890.2,
+                    2.19596922039991,
+                    0.009774259,
+                    icp_close_b,
+                    0.2151101707534066,
+                ),
+                (
+                    "icp-close-c",
+                    "buy",
+                    4.896,
+                    489.6,
+                    2.19,
+                    0.00536112,
+                    icp_close_c,
+                    0.1475334805671398,
+                ),
+            ):
+                await add_order(
+                    repo,
+                    symbol="ICP/USDT",
+                    inst_id="ICP-USDT-SWAP",
+                    order_id=order_id,
+                    side=side,
+                    quantity=qty,
+                    contracts=contracts,
+                    contract_size=0.01,
+                    price=price,
+                    fee=fee,
+                    filled_at=ts,
+                    pnl=pnl,
+                )
+            await add_closed_position(
+                repo,
+                model_name="okx_authoritative_sync",
+                symbol="ICP/USDT",
+                inst_id="ICP-USDT-SWAP",
+                pos_id=icp_pos_id,
+                side="short",
+                quantity=0.674,
+                entry_price=2.2060082778193855,
+                close_price=2.2670919881305633,
+                leverage=2.0,
+                entry_order="icp-old-entry",
+                close_order="icp-old-close",
+                opened_at=icp_old_open,
+                closed_at=icp_old_close,
+                realized_pnl=-3.143391843599996,
+            )
+            for qty, close_order, closed_at, close_price, pnl in (
+                (16.186, "icp-close-a", icp_close_a, 2.1946103422710985, 0.37),
+                (8.902, "icp-close-b", icp_close_b, 2.19596922039991, 0.19),
+                (4.896, "icp-close-c", icp_close_c, 2.19, 0.13),
+            ):
+                await add_closed_position(
+                    repo,
+                    model_name="ensemble_trader",
+                    symbol="ICP/USDT",
+                    inst_id="ICP-USDT-SWAP",
+                    pos_id=icp_pos_id,
+                    side="short",
+                    quantity=qty,
+                    entry_price=2.22013347233806,
+                    close_price=close_price,
+                    leverage=1.0,
+                    entry_order="icp-new-entry",
+                    close_order=close_order,
+                    opened_at=icp_new_open,
+                    closed_at=closed_at,
+                    realized_pnl=pnl,
+                )
+
+            await add_order(
+                repo,
+                symbol="ZZZ/USDT",
+                inst_id="ZZZ-USDT-SWAP",
+                order_id="filler-entry",
+                side="buy",
+                quantity=1.0,
+                contracts=1.0,
+                contract_size=1.0,
+                price=1.0,
+                fee=0.0,
+                filled_at=filler_open,
+            )
+            await add_order(
+                repo,
+                symbol="ZZZ/USDT",
+                inst_id="ZZZ-USDT-SWAP",
+                order_id="filler-close",
+                side="sell",
+                quantity=1.0,
+                contracts=1.0,
+                contract_size=1.0,
+                price=1.1,
+                fee=0.0,
+                filled_at=filler_close,
+                pnl=0.1,
+            )
+            await add_closed_position(
+                repo,
+                model_name="ensemble_trader",
+                symbol="ZZZ/USDT",
+                inst_id="ZZZ-USDT-SWAP",
+                pos_id=None,
+                side="long",
+                quantity=1.0,
+                entry_price=1.0,
+                close_price=1.1,
+                leverage=1.0,
+                entry_order="filler-entry",
+                close_order="filler-close",
+                opened_at=filler_open,
+                closed_at=filler_close,
+                realized_pnl=0.1,
+            )
+
+        payload = await get_dashboard_positions(
+            mode="paper",
+            closed_only=True,
+            page=1,
+            page_size=2,
+        )
+    finally:
+        await close_db()
+
+    rows = payload["positions"]
+    assert [row["symbol"] for row in rows] == ["JUP/USDT", "ICP/USDT"]
+
+    jup_row = rows[0]
+    assert jup_row["quantity"] == pytest.approx(90.0)
+    assert jup_row["max_position_quantity"] == pytest.approx(110.0)
+    assert jup_row["realized_pnl"] == pytest.approx(0.423237822727263)
+    assert set(jup_row["close_order_ids"]) == {
+        "jup-close-a",
+        "jup-close-b",
+        "jup-close-c",
+        "jup-close-d",
+    }
+
+    icp_row = rows[1]
+    assert icp_row["quantity"] == pytest.approx(29.984)
+    assert icp_row["max_position_quantity"] == pytest.approx(35.97)
+    assert icp_row["realized_pnl"] == pytest.approx(0.7160030259843799)
+    assert icp_row["entry_order_ids"] == ["icp-new-entry"]
+    assert set(icp_row["close_order_ids"]) == {
+        "icp-close-a",
+        "icp-close-b",
+        "icp-close-c",
+    }
+    assert "icp-old-entry" not in icp_row["entry_order_ids"]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_adds_okx_funding_fee_from_account_bills(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
