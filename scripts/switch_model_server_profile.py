@@ -109,7 +109,14 @@ if not found:
     lines.append('MODEL_SERVER_ACTIVE_PROFILE=' + profile)
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text('\\n'.join(lines).rstrip() + '\\n', encoding='utf-8')
-path.chmod(0o600)
+try:
+    import grp
+    group_id = grp.getgrnam('bb').gr_gid
+    import os
+    os.chown(path, 0, group_id)
+    path.chmod(0o640)
+except Exception:
+    path.chmod(0o600)
 print('MODEL_SERVER_ACTIVE_PROFILE=' + profile)
 """
     return "python3 -c " + sh(textwrap.dedent(code))

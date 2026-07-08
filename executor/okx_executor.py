@@ -230,10 +230,64 @@ class OKXExecutor(AbstractExecutor):
         instruments = response.get("data", []) if isinstance(response, dict) else []
         filtered = supported_usdt_swap_instruments(instruments)
         markets = self._exchange.parse_markets(filtered)
+        self._apply_okx_instrument_contract_rules(markets, filtered)
         self._exchange.set_markets(markets)
         if not self._exchange.markets:
             raise ExchangeAPIError("No OKX USDT swap markets loaded")
         self._markets_loaded = True
+
+    def _apply_okx_instrument_contract_rules(
+        self,
+        markets: Any,
+        instruments: list[Any],
+    ) -> None:
+        """Preserve OKX raw contract rules after CCXT market parsing.
+
+        Some OKX swap instruments, notably BTC/ETH, have ``ctVal`` below 1.
+        If the parsed market loses that raw value, the executor can mistake
+        contracts for base quantity and poison order/position reconciliation.
+        """
+
+        raw_by_inst_id = {
+            str(item.get("instId") or "").strip().upper(): item
+            for item in instruments
+            if isinstance(item, dict) and str(item.get("instId") or "").strip()
+        }
+        if isinstance(markets, dict):
+            iterable = markets.values()
+        elif isinstance(markets, list):
+            iterable = markets
+        else:
+            return
+        for market in iterable:
+            if not isinstance(market, dict):
+                continue
+            info = market.get("info") if isinstance(market.get("info"), dict) else {}
+            inst_id = str(info.get("instId") or market.get("id") or "").strip().upper()
+            raw = raw_by_inst_id.get(inst_id)
+            if not raw:
+                continue
+            market["info"] = {**info, **raw}
+            contract_size = self._safe_float(raw.get("ctVal"), 0.0)
+            if contract_size > 0:
+                market["contractSize"] = contract_size
+                market["info"]["ctVal"] = raw.get("ctVal")
+            min_size = self._safe_float(raw.get("minSz"), 0.0)
+            lot_size = self._safe_float(raw.get("lotSz"), 0.0)
+            max_market_size = self._safe_float(raw.get("maxMktSz"), 0.0)
+            limits = dict(market.get("limits") or {})
+            amount_limits = dict(limits.get("amount") or {})
+            if min_size > 0:
+                amount_limits["min"] = min_size
+            if max_market_size > 0:
+                amount_limits["max"] = max_market_size
+            if amount_limits:
+                limits["amount"] = amount_limits
+                market["limits"] = limits
+            precision = dict(market.get("precision") or {})
+            if lot_size > 0:
+                precision["amount"] = lot_size
+                market["precision"] = precision
 
     async def _ensure_markets_loaded(self) -> None:
         """Load OKX swap contract rules before market/order/position operations."""
@@ -2430,11 +2484,20 @@ class OKXExecutor(AbstractExecutor):
         return status_map.get(str(status or "").lower(), OrderStatus.OPEN)
 
     def _contract_size(self, market: dict[str, Any]) -> float:
-        try:
-            value = float(market.get("contractSize") or 1.0)
-            return value if value > 0 else 1.0
-        except (TypeError, ValueError):
-            return 1.0
+        info_value = self._market_info_float(
+            market,
+            "ctVal",
+            "contractSize",
+            "contract_size",
+        )
+        market_value = self._safe_float(market.get("contractSize"), 0.0)
+        if info_value > 0 and (
+            market_value <= 0 or abs(info_value - market_value) > max(info_value, market_value) * 1e-12
+        ):
+            return info_value
+        if market_value > 0:
+            return market_value
+        return info_value if info_value > 0 else 1.0
 
     def _native_inst_id_for_market(self, market: dict[str, Any], okx_symbol: str) -> str:
         info = market.get("info") if isinstance(market.get("info"), dict) else {}

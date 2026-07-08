@@ -15,6 +15,9 @@ def _instrument(
     open_type: str = "fix_price",
     inst_category: str = "1",
     uly: str | None = None,
+    ct_val: str = "1",
+    min_sz: str = "0.01",
+    lot_sz: str = "0.01",
 ) -> dict[str, str]:
     base = inst_id.removesuffix("-USDT-SWAP")
     return {
@@ -23,8 +26,9 @@ def _instrument(
         "ctType": "linear",
         "settleCcy": "USDT",
         "instId": inst_id,
-        "ctVal": "1",
-        "minSz": "0.01",
+        "ctVal": ct_val,
+        "minSz": min_sz,
+        "lotSz": lot_sz,
         "tickSz": "0.0001",
         "openType": open_type,
         "instCategory": inst_category,
@@ -93,12 +97,20 @@ class _InstrumentFilteringCcxt:
         for row in rows:
             base = str(row["instId"]).removesuffix("-USDT-SWAP")
             symbol = f"{base}/USDT:USDT"
-            markets[symbol] = {"symbol": symbol, "id": row["instId"], "info": row}
+            markets[symbol] = {
+                "symbol": symbol,
+                "id": row["instId"],
+                "contractSize": 1.0,
+                "info": {"instId": row["instId"]},
+            }
         return markets
 
     def set_markets(self, markets: dict[str, dict]) -> None:
         self.markets = dict(markets)
         self.markets_by_id = {market["id"]: market for market in markets.values()}
+
+    def amount_to_precision(self, _symbol: str, amount: float) -> str:
+        return str(amount)
 
 
 @pytest.mark.asyncio
@@ -112,3 +124,43 @@ async def test_okx_executor_market_loader_filters_unsupported_pre_quote_contract
 
     assert "BTC/USDT:USDT" in fake_ccxt.markets
     assert "PLTR/USDT:USDT" not in fake_ccxt.markets
+
+
+@pytest.mark.asyncio
+async def test_okx_executor_market_loader_preserves_subunit_contract_size() -> None:
+    class _SmallContractCcxt(_InstrumentFilteringCcxt):
+        async def publicGetPublicInstruments(self, _params: dict) -> dict:
+            return {
+                "data": [
+                    _instrument(
+                        "BTC-USDT-SWAP",
+                        ct_val="0.01",
+                        min_sz="0.01",
+                        lot_sz="0.01",
+                    )
+                ]
+            }
+
+    fake_ccxt = _SmallContractCcxt()
+    executor = OKXExecutor(mode="paper")
+    executor._connected = True
+    executor._exchange = fake_ccxt
+
+    await executor._load_usdt_swap_markets()
+
+    market = fake_ccxt.markets["BTC/USDT:USDT"]
+    assert market["contractSize"] == pytest.approx(0.01)
+    assert market["info"]["ctVal"] == "0.01"
+    assert executor._contract_size(market) == pytest.approx(0.01)
+
+    contracts, base_quantity = executor._entry_order_amount(
+        fake_ccxt,
+        market,
+        position_value=43.4,
+        price=62000.0,
+        balance=100.0,
+        leverage=1.0,
+    )
+
+    assert contracts == pytest.approx(0.07)
+    assert base_quantity == pytest.approx(0.0007)

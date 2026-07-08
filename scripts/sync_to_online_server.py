@@ -375,7 +375,13 @@ if backup_runtime_env and runtime_path.exists():
     Path(backup_path).write_text(current_runtime_text, encoding='utf-8')
     os.chmod(backup_path, 0o600)
 runtime_path.write_text(''.join(f'{{key}}={{value}}\\n' for key, value in values.items()), encoding='utf-8')
-os.chmod(runtime_path, 0o600)
+try:
+    import grp
+    group_id = grp.getgrnam('bb').gr_gid
+    os.chown(runtime_path, 0, group_id)
+    os.chmod(runtime_path, 0o640)
+except Exception:
+    os.chmod(runtime_path, 0o600)
 app_env_cleanup = scrub_app_env_ai_routes(app_env_path, app_env_ai_route_keys)
 if emit_summary:
     print(json.dumps({{

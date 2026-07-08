@@ -112,6 +112,75 @@ async def test_contract_count_converts_to_base_quantity_without_false_issue(
 
 
 @pytest.mark.asyncio
+async def test_position_linked_orders_are_loaded_even_when_fills_are_older_than_lookback(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        old_fill_time = datetime.now(UTC) - timedelta(hours=72)
+        recent_close_time = datetime.now(UTC) - timedelta(minutes=20)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="BTC/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=0.0003,
+                        price=62456.79,
+                        status="filled",
+                        exchange_order_id="old-entry-order",
+                        filled_at=old_fill_time,
+                        created_at=old_fill_time,
+                    ),
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="BTC/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=0.0001,
+                        price=62731.0,
+                        status="filled",
+                        exchange_order_id="old-close-order",
+                        filled_at=old_fill_time + timedelta(minutes=15),
+                        created_at=old_fill_time + timedelta(minutes=15),
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="BTC/USDT",
+                        side="long",
+                        quantity=0.0003,
+                        entry_price=62456.79,
+                        current_price=62731.0,
+                        leverage=1.0,
+                        unrealized_pnl=0.0,
+                        realized_pnl=0.09,
+                        is_open=False,
+                        okx_inst_id="BTC-USDT-SWAP",
+                        okx_pos_id="btc-pos",
+                        entry_exchange_order_id="old-entry-order",
+                        close_exchange_order_id="old-close-order",
+                        created_at=old_fill_time,
+                        closed_at=recent_close_time,
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["checked_orders"] == 0
+        assert report["checked_positions"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_order_okx_raw_fills_win_over_stale_decision_execution_price(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

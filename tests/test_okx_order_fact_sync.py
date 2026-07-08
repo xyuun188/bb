@@ -267,6 +267,7 @@ class _FillCcxt:
                 {"instId": "SPK-USDT-SWAP", "ctVal": "1"},
                 {"instId": "HOME-USDT-SWAP", "ctVal": "1"},
                 {"instId": "BTC-USDT-SWAP", "ctVal": "0.01"},
+                {"instId": "XPL-USDT-SWAP", "ctVal": "10"},
             ]
         }
 
@@ -556,6 +557,115 @@ def test_position_history_payload_preserves_existing_order_links() -> None:
     assert position.entry_exchange_order_id == "entry-repaired"
     assert position.close_exchange_order_id == "close-repaired"
     assert position.updated_at == now
+
+
+def test_position_history_payload_merges_existing_and_authoritative_order_links() -> None:
+    position = Position(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        quantity=1000000.0,
+        entry_price=0.0000026,
+        current_price=0.0000027,
+        leverage=1.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.12,
+        is_open=False,
+        okx_inst_id="PEPE-USDT-SWAP",
+        okx_pos_id="pepe-pos",
+        entry_exchange_order_id="entry-a",
+        close_exchange_order_id="partial-close-a,partial-close-b",
+        closed_at=datetime(2026, 7, 4, 15, 13, tzinfo=UTC),
+        created_at=datetime(2026, 7, 3, 19, 19, tzinfo=UTC),
+    )
+    now = datetime(2026, 7, 8, 20, 22, tzinfo=UTC)
+
+    _apply_position_history_payload(
+        position,
+        {
+            "model_name": "okx_authoritative_sync",
+            "execution_mode": "paper",
+            "symbol": "PEPE/USDT",
+            "side": "long",
+            "quantity": 999999.9,
+            "entry_price": 0.000002599,
+            "current_price": 0.000002735,
+            "leverage": 1.0,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.1333329865,
+            "closed_at": datetime(2026, 7, 4, 15, 13, tzinfo=UTC),
+            "created_at": datetime(2026, 7, 3, 19, 19, tzinfo=UTC),
+            "okx_inst_id": "PEPE-USDT-SWAP",
+            "okx_pos_id": "pepe-pos",
+            "entry_exchange_order_id": "entry-a",
+            "close_exchange_order_id": "final-close",
+        },
+        now=now,
+    )
+
+    assert position.entry_exchange_order_id == "entry-a"
+    assert position.close_exchange_order_id == "partial-close-a,partial-close-b,final-close"
+    assert position.updated_at == now
+
+
+def test_position_history_payload_keeps_long_close_order_link_chains() -> None:
+    position = Position(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        quantity=1000000.0,
+        entry_price=0.0000026,
+        current_price=0.0000027,
+        leverage=1.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.12,
+        is_open=False,
+        okx_inst_id="PEPE-USDT-SWAP",
+        okx_pos_id="pepe-pos",
+        entry_exchange_order_id="entry-a",
+        close_exchange_order_id=(
+            "3712904697435881472,3712930282153410560,"
+            "3713658183647723520,3713658183647723521"
+        ),
+        closed_at=datetime(2026, 7, 4, 15, 13, tzinfo=UTC),
+        created_at=datetime(2026, 7, 3, 19, 19, tzinfo=UTC),
+    )
+    now = datetime(2026, 7, 8, 20, 22, tzinfo=UTC)
+
+    _apply_position_history_payload(
+        position,
+        {
+            "model_name": "okx_authoritative_sync",
+            "execution_mode": "paper",
+            "symbol": "PEPE/USDT",
+            "side": "long",
+            "quantity": 999999.9,
+            "entry_price": 0.000002599,
+            "current_price": 0.000002735,
+            "leverage": 1.0,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.1333329865,
+            "closed_at": datetime(2026, 7, 4, 15, 13, tzinfo=UTC),
+            "created_at": datetime(2026, 7, 3, 19, 19, tzinfo=UTC),
+            "okx_inst_id": "PEPE-USDT-SWAP",
+            "okx_pos_id": "pepe-pos",
+            "entry_exchange_order_id": "entry-a",
+            "close_exchange_order_id": "3713658183647723522,3713658183647723523",
+        },
+        now=now,
+    )
+
+    close_ids = set(position.close_exchange_order_id.split(","))
+    assert close_ids == {
+        "3712904697435881472",
+        "3712930282153410560",
+        "3713658183647723520",
+        "3713658183647723521",
+        "3713658183647723522",
+        "3713658183647723523",
+    }
 
 
 class _CurrentPositionOnlyCcxt:
@@ -1175,6 +1285,169 @@ def test_order_fact_sync_effective_since_is_phase3_start_not_rolling_lookback() 
 
 def test_order_fact_sync_db_since_uses_phase3_beijing_midnight_as_utc_instant() -> None:
     assert _db_naive_since(PHASE3_DEFAULT_ORDER_SYNC_START) == datetime(2026, 6, 27, 16, 0)
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_confirmed_order_contract_size_from_instruments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-contract-size-repair.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=3.0,
+                    price=60000.0,
+                    status="filled",
+                    fee=0.12,
+                    exchange_order_id="stale-btc-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="BTC-USDT-SWAP",
+                    okx_trade_ids="btc-trade",
+                    okx_fill_contracts=3.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        "fills_history_confirmed": True,
+                        "order_id": "stale-btc-order",
+                        "trade_ids": ["btc-trade"],
+                        "inst_id": "BTC-USDT-SWAP",
+                        "contracts": 3.0,
+                        "contract_size": 1.0,
+                        "base_quantity": 3.0,
+                        "avg_price": 60000.0,
+                        "fee_abs": 0.12,
+                        "fill_pnl": 0.0,
+                        "timestamp": phase3_time.isoformat(),
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_Executor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "stale-btc-order"
+                    )
+                )
+            ).one()._mapping
+
+        raw = row["okx_raw_fills"]
+        assert report["okx_pull_available"] is True
+        assert row["quantity"] == pytest.approx(0.03)
+        assert row["okx_fill_contracts"] == pytest.approx(3.0)
+        assert raw["contract_size"] == pytest.approx(0.01)
+        assert raw["base_quantity"] == pytest.approx(0.03)
+        assert raw["contract_size_verified"] is True
+        assert raw["contract_size_source"] == "okx_public_instruments"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_repairs_execution_result_contract_size_from_instruments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-execution-result-contract-size.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=12)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="XPL/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=146.0,
+                    price=0.0921,
+                    status="filled",
+                    fee=0.067233,
+                    exchange_order_id="stale-xpl-execution-result",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="XPL-USDT-SWAP",
+                    okx_fill_contracts=146.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    okx_raw_fills={
+                        "source": "okx_execution_result",
+                        "fills_history_confirmed": False,
+                        "execution_result_confirmed": True,
+                        "order_id": "stale-xpl-execution-result",
+                        "trade_ids": [],
+                        "inst_id": "XPL-USDT-SWAP",
+                        "contracts": 146.0,
+                        "base_quantity": 146.0,
+                        "avg_price": 0.0921,
+                        "fee_abs": 0.067233,
+                        "fill_pnl": 0.0,
+                        "timestamp": phase3_time.isoformat(),
+                        "rows": [],
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_Executor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "stale-xpl-execution-result"
+                    )
+                )
+            ).one()._mapping
+
+        raw = row["okx_raw_fills"]
+        assert report["okx_pull_available"] is True
+        assert row["quantity"] == pytest.approx(1460.0)
+        assert row["okx_fill_contracts"] == pytest.approx(146.0)
+        assert raw["contract_size"] == pytest.approx(10.0)
+        assert raw["base_quantity"] == pytest.approx(1460.0)
+        assert raw["contract_size_verified"] is True
+        assert raw["contract_size_source"] == "okx_public_instruments"
+        assert raw["execution_result_confirmed"] is True
+        assert raw["fills_history_confirmed"] is False
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio
@@ -3335,13 +3608,81 @@ async def test_order_fact_sync_links_reduce_only_partial_close_to_open_position(
             ).one()._mapping
 
         assert report["okx_pull_available"] is True
-        assert report["current_position_updated_count"] == 2
+        assert report["current_position_updated_count"] == 1
         assert position["is_open"] is True
         assert position["quantity"] == pytest.approx(1000000.0)
         assert position["close_exchange_order_id"] == "3712882834810830848"
         assert position["realized_pnl"] == pytest.approx(0.382908)
         assert close_order["okx_sync_status"] == OKX_SYNC_OKX_ONLY
         assert close_order["okx_raw_fills"].get("order_rows", []) == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_links_unlinked_partial_close_to_closed_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-partial-close-closed-lifecycle.db').as_posix()}",
+    )
+    await init_db()
+    position_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=2)
+    ).astimezone(UTC).replace(tzinfo=None)
+    closed_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(hours=5)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="okx_authoritative_sync",
+                    execution_mode="paper",
+                    symbol="PEPE/USDT",
+                    side="long",
+                    quantity=1000000.0,
+                    entry_price=0.000002599,
+                    current_price=0.000002735,
+                    leverage=1.0,
+                    unrealized_pnl=0.0,
+                    realized_pnl=1.80904525,
+                    is_open=False,
+                    created_at=position_time,
+                    closed_at=closed_time,
+                    okx_inst_id="PEPE-USDT-SWAP",
+                    okx_pos_id="pepe-position",
+                    entry_exchange_order_id="3711253572185980928",
+                    close_exchange_order_id="3713658183647723520",
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_PartialCloseCurrentPositionExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            position = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "pepe-position",
+                        Position.__table__.c.is_open.is_(False),
+                    )
+                )
+            ).one()._mapping
+
+        assert report["okx_pull_available"] is True
+        assert position["realized_pnl"] == pytest.approx(1.80904525)
+        assert set(position["close_exchange_order_id"].split(",")) == {
+            "3712882834810830848",
+            "3713658183647723520",
+        }
     finally:
         await close_db()
 

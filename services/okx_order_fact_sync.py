@@ -61,6 +61,8 @@ DEFAULT_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 12
 DEFAULT_MAX_ORDER_GAP_QUERIES = 20
+CORE_OKX_STAGE_TIMEOUT_SECONDS = 6.0
+TARGET_ORDER_PULL_TIMEOUT_SECONDS = 12.0
 CURRENT_POSITION_ENTRY_LINK_WINDOW_SECONDS = 10 * 60
 CURRENT_POSITION_ENTRY_PRICE_TOLERANCE_RATIO = 0.002
 CURRENT_POSITION_ENTRY_QUANTITY_TOLERANCE_RATIO = 0.02
@@ -287,13 +289,13 @@ class OkxOrderFactSyncService:
         try:
             await _bounded(
                 executor.initialize(),
-                min(self.timeout_seconds, 2.0),
+                max(3.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
             )
             native_facts = OkxNativeFactsClient(executor)
             try:
                 exchange_positions = await _bounded(
                     native_facts.fetch_positions(),
-                    min(self.timeout_seconds, 2.0),
+                    max(3.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                 )
             except Exception as exc:
                 record_optional_stage_error("positions", exc)
@@ -306,18 +308,22 @@ class OkxOrderFactSyncService:
             )
             target_fills: list[OkxNativeFillGroup] = []
             if priority_target_order_ids:
-                target_fills = await _bounded(
-                    native_facts.fetch_fill_groups(
-                        order_ids=priority_target_order_ids,
-                        since=since,
-                        limit=100,
-                        max_pages=1,
-                        target_orders_only=True,
-                        target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
-                        strict=True,
-                    ),
-                    self.timeout_seconds,
-                )
+                try:
+                    target_fills = await _bounded(
+                        native_facts.fetch_fill_groups(
+                            order_ids=priority_target_order_ids,
+                            since=since,
+                            limit=100,
+                            max_pages=1,
+                            target_orders_only=True,
+                            target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+                            strict=True,
+                        ),
+                        max(self.timeout_seconds, TARGET_ORDER_PULL_TIMEOUT_SECONDS),
+                    )
+                except Exception as exc:
+                    record_optional_stage_error("fills_history_targeted", exc)
+                    target_fills = []
             fills = list(target_fills)
             try:
                 account_wide_fills = await _bounded(
@@ -330,14 +336,11 @@ class OkxOrderFactSyncService:
                         account_wide_fallback=False,
                         strict=True,
                     ),
-                    max(0.5, min(self.timeout_seconds * 0.5, 3.0)),
+                    max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                 )
                 fills = _dedupe_fills_by_order_id([*fills, *account_wide_fills])
             except Exception as exc:
-                if target_fills or not external_refresh_orders:
-                    record_optional_stage_error("fills_history_account_context", exc)
-                else:
-                    raise
+                record_optional_stage_error("fills_history_account_context", exc)
             account_order_rows: list[dict[str, Any]] = []
             try:
                 account_order_rows = await _bounded(
@@ -352,7 +355,7 @@ class OkxOrderFactSyncService:
                         ),
                         strict=True,
                     ),
-                    min(self.timeout_seconds, 3.0),
+                    max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                 )
             except Exception as exc:
                 record_optional_stage_error("orders_history_by_inst", exc)
@@ -368,7 +371,7 @@ class OkxOrderFactSyncService:
                                     max_pages=1,
                                     strict=True,
                                 ),
-                                min(self.timeout_seconds, 2.0),
+                                max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                             ),
                         ]
                     )
@@ -391,7 +394,7 @@ class OkxOrderFactSyncService:
                             max_pages=1,
                             strict=True,
                         ),
-                        min(self.timeout_seconds, 2.0),
+                        max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                     )
                 except Exception as exc:
                     record_optional_stage_error("orders_history_targeted", exc)
@@ -407,7 +410,7 @@ class OkxOrderFactSyncService:
                             | position_target_inst_ids
                         ),
                     ),
-                    min(self.timeout_seconds, 2.0),
+                    max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                 )
             except Exception as exc:
                 record_optional_stage_error("contract_sizes", exc)
@@ -578,6 +581,18 @@ class OkxOrderFactSyncService:
                     since=since,
                     now=datetime.now(UTC),
                     samples=samples,
+                )
+                unlinked_close_result = await self._sync_unlinked_close_fills_to_position_lifecycles(
+                    session,
+                    fills=fills,
+                    contract_sizes=contract_sizes,
+                    since=since,
+                    now=datetime.now(UTC),
+                    samples=samples,
+                )
+                current_position_result = _combine_position_fact_summaries(
+                    current_position_result,
+                    unlinked_close_result,
                 )
             else:
                 confirmed_count = self._recover_local_stored_order_facts(
@@ -837,6 +852,11 @@ class OkxOrderFactSyncService:
                     sync_status == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
                     and _order_has_okx_execution_result_fact(order)
                 ):
+                    _repair_execution_result_contract_size_from_instruments(
+                        order,
+                        contract_sizes=contract_sizes,
+                        now=now,
+                    )
                     _apply_execution_result_confirmation_to_order(order, now=now)
                     samples.append(
                         _sample(order, kind="local_order_execution_result_already_confirmed")
@@ -844,6 +864,11 @@ class OkxOrderFactSyncService:
                     continue
                 decision = (decisions_by_id or {}).get(int(getattr(order, "decision_id", 0) or 0))
                 if _recover_okx_execution_result_fact_from_decision(order, decision):
+                    _repair_execution_result_contract_size_from_instruments(
+                        order,
+                        contract_sizes=contract_sizes,
+                        now=now,
+                    )
                     _apply_execution_result_confirmation_to_order(order, now=now)
                     confirmed_count += 1
                     samples.append(_sample(order, kind="local_order_execution_result_recovered"))
@@ -853,7 +878,18 @@ class OkxOrderFactSyncService:
                     confirmed_count += 1
                     samples.append(_sample(order, kind="local_order_close_fill_recovered"))
                     continue
+                if _repair_stored_fill_contract_size_from_instruments(
+                    order,
+                    contract_sizes=contract_sizes,
+                    now=now,
+                ):
+                    confirmed_count += 1
+                    samples.append(_sample(order, kind="local_order_contract_size_repaired"))
+                    continue
                 if _order_has_authoritative_stored_okx_fill_fact(order):
+                    if _order_has_confirmed_okx_fill_fact(order):
+                        samples.append(_sample(order, kind="local_order_stored_fill_waiting_contract_size"))
+                        continue
                     _apply_close_fill_confirmation_to_order(order, now=now)
                     confirmed_count += 1
                     samples.append(_sample(order, kind="local_order_stored_fill_repaired"))
@@ -1599,22 +1635,33 @@ class OkxOrderFactSyncService:
             samples=tuple(samples[-8:]),
         )
 
-    async def _sync_partial_close_fills_to_open_positions(
+    async def _sync_unlinked_close_fills_to_position_lifecycles(
         self,
         session: Any,
         *,
         fills: list[OkxNativeFillGroup],
         contract_sizes: dict[str, float],
+        since: datetime,
         now: datetime,
         samples: list[dict[str, Any]],
     ) -> OkxPositionFactSyncSummary:
+        since_naive = _db_naive_since(since)
         position_rows = await session.execute(
             select(Position)
             .where(
                 Position.execution_mode == self.mode,
-                Position.is_open.is_(True),
+                or_(
+                    Position.is_open.is_(True),
+                    Position.created_at >= since_naive,
+                    Position.closed_at >= since_naive,
+                ),
             )
-            .order_by(Position.created_at.desc().nullslast(), Position.id.desc())
+            .order_by(
+                Position.closed_at.desc().nullslast(),
+                Position.created_at.desc().nullslast(),
+                Position.id.desc(),
+            )
+            .limit(self.limit * 4)
         )
         positions = list(position_rows.scalars().all())
         if not positions:
@@ -1691,24 +1738,19 @@ class OkxOrderFactSyncService:
                 for position in positions
                 if _position_inst_id(position) == order_inst_id
                 and _close_side_for_position_side(str(getattr(position, "side", "") or "").lower()) == order_side
-                and (
-                    _db_datetime_to_utc(getattr(position, "created_at", None))
-                    or datetime.min.replace(tzinfo=UTC)
-                )
-                <= order_time
+                and _position_lifecycle_contains_order_time(position, order_time)
             ]
             if not candidates:
                 skipped += 1
                 continue
-            position = sorted(
+            position = _best_position_lifecycle_for_close_order(
                 candidates,
-                key=lambda item: (
-                    _db_datetime_to_utc(getattr(item, "created_at", None))
-                    or datetime.min.replace(tzinfo=UTC),
-                    int(getattr(item, "id", 0) or 0),
-                ),
-                reverse=True,
-            )[0]
+                order_time=order_time,
+                fill_quantity=abs(_safe_float(getattr(order, "quantity", None), 0.0)),
+            )
+            if position is None:
+                skipped += 1
+                continue
             contract_size = _contract_size_for_inst_id(order_inst_id, contract_sizes)
             if fill is not None:
                 contract_size = _contract_size_for_fill(fill, contract_sizes)
@@ -1719,19 +1761,29 @@ class OkxOrderFactSyncService:
             if fill_quantity <= 0 or current_quantity <= 0:
                 skipped += 1
                 continue
-            position.close_exchange_order_id = _merge_exchange_order_ids(
+            merged_close_ids = _merge_exchange_order_ids(
                 getattr(position, "close_exchange_order_id", None),
                 order_id,
-            ) or None
-            position.realized_pnl = _safe_float(getattr(position, "realized_pnl", None), 0.0) + (
-                fill_pnl - fill_fee
+                max_length=500,
             )
+            if order_id not in _split_exchange_order_ids(merged_close_ids):
+                skipped += 1
+                continue
+            position.close_exchange_order_id = merged_close_ids or None
+            if bool(getattr(position, "is_open", False)):
+                position.realized_pnl = _safe_float(getattr(position, "realized_pnl", None), 0.0) + (
+                    fill_pnl - fill_fee
+                )
             position.updated_at = now
             linked_order_ids.add(order_id)
             updated += 1
             samples.append(
                 {
-                    "kind": "okx_partial_close_linked_to_open_position",
+                    "kind": (
+                        "okx_partial_close_linked_to_open_position"
+                        if bool(getattr(position, "is_open", False))
+                        else "okx_partial_close_linked_to_position_lifecycle"
+                    ),
                     "local_position_id": getattr(position, "id", None),
                     "symbol": getattr(position, "symbol", None),
                     "side": getattr(position, "side", None),
@@ -1746,6 +1798,24 @@ class OkxOrderFactSyncService:
             updated_count=updated,
             skipped_count=skipped,
             samples=tuple(samples[-8:]),
+        )
+
+    async def _sync_partial_close_fills_to_open_positions(
+        self,
+        session: Any,
+        *,
+        fills: list[OkxNativeFillGroup],
+        contract_sizes: dict[str, float],
+        now: datetime,
+        samples: list[dict[str, Any]],
+    ) -> OkxPositionFactSyncSummary:
+        return await self._sync_unlinked_close_fills_to_position_lifecycles(
+            session,
+            fills=fills,
+            contract_sizes=contract_sizes,
+            since=self.phase3_order_sync_start,
+            now=now,
+            samples=samples,
         )
 
     async def _close_open_positions_from_linked_close_orders(
@@ -2111,6 +2181,10 @@ class OkxOrderFactSyncService:
             "pos_side": fill.pos_side,
             "contracts": fill.contracts,
             "contract_size": contract_size or None,
+            "contract_size_verified": contract_size > 0,
+            "contract_size_source": (
+                "okx_public_instruments_or_fill_row" if contract_size > 0 else "missing"
+            ),
             "base_quantity": _fill_base_quantity(fill, contract_size),
             "avg_price": fill.avg_price,
             "fee_abs": fill.fee_abs,
@@ -2409,6 +2483,117 @@ def _apply_close_fill_confirmation_to_order(order: Order, *, now: datetime) -> N
     order.okx_raw_fills = raw
 
 
+def _repair_stored_fill_contract_size_from_instruments(
+    order: Order,
+    *,
+    contract_sizes: dict[str, float],
+    now: datetime,
+) -> bool:
+    if not _order_has_authoritative_stored_okx_fill_fact(order):
+        return False
+    raw = dict(getattr(order, "okx_raw_fills", None) or {})
+    inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
+    if not inst_id:
+        return False
+    contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
+    if contract_size <= 0:
+        return False
+    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    if contracts <= 0:
+        return False
+    base_quantity = contracts * contract_size
+    if base_quantity <= 0:
+        return False
+
+    existing_contract_size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), 0.0)
+    existing_base_quantity = _safe_float(raw.get("base_quantity") or raw.get("filled_base_quantity"), 0.0)
+    local_quantity = _safe_float(getattr(order, "quantity", None), 0.0)
+    already_verified = (
+        raw.get("contract_size_verified") is True
+        and _relative_close_enough(existing_contract_size, contract_size, 0.000001)
+        and _relative_close_enough(existing_base_quantity, base_quantity, 0.000001)
+        and _relative_close_enough(local_quantity, base_quantity, 0.000001)
+    )
+    if already_verified:
+        return False
+
+    order.okx_inst_id = inst_id
+    order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
+    order.quantity = base_quantity
+    order.okx_fill_contracts = contracts
+    order.okx_state = "filled"
+    if str(getattr(order, "okx_sync_status", "") or "").strip() not in {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+    }:
+        order.okx_sync_status = OKX_SYNC_CONFIRMED
+    order.okx_synced_at = now
+    order.okx_last_error = None
+    raw["inst_id"] = inst_id
+    raw["contracts"] = contracts
+    raw["contract_size"] = contract_size
+    raw["contract_size_verified"] = True
+    raw["contract_size_source"] = "okx_public_instruments"
+    raw["base_quantity"] = base_quantity
+    raw["fills_history_confirmed"] = True
+    order.okx_raw_fills = raw
+    return True
+
+
+def _repair_execution_result_contract_size_from_instruments(
+    order: Order,
+    *,
+    contract_sizes: dict[str, float],
+    now: datetime,
+) -> bool:
+    if not _order_has_okx_execution_result_fact(order):
+        return False
+    raw = dict(getattr(order, "okx_raw_fills", None) or {})
+    inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
+    if not inst_id:
+        return False
+    contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
+    if contract_size <= 0:
+        return False
+    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    if contracts <= 0:
+        return False
+    base_quantity = contracts * contract_size
+    if base_quantity <= 0:
+        return False
+
+    existing_contract_size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), 0.0)
+    existing_base_quantity = _safe_float(raw.get("base_quantity") or raw.get("filled_base_quantity"), 0.0)
+    local_quantity = _safe_float(getattr(order, "quantity", None), 0.0)
+    already_verified = (
+        raw.get("contract_size_verified") is True
+        and _relative_close_enough(existing_contract_size, contract_size, 0.000001)
+        and _relative_close_enough(existing_base_quantity, base_quantity, 0.000001)
+        and _relative_close_enough(local_quantity, base_quantity, 0.000001)
+    )
+    if already_verified:
+        return False
+
+    order.okx_inst_id = inst_id
+    order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
+    order.quantity = base_quantity
+    order.okx_fill_contracts = contracts
+    order.okx_state = "execution_result_confirmed"
+    order.okx_sync_status = OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+    order.okx_synced_at = now
+    order.okx_last_error = None
+    raw["inst_id"] = inst_id
+    raw["contracts"] = contracts
+    raw["contract_size"] = contract_size
+    raw["contract_size_verified"] = True
+    raw["contract_size_source"] = "okx_public_instruments"
+    raw["base_quantity"] = base_quantity
+    raw["execution_result_confirmed"] = True
+    raw.setdefault("fills_history_confirmed", False)
+    order.okx_raw_fills = raw
+    return True
+
+
 def _order_inst_id(order: Order) -> str:
     inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
     if inst_id:
@@ -2514,9 +2699,15 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
         return _order_is_rejected_without_exchange_fill(order)
     status = str(getattr(order, "status", "") or "").lower().strip()
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
-    if sync_status == OKX_SYNC_CONFIRMED and _order_has_confirmed_okx_fill_fact(order):
+    if sync_status == OKX_SYNC_CONFIRMED and _order_has_confirmed_okx_fill_fact(
+        order,
+        require_verified_contract_size=True,
+    ):
         return False
-    if sync_status == OKX_SYNC_OKX_ONLY and _order_has_confirmed_okx_fill_fact(order):
+    if sync_status == OKX_SYNC_OKX_ONLY and _order_has_confirmed_okx_fill_fact(
+        order,
+        require_verified_contract_size=True,
+    ):
         return False
     if sync_status == OKX_SYNC_NO_FILL_REJECTED and status in {
         "rejected",
@@ -2569,7 +2760,10 @@ def _order_needs_okx_pull(order: Order) -> bool:
         "canceled",
     }:
         return False
-    if _order_has_fills_history_confirmed(order) and _order_has_confirmed_okx_fill_fact(order):
+    if _order_has_fills_history_confirmed(order) and _order_has_confirmed_okx_fill_fact(
+        order,
+        require_verified_contract_size=True,
+    ):
         return False
     return True
 
@@ -2595,11 +2789,21 @@ def _order_has_fills_history_confirmed(order: Order) -> bool:
     return bool(raw.get("fills_history_confirmed"))
 
 
-def _order_has_confirmed_okx_fill_fact(order: Order) -> bool:
+def _order_has_confirmed_okx_fill_fact(
+    order: Order,
+    *,
+    require_verified_contract_size: bool = False,
+) -> bool:
     if not _order_has_authoritative_stored_okx_fill_fact(order):
         return False
     raw = getattr(order, "okx_raw_fills", None)
     raw = raw if isinstance(raw, dict) else {}
+    if (
+        require_verified_contract_size
+        and raw.get("fills_history_confirmed") is True
+        and raw.get("contract_size_verified") is not True
+    ):
+        return False
     expected_quantity = _stored_fill_base_quantity(raw)
     raw_base_quantity = _safe_float(
         raw.get("base_quantity") or raw.get("filled_base_quantity"),
@@ -3307,16 +3511,78 @@ def _apply_position_history_payload(position: Position, payload: dict[str, Any],
     payload_entry_exchange_order_id = payload.get("entry_exchange_order_id")
     payload_close_exchange_order_id = payload.get("close_exchange_order_id")
     position.entry_exchange_order_id = (
-        str(payload_entry_exchange_order_id)
-        if str(payload_entry_exchange_order_id or "").strip()
-        else existing_entry_exchange_order_id
+        _merge_position_history_order_ids(
+            existing_entry_exchange_order_id,
+            payload_entry_exchange_order_id,
+        )
+        or None
     )
     position.close_exchange_order_id = (
-        str(payload_close_exchange_order_id)
-        if str(payload_close_exchange_order_id or "").strip()
-        else existing_close_exchange_order_id
+        _merge_position_history_order_ids(
+            existing_close_exchange_order_id,
+            payload_close_exchange_order_id,
+            max_length=500,
+        )
+        or None
     )
     position.updated_at = now
+
+
+def _merge_position_history_order_ids(existing: Any, incoming: Any, *, max_length: int = 100) -> str:
+    incoming_text = str(incoming or "").strip()
+    if not incoming_text:
+        return str(existing or "").strip()
+    existing_text = str(existing or "").strip()
+    if not existing_text:
+        return incoming_text
+    existing_ids = _split_exchange_order_ids(existing_text)
+    incoming_ids = _split_exchange_order_ids(incoming_text)
+    if existing_ids and incoming_ids and existing_ids & incoming_ids and not existing_ids.issubset(incoming_ids):
+        return incoming_text
+    return _merge_exchange_order_ids(existing_text, incoming_text, max_length=max_length)
+
+
+def _position_lifecycle_contains_order_time(position: Position, order_time: datetime) -> bool:
+    opened_at = _db_datetime_to_utc(getattr(position, "created_at", None))
+    if opened_at is not None and opened_at > order_time:
+        return False
+    closed_at = _db_datetime_to_utc(getattr(position, "closed_at", None))
+    if bool(getattr(position, "is_open", False)) or closed_at is None:
+        return True
+    return closed_at + timedelta(seconds=POSITION_HISTORY_LINK_WINDOW_SECONDS) >= order_time
+
+
+def _best_position_lifecycle_for_close_order(
+    candidates: list[Position],
+    *,
+    order_time: datetime,
+    fill_quantity: float,
+) -> Position | None:
+    if not candidates:
+        return None
+
+    def score(position: Position) -> tuple[int, int, int, float, float, int]:
+        entry_ids = _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+        close_ids = _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+        closed_at = _db_datetime_to_utc(getattr(position, "closed_at", None))
+        quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
+        quantity_gap = abs(quantity - fill_quantity) if fill_quantity > 0 else 0.0
+        if bool(getattr(position, "is_open", False)) or closed_at is None:
+            close_distance = 0.0
+            closed_score = 0
+        else:
+            close_distance = abs((closed_at - order_time).total_seconds())
+            closed_score = 1
+        return (
+            closed_score,
+            1 if str(getattr(position, "okx_pos_id", "") or "").strip() else 0,
+            len(entry_ids) + len(close_ids),
+            -close_distance,
+            -quantity_gap,
+            int(getattr(position, "id", 0) or 0),
+        )
+
+    return sorted(candidates, key=score, reverse=True)[0]
 
 
 def _best_position_history_lifecycle_match(
@@ -3473,6 +3739,7 @@ def _apply_current_position_payload(position: Position, payload: dict[str, Any],
     position.close_exchange_order_id = _merge_exchange_order_ids(
         existing_close_exchange_order_id,
         payload.get("close_exchange_order_id"),
+        max_length=500,
     ) or None
     position.updated_at = now
 

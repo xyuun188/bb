@@ -135,6 +135,16 @@ class OkxTradeFactIntegrityService:
                 .limit(self.limit)
             )
             positions = list(position_rows.scalars().all())
+            linked_order_ids = _position_linked_order_ids(positions)
+            linked_orders: list[Order] = []
+            if linked_order_ids:
+                linked_order_rows = await session.execute(
+                    select(Order).where(
+                        Order.exchange_order_id.in_(sorted(linked_order_ids)),
+                        Order.status == "filled",
+                    )
+                )
+                linked_orders = list(linked_order_rows.scalars().all())
 
         issues: list[TradeFactIssue] = []
         for order in orders:
@@ -158,7 +168,14 @@ class OkxTradeFactIntegrityService:
                     positions,
                 )
             )
-        issues.extend(self._audit_position_authority_links(positions, orders, since=since))
+        position_link_orders = _dedupe_orders_by_id([*orders, *linked_orders])
+        issues.extend(
+            self._audit_position_authority_links(
+                positions,
+                position_link_orders,
+                since=since,
+            )
+        )
 
         return _summary(
             issues,
@@ -931,6 +948,24 @@ def _is_recent(value: datetime | None, since: datetime) -> bool:
 
 def _split_exchange_order_ids(value: Any) -> set[str]:
     return {item.strip() for item in str(value or "").split(",") if item.strip()}
+
+
+def _position_linked_order_ids(positions: list[Position]) -> set[str]:
+    order_ids: set[str] = set()
+    for position in positions:
+        order_ids.update(_split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None)))
+        order_ids.update(_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None)))
+    return order_ids
+
+
+def _dedupe_orders_by_id(orders: list[Order]) -> list[Order]:
+    deduped: dict[int, Order] = {}
+    for order in orders:
+        order_id = int(getattr(order, "id", 0) or 0)
+        if not order_id:
+            continue
+        deduped[order_id] = order
+    return list(deduped.values())
 
 
 def _order_time(order: Order) -> datetime | None:
