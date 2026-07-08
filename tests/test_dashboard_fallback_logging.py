@@ -617,6 +617,27 @@ async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
     assert refresh_calls == ["paper"]
 
 
+async def test_dashboard_okx_balance_uncached_splits_initialize_and_read_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+
+    async def recording_wait_for(awaitable: Any, **kwargs: Any) -> Any:
+        waits.append(float(kwargs["timeout"]))
+        return await awaitable
+
+    monkeypatch.setattr(dashboard, "OKXExecutor", SuccessfulStandaloneBalanceExecutor)
+    monkeypatch.setattr(dashboard.asyncio, "wait_for", recording_wait_for)
+
+    result = await dashboard._fetch_dashboard_okx_balance_uncached("paper")
+
+    assert result["equity"] == 7.0
+    assert waits == [
+        dashboard._DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
+        dashboard._DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
+    ]
+
+
 async def test_dashboard_okx_position_cache_is_bound_to_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

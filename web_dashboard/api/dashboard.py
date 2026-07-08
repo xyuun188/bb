@@ -92,8 +92,8 @@ _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 15.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
 _DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 3.0
 _DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 3.0
-_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 3.0
-_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 3.0
+_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 5.0
+_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
@@ -248,22 +248,19 @@ async def _fetch_dashboard_okx_balance_uncached(selected_mode: str) -> dict[str,
     selected_mode = "live" if selected_mode == "live" else "paper"
     fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
     try:
-        async def fetch_with_fallback() -> dict[str, Any] | None:
-            await fallback_executor.initialize()
-            snapshot = await asyncio.wait_for(
-                fallback_executor.get_balance_snapshot("USDT"),
-                timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
-            )
-            if not snapshot:
-                raise RuntimeError("empty OKX balance snapshot")
-            if snapshot.get("error"):
-                raise RuntimeError(safe_error_text(snapshot.get("error")))
-            return dict(snapshot)
-
-        return await asyncio.wait_for(
-            fetch_with_fallback(),
+        await asyncio.wait_for(
+            fallback_executor.initialize(),
             timeout=_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
         )
+        snapshot = await asyncio.wait_for(
+            fallback_executor.get_balance_snapshot("USDT"),
+            timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
+        )
+        if not snapshot:
+            raise RuntimeError("empty OKX balance snapshot")
+        if snapshot.get("error"):
+            raise RuntimeError(safe_error_text(snapshot.get("error")))
+        return dict(snapshot)
     finally:
         try:
             await fallback_executor.shutdown()
@@ -275,11 +272,28 @@ async def _fetch_dashboard_okx_balance_uncached(selected_mode: str) -> dict[str,
             )
 
 
+async def _fetch_dashboard_okx_balance_uncached_with_total_budget(
+    selected_mode: str,
+) -> dict[str, Any] | None:
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    try:
+        return await asyncio.wait_for(
+            _fetch_dashboard_okx_balance_uncached(selected_mode),
+            timeout=(
+                _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS
+                + _DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS
+                + 1.0
+            ),
+        )
+    except TimeoutError as exc:
+        raise TimeoutError("OKX balance background refresh exceeded total budget") from exc
+
+
 async def _refresh_dashboard_okx_balance_cache(selected_mode: str) -> None:
     selected_mode = "live" if selected_mode == "live" else "paper"
     executor_identity = _dashboard_okx_executor_for_mode(selected_mode)
     try:
-        snapshot = await _fetch_dashboard_okx_balance_uncached(selected_mode)
+        snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(selected_mode)
         if snapshot:
             _dashboard_okx_balance_cache[selected_mode] = (
                 datetime.now(UTC),

@@ -52,7 +52,8 @@ _OKX_BALANCE_LOCKS: dict[str, asyncio.Lock] = {}
 _OKX_BALANCE_TTL_SECONDS = 60.0
 _OKX_BALANCE_STALE_SECONDS = 300.0
 _OKX_BALANCE_ERROR_TTL_SECONDS = 5.0
-_OKX_BALANCE_TIMEOUT_SECONDS = 3.0
+_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
+_OKX_BALANCE_READ_TIMEOUT_SECONDS = 5.0
 _MODEL_CONNECTION_ERROR_LIMIT = 700
 
 
@@ -165,30 +166,57 @@ def _okx_balance_error_text(exc: Exception) -> str:
     return f"OKX 余额查询失败: {error}"
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_optional_float(*values: Any) -> float | None:
+    for value in values:
+        parsed = _optional_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _okx_balance_result_from_raw_snapshot(
     mode: str,
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     result = _empty_okx_snapshot(mode)
+    available = _first_optional_float(snapshot.get("free"), snapshot.get("available_balance"))
+    used = _first_optional_float(snapshot.get("used"), snapshot.get("used_balance"))
+    total = _first_optional_float(snapshot.get("total"), snapshot.get("total_balance"))
+    cash = _first_optional_float(snapshot.get("cash"), snapshot.get("cash_balance"), total)
+    equity = _first_optional_float(snapshot.get("equity"), snapshot.get("equity_balance"), total)
+    allocatable = _first_optional_float(
+        snapshot.get("allocatable"),
+        snapshot.get("allocatable_balance"),
+        equity,
+        total,
+        available,
+    )
     result.update(
         {
-            "available_balance": float(snapshot.get("free") or 0.0),
-            "used_balance": float(snapshot.get("used") or 0.0),
-            "total_balance": float(snapshot.get("total") or 0.0),
-            "cash_balance": float(snapshot.get("cash") or snapshot.get("total") or 0.0),
-            "equity_balance": float(snapshot.get("equity") or snapshot.get("total") or 0.0),
-            "allocatable_balance": float(
-                snapshot.get("allocatable")
-                or snapshot.get("equity")
-                or snapshot.get("total")
-                or snapshot.get("free")
-                or 0.0
-            ),
+            "available_balance": available,
+            "used_balance": used,
+            "total_balance": total,
+            "cash_balance": cash,
+            "equity_balance": equity,
+            "allocatable_balance": allocatable,
+            "balance_source": snapshot.get("balance_source") or _okx_mode_label(mode),
         }
     )
     if snapshot.get("stale"):
         result["stale"] = True
         result["stale_age_seconds"] = snapshot.get("stale_age_seconds")
+    for key in ("balance_status", "refresh_in_progress", "source"):
+        if key in snapshot:
+            result[key] = snapshot.get(key)
     if snapshot.get("error") or snapshot.get("balance_error"):
         result["balance_error"] = snapshot.get("balance_error") or snapshot.get("error")
         result["error_cached"] = bool(snapshot.get("error_cached"))
@@ -265,6 +293,23 @@ def _trading_service_cached_okx_snapshot(mode: str) -> dict[str, Any] | None:
     return result
 
 
+def _dashboard_cached_okx_snapshot(mode: str, *, allow_stale: bool) -> dict[str, Any] | None:
+    selected_mode = "live" if mode == "live" else "paper"
+    cached = getattr(_dash, "_dashboard_okx_balance_cache", {}).get(selected_mode)
+    if not cached:
+        return None
+    cached_at, cached_snapshot = cached
+    age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+    ttl_seconds = _OKX_BALANCE_STALE_SECONDS if allow_stale else _OKX_BALANCE_TTL_SECONDS
+    if age_seconds > ttl_seconds:
+        return None
+    snapshot = copy.deepcopy(cached_snapshot)
+    if allow_stale and age_seconds > _OKX_BALANCE_TTL_SECONDS:
+        snapshot["stale"] = True
+        snapshot["stale_age_seconds"] = round(age_seconds, 3)
+    return snapshot
+
+
 async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, Any]:
     """Fetch the real OKX USDT balance snapshot for paper/demo or live mode."""
     mode = "live" if mode == "live" else "paper"
@@ -273,6 +318,7 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
     creds = settings.get_okx_credentials(mode)
     if not creds.get("api_key"):
         result["balance_error"] = "未配置 OKX API Key"
+        result["balance_status"] = "not_configured"
         return result
 
     cached = _cached_okx_snapshot(mode, allow_stale=False)
@@ -296,28 +342,42 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
         if cached and not force:
             return cached
 
-        shared_snapshot = None if force else _trading_service_cached_okx_snapshot(mode)
-        if shared_snapshot:
-            normalized = _okx_balance_result_from_raw_snapshot(mode, shared_snapshot)
-            if not (
-                shared_snapshot.get("stale")
-                or shared_snapshot.get("error")
-                or shared_snapshot.get("balance_error")
-            ):
-                _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
-                _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
-            return normalized
+        if not force:
+            shared_snapshot = _trading_service_cached_okx_snapshot(mode)
+            if shared_snapshot:
+                normalized = _okx_balance_result_from_raw_snapshot(mode, shared_snapshot)
+                if not (
+                    shared_snapshot.get("stale")
+                    or shared_snapshot.get("error")
+                    or shared_snapshot.get("balance_error")
+                ):
+                    _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+                    _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+                return normalized
 
-        dashboard_cached = (
-            None if force else getattr(_dash, "_dashboard_okx_balance_cache", {}).get(mode)
-        )
-        if dashboard_cached:
-            dashboard_cached_at, dashboard_snapshot = dashboard_cached
-            dashboard_age = (datetime.now(UTC) - dashboard_cached_at).total_seconds()
-            if dashboard_age <= _OKX_BALANCE_TTL_SECONDS and dashboard_snapshot:
+            dashboard_cached = _dashboard_cached_okx_snapshot(mode, allow_stale=True)
+            if dashboard_cached:
+                normalized = _okx_balance_result_from_raw_snapshot(mode, dashboard_cached)
+                if not (
+                    dashboard_cached.get("stale")
+                    or dashboard_cached.get("error")
+                    or dashboard_cached.get("balance_error")
+                ):
+                    _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+                    _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+                return normalized
+
+            dashboard_snapshot = await _dash._get_dashboard_okx_account_snapshot(mode)
+            if isinstance(dashboard_snapshot, dict) and dashboard_snapshot:
                 normalized = _okx_balance_result_from_raw_snapshot(mode, dashboard_snapshot)
-                _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
-                _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
+                if not (
+                    dashboard_snapshot.get("stale")
+                    or dashboard_snapshot.get("error")
+                    or dashboard_snapshot.get("balance_error")
+                    or dashboard_snapshot.get("refresh_in_progress")
+                ):
+                    _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
+                    _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
                 return normalized
 
         from executor.okx_executor import OKXExecutor
@@ -325,13 +385,19 @@ async def _get_okx_usdt_snapshot(mode: str, force: bool = False) -> dict[str, An
         executor = _make_okx_executor(OKXExecutor, mode)
         try:
             async def fetch_snapshot() -> dict[str, Any]:
-                await executor.initialize()
-                snapshot = await executor.get_balance_snapshot("USDT")
+                await asyncio.wait_for(
+                    executor.initialize(),
+                    timeout=_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
+                )
+                snapshot = await asyncio.wait_for(
+                    executor.get_balance_snapshot("USDT"),
+                    timeout=_OKX_BALANCE_READ_TIMEOUT_SECONDS,
+                )
                 if snapshot.get("error"):
                     raise RuntimeError(_connection_error_text(snapshot.get("error")))
                 return snapshot
 
-            snapshot = await asyncio.wait_for(fetch_snapshot(), timeout=_OKX_BALANCE_TIMEOUT_SECONDS)
+            snapshot = await fetch_snapshot()
             normalized = _okx_balance_result_from_raw_snapshot(mode, snapshot)
             _OKX_BALANCE_CACHE[mode] = (time.time(), copy.deepcopy(normalized))
             _OKX_BALANCE_ERROR_CACHE.pop(mode, None)
@@ -473,6 +539,8 @@ async def _execution_account_status(mode: str) -> dict:
             "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
             "remaining_allocation": okx_available,
             "balance_error": okx_snapshot.get("balance_error"),
+            "balance_status": okx_snapshot.get("balance_status"),
+            "refresh_in_progress": bool(okx_snapshot.get("refresh_in_progress")),
             "balance_source": okx_snapshot.get("balance_source"),
             "okx_available_balance": okx_available,
             "okx_total_balance": okx_snapshot.get("total_balance"),
@@ -783,7 +851,7 @@ async def get_okx_balances():
         if not creds.get("api_key"):
             result[f"{mode}_error"] = "未配置API密钥"
             continue
-        snapshot = await _get_okx_usdt_snapshot(mode)
+        snapshot = await _get_okx_usdt_snapshot(mode, force=True)
         if snapshot.get("balance_error"):
             result[f"{mode}_error"] = snapshot.get("balance_error")
         elif snapshot.get("allocatable_balance") is not None:

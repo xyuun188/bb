@@ -780,6 +780,76 @@ async def test_settings_okx_snapshot_uses_trading_service_cache_before_executor(
 
 
 @pytest.mark.asyncio
+async def test_settings_okx_snapshot_cold_cache_returns_dashboard_refresh_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import executor.okx_executor as okx_executor_module
+
+    class FailingExecutor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("cold settings status must not synchronously create OKX executor")
+
+    async def dashboard_refresh_pending(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        return {
+            "balance_source": "OKX 模拟盘账户",
+            "balance_status": "refresh_pending",
+            "refresh_in_progress": True,
+            "source": "background_refresh",
+        }
+
+    settings_api_module._OKX_BALANCE_CACHE.clear()
+    settings_api_module._OKX_BALANCE_ERROR_CACHE.clear()
+    monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
+    monkeypatch.setattr(settings, "okx_paper_api_secret", "paper-secret")
+    monkeypatch.setattr(settings, "okx_paper_passphrase", "paper-pass")
+    monkeypatch.setattr(settings_api_module._dash, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(settings_api_module._dash, "_trading_service", None)
+    monkeypatch.setattr(
+        settings_api_module._dash,
+        "_get_dashboard_okx_account_snapshot",
+        dashboard_refresh_pending,
+    )
+    monkeypatch.setattr(okx_executor_module, "OKXExecutor", FailingExecutor)
+
+    snapshot = await settings_api_module._get_okx_usdt_snapshot("paper")
+
+    assert snapshot["balance_status"] == "refresh_pending"
+    assert snapshot["refresh_in_progress"] is True
+    assert snapshot["balance_error"] is None
+    assert snapshot["allocatable_balance"] is None
+
+
+@pytest.mark.asyncio
+async def test_execution_account_refresh_pending_does_not_pause_new_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def okx_refresh_pending(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        return {
+            "balance_source": "OKX 模拟盘账户",
+            "balance_status": "refresh_pending",
+            "refresh_in_progress": True,
+        }
+
+    async def empty_pnl_summary(mode: str) -> dict[str, Any]:
+        assert mode == "paper"
+        return {}
+
+    monkeypatch.setattr(settings_api_module, "_get_okx_usdt_snapshot", okx_refresh_pending)
+    monkeypatch.setattr(settings_api_module._dash, "_get_execution_pnl_summary", empty_pnl_summary)
+    monkeypatch.setattr(settings_api_module._dash, "_trading_service", None)
+
+    status = await settings_api_module._execution_account_status("paper")
+
+    assert status["balance_status"] == "refresh_pending"
+    assert status["refresh_in_progress"] is True
+    assert status["balance_error"] is None
+    assert status["risk_paused"] is False
+    assert status["risk_pause_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_dashboard_login_session_allows_remote_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
