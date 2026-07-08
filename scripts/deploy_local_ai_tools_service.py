@@ -93,6 +93,17 @@ TAIL_LOSS_THRESHOLD_PCT = float(os.environ.get("LOCAL_AI_TOOLS_TAIL_LOSS_THRESHO
 MIN_TIMESERIES_SEQUENCE_LENGTH = int(
     os.environ.get("LOCAL_AI_TOOLS_MIN_TIMESERIES_SEQUENCE_LENGTH", "30")
 )
+TIMESERIES_PRIMARY_REPO_ID = os.environ.get(
+    "LOCAL_AI_TOOLS_TIMESERIES_PRIMARY_MODEL",
+    "google/timesfm-2.5-200m-pytorch",
+).strip() or "google/timesfm-2.5-200m-pytorch"
+TIMESERIES_LEGACY_TIMESFM_REPO_ID = "google/timesfm-2.5-200m-transformers"
+TIMESERIES_CHRONOS_REPO_ID = "amazon/chronos-2"
+TIMESERIES_FALLBACK_REPO_ID = "ibm-granite/granite-timeseries-ttm-r2"
+TIMESERIES_PRIMARY_MUTATES_RESPONSE = os.environ.get(
+    "LOCAL_AI_TOOLS_TIMESERIES_PRIMARY_MUTATES_RESPONSE",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
 SECRET_TEXT_RE = re.compile(
@@ -765,6 +776,28 @@ def _timeseries_close_sequence(features: dict[str, Any]) -> tuple[list[float], s
 
 def _load_timesfm_model(model_dir: str):
     def loader():
+        official_error = ""
+        try:
+            import timesfm
+
+            model_ref = model_dir if Path(model_dir).exists() else TIMESERIES_PRIMARY_REPO_ID
+            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(model_ref)
+            if hasattr(model, "compile"):
+                model.compile(
+                    timesfm.ForecastConfig(
+                        max_context=1024,
+                        max_horizon=256,
+                        normalize_inputs=True,
+                        use_continuous_quantile_head=True,
+                        force_flip_invariance=True,
+                        infer_is_positive=True,
+                        fix_quantile_crossing=True,
+                    )
+                )
+            return {"backend": "timesfm", "model": model}
+        except Exception as exc:
+            official_error = safe_error(exc, 160)
+
         from transformers import AutoModelForTimeSeriesPrediction
 
         model = AutoModelForTimeSeriesPrediction.from_pretrained(
@@ -772,7 +805,11 @@ def _load_timesfm_model(model_dir: str):
             local_files_only=True,
         )
         model.eval()
-        return model
+        return {
+            "backend": "transformers",
+            "model": model,
+            "official_backend_error": official_error,
+        }
 
     return _cache_get_or_load(f"timesfm::{model_dir}", loader)
 
@@ -842,6 +879,57 @@ def _extract_timesfm_mean_predictions(output: Any) -> list[float]:
         if values:
             return values
     return []
+
+
+def _timesfm_model_dir() -> Path:
+    candidates = [
+        PHASE3_ROOT / "models" / "timeseries" / "google--timesfm-2.5-200m-pytorch",
+        PHASE3_ROOT / "models" / "timeseries" / "google--timesfm-2.5-200m-transformers",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _timesfm_forecast_values(loaded_model: Any, closes: list[float], horizon_step: int) -> tuple[list[float], str, str]:
+    backend = "transformers"
+    model = loaded_model
+    official_backend_error = ""
+    if isinstance(loaded_model, dict):
+        backend = str(loaded_model.get("backend") or backend)
+        official_backend_error = str(loaded_model.get("official_backend_error") or "")
+        model = loaded_model.get("model")
+
+    if model is None:
+        return [], backend, official_backend_error
+
+    if backend == "timesfm" and hasattr(model, "forecast"):
+        point_forecast, _quantile_forecast = model.forecast(
+            horizon=max(horizon_step, 1),
+            inputs=[np.asarray(closes, dtype=np.float32)],
+        )
+        predictions = _prediction_values(point_forecast)
+        if predictions:
+            return predictions, backend, official_backend_error
+
+    import torch
+
+    series = torch.tensor(closes, dtype=torch.float32)
+    output = None
+    errors = []
+    with torch.no_grad():
+        for past_values in ([series], getattr(series, "reshape", lambda *_: series)(1, -1)):
+            try:
+                output = model(past_values=past_values)
+                break
+            except Exception as exc:
+                errors.append(safe_error(exc, 120))
+    predictions = _extract_timesfm_mean_predictions(output)
+    if predictions:
+        return predictions, backend, official_backend_error
+    error = official_backend_error or "; ".join(errors[-2:])
+    return [], backend, error
 
 
 def _chronos_prediction_values(value: Any) -> list[float]:
@@ -935,7 +1023,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
         return {
             "available": False,
             "kind": "timeseries",
-            "model": "chronos-2-shadow-primary",
+            "model": "chronos-2-shadow-challenger",
             "primary_model": chain.get("primary_model"),
             "challenger_model": chain.get("challenger_model"),
             "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1001,7 +1089,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             return {
                 "available": False,
                 "kind": "timeseries",
-                "model": "chronos-2-shadow-primary",
+                "model": "chronos-2-shadow-challenger",
                 "primary_model": chain.get("primary_model"),
                 "challenger_model": chain.get("challenger_model"),
                 "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1030,7 +1118,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
         return {
             "available": True,
             "kind": "timeseries",
-            "model": "chronos-2-shadow-primary",
+            "model": "chronos-2-shadow-challenger",
             "primary_model": chain.get("primary_model"),
             "challenger_model": chain.get("challenger_model"),
             "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1056,7 +1144,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
         return {
             "available": False,
             "kind": "timeseries",
-            "model": "chronos-2-shadow-primary",
+            "model": "chronos-2-shadow-challenger",
             "primary_model": chain.get("primary_model"),
             "challenger_model": chain.get("challenger_model"),
             "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1086,38 +1174,6 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "live_mutation": False,
         }
     try:
-        import torch
-
-        model_dir = (
-            PHASE3_ROOT
-            / "models"
-            / "timeseries"
-            / "google--timesfm-2.5-200m-transformers"
-        )
-        model = _load_timesfm_model(model_dir.as_posix())
-        series = torch.tensor(closes, dtype=torch.float32)
-        output = None
-        errors = []
-        with torch.no_grad():
-            for past_values in ([series], getattr(series, "reshape", lambda *_: series)(1, -1)):
-                try:
-                    output = model(past_values=past_values)
-                    break
-                except Exception as exc:
-                    errors.append(safe_error(exc, 120))
-        predictions = _extract_timesfm_mean_predictions(output)
-        if not predictions:
-            return {
-                "available": False,
-                "kind": "timeseries",
-                "primary_model": chain.get("primary_model"),
-                "challenger_model": chain.get("challenger_model"),
-                "artifacts_ready": bool(chain.get("artifacts_ready")),
-                "actual_inference": False,
-                "reason": "timesfm_empty_prediction" if not errors else "; ".join(errors[-2:]),
-                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-                "live_mutation": False,
-            }
         horizon_step = int(
             max(
                 1,
@@ -1128,6 +1184,26 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
                 ),
             )
         )
+        model_dir = _timesfm_model_dir()
+        loaded_model = _load_timesfm_model(model_dir.as_posix())
+        predictions, backend, backend_error = _timesfm_forecast_values(
+            loaded_model,
+            closes,
+            horizon_step,
+        )
+        if not predictions:
+            return {
+                "available": False,
+                "kind": "timeseries",
+                "model": "timesfm-2.5-primary",
+                "primary_model": chain.get("primary_model"),
+                "challenger_model": chain.get("challenger_model"),
+                "artifacts_ready": bool(chain.get("artifacts_ready")),
+                "actual_inference": False,
+                "reason": "timesfm_empty_prediction" if not backend_error else backend_error,
+                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                "live_mutation": False,
+            }
         horizon_index = min(horizon_step, len(predictions)) - 1
         last_close = closes[-1]
         forecast_price = float(predictions[horizon_index])
@@ -1148,7 +1224,7 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
         return {
             "available": True,
             "kind": "timeseries",
-            "model": "timesfm-2.5-shadow-challenger",
+            "model": "timesfm-2.5-primary",
             "primary_model": chain.get("primary_model"),
             "challenger_model": chain.get("challenger_model"),
             "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1166,7 +1242,11 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "confidence": round(confidence, 6),
             "realized_vol_pct": round(realized_vol_pct, 6),
             "prediction_count": len(predictions),
-            "adapter": "timesfm_transformers_adapter",
+            "adapter": "timesfm_official_adapter"
+            if backend == "timesfm"
+            else "timesfm_transformers_adapter",
+            "backend": backend,
+            "model_dir": model_dir.as_posix(),
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "live_mutation": False,
         }
@@ -1174,6 +1254,7 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
         return {
             "available": False,
             "kind": "timeseries",
+            "model": "timesfm-2.5-primary",
             "primary_model": chain.get("primary_model"),
             "challenger_model": chain.get("challenger_model"),
             "artifacts_ready": bool(chain.get("artifacts_ready")),
@@ -1190,10 +1271,37 @@ def _attach_timeseries_specialist_shadow(
     features: dict[str, Any],
 ) -> dict[str, Any]:
     chain = _specialist_model_chain("timeseries")
-    primary_shadow = _run_chronos2_shadow(features)
-    challenger_shadow = _run_timesfm_shadow(features)
+    primary_shadow = _run_timesfm_shadow(features)
+    challenger_shadow = _run_chronos2_shadow(features)
     active = bool(primary_shadow.get("available") or challenger_shadow.get("available"))
     specialist_shadow = primary_shadow if primary_shadow.get("available") else challenger_shadow
+    if TIMESERIES_PRIMARY_MUTATES_RESPONSE and specialist_shadow.get("available"):
+        payload.setdefault(
+            "baseline_timeseries_response",
+            {
+                "model": payload.get("model"),
+                "best_side": payload.get("best_side"),
+                "side": payload.get("side"),
+                "direction": payload.get("direction"),
+                "expected_move_pct": payload.get("expected_move_pct"),
+                "expected_return_pct": payload.get("expected_return_pct"),
+                "confidence": payload.get("confidence"),
+                "status": payload.get("status"),
+            },
+        )
+        payload["model"] = specialist_shadow.get("model") or payload.get("model")
+        payload["architecture"] = specialist_shadow.get("adapter") or "timeseries_specialist_adapter"
+        payload["best_side"] = specialist_shadow.get("best_side") or payload.get("best_side")
+        payload["side"] = payload.get("best_side")
+        payload["direction"] = specialist_shadow.get("direction") or payload.get("direction")
+        payload["forecast_price"] = specialist_shadow.get("forecast_price")
+        payload["last_close"] = specialist_shadow.get("last_close")
+        payload["expected_move_pct"] = specialist_shadow.get("expected_move_pct")
+        payload["expected_return_pct"] = specialist_shadow.get("expected_return_pct")
+        payload["confidence"] = specialist_shadow.get("confidence")
+        payload["specialist_response_applied"] = True
+        payload["specialist_applied_model"] = specialist_shadow.get("model")
+        payload["status"] = "timesfm_primary_applied" if primary_shadow.get("available") else "timeseries_challenger_applied"
     chain = dict(chain)
     chain["actual_inference"] = active
     payload["specialist_primary_model"] = chain.get("primary_model")
@@ -1201,16 +1309,16 @@ def _attach_timeseries_specialist_shadow(
     payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
     payload["specialist_inference_active"] = active
     payload["specialist_model_chain"] = chain
-    payload["chronos_shadow_expected_move_pct"] = primary_shadow.get("expected_move_pct")
-    payload["chronos_shadow_expected_return_pct"] = primary_shadow.get("expected_return_pct")
-    payload["chronos_shadow_side"] = primary_shadow.get("best_side")
-    payload["chronos_shadow_confidence"] = primary_shadow.get("confidence")
-    payload["chronos_shadow_horizon_step"] = primary_shadow.get("horizon_step")
-    payload["timesfm_shadow_expected_move_pct"] = challenger_shadow.get("expected_move_pct")
-    payload["timesfm_shadow_expected_return_pct"] = challenger_shadow.get("expected_return_pct")
-    payload["timesfm_shadow_side"] = challenger_shadow.get("best_side")
-    payload["timesfm_shadow_confidence"] = challenger_shadow.get("confidence")
-    payload["timesfm_shadow_horizon_step"] = challenger_shadow.get("horizon_step")
+    payload["timesfm_shadow_expected_move_pct"] = primary_shadow.get("expected_move_pct")
+    payload["timesfm_shadow_expected_return_pct"] = primary_shadow.get("expected_return_pct")
+    payload["timesfm_shadow_side"] = primary_shadow.get("best_side")
+    payload["timesfm_shadow_confidence"] = primary_shadow.get("confidence")
+    payload["timesfm_shadow_horizon_step"] = primary_shadow.get("horizon_step")
+    payload["chronos_shadow_expected_move_pct"] = challenger_shadow.get("expected_move_pct")
+    payload["chronos_shadow_expected_return_pct"] = challenger_shadow.get("expected_return_pct")
+    payload["chronos_shadow_side"] = challenger_shadow.get("best_side")
+    payload["chronos_shadow_confidence"] = challenger_shadow.get("confidence")
+    payload["chronos_shadow_horizon_step"] = challenger_shadow.get("horizon_step")
     payload["professional_model_shadow"] = {
         "kind": "timeseries",
         "primary_model": chain.get("primary_model"),
@@ -1227,12 +1335,16 @@ def _attach_timeseries_specialist_shadow(
         "live_mutation": False,
     }
     payload["fallback_reason"] = (
-        "specialist_timeseries_shadow_only"
+        "timesfm_primary_applied"
+        if payload.get("specialist_response_applied") and primary_shadow.get("available")
+        else "timeseries_challenger_applied"
+        if payload.get("specialist_response_applied")
+        else "specialist_timeseries_shadow_only"
         if active
         else "specialist_timeseries_adapter_not_promoted"
     )
     payload["note"] = (
-        "TimesFM specialist inference is shadow-only and cannot mutate live routing."
+        "TimesFM is the primary time-series evidence model; Chronos/Granite remain comparison and fallback."
         if active
         else payload.get("note")
         or "Timeseries specialist adapters remain blocked until preflight and walk-forward pass."
@@ -1431,19 +1543,19 @@ SPECIALIST_MODEL_CHAINS = {
         {
             "slot": "timeseries_primary",
             "role": "primary",
-            "repo_id": "amazon/chronos-2",
+            "repo_id": TIMESERIES_PRIMARY_REPO_ID,
             "purpose": "online_primary_time_series_forecast",
         },
         {
             "slot": "timeseries_challenger",
             "role": "challenger",
-            "repo_id": "google/timesfm-2.5-200m-transformers",
+            "repo_id": TIMESERIES_CHRONOS_REPO_ID,
             "purpose": "shadow_challenger_time_series_forecast",
         },
         {
             "slot": "timeseries_fallback",
             "role": "fallback",
-            "repo_id": "ibm-granite/granite-timeseries-ttm-r2",
+            "repo_id": TIMESERIES_FALLBACK_REPO_ID,
             "purpose": "fallback_time_series_regime_check",
         },
     ],
@@ -1465,15 +1577,15 @@ SPECIALIST_MODEL_CHAINS = {
 
 SPECIALIST_ADAPTER_REQUIREMENTS = {
     "timeseries_primary": {
-        "adapter": "chronos_2_transformers_adapter",
+        "adapter": "timesfm_official_primary_adapter",
         "required_imports": ["torch", "transformers"],
-        "optional_imports": ["chronos"],
+        "optional_imports": ["timesfm"],
         "requires_walk_forward": True,
     },
     "timeseries_challenger": {
-        "adapter": "timesfm_transformers_adapter",
+        "adapter": "chronos_2_transformers_adapter",
         "required_imports": ["torch", "transformers"],
-        "optional_imports": ["timesfm"],
+        "optional_imports": ["chronos"],
         "requires_walk_forward": True,
     },
     "timeseries_fallback": {
@@ -2337,13 +2449,13 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     base.update(
         {
             "endpoint": "timeseries_deep",
-            "model_family": "Chronos-2/TimesFM shadow-ready time-series chain",
+            "model_family": "TimesFM primary with Chronos/Granite comparison time-series chain",
             "status": (
                 "trained_horizon_fallback" if base.get("trained") else "heuristic_fallback"
             ),
             "note": (
-                "Chronos-2/TimesFM artifacts are audited separately; this response remains "
-                "baseline-only until specialist adapters pass walk-forward gates."
+                "TimesFM is evaluated as the primary specialist time-series evidence source; "
+                "Chronos and Granite remain comparison/fallback models."
             ),
             "sequence_input_status": sequence_reason or "real_sequence_ready",
             "sequence_length": len(close_sequence),
@@ -2678,15 +2790,15 @@ def _stop_legacy_8101_holder_command() -> str:
             "    continue",
             "  fi",
             "  if [ -n \"${unit}\" ] && [ \"${unit}\" != \"$new_service\" ]; then",
-            "    systemctl stop \"${unit}\" || true",
-            "    systemctl disable \"${unit}\" || true",
+            "    sudo systemctl stop \"${unit}\" || true",
+            "    sudo systemctl disable \"${unit}\" || true",
             "  fi",
             "  if kill -0 \"${pid}\" 2>/dev/null; then",
-            "    kill \"${pid}\" || true",
+            "    sudo kill \"${pid}\" || true",
             "    sleep 2",
             "  fi",
             "  if kill -0 \"${pid}\" 2>/dev/null; then",
-            "    kill -9 \"${pid}\" || true",
+            "    sudo kill -9 \"${pid}\" || true",
             "  fi",
             "done",
         ]
@@ -2794,8 +2906,8 @@ def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> N
         )
         run_remote_text(
             ssh,
-            f"install -m 0644 {sh(staged_service_path)} /etc/systemd/system/{sh(PHASE3_SERVICE_NAME)} && "
-            "systemctl daemon-reload",
+            f"sudo install -m 0644 {sh(staged_service_path)} /etc/systemd/system/{sh(PHASE3_SERVICE_NAME)} && "
+            "sudo systemctl daemon-reload",
             timeout=60,
             check=True,
         )
@@ -2811,8 +2923,8 @@ def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> N
         )
         run_remote_text(
             ssh,
-            f"systemctl enable {sh(PHASE3_SERVICE_NAME)} && "
-            f"systemctl restart {sh(PHASE3_SERVICE_NAME)}",
+            f"sudo systemctl enable {sh(PHASE3_SERVICE_NAME)} && "
+            f"sudo systemctl restart {sh(PHASE3_SERVICE_NAME)}",
             timeout=90,
             check=True,
         )

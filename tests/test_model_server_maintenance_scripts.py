@@ -132,6 +132,74 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     assert "BB-FinQuant-Expert-14B" in runtime_text
 
 
+def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    runtime_env = tmp_path / "bb-runtime.env"
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    monkeypatch.setattr(sync, "REMOTE_RUNTIME_ENV_PATH", str(runtime_env))
+    runtime_env.write_text(
+        "DATABASE_URL=postgresql+asyncpg://runtime\n"
+        "BB_SECURE_SETTINGS_KEY=runtime-key\n"
+        "ONLINE_DECISION_MAKER_API_BASE=https://online-llm.example/v1\n"
+        "ONLINE_DECISION_MAKER_MODEL=deepseek-reasoner\n"
+        "ONLINE_DECISION_MAKER_API_KEY=secret-online-key\n",
+        encoding="utf-8",
+    )
+    (app_dir / ".env").write_text("PROJECT_ONLY=yes\n", encoding="utf-8")
+
+    script = sync._runtime_env_update_script(
+        remote_app_dir=str(app_dir),
+        backup_runtime_env=False,
+        emit_summary=False,
+    )
+    exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
+
+    runtime_text = runtime_env.read_text(encoding="utf-8")
+    assert "https://online-llm.example/v1" in runtime_text
+    assert "deepseek-reasoner" in runtime_text
+    assert "route_mode\":\"online_slow_brain" in runtime_text
+    assert "http://127.0.0.1:18003/v1" in runtime_text
+    assert "BB-FinQuant-Expert-14B" in runtime_text
+
+
+def test_sync_to_online_server_old_profile_routes_decision_to_alias(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    runtime_env = tmp_path / "bb-runtime.env"
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    monkeypatch.setattr(sync, "REMOTE_RUNTIME_ENV_PATH", str(runtime_env))
+    runtime_env.write_text(
+        "DATABASE_URL=postgresql+asyncpg://runtime\n"
+        "BB_SECURE_SETTINGS_KEY=runtime-key\n"
+        "MODEL_SERVER_ACTIVE_PROFILE=old\n",
+        encoding="utf-8",
+    )
+    (app_dir / ".env").write_text("PROJECT_ONLY=yes\n", encoding="utf-8")
+
+    script = sync._runtime_env_update_script(
+        remote_app_dir=str(app_dir),
+        backup_runtime_env=False,
+        emit_summary=False,
+    )
+    exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
+
+    runtime_text = runtime_env.read_text(encoding="utf-8")
+    assert "MODEL_SERVER_ACTIVE_PROFILE=old" in runtime_text
+    assert '"name":"decision_maker"' in runtime_text
+    assert '"api_base":"http://127.0.0.1:18003/v1"' in runtime_text
+    assert '"model":"BB-FinQuant-Expert-14B"' in runtime_text
+    assert '"route_mode":"old_model_server_fast_fallback"' in runtime_text
+
+
 def test_sync_to_online_server_runtime_env_only_does_not_restart_services() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 

@@ -15,6 +15,8 @@ from services.phase3_model_server_readiness import (
     evaluate_phase3_model_server_snapshot,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _model(slot: str, *, repo_id: str | None = None, status: str = "ok") -> dict[str, Any]:
     return {
@@ -139,6 +141,95 @@ def _artifact_ready_snapshot(*, runtime_ready: bool = False) -> dict[str, Any]:
     }
 
 
+def _old_one_gpu_takeover_snapshot(*, runtime_ready: bool = True) -> dict[str, Any]:
+    model_rows = [
+        _model("timeseries_primary", repo_id="google/timesfm-2.5-200m-pytorch"),
+        _model("timeseries_challenger", repo_id="amazon/chronos-2"),
+        _model("sentiment_primary", repo_id="ProsusAI/finbert"),
+        _model("sentiment_challenger", repo_id="yiyanghkust/finbert-tone"),
+        _model("timeseries_fallback", repo_id="ibm-granite/granite-timeseries-ttm-r2"),
+    ]
+    return {
+        "download_manifest": {
+            "present": True,
+            "data": {"models": model_rows},
+        },
+        "validation_manifest": {
+            "present": True,
+            "data": {
+                "checked_at": "2026-07-08T07:50:50Z",
+                "torch": {},
+                "models": model_rows,
+            },
+        },
+        "service_manifest": {"present": False, "data": {}},
+        "services": (
+            [
+                "qwen3-14b-trade.service loaded active running Qwen3 14B",
+                "deepseek-r1-14b-risk.service loaded active running DeepSeek risk",
+                "bb-finquant-expert-alias.service loaded active running FinQuant alias",
+                "bb-phase3-quant-api.service loaded active running Phase 3 Quant API",
+            ]
+            if runtime_ready
+            else []
+        ),
+        "gpu": ["0, NVIDIA A100-SXM4-40GB, 26720, 40960, 0, 34"],
+        "gpu_processes": (
+            [
+                "GPU-a3, 2644133, /home/linux/anaconda3/envs/trade_vllm/bin/python, 13732",
+                "GPU-a3, 2650039, /home/linux/anaconda3/envs/trade_vllm/bin/python, 11482",
+                "GPU-a3, 3978899, /data/BB/envs/phase3-quant/bin/python, 1472",
+            ]
+            if runtime_ready
+            else []
+        ),
+        "listening_ports": (
+            [
+                "LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*",
+                "LISTEN 0 2048 0.0.0.0:8002 0.0.0.0:*",
+                "LISTEN 0 5 127.0.0.1:8003 0.0.0.0:*",
+                "LISTEN 0 2048 127.0.0.1:8101 0.0.0.0:*",
+            ]
+            if runtime_ready
+            else []
+        ),
+        "port_probes": [
+            {
+                "port": 8000,
+                "path": "/v1/models",
+                "ok": runtime_ready,
+                "response": '{"data":[{"id":"qwen3-14b-trade"}]}',
+            },
+            {
+                "port": 8002,
+                "path": "/v1/models",
+                "ok": runtime_ready,
+                "response": '{"data":[{"id":"deepseek-r1-14b-risk"}]}',
+            },
+            {
+                "port": 8003,
+                "path": "/v1/models",
+                "ok": runtime_ready,
+                "response": '{"data":[{"id":"BB-FinQuant-Expert-14B"}]}',
+            },
+            {
+                "port": 8101,
+                "path": "/health",
+                "ok": runtime_ready,
+                "response": '{"status":"ready","trained_models_available":true}',
+            },
+        ],
+        "model_paths": [
+            "d /data/BB/models/timeseries/google--timesfm-2.5-200m-pytorch",
+            "f /data/BB/models/local_ai_tools/local_quant_models.joblib",
+        ],
+        "manifest_files": [
+            "/data/BB/manifests/phase3_model_download_manifest.json",
+            "/data/BB/manifests/phase3_model_validation.json",
+        ],
+    }
+
+
 def test_phase3_model_server_artifacts_ready_but_services_pending() -> None:
     report = evaluate_phase3_model_server_snapshot(_artifact_ready_snapshot())
     warning_codes = {item["code"] for item in report["warnings"]}
@@ -166,6 +257,28 @@ def test_phase3_model_server_ready_requires_services_and_endpoint() -> None:
     assert report["active_model_service_count"] == 3
     assert report["active_endpoint_count"] == 3
     assert report["manifest_service_ready_count"] == 3
+
+
+def test_phase3_model_server_accepts_old_one_gpu_timesfm_takeover_contract() -> None:
+    report = evaluate_phase3_model_server_snapshot(_old_one_gpu_takeover_snapshot())
+    blocker_codes = {item["code"] for item in report["blockers"]}
+    warning_codes = {item["code"] for item in report["warnings"]}
+
+    assert report["status"] == "ready"
+    assert report["deployment_contract"] == "old_one_gpu_timesfm_takeover"
+    assert report["artifact_ready"] is True
+    assert report["runtime_ready"] is True
+    assert report["phase3_model_service_go_live_blocked"] is False
+    assert report["expected_gpu_count"] == 1
+    assert report["gpu_count"] == 1
+    assert report["required_slot_count"] == 3
+    assert report["required_slot_ready_count"] == 3
+    assert report["active_endpoint_count"] == 4
+    assert blocker_codes == set()
+    assert "old_model_server_takeover_active" in warning_codes
+    assert "old_takeover_service_manifest_not_required" in warning_codes
+    assert "cuda_unavailable" not in blocker_codes
+    assert "required_model_slot_not_ready" not in blocker_codes
 
 
 @pytest.mark.asyncio
@@ -218,7 +331,7 @@ async def test_phase3_model_server_readiness_falls_back_to_platform_bridge_when_
         command_executor=fake_command_executor,
     ).report()
 
-    assert used["project_root"] == Path(__file__).resolve().parents[1]
+    assert used["project_root"] == PROJECT_ROOT
     assert used["ssh_info"] == fallback_info
     assert used["executed"] is True
     assert used["closed"] is True
@@ -272,7 +385,7 @@ async def test_phase3_model_server_readiness_falls_back_to_platform_bridge_when_
         command_executor=lambda *_args, **_kwargs: FakeResult(),
     ).report()
 
-    assert used["project_root"] == Path(__file__).resolve().parents[1]
+    assert used["project_root"] == PROJECT_ROOT
     assert used["ssh_info"] == fallback_info
     assert used["closed"] is True
     assert report["status"] == "ready"

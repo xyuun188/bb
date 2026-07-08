@@ -270,6 +270,64 @@ current_runtime_text = runtime_path.read_text(encoding='utf-8') if runtime_path.
 values = parse_env(runtime_path)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
 app_env_values = parse_env(app_env_path)
+
+def first_non_empty(*items):
+    for item in items:
+        text = str(item or '').strip()
+        if text:
+            return text
+    return ''
+
+
+decision_api_base = first_non_empty(
+    values.get('ONLINE_DECISION_MAKER_API_BASE'),
+    app_env_values.get('ONLINE_DECISION_MAKER_API_BASE'),
+    values.get('QWEN32B_ONLINE_API_BASE'),
+    app_env_values.get('QWEN32B_ONLINE_API_BASE'),
+    values.get('AI_DECISION_MAKER_API_BASE'),
+    app_env_values.get('AI_DECISION_MAKER_API_BASE'),
+)
+decision_api_key = first_non_empty(
+    values.get('ONLINE_DECISION_MAKER_API_KEY'),
+    app_env_values.get('ONLINE_DECISION_MAKER_API_KEY'),
+    values.get('QWEN32B_ONLINE_API_KEY'),
+    app_env_values.get('QWEN32B_ONLINE_API_KEY'),
+    values.get('AI_DECISION_MAKER_API_KEY'),
+    app_env_values.get('AI_DECISION_MAKER_API_KEY'),
+)
+decision_model = first_non_empty(
+    values.get('ONLINE_DECISION_MAKER_MODEL'),
+    app_env_values.get('ONLINE_DECISION_MAKER_MODEL'),
+    values.get('QWEN32B_ONLINE_MODEL'),
+    app_env_values.get('QWEN32B_ONLINE_MODEL'),
+    values.get('AI_DECISION_MAKER_MODEL'),
+    app_env_values.get('AI_DECISION_MAKER_MODEL'),
+)
+model_server_active_profile = first_non_empty(
+    values.get('MODEL_SERVER_ACTIVE_PROFILE'),
+    app_env_values.get('MODEL_SERVER_ACTIVE_PROFILE'),
+).lower()
+if decision_api_base:
+    for row in rows:
+        if row.get('name') == 'decision_maker':
+            row['api_base'] = decision_api_base.rstrip('/')
+            if decision_api_key:
+                row['api_key'] = decision_api_key
+            if decision_model:
+                row['model'] = decision_model
+            row['route_mode'] = 'online_slow_brain'
+            break
+    online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
+elif model_server_active_profile == 'old':
+    for row in rows:
+        if row.get('name') == 'decision_maker':
+            row['api_base'] = 'http://127.0.0.1:18003/v1'
+            row['api_key'] = ''
+            row['model'] = 'BB-FinQuant-Expert-14B'
+            row['route_mode'] = 'old_model_server_fast_fallback'
+            break
+    online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
+
 if local_ai_tools_api_key:
     values['LOCAL_AI_TOOLS_API_KEY'] = local_ai_tools_api_key
 if not values.get('BB_SECURE_SETTINGS_KEY'):
@@ -288,6 +346,8 @@ values['DASHBOARD_AUTH_ENABLED'] = 'true'
 values['DASHBOARD_INLINE_ENABLED'] = 'false'
 values['USE_FAKEREDIS'] = 'false'
 values['REDIS_URL'] = 'redis://127.0.0.1:6379/0'
+if model_server_active_profile:
+    values['MODEL_SERVER_ACTIVE_PROFILE'] = model_server_active_profile
 values['AI_MODELS'] = online_ai_models
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'

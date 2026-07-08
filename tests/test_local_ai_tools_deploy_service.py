@@ -184,8 +184,8 @@ def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> N
     timeseries_chain = health["specialist_model_chains"]["timeseries"]
     sentiment_chain = health["specialist_model_chains"]["sentiment"]
 
-    assert timeseries_chain["primary_model"] == "amazon/chronos-2"
-    assert timeseries_chain["challenger_model"] == "google/timesfm-2.5-200m-transformers"
+    assert timeseries_chain["primary_model"] == "google/timesfm-2.5-200m-pytorch"
+    assert timeseries_chain["challenger_model"] == "amazon/chronos-2"
     assert timeseries_chain["artifacts_ready"] is True
     assert timeseries_chain["actual_inference"] is False
     assert sentiment_chain["primary_model"] == "ProsusAI/finbert"
@@ -239,12 +239,12 @@ def test_local_ai_tools_generated_deep_endpoints_expose_professional_shadow_chai
     timeseries = module.deep_timeseries_predict(req)
     sentiment = module.deep_sentiment_analyze(req)
 
-    assert timeseries["specialist_primary_model"] == "amazon/chronos-2"
-    assert timeseries["specialist_challenger_model"] == "google/timesfm-2.5-200m-transformers"
+    assert timeseries["specialist_primary_model"] == "google/timesfm-2.5-200m-pytorch"
+    assert timeseries["specialist_challenger_model"] == "amazon/chronos-2"
     assert timeseries["specialist_artifacts_ready"] is True
     assert timeseries["specialist_inference_active"] is False
     assert timeseries["professional_model_shadow"]["baseline_response"] is True
-    assert timeseries["shadow_payload"]["specialist_primary_model"] == "amazon/chronos-2"
+    assert timeseries["shadow_payload"]["specialist_primary_model"] == "google/timesfm-2.5-200m-pytorch"
     assert (
         timeseries["fallback_reason"]
         == "specialist_timeseries_adapter_not_promoted"
@@ -405,15 +405,17 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
     )
 
     assert result["specialist_inference_active"] is True
-    assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
+    assert result["fallback_reason"] == "timesfm_primary_applied"
     assert result["professional_model_shadow"]["actual_inference"] is True
     assert result["professional_model_shadow"]["baseline_response"] is True
     assert result["professional_model_shadow"]["shadow_result"]["model"] == (
-        "timesfm-2.5-shadow-challenger"
+        "timesfm-2.5-primary"
     )
+    assert result["specialist_response_applied"] is True
+    assert result["specialist_applied_model"] == "timesfm-2.5-primary"
     assert result["timesfm_shadow_expected_return_pct"] == pytest.approx(0.790514)
     assert result["timesfm_shadow_side"] == "long"
-    assert result["expected_return_pct"] != result["timesfm_shadow_expected_return_pct"]
+    assert result["expected_return_pct"] == result["timesfm_shadow_expected_return_pct"]
     assert result["live_mutation"] is False
     assert result["shadow_payload"]["specialist_inference_active"] is True
 
@@ -483,9 +485,9 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
     module._run_timesfm_shadow = lambda _features: {
         "available": True,
         "kind": "timeseries",
-        "model": "timesfm-2.5-shadow-challenger",
-        "primary_model": "amazon/chronos-2",
-        "challenger_model": "google/timesfm-2.5-200m-transformers",
+        "model": "timesfm-2.5-primary",
+        "primary_model": "google/timesfm-2.5-200m-pytorch",
+        "challenger_model": "amazon/chronos-2",
         "artifacts_ready": True,
         "actual_inference": True,
         "expected_move_pct": 0.5,
@@ -519,11 +521,12 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
     assert result["chronos_shadow_side"] == "long"
     assert result["timesfm_shadow_expected_return_pct"] == pytest.approx(0.5)
     assert shadow["actual_inference"] is True
-    assert shadow["shadow_result"]["model"] == "chronos-2-shadow-primary"
-    assert shadow["primary_shadow_result"]["actual_inference"] is True
-    assert shadow["challenger_shadow_result"]["model"] == "timesfm-2.5-shadow-challenger"
+    assert shadow["shadow_result"]["model"] == "timesfm-2.5-primary"
+    assert shadow["primary_shadow_result"]["model"] == "timesfm-2.5-primary"
+    assert shadow["challenger_shadow_result"]["model"] == "chronos-2-shadow-challenger"
+    assert shadow["challenger_shadow_result"]["actual_inference"] is True
     assert shadow["activation_blocker"] == "walk_forward_required"
-    assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
+    assert result["fallback_reason"] == "timesfm_primary_applied"
     assert result["live_mutation"] is False
 
 
@@ -631,7 +634,7 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
         )
     )
 
-    shadow = result["professional_model_shadow"]["primary_shadow_result"]
+    shadow = result["professional_model_shadow"]["challenger_shadow_result"]
     assert shadow["actual_inference"] is True
     assert shadow["forecast_price"] == pytest.approx(102.0)
     assert shadow["expected_return_pct"] == pytest.approx(0.990099)

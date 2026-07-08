@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import pytest
-
 from pathlib import Path
+
+import pytest
 
 from core.remote_server_info import RemoteServerInfo
 from services.phase3_server_migration_audit import (
@@ -57,6 +57,84 @@ def _ready_snapshot() -> dict:
     }
 
 
+def _old_takeover_snapshot() -> dict:
+    return {
+        "resource_release_marker": {"present": False, "data": {}},
+        "migration_manifest": {"present": False, "data": {}},
+        "legacy_data_paths": [
+            {"path": "/data/trade_ai/models", "exists": True},
+            {"path": "/data/trade_ai/logs/qwen3_32b_main.log", "exists": True},
+        ],
+        "phase3_roots": [
+            {"path": "/data/BB", "exists": True},
+            {"path": "/data/BB/models", "exists": True},
+            {"path": "/data/BB/cache", "exists": True},
+            {"path": "/data/BB/training", "exists": False},
+            {"path": "/data/BB/runtime", "exists": True},
+            {"path": "/data/BB/logs", "exists": True},
+            {"path": "/data/BB/manifests", "exists": True},
+        ],
+        "forbidden_services": [
+            {
+                "name": "qwen3-32b-main.service",
+                "unit_exists": False,
+                "active": False,
+                "enabled": False,
+            }
+        ],
+        "old_takeover_services": [
+            {"name": "qwen3-14b-trade.service", "active": True, "enabled": True},
+            {"name": "deepseek-r1-14b-risk.service", "active": True, "enabled": True},
+            {"name": "bb-finquant-expert-alias.service", "active": True, "enabled": True},
+            {"name": "bb-phase3-quant-api.service", "active": True, "enabled": True},
+        ],
+        "old_takeover_artifacts": [
+            {
+                "path": "/data/BB/models/timeseries/google--timesfm-2.5-200m-pytorch",
+                "exists": True,
+            },
+            {"path": "/data/BB/models/timeseries/amazon--chronos-2", "exists": True},
+            {"path": "/data/BB/models/sentiment/ProsusAI--finbert", "exists": True},
+            {
+                "path": "/data/BB/models/local_ai_tools/local_quant_models.joblib",
+                "exists": True,
+            },
+        ],
+        "port_probes": [
+            {
+                "port": 8000,
+                "ok": True,
+                "response": '{"data":[{"id":"qwen3-14b-trade"}]}',
+            },
+            {
+                "port": 8002,
+                "ok": True,
+                "response": '{"data":[{"id":"deepseek-r1-14b-risk"}]}',
+            },
+            {
+                "port": 8003,
+                "ok": True,
+                "response": '{"data":[{"id":"BB-FinQuant-Expert-14B"}]}',
+            },
+            {
+                "port": 8101,
+                "ok": True,
+                "response": '{"status":"ready","trained_models_available":true}',
+            },
+        ],
+        "candidate_model_processes": [
+            "2643915 python -m vllm.entrypoints.openai.api_server --model "
+            "/data/trade_models/Qwen/Qwen3-14B-AWQ --served-model-name qwen3-14b-trade",
+            "2649820 python -m vllm.entrypoints.openai.api_server --model "
+            "/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq "
+            "--served-model-name deepseek-r1-14b-risk",
+            "3978899 /data/BB/envs/phase3-quant/bin/python -m uvicorn local_ai_tools_api:app",
+        ],
+        "legacy_processes": [],
+        "approved_roots": [{"path": "/data/BB", "exists": True}],
+    }
+
+
 def test_phase3_server_migration_snapshot_ready() -> None:
     report = evaluate_phase3_server_snapshot(_ready_snapshot())
 
@@ -67,6 +145,43 @@ def test_phase3_server_migration_snapshot_ready() -> None:
     assert report["blockers"] == []
     assert report["legacy_data_path_count"] == 1
     assert report["warnings"][0]["code"] == "legacy_data_paths_preserved"
+
+
+def test_phase3_server_migration_accepts_old_one_gpu_takeover_contract() -> None:
+    report = evaluate_phase3_server_snapshot(_old_takeover_snapshot())
+    blocker_codes = {item["code"] for item in report["blockers"]}
+    warning_codes = {item["code"] for item in report["warnings"]}
+
+    assert report["status"] == "ready"
+    assert report["deployment_contract"] == "old_one_gpu_timesfm_takeover"
+    assert report["phase3_go_live_blocked"] is False
+    assert report["old_takeover"]["active"] is True
+    assert report["old_takeover"]["service_ready"] is True
+    assert report["old_takeover"]["endpoint_ready"] is True
+    assert report["old_takeover"]["artifact_ready"] is True
+    assert report["legacy_process_count"] == 0
+    assert report["old_takeover_allowed_process_count"] == 3
+    assert blocker_codes == set()
+    assert "old_takeover_resource_release_marker_not_required" in warning_codes
+    assert "old_takeover_migration_manifest_not_required" in warning_codes
+    assert "old_takeover_legacy_14b_processes_allowed" in warning_codes
+    assert "legacy_processes_running" not in blocker_codes
+
+
+def test_phase3_server_migration_old_takeover_still_blocks_32b_legacy_process() -> None:
+    snapshot = _old_takeover_snapshot()
+    snapshot["candidate_model_processes"].append(
+        "777 python -m vllm.entrypoints.openai.api_server "
+        "--model /data/trade_models/Qwen/Qwen3-32B-AWQ --port 8004"
+    )
+
+    report = evaluate_phase3_server_snapshot(snapshot)
+    blocker_codes = {item["code"] for item in report["blockers"]}
+
+    assert report["status"] == "blocked"
+    assert report["phase3_go_live_blocked"] is True
+    assert "legacy_processes_running" in blocker_codes
+    assert report["legacy_process_count"] == 1
 
 
 def test_phase3_server_migration_allows_phase3_vllm_under_data_bb() -> None:
