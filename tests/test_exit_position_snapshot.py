@@ -17,10 +17,10 @@ def _decision() -> DecisionOutput:
 
 class FakeSyncService:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, object]] = []
 
-    async def reconcile_positions(self, reason: str) -> None:
-        self.calls.append(("reconcile", reason))
+    async def reconcile_positions(self, reason: str, **kwargs) -> None:
+        self.calls.append(("reconcile", {"reason": reason, **kwargs}))
 
     async def get_open_positions_context(self) -> list[dict]:
         self.calls.append(("context", ""))
@@ -44,7 +44,29 @@ async def test_exit_position_snapshot_refreshes_and_replaces_open_positions() ->
 
     assert positions == [{"symbol": "BTC/USDT", "side": "long", "quantity": 1}]
     assert open_positions == positions
-    assert sync.calls == [("reconcile", "exit precheck"), ("context", "")]
+    assert sync.calls == [("context", "")]
+
+
+async def test_exit_position_snapshot_can_run_bounded_reconcile_when_enabled() -> None:
+    sync = FakeSyncService()
+    policy = ExitPositionSnapshotPolicy(sync, reconcile_timeout_seconds=1.5)
+    open_positions = [{"symbol": "OLD/USDT"}]
+
+    positions = await policy.refresh_positions(open_positions)
+
+    assert positions == [{"symbol": "BTC/USDT", "side": "long", "quantity": 1}]
+    assert sync.calls == [
+        (
+            "reconcile",
+            {
+                "reason": "exit precheck",
+                "timeout_seconds": 1.5,
+                "lock_wait_seconds": 0.05,
+                "record_timeout_error": False,
+            },
+        ),
+        ("context", ""),
+    ]
 
 
 async def test_exit_position_snapshot_proxies_exchange_match_status() -> None:

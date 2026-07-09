@@ -15,16 +15,23 @@ from ai_brain.base_model import DecisionOutput
 
 @dataclass(slots=True)
 class ExitPositionSnapshotPolicy:
-    """Refresh local exit position context and query matching exchange positions."""
+    """Refresh local exit context without running heavy full reconciliation per exit."""
 
     sync_service: Any
     reconcile_reason: str = "exit precheck"
+    reconcile_timeout_seconds: float | None = None
 
     async def refresh_positions(
         self,
         open_positions: list[dict[str, Any]] | None,
     ) -> list[dict[str, Any]]:
-        await self.sync_service.reconcile_positions(self.reconcile_reason)
+        if self.reconcile_timeout_seconds and self.reconcile_timeout_seconds > 0:
+            await self.sync_service.reconcile_positions(
+                self.reconcile_reason,
+                timeout_seconds=self.reconcile_timeout_seconds,
+                lock_wait_seconds=0.05,
+                record_timeout_error=False,
+            )
         exit_positions = await self.sync_service.get_open_positions_context()
         if open_positions is not None:
             open_positions[:] = exit_positions
