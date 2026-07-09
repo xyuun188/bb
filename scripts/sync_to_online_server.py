@@ -183,6 +183,7 @@ import json
 import os
 import secrets
 import time
+from urllib.parse import urlparse
 
 runtime_path = Path({REMOTE_RUNTIME_ENV_PATH!r})
 app_env_path = Path({remote_app_dir!r}) / '.env'
@@ -279,6 +280,39 @@ def first_non_empty(*items):
     return ''
 
 
+def is_loopback_api_base(value):
+    try:
+        host = (urlparse(str(value or '')).hostname or '').strip().lower()
+    except Exception:
+        return False
+    return host in ('127.0.0.1', 'localhost', '::1')
+
+
+def current_external_decision_route(raw_ai_models):
+    try:
+        configured_rows = json.loads(str(raw_ai_models or '[]'))
+    except Exception:
+        return {{}}
+    if not isinstance(configured_rows, list):
+        return {{}}
+    for configured_row in configured_rows:
+        if not isinstance(configured_row, dict):
+            continue
+        if str(configured_row.get('name') or '').strip() != 'decision_maker':
+            continue
+        api_base = str(configured_row.get('api_base') or '').strip().rstrip('/')
+        model = str(configured_row.get('model') or '').strip()
+        if api_base and model and not is_loopback_api_base(api_base):
+            return {{
+                'api_base': api_base,
+                'api_key': str(configured_row.get('api_key') or '').strip(),
+                'model': model,
+                'route_mode': str(configured_row.get('route_mode') or 'online_slow_brain').strip(),
+            }}
+    return {{}}
+
+
+current_decision_route = current_external_decision_route(values.get('AI_MODELS'))
 decision_api_base = first_non_empty(
     values.get('ONLINE_DECISION_MAKER_API_BASE'),
     app_env_values.get('ONLINE_DECISION_MAKER_API_BASE'),
@@ -286,6 +320,7 @@ decision_api_base = first_non_empty(
     app_env_values.get('QWEN32B_ONLINE_API_BASE'),
     values.get('AI_DECISION_MAKER_API_BASE'),
     app_env_values.get('AI_DECISION_MAKER_API_BASE'),
+    current_decision_route.get('api_base'),
 )
 decision_api_key = first_non_empty(
     values.get('ONLINE_DECISION_MAKER_API_KEY'),
@@ -294,6 +329,7 @@ decision_api_key = first_non_empty(
     app_env_values.get('QWEN32B_ONLINE_API_KEY'),
     values.get('AI_DECISION_MAKER_API_KEY'),
     app_env_values.get('AI_DECISION_MAKER_API_KEY'),
+    current_decision_route.get('api_key'),
 )
 decision_model = first_non_empty(
     values.get('ONLINE_DECISION_MAKER_MODEL'),
@@ -302,6 +338,7 @@ decision_model = first_non_empty(
     app_env_values.get('QWEN32B_ONLINE_MODEL'),
     values.get('AI_DECISION_MAKER_MODEL'),
     app_env_values.get('AI_DECISION_MAKER_MODEL'),
+    current_decision_route.get('model'),
 )
 model_server_active_profile = first_non_empty(
     values.get('MODEL_SERVER_ACTIVE_PROFILE'),
@@ -315,7 +352,7 @@ if decision_api_base:
                 row['api_key'] = decision_api_key
             if decision_model:
                 row['model'] = decision_model
-            row['route_mode'] = 'online_slow_brain'
+            row['route_mode'] = current_decision_route.get('route_mode') or 'online_slow_brain'
             break
     online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
 elif model_server_active_profile == 'old':

@@ -836,6 +836,26 @@ def _model_ids_from_models_response(payload: dict[str, Any] | None) -> list[str]
     return model_ids
 
 
+def _is_loopback_api_base(value: Any) -> bool:
+    host = _host_from_api_base(value)
+    return bool(not host or host in LOOPBACK_HOSTS)
+
+
+def _decision_runtime_row(ai_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    for row in ai_rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name") or "").strip() == "decision_maker":
+            return row
+    for row in ai_rows:
+        if not isinstance(row, dict):
+            continue
+        model = str(row.get("model") or "").strip().lower()
+        if model and ("qwen" in model or "deepseek" in model):
+            return row
+    return {}
+
+
 def _platform_model_tunnel_summary(
     ai_rows: list[dict[str, Any]],
     local_tools: dict[str, Any],
@@ -845,10 +865,22 @@ def _platform_model_tunnel_summary(
         for row in ai_rows
         if isinstance(row, dict) and str(row.get("model") or "").strip()
     }
+    decision_row = _decision_runtime_row(ai_rows)
+    decision_model = str(decision_row.get("model") or "").strip()
+    decision_api_base = str(decision_row.get("api_base") or "").strip()
+    decision_available = bool(decision_row.get("available"))
+    decision_endpoint_ok = bool(decision_row.get("endpoint_ok"))
+    decision_uses_external_route = bool(
+        decision_api_base and not _is_loopback_api_base(decision_api_base)
+    )
     tunnels: list[dict[str, Any]] = []
     unavailable: list[dict[str, Any]] = []
     for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS:
         model = str(spec.get("model") or "").strip()
+        is_decision_tunnel = str(spec.get("role") or "") == "decision_maker"
+        required = True
+        if is_decision_tunnel and decision_uses_external_route:
+            required = False
         if model:
             probe = rows_by_model.get(model, {})
             available = bool(probe.get("available"))
@@ -865,6 +897,7 @@ def _platform_model_tunnel_summary(
                 "role": spec["role"],
                 "capability": spec["capability"],
                 "local_port": spec["local_port"],
+                "required": required,
                 "expected_api_base": spec["api_base"],
                 "api_base": probe.get("api_base") or spec["api_base"],
                 "model": model,
@@ -876,6 +909,10 @@ def _platform_model_tunnel_summary(
                 "latency_ms": probe.get("latency_ms"),
                 "error": str(probe.get("error") or ""),
             }
+            if is_decision_tunnel and decision_uses_external_route:
+                row["status"] = "standby" if endpoint_ok else "standby_unavailable"
+                row["active_decision_model"] = decision_model
+                row["active_decision_api_base"] = decision_api_base
         else:
             health = local_tools.get("health") if isinstance(local_tools.get("health"), dict) else {}
             status_probe = (
@@ -900,6 +937,7 @@ def _platform_model_tunnel_summary(
                 "role": spec["role"],
                 "capability": spec["capability"],
                 "local_port": spec["local_port"],
+                "required": required,
                 "expected_api_base": spec["api_base"],
                 "api_base": local_tools.get("api_base") or spec["api_base"],
                 "model": "",
@@ -917,26 +955,44 @@ def _platform_model_tunnel_summary(
                 ),
             }
         tunnels.append(row)
-        if not row["available"]:
+        if row["required"] and not row["available"]:
             unavailable.append(row)
 
     by_name = {str(row.get("name") or ""): row for row in tunnels}
+    local_decision_available = bool(by_name.get("qwen3-32b-trade", {}).get("available"))
+    can_call_decision = bool(decision_available or local_decision_available)
     can_call_expert = bool(by_name.get("BB-FinQuant-Expert-14B", {}).get("available"))
     can_call_quant_tool = bool(by_name.get("phase3-quant-api", {}).get("available"))
-    can_call_decision = bool(by_name.get("qwen3-32b-trade", {}).get("available"))
     blocker_codes = [
         f"tunnel_port_{int(row['local_port'])}_{str(row['status'] or 'unavailable')}"
         for row in unavailable
     ]
+    if not can_call_decision:
+        blocker_codes.append(
+            "decision_route_unavailable"
+            if decision_model
+            else "decision_route_not_configured"
+        )
+    unavailable_all = [row for row in tunnels if not row["available"]]
     return {
         "expected_ports": [int(spec["local_port"]) for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS],
-        "ready": not unavailable,
-        "available_count": len(tunnels) - len(unavailable),
-        "unavailable_count": len(unavailable),
+        "ready": not unavailable and can_call_decision,
+        "available_count": sum(1 for row in tunnels if row["available"]),
+        "unavailable_count": len(unavailable_all),
+        "blocking_unavailable_count": len(unavailable),
         "tunnels": tunnels,
         "unavailable_ports": [int(row["local_port"]) for row in unavailable],
+        "blocking_unavailable_ports": [int(row["local_port"]) for row in unavailable],
         "blocker_codes": blocker_codes,
         "can_call_decision_maker": can_call_decision,
+        "decision_route": {
+            "model": decision_model,
+            "api_base": decision_api_base,
+            "available": decision_available,
+            "endpoint_ok": decision_endpoint_ok,
+            "external": decision_uses_external_route,
+            "fallback_local_available": local_decision_available,
+        },
         "can_call_expert": can_call_expert,
         "can_call_quant_tool": can_call_quant_tool,
         "can_create_strategy": bool(can_call_decision and can_call_expert and can_call_quant_tool),
@@ -962,6 +1018,7 @@ def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict
             endpoint = endpoint[:-3]
         endpoint_rows.append(
             {
+                "name": str(item.get("name") or ""),
                 "label": str(item.get("label") or item.get("name") or model),
                 "provider_model": model,
                 "api_base": api_base,
@@ -997,8 +1054,11 @@ def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict
         else {}
     )
     primary = next(
-        (row for row in endpoint_rows if row.get("provider_model") == "qwen3-32b-trade"),
-        endpoint_rows[0] if endpoint_rows else {},
+        (row for row in endpoint_rows if row.get("name") == "decision_maker"),
+        next(
+            (row for row in endpoint_rows if row.get("provider_model") == "qwen3-32b-trade"),
+            endpoint_rows[0] if endpoint_rows else {},
+        ),
     )
     return {
         "vllm": dict(primary),

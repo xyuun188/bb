@@ -50,7 +50,7 @@ def render_server_monitor_probe(
         PRIMARY_MODEL_ID = {json.dumps(primary_model_id, ensure_ascii=False)}
         PRIMARY_MODEL_LABEL = {json.dumps(primary_model_label, ensure_ascii=False)}
         LOCAL_AI_TOOLS_API_KEY = {json.dumps(local_ai_tools_api_key, ensure_ascii=False)}
-        DECISION_MODEL_ID = "qwen3-32b-trade"
+        LOCAL_DECISION_MODEL_ID = "qwen3-32b-trade"
         DEEPSEEK_R1_MODEL_ID = "deepseek-r1-14b-risk"
         QWEN3_EXPERT_POOL_MODEL_ID = "BB-FinQuant-Expert-14B"
         ERROR_TEXT_LIMIT = 240
@@ -354,7 +354,20 @@ def render_server_monitor_probe(
 
 
         def primary_model_available(model_ids):
-            return target_model_available(model_ids, DECISION_MODEL_ID)
+            return target_model_available(model_ids, PRIMARY_MODEL_ID)
+
+
+        def primary_model_is_local_decision_candidate():
+            value = (PRIMARY_MODEL_ID or "").lower()
+            return bool(
+                value
+                and (
+                    value == LOCAL_DECISION_MODEL_ID.lower()
+                    or "qwen3-32b" in value
+                    or "qwen3-14b" in value
+                    or value == QWEN3_EXPERT_POOL_MODEL_ID.lower()
+                )
+            )
 
 
         def target_model_available(model_ids, target_model_id):
@@ -385,7 +398,7 @@ def render_server_monitor_probe(
             endpoint = f"127.0.0.1:{{port}}/v1"
             response = http_json(f"http://127.0.0.1:{{port}}/v1/models", timeout=4)
             model_ids = openai_model_ids(response)
-            target_model = target_model_id or PRIMARY_MODEL_ID
+            target_model = PRIMARY_MODEL_ID if target_model_id is None else target_model_id
             target_ok = target_model_available(model_ids, target_model)
             endpoint_ok = bool(response.get("ok"))
             model_mismatch = bool(endpoint_ok and model_ids and target_model and not target_ok)
@@ -501,8 +514,18 @@ def render_server_monitor_probe(
 
 
         def model_runtime():
+            local_decision_target = (
+                PRIMARY_MODEL_ID
+                if primary_model_is_local_decision_candidate()
+                else ""
+            )
+            local_decision_label = (
+                PRIMARY_MODEL_LABEL or "Local decision model"
+                if primary_model_is_local_decision_candidate()
+                else "Local decision fallback"
+            )
             vllm_endpoints = [
-                vllm_endpoint_runtime(8000, PRIMARY_MODEL_LABEL or "Qwen3 32B decision", DECISION_MODEL_ID),
+                vllm_endpoint_runtime(8000, local_decision_label, local_decision_target),
                 vllm_endpoint_runtime(8002, "DeepSeek R1 14B", DEEPSEEK_R1_MODEL_ID),
                 vllm_endpoint_runtime(8003, "BB-FinQuant Expert 14B", QWEN3_EXPERT_POOL_MODEL_ID),
             ]
@@ -511,8 +534,12 @@ def render_server_monitor_probe(
                     item
                     for item in vllm_endpoints
                     if item.get("primary_model_available")
-                    or str(item.get("provider_model") or "").lower()
-                    == str(DECISION_MODEL_ID or "").lower()
+                    or (
+                        primary_model_is_local_decision_candidate()
+                        and item.get("available")
+                        and str(item.get("provider_model") or "").lower()
+                        == str(PRIMARY_MODEL_ID or "").lower()
+                    )
                 ),
                 vllm_endpoints[0],
             )

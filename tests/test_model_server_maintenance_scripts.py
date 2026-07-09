@@ -167,6 +167,43 @@ def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(
     assert "BB-FinQuant-Expert-14B" in runtime_text
 
 
+def test_sync_to_online_server_runtime_env_preserves_existing_external_ai_models_decision(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    runtime_env = tmp_path / "bb-runtime.env"
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    monkeypatch.setattr(sync, "REMOTE_RUNTIME_ENV_PATH", str(runtime_env))
+    runtime_env.write_text(
+        "DATABASE_URL=postgresql+asyncpg://runtime\n"
+        "BB_SECURE_SETTINGS_KEY=runtime-key\n"
+        "AI_MODELS=["
+        '{"name":"decision_maker","api_base":"https://api.deepseek.com/v1",'
+        '"api_key":"unit-test-key","model":"deepseek-v4-pro",'
+        '"route_mode":"online_slow_brain","enabled":true}'
+        "]\n",
+        encoding="utf-8",
+    )
+    (app_dir / ".env").write_text("PROJECT_ONLY=yes\n", encoding="utf-8")
+
+    script = sync._runtime_env_update_script(
+        remote_app_dir=str(app_dir),
+        backup_runtime_env=False,
+        emit_summary=False,
+    )
+    exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
+
+    runtime_text = runtime_env.read_text(encoding="utf-8")
+    assert "https://api.deepseek.com/v1" in runtime_text
+    assert "deepseek-v4-pro" in runtime_text
+    assert "unit-test-key" in runtime_text
+    assert '"route_mode":"online_slow_brain"' in runtime_text
+    assert '"model":"qwen3-32b-trade"' not in runtime_text
+
+
 def test_sync_to_online_server_old_profile_routes_decision_to_alias(
     monkeypatch,
     tmp_path,

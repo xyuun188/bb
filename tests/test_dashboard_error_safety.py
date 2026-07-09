@@ -2372,6 +2372,101 @@ async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_por
     assert quant_tunnel["status"] != "ok"
 
 
+async def test_collect_platform_runtime_status_uses_external_decision_route(
+    monkeypatch,
+) -> None:
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [
+            {
+                "name": "decision_maker",
+                "label": "最终交易员",
+                "api_base": "https://api.deepseek.com/v1",
+                "api_key": "hidden-deepseek-key",
+                "model": "deepseek-v4-pro",
+                "enabled": True,
+            },
+            {
+                "name": "trend_expert",
+                "label": "趋势专家",
+                "api_base": "http://127.0.0.1:18003/v1",
+                "api_key": "",
+                "model": "BB-FinQuant-Expert-14B",
+                "enabled": True,
+            },
+        ],
+        local_ai_tools_api_base="http://127.0.0.1:18001",
+        local_ai_tools_api_key="hidden-tools-key",
+        ai_api_key="",
+        high_risk_review_api_base="http://127.0.0.1:18002/v1",
+        high_risk_review_api_key="",
+        high_risk_review_model="deepseek-r1-14b-risk",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            request = httpx.Request(method, url)
+            if url == "https://api.deepseek.com/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "deepseek-v4-pro"}]},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18003/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "BB-FinQuant-Expert-14B"}]},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18002/v1/models":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": "deepseek-r1-14b-risk"}]},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18001/health":
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "service": "phase3_quant_api", "root": "/data/BB"},
+                    request=request,
+                )
+            if url == "http://127.0.0.1:18001/models/status":
+                return httpx.Response(200, json={"available": True}, request=request)
+            return httpx.Response(200, json={"available": True}, request=request)
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+
+    runtime = server_monitor_status._platform_runtime_to_model_runtime(result)
+    assert runtime["vllm"]["name"] == "decision_maker"
+    assert runtime["vllm"]["provider_model"] == "deepseek-v4-pro"
+    tunnels = result["model_tunnels"]
+    assert tunnels["decision_route"]["external"] is True
+    assert tunnels["decision_route"]["available"] is True
+    assert tunnels["can_call_decision_maker"] is True
+    assert tunnels["can_create_strategy"] is True
+    assert 18000 not in tunnels["unavailable_ports"]
+    qwen_tunnel = next(row for row in tunnels["tunnels"] if row["local_port"] == 18000)
+    assert qwen_tunnel["required"] is False
+    assert qwen_tunnel["status"].startswith("standby")
+
+
 async def test_symbols_available_error_response_is_redacted(
     monkeypatch,
 ) -> None:

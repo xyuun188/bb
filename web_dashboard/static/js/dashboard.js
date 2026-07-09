@@ -6689,7 +6689,7 @@ function renderServerModelRuntime(data, container) {
     const vllmRows = vllmEndpoints.length ? vllmEndpoints : [vllm];
     const vllmInstanceCards = vllmRows.map(item => {
         const label = item.label || item.provider_model || 'vLLM';
-        const targetModel = item.provider_model || (String(label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : 'qwen3-32b-trade');
+        const targetModel = item.provider_model || item.model || '';
         const healthLine = runtimeEndpointSummary(item.health);
         const modelNames = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
         const mismatchLine = item.model_mismatch
@@ -6711,7 +6711,7 @@ function renderServerModelRuntime(data, container) {
         ? `<div class="server-monitor-process-list">${vllmEndpoints.map(item => {
             const endpointModels = Array.isArray(item.models) && item.models.length ? item.models.join('、') : '未返回模型名';
             const healthLine = runtimeEndpointSummary(item.health);
-            const targetModel = item.provider_model || (String(item.label || '').includes('DeepSeek') ? 'deepseek-r1-14b-risk' : '-');
+            const targetModel = item.provider_model || item.model || '-';
             const publicEndpoint = configuredOrPublicModelEndpoint(
                 targetModel,
                 item.api_base || item.endpoint

@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from config.settings import settings
 from core.server_monitor_probe import (
     display_provider_model_name,
     render_python_here_doc,
     render_server_monitor_probe,
 )
-from config.settings import settings
 from services import server_monitor_status
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -311,11 +311,55 @@ def test_server_monitor_probe_uses_port_role_when_primary_provider_is_expert() -
     vllm = cast(dict[str, object], runtime["vllm"])
     endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
 
-    assert vllm["endpoint"] == "127.0.0.1:8000/v1"
-    assert vllm["provider_model"] == "qwen3-32b-trade"
+    assert vllm["endpoint"] == "127.0.0.1:8003/v1"
+    assert vllm["provider_model"] == "BB-FinQuant-Expert-14B"
     assert vllm["available"] is True
     assert endpoints[2]["provider_model"] == "BB-FinQuant-Expert-14B"
     assert endpoints[2]["available"] is True
+
+
+def test_server_monitor_probe_treats_external_primary_as_local_fallback() -> None:
+    script = render_server_monitor_probe("deepseek-v4-pro", "deepseek-v4-pro")
+    namespace = _load_probe_namespace(script)
+
+    def fake_http_json(
+        url: str,
+        timeout: int = 3,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        model_by_port = {
+            "8000": "qwen3-14b-trade",
+            "8002": "deepseek-r1-14b-risk",
+            "8003": "BB-FinQuant-Expert-14B",
+        }
+        for port, model in model_by_port.items():
+            if url == f"http://127.0.0.1:{port}/v1/models":
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "latency_ms": 3.0,
+                    "truncated": False,
+                    "data": {"data": [{"id": model}]},
+                }
+        return {
+            "ok": False,
+            "status_code": 0,
+            "latency_ms": 0.0,
+            "truncated": False,
+            "data": {},
+        }
+
+    namespace["http_json"] = fake_http_json
+    runtime = cast(Callable[[], dict[str, object]], namespace["model_runtime"])()
+    vllm = cast(dict[str, object], runtime["vllm"])
+    endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
+
+    assert vllm["endpoint"] == "127.0.0.1:8000/v1"
+    assert vllm["label"] == "Local decision fallback"
+    assert vllm["provider_model"] == ""
+    assert vllm["available"] is True
+    assert vllm["model_mismatch"] is False
+    assert endpoints[0]["models"] == ["qwen3-14b-trade"]
 
 
 def test_primary_provider_model_id_prefers_decision_maker(
