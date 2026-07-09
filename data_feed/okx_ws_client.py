@@ -14,22 +14,27 @@ from collections.abc import Callable
 from typing import Any
 
 import structlog
-import websockets
 
 from config.settings import settings
 from core.exceptions import WebSocketConnectionError
 from core.safe_output import safe_error_text
 from data_feed.okx_ticker_volume import okx_swap_volume_fields, safe_float
+from services.okx_perpetual_sdk import (
+    OKX_WS_BUSINESS_URL,
+    OKX_WS_DEMO_URL,
+    OKX_WS_PUBLIC_URL,
+    OkxPublicWebSocketSdkStream,
+)
 
 logger = structlog.get_logger(__name__)
 
 # OKX WebSocket endpoints
 # Public URL: tickers, instruments, funding-rate, etc.
-WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
+WS_PUBLIC_URL = OKX_WS_PUBLIC_URL
 # Business URL: candlesticks, mark-price-candle, index-candle (moved from public in June 2023)
-WS_BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
+WS_BUSINESS_URL = OKX_WS_BUSINESS_URL
 # Demo URL: blocked in some regions, not used
-WS_DEMO_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+WS_DEMO_URL = OKX_WS_DEMO_URL
 
 
 class OKXWebSocketClient:
@@ -79,13 +84,8 @@ class OKXWebSocketClient:
         logger.info("connecting to OKX WebSocket", url=self._ws_url)
 
         try:
-            self._ws = await websockets.connect(
-                self._ws_url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5,
-                max_size=2**20,
-            )
+            self._ws = OkxPublicWebSocketSdkStream(self._ws_url)
+            await self._ws.connect()
             logger.info("OKX WebSocket connected")
             await self._subscribe()
         except Exception as e:
@@ -203,11 +203,15 @@ class OKXWebSocketClient:
                 except Exception:
                     logger.warning("ping failed, reconnecting...")
                     break
-            except websockets.ConnectionClosed as e:
-                logger.warning("websocket closed", code=e.code, reason=e.reason)
-                break
             except Exception as e:
-                logger.error("unexpected error in listen loop", error=safe_error_text(e))
+                if "ConnectionClosed" in type(e).__name__ or hasattr(e, "code"):
+                    logger.warning(
+                        "websocket closed",
+                        code=getattr(e, "code", None),
+                        reason=getattr(e, "reason", None),
+                    )
+                else:
+                    logger.error("unexpected error in listen loop", error=safe_error_text(e))
                 break
 
         # Auto-reconnect

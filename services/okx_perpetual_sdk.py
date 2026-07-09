@@ -9,6 +9,7 @@ executor and sync services already use, but the transport is the official
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import threading
@@ -33,6 +34,9 @@ OKX_SWAP_SETTLE_CCY = "USDT"
 OKX_CROSS_MARGIN_MODE = "cross"
 OKX_SERVER_TIME_PATH = "/api/v5/public/time"
 OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
+OKX_WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_WS_BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
+OKX_WS_DEMO_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 
 
 def okx_sdk_flag_for_mode(mode: str) -> str:
@@ -158,6 +162,59 @@ def _normalize_bool_text(value: Any) -> str:
     if text in {"false", "0", "no"}:
         return "false"
     return ""
+
+
+class OkxPublicWebSocketSdkStream:
+    """Small async stream wrapper around python-okx public WebSocket SDK."""
+
+    def __init__(self, url: str = OKX_WS_PUBLIC_URL) -> None:
+        self.url = url
+        self._client: Any | None = None
+        self._consume_task: asyncio.Task[Any] | None = None
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def connect(self) -> None:
+        from okx.websocket.WsPublicAsync import WsPublicAsync
+
+        self._client = WsPublicAsync(self.url, debug=False)
+        self._consume_task = await self._client.start()
+
+    def _on_message(self, message: str) -> None:
+        self._queue.put_nowait(message)
+
+    async def send(self, payload: str) -> None:
+        if self._client is None:
+            raise ExchangeAPIError("OKX WebSocket SDK client is not connected")
+        text = payload.decode() if isinstance(payload, bytes) else str(payload)
+        if text == "ping":
+            websocket = getattr(self._client, "websocket", None)
+            if websocket is not None:
+                await websocket.send(text)
+            return
+        try:
+            message = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ExchangeAPIError("OKX WebSocket SDK payload must be JSON") from exc
+        op = str(message.get("op") or "")
+        args = message.get("args") or []
+        request_id = message.get("id")
+        if op == "subscribe":
+            await self._client.subscribe(args, self._on_message, id=request_id)
+        elif op == "unsubscribe":
+            await self._client.unsubscribe(args, self._on_message, id=request_id)
+        else:
+            await self._client.send(op, args, callback=self._on_message, id=request_id)
+
+    async def recv(self) -> str:
+        return await self._queue.get()
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.stop()
+        if self._consume_task is not None and not self._consume_task.done():
+            self._consume_task.cancel()
+        self._client = None
+        self._consume_task = None
 
 
 def normalize_swap_inst_id(value: Any, *, field: str = "instId", required: bool = True) -> str:

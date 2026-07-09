@@ -1,22 +1,17 @@
-"""
-OKX official Python SDK client for perpetual market data and account balance.
-Wraps sync SDK calls in asyncio.to_thread for async compatibility.
-"""
+"""Compatibility helpers routed through the unified OKX perpetual SDK adapter."""
 
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
-from config.settings import settings
-from core.exceptions import ConfigError, ExchangeAPIError
+from core.exceptions import ExchangeAPIError
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
-from data_feed.okx_ticker_volume import okx_swap_volume_fields
-from services.okx_perpetual_sdk import okx_proxy_url, okx_sdk_flag_for_mode
+from data_feed.okx_ticker_volume import okx_swap_volume_fields, safe_float
+from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
 logger = structlog.get_logger(__name__)
 
@@ -34,42 +29,15 @@ def _raise_okx_api_error(result: dict[str, Any], fallback: str = "OKX API error"
     raise ExchangeAPIError(f"OKX API error [{code}]: {message}")
 
 
-def _make_market_api(mode: str) -> Any:
-    """Create a MarketAPI instance for the given mode.
-
-    NOTE: flag='1' means simulated/demo in the x-simulated-trading header.
-    """
-    import okx.MarketData as MarketData
-
-    return MarketData.MarketAPI(flag=okx_sdk_flag_for_mode(mode), debug=False, proxy=okx_proxy_url())
+def _make_exchange(mode: str) -> OkxPerpetualSdkExchange:
+    return OkxPerpetualSdkExchange(mode)
 
 
-def _make_public_api(mode: str) -> Any:
-    """Create a PublicAPI instance for OKX perpetual metadata."""
-    from okx.PublicData import PublicAPI
-
-    return PublicAPI(flag=okx_sdk_flag_for_mode(mode), debug=False, proxy=okx_proxy_url())
-
-
-def _make_account_api(mode: str) -> Any:
-    """Create an AccountAPI instance for the given mode.
-
-    NOTE: The python-okx SDK maps flag directly to the x-simulated-trading header,
-    where '1' = simulated/demo and '0' = real/live. So we use flag='1' for paper
-    and flag='0' for live (inverse of the SDK's documented convention).
-    """
-    from okx.Account import AccountAPI
-
-    creds = settings.get_okx_credentials(mode)
-    return AccountAPI(
-        api_key=creds.get("api_key", ""),
-        api_secret_key=creds.get("api_secret", ""),
-        passphrase=creds.get("passphrase", ""),
-        flag=okx_sdk_flag_for_mode(mode),
-        use_server_time=True,
-        debug=False,
-        proxy=okx_proxy_url(),
-    )
+def _ensure_okx_success(result: dict[str, Any], fallback: str = "OKX API error") -> None:
+    if not isinstance(result, dict):
+        raise ExchangeAPIError(f"{fallback}: unexpected response type {type(result).__name__}")
+    if str(result.get("code") or "0") != "0":
+        _raise_okx_api_error(result, fallback)
 
 
 async def fetch_klines(
@@ -84,60 +52,39 @@ async def fetch_klines(
     Defaults to perpetual swap (SWAP) for accurate pricing.
     Returns list of {time, open, high, low, close, volume} in chronological order.
     """
-    from datetime import datetime
+    inst_type = str(inst_type or "SWAP").upper()
+    if inst_type != "SWAP":
+        raise ExchangeAPIError(f"Only OKX SWAP klines are supported, got {inst_type!r}")
 
-    base = symbol.split("/")[0]
-    if inst_type == "SWAP":
-        instId = f"{base}-USDT-SWAP"
-    else:
-        instId = f"{base}-USDT"
-
-    def _sync():
-        api = _make_market_api(mode)
-        result = api.get_candlesticks(instId=instId, bar=bar, limit=limit)
-        if result.get("code") != "0":
-            _raise_okx_api_error(result)
-        raw = result.get("data", [])
-        # OKX returns newest first; reverse to chronological order (left to right)
-        raw.reverse()
-        return [
-            {
-                "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=UTC).isoformat(),
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
-            }
-            for c in raw
-        ]
-
-    return await asyncio.to_thread(_sync)
+    exchange = _make_exchange(mode)
+    rows = await exchange.fetch_ohlcv(symbol, timeframe=bar, limit=limit)
+    return [
+        {
+            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=UTC).isoformat(),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        }
+        for c in rows
+        if len(c) >= 6
+    ]
 
 
 async def fetch_usdt_balance(mode: str = "paper") -> float | None:
     """Fetch USDT balance from OKX account using official SDK."""
 
-    def _sync():
-        creds = settings.get_okx_credentials(mode)
-        if not creds.get("api_key") or not creds.get("api_secret"):
-            raise ConfigError("OKX API credentials are not configured")
-        if not creds.get("passphrase"):
-            raise ConfigError("OKX API passphrase is not configured")
-
-        api = _make_account_api(mode)
-        result = api.get_account_balance(ccy="USDT")
-        if result.get("code") != "0":
-            _raise_okx_api_error(result)
+    try:
+        exchange = _make_exchange(mode)
+        result = await exchange.privateGetAccountBalance({"ccy": "USDT"})
+        _ensure_okx_success(result)
         data = result.get("data", [])
         if data:
             inner_details = data[0].get("details", [])
             for d in inner_details:
                 return float(d.get("availBal", 0))
         return 0.0
-
-    try:
-        return await asyncio.to_thread(_sync)
     except Exception as e:
         logger.warning("fetch USDT balance failed", mode=mode, error=safe_error_text(e))
         return None
@@ -146,45 +93,43 @@ async def fetch_usdt_balance(mode: str = "paper") -> float | None:
 async def fetch_tickers(instType: str = "SWAP", mode: str = "paper") -> dict:
     """Fetch all tickers from OKX via official SDK."""
 
-    def _sync():
-        inst_type = str(instType or "SWAP").upper()
-        if inst_type != "SWAP":
-            raise ExchangeAPIError(f"Only OKX SWAP tickers are supported, got {inst_type!r}")
-        api = _make_market_api(mode)
-        result = api.get_tickers(instType=inst_type)
-        if result.get("code") != "0":
-            _raise_okx_api_error(result)
-        supported_swap_inst_ids = _fetch_supported_swap_inst_ids(mode)
-        tickers = {}
-        for t in result.get("data", []):
-            inst_id = str(t.get("instId") or "").strip().upper()
-            if supported_swap_inst_ids is not None and inst_id not in supported_swap_inst_ids:
-                continue
-            symbol = t.get("instId", "").replace("-", "/")
-            last = float(t.get("last", 0))
-            open24h = float(t.get("open24h", 0))
-            change_pct = ((last - open24h) / open24h * 100) if open24h else 0
-            volume_fields = okx_swap_volume_fields(t, last)
-            tickers[symbol] = {
-                "price": last,
-                "change_24h": change_pct,
-                "volume_24h": volume_fields["volume_24h_base"]
-                or volume_fields["volume_24h_contracts"],
-                **volume_fields,
-                "bid": float(t.get("bidPx", 0)),
-                "ask": float(t.get("askPx", 0)),
-            }
-        return tickers
-
-    return await asyncio.to_thread(_sync)
+    inst_type = str(instType or "SWAP").upper()
+    if inst_type != "SWAP":
+        raise ExchangeAPIError(f"Only OKX SWAP tickers are supported, got {inst_type!r}")
+    exchange = _make_exchange(mode)
+    result = await exchange.publicGetMarketTickers({"instType": "SWAP"})
+    _ensure_okx_success(result)
+    supported_swap_inst_ids = await _fetch_supported_swap_inst_ids(mode, exchange=exchange)
+    tickers = {}
+    for t in result.get("data", []):
+        inst_id = str(t.get("instId") or "").strip().upper()
+        if supported_swap_inst_ids is not None and inst_id not in supported_swap_inst_ids:
+            continue
+        symbol = t.get("instId", "").replace("-", "/")
+        last = safe_float(t.get("last"), 0.0)
+        open24h = safe_float(t.get("open24h"), 0.0)
+        change_pct = ((last - open24h) / open24h * 100) if open24h else 0
+        volume_fields = okx_swap_volume_fields(t, last)
+        tickers[symbol] = {
+            "price": last,
+            "change_24h": change_pct,
+            "volume_24h": volume_fields["volume_24h_base"] or volume_fields["volume_24h_contracts"],
+            **volume_fields,
+            "bid": safe_float(t.get("bidPx"), 0.0),
+            "ask": safe_float(t.get("askPx"), 0.0),
+        }
+    return tickers
 
 
-def _fetch_supported_swap_inst_ids(mode: str) -> set[str] | None:
+async def _fetch_supported_swap_inst_ids(
+    mode: str,
+    *,
+    exchange: OkxPerpetualSdkExchange | None = None,
+) -> set[str] | None:
     try:
-        api = _make_public_api(mode)
-        data = api.get_instruments(instType="SWAP")
-        if data.get("code") != "0":
-            _raise_okx_api_error(data)
+        ex = exchange or _make_exchange(mode)
+        data = await ex.publicGetPublicInstruments({"instType": "SWAP"})
+        _ensure_okx_success(data)
     except Exception as exc:
         logger.warning(
             "fetch OKX instrument metadata failed; using unfiltered SDK tickers",
@@ -201,45 +146,41 @@ def _fetch_supported_swap_inst_ids(mode: str) -> set[str] | None:
 async def get_available_symbols(mode: str = "paper") -> list[dict[str, str]]:
     """Get available OKX USDT perpetual swaps via public endpoint."""
 
-    def _sync():
-        api = _make_public_api(mode)
-        data = api.get_instruments(instType="SWAP")
-        if data.get("code") != "0":
-            _raise_okx_api_error(data)
-        symbols = []
-        for inst in supported_usdt_swap_instruments(data.get("data", [])):
-            inst_id = inst.get("instId", "")
-            base = inst_id.removesuffix("-USDT-SWAP")
-            if _is_suspicious_contract_base(base):
-                continue
-            symbols.append(
-                {
-                    "symbol": f"{base}/USDT",
-                    "base": base,
-                    "quote": "USDT",
-                    "type": "swap",
-                    "id": inst_id,
-                    "ccxt_symbol": f"{base}/USDT:USDT",
-                }
-            )
+    exchange = _make_exchange(mode)
+    data = await exchange.publicGetPublicInstruments({"instType": "SWAP"})
+    _ensure_okx_success(data)
+    symbols = []
+    for inst in supported_usdt_swap_instruments(data.get("data", [])):
+        inst_id = inst.get("instId", "")
+        base = inst_id.removesuffix("-USDT-SWAP")
+        if _is_suspicious_contract_base(base):
+            continue
+        symbols.append(
+            {
+                "symbol": f"{base}/USDT",
+                "base": base,
+                "quote": "USDT",
+                "type": "swap",
+                "id": inst_id,
+                "ccxt_symbol": f"{base}/USDT:USDT",
+            }
+        )
 
-        priority = {
-            "BTC": 0,
-            "ETH": 1,
-            "SOL": 2,
-            "XRP": 3,
-            "BNB": 4,
-            "DOGE": 5,
-            "ADA": 6,
-            "AVAX": 7,
-            "LINK": 8,
-            "SUI": 9,
-            "LTC": 10,
-            "BCH": 11,
-            "DOT": 12,
-            "TRX": 13,
-            "TON": 14,
-        }
-        return sorted(symbols, key=lambda x: (priority.get(x["base"], 1000), x["symbol"]))
-
-    return await asyncio.to_thread(_sync)
+    priority = {
+        "BTC": 0,
+        "ETH": 1,
+        "SOL": 2,
+        "XRP": 3,
+        "BNB": 4,
+        "DOGE": 5,
+        "ADA": 6,
+        "AVAX": 7,
+        "LINK": 8,
+        "SUI": 9,
+        "LTC": 10,
+        "BCH": 11,
+        "DOT": 12,
+        "TRX": 13,
+        "TON": 14,
+    }
+    return sorted(symbols, key=lambda x: (priority.get(x["base"], 1000), x["symbol"]))

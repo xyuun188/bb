@@ -342,65 +342,8 @@ class NewsFetcher:
         return articles
 
     async def fetch_okx_announcements(self) -> list[dict]:
-        """Fetch public OKX support announcements."""
-        articles: list[dict] = []
-        try:
-            client = await self._get_client()
-            resp = await client.get("https://www.okx.com/api/v5/support/announcements")
-            if resp.status_code != 200:
-                logger.debug("okx announcements fetch failed", status=resp.status_code)
-                return articles
-            data = resp.json()
-            groups = data.get("data") if isinstance(data, dict) else []
-            if not isinstance(groups, list):
-                return articles
-            for group in groups[:10]:
-                if isinstance(group, dict) and isinstance(group.get("details"), list):
-                    rows = group.get("details") or []
-                elif isinstance(group, dict):
-                    rows = [group]
-                else:
-                    rows = []
-                for item in rows[:20]:
-                    if not isinstance(item, dict):
-                        continue
-                    title = str(
-                        item.get("title") or item.get("annTitle") or item.get("detailsTitle") or ""
-                    ).strip()
-                    if not title:
-                        continue
-                    url = str(item.get("url") or item.get("link") or "")
-                    if not url:
-                        url = f"https://www.okx.com/help/{self._dedup_key(title)}"
-                    key = url or self._dedup_key(f"okx:{title}")
-                    if not self._remember_dedup(key):
-                        continue
-                    published = (
-                        item.get("pTime")
-                        or item.get("businessPTime")
-                        or item.get("publishTime")
-                        or item.get("createdTime")
-                        or item.get("created")
-                    )
-                    summary = str(
-                        item.get("summary") or item.get("desc") or item.get("content") or ""
-                    )[:500]
-                    articles.append(
-                        self._normalize_article(
-                            {
-                                "title": title,
-                                "summary": summary,
-                                "url": url,
-                                "symbols_mentioned": self._extract_symbols(f"{title} {summary}"),
-                                "published_at": self._parse_millis_time(published),
-                                "event_type": item.get("annType") or "okx_announcement",
-                            },
-                            "okx_announcements",
-                        )
-                    )
-        except Exception as e:
-            logger.debug("okx announcements error", error=safe_error_text(e))
-        return articles
+        """Fetch public OKX announcements from RSS instead of OKX REST API."""
+        return await self.fetch_rss("https://www.okx.com/help/rss/announcements-en.xml")
 
     async def fetch_coinmarketcal(self) -> list[dict]:
         """Fetch CoinMarketCal events when a free API key is configured."""
@@ -514,7 +457,6 @@ class NewsFetcher:
         """Fetch from all sources concurrently. Returns deduped article list."""
         tasks = [
             self.fetch_cryptopanic(),
-            self.fetch_okx_announcements(),
             self.fetch_coinmarketcal(),
             self.fetch_newsapi_crypto(),
         ] + [self.fetch_rss(url) for url in RSS_FEEDS]
