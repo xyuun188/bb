@@ -44,6 +44,8 @@ UNCONFIRMED_EXCHANGE_CLOSE_GRACE_SECONDS = 180.0
 OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND = "unknown"
 EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS = 6.0
 EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS = 8.0
+RECONCILE_OPTIONAL_DEADLINE_RESERVE_SECONDS = 0.75
+RECONCILE_OPTIONAL_MIN_TIMEOUT_SECONDS = 0.5
 RECONCILE_ORIGIN_SYSTEM_PROTECTION = "system_protection"
 RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
@@ -807,6 +809,8 @@ class OkxSyncService:
         self.trade_reflection_recorder = trade_reflection_recorder
         self.position_margin_calculator = position_margin_calculator
         self.memory_position_remover = memory_position_remover
+        self._reconcile_deadline_monotonic: float | None = None
+        self._reconcile_degraded_rows: list[dict[str, Any]] | None = None
 
     def _required_exchange_reconcile_lock(self) -> AbstractAsyncContextManager[Any]:
         if self.exchange_reconcile_lock is None:
@@ -817,6 +821,63 @@ class OkxSyncService:
         if self.round_error_recorder is None:
             raise RuntimeError("OkxSyncService requires round_error_recorder dependency")
         self.round_error_recorder(reason)
+
+    def _reconcile_seconds_remaining(self) -> float | None:
+        deadline = self._reconcile_deadline_monotonic
+        if not isinstance(deadline, (int, float)):
+            return None
+        return float(deadline) - asyncio.get_running_loop().time()
+
+    def _reconcile_optional_timeout(self, requested_seconds: float) -> float | None:
+        requested = max(float(requested_seconds or 0.0), 0.0)
+        remaining = self._reconcile_seconds_remaining()
+        if remaining is None:
+            return requested
+        available = remaining - RECONCILE_OPTIONAL_DEADLINE_RESERVE_SECONDS
+        if available < RECONCILE_OPTIONAL_MIN_TIMEOUT_SECONDS:
+            return None
+        return max(
+            RECONCILE_OPTIONAL_MIN_TIMEOUT_SECONDS,
+            min(requested, available),
+        )
+
+    def _record_reconcile_degraded(
+        self,
+        *,
+        kind: str,
+        note: str,
+        symbol: Any = None,
+        side: Any = None,
+        exchange_order_id: Any = None,
+        error: Any = None,
+    ) -> None:
+        rows = self._reconcile_degraded_rows
+        if rows is None:
+            rows = []
+            self._reconcile_degraded_rows = rows
+        row: dict[str, Any] = {
+            "kind": kind,
+            "source": "okx_authoritative_current_position",
+            "requires_attention": False,
+            "degraded": True,
+            "note": note,
+        }
+        if symbol not in (None, ""):
+            row["symbol"] = symbol
+        if side not in (None, ""):
+            row["side"] = side
+        if exchange_order_id not in (None, ""):
+            row["exchange_order_id"] = exchange_order_id
+        if error not in (None, ""):
+            row["error"] = safe_error_text(error, limit=180)
+        rows.append(row)
+
+    def _with_reconcile_degraded_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        degraded_rows = self._reconcile_degraded_rows or []
+        self._reconcile_degraded_rows = None
+        if not degraded_rows:
+            return rows
+        return [*rows, *degraded_rows]
 
     def _required_symbol_normalizer(self) -> Callable[[Any], str]:
         if self.symbol_normalizer is None:
@@ -969,12 +1030,17 @@ class OkxSyncService:
             return []
 
         try:
+            previous_deadline = self._reconcile_deadline_monotonic
+            self._reconcile_deadline_monotonic = (
+                asyncio.get_running_loop().time() + max(float(timeout_seconds or 0.0), 0.0)
+            )
             try:
                 return await asyncio.wait_for(
                     self.reconcile_exchange_positions(),
                     timeout=timeout_seconds,
                 )
             finally:
+                self._reconcile_deadline_monotonic = previous_deadline
                 lock.release()
         except TimeoutError:
             timeout_reason = (
@@ -1192,13 +1258,49 @@ class OkxSyncService:
 
         entry_side = "buy" if side == "long" else "sell"
         exit_side = "sell" if side == "long" else "buy"
+        timeout = self._reconcile_optional_timeout(8.0)
+        if timeout is None:
+            self._record_reconcile_degraded(
+                kind="active_order_lookup_deferred",
+                symbol=pos.symbol,
+                side=pos.side,
+                error="deadline_budget_exhausted",
+                note=(
+                    "OKX active-order lookup was deferred because the current-position "
+                    "reconciliation round had already spent its safe time budget."
+                ),
+            )
+            logger.info(
+                "deferred active OKX order lookup because reconciliation budget is low",
+                position_id=pos.id,
+                symbol=pos.symbol,
+                side=pos.side,
+            )
+            return {
+                "kind": OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND,
+                "order_id": None,
+                "side": None,
+                "state": "deferred",
+                "reduce_only": None,
+                "error": "deadline_budget_exhausted",
+            }
         try:
             executor = await self._required_okx_executor_provider()(pos.execution_mode or "paper")
             orders = await asyncio.wait_for(
                 executor.get_open_orders_strict(pos.symbol),
-                timeout=8.0,
+                timeout=timeout,
             )
         except TimeoutError:
+            self._record_reconcile_degraded(
+                kind="active_order_lookup_unavailable",
+                symbol=pos.symbol,
+                side=pos.side,
+                error="timeout",
+                note=(
+                    "OKX active-order lookup timed out; current positions stayed usable "
+                    "and this optional mismatch check will be retried later."
+                ),
+            )
             logger.warning(
                 "timed out checking active OKX orders before local close",
                 position_id=pos.id,
@@ -1289,15 +1391,34 @@ class OkxSyncService:
         paper_okx: Any,
         exchange_positions: list[dict],
     ) -> dict[tuple[str, str], dict[str, Any]]:
+        timeout = self._reconcile_optional_timeout(EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS)
+        if timeout is None:
+            self._record_reconcile_degraded(
+                kind="protection_order_map_deferred",
+                error="deadline_budget_exhausted",
+                note=(
+                    "OKX TP/SL protection map lookup was deferred because the current-position "
+                    "snapshot already consumed this reconciliation round's safe time budget."
+                ),
+            )
+            logger.info(
+                "deferred exchange protection order map because reconciliation budget is low"
+            )
+            return {}
         try:
             return await asyncio.wait_for(
                 provider(paper_okx, exchange_positions),
-                timeout=EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except TimeoutError:
             reason = (
                 "exchange protection order map timed out during reconciliation; "
                 "continuing without exchange TP/SL map this round"
+            )
+            self._record_reconcile_degraded(
+                kind="protection_order_map_unavailable",
+                error="timeout",
+                note=reason,
             )
             logger.warning(reason)
             return {}
@@ -1305,6 +1426,11 @@ class OkxSyncService:
             reason = (
                 "exchange protection order map failed during reconciliation; "
                 "continuing without exchange TP/SL map this round"
+            )
+            self._record_reconcile_degraded(
+                kind="protection_order_map_unavailable",
+                error=safe_error_text(exc),
+                note=reason,
             )
             logger.warning(reason, error=safe_error_text(exc))
             return {}
@@ -1316,17 +1442,44 @@ class OkxSyncService:
         *,
         context: str,
     ) -> dict[str, Any]:
+        timeout = self._reconcile_optional_timeout(EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS)
+        if timeout is None:
+            reason = (
+                f"exchange close-fill lookup deferred during {context}; "
+                "current OKX positions were refreshed and historical close-fill repair "
+                "will continue in a later sync round"
+            )
+            self._record_reconcile_degraded(
+                kind="close_fill_lookup_deferred",
+                symbol=getattr(position, "symbol", None),
+                side=getattr(position, "side", None),
+                error="deadline_budget_exhausted",
+                note=reason,
+            )
+            logger.info(
+                reason,
+                position_id=getattr(position, "id", None),
+                symbol=getattr(position, "symbol", None),
+                side=getattr(position, "side", None),
+            )
+            return {"lookup_unavailable": True, "error": "deadline_budget_exhausted"}
         try:
             return await asyncio.wait_for(
                 finder(position),
-                timeout=EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except TimeoutError:
             reason = (
                 f"exchange close-fill lookup timed out during {context}; "
                 "skipping local close reconciliation for this position this round"
             )
-            self._record_round_error(reason)
+            self._record_reconcile_degraded(
+                kind="close_fill_lookup_unavailable",
+                symbol=getattr(position, "symbol", None),
+                side=getattr(position, "side", None),
+                error="timeout",
+                note=reason,
+            )
             logger.warning(
                 reason,
                 position_id=getattr(position, "id", None),
@@ -1351,7 +1504,13 @@ class OkxSyncService:
                 f"exchange close-fill lookup failed during {context}; "
                 "skipping local close reconciliation for this position this round"
             )
-            self._record_round_error(f"{reason}: {error_text}")
+            self._record_reconcile_degraded(
+                kind="close_fill_lookup_unavailable",
+                symbol=getattr(position, "symbol", None),
+                side=getattr(position, "side", None),
+                error=error_text,
+                note=reason,
+            )
             logger.warning(
                 reason,
                 position_id=getattr(position, "id", None),
@@ -1368,6 +1527,7 @@ class OkxSyncService:
         AI decision loop. When that happens, close the local DB position using
         the exchange fill so the dashboard and account state remain truthful.
         """
+        self._reconcile_degraded_rows = []
         normalize_symbol = self._required_symbol_normalizer()
         parse_float = self._required_float_parser()
         exchange_position_is_open = self._required_exchange_position_open_checker()
@@ -1756,6 +1916,11 @@ class OkxSyncService:
                         context="missing exchange position",
                     )
                     if close_fill.get("lookup_unavailable"):
+                        lookup_error = str(close_fill.get("error") or "").strip().lower()
+                        temporary_lookup_unavailable = lookup_error in {
+                            "timeout",
+                            "deadline_budget_exhausted",
+                        }
                         reconciled.append(
                             {
                                 "kind": "close_fill_lookup_unavailable",
@@ -1764,11 +1929,19 @@ class OkxSyncService:
                                 "symbol": pos.symbol,
                                 "side": pos.side,
                                 "exchange_order_id": None,
-                                "requires_attention": True,
+                                "requires_attention": not temporary_lookup_unavailable,
+                                "degraded": temporary_lookup_unavailable,
+                                "error": lookup_error or None,
                                 "note": (
-                                    "OKX close-fill lookup was unavailable; local position "
-                                    "was left open until a real close fill or stable exchange "
-                                    "state is confirmed."
+                                    "OKX close-fill lookup was temporarily unavailable; "
+                                    "current positions stayed usable and historical close-fill "
+                                    "repair will retry in a later sync round."
+                                    if temporary_lookup_unavailable
+                                    else (
+                                        "OKX close-fill lookup was unavailable; local position "
+                                        "was left open until a real close fill or stable exchange "
+                                        "state is confirmed."
+                                    )
                                 ),
                             }
                         )
@@ -1777,6 +1950,13 @@ class OkxSyncService:
                         active_order = await self.active_exchange_order_for_local_position(pos)
                         if active_order:
                             if active_order.get("kind") == OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND:
+                                active_order_error = str(
+                                    active_order.get("error") or ""
+                                ).strip().lower()
+                                temporary_order_unavailable = active_order_error in {
+                                    "timeout",
+                                    "deadline_budget_exhausted",
+                                }
                                 logger.warning(
                                     "skip synthetic local close because OKX open order snapshot is unavailable",
                                     position_id=pos.id,
@@ -1792,7 +1972,9 @@ class OkxSyncService:
                                         "symbol": pos.symbol,
                                         "side": pos.side,
                                         "exchange_order_id": None,
-                                        "requires_attention": True,
+                                        "requires_attention": not temporary_order_unavailable,
+                                        "degraded": temporary_order_unavailable,
+                                        "error": active_order_error or None,
                                         "note": (
                                             "OKX 暂时没有返回对应持仓，且挂单状态查询失败或超时；"
                                             "为避免把查询失败误判为没有挂单，本地不估算平仓，等待下一轮同步确认。"
@@ -2037,13 +2219,13 @@ class OkxSyncService:
 
         except Exception as e:
             logger.warning("exchange position reconciliation failed", error=safe_error_text(e))
-            return reconciled
+            return self._with_reconcile_degraded_rows(reconciled)
 
         if reconciled:
             logger.info(
                 "reconciled exchange-closed positions", count=len(reconciled), positions=reconciled
             )
-        return reconciled
+        return self._with_reconcile_degraded_rows(reconciled)
 
     def _quarantine_orphan_local_position(
         self,

@@ -6978,6 +6978,92 @@ async def test_sync_service_records_reconcile_timeout_through_injected_boundary(
 
 
 @pytest.mark.asyncio
+async def test_sync_service_close_fill_timeout_is_degraded_not_round_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_errors: list[str] = []
+    monkeypatch.setattr(sync_module, "EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS", 0.001)
+    service = OkxSyncService(round_error_recorder=recorded_errors.append)
+
+    async def slow_close_fill(_position):
+        await asyncio.sleep(0.05)
+        return {"order_id": "should-not-finish"}
+
+    result = await service._find_exchange_close_fill_with_timeout(
+        slow_close_fill,
+        SimpleNamespace(id=21, symbol="BTC/USDT", side="long"),
+        context="unit test",
+    )
+
+    assert result == {"lookup_unavailable": True, "error": "timeout"}
+    assert recorded_errors == []
+    degraded_rows = service._with_reconcile_degraded_rows([])
+    assert degraded_rows == [
+        {
+            "kind": "close_fill_lookup_unavailable",
+            "source": "okx_authoritative_current_position",
+            "requires_attention": False,
+            "degraded": True,
+            "note": (
+                "exchange close-fill lookup timed out during unit test; "
+                "skipping local close reconciliation for this position this round"
+            ),
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "error": "timeout",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_close_fill_lookup_defers_when_reconcile_budget_is_low() -> None:
+    recorded_errors: list[str] = []
+    service = OkxSyncService(round_error_recorder=recorded_errors.append)
+    service._reconcile_deadline_monotonic = asyncio.get_running_loop().time() + 0.1
+    called = False
+
+    async def should_not_call(_position):
+        nonlocal called
+        called = True
+        return {"order_id": "unexpected"}
+
+    result = await service._find_exchange_close_fill_with_timeout(
+        should_not_call,
+        SimpleNamespace(id=22, symbol="ETH/USDT", side="short"),
+        context="missing exchange position",
+    )
+
+    assert result == {"lookup_unavailable": True, "error": "deadline_budget_exhausted"}
+    assert called is False
+    assert recorded_errors == []
+    degraded_rows = service._with_reconcile_degraded_rows([])
+    assert degraded_rows[0]["kind"] == "close_fill_lookup_deferred"
+    assert degraded_rows[0]["requires_attention"] is False
+    assert degraded_rows[0]["degraded"] is True
+    assert degraded_rows[0]["symbol"] == "ETH/USDT"
+    assert degraded_rows[0]["side"] == "short"
+
+
+def test_okx_authoritative_degraded_optional_rows_do_not_block_entries() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {  # type: ignore[method-assign]
+        "status": "ok",
+        "last_error": None,
+        "last_requires_attention_count": 0,
+        "last_samples": [
+            {
+                "kind": "close_fill_lookup_unavailable",
+                "requires_attention": False,
+                "degraded": True,
+                "symbol": "BTC/USDT",
+            }
+        ],
+    }
+
+    assert service._okx_authoritative_sync_entry_block_reason() is None
+
+
+@pytest.mark.asyncio
 async def test_sync_service_skips_duplicate_reconcile_without_recording_error():
     lock = asyncio.Lock()
     recorded_errors: list[str] = []
@@ -7153,8 +7239,13 @@ async def test_sync_service_close_fill_lookup_timeout_is_phase_specific(
     )
 
     assert result == {"lookup_unavailable": True, "error": "timeout"}
-    assert errors
-    assert "exchange close-fill lookup timed out during missing exchange position" in errors[0]
+    assert errors == []
+    degraded_rows = service._with_reconcile_degraded_rows([])
+    assert degraded_rows[0]["kind"] == "close_fill_lookup_unavailable"
+    assert degraded_rows[0]["requires_attention"] is False
+    assert degraded_rows[0]["degraded"] is True
+    assert degraded_rows[0]["symbol"] == "LINK/USDT"
+    assert degraded_rows[0]["side"] == "short"
 
 
 @pytest.mark.asyncio
