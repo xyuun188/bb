@@ -1,13 +1,11 @@
 """
-OKX official Python SDK client for market data and account balance.
-Uses python-okx with openapi.okx.com domain.
+OKX official Python SDK client for perpetual market data and account balance.
 Wraps sync SDK calls in asyncio.to_thread for async compatibility.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import UTC
 from typing import Any
 
@@ -18,29 +16,11 @@ from core.exceptions import ConfigError, ExchangeAPIError
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
+from services.okx_perpetual_sdk import okx_proxy_url, okx_sdk_flag_for_mode
 
 logger = structlog.get_logger(__name__)
 
 SUSPICIOUS_CONTRACT_BASE_TOKENS = ("TEST", "DEMO", "DUMMY", "MOCK", "SAMPLE")
-
-
-def _requests_proxies() -> dict[str, str] | None:
-    proxy = (
-        os.environ.get("OKX_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-    )
-    if not proxy:
-        return None
-    return {"http": proxy, "https": proxy}
-
-
-def _requests_headers(mode: str) -> dict[str, str] | None:
-    if settings.is_okx_demo(mode):
-        return {"x-simulated-trading": "1"}
-    return None
 
 
 def _is_suspicious_contract_base(base: str | None) -> bool:
@@ -61,8 +41,14 @@ def _make_market_api(mode: str) -> Any:
     """
     import okx.MarketData as MarketData
 
-    flag = "0" if mode == "live" else "1"
-    return MarketData.MarketAPI(flag=flag, debug=False)
+    return MarketData.MarketAPI(flag=okx_sdk_flag_for_mode(mode), debug=False, proxy=okx_proxy_url())
+
+
+def _make_public_api(mode: str) -> Any:
+    """Create a PublicAPI instance for OKX perpetual metadata."""
+    from okx.PublicData import PublicAPI
+
+    return PublicAPI(flag=okx_sdk_flag_for_mode(mode), debug=False, proxy=okx_proxy_url())
 
 
 def _make_account_api(mode: str) -> Any:
@@ -75,14 +61,14 @@ def _make_account_api(mode: str) -> Any:
     from okx.Account import AccountAPI
 
     creds = settings.get_okx_credentials(mode)
-    flag = "0" if mode == "live" else "1"
     return AccountAPI(
         api_key=creds.get("api_key", ""),
         api_secret_key=creds.get("api_secret", ""),
         passphrase=creds.get("passphrase", ""),
-        flag=flag,
+        flag=okx_sdk_flag_for_mode(mode),
         use_server_time=True,
         debug=False,
+        proxy=okx_proxy_url(),
     )
 
 
@@ -157,17 +143,18 @@ async def fetch_usdt_balance(mode: str = "paper") -> float | None:
         return None
 
 
-async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
+async def fetch_tickers(instType: str = "SWAP", mode: str = "paper") -> dict:
     """Fetch all tickers from OKX via official SDK."""
 
     def _sync():
+        inst_type = str(instType or "SWAP").upper()
+        if inst_type != "SWAP":
+            raise ExchangeAPIError(f"Only OKX SWAP tickers are supported, got {inst_type!r}")
         api = _make_market_api(mode)
-        result = api.get_tickers(instType=instType)
+        result = api.get_tickers(instType=inst_type)
         if result.get("code") != "0":
             _raise_okx_api_error(result)
-        supported_swap_inst_ids = (
-            _fetch_supported_swap_inst_ids(mode) if str(instType).upper() == "SWAP" else None
-        )
+        supported_swap_inst_ids = _fetch_supported_swap_inst_ids(mode)
         tickers = {}
         for t in result.get("data", []):
             inst_id = str(t.get("instId") or "").strip().upper()
@@ -193,17 +180,9 @@ async def fetch_tickers(instType: str = "SPOT", mode: str = "paper") -> dict:
 
 
 def _fetch_supported_swap_inst_ids(mode: str) -> set[str] | None:
-    import requests
-
-    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
     try:
-        resp = requests.get(
-            url,
-            timeout=10,
-            proxies=_requests_proxies(),
-            headers=_requests_headers(mode),
-        )
-        data = resp.json()
+        api = _make_public_api(mode)
+        data = api.get_instruments(instType="SWAP")
         if data.get("code") != "0":
             _raise_okx_api_error(data)
     except Exception as exc:
@@ -221,17 +200,10 @@ def _fetch_supported_swap_inst_ids(mode: str) -> set[str] | None:
 
 async def get_available_symbols(mode: str = "paper") -> list[dict[str, str]]:
     """Get available OKX USDT perpetual swaps via public endpoint."""
-    import requests
 
     def _sync():
-        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-        resp = requests.get(
-            url,
-            timeout=10,
-            proxies=_requests_proxies(),
-            headers=_requests_headers(mode),
-        )
-        data = resp.json()
+        api = _make_public_api(mode)
+        data = api.get_instruments(instType="SWAP")
         if data.get("code") != "0":
             _raise_okx_api_error(data)
         symbols = []

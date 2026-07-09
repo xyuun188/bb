@@ -149,6 +149,7 @@ async def test_okx_position_settlement_sync_reconciles_official_funding_fee(
 
         summary = await OkxPositionSettlementSyncService(
             mode="paper",
+            lookback_hours=24 * 14,
             executor_factory=_executor_factory(ccxt),
         ).sync_once()
 
@@ -202,6 +203,7 @@ async def test_okx_position_settlement_sync_records_funding_fee_failure_reason(
 
         summary = await OkxPositionSettlementSyncService(
             mode="paper",
+            lookback_hours=24 * 14,
             retry_seconds=10.0,
             executor_factory=_executor_factory(ccxt),
         ).sync_once()

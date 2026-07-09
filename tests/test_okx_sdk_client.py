@@ -35,6 +35,24 @@ class _FailingAccountApi:
         return {"code": "51001", "msg": self.message}
 
 
+class _InstrumentPublicApi:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.calls: list[dict[str, Any]] = []
+
+    def get_instruments(
+        self,
+        instType: str,  # noqa: N803
+        uly: str = "",
+        instId: str = "",  # noqa: N803
+        instFamily: str = "",  # noqa: N803
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {"instType": instType, "uly": uly, "instId": instId, "instFamily": instFamily}
+        )
+        return {"code": "0", "data": list(self.rows)}
+
+
 def _leaking_okx_message() -> tuple[str, str, str]:
     leaked_value = "abcdefghi" + "jklmnopqrst" + "uvwxyz123456"
     hidden_value = "plain-credential-value"
@@ -91,59 +109,39 @@ async def test_fetch_tickers_raises_typed_redacted_exchange_error(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_fetch_swap_tickers_filters_to_supported_crypto_instruments(monkeypatch) -> None:
-    calls: list[dict[str, Any]] = []
-
-    class _Response:
-        def json(self) -> dict[str, Any]:
-            return {
-                "code": "0",
-                "data": [
-                    _instrument("BTC-USDT-SWAP", "1"),
-                    _instrument("PLTR-USDT-SWAP", "3"),
-                ],
-            }
-
-    import requests
-
-    def fake_get(*args, **kwargs):
-        calls.append(kwargs)
-        return _Response()
+    public_api = _InstrumentPublicApi(
+        [
+            _instrument("BTC-USDT-SWAP", "1"),
+            _instrument("PLTR-USDT-SWAP", "3"),
+        ]
+    )
 
     monkeypatch.setattr(okx_sdk_client, "_make_market_api", lambda _mode: _TickerMarketApi())
-    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(okx_sdk_client, "_make_public_api", lambda _mode: public_api)
 
     tickers = await okx_sdk_client.fetch_tickers(instType="SWAP")
 
     assert set(tickers) == {"BTC/USDT/SWAP"}
-    assert calls[0]["headers"] == {"x-simulated-trading": "1"}
+    assert public_api.calls == [
+        {"instType": "SWAP", "uly": "", "instId": "", "instFamily": ""}
+    ]
 
 
 @pytest.mark.asyncio
 async def test_get_available_symbols_uses_demo_instrument_universe_for_paper(
     monkeypatch,
 ) -> None:
-    calls: list[dict[str, Any]] = []
+    public_api = _InstrumentPublicApi(
+        [
+            _instrument("BTC-USDT-SWAP", "1"),
+            _instrument("BCH-USDT-SWAP", "1"),
+            {**_instrument("LINEA-USDT-SWAP", "1"), "uly": "LINEA-USDT"},
+            {**_instrument("SKY-USDT-SWAP", "1"), "uly": "LINEA-USDT"},
+            _instrument("PLTR-USDT-SWAP", "3"),
+        ]
+    )
 
-    class _Response:
-        def json(self) -> dict[str, Any]:
-            return {
-                "code": "0",
-                "data": [
-                    _instrument("BTC-USDT-SWAP", "1"),
-                    _instrument("BCH-USDT-SWAP", "1"),
-                    {**_instrument("LINEA-USDT-SWAP", "1"), "uly": "LINEA-USDT"},
-                    {**_instrument("SKY-USDT-SWAP", "1"), "uly": "LINEA-USDT"},
-                    _instrument("PLTR-USDT-SWAP", "3"),
-                ],
-            }
-
-    import requests
-
-    def fake_get(*args, **kwargs):
-        calls.append(kwargs)
-        return _Response()
-
-    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(okx_sdk_client, "_make_public_api", lambda _mode: public_api)
 
     symbols = await okx_sdk_client.get_available_symbols(mode="paper")
 
@@ -152,7 +150,9 @@ async def test_get_available_symbols_uses_demo_instrument_universe_for_paper(
         "BCH-USDT-SWAP",
         "SKY-USDT-SWAP",
     ]
-    assert calls[0]["headers"] == {"x-simulated-trading": "1"}
+    assert public_api.calls == [
+        {"instType": "SWAP", "uly": "", "instId": "", "instFamily": ""}
+    ]
 
 
 @pytest.mark.asyncio

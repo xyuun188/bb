@@ -154,7 +154,6 @@ def test_dashboard_internal_api_requests_handle_auth_expiry() -> None:
         "const res = await fetch(url, { cache: 'no-store' });",
         "const res = await fetch(url, options);",
         "await fetch('/api/auth/logout', dashboardWriteOptions({",
-        "const res = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);",  # noqa: E501
     }
 
     for line in script.splitlines():
@@ -164,6 +163,7 @@ def test_dashboard_internal_api_requests_handle_auth_expiry() -> None:
     assert "fetchWithAuth('/api/settings/okx/balance'" in script
     assert "fetchWithAuth('/api/control/mode'" in script
     assert "fetchWithAuth('/api/settings/okx'" in script
+    assert "www.okx.com/api/v5" not in script
 
 
 def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:

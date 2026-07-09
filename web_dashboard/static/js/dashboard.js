@@ -124,7 +124,6 @@ const FIXED_AI_EXPERT_FALLBACKS = [
     },
 ];
 let recentDecisionsRefreshTimer = null;
-const okxTickerCache = {};
 let positionsRequestToken = 0;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
@@ -894,50 +893,6 @@ function buildPositionTickers(accounts) {
 
 function marketOpenPositions(market) {
     return Array.isArray(market?.open_positions) ? market.open_positions : [];
-}
-
-function toOKXSwapInstId(symbol) {
-    const base = String(symbol || '').split('/')[0].split('-')[0].split(':')[0];
-    return base ? `${base}-USDT-SWAP` : '';
-}
-
-async function fetchOKXTicker(symbol) {
-    const cached = okxTickerCache[symbol];
-    if (cached && Date.now() - cached.ts < 5000) return cached.data;
-
-    const instId = toOKXSwapInstId(symbol);
-    if (!instId) return null;
-
-    const res = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);
-    const json = await res.json();
-    const raw = json?.data?.[0];
-    if (!raw) return null;
-
-    const price = Number(raw.last || 0);
-    const displayOpen = Number(raw.sodUtc8 || raw.open24h || 0);
-    const change = displayOpen ? ((price - displayOpen) / displayOpen * 100) : 0;
-    const data = {
-        price,
-        change_24h: change,
-        volume_24h: Number(raw.vol24h || 0),
-        bid: Number(raw.bidPx || 0),
-        ask: Number(raw.askPx || 0),
-    };
-    okxTickerCache[symbol] = { ts: Date.now(), data };
-    return data;
-}
-
-async function enrichTickersFromOKX(tickers) {
-    const enriched = { ...tickers };
-    await Promise.all(Object.keys(enriched).map(async (symbol) => {
-        try {
-            const liveTicker = await fetchOKXTicker(symbol);
-            if (liveTicker) enriched[symbol] = { ...enriched[symbol], ...liveTicker };
-        } catch (e) {
-            console.debug('OKX ticker fallback failed', symbol, e);
-        }
-    }));
-    return enriched;
 }
 
 function updateMarketData(market, accounts = []) {

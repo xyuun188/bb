@@ -1,5 +1,5 @@
 """
-OKX live/demo executor via CCXT.
+OKX live/demo executor via the official python-okx SDK adapter.
 Sends real orders to OKX exchange (demo or production based on settings).
 Includes retry logic, rate limiting, and error handling.
 """
@@ -7,7 +7,6 @@ Includes retry logic, rate limiting, and error handling.
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import time
 from datetime import UTC, datetime
@@ -35,6 +34,7 @@ from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import OkxNativeFactsClient
+from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
 logger = structlog.get_logger(__name__)
 
@@ -51,20 +51,6 @@ OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 ATTACHED_PROTECTION_MIN_STOP_PCT = 0.012
 ATTACHED_PROTECTION_MIN_TAKE_PROFIT_PCT = 0.024
 ATTACHED_PROTECTION_MIN_TRIGGER_GAP_PCT = 0.0015
-
-
-def _okx_proxy_url() -> str | None:
-    return (
-        settings.okx_proxy
-        or os.environ.get("OKX_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-        or os.environ.get("ALL_PROXY")
-        or os.environ.get("all_proxy")
-    )
-
 
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
@@ -92,7 +78,7 @@ class TokenBucket:
 
 
 class OKXExecutor(AbstractExecutor):
-    """Executes trades on OKX via CCXT.
+    """Executes trades on OKX via the official python-okx SDK adapter.
 
     In demo mode (settings.okx_demo=True), trades go to OKX demo trading environment.
     In production mode, real orders are placed.
@@ -113,35 +99,10 @@ class OKXExecutor(AbstractExecutor):
         return self._mode_override or mode_manager.mode.value
 
     async def initialize(self) -> None:
-        import ccxt.async_support as ccxt_async
-
         mode = self.executor_mode
-        creds = settings.get_okx_credentials(mode)
         is_demo = settings.is_okx_demo(mode)
 
-        config: dict[str, Any] = {
-            "apiKey": creds["api_key"],
-            "secret": creds["api_secret"],
-            "enableRateLimit": True,
-            "options": {
-                "adjustForTimeDifference": True,
-                "defaultType": "swap",
-                "defaultSubType": "linear",
-                "fetchMarkets": ["swap"],
-            },
-        }
-        if creds.get("passphrase"):
-            config["password"] = creds["passphrase"]
-        if is_demo:
-            # OKX demo trading uses the normal REST host with this header.
-            config["headers"] = {"x-simulated-trading": "1"}
-        proxy_url = _okx_proxy_url()
-        if proxy_url:
-            config["aiohttp_proxy"] = proxy_url
-
-        self._exchange = ccxt_async.okx(config)
-        if is_demo:
-            self._exchange.set_sandbox_mode(True)
+        self._exchange = OkxPerpetualSdkExchange(mode)
         self._ensure_rest_url()
 
         try:
@@ -193,7 +154,7 @@ class OKXExecutor(AbstractExecutor):
         )
 
     def _ensure_rest_url(self) -> None:
-        """Repair CCXT OKX URL fields before every exchange call."""
+        """Keep legacy URL guards harmless for the SDK-backed exchange adapter."""
         if self._exchange is None:
             return
         urls = getattr(self._exchange, "urls", None)
@@ -218,9 +179,8 @@ class OKXExecutor(AbstractExecutor):
         """Load only live linear USDT perpetual swaps.
 
         OKX demo public instruments can include test/preopen contracts with missing
-        fields. CCXT's full load_markets() tries to parse all of them and can fail
-        before credentials are even tested. The trading system only needs live
-        USDT swaps, so filter the raw instrument list before parsing.
+        fields. The trading system only needs live USDT swaps, so filter the raw
+        instrument list before building local market rules.
         """
         if self._exchange is None:
             raise ExchangeAPIError("OKX exchange is not initialized")
@@ -241,7 +201,7 @@ class OKXExecutor(AbstractExecutor):
         markets: Any,
         instruments: list[Any],
     ) -> None:
-        """Preserve OKX raw contract rules after CCXT market parsing.
+        """Preserve OKX raw contract rules after local market parsing.
 
         Some OKX swap instruments, notably BTC/ETH, have ``ctVal`` below 1.
         If the parsed market loses that raw value, the executor can mistake
@@ -428,8 +388,6 @@ class OKXExecutor(AbstractExecutor):
 
     async def _with_retry(self, fn, *args, **kwargs):
         """Execute an API call with retry + rate limit handling."""
-        import ccxt.async_support as ccxt_async
-
         last_error = None
         method_name = getattr(fn, "__name__", "")
         for attempt in range(MAX_RETRIES):
@@ -451,15 +409,11 @@ class OKXExecutor(AbstractExecutor):
                 raise ExchangeAPIError(
                     f"OKX REST call timed out after {OKX_REST_CALL_TIMEOUT:.0f}s: {method_name}"
                 ) from e
-            except ccxt_async.RateLimitExceeded as e:
-                logger.warning("rate limited", attempt=attempt)
-                await asyncio.sleep(RETRY_DELAY * (2**attempt))
-                last_error = e
-            except ccxt_async.NetworkError as e:
+            except ExchangeAPIError as e:
                 message = safe_error_text(e)
                 if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
                     logger.warning(
-                        "OKX network time drift detected; resyncing and retrying",
+                        "OKX SDK time drift detected; resyncing and retrying",
                         method=method_name,
                         attempt=attempt,
                         error=message,
@@ -468,28 +422,17 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                logger.warning("network error", attempt=attempt, error=message)
-                await asyncio.sleep(RETRY_DELAY * (2**attempt))
-                last_error = e
-            except ccxt_async.ExchangeError as e:
-                message = safe_error_text(e)
-                if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
-                    logger.warning(
-                        "OKX exchange time drift detected; resyncing and retrying",
-                        method=method_name,
-                        attempt=attempt,
-                        error=message,
-                    )
-                    await self._sync_time_difference()
+                if self._is_rate_limit_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning("OKX SDK rate limited", method=method_name, attempt=attempt)
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                logger.error("exchange error", error=message)
+                logger.error("OKX SDK exchange error", error=message)
                 raise ExchangeAPIError(message) from e
             except Exception as e:
                 if self._is_broken_rest_url_error(e) and attempt < MAX_RETRIES - 1:
                     logger.warning(
-                        "OKX executor REST URL state invalid; reinitializing CCXT client",
+                        "OKX executor REST URL state invalid; reinitializing SDK client",
                         method=method_name,
                         attempt=attempt,
                         error=safe_error_text(e),
@@ -500,9 +443,45 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
+                message = safe_error_text(e)
+                if self._is_rate_limit_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning("OKX SDK call rate limited", method=method_name, attempt=attempt)
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
+                if self._is_network_retryable_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        "OKX SDK network error; retrying",
+                        method=method_name,
+                        attempt=attempt,
+                        error=message,
+                    )
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
                 raise
 
         raise RateLimitError(f"Max retries exceeded: {safe_error_text(last_error)}")
+
+    @staticmethod
+    def _is_rate_limit_error(message: Any) -> bool:
+        text = str(message or "").lower()
+        return "rate limit" in text or "too many requests" in text or "50011" in text
+
+    @staticmethod
+    def _is_network_retryable_error(message: Any) -> bool:
+        text = str(message or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection",
+                "network",
+                "temporarily unavailable",
+                "remote protocol error",
+            )
+        )
 
     async def place_order(
         self,
@@ -538,7 +517,7 @@ class OKXExecutor(AbstractExecutor):
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
-            # Map action to CCXT side
+            # Map action to OKX order side.
             if decision.action == Action.LONG:
                 side = "buy"
             elif decision.action == Action.SHORT:
@@ -3525,30 +3504,6 @@ class OKXExecutor(AbstractExecutor):
         except Exception as e:
             logger.debug(
                 "fetch leverage tiers failed",
-                symbol=okx_symbol,
-                error=safe_error_text(e),
-            )
-
-        try:
-            market = await self._market_for_symbol(okx_symbol)
-            inst_id = (market.get("info") or {}).get("instId") or okx_symbol.replace(
-                "/", "-"
-            ).replace(":USDT", "-SWAP")
-            estimate = await self._with_retry(
-                ccxt.privateGetAccountAdjustLeverageInfo,
-                {
-                    "instType": "SWAP",
-                    "mgnMode": params.get("mgnMode", "cross"),
-                    "lever": str(max(1, requested_leverage)),
-                    "instId": inst_id,
-                },
-            )
-            for item in (estimate or {}).get("data") or []:
-                if isinstance(item, dict):
-                    values.append(self._safe_float(item.get("maxLever"), 0.0))
-        except Exception as e:
-            logger.debug(
-                "fetch OKX adjust leverage info failed",
                 symbol=okx_symbol,
                 error=safe_error_text(e),
             )

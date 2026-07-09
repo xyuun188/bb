@@ -158,6 +158,14 @@ async def test_dashboard_ticker_fallback_reads_open_position_prices_from_db(
     await _use_temp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(dashboard, "_data_service", None)
     monkeypatch.setattr(dashboard, "_trading_service", None)
+    async def _empty_public_ticker_map(_symbols):
+        return {}
+
+    async def _empty_exchange_position_mark_map(_mode=None):
+        return {}
+
+    monkeypatch.setattr(dashboard, "_get_public_ticker_map", _empty_public_ticker_map)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", _empty_exchange_position_mark_map)
     try:
         async with get_session_ctx() as session:
             session.add(

@@ -89,48 +89,6 @@ def _assert_execution_account_configured(mode: str) -> None:
     raise HTTPException(status_code=409, detail=detail)
 
 
-def _symbol_to_okx_inst_id(symbol: str, inst_type: str = "SWAP") -> str:
-    """Convert BTC/USDT or BTC-USDT-SWAP to OKX instrument id."""
-    normalized = (symbol or "BTC/USDT").strip().upper().replace("_", "-")
-    if normalized.endswith("-SWAP") or normalized.endswith("-USDT"):
-        return normalized
-
-    base = normalized.split("/")[0].split("-")[0]
-    return f"{base}-USDT-SWAP" if inst_type == "SWAP" else f"{base}-USDT"
-
-
-async def _fetch_okx_public_klines(symbol: str, bar: str, limit: int) -> list[dict]:
-    """Fetch OKX public candles directly so charts work without the data service."""
-    import httpx
-
-    inst_id = _symbol_to_okx_inst_id(symbol, inst_type="SWAP")
-    safe_limit = max(1, min(int(limit or 100), 300))
-    url = "https://www.okx.com/api/v5/market/candles"
-    params = {"instId": inst_id, "bar": bar, "limit": str(safe_limit)}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        payload = resp.json()
-
-    if payload.get("code") != "0":
-        raise RuntimeError(payload.get("msg") or f"OKX API error: {payload.get('code')}")
-
-    rows = payload.get("data", [])
-    rows = sorted(rows, key=lambda c: int(c[0]))
-    return [
-        {
-            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=UTC).isoformat(),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5]) if len(c) > 5 else 0.0,
-        }
-        for c in rows
-    ]
-
-
 @router.post("/control/mode")
 async def switch_mode(req: ModeSwitchRequest):
     """Switch between paper and live trading modes."""
@@ -274,18 +232,7 @@ async def get_klines(symbol: str, timeframe: str = "1H", limit: int = 100):
             error=safe_error_text(exc),
         )
 
-    # Public OKX REST fallback works even when the trading/data services are stopped.
-    if not data:
-        try:
-            data = await _fetch_okx_public_klines(symbol, bar=bar, limit=limit)
-        except Exception as exc:
-            logger.warning(
-                "failed to fetch klines from OKX public REST",
-                symbol=symbol,
-                error=safe_error_text(exc),
-            )
-
-    # Fallback to CCXT if SDK fails
+    # Fallback to the shared data-service client; it also uses the unified SDK adapter.
     if not data and _dash._data_service and _dash._data_service.rest_client:
         try:
             raw_klines = await _dash._data_service.rest_client.fetch_ohlcv(
@@ -304,7 +251,7 @@ async def get_klines(symbol: str, timeframe: str = "1H", limit: int = 100):
             ]
         except Exception as exc:
             logger.warning(
-                "failed to fetch klines from CCXT fallback",
+                "failed to fetch klines from data-service SDK fallback",
                 symbol=symbol,
                 error=safe_error_text(exc),
             )

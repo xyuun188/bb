@@ -1,5 +1,5 @@
 """
-OKX REST client via CCXT for fallback and private API operations.
+OKX REST client via the official OKX SDK for fallback and private API operations.
 Used when WebSocket is unavailable or for account/trading endpoints.
 """
 
@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
 from typing import Any
 
-import ccxt.async_support as ccxt_async
 import structlog
 
 from config.settings import settings
@@ -24,6 +22,7 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
+from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
 logger = structlog.get_logger(__name__)
 
@@ -31,59 +30,23 @@ OKX_REST_URL = "https://{hostname}"
 OKX_HOSTNAME = "www.okx.com"
 SUSPICIOUS_CONTRACT_BASE_TOKENS = ("TEST", "DEMO", "DUMMY", "MOCK", "SAMPLE")
 
-
-def _okx_proxy_url() -> str | None:
-    return (
-        settings.okx_proxy
-        or os.environ.get("OKX_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-        or os.environ.get("ALL_PROXY")
-        or os.environ.get("all_proxy")
-    )
-
-
 def _is_suspicious_contract_base(base: str | None) -> bool:
     value = str(base or "").upper()
     return bool(value and any(token in value for token in SUSPICIOUS_CONTRACT_BASE_TOKENS))
 
 
 class OKXRestClient:
-    """Async REST client wrapping CCXT for OKX."""
+    """Async REST client wrapping the official OKX SDK adapter."""
 
     def __init__(self) -> None:
-        self._exchange: ccxt_async.okx | None = None
+        self._exchange: OkxPerpetualSdkExchange | None = None
 
-    async def _get_exchange(self) -> ccxt_async.okx:
+    async def _get_exchange(self) -> OkxPerpetualSdkExchange:
         if self._exchange is None:
             mode = mode_manager.mode.value
-            creds = settings.get_okx_credentials(mode)
             is_demo = settings.is_okx_demo(mode)
 
-            config: dict[str, Any] = {
-                "apiKey": creds["api_key"],
-                "secret": creds["api_secret"],
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "swap",
-                    "defaultSubType": "linear",
-                    "fetchMarkets": ["swap"],
-                },
-            }
-            if creds.get("passphrase"):
-                config["password"] = creds["passphrase"]
-            if is_demo:
-                config["headers"] = {"x-simulated-trading": "1"}
-            proxy_url = _okx_proxy_url()
-            if proxy_url:
-                config["aiohttp_proxy"] = proxy_url
-
-            self._exchange = ccxt_async.okx(config)
-
-            if is_demo:
-                self._exchange.set_sandbox_mode(True)
+            self._exchange = OkxPerpetualSdkExchange(mode)
             self._ensure_rest_url()
 
             await self._load_usdt_swap_markets()
@@ -97,7 +60,7 @@ class OKXRestClient:
         return self._exchange
 
     def _ensure_rest_url(self) -> None:
-        """Repair CCXT's OKX REST URL fields if a long-running client loses them."""
+        """Keep legacy URL guards harmless for the SDK-backed client."""
         if self._exchange is None:
             return
         urls = getattr(self._exchange, "urls", None)
@@ -128,7 +91,7 @@ class OKXRestClient:
             except Exception as exc:
                 if attempt == 0 and self._is_broken_rest_url_error(exc):
                     logger.warning(
-                        "OKX REST URL state invalid; reinitializing CCXT client",
+                        "OKX REST URL state invalid; reinitializing SDK client",
                         method=method_name,
                         error=safe_error_text(exc),
                     )
@@ -140,7 +103,7 @@ class OKXRestClient:
         """Load only live linear USDT perpetual swaps.
 
         OKX demo can return test/preopen instruments with incomplete fields; filtering
-        before CCXT parses markets keeps public ticker/K-line calls usable.
+        before building local market rules keeps public ticker/K-line calls usable.
         """
         if self._exchange is None:
             return

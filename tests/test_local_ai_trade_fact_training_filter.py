@@ -16,6 +16,15 @@ from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_
 from services.training_data_quality import annotate_training_payload
 
 
+def _okx_settlement_fields() -> dict:
+    return {
+        "settlement_status": "reconciled",
+        "settlement_source": "okx_position_history_settlement",
+        "funding_fee": 0.0,
+        "settlement_raw": {"funding_fee_source": "okx_positions_history.fundingFee"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_local_ai_trade_samples_exclude_unlinked_okx_position_facts(
     tmp_path,
@@ -46,6 +55,7 @@ async def test_local_ai_trade_samples_exclude_unlinked_okx_position_facts(
                 okx_inst_id="BTC-USDT-SWAP",
                 entry_exchange_order_id="entry-ok",
                 close_exchange_order_id="close-ok",
+                **_okx_settlement_fields(),
             )
             dirty = Position(
                 model_name="ensemble_trader",
@@ -127,6 +137,7 @@ async def test_local_ai_closed_position_samples_require_okx_confirmed_orders(
                 okx_inst_id="BTC-USDT-SWAP",
                 entry_exchange_order_id="entry-ok",
                 close_exchange_order_id="close-ok",
+                **_okx_settlement_fields(),
             )
             unconfirmed = Position(
                 model_name="ensemble_trader",
@@ -143,6 +154,7 @@ async def test_local_ai_closed_position_samples_require_okx_confirmed_orders(
                 okx_inst_id="ETH-USDT-SWAP",
                 entry_exchange_order_id="entry-local",
                 close_exchange_order_id="close-local",
+                **_okx_settlement_fields(),
             )
             session.add_all([trusted, unconfirmed])
             await session.flush()
@@ -201,6 +213,7 @@ async def test_local_ai_accepts_okx_execution_result_confirmed_orders(
                 okx_inst_id="ACT-USDT-SWAP",
                 entry_exchange_order_id="act-entry",
                 close_exchange_order_id="3703940352525967360",
+                **_okx_settlement_fields(),
             )
             session.add(trusted)
             await session.flush()

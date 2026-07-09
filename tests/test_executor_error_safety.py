@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-import ccxt.async_support as ccxt_async
 import pytest
 
 import executor.okx_executor as okx_module
@@ -157,7 +156,7 @@ class _TimestampExpiredOnceCcxt:
     async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         self.position_calls += 1
         if self.position_calls == 1:
-            raise ccxt_async.NetworkError('okx {"msg":"Timestamp request expired","code":"50102"}')
+            raise ExchangeAPIError('okx {"msg":"Timestamp request expired","code":"50102"}')
         return {"data": []}
 
 
@@ -956,17 +955,13 @@ async def test_okx_initialize_enables_and_loads_time_difference(
 ) -> None:
     created: dict[str, Any] = {}
 
-    def fake_okx(config: dict[str, Any]) -> _InitTimeSyncCcxt:
-        exchange = _InitTimeSyncCcxt(config)
+    def fake_exchange(mode: str) -> _InitTimeSyncCcxt:
+        exchange = _InitTimeSyncCcxt({"options": {"defaultType": "swap"}})
+        exchange.mode = mode
         created["exchange"] = exchange
         return exchange
 
-    monkeypatch.setattr(ccxt_async, "okx", fake_okx)
-    monkeypatch.setattr(
-        type(okx_module.settings),
-        "get_okx_credentials",
-        lambda _self, _mode: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"},
-    )
+    monkeypatch.setattr(okx_module, "OkxPerpetualSdkExchange", fake_exchange)
     monkeypatch.setattr(type(okx_module.settings), "is_okx_demo", lambda _self, _mode: False)
 
     executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
@@ -976,7 +971,7 @@ async def test_okx_initialize_enables_and_loads_time_difference(
         await executor.shutdown()
 
     exchange = created["exchange"]
-    assert exchange.options["adjustForTimeDifference"] is True
+    assert exchange.mode == "paper"
     assert exchange.load_time_difference_calls == 1
 
 
