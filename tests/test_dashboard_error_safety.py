@@ -19,6 +19,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from services import server_monitor_status
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
+from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api import dashboard, symbols
 
 
@@ -222,11 +223,22 @@ def test_dashboard_execution_account_uses_okx_equity_not_cash_for_today_pnl(
         },
         pnl_summary={"today_equity_baseline": 4990.90},
     )
-
     assert payload["account_equity"] == pytest.approx(4990.70)
     assert payload["okx_equity_balance"] == pytest.approx(4990.70)
     assert payload["today_equity_pnl"] == pytest.approx(-0.20)
     assert payload["today_total_pnl"] == pytest.approx(-0.20)
+
+
+async def _seed_okx_position_history_rows(rows) -> None:
+    async with get_session_ctx() as session:
+        for row in rows:
+            await upsert_okx_position_history_row(
+                session,
+                row,
+                mode="paper",
+                source="test_okx_position_history_mirror",
+                match_status="test_seed",
+            )
 
 
 def test_dashboard_execution_account_keeps_stale_cached_balance_usable(
@@ -1081,6 +1093,7 @@ async def test_daily_pnl_records_include_okx_authoritative_ledger_positions(
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(await official_position_history_rows())
 
     try:
         async with get_session_ctx() as session:
@@ -1225,6 +1238,7 @@ async def test_daily_pnl_records_include_phase3_closed_position_even_if_opened_b
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(await official_position_history_rows())
 
     try:
         async with get_session_ctx() as session:
@@ -1512,6 +1526,7 @@ async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(await official_position_history_rows())
 
     try:
         async with get_session_ctx() as session:
@@ -1665,6 +1680,7 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(await official_position_history_rows())
 
     try:
         async with get_session_ctx() as session:

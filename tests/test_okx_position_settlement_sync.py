@@ -11,6 +11,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.trade import Order, Position
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
+from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
 
@@ -36,6 +37,18 @@ class _FakeCcxt:
         if self.bills_error is not None:
             raise self.bills_error
         return {"data": []}
+
+
+async def _seed_okx_position_history_rows(rows: list[dict[str, Any]]) -> None:
+    async with get_session_ctx() as session:
+        for row in rows:
+            await upsert_okx_position_history_row(
+                session,
+                row,
+                mode="paper",
+                source="test_okx_position_history_mirror",
+                match_status="test_seed",
+            )
 
 
 class _FakeExecutor:
@@ -264,6 +277,7 @@ async def test_dashboard_closed_history_hides_unsettled_positions(
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(await official_position_history_rows())
     try:
         await _create_closed_position(
             symbol="HIDDEN/USDT",

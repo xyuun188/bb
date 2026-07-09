@@ -165,6 +165,7 @@ async def init_db() -> None:
         await _ensure_trade_fact_columns(conn)
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
+        await _ensure_okx_position_history_indexes(conn)
         if "sqlite" in settings.database_url:
             for ddl in [
                 "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created ON ai_decisions (is_paper, created_at DESC)",
@@ -365,6 +366,35 @@ async def _ensure_okx_account_bill_indexes(conn: Any) -> None:
         (
             "idx_okx_account_bills_mode_type_ts",
             "CREATE INDEX IF NOT EXISTS idx_okx_account_bills_mode_type_ts ON okx_account_bills (mode, bill_type, bill_sub_type, bill_ts DESC)",
+        ),
+    )
+    if "postgresql" in settings.database_url:
+        index_names = await _postgres_index_names(conn)
+        for name, ddl in index_ddls:
+            if name not in index_names:
+                await conn.execute(text(ddl))
+        return
+    for _name, ddl in index_ddls:
+        await conn.execute(text(ddl))
+
+
+async def _ensure_okx_position_history_indexes(conn: Any) -> None:
+    index_ddls = (
+        (
+            "idx_okx_position_history_mode_updated",
+            "CREATE INDEX IF NOT EXISTS idx_okx_position_history_mode_updated ON okx_position_history (mode, updated_at_okx DESC)",
+        ),
+        (
+            "idx_okx_position_history_mode_inst_updated",
+            "CREATE INDEX IF NOT EXISTS idx_okx_position_history_mode_inst_updated ON okx_position_history (mode, inst_id, updated_at_okx DESC)",
+        ),
+        (
+            "idx_okx_position_history_mode_pos_id",
+            "CREATE INDEX IF NOT EXISTS idx_okx_position_history_mode_pos_id ON okx_position_history (mode, pos_id)",
+        ),
+        (
+            "idx_okx_position_history_mode_symbol",
+            "CREATE INDEX IF NOT EXISTS idx_okx_position_history_mode_symbol ON okx_position_history (mode, symbol)",
         ),
     )
     if "postgresql" in settings.database_url:

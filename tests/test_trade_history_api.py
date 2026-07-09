@@ -10,6 +10,7 @@ from db.session import close_db, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.decision import AIDecision
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
 from web_dashboard.api.trades import (
     _execution_status_label,
@@ -43,6 +44,25 @@ def _isolate_dashboard_exchange_position_caches(monkeypatch: pytest.MonkeyPatch)
         empty_position_history_rows,
         raising=False,
     )
+
+
+async def _seed_okx_position_history_rows(
+    rows,
+    *,
+    entry_order_ids=None,
+    close_order_ids=None,
+) -> None:
+    async with get_session_ctx() as session:
+        for row in rows:
+            await upsert_okx_position_history_row(
+                session,
+                row,
+                mode="paper",
+                source="test_okx_position_history_mirror",
+                entry_order_ids=(entry_order_ids or {}).get(row.get("posId")),
+                close_order_ids=(close_order_ids or {}).get(row.get("posId")),
+                match_status="test_seed",
+            )
 
 
 @pytest.mark.asyncio
@@ -464,12 +484,11 @@ async def test_dashboard_position_history_uses_persisted_okx_official_snapshot_w
                         "created_at": opened_at,
                     }
                 )
-
         payload = await get_dashboard_positions(mode="paper", closed_only=True)
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_positions_history_official_stale_cache"
+    assert payload["ledger_source"] == "okx_position_history_mirror"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"
@@ -774,6 +793,11 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
     )
+    await _seed_okx_position_history_rows(
+        await official_position_history_rows(),
+        entry_order_ids={"inj-pos": ["inj-entry"]},
+        close_order_ids={"inj-pos": ["inj-close-a", "inj-close-b"]},
+    )
     try:
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
@@ -871,7 +895,7 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_positions_history_official"
+    assert payload["ledger_source"] == "okx_position_history_mirror"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "INJ/USDT"
@@ -952,6 +976,17 @@ async def test_dashboard_position_history_uses_okx_official_rows_over_polluted_l
         dashboard_api,
         "_dashboard_okx_position_history_rows",
         official_position_history_rows,
+    )
+    await _seed_okx_position_history_rows(
+        await official_position_history_rows(),
+        entry_order_ids={
+            "axs-pos": ["axs-entry-a", "axs-entry-b"],
+            "xpl-pos": ["xpl-entry"],
+        },
+        close_order_ids={
+            "axs-pos": ["axs-close-a", "axs-close-b"],
+            "xpl-pos": ["xpl-close-a", "xpl-close-b", "xpl-close-c"],
+        },
     )
 
     async def add_order(
@@ -1122,7 +1157,7 @@ async def test_dashboard_position_history_uses_okx_official_rows_over_polluted_l
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_positions_history_official"
+    assert payload["ledger_source"] == "okx_position_history_mirror"
     assert payload["total"] == 2
     by_symbol = {row["symbol"]: row for row in payload["positions"]}
 
@@ -1296,11 +1331,16 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
                     }
                 )
 
+        await _seed_okx_position_history_rows(
+            await official_position_history_rows(),
+            entry_order_ids={pos_id: [entry_order_id]},
+            close_order_ids={pos_id: [item[0] for item in partial_closes]},
+        )
         payload = await get_dashboard_positions(mode="paper", closed_only=True)
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_positions_history_official"
+    assert payload["ledger_source"] == "okx_position_history_mirror"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"
@@ -1741,6 +1781,7 @@ async def test_dashboard_position_history_keeps_reused_posid_lifecycles_and_part
                 realized_pnl=0.1,
             )
 
+        await _seed_okx_position_history_rows(await official_position_history_rows())
         payload = await get_dashboard_positions(
             mode="paper",
             closed_only=True,

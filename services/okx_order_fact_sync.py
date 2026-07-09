@@ -42,6 +42,7 @@ from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
     find_current_position_entry_confirmation,
 )
+from services.okx_position_history_store import upsert_okx_position_history_row
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 from services.position_settlement import (
     apply_position_settlement_snapshot,
@@ -1130,6 +1131,24 @@ class OkxOrderFactSyncService:
                 if lifecycle_close_fills:
                     close_order_ids = _ordered_exchange_ids(fill.order_id for fill in lifecycle_close_fills)
                     close_fills = lifecycle_close_fills
+            await upsert_okx_position_history_row(
+                session,
+                row,
+                mode=self.mode,
+                source="okx_order_fact_sync",
+                entry_order_ids=entry_order_ids,
+                close_order_ids=close_order_ids,
+                match_status="okx_order_fact_sync",
+                evidence_gaps=(
+                    []
+                    if entry_order_ids and close_order_ids
+                    else [
+                        *([] if entry_order_ids else ["missing_position_history_entry_orders"]),
+                        *([] if close_order_ids else ["missing_position_history_close_orders"]),
+                    ]
+                ),
+                synced_at=now,
+            )
             suppression = _matching_position_sync_suppression(
                 suppressions,
                 mode=self.mode,

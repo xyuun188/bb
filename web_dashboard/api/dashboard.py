@@ -2365,6 +2365,11 @@ def _dashboard_symbol_query_variants(symbols: set[str]) -> set[str]:
 
 
 def _dashboard_split_exchange_order_ids(value: Any) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_dashboard_split_exchange_order_ids(item))
+        return result
     tokens = {str(value or "").strip()}
     if not next(iter(tokens), ""):
         return set()
@@ -2394,6 +2399,11 @@ async def _dashboard_closed_position_ledger_rows(
         OKX_SYNC_CONFIRMED,
         OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
         OKX_SYNC_OKX_ONLY,
+    )
+    from services.okx_position_history_store import (
+        backfill_okx_position_history_from_positions,
+        load_okx_position_history_records,
+        okx_position_history_records_to_rows,
     )
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
     from services.position_settlement import is_final_settlement_status
@@ -2425,18 +2435,25 @@ async def _dashboard_closed_position_ledger_rows(
         for position in closed_rows
         if is_final_settlement_status(getattr(position, "settlement_status", None))
     ]
-    position_history_rows = await _dashboard_okx_position_history_rows(
+    await backfill_okx_position_history_from_positions(
+        session,
         mode=mode,
-        closed_rows=closed_rows,
+        limit=5000,
     )
-    official_history_source = "okx_positions_history_official"
+    history_records = await load_okx_position_history_records(
+        session,
+        mode=mode,
+        limit=5000,
+    )
+    position_history_rows = okx_position_history_records_to_rows(history_records)
+    official_history_source = "okx_position_history_mirror"
     if not position_history_rows:
         position_history_rows = _dashboard_persisted_position_history_rows(
             closed_rows,
             mode=mode,
         )
         if position_history_rows:
-            official_history_source = "okx_positions_history_official_stale_cache"
+            official_history_source = "okx_position_history_snapshot_backfill_pending"
     linked_order_ids = {
         token
         for position in closed_rows
@@ -2446,6 +2463,16 @@ async def _dashboard_closed_position_ledger_rows(
         )
         for token in _dashboard_split_exchange_order_ids(value)
     }
+    linked_order_ids.update(
+        token
+        for row in position_history_rows
+        for value in (
+            row.get("_dashboard_entry_order_ids"),
+            row.get("_dashboard_close_order_ids"),
+            row.get("_dashboard_linked_order_ids"),
+        )
+        for token in _dashboard_split_exchange_order_ids(value)
+    )
     official_symbols = {
         symbol
         for row in position_history_rows
@@ -3136,6 +3163,45 @@ def _dashboard_position_history_order_payload(
             updated_at=updated_at,
         )
     ]
+    hinted_entry_ids = _dashboard_split_exchange_order_ids(
+        row.get("_dashboard_entry_order_ids")
+    )
+    hinted_close_ids = _dashboard_split_exchange_order_ids(row.get("_dashboard_close_order_ids"))
+    hinted_linked_ids = _dashboard_split_exchange_order_ids(row.get("_dashboard_linked_order_ids"))
+    if hinted_entry_ids or hinted_close_ids or hinted_linked_ids:
+        selected_entries = _dashboard_orders_by_exchange_ids(
+            order_rows,
+            hinted_entry_ids or (hinted_linked_ids - hinted_close_ids),
+        )
+        selected_closes = _dashboard_orders_by_exchange_ids(
+            order_rows,
+            hinted_close_ids or (hinted_linked_ids - hinted_entry_ids),
+        )
+        if not selected_entries and not selected_closes and hinted_linked_ids:
+            hinted_orders = _dashboard_orders_by_exchange_ids(order_rows, hinted_linked_ids)
+            selected_entries = [
+                order
+                for order in hinted_orders
+                if not entry_side or str(getattr(order, "side", "") or "").lower() == entry_side
+            ]
+            selected_closes = [
+                order
+                for order in hinted_orders
+                if not close_side or str(getattr(order, "side", "") or "").lower() == close_side
+            ]
+        return _dashboard_position_history_order_payload_from_selected(
+            row,
+            selected_entries=selected_entries,
+            selected_closes=selected_closes,
+            raw_close_quantity=raw_close_quantity,
+            raw_max_quantity=raw_max_quantity,
+            entry_match_source=(
+                "persisted_order_ids" if selected_entries else "persisted_order_ids_missing"
+            ),
+            close_match_source=(
+                "persisted_order_ids" if selected_closes else "persisted_order_ids_missing"
+            ),
+        )
     entry_candidates = [
         order
         for order in candidates
@@ -3174,6 +3240,58 @@ def _dashboard_position_history_order_payload(
                 and order_time <= first_close_at
             )
         ]
+    close_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_closes)
+    close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
+    entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)
+    entry_contracts = sum(_dashboard_order_contracts(order) for order in selected_entries)
+    close_quantity = raw_close_quantity
+    if close_base_quantity > 0 and _dashboard_quantities_match(close_base_quantity, raw_close_quantity):
+        close_quantity = close_base_quantity
+    elif close_contracts > 0 and _dashboard_quantities_match(close_contracts, raw_close_quantity):
+        close_quantity = close_base_quantity or raw_close_quantity
+    max_quantity = raw_max_quantity or entry_base_quantity or close_quantity
+    if raw_max_quantity > 0:
+        if entry_base_quantity > 0 and _dashboard_quantities_match(entry_base_quantity, raw_max_quantity):
+            max_quantity = entry_base_quantity
+        elif entry_contracts > 0 and _dashboard_quantities_match(entry_contracts, raw_max_quantity):
+            max_quantity = entry_base_quantity or raw_max_quantity
+    elif entry_base_quantity > 0:
+        max_quantity = max(entry_base_quantity, close_quantity)
+    return _dashboard_position_history_order_payload_from_selected(
+        row,
+        selected_entries=selected_entries,
+        selected_closes=selected_closes,
+        raw_close_quantity=close_quantity,
+        raw_max_quantity=max_quantity,
+        entry_match_source=entry_match_source,
+        close_match_source=close_match_source,
+    )
+
+
+def _dashboard_orders_by_exchange_ids(order_rows: list[Any], order_ids: set[str]) -> list[Any]:
+    if not order_ids:
+        return []
+    return sorted(
+        [
+            order
+            for order in order_rows
+            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+            & order_ids
+        ],
+        key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+
+
+def _dashboard_position_history_order_payload_from_selected(
+    row: dict[str, Any],
+    *,
+    selected_entries: list[Any],
+    selected_closes: list[Any],
+    raw_close_quantity: float,
+    raw_max_quantity: float,
+    entry_match_source: str,
+    close_match_source: str,
+) -> dict[str, Any]:
     close_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_closes)
     close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
     entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)

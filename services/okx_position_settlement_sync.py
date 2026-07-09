@@ -28,6 +28,7 @@ from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.trade import Position
 from services.okx_native_facts import OkxNativeAccountBill, OkxNativeFactsClient
+from services.okx_position_history_store import upsert_okx_position_history_row
 from services.position_settlement import (
     SETTLEMENT_FORMULA,
     SETTLEMENT_STATUS_EXCEPTION,
@@ -475,6 +476,17 @@ class OkxPositionSettlementSyncService:
             row_side = _position_history_side(success.row)
             if row_side in {"long", "short"}:
                 position.side = row_side
+            await upsert_okx_position_history_row(
+                session,
+                success.row,
+                mode=self.mode,
+                source="okx_position_settlement_sync",
+                entry_order_ids=[candidate.entry_exchange_order_id],
+                close_order_ids=[candidate.close_exchange_order_id],
+                position_ids=[candidate.position_id],
+                match_status=success.match_reason,
+                synced_at=now,
+            )
             position.updated_at = now
             await session.flush()
             return True
