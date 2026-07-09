@@ -1778,6 +1778,8 @@ async def test_model_training_audit_does_not_run_full_self_check(
                     "text_sentiment_sample_count": 11,
                     "training_mode": "walk_forward",
                     "model_stage": "canary",
+                    "trained_models_available": True,
+                    "trained_at": "2026-07-09T05:00:00+00:00",
                     "evaluation_policy": {
                         "promotion_flow": "shadow_to_canary_to_live",
                         "live_mutation": False,
@@ -1872,6 +1874,12 @@ async def test_model_training_audit_does_not_run_full_self_check(
     assert specialist["available"] is True
     assert specialist["eligible_shadow_count"] == 12
     assert specialist["models"][0]["model"] == "timesfm_shadow_challenger"
+    health = card["details"]["training_health_summary"]
+    assert health["policy"] == "distinguish_project_training_from_pretrained_or_alias_models"
+    assert health["status_counts"]["trained_canary_ready"] == 1
+    assert health["status_counts"]["shadow_inference_evaluated_not_promoted"] == 1
+    assert health["items"][0]["kind"] == "project_trained_bundle"
+    assert health["items"][1]["kind"] == "specialist_shadow_evidence_source"
     assert card["evidence"][-1]["value"] == 12
     historical = card["details"]["historical_trade_fact_audit"]
     assert historical["training_policy"] == "clean_training_view_only"

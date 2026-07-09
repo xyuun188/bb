@@ -1163,6 +1163,67 @@ def test_ml_signal_status_exposes_learning_only_readiness_reasons() -> None:
     assert status["readiness"]["next_training_conditions"]["min_new_samples"] > 0
 
 
+def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> None:
+    metadata = {
+        "version": datetime.now(UTC).isoformat(),
+        "trained_at": datetime.now(UTC).isoformat(),
+        "sample_count": 1200,
+        "test_count": 240,
+        "quality_report": {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+        },
+        "metrics": {
+            "long_auc": 0.61,
+            "short_auc": 0.61,
+            "long_pr_auc": 0.60,
+            "short_pr_auc": 0.60,
+            "long_accuracy": 0.60,
+            "short_accuracy": 0.60,
+            "top_long_avg_return_pct": -0.14,
+            "bottom_long_avg_return_pct": -0.02,
+            "top_long_win_rate": 0.42,
+            "bottom_long_win_rate": 0.51,
+            "top_long_tail_loss_rate": 0.18,
+            "bottom_long_tail_loss_rate": 0.07,
+            "top_short_avg_return_pct": 0.18,
+            "bottom_short_avg_return_pct": -0.03,
+            "top_short_win_rate": 0.70,
+            "bottom_short_win_rate": 0.42,
+            "top_short_tail_loss_rate": 0.04,
+            "bottom_short_tail_loss_rate": 0.09,
+        },
+        "score_bucket_diagnostics": {
+            "long": {
+                "top": {
+                    "count": 48,
+                    "tail_loss_rate": 0.18,
+                    "action_counts": {"long": 48},
+                    "top_quality_reasons": [{"reason": "fee_drag", "count": 9}],
+                },
+                "bottom": {
+                    "count": 48,
+                    "tail_loss_rate": 0.07,
+                    "action_counts": {"short": 48},
+                },
+            }
+        },
+    }
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    long_diag = readiness["profit_quality_diagnostics"]["long"]
+
+    assert readiness["allow_live_position_influence"] is True
+    assert long_diag["training_target"] == "fee_after_realized_return_quality"
+    assert long_diag["top_avg_return_pct"] == -0.14
+    assert long_diag["top_bottom_return_spread_pct"] == -0.12
+    assert "top_score_bucket_not_fee_after_profitable" in long_diag["diagnosis"]
+    assert "top_score_bucket_not_better_than_bottom" in long_diag["diagnosis"]
+    assert "top_score_tail_loss_worse_than_bottom" in long_diag["diagnosis"]
+    assert long_diag["top_bucket"]["top_quality_reasons"][0]["reason"] == "fee_drag"
+    assert readiness["metrics"]["top_long_bottom_return_spread_pct"] == -0.12
+
+
 def test_ml_signal_status_marks_ready_only_when_all_readiness_metrics_pass() -> None:
     service = _service_with_metadata(
         {

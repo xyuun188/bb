@@ -29,12 +29,13 @@ from scripts.audit_runtime_text_integrity import collect_runtime_text_integrity_
 from scripts.repair_okx_position_fact_links import (
     collect_scan_report as collect_position_fact_link_scan_report,
 )
+from services.artifact_retirement_audit import ArtifactRetirementAuditService
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
 from services.exchange_position_state import (
     exchange_position_display_valuation,
     parse_exchange_position_snapshot,
 )
-from services.artifact_retirement_audit import ArtifactRetirementAuditService
+from services.execution_reason_localizer import localize_execution_reason
 from services.high_risk_review_audit import HighRiskReviewAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.model_dynamic_routing import ModelDynamicRoutingService
@@ -46,15 +47,14 @@ from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
 from services.phase3_paper_resume_observation import Phase3PaperResumeObservationService
 from services.phase3_paper_resume_preflight import Phase3PaperResumePreflightService
+from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 from services.phase3_server_migration_audit import Phase3ServerMigrationAuditService
 from services.phase3_stage_handoff import Phase3StageHandoffService
-from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.profit_first_governance_report import ProfitFirstGovernanceReportService
 from services.profit_first_ranking import ProfitFirstRankingService
 from services.profit_first_recovery_blockers import build_profit_first_recovery_blockers
 from services.server_monitor_status import collect_platform_runtime_status
-from services.execution_reason_localizer import localize_execution_reason
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
 )
@@ -2058,11 +2058,6 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     status = str(details.get("status") or "ok")
     critical_count = int(details.get("critical_count") or 0)
     warning_count = int(details.get("warning_count") or 0)
-    link_candidate_count = (
-        int(link_repair.get("candidate_link_count") or 0)
-        if bool(link_repair.get("available"))
-        else 0
-    )
     unresolved_link_candidate_count = _okx_unresolved_link_candidate_count(details, link_repair)
     details["unresolved_position_fact_link_candidate_count"] = unresolved_link_candidate_count
     authoritative_issue_count = int(authoritative_sync.get("issue_count") or 0)
@@ -3655,7 +3650,6 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
     weak_executed = int(summary.get("weak_evidence_executed_count") or 0)
     negative_expected = int(summary.get("negative_expected_executed_count") or 0)
     fast_loss_without_exit = int(summary.get("fast_loss_without_strong_exit_count") or 0)
-    dust_fast_loss = int(summary.get("dust_or_rounding_fast_loss_count") or 0)
     reentry_without_unlock = int(summary.get("reentry_without_strong_unlock_count") or 0)
     missing_sizing = int(summary.get("missing_sizing_explanation_count") or 0)
     hard_violations, soft_violations = _trade_contract_violation_counts(summary)
@@ -4068,6 +4062,116 @@ async def _crypto_feature_coverage_audit() -> dict[str, Any]:
     )
 
 
+def _model_training_health_summary(
+    *,
+    local_tools: dict[str, Any],
+    specialist_shadow_evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    local_stage = str(local_tools.get("model_stage") or local_tools.get("training_mode") or "shadow")
+    trained_at = str(local_tools.get("trained_at") or "")
+    trained_models_available = bool(
+        local_tools.get("trained_models_available")
+        or local_tools.get("model_bundle_available")
+        or trained_at
+    )
+    promotion = (
+        local_tools.get("promotion_recommendation")
+        if isinstance(local_tools.get("promotion_recommendation"), dict)
+        else {}
+    )
+    live_ready = bool(promotion.get("live_ready"))
+    canary_ready = bool(promotion.get("canary_ready"))
+    if trained_models_available:
+        if live_ready or local_stage == "live":
+            local_status = "trained_and_loaded"
+        elif canary_ready or local_stage == "canary":
+            local_status = "trained_canary_ready"
+        elif local_stage in {"degraded", "shadow"}:
+            local_status = "trained_but_not_promoted"
+        else:
+            local_status = "trained_shadow"
+    elif bool(local_tools.get("available")):
+        local_status = "service_online_without_training_artifact"
+    else:
+        local_status = "service_unavailable"
+    items.append(
+        {
+            "model": "local_ai_tools_quant_bundle",
+            "kind": "project_trained_bundle",
+            "training_status": local_status,
+            "trained_at": trained_at,
+            "model_stage": local_stage,
+            "live_ready": live_ready,
+            "canary_ready": canary_ready,
+            "sample_counts": {
+                "shadow": _safe_int_value(local_tools.get("shadow_sample_count")),
+                "trade": _safe_int_value(local_tools.get("trade_sample_count")),
+                "text_sentiment": _safe_int_value(local_tools.get("text_sentiment_sample_count")),
+            },
+            "note": "本项目训练产物；未晋升时只能作为 shadow/观察证据。",
+        }
+    )
+    for model in _safe_list(specialist_shadow_evaluation.get("models")):
+        if not isinstance(model, dict):
+            continue
+        actual_count = _safe_int_value(model.get("actual_inference_count"))
+        promotion_ready = bool(model.get("promotion_ready"))
+        if actual_count <= 0:
+            training_status = "installed_or_reported_but_actual_inference_missing"
+        elif promotion_ready:
+            training_status = "shadow_inference_evaluated_promotion_ready"
+        else:
+            training_status = "shadow_inference_evaluated_not_promoted"
+        items.append(
+            {
+                "model": model.get("model"),
+                "kind": "specialist_shadow_evidence_source",
+                "tool": model.get("tool"),
+                "training_status": training_status,
+                "actual_inference_count": actual_count,
+                "sample_count": _safe_int_value(model.get("sample_count")),
+                "promotion_ready": promotion_ready,
+                "promotion_blockers": _safe_list(model.get("promotion_blockers"))[:8],
+                "note": "预训练/专业证据源；只有 actual inference 和影子表现达标后才可晋升。",
+            }
+        )
+    if not bool(specialist_shadow_evaluation.get("available")):
+        items.append(
+            {
+                "model": "timeseries_and_sentiment_specialist_shadow",
+                "kind": "specialist_shadow_evaluation",
+                "training_status": "evaluation_report_missing",
+                "reason": specialist_shadow_evaluation.get("reason"),
+                "note": "模型文件存在不等于进入训练闭环；缺少评估报告时必须按未闭环处理。",
+            }
+        )
+    counts = Counter(str(item.get("training_status") or "unknown") for item in items)
+    return {
+        "policy": "distinguish_project_training_from_pretrained_or_alias_models",
+        "items": items,
+        "status_counts": dict(counts),
+        "trained_and_loaded_count": counts.get("trained_and_loaded", 0),
+        "trained_not_promoted_count": sum(
+            counts.get(key, 0)
+            for key in (
+                "trained_but_not_promoted",
+                "trained_shadow",
+                "trained_canary_ready",
+                "shadow_inference_evaluated_not_promoted",
+            )
+        ),
+        "actual_inference_missing_count": counts.get(
+            "installed_or_reported_but_actual_inference_missing",
+            0,
+        ),
+        "service_without_artifact_count": counts.get(
+            "service_online_without_training_artifact",
+            0,
+        ),
+    }
+
+
 async def _model_training_audit() -> dict[str, Any]:
     runtime_task = asyncio.create_task(
         asyncio.wait_for(
@@ -4294,6 +4398,10 @@ async def _model_training_audit() -> dict[str, Any]:
     specialist_summary = _safe_dict(specialist_shadow_evaluation.get("summary"))
     specialist_models = _safe_list(specialist_shadow_evaluation.get("models"))
     specialist_report_missing = not bool(specialist_shadow_evaluation.get("available"))
+    training_health_summary = _model_training_health_summary(
+        local_tools=local_tools if isinstance(local_tools, dict) else {},
+        specialist_shadow_evaluation=specialist_shadow_evaluation,
+    )
     status = _status_from_counts(
         critical=hard_failure
         and (bool(model_critical) or local_tools_hard_missing or runtime_probe_hard_failure),
@@ -4345,6 +4453,7 @@ async def _model_training_audit() -> dict[str, Any]:
                 ),
             },
             "phase3_training_governance": phase3_training_governance,
+            "training_health_summary": training_health_summary,
             "phase3_rebuild_readiness": phase3_rebuild_readiness,
             "specialist_shadow_evaluation": {
                 "available": bool(specialist_shadow_evaluation.get("available")),

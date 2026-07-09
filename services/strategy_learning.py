@@ -354,10 +354,18 @@ def _compact_profit_first_runtime_feedback(value: dict[str, Any]) -> dict[str, A
             "side": row.get("side"),
             "decision_lane": row.get("decision_lane"),
             "recommended_stage": row.get("recommended_stage"),
+            "lifecycle_stage": row.get("lifecycle_stage"),
             "weight_multiplier": row.get("weight_multiplier"),
             "realized_net_pnl": row.get("realized_net_pnl"),
             "profit_factor": row.get("profit_factor"),
             "ranking_reasons": _safe_list(row.get("ranking_reasons"))[:4],
+            "strategy_lifecycle": {
+                "next_action": _safe_dict(row.get("strategy_lifecycle")).get("next_action"),
+                "operator_gate_required": bool(
+                    _safe_dict(row.get("strategy_lifecycle")).get("operator_gate_required")
+                ),
+                "live_mutation": False,
+            },
         }
         for row in _safe_list(feedback.get("strategy_profile_feedback"))[:12]
         if isinstance(row, dict)

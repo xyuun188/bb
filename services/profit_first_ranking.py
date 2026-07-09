@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -92,6 +92,7 @@ class ProfitFirstRankingService:
         )
         blockers = self._blockers(strategy_rows, source_rows)
         runtime_feedback = self._runtime_feedback(
+            decisions=decisions_list,
             strategy_rows=strategy_rows,
             source_rows=source_rows,
             closed_positions=positions_list,
@@ -122,6 +123,12 @@ class ProfitFirstRankingService:
             ),
             "exit_plan_reference_missing_count": _safe_int(
                 _safe_dict(runtime_feedback.get("exit_plan_reference")).get("missing_count")
+            ),
+            "generated_strategy_count": _safe_int(
+                _safe_dict(runtime_feedback.get("strategy_lifecycle")).get("generated_count")
+            ),
+            "strategy_lifecycle_stage_counts": _safe_dict(
+                _safe_dict(runtime_feedback.get("strategy_lifecycle")).get("stage_counts")
             ),
             "blocker_count": len(blockers),
         }
@@ -168,6 +175,7 @@ class ProfitFirstRankingService:
     def _runtime_feedback(
         self,
         *,
+        decisions: Sequence[Any],
         strategy_rows: list[dict[str, Any]],
         source_rows: list[dict[str, Any]],
         closed_positions: Sequence[Any],
@@ -177,6 +185,7 @@ class ProfitFirstRankingService:
         side_feedback = _side_runtime_feedback(closed_positions)
         exit_plan_reference = _exit_plan_reference_report(closed_positions)
         strategy_feedback = _strategy_runtime_feedback(strategy_rows)
+        strategy_lifecycle = _strategy_lifecycle_report(decisions, strategy_rows)
         source_feedback = _source_runtime_feedback(source_rows)
         lane_feedback = _lane_runtime_feedback(
             _safe_list(brain_recommendations.get("lane_threshold_recommendations"))
@@ -221,6 +230,7 @@ class ProfitFirstRankingService:
             },
             "side_feedback": side_feedback,
             "strategy_profile_feedback": strategy_feedback[:40],
+            "strategy_lifecycle": strategy_lifecycle,
             "source_weight_feedback": source_feedback[:40],
             "lane_feedback": lane_feedback[:24],
             "size_feedback": size_feedback[:24],
@@ -241,6 +251,9 @@ class ProfitFirstRankingService:
                 "optimization_target": "realized_net_pnl",
                 "side_weight_policy": "relative_window_realized_pnl_not_fixed_usdt_thresholds",
                 "strategy_flow": "shadow_to_canary_to_live",
+                "strategy_lifecycle_policy": (
+                    "generated_to_shadow_to_canary_to_live_or_demote_by_rolling_realized_pnl"
+                ),
                 "low_sample_policy": "observe_or_shadow_until_window_evidence_improves",
                 "direct_order_mutation_allowed": False,
                 "direct_live_size_increase_allowed": False,
@@ -371,10 +384,20 @@ class ProfitFirstRankingService:
                 consecutive_losses=consecutive_losses,
                 fee_drag_ratio=fee_drag_ratio,
             )
+            lifecycle = _strategy_lifecycle_record(
+                row,
+                recommended_stage=stage,
+                ranking_reasons=reasons,
+                count=count,
+                realized_net_pnl=pnl,
+                profit_factor=profit_factor,
+            )
             rows.append(
                 {
                     **row,
                     "recommended_stage": stage,
+                    "lifecycle_stage": lifecycle["lifecycle_stage"],
+                    "strategy_lifecycle": lifecycle,
                     "ranking_reasons": reasons,
                     "tail_loss_usdt": round(tail_loss_usdt, 6),
                     "tail_loss_count": _safe_int(metric.get("tail_loss_count")),
@@ -607,6 +630,171 @@ def _empty_side_runtime_bucket(side: str) -> dict[str, Any]:
     }
 
 
+def _lifecycle_stage(recommended_stage: str, *, count: int) -> str:
+    stage = str(recommended_stage or "shadow")
+    if stage == "disable":
+        return "quarantine"
+    if stage == "demote":
+        return "demote"
+    if stage == "live_candidate":
+        return "live_candidate"
+    if stage == "canary":
+        return "canary_candidate"
+    if count > 0:
+        return "shadow_observation"
+    return "generated"
+
+
+def _strategy_lifecycle_record(
+    row: dict[str, Any],
+    *,
+    recommended_stage: str,
+    ranking_reasons: list[str],
+    count: int,
+    realized_net_pnl: float,
+    profit_factor: float,
+) -> dict[str, Any]:
+    lifecycle_stage = _lifecycle_stage(recommended_stage, count=count)
+    next_action_by_stage = {
+        "generated": "collect_shadow_or_execution_evidence",
+        "shadow_observation": "keep_shadow_until_rolling_evidence_improves",
+        "canary_candidate": "operator_review_for_small_budget_canary",
+        "live_candidate": "operator_review_for_live_budget_after_clean_window",
+        "demote": "reduce_or_disable_budget_until_shadow_recovery",
+        "quarantine": "stop_budget_until_root_cause_review",
+    }
+    return {
+        "policy": "generated_to_shadow_to_canary_to_live_or_demote",
+        "lifecycle_stage": lifecycle_stage,
+        "recommended_stage": recommended_stage,
+        "strategy_profile_id": row.get("strategy_profile_id"),
+        "model_name": row.get("model_name"),
+        "symbol": row.get("symbol"),
+        "side": row.get("side"),
+        "decision_lane": row.get("decision_lane"),
+        "closed_trade_count": count,
+        "realized_net_pnl": round(realized_net_pnl, 6),
+        "profit_factor": round(profit_factor, 6),
+        "ranking_reasons": list(ranking_reasons),
+        "transition_path": ["generated", "shadow", "canary", "live"],
+        "next_action": next_action_by_stage.get(
+            lifecycle_stage,
+            "keep_shadow_until_rolling_evidence_improves",
+        ),
+        "operator_gate_required": lifecycle_stage in {"canary_candidate", "live_candidate"},
+        "live_mutation": False,
+    }
+
+
+def _decision_profit_first_plan(row: Any) -> dict[str, Any]:
+    raw = _safe_dict(_row_get(row, "raw_llm_response") or _row_get(row, "raw_response"))
+    return _safe_dict(raw.get("profit_first_trade_plan"))
+
+
+def _decision_lifecycle_key(row: Any, plan: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(_row_get(row, "model_name") or "decision_llm"),
+        str(plan.get("strategy_profile_id") or "unknown"),
+        str(_row_get(row, "symbol") or plan.get("symbol") or "unknown"),
+        str(_row_get(row, "action") or plan.get("side") or plan.get("action") or "unknown"),
+        str(plan.get("decision_lane") or "unknown"),
+    )
+
+
+def _strategy_generation_rows(decisions: Sequence[Any]) -> list[dict[str, Any]]:
+    rows: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for decision in decisions:
+        plan = _decision_profit_first_plan(decision)
+        if not plan:
+            continue
+        key = _decision_lifecycle_key(decision, plan)
+        row = rows.setdefault(
+            key,
+            {
+                "model_name": key[0],
+                "strategy_profile_id": key[1],
+                "symbol": key[2],
+                "side": key[3],
+                "decision_lane": key[4],
+                "generated_count": 0,
+                "executed_entry_count": 0,
+                "skipped_count": 0,
+                "expected_net_return_sum_pct": 0.0,
+                "profit_quality_sum": 0.0,
+                "profit_quality_count": 0,
+            },
+        )
+        row["generated_count"] += 1
+        if bool(_row_get(decision, "was_executed")):
+            row["executed_entry_count"] += 1
+        else:
+            row["skipped_count"] += 1
+        row["expected_net_return_sum_pct"] += _safe_float(
+            plan.get("expected_net_return_pct"),
+            0.0,
+        )
+        quality = plan.get("profit_quality_ratio")
+        if quality is not None:
+            row["profit_quality_sum"] += _safe_float(quality, 0.0)
+            row["profit_quality_count"] += 1
+    result = []
+    for row in rows.values():
+        generated = _safe_int(row.get("generated_count"))
+        quality_count = _safe_int(row.get("profit_quality_count"))
+        row["avg_expected_net_return_pct"] = round(
+            _safe_float(row.pop("expected_net_return_sum_pct"), 0.0) / max(generated, 1),
+            6,
+        )
+        row["avg_profit_quality_ratio"] = (
+            round(_safe_float(row.pop("profit_quality_sum"), 0.0) / quality_count, 6)
+            if quality_count
+            else None
+        )
+        row.pop("profit_quality_count", None)
+        row["lifecycle_stage"] = "generated"
+        row["next_action"] = "collect_shadow_or_execution_evidence"
+        row["live_mutation"] = False
+        result.append(row)
+    result.sort(
+        key=lambda item: (
+            _safe_int(item.get("generated_count")),
+            _safe_float(item.get("avg_expected_net_return_pct")),
+        ),
+        reverse=True,
+    )
+    return result
+
+
+def _strategy_lifecycle_report(
+    decisions: Sequence[Any],
+    strategy_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    generated_rows = _strategy_generation_rows(decisions)
+    stage_counts = Counter(
+        str(_safe_dict(row.get("strategy_lifecycle")).get("lifecycle_stage") or "shadow")
+        for row in strategy_rows
+    )
+    if generated_rows:
+        stage_counts["generated"] += sum(
+            _safe_int(row.get("generated_count")) for row in generated_rows
+        )
+    return {
+        "policy": "generated_to_shadow_to_canary_to_live_or_demote_by_rolling_realized_pnl",
+        "read_only": True,
+        "live_mutation": False,
+        "generated_count": sum(_safe_int(row.get("generated_count")) for row in generated_rows),
+        "executed_entry_count": sum(
+            _safe_int(row.get("executed_entry_count")) for row in generated_rows
+        ),
+        "closed_strategy_count": len(strategy_rows),
+        "stage_counts": dict(stage_counts),
+        "generated_profiles": generated_rows[:40],
+        "ranked_profiles": [
+            _safe_dict(row.get("strategy_lifecycle")) for row in strategy_rows[:40]
+        ],
+    }
+
+
 def _strategy_runtime_feedback(strategy_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for row in strategy_rows:
@@ -629,6 +817,8 @@ def _strategy_runtime_feedback(strategy_rows: list[dict[str, Any]]) -> list[dict
                 "side": row.get("side"),
                 "decision_lane": row.get("decision_lane"),
                 "recommended_stage": stage,
+                "lifecycle_stage": row.get("lifecycle_stage"),
+                "strategy_lifecycle": _safe_dict(row.get("strategy_lifecycle")),
                 "weight_multiplier": round(multiplier, 6),
                 "count": row.get("count"),
                 "realized_net_pnl": row.get("realized_net_pnl"),

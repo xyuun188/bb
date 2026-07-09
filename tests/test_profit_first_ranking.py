@@ -134,6 +134,44 @@ def test_profit_first_ranking_promotes_profitable_profile_after_sample_floor() -
     assert "positive_realized_net_pnl" in top["ranking_reasons"]
 
 
+def test_profit_first_ranking_exposes_strategy_generation_lifecycle() -> None:
+    positions = [
+        _position(idx, pnl=1.0, strategy="bb_finquant_momo", closed_offset_minutes=idx)
+        for idx in range(1, 22)
+    ]
+    generated_decision = SimpleNamespace(
+        id=901,
+        model_name="BB-FinQuant-Expert-14B",
+        symbol="BTC/USDT",
+        action="long",
+        was_executed=False,
+        raw_llm_response=_raw(strategy="bb_finquant_momo", lane="validated_probe"),
+    )
+
+    report = ProfitFirstRankingService(min_canary_samples=20).build_report(
+        decisions=[generated_decision],
+        closed_positions=positions,
+    )
+
+    top = report["strategy_rankings"][0]
+    lifecycle = top["strategy_lifecycle"]
+    runtime_lifecycle = report["runtime_feedback"]["strategy_lifecycle"]
+
+    assert top["lifecycle_stage"] == "canary_candidate"
+    assert lifecycle["operator_gate_required"] is True
+    assert lifecycle["live_mutation"] is False
+    assert lifecycle["next_action"] == "operator_review_for_small_budget_canary"
+    assert runtime_lifecycle["generated_count"] == 1
+    assert runtime_lifecycle["executed_entry_count"] == 0
+    assert runtime_lifecycle["stage_counts"]["generated"] == 1
+    assert runtime_lifecycle["stage_counts"]["canary_candidate"] == 1
+    assert runtime_lifecycle["generated_profiles"][0]["model_name"] == "BB-FinQuant-Expert-14B"
+    assert report["summary"]["generated_strategy_count"] == 1
+    assert report["runtime_feedback"]["policy"]["strategy_lifecycle_policy"] == (
+        "generated_to_shadow_to_canary_to_live_or_demote_by_rolling_realized_pnl"
+    )
+
+
 def test_profit_first_ranking_disables_repeated_losing_profile() -> None:
     positions = [
         _position(idx, pnl=-2.5, strategy="loss_loop", closed_offset_minutes=idx)

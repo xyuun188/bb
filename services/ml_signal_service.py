@@ -1889,6 +1889,11 @@ def _bucket_segment_summary(
         "avg_model_score": None if bucket.empty else float(score_values.mean()),
         "avg_return_pct": None if bucket.empty else float(bucket[return_col].mean()),
         "win_rate": None if bucket.empty else float(bucket[win_col].mean()),
+        "tail_loss_rate": (
+            None
+            if bucket.empty or f"{side}_tail_loss" not in bucket
+            else float(bucket[f"{side}_tail_loss"].mean())
+        ),
         "avg_sample_weight": (
             None
             if bucket.empty

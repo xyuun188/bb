@@ -116,10 +116,17 @@ _LOCAL_AI_TOOLS_SHADOW_TOOL_KEYS = {
     "specialist_inference_active",
     "specialist_primary_model",
     "specialist_challenger_model",
+    "specialist_artifacts_ready",
     "timesfm_shadow_expected_return_pct",
     "timesfm_shadow_expected_move_pct",
     "timesfm_shadow_side",
     "timesfm_shadow_confidence",
+    "timesfm_shadow_horizon_step",
+    "chronos_shadow_expected_return_pct",
+    "chronos_shadow_expected_move_pct",
+    "chronos_shadow_side",
+    "chronos_shadow_confidence",
+    "chronos_shadow_horizon_step",
 }
 _TRAINING_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
 _TRAINING_REPAIR_SOURCES = {
@@ -131,8 +138,12 @@ _TRAINING_REPAIR_SOURCES = {
 }
 _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "kind",
+    "primary_model",
+    "challenger_model",
+    "artifacts_ready",
     "actual_inference",
     "baseline_response",
+    "baseline_model",
     "activation_blocker",
     "promotion_flow",
     "live_mutation",
@@ -363,8 +374,10 @@ def _compact_professional_shadow(value: Any) -> dict[str, Any]:
         item = _compact_shadow_scalar(value.get(key))
         if item is not None:
             compact[key] = item
-    result = value.get("shadow_result")
-    if isinstance(result, dict):
+
+    def compact_shadow_result(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return {}
         compact_result = {}
         for key in (
             "model",
@@ -381,8 +394,17 @@ def _compact_professional_shadow(value: Any) -> dict[str, Any]:
             item = _compact_shadow_scalar(result.get(key))
             if item is not None:
                 compact_result[key] = item
+        return compact_result
+
+    result = value.get("shadow_result")
+    if isinstance(result, dict):
+        compact_result = compact_shadow_result(result)
         if compact_result:
             compact["shadow_result"] = compact_result
+    for key in ("primary_shadow_result", "challenger_shadow_result"):
+        compact_result = compact_shadow_result(value.get(key))
+        if compact_result:
+            compact[key] = compact_result
     return compact
 
 

@@ -189,17 +189,44 @@ def test_local_ai_tools_shadow_features_are_compacted_for_training_payload() -> 
                 "expected_return_pct": 0.1,
                 "timesfm_shadow_expected_return_pct": 0.42,
                 "timesfm_shadow_side": "long",
+                "timesfm_shadow_horizon_step": 2,
+                "chronos_shadow_expected_return_pct": 0.21,
+                "chronos_shadow_side": "long",
+                "chronos_shadow_horizon_step": 2,
                 "specialist_inference_active": True,
                 "professional_model_shadow": {
                     "kind": "timeseries",
+                    "primary_model": "google/timesfm-2.5-200m-pytorch",
+                    "challenger_model": "amazon/chronos-2",
+                    "artifacts_ready": True,
                     "actual_inference": True,
                     "baseline_response": True,
                     "live_mutation": False,
                     "shadow_result": {
                         "model": "timesfm-2.5-shadow-challenger",
+                        "actual_inference": True,
                         "expected_return_pct": 0.42,
                         "best_side": "long",
                         "confidence": 0.73,
+                        "sequence_length": 60,
+                        "raw_predictions": list(range(100)),
+                    },
+                    "primary_shadow_result": {
+                        "model": "timesfm-2.5-primary",
+                        "actual_inference": True,
+                        "expected_return_pct": 0.42,
+                        "best_side": "long",
+                        "confidence": 0.73,
+                        "sequence_length": 60,
+                        "raw_predictions": list(range(100)),
+                    },
+                    "challenger_shadow_result": {
+                        "model": "chronos-2-shadow-challenger",
+                        "actual_inference": True,
+                        "expected_return_pct": 0.21,
+                        "best_side": "long",
+                        "confidence": 0.62,
+                        "sequence_length": 60,
                         "raw_predictions": list(range(100)),
                     },
                 },
@@ -222,14 +249,40 @@ def test_local_ai_tools_shadow_features_are_compacted_for_training_payload() -> 
     shadow = compact["local_ai_tools_shadow"]["time_series_prediction"]
     assert shadow["timesfm_shadow_expected_return_pct"] == 0.42
     assert shadow["timesfm_shadow_side"] == "long"
+    assert shadow["chronos_shadow_expected_return_pct"] == 0.21
+    assert shadow["chronos_shadow_side"] == "long"
+    assert shadow["professional_model_shadow"]["primary_model"] == (
+        "google/timesfm-2.5-200m-pytorch"
+    )
+    assert shadow["professional_model_shadow"]["challenger_model"] == "amazon/chronos-2"
     assert shadow["professional_model_shadow"]["shadow_result"] == {
         "model": "timesfm-2.5-shadow-challenger",
+        "actual_inference": True,
         "expected_return_pct": 0.42,
         "best_side": "long",
         "confidence": 0.73,
+        "sequence_length": 60.0,
+    }
+    assert shadow["professional_model_shadow"]["primary_shadow_result"] == {
+        "model": "timesfm-2.5-primary",
+        "actual_inference": True,
+        "expected_return_pct": 0.42,
+        "best_side": "long",
+        "confidence": 0.73,
+        "sequence_length": 60.0,
+    }
+    assert shadow["professional_model_shadow"]["challenger_shadow_result"] == {
+        "model": "chronos-2-shadow-challenger",
+        "actual_inference": True,
+        "expected_return_pct": 0.21,
+        "best_side": "long",
+        "confidence": 0.62,
+        "sequence_length": 60.0,
     }
     assert "raw_huge_payload" not in shadow
     assert "raw_predictions" not in shadow["professional_model_shadow"]["shadow_result"]
+    assert "raw_predictions" not in shadow["professional_model_shadow"]["primary_shadow_result"]
+    assert "raw_predictions" not in shadow["professional_model_shadow"]["challenger_shadow_result"]
     assert "raw_llm_response" not in compact
     assert "opinions" not in compact
     assert "nested_context" not in compact

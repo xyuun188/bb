@@ -145,6 +145,55 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
     return blockers
 
 
+def _side_profit_quality_diagnostics(
+    metadata: dict[str, Any],
+    metrics: dict[str, Any],
+    side: str,
+) -> dict[str, Any]:
+    score_bucket_diagnostics = _safe_dict(metadata.get("score_bucket_diagnostics"))
+    side_buckets = _safe_dict(score_bucket_diagnostics.get(side))
+    top_bucket = _safe_dict(side_buckets.get("top"))
+    bottom_bucket = _safe_dict(side_buckets.get("bottom"))
+    top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), None)
+    bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), None)
+    top_win = _safe_float(metrics.get(f"top_{side}_win_rate"), None)
+    bottom_win = _safe_float(metrics.get(f"bottom_{side}_win_rate"), None)
+    top_tail_loss = _safe_float(metrics.get(f"top_{side}_tail_loss_rate"), None)
+    bottom_tail_loss = _safe_float(metrics.get(f"bottom_{side}_tail_loss_rate"), None)
+    if top_tail_loss is None:
+        top_tail_loss = _safe_float(top_bucket.get("tail_loss_rate"), None)
+    if bottom_tail_loss is None:
+        bottom_tail_loss = _safe_float(bottom_bucket.get("tail_loss_rate"), None)
+    spread = (
+        None
+        if top_return is None or bottom_return is None
+        else round(top_return - bottom_return, 6)
+    )
+    diagnosis: list[str] = []
+    if top_return is not None and top_return <= ML_READINESS_MIN_TOP_RETURN_PCT:
+        diagnosis.append("top_score_bucket_not_fee_after_profitable")
+    if spread is not None and spread <= 0:
+        diagnosis.append("top_score_bucket_not_better_than_bottom")
+    if top_win is not None and bottom_win is not None and top_win <= bottom_win:
+        diagnosis.append("top_score_win_rate_not_better_than_bottom")
+    if top_tail_loss is not None and bottom_tail_loss is not None and top_tail_loss > bottom_tail_loss:
+        diagnosis.append("top_score_tail_loss_worse_than_bottom")
+    return {
+        "side": side,
+        "training_target": "fee_after_realized_return_quality",
+        "top_avg_return_pct": top_return,
+        "bottom_avg_return_pct": bottom_return,
+        "top_bottom_return_spread_pct": spread,
+        "top_win_rate": top_win,
+        "bottom_win_rate": bottom_win,
+        "top_tail_loss_rate": top_tail_loss,
+        "bottom_tail_loss_rate": bottom_tail_loss,
+        "top_bucket": top_bucket,
+        "bottom_bucket": bottom_bucket,
+        "diagnosis": diagnosis,
+    }
+
+
 def build_ml_readiness_report(
     metadata: dict[str, Any],
     influence: dict[str, Any],
@@ -192,6 +241,10 @@ def build_ml_readiness_report(
             )
         )
     side_blockers = {side: _side_metric_blockers(metrics, side) for side in ("long", "short")}
+    profit_quality_diagnostics = {
+        side: _side_profit_quality_diagnostics(metadata, metrics, side)
+        for side in ("long", "short")
+    }
     side_enabled = {
         side: not bool(blockers) and bool(_safe_dict(influence.get(side)).get("enabled", True))
         for side, blockers in side_blockers.items()
@@ -274,6 +327,7 @@ def build_ml_readiness_report(
         "live_enabled_sides": live_enabled_sides,
         "side_blocking_reasons": side_blockers,
         "blocking_reasons": blockers,
+        "profit_quality_diagnostics": profit_quality_diagnostics,
         "next_training_conditions": {
             "min_interval_seconds": min_interval_seconds,
             "min_new_samples": min_new_samples,
@@ -305,6 +359,9 @@ def build_ml_readiness_report(
             "bottom_long_avg_return_pct": _safe_float(
                 metrics.get("bottom_long_avg_return_pct"), None
             ),
+            "top_long_bottom_return_spread_pct": profit_quality_diagnostics["long"].get(
+                "top_bottom_return_spread_pct"
+            ),
             "top_long_tail_loss_rate": _safe_float(
                 metrics.get("top_long_tail_loss_rate"), None
             ),
@@ -314,6 +371,9 @@ def build_ml_readiness_report(
             "top_short_avg_return_pct": _safe_float(metrics.get("top_short_avg_return_pct"), None),
             "bottom_short_avg_return_pct": _safe_float(
                 metrics.get("bottom_short_avg_return_pct"), None
+            ),
+            "top_short_bottom_return_spread_pct": profit_quality_diagnostics["short"].get(
+                "top_bottom_return_spread_pct"
             ),
             "top_short_tail_loss_rate": _safe_float(
                 metrics.get("top_short_tail_loss_rate"), None
