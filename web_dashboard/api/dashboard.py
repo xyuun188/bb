@@ -22,7 +22,12 @@ from config.settings import (
     settings,
 )
 from core.safe_output import safe_error_text
-from core.symbols import normalize_trading_symbol, symbol_query_variants
+from core.symbols import (
+    normalize_trading_symbol,
+    okx_inst_id_from_symbol,
+    symbol_from_okx_inst_id,
+    symbol_query_variants,
+)
 from core.trading_mode import mode_manager
 from data_feed.okx_rest_client import OKXRestClient
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
@@ -2515,6 +2520,24 @@ async def _dashboard_closed_position_ledger_rows(
             or group
             for group in selected_groups
         ]
+        official_rows = _dashboard_position_history_official_rows_as_groups(
+            position_history_rows,
+            refreshed_groups,
+            mode=mode,
+        )
+        if official_rows:
+            official_total = max(total, len(official_rows))
+            official_total_pages = (
+                max(1, (official_total + page_size - 1) // page_size)
+                if official_total
+                else 1
+            )
+            return (
+                official_rows[:page_size],
+                official_total,
+                page,
+                official_total_pages,
+            )
     return (
         [group.as_dict(include_fills=True) for group in selected_groups],
         total,
@@ -2552,6 +2575,252 @@ def _dashboard_ledger_group_refresh_key(group: Any) -> tuple[Any, ...]:
     )
 
 
+def _dashboard_ms_datetime(value: Any) -> datetime | None:
+    number = _safe_float(value, 0.0) or 0.0
+    if number <= 0:
+        return None
+    if number < 10_000_000_000:
+        number *= 1000.0
+    try:
+        return datetime.fromtimestamp(number / 1000.0, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _dashboard_position_history_side(row: dict[str, Any]) -> str:
+    for key in ("posSide", "positionSide", "side", "direction"):
+        value = str(row.get(key) or "").lower().strip()
+        if value in {"long", "short"}:
+            return value
+    return ""
+
+
+def _dashboard_position_history_close_status(row: dict[str, Any]) -> tuple[str, str]:
+    close_type = str(row.get("type") or row.get("closeType") or "").strip()
+    if close_type == "1":
+        return "partial", "部分平仓"
+    if close_type == "2":
+        return "full", "全部平仓"
+    closed_qty = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
+    max_qty = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
+    if max_qty > 0 and closed_qty > 0 and closed_qty < max_qty:
+        return "partial", "部分平仓"
+    return "full", "全部平仓"
+
+
+def _dashboard_position_history_group_id(row: dict[str, Any], mode: str | None) -> str:
+    inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+    pos_id = str(row.get("posId") or row.get("pos_id") or "").strip()
+    c_time = str(row.get("cTime") or row.get("createdTime") or "").strip()
+    u_time = str(row.get("uTime") or row.get("updatedTime") or "").strip()
+    close_type = str(row.get("type") or row.get("closeType") or "").strip()
+    raw = "|".join([mode or "", inst_id, pos_id, c_time, u_time, close_type])
+    return raw.replace("/", "_").replace(":", "").replace("+", "")
+
+
+def _dashboard_position_history_match_score(
+    row: dict[str, Any],
+    group: Any,
+) -> int:
+    row_inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+    if row_inst_id and row_inst_id != str(getattr(group, "inst_id", "") or "").strip().upper():
+        return -1
+    score = 0
+    if row_inst_id:
+        score += 20
+    row_side = _dashboard_position_history_side(row)
+    if row_side and row_side == str(getattr(group, "side", "") or "").lower().strip():
+        score += 15
+    row_closed_qty = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
+    group_closed_qty = _safe_float(getattr(group, "closed_quantity", None), 0.0) or 0.0
+    if row_closed_qty > 0 and group_closed_qty > 0:
+        denominator = max(abs(row_closed_qty), abs(group_closed_qty), 1e-12)
+        if abs(row_closed_qty - group_closed_qty) / denominator <= 0.02:
+            score += 30
+    row_opened = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+    group_opened = _as_utc_datetime(getattr(group, "opened_at", None))
+    if row_opened and group_opened:
+        delta = abs((row_opened - group_opened).total_seconds())
+        if delta <= 300:
+            score += max(0, 20 - int(delta // 30))
+    row_updated = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+    group_closed = _as_utc_datetime(getattr(group, "closed_at", None))
+    if row_updated and group_closed:
+        delta = abs((row_updated - group_closed).total_seconds())
+        if delta <= 3600:
+            score += max(0, 20 - int(delta // 180))
+    return score
+
+
+def _dashboard_position_history_best_local_group(row: dict[str, Any], groups: list[Any]) -> Any | None:
+    scored = [
+        (score, group)
+        for group in groups
+        if (score := _dashboard_position_history_match_score(row, group)) >= 0
+    ]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored[0][0] <= 0:
+        return None
+    return scored[0][1]
+
+
+def _dashboard_linked_fill_unit_sums(
+    fills: list[dict[str, Any]],
+    order_ids: set[str],
+) -> tuple[float, float]:
+    base_quantity = 0.0
+    contracts = 0.0
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        order_id = str(fill.get("order_id") or "").strip()
+        if order_ids and order_id not in order_ids:
+            continue
+        base_quantity += abs(_safe_float(fill.get("quantity"), 0.0) or 0.0)
+        contracts += abs(_safe_float(fill.get("contracts"), 0.0) or 0.0)
+    return base_quantity, contracts
+
+
+def _dashboard_position_history_quantity_in_base_units(
+    raw_quantity: Any,
+    payload: dict[str, Any],
+    *,
+    order_id_key: str,
+    fallback: Any,
+) -> float:
+    raw = _safe_float(raw_quantity, None)
+    fallback_value = _safe_float(fallback, 0.0) or 0.0
+    if raw is None or raw <= 0:
+        return fallback_value
+    linked_fills = payload.get("linked_fills") if isinstance(payload, dict) else []
+    linked_fills = linked_fills if isinstance(linked_fills, list) else []
+    order_ids = {str(item or "").strip() for item in payload.get(order_id_key, []) or []}
+    base_quantity, contracts = _dashboard_linked_fill_unit_sums(linked_fills, order_ids)
+    if base_quantity > 0:
+        denominator = max(abs(raw), abs(base_quantity), 1e-12)
+        if abs(raw - base_quantity) / denominator <= 0.02:
+            return base_quantity
+    if contracts > 0:
+        denominator = max(abs(raw), abs(contracts), 1e-12)
+        if abs(raw - contracts) / denominator <= 0.02:
+            return base_quantity if base_quantity > 0 else fallback_value or raw
+    if fallback_value > 0:
+        denominator = max(abs(raw), abs(fallback_value), 1e-12)
+        if abs(raw - fallback_value) / denominator <= 0.02:
+            return fallback_value
+    return raw
+
+
+def _dashboard_position_history_official_rows_as_groups(
+    rows: list[dict[str, Any]],
+    local_groups: list[Any],
+    *,
+    mode: str | None,
+) -> list[dict[str, Any]]:
+    official_groups: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+        symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id)
+        if not symbol:
+            continue
+        matched = _dashboard_position_history_best_local_group(row, local_groups)
+        payload = (
+            matched.as_dict(include_fills=True)
+            if matched is not None and hasattr(matched, "as_dict")
+            else {}
+        )
+        status, status_label = _dashboard_position_history_close_status(row)
+        if status == "full" and str(payload.get("close_status") or "") == "partial":
+            status, status_label = "partial", "部分平仓"
+        opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+        updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+        closed_at = None if status == "partial" else updated_at
+        close_quantity = _dashboard_position_history_quantity_in_base_units(
+            row.get("closeTotalPos"),
+            payload,
+            order_id_key="close_order_ids",
+            fallback=payload.get("closed_quantity") or payload.get("quantity"),
+        )
+        max_quantity = _dashboard_position_history_quantity_in_base_units(
+            row.get("openMaxPos"),
+            payload,
+            order_id_key="entry_order_ids",
+            fallback=payload.get("max_position_quantity") or close_quantity,
+        )
+        realized_pnl = _safe_float(row.get("realizedPnl"), 0.0) or 0.0
+        pnl_ratio = _safe_float(row.get("pnlRatio"), None)
+        if pnl_ratio is not None:
+            pnl_ratio *= 100.0
+        payload.update(
+            {
+                "id": _dashboard_position_history_group_id(row, mode),
+                "group_id": _dashboard_position_history_group_id(row, mode),
+                "is_open": False,
+                "symbol": symbol,
+                "okx_inst_id": inst_id,
+                "okx_pos_id": str(row.get("posId") or row.get("pos_id") or "").strip(),
+                "side": _dashboard_position_history_side(row)
+                or str(payload.get("side") or "").lower(),
+                "leverage": _safe_float(row.get("lever"), payload.get("leverage", 1.0)) or 1.0,
+                "position_status": status_label,
+                "close_status": status,
+                "close_status_label": status_label,
+                "quantity": close_quantity,
+                "max_position_quantity": max_quantity,
+                "closed_quantity": close_quantity,
+                "entry_price": _safe_float(row.get("openAvgPx"), payload.get("entry_price", 0.0))
+                or 0.0,
+                "current_price": _safe_float(row.get("closeAvgPx"), payload.get("current_price", 0.0))
+                or 0.0,
+                "average_entry_price": _safe_float(
+                    row.get("openAvgPx"),
+                    payload.get("average_entry_price", 0.0),
+                )
+                or 0.0,
+                "average_close_price": _safe_float(
+                    row.get("closeAvgPx"),
+                    payload.get("average_close_price", 0.0),
+                )
+                or 0.0,
+                "realized_pnl": realized_pnl,
+                "realized_pnl_pct": pnl_ratio,
+                "pnl_source": "okx_position_history_realized_pnl",
+                "funding_fee": _safe_float(row.get("fundingFee"), payload.get("funding_fee", 0.0))
+                or 0.0,
+                "settlement_source": "okx_position_history_realized_pnl",
+                "settlement_status": "okx_position_history",
+                "opened_at": opened_at.isoformat() if opened_at else payload.get("opened_at"),
+                "closed_at": closed_at.isoformat() if closed_at else None,
+                "official_updated_at": updated_at.isoformat() if updated_at else None,
+                "ledger_source": "okx_positions_history_official",
+                "okx_position_history_row": dict(row),
+            }
+        )
+        if "linked_fills" not in payload:
+            payload["linked_fills"] = []
+        payload["linked_order_count"] = len(payload.get("linked_fills") or [])
+        payload.setdefault("entry_order_ids", [])
+        payload.setdefault("close_order_ids", [])
+        payload.setdefault("evidence_complete", True)
+        payload.setdefault("trainable", True)
+        payload.setdefault("evidence_gaps", [])
+        official_groups.append(payload)
+    return sorted(
+        official_groups,
+        key=lambda item: (
+            _as_utc_datetime(item.get("official_updated_at"))
+            or _as_utc_datetime(item.get("closed_at"))
+            or _as_utc_datetime(item.get("opened_at"))
+            or datetime.min.replace(tzinfo=UTC)
+        ),
+        reverse=True,
+    )
+
+
 async def _dashboard_okx_position_history_rows(
     *,
     mode: str | None,
@@ -2569,19 +2838,34 @@ async def _dashboard_okx_position_history_rows(
     )
     inst_ids = sorted(
         {
-            str(getattr(row, "okx_inst_id", "") or "").strip().upper()
+            (
+                str(getattr(row, "okx_inst_id", "") or "").strip().upper()
+                or okx_inst_id_from_symbol(getattr(row, "symbol", None))
+                or ""
+            )
             for row in closed_rows
-            if str(getattr(row, "okx_inst_id", "") or "").strip()
+            if (
+                str(getattr(row, "okx_inst_id", "") or "").strip()
+                or okx_inst_id_from_symbol(getattr(row, "symbol", None))
+            )
         }
     )
-    if not pos_ids or not inst_ids:
-        return []
     opened_values = [
         value
         for row in closed_rows
         if (value := _as_utc_datetime(getattr(row, "created_at", None))) is not None
     ]
-    since = min(opened_values) - timedelta(days=1) if opened_values else datetime.now(UTC) - timedelta(days=7)
+    closed_values = [
+        value
+        for row in closed_rows
+        if (value := _as_utc_datetime(getattr(row, "closed_at", None))) is not None
+    ]
+    reference_values = [*opened_values, *closed_values]
+    since = (
+        min(reference_values) - timedelta(days=1)
+        if reference_values
+        else datetime.now(UTC) - timedelta(days=14)
+    )
     cache_key = (
         "okx_position_history_rows",
         selected_mode,
@@ -2600,20 +2884,34 @@ async def _dashboard_okx_position_history_rows(
         try:
             if owns_executor:
                 await executor.initialize()
+            page_count = 5 if not pos_ids else 2
             rows = await asyncio.wait_for(
                 OkxNativeFactsClient(executor).fetch_position_history_rows(
-                    inst_ids=inst_ids,
+                    inst_ids=inst_ids or None,
+                    pos_ids=pos_ids or None,
                     since=since,
                     strict=False,
+                    limit=100,
+                    max_pages=page_count,
                 ),
                 timeout=12.0,
             )
             wanted_pos_ids = set(pos_ids)
+            wanted_inst_ids = set(inst_ids)
             return [
                 dict(row)
                 for row in rows
                 if isinstance(row, dict)
-                and str(row.get("posId") or row.get("pos_id") or "").strip() in wanted_pos_ids
+                and (
+                    not wanted_pos_ids
+                    or str(row.get("posId") or row.get("pos_id") or "").strip()
+                    in wanted_pos_ids
+                )
+                and (
+                    not wanted_inst_ids
+                    or str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+                    in wanted_inst_ids
+                )
             ]
         except Exception as exc:
             _log_dashboard_fallback(
