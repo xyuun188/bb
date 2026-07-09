@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import threading
+import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 
@@ -28,6 +31,8 @@ OKX_DOMAIN = "https://www.okx.com"
 OKX_SWAP_INST_TYPE = "SWAP"
 OKX_SWAP_SETTLE_CCY = "USDT"
 OKX_CROSS_MARGIN_MODE = "cross"
+OKX_SERVER_TIME_PATH = "/api/v5/public/time"
+OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
 
 
 def okx_sdk_flag_for_mode(mode: str) -> str:
@@ -84,6 +89,14 @@ def _format_number(value: Any) -> str:
     except (InvalidOperation, ValueError):
         return str(value)
     return format(decimal_value.normalize(), "f").rstrip("0").rstrip(".") or "0"
+
+
+def _timestamp_from_epoch_ms(epoch_ms: int) -> str:
+    return (
+        datetime.fromtimestamp(epoch_ms / 1000.0, tz=UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -228,13 +241,16 @@ class OkxPerpetualSdkExchange:
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
         self._public_api: Any | None = None
+        self._server_time_lock = threading.Lock()
+        self._server_time_offset_ms: int | None = None
+        self._server_time_synced_at: float = 0.0
 
     @property
     def account_api(self) -> Any:
         if self._account_api is None:
             from okx.Account import AccountAPI
 
-            self._account_api = AccountAPI(**self._private_kwargs())
+            self._account_api = self._configure_private_api(AccountAPI(**self._private_kwargs()))
         return self._account_api
 
     @property
@@ -242,7 +258,7 @@ class OkxPerpetualSdkExchange:
         if self._trade_api is None:
             from okx.Trade import TradeAPI
 
-            self._trade_api = TradeAPI(**self._private_kwargs())
+            self._trade_api = self._configure_private_api(TradeAPI(**self._private_kwargs()))
         return self._trade_api
 
     @property
@@ -281,12 +297,59 @@ class OkxPerpetualSdkExchange:
             "api_key": creds.get("api_key", ""),
             "api_secret_key": creds.get("api_secret", ""),
             "passphrase": creds.get("passphrase", ""),
-            "use_server_time": True,
             "flag": okx_sdk_flag_for_mode(self.mode),
             "domain": OKX_DOMAIN,
             "debug": False,
             "proxy": proxy,
         }
+
+    def _configure_private_api(self, api: Any) -> Any:
+        # python-okx 0.4.x accepts a deprecated use_server_time argument but
+        # leaves the instance flag disabled. Set it explicitly and override the
+        # timestamp source with a cached OKX server-time offset so private
+        # signed calls are not invalidated by host clock drift.
+        api.use_server_time = True
+        api._get_timestamp = lambda: self._server_timestamp(api)
+        return api
+
+    def _server_timestamp(self, api: Any) -> str:
+        now_monotonic = time.monotonic()
+        with self._server_time_lock:
+            offset_is_stale = (
+                self._server_time_offset_ms is None
+                or now_monotonic - self._server_time_synced_at > OKX_SERVER_TIME_SYNC_TTL_SECONDS
+            )
+            if offset_is_stale:
+                try:
+                    response = api.get(f"{OKX_DOMAIN}{OKX_SERVER_TIME_PATH}")
+                    response.raise_for_status()
+                    payload = response.json()
+                    rows = payload.get("data") if isinstance(payload, Mapping) else None
+                    server_ms = int((rows or [{}])[0].get("ts"))
+                    local_ms = int(time.time() * 1000)
+                    self._server_time_offset_ms = server_ms - local_ms
+                    self._server_time_synced_at = now_monotonic
+                    if abs(self._server_time_offset_ms) > 5_000:
+                        logger.warning(
+                            "OKX SDK server time offset is high",
+                            mode=self.mode,
+                            offset_ms=self._server_time_offset_ms,
+                        )
+                except Exception as exc:
+                    if self._server_time_offset_ms is None:
+                        logger.warning(
+                            "OKX SDK server time sync failed; falling back to local clock",
+                            mode=self.mode,
+                            error=safe_error_text(exc),
+                        )
+                        return _timestamp_from_epoch_ms(int(time.time() * 1000))
+                    logger.warning(
+                        "OKX SDK server time refresh failed; reusing cached offset",
+                        mode=self.mode,
+                        error=safe_error_text(exc),
+                    )
+
+            return _timestamp_from_epoch_ms(int(time.time() * 1000) + int(self._server_time_offset_ms or 0))
 
     async def _call_sdk(
         self,

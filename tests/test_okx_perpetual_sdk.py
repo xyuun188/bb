@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from core.exceptions import ExchangeAPIError
+from services import okx_perpetual_sdk
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
 
@@ -46,6 +47,48 @@ class _AccountApi:
     def set_leverage(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("set_leverage", dict(kwargs)))
         return {"code": "0", "data": [{"sCode": "0"}]}
+
+
+class _ServerTimeResponse:
+    def __init__(self, server_ms: int) -> None:
+        self.server_ms = server_ms
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {"code": "0", "data": [{"ts": str(self.server_ms)}]}
+
+
+class _PrivateApiForTime:
+    def __init__(self, server_ms: int) -> None:
+        self.server_ms = server_ms
+        self.use_server_time = False
+        self.urls: list[str] = []
+
+    def get(self, url: str) -> _ServerTimeResponse:
+        self.urls.append(url)
+        return _ServerTimeResponse(self.server_ms)
+
+
+def test_sdk_adapter_enables_cached_okx_server_time_for_private_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    api = exchange._configure_private_api(_PrivateApiForTime(1_783_592_000_123))
+    clock = {"wall": 1000.0, "mono": 10.0}
+    monkeypatch.setattr(okx_perpetual_sdk.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(okx_perpetual_sdk.time, "monotonic", lambda: clock["mono"])
+
+    first = api._get_timestamp()
+    clock["wall"] = 1001.0
+    clock["mono"] = 11.0
+    second = api._get_timestamp()
+
+    assert api.use_server_time is True
+    assert first == okx_perpetual_sdk._timestamp_from_epoch_ms(1_783_592_000_123)
+    assert second == okx_perpetual_sdk._timestamp_from_epoch_ms(1_783_592_001_123)
+    assert api.urls == [f"{okx_perpetual_sdk.OKX_DOMAIN}{okx_perpetual_sdk.OKX_SERVER_TIME_PATH}"]
 
 
 @pytest.mark.asyncio
