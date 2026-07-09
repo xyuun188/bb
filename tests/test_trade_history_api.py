@@ -406,6 +406,81 @@ async def test_dashboard_position_history_prefers_closed_position_settlement_sna
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_uses_persisted_okx_official_snapshot_when_live_empty(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-official-stale-cache.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    official_row = {
+        "instId": "BAND-USDT-SWAP",
+        "posId": "3714144287308087298",
+        "posSide": "net",
+        "openAvgPx": "1.0",
+        "closeAvgPx": "1.12",
+        "openMaxPos": "20",
+        "closeTotalPos": "20",
+        "realizedPnl": "2.34",
+        "pnl": "2.34",
+        "fundingFee": "-0.01",
+        "type": "2",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+    }
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            for index in range(2):
+                await repo.open_position(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "BAND/USDT",
+                        "side": "long",
+                        "quantity": 20.0,
+                        "entry_price": 1.0,
+                        "current_price": 1.12,
+                        "leverage": 2.0,
+                        "realized_pnl": -999.0,
+                        "settlement_status": "reconciled",
+                        "settlement_source": "okx_position_history_settlement",
+                        "settlement_raw": {
+                            "okx_position_history_row": dict(official_row),
+                            "source": "okx_position_history_settlement",
+                        },
+                        "is_open": False,
+                        "okx_inst_id": "BAND-USDT-SWAP",
+                        "okx_pos_id": "band-pos-3714144287308087298",
+                        "entry_exchange_order_id": f"local-entry-{index}",
+                        "close_exchange_order_id": f"local-close-{index}",
+                        "closed_at": closed_at,
+                        "created_at": opened_at,
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    assert payload["ledger_source"] == "okx_positions_history_official_stale_cache"
+    assert payload["total"] == 1
+    row = payload["positions"][0]
+    assert row["symbol"] == "BAND/USDT"
+    assert row["okx_pos_id"] == "3714144287308087298"
+    assert row["realized_pnl"] == pytest.approx(2.34)
+    assert row["funding_fee"] == pytest.approx(-0.01)
+    assert row["quantity"] == pytest.approx(20.0)
+    assert len(row["position_ids"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_prefers_confirmed_okx_close_fill_net_pnl(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

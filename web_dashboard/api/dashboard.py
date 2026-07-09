@@ -2429,6 +2429,14 @@ async def _dashboard_closed_position_ledger_rows(
         mode=mode,
         closed_rows=closed_rows,
     )
+    official_history_source = "okx_positions_history_official"
+    if not position_history_rows:
+        position_history_rows = _dashboard_persisted_position_history_rows(
+            closed_rows,
+            mode=mode,
+        )
+        if position_history_rows:
+            official_history_source = "okx_positions_history_official_stale_cache"
     linked_order_ids = {
         token
         for position in closed_rows
@@ -2535,7 +2543,7 @@ async def _dashboard_closed_position_ledger_rows(
                 official_total,
                 page,
                 official_total_pages,
-                "okx_positions_history_official",
+                official_history_source,
             )
     return (
         [],
@@ -2616,6 +2624,61 @@ def _dashboard_position_history_group_id(row: dict[str, Any], mode: str | None) 
     close_type = str(row.get("type") or row.get("closeType") or "").strip()
     raw = "|".join([mode or "", inst_id, pos_id, c_time, u_time, close_type])
     return raw.replace("/", "_").replace(":", "").replace("+", "")
+
+
+def _dashboard_persisted_position_history_rows(
+    closed_rows: list[Any],
+    *,
+    mode: str | None,
+) -> list[dict[str, Any]]:
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for position in closed_rows:
+        raw = getattr(position, "settlement_raw", None)
+        raw = raw if isinstance(raw, dict) else {}
+        row = raw.get("okx_position_history_row")
+        if not isinstance(row, dict):
+            continue
+        payload = dict(row)
+        if not str(payload.get("instId") or payload.get("inst_id") or "").strip():
+            payload["instId"] = (
+                str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+                or okx_inst_id_from_symbol(getattr(position, "symbol", None))
+                or ""
+            )
+        if not str(payload.get("posId") or payload.get("pos_id") or "").strip():
+            payload["posId"] = str(getattr(position, "okx_pos_id", "") or "").strip()
+        opened_at = _as_utc_datetime(getattr(position, "created_at", None))
+        closed_at = _as_utc_datetime(getattr(position, "closed_at", None))
+        if not str(payload.get("cTime") or payload.get("createdTime") or "").strip() and opened_at:
+            payload["cTime"] = str(int(opened_at.timestamp() * 1000))
+        if not str(payload.get("uTime") or payload.get("updatedTime") or "").strip() and closed_at:
+            payload["uTime"] = str(int(closed_at.timestamp() * 1000))
+        payload["_dashboard_official_cache_source"] = "position_settlement_snapshot"
+        group_id = _dashboard_position_history_group_id(payload, mode)
+        if not group_id:
+            continue
+        existing = rows_by_id.get(group_id)
+        if existing is None or _dashboard_cached_history_row_quality(payload) > (
+            _dashboard_cached_history_row_quality(existing)
+        ):
+            rows_by_id[group_id] = payload
+    return sorted(
+        rows_by_id.values(),
+        key=lambda item: (
+            _dashboard_ms_datetime(item.get("uTime") or item.get("updatedTime"))
+            or _dashboard_ms_datetime(item.get("cTime") or item.get("createdTime"))
+            or datetime.min.replace(tzinfo=UTC)
+        ),
+        reverse=True,
+    )
+
+
+def _dashboard_cached_history_row_quality(row: dict[str, Any]) -> int:
+    score = 0
+    for key in ("realizedPnl", "closeTotalPos", "openAvgPx", "closeAvgPx", "instId"):
+        if str(row.get(key) or "").strip():
+            score += 1
+    return score
 
 
 def _dashboard_position_history_match_score(
@@ -3377,7 +3440,7 @@ async def _dashboard_okx_position_history_rows(
     closed_rows: list[Any],
 ) -> list[dict[str, Any]]:
     selected_mode = "live" if mode == "live" else "paper"
-    pos_ids = sorted(
+    local_pos_ids = sorted(
         {
             str(getattr(row, "okx_pos_id", "") or "").strip()
             for row in closed_rows
@@ -3417,7 +3480,7 @@ async def _dashboard_okx_position_history_rows(
     cache_key = (
         "okx_position_history_rows",
         selected_mode,
-        tuple(pos_ids[:500]),
+        "account_official",
         tuple(inst_ids[:200]),
         since.date().isoformat(),
     )
@@ -3432,34 +3495,21 @@ async def _dashboard_okx_position_history_rows(
         try:
             if owns_executor:
                 await executor.initialize()
-            page_count = 5 if not pos_ids else 2
             rows = await asyncio.wait_for(
                 OkxNativeFactsClient(executor).fetch_position_history_rows(
-                    inst_ids=inst_ids or None,
-                    pos_ids=pos_ids or None,
+                    inst_ids=None,
+                    pos_ids=None,
                     since=since,
                     strict=False,
                     limit=100,
-                    max_pages=page_count,
+                    max_pages=5,
                 ),
                 timeout=12.0,
             )
-            wanted_pos_ids = set(pos_ids)
-            wanted_inst_ids = set(inst_ids)
             return [
                 dict(row)
                 for row in rows
                 if isinstance(row, dict)
-                and (
-                    not wanted_pos_ids
-                    or str(row.get("posId") or row.get("pos_id") or "").strip()
-                    in wanted_pos_ids
-                )
-                and (
-                    not wanted_inst_ids
-                    or str(row.get("instId") or row.get("inst_id") or "").strip().upper()
-                    in wanted_inst_ids
-                )
             ]
         except Exception as exc:
             _log_dashboard_fallback(
@@ -3467,7 +3517,7 @@ async def _dashboard_okx_position_history_rows(
                 exc,
                 mode=selected_mode,
                 inst_id_count=len(inst_ids),
-                pos_id_count=len(pos_ids),
+                pos_id_count=len(local_pos_ids),
             )
             return []
         finally:

@@ -1135,6 +1135,53 @@ async def test_daily_pnl_records_include_okx_authoritative_ledger_positions(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_fetch_does_not_send_dirty_local_pos_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import okx_native_facts
+
+    captured: dict[str, object] = {}
+
+    class FakeFactsClient:
+        def __init__(self, _executor):
+            pass
+
+        async def fetch_position_history_rows(self, **kwargs):
+            captured.update(kwargs)
+            return [
+                {
+                    "instId": "BAND-USDT-SWAP",
+                    "posId": "3714144287308087298",
+                    "cTime": "1783192525444",
+                    "uTime": "1783275756951",
+                    "realizedPnl": "1.23",
+                }
+            ]
+
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_executor_for_mode", lambda _mode: object())
+    monkeypatch.setattr(okx_native_facts, "OkxNativeFactsClient", FakeFactsClient)
+
+    rows = await dashboard._dashboard_okx_position_history_rows(
+        mode="paper",
+        closed_rows=[
+            SimpleNamespace(
+                okx_pos_id="band-pos-3714144287308087298",
+                okx_inst_id="BAND-USDT-SWAP",
+                symbol="BAND/USDT",
+                created_at=datetime(2026, 7, 5, 1, 0, tzinfo=UTC),
+                closed_at=datetime(2026, 7, 5, 2, 0, tzinfo=UTC),
+            )
+        ],
+    )
+
+    assert rows and rows[0]["posId"] == "3714144287308087298"
+    assert captured["pos_ids"] is None
+    assert captured["inst_ids"] is None
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_records_include_phase3_closed_position_even_if_opened_before_phase3(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
