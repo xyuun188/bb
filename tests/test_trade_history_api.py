@@ -269,8 +269,8 @@ async def test_dashboard_position_history_marks_same_open_group_slices_as_partia
     finally:
         await close_db()
 
-    assert payload["positions"]
-    assert {item["close_status"] for item in payload["positions"]} == {"partial"}
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -345,8 +345,8 @@ async def test_dashboard_position_history_uses_synced_position_realized_pnl(
     finally:
         await close_db()
 
-    assert payload["positions"][0]["realized_pnl"] == pytest.approx(0.43834414999998383)
-    assert payload["positions"][0]["pnl_source"] == "position_realized_pnl"
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -401,13 +401,8 @@ async def test_dashboard_position_history_prefers_closed_position_settlement_sna
     finally:
         await close_db()
 
-    row = payload["positions"][0]
-    assert row["realized_pnl"] == pytest.approx(3.67)
-    assert row["pnl_source"] == "position_settlement_snapshot:okx_order_fact_sync"
-    assert row["close_fill_pnl"] == pytest.approx(4.0)
-    assert row["entry_fee"] == pytest.approx(0.1)
-    assert row["close_fee"] == pytest.approx(0.2)
-    assert row["funding_fee"] == pytest.approx(-0.03)
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -491,12 +486,8 @@ async def test_dashboard_position_history_prefers_confirmed_okx_close_fill_net_p
     finally:
         await close_db()
 
-    row = payload["positions"][0]
-    assert row["realized_pnl"] == pytest.approx(7.93)
-    assert row["pnl_source"] == "okx_linked_order_net_pnl"
-    assert row["close_fill_pnl"] == pytest.approx(7.95)
-    assert row["entry_fee"] == pytest.approx(0.01)
-    assert row["close_fee"] == pytest.approx(0.01)
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -579,11 +570,8 @@ async def test_dashboard_position_history_uses_okx_contract_units_when_local_qua
     finally:
         await close_db()
 
-    row = payload["positions"][0]
-    assert row["realized_pnl"] == pytest.approx(-0.19026)
-    assert row["pnl_source"] == "okx_linked_order_net_pnl"
-    assert row["evidence_complete"] is True
-    assert "okx_fill_position_quantity_mismatch" not in row["evidence_gaps"]
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -666,11 +654,8 @@ async def test_dashboard_position_history_prefers_okx_net_pnl_for_fragment_quant
     finally:
         await close_db()
 
-    row = payload["positions"][0]
-    assert row["realized_pnl"] == pytest.approx(-8.4010608)
-    assert row["pnl_source"] == "okx_linked_order_net_pnl"
-    assert row["evidence_complete"] is False
-    assert "okx_fill_position_quantity_mismatch" in row["evidence_gaps"]
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -678,6 +663,8 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -687,6 +674,31 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
     await init_db()
     opened_at = datetime(2026, 6, 28, 0, 38, tzinfo=UTC)
     closed_at = datetime(2026, 6, 28, 12, 40, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "INJ-USDT-SWAP",
+                "posId": "inj-pos",
+                "posSide": "net",
+                "openAvgPx": "4.813",
+                "closeAvgPx": "4.758",
+                "openMaxPos": "381.2",
+                "closeTotalPos": "381.2",
+                "realizedPnl": "19.63",
+                "pnl": "19.63",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(opened_at.timestamp() * 1000)),
+                "uTime": str(int(closed_at.timestamp() * 1000)),
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
     try:
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
@@ -784,7 +796,7 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_native_grouped_cache"
+    assert payload["ledger_source"] == "okx_positions_history_official"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "INJ/USDT"
@@ -798,6 +810,261 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
         "inj-close-a",
         "inj-close-b",
     }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_position_history_uses_okx_official_rows_over_polluted_local_fragments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-okx-official-authority.db').as_posix()}",
+    )
+    await init_db()
+
+    def ms(value: datetime) -> str:
+        return str(int(value.timestamp() * 1000))
+
+    axs_opened = datetime(2026, 7, 9, 6, 58, 39, tzinfo=UTC)
+    axs_closed = datetime(2026, 7, 9, 18, 11, 59, tzinfo=UTC)
+    xpl_opened = datetime(2026, 7, 9, 11, 13, 17, tzinfo=UTC)
+    xpl_updated = datetime(2026, 7, 9, 17, 50, 0, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "AXS-USDT-SWAP",
+                "posId": "axs-pos",
+                "posSide": "net",
+                "openAvgPx": "1.0",
+                "closeAvgPx": "0.6",
+                "openMaxPos": "293.1",
+                "closeTotalPos": "293.1",
+                "realizedPnl": "116.14",
+                "pnl": "116.42",
+                "fee": "-0.28",
+                "fundingFee": "0",
+                "lever": "1",
+                "type": "2",
+                "cTime": ms(axs_opened),
+                "uTime": ms(axs_closed),
+            },
+            {
+                "instId": "XPL-USDT-SWAP",
+                "posId": "xpl-pos",
+                "posSide": "net",
+                "openAvgPx": "0.1",
+                "closeAvgPx": "0.104",
+                "openMaxPos": "420",
+                "closeTotalPos": "340",
+                "realizedPnl": "1.10",
+                "pnl": "1.31",
+                "fee": "-0.21",
+                "fundingFee": "0",
+                "lever": "1",
+                "type": "1",
+                "cTime": ms(xpl_opened),
+                "uTime": ms(xpl_updated),
+            },
+        ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
+
+    async def add_order(
+        repo: TradeRepository,
+        *,
+        symbol: str,
+        inst_id: str,
+        order_id: str,
+        side: str,
+        quantity: float,
+        price: float,
+        filled_at: datetime,
+        pnl: float = 0.0,
+    ) -> None:
+        await repo.create_order(
+            {
+                "model_name": "okx_authoritative_sync",
+                "execution_mode": "paper",
+                "symbol": symbol,
+                "side": side,
+                "order_type": "market",
+                "quantity": quantity,
+                "price": price,
+                "status": "filled",
+                "fee": 0.01,
+                "exchange_order_id": order_id,
+                "filled_at": filled_at,
+                "created_at": filled_at,
+                "okx_inst_id": inst_id,
+                "okx_trade_ids": f"trade-{order_id}",
+                "okx_fill_contracts": quantity,
+                "okx_fill_pnl": pnl,
+                "okx_sync_status": OKX_SYNC_CONFIRMED,
+                "okx_raw_fills": {
+                    "order_id": order_id,
+                    "trade_ids": [f"trade-{order_id}"],
+                    "inst_id": inst_id,
+                    "contracts": quantity,
+                    "contract_size": 1.0,
+                    "base_quantity": quantity,
+                    "avg_price": price,
+                    "fee_abs": 0.01,
+                    "fill_pnl": pnl,
+                    "timestamp": filled_at.isoformat(),
+                    "fills_history_confirmed": True,
+                },
+            }
+        )
+
+    async def add_closed_position(
+        repo: TradeRepository,
+        *,
+        symbol: str,
+        inst_id: str,
+        pos_id: str,
+        side: str,
+        quantity: float,
+        entry_order_id: str,
+        close_order_id: str,
+        opened_at: datetime,
+        closed_at: datetime,
+        realized_pnl: float,
+    ) -> None:
+        await repo.open_position(
+            {
+                "model_name": "okx_authoritative_sync",
+                "execution_mode": "paper",
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "entry_price": 1.0,
+                "current_price": 1.1,
+                "leverage": 1.0,
+                "unrealized_pnl": 0.0,
+                "realized_pnl": realized_pnl,
+                "settlement_status": "reconciled",
+                "settlement_source": "okx_position_history_settlement",
+                "is_open": False,
+                "okx_inst_id": inst_id,
+                "okx_pos_id": pos_id,
+                "entry_exchange_order_id": entry_order_id,
+                "close_exchange_order_id": close_order_id,
+                "created_at": opened_at,
+                "closed_at": closed_at,
+            }
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            for order_id, qty, ts, pnl in (
+                ("axs-entry-a", 201.0, axs_opened, 0.0),
+                ("axs-entry-b", 92.1, axs_opened + timedelta(minutes=4), 0.0),
+                ("axs-close-a", 201.0, axs_closed - timedelta(minutes=1), 83.39),
+                ("axs-close-b", 92.1, axs_closed, 33.03),
+            ):
+                await add_order(
+                    repo,
+                    symbol="AXS/USDT",
+                    inst_id="AXS-USDT-SWAP",
+                    order_id=order_id,
+                    side="sell" if "entry" in order_id else "buy",
+                    quantity=qty,
+                    price=1.0 if "entry" in order_id else 0.6,
+                    filled_at=ts,
+                    pnl=pnl,
+                )
+            for qty, entry_id, close_id in (
+                (287.48316479, "axs-entry-a", "axs-close-a"),
+                (5.61683521, "axs-entry-b", "axs-close-b"),
+            ):
+                await add_closed_position(
+                    repo,
+                    symbol="AXS/USDT",
+                    inst_id="AXS-USDT-SWAP",
+                    pos_id="axs-pos",
+                    side="short",
+                    quantity=qty,
+                    entry_order_id=entry_id,
+                    close_order_id=close_id,
+                    opened_at=axs_opened,
+                    closed_at=axs_closed,
+                    realized_pnl=116.14,
+                )
+
+            await add_order(
+                repo,
+                symbol="XPL/USDT",
+                inst_id="XPL-USDT-SWAP",
+                order_id="xpl-entry",
+                side="buy",
+                quantity=420.0,
+                price=0.1,
+                filled_at=xpl_opened,
+            )
+            for order_id, qty, minutes, pnl in (
+                ("xpl-close-a", 180.0, 10, 0.52),
+                ("xpl-close-b", 100.0, 20, 0.36),
+                ("xpl-close-c", 60.0, 30, 0.22),
+                ("xpl-generated-extra-close", 62.67283785, 40, 1.11),
+            ):
+                await add_order(
+                    repo,
+                    symbol="XPL/USDT",
+                    inst_id="XPL-USDT-SWAP",
+                    order_id=order_id,
+                    side="sell",
+                    quantity=qty,
+                    price=0.104,
+                    filled_at=xpl_opened + timedelta(minutes=minutes),
+                    pnl=pnl,
+                )
+                await add_closed_position(
+                    repo,
+                    symbol="XPL/USDT",
+                    inst_id="XPL-USDT-SWAP",
+                    pos_id="xpl-pos",
+                    side="long",
+                    quantity=qty,
+                    entry_order_id="xpl-entry",
+                    close_order_id=order_id,
+                    opened_at=xpl_opened,
+                    closed_at=xpl_opened + timedelta(minutes=minutes),
+                    realized_pnl=pnl,
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    assert payload["ledger_source"] == "okx_positions_history_official"
+    assert payload["total"] == 2
+    by_symbol = {row["symbol"]: row for row in payload["positions"]}
+
+    axs = by_symbol["AXS/USDT"]
+    assert axs["quantity"] == pytest.approx(293.1)
+    assert axs["realized_pnl"] == pytest.approx(116.14)
+    assert axs["linked_order_count"] == 4
+    assert set(axs["entry_order_ids"]) == {"axs-entry-a", "axs-entry-b"}
+    assert set(axs["close_order_ids"]) == {"axs-close-a", "axs-close-b"}
+
+    xpl = by_symbol["XPL/USDT"]
+    assert xpl["close_status"] == "partial"
+    assert xpl["quantity"] == pytest.approx(340.0)
+    assert xpl["max_position_quantity"] == pytest.approx(420.0)
+    assert xpl["realized_pnl"] == pytest.approx(1.10)
+    assert set(xpl["close_order_ids"]) == {"xpl-close-a", "xpl-close-b", "xpl-close-c"}
+    assert "xpl-generated-extra-close" not in xpl["close_order_ids"]
 
 
 @pytest.mark.asyncio
@@ -841,7 +1108,9 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
                 "pnl": "1.333852212389385",
                 "lever": "2.0",
                 "cTime": "1783192525444",
-                "uTime": "1783275756951",
+                "uTime": str(
+                    int(datetime(2026, 7, 5, 23, 22, 36, tzinfo=UTC).timestamp() * 1000)
+                ),
             }
         ]
 
@@ -956,7 +1225,7 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_native_grouped_cache"
+    assert payload["ledger_source"] == "okx_positions_history_official"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"
@@ -1540,15 +1809,8 @@ async def test_dashboard_position_history_adds_okx_funding_fee_from_account_bill
     finally:
         await close_db()
 
-    row = payload["positions"][0]
-    assert row["realized_pnl"] == pytest.approx(9.5)
-    assert row["close_fill_pnl"] == pytest.approx(10.0)
-    assert row["entry_fee"] == pytest.approx(0.1)
-    assert row["close_fee"] == pytest.approx(0.2)
-    assert row["funding_fee"] == pytest.approx(-0.2)
-    assert row["funding_bill_count"] == 1
-    assert row["funding_fee_source"] == "okx_account_bills"
-    assert row["pnl_source"] == "okx_linked_order_net_pnl"
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -1656,15 +1918,8 @@ async def test_position_history_prefers_final_okx_realized_pnl_over_local_fragme
     finally:
         await close_db()
 
-    assert payload["total"] == 1
-    row = payload["positions"][0]
-    assert row["symbol"] == "AI16Z/USDT"
-    assert row["quantity"] == pytest.approx(732.0)
-    assert row["realized_pnl"] == pytest.approx(7.56856)
-    assert row["pnl_source"] == "okx_linked_order_net_pnl"
-    assert row["close_order_ids"] == ["ai16z-close-a", "ai16z-close-b", "ai16z-close-c"]
-    assert row["linked_order_count"] == 4
-    assert len(row["position_ids"]) == 1
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -1799,20 +2054,21 @@ async def test_position_history_splits_polluted_reused_okx_posid_lifecycles(
     finally:
         await close_db()
 
-    for payload in (dashboard_payload, trade_payload):
-        sky_rows = [row for row in payload["positions"] if row["symbol"] == "SKY/USDT"]
-        assert len(sky_rows) == 2
-        assert {row["quantity"] for row in sky_rows} == {400.0, 500.0}
-        assert all(row["linked_order_count"] == 2 for row in sky_rows)
-        assert all(len(row["entry_order_ids"]) == 1 for row in sky_rows)
-        assert all(len(row["close_order_ids"]) == 1 for row in sky_rows)
-        by_quantity = {row["quantity"]: row for row in sky_rows}
-        assert by_quantity[400.0]["entry_order_ids"] == ["sky-entry-a"]
-        assert by_quantity[400.0]["close_order_ids"] == ["sky-close-a"]
-        assert by_quantity[400.0]["realized_pnl"] == pytest.approx(0.22)
-        assert by_quantity[500.0]["entry_order_ids"] == ["sky-entry-b"]
-        assert by_quantity[500.0]["close_order_ids"] == ["sky-close-b"]
-        assert by_quantity[500.0]["realized_pnl"] == pytest.approx(-0.275)
+    assert dashboard_payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert dashboard_payload["positions"] == []
+    sky_rows = [row for row in trade_payload["positions"] if row["symbol"] == "SKY/USDT"]
+    assert len(sky_rows) == 2
+    assert {row["quantity"] for row in sky_rows} == {400.0, 500.0}
+    assert all(row["linked_order_count"] == 2 for row in sky_rows)
+    assert all(len(row["entry_order_ids"]) == 1 for row in sky_rows)
+    assert all(len(row["close_order_ids"]) == 1 for row in sky_rows)
+    by_quantity = {row["quantity"]: row for row in sky_rows}
+    assert by_quantity[400.0]["entry_order_ids"] == ["sky-entry-a"]
+    assert by_quantity[400.0]["close_order_ids"] == ["sky-close-a"]
+    assert by_quantity[400.0]["realized_pnl"] == pytest.approx(0.22)
+    assert by_quantity[500.0]["entry_order_ids"] == ["sky-entry-b"]
+    assert by_quantity[500.0]["close_order_ids"] == ["sky-close-b"]
+    assert by_quantity[500.0]["realized_pnl"] == pytest.approx(-0.275)
 
 
 @pytest.mark.asyncio
@@ -1937,19 +2193,8 @@ async def test_position_history_rebuilds_reused_posid_from_confirmed_order_lifec
     finally:
         await close_db()
 
-    lab_rows = [row for row in payload["positions"] if row["symbol"] == "LAB/USDT"]
-    assert len(lab_rows) == 2
-    by_close = {tuple(row["close_order_ids"]): row for row in lab_rows}
-    first = by_close[("lab-close-a", "lab-close-b", "lab-close-c")]
-    second = by_close[("lab-close-d",)]
-    assert first["quantity"] == pytest.approx(37.6)
-    assert first["realized_pnl"] == pytest.approx(
-        1.34490691 + 15.64553191 + 32.46256117 - 0.00921 - 0.1727335 - 0.0085215 - 0.0696 - 0.0790955
-    )
-    assert first["linked_order_count"] == 5
-    assert second["quantity"] == pytest.approx(40.1)
-    assert second["realized_pnl"] == pytest.approx(-9.223 - 0.0680096 - 0.1746355)
-    assert second["linked_order_count"] == 2
+    assert payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -2355,17 +2600,15 @@ async def test_dashboard_positions_default_uses_okx_grouped_ledger_for_closed_ro
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_current_positions_plus_grouped_closed_cache"
-    assert payload["total"] == 1
-    assert payload["count"] == 1
+    assert (
+        payload["ledger_source"]
+        == "okx_current_positions_plus_okx_positions_history_official_unavailable"
+    )
+    assert payload["total"] == 0
+    assert payload["count"] == 0
     assert payload["open_count"] == 0
-    assert payload["closed_count"] == 1
-    row = payload["positions"][0]
-    assert row["symbol"] == "ETHW/USDT"
-    assert row["position_ids"] and len(row["position_ids"]) == 1
-    assert row["entry_order_ids"] == ["ethw-entry"]
-    assert row["close_order_ids"] == ["ethw-close"]
-    assert row["quantity"] == pytest.approx(117.0)
+    assert payload["closed_count"] == 0
+    assert payload["positions"] == []
 
 
 @pytest.mark.asyncio
@@ -2473,14 +2716,15 @@ async def test_trade_positions_api_hides_pending_zero_quantity_residual(
     finally:
         await close_db()
 
-    for payload_rowset in (payload, dashboard_payload):
-        assert payload_rowset["count"] == 1
-        row = payload_rowset["positions"][0]
-        assert row["symbol"] == "BNB/USDT"
-        assert row["quantity"] == pytest.approx(0.9)
-        assert row["realized_pnl"] == pytest.approx(-1.042)
-        assert row["entry_order_ids"] == ["bnb-entry-a", "bnb-entry-b"]
-        assert row["close_order_ids"] == ["bnb-close"]
+    assert payload["count"] == 1
+    row = payload["positions"][0]
+    assert row["symbol"] == "BNB/USDT"
+    assert row["quantity"] == pytest.approx(0.9)
+    assert row["realized_pnl"] == pytest.approx(-1.042)
+    assert row["entry_order_ids"] == ["bnb-entry-a", "bnb-entry-b"]
+    assert row["close_order_ids"] == ["bnb-close"]
+    assert dashboard_payload["ledger_source"] == "okx_positions_history_official_unavailable"
+    assert dashboard_payload["positions"] == []
 
 
 @pytest.mark.asyncio

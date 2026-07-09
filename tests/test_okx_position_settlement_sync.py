@@ -229,6 +229,8 @@ async def test_dashboard_closed_history_hides_unsettled_positions(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -237,6 +239,31 @@ async def test_dashboard_closed_history_hides_unsettled_positions(
     )
     await init_db()
     closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "VISIBLE-USDT-SWAP",
+                "posId": "visible-pos",
+                "posSide": "net",
+                "openAvgPx": "1.0",
+                "closeAvgPx": "1.2",
+                "openMaxPos": "3",
+                "closeTotalPos": "3",
+                "realizedPnl": "0.58",
+                "pnl": "0.6",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(closed_at.timestamp() * 1000)),
+                "uTime": str(int(closed_at.timestamp() * 1000)),
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
     try:
         await _create_closed_position(
             symbol="HIDDEN/USDT",

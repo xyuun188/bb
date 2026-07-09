@@ -1054,11 +1054,36 @@ async def test_daily_pnl_records_include_okx_authoritative_ledger_positions(
 
     monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", exchange_marks)
     monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", lambda _mode: _async_value(set()))
+    act_entry_at = datetime(2026, 6, 28, 5, 0, 59, tzinfo=UTC)
+    act_close_at = datetime(2026, 6, 28, 7, 46, 45, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "ACT-USDT-SWAP",
+                "posId": "act-pos",
+                "posSide": "net",
+                "openAvgPx": "0.01049",
+                "closeAvgPx": "0.00908",
+                "openMaxPos": "1270",
+                "closeTotalPos": "1270",
+                "realizedPnl": "1.77827305",
+                "pnl": "1.77827305",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(act_entry_at.timestamp() * 1000)),
+                "uTime": str(int(act_close_at.timestamp() * 1000)),
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
 
     try:
         async with get_session_ctx() as session:
-            act_entry_at = datetime(2026, 6, 28, 5, 0, 59, tzinfo=UTC)
-            act_close_at = datetime(2026, 6, 28, 7, 46, 45, tzinfo=UTC)
             session.add_all(
                 [
                     Position(
@@ -1126,11 +1151,36 @@ async def test_daily_pnl_records_include_phase3_closed_position_even_if_opened_b
     monkeypatch.setattr(
         dashboard, "_get_exchange_open_position_symbols", lambda _mode: _async_value(set())
     )
+    act_entry_at = datetime(2026, 6, 27, 15, 59, 59, tzinfo=UTC)
+    act_close_at = datetime(2026, 6, 28, 5, 0, 59, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "ACT-USDT-SWAP",
+                "posId": "act-pos",
+                "posSide": "net",
+                "openAvgPx": "0.01049",
+                "closeAvgPx": "0.00908",
+                "openMaxPos": "1270",
+                "closeTotalPos": "1270",
+                "realizedPnl": "1.77827305",
+                "pnl": "1.77827305",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(act_entry_at.timestamp() * 1000)),
+                "uTime": str(int(act_close_at.timestamp() * 1000)),
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
 
     try:
         async with get_session_ctx() as session:
-            act_entry_at = datetime(2026, 6, 27, 15, 59, 59, tzinfo=UTC)
-            act_close_at = datetime(2026, 6, 28, 5, 0, 59, tzinfo=UTC)
             session.add_all(
                 [
                     Position(
@@ -1388,11 +1438,36 @@ async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
         "_get_exchange_open_position_symbols",
         lambda _mode: _async_value(set()),
     )
+    opened_at = datetime(2026, 7, 1, 6, 10, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 1, 7, 10, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "AI16Z-USDT-SWAP",
+                "posId": "ai16z-pos-1",
+                "posSide": "net",
+                "openAvgPx": "0.1",
+                "closeAvgPx": "0.1793794089",
+                "openMaxPos": "100",
+                "closeTotalPos": "100",
+                "realizedPnl": "7.93794089",
+                "pnl": "7.93794089",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(opened_at.timestamp() * 1000)),
+                "uTime": str(int(closed_at.timestamp() * 1000)),
+            }
+        ]
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
 
     try:
         async with get_session_ctx() as session:
-            opened_at = datetime(2026, 7, 1, 6, 10, tzinfo=UTC)
-            closed_at = datetime(2026, 7, 1, 7, 10, tzinfo=UTC)
             session.add_all(
                 [
                     Position(
@@ -1465,7 +1540,7 @@ async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
     assert day["realized_pnl"] == pytest.approx(7.93794089)
     assert day["symbols"] == ["AI16Z/USDT"]
     assert len(day["position_details"]) == 1
-    assert day["position_details"][0]["pnl_source"] == "okx_linked_order_net_pnl"
+    assert day["position_details"][0]["pnl_source"] == "okx_position_history_realized_pnl"
     assert day["position_details"][0]["position_ids"]
     assert day["symbol_pnl"][0]["realized_pnl"] == pytest.approx(7.93794089)
 
@@ -1499,13 +1574,53 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
         lambda _mode: _async_value(set()),
     )
     monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
+    pros_opened = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+    pros_closed = datetime(2026, 7, 5, 7, 19, tzinfo=UTC)
+    met_opened = datetime(2026, 7, 5, 2, 0, tzinfo=UTC)
+    met_closed = datetime(2026, 7, 5, 5, 45, tzinfo=UTC)
+
+    async def official_position_history_rows(*_args, **_kwargs):
+        return [
+            {
+                "instId": "PROS-USDT-SWAP",
+                "posId": "pros-pos",
+                "posSide": "net",
+                "openAvgPx": "0.42943636",
+                "closeAvgPx": "0.487",
+                "openMaxPos": "77",
+                "closeTotalPos": "77",
+                "realizedPnl": "4.3971172",
+                "pnl": "4.4324",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(pros_opened.timestamp() * 1000)),
+                "uTime": str(int(pros_closed.timestamp() * 1000)),
+            },
+            {
+                "instId": "MET-USDT-SWAP",
+                "posId": "met-pos",
+                "posSide": "net",
+                "openAvgPx": "10.0",
+                "closeAvgPx": "9.0",
+                "openMaxPos": "3",
+                "closeTotalPos": "3",
+                "realizedPnl": "2.7",
+                "pnl": "3.0",
+                "fundingFee": "0",
+                "type": "2",
+                "cTime": str(int(met_opened.timestamp() * 1000)),
+                "uTime": str(int(met_closed.timestamp() * 1000)),
+            },
+        ]
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_history_rows",
+        official_position_history_rows,
+    )
 
     try:
         async with get_session_ctx() as session:
-            pros_opened = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
-            pros_closed = datetime(2026, 7, 5, 7, 19, tzinfo=UTC)
-            met_opened = datetime(2026, 7, 5, 2, 0, tzinfo=UTC)
-            met_closed = datetime(2026, 7, 5, 5, 45, tzinfo=UTC)
             session.add_all(
                 [
                     Position(

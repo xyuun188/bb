@@ -105,6 +105,12 @@ _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
+    "okx_confirmed",
+    "okx_only_backfilled",
+    "okx_execution_result_confirmed",
+}
+_DASHBOARD_POSITION_HISTORY_ORDER_WINDOW_SECONDS = 10 * 60
 _dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], Any | None]] = {}
 _dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, Any | None]] = {}
 _dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
@@ -2379,7 +2385,7 @@ async def _dashboard_closed_position_ledger_rows(
     page: int = 1,
     page_size: int = 20,
     paginate: bool = True,
-) -> tuple[list[dict[str, Any]], int, int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int, str]:
     from sqlalchemy import select
 
     from models.account import OkxAccountBill
@@ -2419,6 +2425,10 @@ async def _dashboard_closed_position_ledger_rows(
         for position in closed_rows
         if is_final_settlement_status(getattr(position, "settlement_status", None))
     ]
+    position_history_rows = await _dashboard_okx_position_history_rows(
+        mode=mode,
+        closed_rows=closed_rows,
+    )
     linked_order_ids = {
         token
         for position in closed_rows
@@ -2428,12 +2438,25 @@ async def _dashboard_closed_position_ledger_rows(
         )
         for token in _dashboard_split_exchange_order_ids(value)
     }
+    official_symbols = {
+        symbol
+        for row in position_history_rows
+        if isinstance(row, dict)
+        for symbol in [
+            symbol_from_okx_inst_id(
+                str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+            )
+            or normalize_trading_symbol(str(row.get("instId") or row.get("inst_id") or ""))
+        ]
+        if symbol
+    }
     symbol_variants = _dashboard_symbol_query_variants(
         {
             _normalize_dashboard_symbol(str(getattr(position, "symbol", "") or ""))
             for position in closed_rows
             if getattr(position, "symbol", None)
         }
+        | official_symbols
     )
     order_stmt = select(Order).where(Order.status == "filled")
     if mode:
@@ -2469,35 +2492,13 @@ async def _dashboard_closed_position_ledger_rows(
                 OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
             }
         ]
-    account_bill_rows = await _dashboard_okx_account_bill_rows(
-        session,
-        closed_rows=closed_rows,
-        mode=mode,
-        account_bill_model=OkxAccountBill,
-    )
-    ledger_groups = build_okx_position_ledger_groups(
-        closed_rows,
-        order_rows,
-        account_bills=account_bill_rows,
-        require_order_lifecycle_source_positions=True,
-    )
-    ledger_groups = [
-        group
-        for group in ledger_groups
-        if is_final_settlement_status(getattr(group, "settlement_status", None))
-    ]
-    total = len(ledger_groups)
-    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
-    page = min(max(int(page or 1), 1), total_pages)
-    selected_groups = ledger_groups
-    if paginate:
-        start = (page - 1) * page_size
-        selected_groups = ledger_groups[start : start + page_size]
-    position_history_rows = await _dashboard_okx_position_history_rows(
-        mode=mode,
-        closed_rows=_closed_rows_for_selected_ledger_groups(closed_rows, selected_groups),
-    )
     if position_history_rows:
+        account_bill_rows = await _dashboard_okx_account_bill_rows(
+            session,
+            closed_rows=closed_rows,
+            mode=mode,
+            account_bill_model=OkxAccountBill,
+        )
         refreshed_groups = build_okx_position_ledger_groups(
             closed_rows,
             order_rows,
@@ -2510,39 +2511,38 @@ async def _dashboard_closed_position_ledger_rows(
             for group in refreshed_groups
             if is_final_settlement_status(getattr(group, "settlement_status", None))
         ]
-        refreshed_by_id = {group.group_id: group for group in refreshed_groups}
-        refreshed_by_key = {
-            _dashboard_ledger_group_refresh_key(group): group for group in refreshed_groups
-        }
-        selected_groups = [
-            refreshed_by_id.get(group.group_id)
-            or refreshed_by_key.get(_dashboard_ledger_group_refresh_key(group))
-            or group
-            for group in selected_groups
-        ]
         official_rows = _dashboard_position_history_official_rows_as_groups(
             position_history_rows,
             refreshed_groups,
             mode=mode,
+            order_rows=order_rows,
+            closed_rows=closed_rows,
         )
         if official_rows:
-            official_total = max(total, len(official_rows))
+            official_total = len(official_rows)
             official_total_pages = (
                 max(1, (official_total + page_size - 1) // page_size)
                 if official_total
                 else 1
             )
+            page = min(max(int(page or 1), 1), official_total_pages)
+            selected_official_rows = official_rows
+            if paginate:
+                start = (page - 1) * page_size
+                selected_official_rows = official_rows[start : start + page_size]
             return (
-                official_rows[:page_size],
+                selected_official_rows,
                 official_total,
                 page,
                 official_total_pages,
+                "okx_positions_history_official",
             )
     return (
-        [group.as_dict(include_fills=True) for group in selected_groups],
-        total,
-        page,
-        total_pages,
+        [],
+        0,
+        1,
+        1,
+        "okx_positions_history_official_unavailable",
     )
 
 
@@ -2713,7 +2713,442 @@ def _dashboard_position_history_quantity_in_base_units(
     return raw
 
 
-def _dashboard_position_history_official_rows_as_groups(
+def _dashboard_position_history_status_label(status: str) -> str:
+    close_type = "1" if status == "partial" else "2"
+    return _dashboard_position_history_close_status({"type": close_type})[1]
+
+
+def _dashboard_position_history_inferred_side(row: dict[str, Any]) -> str:
+    explicit = _dashboard_position_history_side(row)
+    if explicit:
+        return explicit
+    open_price = _safe_float(row.get("openAvgPx"), 0.0) or 0.0
+    close_price = _safe_float(row.get("closeAvgPx"), 0.0) or 0.0
+    pnl = _safe_float(row.get("pnl"), None)
+    if pnl is None:
+        pnl = _safe_float(row.get("realizedPnl"), None)
+    if open_price <= 0 or close_price <= 0 or pnl is None or abs(close_price - open_price) <= 1e-12:
+        return ""
+    return "long" if (close_price > open_price) == (pnl >= 0) else "short"
+
+
+def _dashboard_position_history_local_side(
+    row: dict[str, Any],
+    local_groups: list[Any],
+    closed_rows: list[Any],
+) -> str:
+    explicit = _dashboard_position_history_side(row)
+    if explicit:
+        return explicit
+    matched = _dashboard_position_history_best_local_group(row, local_groups)
+    if matched is not None:
+        side = str(getattr(matched, "side", "") or "").lower().strip()
+        if side in {"long", "short"}:
+            return side
+    inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+    pos_id = str(row.get("posId") or row.get("pos_id") or "").strip()
+    opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+    updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+    candidates: list[tuple[int, str]] = []
+    for position in closed_rows:
+        position_inst_id = (
+            str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            or okx_inst_id_from_symbol(getattr(position, "symbol", None))
+            or ""
+        )
+        if inst_id and position_inst_id and position_inst_id != inst_id:
+            continue
+        score = 0
+        if pos_id and str(getattr(position, "okx_pos_id", "") or "").strip() == pos_id:
+            score += 20
+        position_opened = _as_utc_datetime(getattr(position, "created_at", None))
+        if opened_at and position_opened:
+            delta = abs((opened_at - position_opened).total_seconds())
+            if delta <= 1800:
+                score += max(0, 10 - int(delta // 180))
+        position_closed = _as_utc_datetime(getattr(position, "closed_at", None))
+        if updated_at and position_closed:
+            delta = abs((updated_at - position_closed).total_seconds())
+            if delta <= 3600:
+                score += max(0, 10 - int(delta // 360))
+        side = str(getattr(position, "side", "") or "").lower().strip()
+        if score > 0 and side in {"long", "short"}:
+            candidates.append((score, side))
+    if not candidates:
+        return _dashboard_position_history_inferred_side(row)
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _dashboard_order_time(order: Any) -> datetime | None:
+    return _as_utc_datetime(getattr(order, "filled_at", None)) or _as_utc_datetime(
+        getattr(order, "created_at", None)
+    )
+
+
+def _dashboard_order_raw_fills(order: Any) -> dict[str, Any]:
+    raw = getattr(order, "okx_raw_fills", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _dashboard_order_base_quantity(order: Any) -> float:
+    raw = _dashboard_order_raw_fills(order)
+    for key in ("base_quantity", "baseQuantity", "fill_base_quantity"):
+        value = _safe_float(raw.get(key), None)
+        if value is not None and abs(value) > 0:
+            return abs(value)
+    return abs(_safe_float(getattr(order, "quantity", None), 0.0) or 0.0)
+
+
+def _dashboard_order_contracts(order: Any) -> float:
+    value = _safe_float(getattr(order, "okx_fill_contracts", None), None)
+    if value is not None and abs(value) > 0:
+        return abs(value)
+    raw = _dashboard_order_raw_fills(order)
+    for key in ("contracts", "fillSz", "fill_size"):
+        value = _safe_float(raw.get(key), None)
+        if value is not None and abs(value) > 0:
+            return abs(value)
+    contract_size = _safe_float(raw.get("contract_size"), 0.0) or 0.0
+    base_quantity = _dashboard_order_base_quantity(order)
+    if contract_size > 0 and base_quantity > 0:
+        return abs(base_quantity / contract_size)
+    return base_quantity
+
+
+def _dashboard_order_fee_abs(order: Any) -> float:
+    raw = _dashboard_order_raw_fills(order)
+    value = _safe_float(raw.get("fee_abs"), None)
+    if value is None:
+        value = _safe_float(getattr(order, "fee", None), 0.0) or 0.0
+    return abs(value)
+
+
+def _dashboard_order_fill_pnl(order: Any) -> float | None:
+    value = _safe_float(getattr(order, "okx_fill_pnl", None), None)
+    if value is not None:
+        return value
+    raw = _dashboard_order_raw_fills(order)
+    for key in ("fill_pnl", "fillPnl", "pnl"):
+        value = _safe_float(raw.get(key), None)
+        if value is not None:
+            return value
+    return None
+
+
+def _dashboard_order_price(order: Any) -> float:
+    raw = _dashboard_order_raw_fills(order)
+    value = _safe_float(raw.get("avg_price"), None)
+    if value is None:
+        value = _safe_float(raw.get("fillPx"), None)
+    if value is None:
+        value = _safe_float(getattr(order, "price", None), 0.0)
+    return value or 0.0
+
+
+def _dashboard_order_inst_id(order: Any) -> str:
+    raw = _dashboard_order_raw_fills(order)
+    return (
+        str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+        or str(raw.get("inst_id") or raw.get("instId") or "").strip().upper()
+        or okx_inst_id_from_symbol(getattr(order, "symbol", None))
+        or ""
+    )
+
+
+def _dashboard_order_okx_confirmed(order: Any) -> bool:
+    return str(getattr(order, "okx_sync_status", "") or "").strip() in (
+        _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES
+    )
+
+
+def _dashboard_order_matches_position_history_window(
+    order: Any,
+    *,
+    inst_id: str,
+    opened_at: datetime | None,
+    updated_at: datetime | None,
+) -> bool:
+    order_inst_id = _dashboard_order_inst_id(order)
+    if inst_id and order_inst_id and order_inst_id != inst_id:
+        return False
+    if not _dashboard_order_okx_confirmed(order):
+        return False
+    order_time = _dashboard_order_time(order)
+    if order_time is None:
+        return False
+    window = timedelta(seconds=_DASHBOARD_POSITION_HISTORY_ORDER_WINDOW_SECONDS)
+    if opened_at and order_time < opened_at - window:
+        return False
+    if updated_at and order_time > updated_at + window:
+        return False
+    return True
+
+
+def _dashboard_quantities_match(
+    left: float,
+    right: float,
+    *,
+    tolerance_ratio: float = 0.02,
+) -> bool:
+    if left <= 0 or right <= 0:
+        return False
+    denominator = max(abs(left), abs(right), 1e-12)
+    return abs(left - right) / denominator <= tolerance_ratio
+
+
+def _dashboard_best_quantity_subset(
+    orders: list[Any],
+    target: float,
+    quantity_getter: Callable[[Any], float],
+) -> tuple[list[Any], bool]:
+    if target <= 0 or not orders:
+        return (orders, False)
+    ordered = sorted(
+        [order for order in orders if quantity_getter(order) > 0],
+        key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+    total = sum(quantity_getter(order) for order in ordered)
+    if _dashboard_quantities_match(total, target):
+        return (ordered, True)
+    if len(ordered) <= 18:
+        best_subset: list[Any] = []
+        best_delta = float("inf")
+
+        def visit(index: int, current: list[Any], quantity: float) -> None:
+            nonlocal best_subset, best_delta
+            if quantity > target * 1.03:
+                return
+            if index >= len(ordered):
+                delta = abs(quantity - target)
+                if delta < best_delta:
+                    best_subset = list(current)
+                    best_delta = delta
+                return
+            order = ordered[index]
+            current.append(order)
+            visit(index + 1, current, quantity + quantity_getter(order))
+            current.pop()
+            visit(index + 1, current, quantity)
+
+        visit(0, [], 0.0)
+        best_quantity = sum(quantity_getter(order) for order in best_subset)
+        if _dashboard_quantities_match(best_quantity, target):
+            return (
+                sorted(
+                    best_subset,
+                    key=lambda order: _dashboard_order_time(order)
+                    or datetime.max.replace(tzinfo=UTC),
+                ),
+                True,
+            )
+    selected: list[Any] = []
+    quantity = 0.0
+    for order in ordered:
+        order_quantity = quantity_getter(order)
+        if quantity + order_quantity > target * 1.03 and selected:
+            break
+        selected.append(order)
+        quantity += order_quantity
+        if quantity >= target * 0.98:
+            break
+    return (selected or ordered, _dashboard_quantities_match(quantity, target))
+
+
+def _dashboard_select_orders_by_official_quantity(
+    orders: list[Any],
+    target: float,
+) -> tuple[list[Any], str]:
+    selected, matched = _dashboard_best_quantity_subset(
+        orders,
+        target,
+        _dashboard_order_base_quantity,
+    )
+    if matched:
+        return selected, "base_quantity"
+    selected, matched = _dashboard_best_quantity_subset(
+        orders,
+        target,
+        _dashboard_order_contracts,
+    )
+    if matched:
+        return selected, "contracts"
+    return selected, "unmatched"
+
+
+def _dashboard_linked_fill_from_order(order: Any) -> dict[str, Any]:
+    raw = _dashboard_order_raw_fills(order)
+    order_time = _dashboard_order_time(order)
+    return {
+        "side": str(getattr(order, "side", "") or "").lower(),
+        "quantity": _dashboard_order_base_quantity(order),
+        "contracts": _dashboard_order_contracts(order),
+        "contract_size": _safe_float(raw.get("contract_size"), 1.0) or 1.0,
+        "price": _dashboard_order_price(order),
+        "pnl": _dashboard_order_fill_pnl(order),
+        "pnl_pct": None,
+        "fee": _dashboard_order_fee_abs(order),
+        "order_id": str(getattr(order, "exchange_order_id", "") or "").strip(),
+        "trade_id": str(getattr(order, "okx_trade_ids", "") or "").strip(),
+        "filled_at": order_time.isoformat() if order_time else None,
+        "okx_confirmed": _dashboard_order_okx_confirmed(order),
+        "source": "okx_order_fact_cache",
+    }
+
+
+def _dashboard_order_ids(orders: list[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for order in sorted(
+        orders,
+        key=lambda item: _dashboard_order_time(item) or datetime.max.replace(tzinfo=UTC),
+    ):
+        order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if order_id and order_id not in seen:
+            result.append(order_id)
+            seen.add(order_id)
+    return result
+
+
+def _dashboard_position_history_matching_position_ids(
+    row: dict[str, Any],
+    closed_rows: list[Any],
+    *,
+    side: str,
+) -> list[int]:
+    inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+    pos_id = str(row.get("posId") or row.get("pos_id") or "").strip()
+    opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+    updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+    result: list[int] = []
+    window = timedelta(seconds=_DASHBOARD_POSITION_HISTORY_ORDER_WINDOW_SECONDS)
+    for position in closed_rows:
+        row_id = getattr(position, "id", None)
+        if row_id is None:
+            continue
+        position_inst_id = (
+            str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            or okx_inst_id_from_symbol(getattr(position, "symbol", None))
+            or ""
+        )
+        if inst_id and position_inst_id and position_inst_id != inst_id:
+            continue
+        position_side = str(getattr(position, "side", "") or "").lower().strip()
+        if side and position_side and position_side != side:
+            continue
+        if pos_id and str(getattr(position, "okx_pos_id", "") or "").strip() == pos_id:
+            result.append(int(row_id))
+            continue
+        position_opened = _as_utc_datetime(getattr(position, "created_at", None))
+        position_closed = _as_utc_datetime(getattr(position, "closed_at", None))
+        if opened_at and position_opened and abs(position_opened - opened_at) > window:
+            continue
+        if updated_at and position_closed and abs(position_closed - updated_at) > window:
+            continue
+        if position_opened or position_closed:
+            result.append(int(row_id))
+    return sorted(set(result))
+
+
+def _dashboard_position_history_order_payload(
+    row: dict[str, Any],
+    *,
+    side: str,
+    order_rows: list[Any],
+) -> dict[str, Any]:
+    inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+    opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+    updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+    raw_close_quantity = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
+    raw_max_quantity = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
+    entry_side = "sell" if side == "short" else "buy" if side == "long" else ""
+    close_side = "buy" if side == "short" else "sell" if side == "long" else ""
+    candidates = [
+        order
+        for order in order_rows
+        if _dashboard_order_matches_position_history_window(
+            order,
+            inst_id=inst_id,
+            opened_at=opened_at,
+            updated_at=updated_at,
+        )
+    ]
+    entry_candidates = [
+        order
+        for order in candidates
+        if not entry_side or str(getattr(order, "side", "") or "").lower() == entry_side
+    ]
+    close_candidates = [
+        order
+        for order in candidates
+        if (
+            not close_side
+            or str(getattr(order, "side", "") or "").lower() == close_side
+        )
+        and (_dashboard_order_fill_pnl(order) is not None or _dashboard_order_raw_fills(order))
+    ]
+    selected_closes, close_match_source = _dashboard_select_orders_by_official_quantity(
+        close_candidates,
+        raw_close_quantity,
+    )
+    entry_match_source = "unmatched"
+    if raw_max_quantity > 0:
+        selected_entries, entry_match_source = _dashboard_select_orders_by_official_quantity(
+            entry_candidates,
+            raw_max_quantity,
+        )
+    else:
+        first_close_at = min(
+            (_dashboard_order_time(order) for order in selected_closes if _dashboard_order_time(order)),
+            default=None,
+        )
+        selected_entries = [
+            order
+            for order in entry_candidates
+            if first_close_at is None
+            or (
+                (order_time := _dashboard_order_time(order)) is not None
+                and order_time <= first_close_at
+            )
+        ]
+    close_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_closes)
+    close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
+    entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)
+    entry_contracts = sum(_dashboard_order_contracts(order) for order in selected_entries)
+    close_quantity = raw_close_quantity
+    if close_base_quantity > 0 and _dashboard_quantities_match(close_base_quantity, raw_close_quantity):
+        close_quantity = close_base_quantity
+    elif close_contracts > 0 and _dashboard_quantities_match(close_contracts, raw_close_quantity):
+        close_quantity = close_base_quantity or raw_close_quantity
+    max_quantity = raw_max_quantity or entry_base_quantity or close_quantity
+    if raw_max_quantity > 0:
+        if entry_base_quantity > 0 and _dashboard_quantities_match(entry_base_quantity, raw_max_quantity):
+            max_quantity = entry_base_quantity
+        elif entry_contracts > 0 and _dashboard_quantities_match(entry_contracts, raw_max_quantity):
+            max_quantity = entry_base_quantity or raw_max_quantity
+    elif entry_base_quantity > 0:
+        max_quantity = max(entry_base_quantity, close_quantity)
+    linked_orders = sorted(
+        [*selected_entries, *selected_closes],
+        key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+    return {
+        "entry_order_ids": _dashboard_order_ids(selected_entries),
+        "close_order_ids": _dashboard_order_ids(selected_closes),
+        "linked_fills": [_dashboard_linked_fill_from_order(order) for order in linked_orders],
+        "close_quantity": close_quantity,
+        "max_quantity": max_quantity,
+        "entry_fee": sum(_dashboard_order_fee_abs(order) for order in selected_entries),
+        "close_fee": sum(_dashboard_order_fee_abs(order) for order in selected_closes),
+        "close_fill_pnl": sum(
+            _dashboard_order_fill_pnl(order) or 0.0 for order in selected_closes
+        ),
+        "entry_match_source": entry_match_source,
+        "close_match_source": close_match_source,
+    }
+
+
+def _dashboard_position_history_official_rows_as_groups_legacy(
     rows: list[dict[str, Any]],
     local_groups: list[Any],
     *,
@@ -2821,13 +3256,126 @@ def _dashboard_position_history_official_rows_as_groups(
     )
 
 
+def _dashboard_position_history_official_rows_as_groups(
+    rows: list[dict[str, Any]],
+    local_groups: list[Any],
+    *,
+    mode: str | None,
+    order_rows: list[Any] | None = None,
+    closed_rows: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    official_groups: list[dict[str, Any]] = []
+    order_rows = list(order_rows or [])
+    closed_rows = list(closed_rows or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
+        symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id)
+        if not symbol:
+            continue
+        side = _dashboard_position_history_local_side(row, local_groups, closed_rows)
+        order_payload = _dashboard_position_history_order_payload(
+            row,
+            side=side,
+            order_rows=order_rows,
+        )
+        status, status_label = _dashboard_position_history_close_status(row)
+        opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
+        updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
+        close_quantity = order_payload["close_quantity"]
+        max_quantity = order_payload["max_quantity"]
+        if max_quantity > 0 and close_quantity > 0 and close_quantity < max_quantity * 0.999:
+            status = "partial"
+            status_label = _dashboard_position_history_status_label(status)
+        closed_at = None if status == "partial" else updated_at
+        realized_pnl = _safe_float(row.get("realizedPnl"), 0.0) or 0.0
+        pnl_ratio = _safe_float(row.get("pnlRatio"), None)
+        if pnl_ratio is not None:
+            pnl_ratio *= 100.0
+        row_pnl = _safe_float(row.get("pnl"), None)
+        close_fill_pnl = (
+            row_pnl
+            if row_pnl is not None
+            else _safe_float(order_payload.get("close_fill_pnl"), 0.0) or 0.0
+        )
+        evidence_gaps: list[str] = []
+        if not order_payload["entry_order_ids"]:
+            evidence_gaps.append("missing_position_history_entry_orders")
+        if not order_payload["close_order_ids"]:
+            evidence_gaps.append("missing_position_history_close_orders")
+        if order_payload["close_match_source"] == "unmatched":
+            evidence_gaps.append("position_history_close_quantity_not_matched_to_orders")
+        official_groups.append(
+            {
+                "id": _dashboard_position_history_group_id(row, mode),
+                "group_id": _dashboard_position_history_group_id(row, mode),
+                "is_open": False,
+                "symbol": symbol,
+                "okx_inst_id": inst_id,
+                "okx_pos_id": str(row.get("posId") or row.get("pos_id") or "").strip(),
+                "side": side,
+                "leverage": _safe_float(row.get("lever"), 1.0) or 1.0,
+                "position_status": status_label,
+                "close_status": status,
+                "close_status_label": status_label,
+                "quantity": close_quantity,
+                "max_position_quantity": max_quantity,
+                "closed_quantity": close_quantity,
+                "entry_price": _safe_float(row.get("openAvgPx"), 0.0) or 0.0,
+                "current_price": _safe_float(row.get("closeAvgPx"), 0.0) or 0.0,
+                "average_entry_price": _safe_float(row.get("openAvgPx"), 0.0) or 0.0,
+                "average_close_price": _safe_float(row.get("closeAvgPx"), 0.0) or 0.0,
+                "realized_pnl": realized_pnl,
+                "realized_pnl_pct": pnl_ratio,
+                "pnl_source": "okx_position_history_realized_pnl",
+                "close_fill_pnl": close_fill_pnl,
+                "entry_fee": order_payload["entry_fee"],
+                "close_fee": order_payload["close_fee"],
+                "funding_fee": _safe_float(row.get("fundingFee"), 0.0) or 0.0,
+                "funding_bill_count": 0,
+                "funding_fee_source": "okx_positions_history.fundingFee",
+                "settlement_source": "okx_position_history_realized_pnl",
+                "settlement_status": "okx_position_history",
+                "realized_pnl_formula": "okx_position_history_realized_pnl_authoritative",
+                "opened_at": opened_at.isoformat() if opened_at else None,
+                "closed_at": closed_at.isoformat() if closed_at else None,
+                "official_updated_at": updated_at.isoformat() if updated_at else None,
+                "position_ids": _dashboard_position_history_matching_position_ids(
+                    row,
+                    closed_rows,
+                    side=side,
+                ),
+                "entry_order_ids": order_payload["entry_order_ids"],
+                "close_order_ids": order_payload["close_order_ids"],
+                "linked_fills": order_payload["linked_fills"],
+                "linked_order_count": len(order_payload["linked_fills"]),
+                "evidence_complete": not evidence_gaps,
+                "trainable": not evidence_gaps,
+                "evidence_gaps": evidence_gaps,
+                "ledger_source": "okx_positions_history_official",
+                "okx_position_history_row": dict(row),
+                "position_history_entry_match_source": order_payload["entry_match_source"],
+                "position_history_close_match_source": order_payload["close_match_source"],
+            }
+        )
+    return sorted(
+        official_groups,
+        key=lambda item: (
+            _as_utc_datetime(item.get("official_updated_at"))
+            or _as_utc_datetime(item.get("closed_at"))
+            or _as_utc_datetime(item.get("opened_at"))
+            or datetime.min.replace(tzinfo=UTC)
+        ),
+        reverse=True,
+    )
+
+
 async def _dashboard_okx_position_history_rows(
     *,
     mode: str | None,
     closed_rows: list[Any],
 ) -> list[dict[str, Any]]:
-    if not closed_rows:
-        return []
     selected_mode = "live" if mode == "live" else "paper"
     pos_ids = sorted(
         {
@@ -4162,7 +4710,7 @@ async def get_positions(
             open_rows = []
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
-            closed_rows, closed_total, _closed_page, _closed_pages = (
+            closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
                 await _dashboard_closed_position_ledger_rows(
                     session,
                     repo,
@@ -4188,13 +4736,13 @@ async def get_positions(
             "page": page,
             "page_size": page_size,
             "total_pages": display_total_pages,
-            "ledger_source": "okx_current_positions_plus_grouped_closed_cache",
+            "ledger_source": f"okx_current_positions_plus_{closed_ledger_source}",
         }
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
         if closed_only:
-            positions, display_total, page, display_total_pages = (
+            positions, display_total, page, display_total_pages, ledger_source = (
                 await _dashboard_closed_position_ledger_rows(
                     session,
                     repo,
@@ -4211,7 +4759,7 @@ async def get_positions(
                 "page": page,
                 "page_size": page_size,
                 "total_pages": display_total_pages,
-                "ledger_source": "okx_native_grouped_cache",
+                "ledger_source": ledger_source,
             }
             closed_rows = await repo.get_position_records(
                 execution_mode=mode,
@@ -6515,7 +7063,13 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         exchange_marks = {}
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
-        closed_ledger_rows, _closed_total, _closed_page, _closed_total_pages = (
+        (
+            closed_ledger_rows,
+            _closed_total,
+            _closed_page,
+            _closed_total_pages,
+            _closed_ledger_source,
+        ) = (
             await _dashboard_closed_position_ledger_rows(
                 session,
                 repo,
