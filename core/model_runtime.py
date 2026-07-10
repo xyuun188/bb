@@ -49,6 +49,19 @@ def uses_thinking_tags(model: str | None) -> bool:
     return "qwen3" in name or "deepseek-r1" in name
 
 
+def supports_provider_thinking_disable(model: str | None) -> bool:
+    """Return whether this OpenAI-compatible provider accepts ``thinking=disabled``.
+
+    DeepSeek's non-R1 routed models expose reasoning content by default. The
+    final-trader JSON contract is latency-sensitive, so this switch is used at
+    that boundary instead of relying on a prompt-only request to avoid thinking.
+    R1-distill models keep their existing chat-template control path.
+    """
+
+    name = str(model or "").lower()
+    return "deepseek" in name and "r1" not in name
+
+
 def batch_expert_json_unreliable_model(model: str | None) -> bool:
     """Return True when a model is unsafe for strict multi-expert JSON batching."""
     name = str(model or "").lower()
@@ -68,6 +81,14 @@ def non_thinking_extra_body(existing: dict[str, Any] | None = None) -> dict[str,
         template_kwargs = {}
     template_kwargs["enable_thinking"] = False
     body["chat_template_kwargs"] = template_kwargs
+    return body
+
+
+def provider_non_thinking_extra_body(existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Add DeepSeek-compatible reasoning disablement without discarding controls."""
+
+    body = dict(existing or {})
+    body["thinking"] = {"type": "disabled"}
     return body
 
 

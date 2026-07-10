@@ -36,7 +36,9 @@ from core.model_runtime import (
     is_openai_reasoning_model,
     is_qwen3_model,
     non_thinking_extra_body,
+    provider_non_thinking_extra_body,
     supports_batch_expert_json,
+    supports_provider_thinking_disable,
     uses_thinking_tags,
 )
 from core.safe_output import safe_error_text
@@ -740,6 +742,40 @@ def _message_content_text(response: Any) -> str:
     return _strip_qwen_thinking(str(content or ""))
 
 
+def _provider_response_contract(response: Any) -> dict[str, Any]:
+    """Return compact, non-sensitive completion diagnostics for one model reply."""
+
+    content = _message_content_text(response)
+    additional = getattr(response, "additional_kwargs", None)
+    if not isinstance(additional, dict):
+        additional = {}
+    metadata = getattr(response, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    usage = getattr(response, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        usage = {}
+    output_token_details = usage.get("output_token_details")
+    if not isinstance(output_token_details, dict):
+        output_token_details = {}
+    completion_token_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_token_details, dict):
+        completion_token_details = {}
+    reasoning_content = str(additional.get("reasoning_content") or "")
+    finish_reason = str(metadata.get("finish_reason") or "")
+    return {
+        "has_final_content": bool(content.strip()),
+        "content_chars": len(content),
+        "reasoning_content_chars": len(reasoning_content),
+        "reasoning_only": bool(reasoning_content and not content.strip()),
+        "finish_reason": finish_reason,
+        "truncated": finish_reason.lower() in {"length", "max_tokens"},
+        "completion_tokens": usage.get("output_tokens") or usage.get("completion_tokens"),
+        "reasoning_tokens": output_token_details.get("reasoning")
+        or completion_token_details.get("reasoning_tokens"),
+    }
+
+
 def _strip_qwen_thinking(text: str) -> str:
     """Remove Qwen3 thinking blocks before JSON parsing."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
@@ -1072,13 +1108,17 @@ class LLMAgent(AbstractAIModel):
         else:
             kwargs["temperature"] = 0.2 if self._role else 0.3
             kwargs["max_tokens"] = max_completion_tokens
+        extra_body: dict[str, Any] = {}
         if _uses_thinking_tags(model):
-            kwargs["extra_body"] = non_thinking_extra_body()
-        if fast_expert:
-            model_kwargs = dict(kwargs.get("model_kwargs") or {})
-            model_kwargs["response_format"] = {"type": "json_object"}
-            kwargs["model_kwargs"] = model_kwargs
-        elif json_response and not _uses_thinking_tags(model):
+            extra_body = non_thinking_extra_body(extra_body)
+        if self._role == "final_decision" and supports_provider_thinking_disable(model):
+            extra_body = provider_non_thinking_extra_body(extra_body)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        structured_json_response = bool(
+            fast_expert or json_response or self._role == "final_decision"
+        )
+        if structured_json_response:
             model_kwargs = dict(kwargs.get("model_kwargs") or {})
             model_kwargs["response_format"] = {"type": "json_object"}
             kwargs["model_kwargs"] = model_kwargs
@@ -1245,12 +1285,18 @@ class LLMAgent(AbstractAIModel):
                         if _LLM_CALL_DELAY:
                             await asyncio.sleep(_LLM_CALL_DELAY)
                         response = await llm.ainvoke(messages)
+                    response_contract = _provider_response_contract(response)
                     content = _message_content_text(response)
                     if not content.strip():
+                        if response_contract["reasoning_only"]:
+                            raise LLMResponseParseError(
+                                f"模型 {model_name} 只返回推理内容，未返回最终 JSON"
+                            )
                         raise LLMResponseParseError(f"模型 {model_name} 返回空内容")
 
                     parsed = _extract_json(content)
                     parsed["provider_model"] = model_name
+                    parsed["provider_response_contract"] = response_contract
                     if model_name != primary_model:
                         parsed["fallback_from"] = primary_model
 

@@ -68,6 +68,40 @@ async def test_final_trader_defers_when_market_analysis_budget_is_exhausted() ->
     assert result.raw_response["decision_maker_timing"]["status"] == "analysis_budget_deferred"
 
 
+@pytest.mark.asyncio
+async def test_final_trader_timeout_preserves_preliminary_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimeoutDecisionMaker:
+        async def decide(self, _features, _context):
+            await asyncio.sleep(60)
+
+    class TimeoutRegistry:
+        def get(self, _name):
+            return TimeoutDecisionMaker()
+
+    async def timeout_wait_for(awaitable, **_kwargs):
+        awaitable.close()
+        raise TimeoutError()
+
+    monkeypatch.setattr("ai_brain.ensemble_coordinator.asyncio.wait_for", timeout_wait_for)
+    coordinator = EnsembleCoordinator(TimeoutRegistry())
+    preliminary = _decision(Action.LONG)
+
+    result = await coordinator._apply_decision_maker(
+        FeatureVector(symbol="CRCL/USDT"),
+        {},
+        preliminary,
+        {},
+        [],
+        None,
+    )
+
+    assert result is preliminary
+    assert result.raw_response["decision_maker"]["status"] == "timeout"
+    assert result.raw_response["decision_maker_timing"]["status"] == "timeout"
+
+
 def test_position_hold_skips_decision_maker_when_exit_evidence_is_insufficient() -> None:
     coordinator = EnsembleCoordinator(SimpleNamespace())
     preliminary = _decision(

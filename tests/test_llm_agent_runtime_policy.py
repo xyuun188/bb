@@ -5,7 +5,8 @@ from typing import Any
 
 import pytest
 
-from ai_brain.llm_agent import LLMAgent
+from ai_brain.llm_agent import LLMAgent, _extract_json, _provider_response_contract
+from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 
 
@@ -115,3 +116,67 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     assert "FAST_EXPERT_JSON_V1" not in prompt_text
     assert "Return JSON only" in prompt_text
     assert len(prompt_text) < 1400
+
+
+def test_final_decision_always_uses_structured_json_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.append(kwargs)
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="decision_maker",
+        api_config={
+            "api_base": "https://api.example.test/v1",
+            "api_key": "test-key",
+            "model": "deepseek-v4-pro",
+            "role": "final_decision",
+        },
+    )
+
+    agent._base_url = "https://api.example.test/v1"
+    agent._api_key = "test-key"
+    agent._create_llm("deepseek-v4-pro")
+
+    kwargs = captured_kwargs[-1]
+    assert kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
+    assert kwargs["max_tokens"] <= 320
+    assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_provider_response_contract_distinguishes_reasoning_only_from_final_json() -> None:
+    reasoning_only = _provider_response_contract(
+        SimpleNamespace(
+            content="",
+            additional_kwargs={"reasoning_content": "internal reasoning"},
+            response_metadata={"finish_reason": "length"},
+            usage_metadata={"completion_tokens": 320},
+        )
+    )
+    completed = _provider_response_contract(
+        SimpleNamespace(
+            content='{"action":"hold"}',
+            additional_kwargs={"reasoning_content": "brief reasoning"},
+            response_metadata={"finish_reason": "stop"},
+            usage_metadata={
+                "completion_tokens": 42,
+                "completion_tokens_details": {"reasoning_tokens": 20},
+            },
+        )
+    )
+
+    assert reasoning_only["reasoning_only"] is True
+    assert reasoning_only["truncated"] is True
+    assert reasoning_only["has_final_content"] is False
+    assert completed["reasoning_only"] is False
+    assert completed["has_final_content"] is True
+    assert completed["reasoning_tokens"] == 20
+
+
+def test_invalid_final_json_is_reported_as_a_parse_error() -> None:
+    with pytest.raises(LLMResponseParseError):
+        _extract_json("not a JSON decision")

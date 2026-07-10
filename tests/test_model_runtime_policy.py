@@ -8,6 +8,7 @@ from core.model_runtime import (
     completion_token_limit,
     ensure_no_think_text,
     supports_batch_expert_json,
+    supports_provider_thinking_disable,
     uses_thinking_tags,
     with_no_think_content,
 )
@@ -17,6 +18,12 @@ def test_uses_thinking_tags_for_qwen3_and_deepseek_r1() -> None:
     assert uses_thinking_tags("qwen3-32b-trade")
     assert uses_thinking_tags("DeepSeek-R1-Distill-Qwen-32B")
     assert not uses_thinking_tags("Qwen2.5-32B-Instruct")
+
+
+def test_provider_thinking_disable_targets_non_r1_deepseek_routes() -> None:
+    assert supports_provider_thinking_disable("deepseek-v4-pro")
+    assert not supports_provider_thinking_disable("deepseek-r1-14b-risk")
+    assert not supports_provider_thinking_disable("qwen3-14b-trade")
 
 
 def test_batch_expert_json_support_excludes_deepseek_r1() -> None:
