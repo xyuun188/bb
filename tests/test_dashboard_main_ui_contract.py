@@ -124,8 +124,8 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "learning: '刷新策略学习上下文'" in script
     assert "市场分析线程：" in script
     assert "持仓复盘线程：" in script
-    assert "position analysis round cancelled by hard watchdog" in script
-    assert "持仓复盘整轮超时" in script
+    assert "position analysis task cancelled during" in script
+    assert "持仓复盘任务被外部取消" in script
     assert "market_current_stage" in script
     assert "position_current_stage" in script
     assert "strategy_context:" in script

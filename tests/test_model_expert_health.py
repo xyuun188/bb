@@ -1,9 +1,23 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
-from services.model_expert_health import summarize_model_expert_health
+import pytest
+
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.decision import AIDecision
+from models.learning import ExpertMemory, ShadowBacktest, StrategyLearningEvent
+from services.model_expert_health import ModelExpertHealthService, summarize_model_expert_health
+
+
+async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    await close_db()
+    db_path = tmp_path / "model-health.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
 
 
 def _decision(
@@ -204,3 +218,84 @@ def test_model_expert_health_does_not_count_successful_independent_retry_as_json
         assert component["windows"]["24h"]["json_error_count"] == 0
         assert component["windows"]["24h"]["no_return_count"] == 0
         assert component["stability"]["json_error_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_model_health_report_projects_required_raw_fragments_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    now = datetime.now(UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="BTC/USDT",
+                    action="long",
+                    confidence=0.7,
+                    was_executed=True,
+                    outcome_pnl_pct=0.4,
+                    raw_llm_response={
+                        "model_timings": [
+                            {
+                                "name": "trend_expert",
+                                "status": "completed",
+                                "duration_sec": 0.4,
+                                "action": "long",
+                            }
+                        ],
+                        "unused_full_transcript": "x" * 100_000,
+                    },
+                    created_at=now,
+                ),
+                ShadowBacktest(
+                    decision_id=1,
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    status="completed",
+                    due_at=now,
+                    best_action="long",
+                    created_at=now,
+                ),
+                ExpertMemory(
+                    expert_name="trend_expert",
+                    memory_key="trend-expert-test",
+                    evidence_count=3,
+                    success_count=2,
+                    failure_count=1,
+                ),
+                StrategyLearningEvent(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    event_type="execution_result",
+                    attribution={"trend": {"source": "trend_expert"}},
+                    strategy_snapshot={"unused": "x" * 100_000},
+                    created_at=now,
+                ),
+            ]
+        )
+
+    try:
+        report = await ModelExpertHealthService().report(hours=24, limit=20)
+        async with get_session_ctx() as session:
+            decision = await session.get(AIDecision, 1)
+            assert decision is not None
+            assert decision.model_health_snapshot_version == 1
+            assert decision.model_health_timings == [
+                {
+                    "name": "trend_expert",
+                    "status": "completed",
+                    "duration_sec": 0.4,
+                    "action": "long",
+                }
+            ]
+            assert decision.model_health_experts is None
+    finally:
+        await close_db()
+
+    trend = report["components"]["trend_expert"]
+    assert trend["windows"]["24h"]["participation_count"] == 1
+    assert trend["memory"]["evidence_count"] == 3

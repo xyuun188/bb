@@ -24,8 +24,9 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
-from sqlalchemy import func, select
+from sqlalchemy import func, select, union_all
 
+from config.settings import settings
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 from core.safe_output import safe_error_text
 from db.session import get_read_session_ctx
@@ -592,6 +593,70 @@ class ShadowTrainingRow:
     missed_opportunity: bool
 
 
+_TRAINING_FEATURE_SNAPSHOT_KEYS = (
+    "abnormal_wick_count_72h",
+    "abnormal_wick_max_pct",
+    "abnormal_wick_recent_hours",
+    "adx_14",
+    "atr_14",
+    "bb_pct",
+    "bb_width",
+    "change_24h_pct",
+    "close",
+    "current_price",
+    "direct_news_item_count",
+    "direct_sentiment_data_available",
+    "ema_12",
+    "ema_26",
+    "entry_activity_volume_ratio",
+    "exchange_inflow",
+    "feature_at",
+    "feature_timestamp",
+    "funding_rate",
+    "high_24h",
+    "indicator_price_gap_pct",
+    "liquidation_risk_score",
+    "low_24h",
+    "macd",
+    "macd_diff",
+    "macd_signal",
+    "market_data_quality",
+    "market_news_item_count",
+    "news_article_count",
+    "news_sentiment_avg",
+    "notional_24h_usdt",
+    "observed_at",
+    "open_interest_value",
+    "orderbook_ask_depth",
+    "orderbook_bid_depth",
+    "orderbook_imbalance",
+    "price_reconciliation_warning",
+    "price_vs_sma20",
+    "price_vs_sma50",
+    "returns_1",
+    "returns_20",
+    "returns_5",
+    "rsi_14",
+    "rsi_7",
+    "sector_relative_strength",
+    "sentiment_data_available",
+    "sequence_length",
+    "social_mention_count",
+    "social_sentiment_avg",
+    "spread_pct",
+    "stale",
+    "stoch_k",
+    "ticker_stale",
+    "training_quality_reason",
+    "volatility_20",
+    "volume_24h",
+    "volume_ratio",
+    "whale_txn_count",
+)
+_TRAINING_FEATURE_COLUMN_PREFIX = "training_feature__"
+_TRAINING_SHADOW_READ_PAGE_SIZE = 500
+
+
 def _shadow_training_columns() -> tuple[Any, ...]:
     return (
         ShadowBacktest.id,
@@ -600,7 +665,7 @@ def _shadow_training_columns() -> tuple[Any, ...]:
         ShadowBacktest.analysis_type,
         ShadowBacktest.decision_action,
         ShadowBacktest.decision_confidence,
-        ShadowBacktest.feature_snapshot,
+        ShadowBacktest.training_feature_snapshot,
         ShadowBacktest.due_at,
         ShadowBacktest.horizon_minutes,
         ShadowBacktest.long_return_pct,
@@ -611,6 +676,7 @@ def _shadow_training_columns() -> tuple[Any, ...]:
 
 
 def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
+    feature_snapshot = _parse_json(mapping.get("training_feature_snapshot"))
     return ShadowTrainingRow(
         id=int(mapping.get("id") or 0),
         created_at=mapping.get("created_at"),
@@ -618,7 +684,7 @@ def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
         analysis_type=str(mapping.get("analysis_type") or ""),
         decision_action=str(mapping.get("decision_action") or ""),
         decision_confidence=_safe_float(mapping.get("decision_confidence"), 0.0),
-        feature_snapshot=mapping.get("feature_snapshot"),
+        feature_snapshot=feature_snapshot,
         due_at=mapping.get("due_at"),
         horizon_minutes=int(mapping.get("horizon_minutes") or 10),
         long_return_pct=mapping.get("long_return_pct"),
@@ -1777,57 +1843,93 @@ class MLSignalService:
 
 
 async def load_shadow_training_rows(limit: int = TRAINING_SHADOW_SAMPLE_LIMIT) -> list[Any]:
-    async with get_read_session_ctx() as session:
-        safe_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
-        recent_limit = max(int(safe_limit * TRAINING_BALANCED_RECENT_CANDIDATE_SHARE), 1)
-        non_hold_limit = max(
-            int(safe_limit * TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE),
-            int(safe_limit * TRAINING_MIN_NON_HOLD_SHARE),
-        )
-        best_trade_limit = max(
-            int(safe_limit * TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE),
-            int(safe_limit * TRAINING_MIN_BEST_TRADE_SHARE),
-        )
-        base_filters = (
-            ShadowBacktest.status == "completed",
-            ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
-            ShadowBacktest.long_return_pct.is_not(None),
-            ShadowBacktest.short_return_pct.is_not(None),
-        )
-        order_by = (ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
-        columns = _shadow_training_columns()
+    safe_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
+    recent_limit = max(int(safe_limit * TRAINING_BALANCED_RECENT_CANDIDATE_SHARE), 1)
+    non_hold_limit = max(
+        int(safe_limit * TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE),
+        int(safe_limit * TRAINING_MIN_NON_HOLD_SHARE),
+    )
+    best_trade_limit = max(
+        int(safe_limit * TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE),
+        int(safe_limit * TRAINING_MIN_BEST_TRADE_SHARE),
+    )
+    base_filters = (
+        ShadowBacktest.status == "completed",
+        ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+        ShadowBacktest.long_return_pct.is_not(None),
+        ShadowBacktest.short_return_pct.is_not(None),
+    )
+    order_by = (ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+    columns = _shadow_training_columns()
 
-        async def load_rows(stmt: Any) -> list[ShadowTrainingRow]:
-            return [
-                _shadow_training_row_from_mapping(row)
-                for row in (await session.execute(stmt)).mappings().all()
-            ]
+    if "sqlite" in settings.database_url:
+        # SQLite does not support ORDER BY/LIMIT in each branch of a compound
+        # SELECT. Keep the equivalent path for local tests and development.
+        async with get_read_session_ctx() as session:
 
-        recent_rows = await load_rows(
-            select(*columns).where(*base_filters).order_by(*order_by).limit(recent_limit)
-        )
-        non_hold_rows = await load_rows(
-            select(*columns)
-            .where(
-                *base_filters,
+            async def load_rows(*filters: Any, row_limit: int) -> list[ShadowTrainingRow]:
+                rows: list[ShadowTrainingRow] = []
+                before_id: int | None = None
+                while len(rows) < row_limit:
+                    page_limit = min(_TRAINING_SHADOW_READ_PAGE_SIZE, row_limit - len(rows))
+                    stmt = select(*columns).where(*base_filters, *filters).order_by(*order_by).limit(
+                        page_limit
+                    )
+                    if before_id is not None:
+                        stmt = stmt.where(ShadowBacktest.id < before_id)
+                    page = [
+                        _shadow_training_row_from_mapping(row)
+                        for row in (await session.execute(stmt)).mappings().all()
+                    ]
+                    if not page:
+                        break
+                    rows.extend(page)
+                    before_id = page[-1].id or before_id
+                    if len(page) < page_limit:
+                        break
+                return rows
+
+            recent_rows = await load_rows(row_limit=recent_limit)
+            non_hold_rows = await load_rows(
                 ShadowBacktest.decision_action.in_(["long", "short"]),
+                row_limit=non_hold_limit,
             )
-            .order_by(*order_by)
-            .limit(non_hold_limit)
-        )
-        best_trade_rows = await load_rows(
-            select(*columns)
-            .where(
-                *base_filters,
+            best_trade_rows = await load_rows(
                 ShadowBacktest.best_action.in_(["long", "short"]),
+                row_limit=best_trade_limit,
             )
-            .order_by(*order_by)
-            .limit(best_trade_limit)
-        )
         return select_shadow_training_rows(
             [*recent_rows, *non_hold_rows, *best_trade_rows],
             limit=safe_limit,
         )
+
+    def candidate_ids(*filters: Any, row_limit: int) -> Any:
+        return (
+            select(ShadowBacktest.id.label("id"))
+            .where(*base_filters, *filters)
+            .order_by(*order_by)
+            .limit(row_limit)
+        )
+
+    candidate_set = union_all(
+        candidate_ids(row_limit=recent_limit),
+        candidate_ids(ShadowBacktest.decision_action.in_(["long", "short"]), row_limit=non_hold_limit),
+        candidate_ids(ShadowBacktest.best_action.in_(["long", "short"]), row_limit=best_trade_limit),
+    ).subquery("training_candidates")
+    async with get_read_session_ctx() as session:
+        result = await session.execute(
+            select(*columns)
+            .where(ShadowBacktest.id.in_(select(candidate_set.c.id)))
+            .order_by(*order_by)
+        )
+        rows = [
+            _shadow_training_row_from_mapping(row)
+            for row in result.mappings().all()
+        ]
+    return select_shadow_training_rows(
+        rows,
+        limit=safe_limit,
+    )
 
 
 async def count_shadow_training_rows() -> int:

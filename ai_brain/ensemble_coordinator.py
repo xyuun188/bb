@@ -46,6 +46,23 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def _analysis_budget_snapshot(context: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the remaining cooperative market-analysis budget, if supplied."""
+
+    try:
+        deadline = float(context.get("_analysis_deadline_monotonic"))
+    except (TypeError, ValueError):
+        return None
+    if deadline <= 0:
+        return None
+    remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
+    return {
+        "scope": str(context.get("_analysis_budget_scope") or "analysis"),
+        "remaining_seconds": round(remaining, 3),
+        "configured_budget_seconds": context.get("_analysis_budget_seconds"),
+    }
+
+
 ACTION_SCORE = {
     Action.LONG: 1.0,
     Action.SHORT: -1.0,
@@ -467,6 +484,7 @@ class EnsembleCoordinator:
         dm_started_at = datetime.now(UTC)
         dm_perf_started = time.perf_counter()
         protected_exit = self._protected_exit_evidence(raw) if preliminary.is_exit else {}
+        decision_budget_details: dict[str, Any] = {}
 
         def set_decision_maker_timing(status: str, reason: str | None = None) -> None:
             duration = round(time.perf_counter() - dm_perf_started, 3)
@@ -479,6 +497,7 @@ class EnsembleCoordinator:
             }
             if reason:
                 timing["reason"] = reason[:240]
+            timing.update(decision_budget_details)
             decision_maker_payload = raw.get("decision_maker")
             if isinstance(decision_maker_payload, dict):
                 decision_maker_payload["duration_sec"] = duration
@@ -638,7 +657,38 @@ class EnsembleCoordinator:
                 configured_dm_timeout = float(settings.ai_decision_maker_timeout_seconds or 14.0)
             except (TypeError, ValueError):
                 configured_dm_timeout = 14.0
-            dm_timeout = min(max(configured_dm_timeout, 5.0), 18.0)
+            requested_dm_timeout = min(max(configured_dm_timeout, 5.0), 18.0)
+            dm_timeout = requested_dm_timeout
+            budget_snapshot = _analysis_budget_snapshot(context)
+            if budget_snapshot is not None:
+                remaining = max(float(budget_snapshot["remaining_seconds"] or 0.0), 0.0)
+                reserve = min(0.5, max(0.1, requested_dm_timeout * 0.02))
+                allowed = max(remaining - reserve, 0.0)
+                decision_budget_details = {
+                    "analysis_budget": {
+                        **budget_snapshot,
+                        "reserve_seconds": round(reserve, 3),
+                        "requested_timeout_seconds": round(requested_dm_timeout, 3),
+                        "allowed_timeout_seconds": round(min(requested_dm_timeout, allowed), 3),
+                    },
+                    "budget_limited": bool(allowed + 1e-9 < requested_dm_timeout),
+                }
+                if allowed <= 0:
+                    reason = (
+                        f"{budget_snapshot['scope']} 剩余分析预算已不足以完成最终交易员复核；"
+                        "保留初步裁决并进入后续独立风控和执行前检查。"
+                    )
+                    raw["decision_maker"] = {
+                        "status": "analysis_budget_deferred",
+                        "model_name": DECISION_MAKER_NAME,
+                        "reason": reason,
+                        "fallback": "本候选不再等待慢模型，下一轮会使用最新行情重新复核。",
+                        **decision_budget_details,
+                    }
+                    set_decision_maker_timing("analysis_budget_deferred", "analysis_budget_exhausted")
+                    preliminary.raw_response = raw
+                    return preliminary
+                dm_timeout = min(requested_dm_timeout, allowed)
             proposal = await asyncio.wait_for(
                 decision_maker.decide(features, decider_context),
                 timeout=dm_timeout,
@@ -651,6 +701,8 @@ class EnsembleCoordinator:
                 "model_name": DECISION_MAKER_NAME,
                 "reason": f"最终交易员超过 {dm_timeout:.0f} 秒未返回，系统保留初步裁决。",
                 "fallback": "开仓信号继续走下单前最新行情复核；平仓/减仓风控信号保留。",
+                "timeout_seconds": round(dm_timeout, 3),
+                **decision_budget_details,
             }
             preliminary.raw_response = raw
             return preliminary
@@ -703,6 +755,7 @@ class EnsembleCoordinator:
             "reasoning": proposal.reasoning,
             "position_size_pct": proposal.position_size_pct,
             "suggested_leverage": proposal.suggested_leverage,
+            **decision_budget_details,
             "provider_model": (
                 (proposal.raw_response or {}).get("provider_model")
                 if isinstance(proposal.raw_response, dict)

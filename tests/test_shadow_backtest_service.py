@@ -210,6 +210,57 @@ async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_price_collection_does_not_hold_database_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", False)
+    repo = _FakeRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=70,
+            decision_id=123,
+            model_name="ensemble_trader",
+            symbol="BTC/USDT",
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=10,
+            status="pending",
+            note="",
+            feature_snapshot={},
+        )
+    ]
+
+    class TrackingSessionCtx:
+        active = 0
+        entries = 0
+
+        async def __aenter__(self) -> object:
+            type(self).active += 1
+            type(self).entries += 1
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            type(self).active -= 1
+
+    async def latest(_symbol: str) -> float:
+        assert TrackingSessionCtx.active == 0
+        return 101.0
+
+    service = ShadowBacktestService(
+        latest_price_provider=latest,
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=TrackingSessionCtx,
+        repository_factory=lambda _session: repo,
+    )
+
+    assert await service.update_due() == 1
+    assert TrackingSessionCtx.entries == 2
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_service_quarantines_dirty_completed_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

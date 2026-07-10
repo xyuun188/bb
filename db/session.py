@@ -26,8 +26,15 @@ async def get_engine():
         if is_sqlite:
             engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30.0}
         else:
-            engine_kwargs["pool_size"] = 5
-            engine_kwargs["max_overflow"] = 10
+            # Market, position, training, and reconciliation work concurrently.
+            # The old implicit 5+10 pool could queue a simple open-position read
+            # for SQLAlchemy's default 30 seconds during a busy round.
+            engine_kwargs["pool_size"] = max(int(settings.database_pool_size or 0), 1)
+            engine_kwargs["max_overflow"] = max(int(settings.database_max_overflow or 0), 0)
+            engine_kwargs["pool_timeout"] = max(
+                float(settings.database_pool_timeout_seconds or 0.0),
+                0.5,
+            )
         _engine = create_async_engine(settings.database_url, **engine_kwargs)
         if is_sqlite:
             _configure_sqlite_engine(_engine)
@@ -163,8 +170,11 @@ async def init_db() -> None:
                       AND position_id IS NOT NULL
                     """))
         await _ensure_trade_fact_columns(conn)
+        await _ensure_ai_decision_model_health_columns(conn)
+        await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
+        await _ensure_okx_position_history_column_widths(conn)
         await _ensure_okx_position_history_indexes(conn)
         if "sqlite" in settings.database_url:
             for ddl in [
@@ -342,6 +352,28 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
             "idx_orders_okx_sync_status",
             "CREATE INDEX IF NOT EXISTS idx_orders_okx_sync_status ON orders (okx_sync_status, okx_synced_at DESC)",
         ),
+        (
+            "idx_ai_decisions_pending_entry_recent",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_pending_entry_recent "
+            "ON ai_decisions (was_executed, action, created_at DESC, id DESC)",
+        ),
+        (
+            "idx_ai_decisions_recent_scan",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_recent_scan "
+            "ON ai_decisions (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_ai_decisions_strategy_learning_recent",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_strategy_learning_recent "
+            "ON ai_decisions (model_name, is_paper, created_at DESC, id DESC)",
+        ),
+        (
+            "idx_shadow_backtests_training_completed",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_training_completed "
+            "ON shadow_backtests (created_at DESC, id DESC) "
+            "WHERE status = 'completed' "
+            "AND long_return_pct IS NOT NULL AND short_return_pct IS NOT NULL",
+        ),
     )
     if "postgresql" in settings.database_url:
         index_names = await _postgres_index_names(conn)
@@ -351,6 +383,237 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
         return
     for _name, ddl in index_ddls:
         await conn.execute(text(ddl))
+
+
+async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
+    """Persist compact health evidence alongside each large decision payload."""
+
+    column_ddls = (
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_timings JSONB",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_fallback_timings JSONB",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_experts JSONB",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_opinions JSONB",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_local_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_local_ai_tools BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_snapshot_version INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS decision_learning_snapshot JSONB",
+        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS decision_learning_snapshot_version INTEGER NOT NULL DEFAULT 0",
+    )
+    if "postgresql" in settings.database_url:
+        for ddl in column_ddls:
+            await conn.execute(text(ddl))
+        await conn.execute(
+            text(
+                """
+                CREATE OR REPLACE FUNCTION bb_sync_ai_decision_model_health()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                DECLARE
+                    raw JSONB := COALESCE(NEW.raw_llm_response::JSONB, '{}'::JSONB);
+                BEGIN
+                    NEW.model_health_timings := CASE
+                        WHEN jsonb_typeof(raw -> 'model_timings') = 'array'
+                        THEN raw -> 'model_timings' ELSE NULL END;
+                    NEW.model_health_fallback_timings := CASE
+                        WHEN jsonb_typeof(raw -> '_model_timings') = 'array'
+                        THEN raw -> '_model_timings' ELSE NULL END;
+                    NEW.model_health_experts := CASE
+                        WHEN jsonb_typeof(raw -> 'experts') = 'array'
+                        THEN raw -> 'experts' ELSE NULL END;
+                    NEW.model_health_opinions := CASE
+                        WHEN jsonb_typeof(raw -> 'opinions') = 'array'
+                        THEN raw -> 'opinions' ELSE NULL END;
+                    NEW.model_health_has_ml_signal := CASE
+                        WHEN raw -> 'ml_signal' IS NULL OR raw -> 'ml_signal' IN ('null'::JSONB, '{}'::JSONB, '[]'::JSONB)
+                        THEN FALSE ELSE TRUE END;
+                    NEW.model_health_has_local_ml_signal := CASE
+                        WHEN raw -> 'local_ml_signal' IS NULL OR raw -> 'local_ml_signal' IN ('null'::JSONB, '{}'::JSONB, '[]'::JSONB)
+                        THEN FALSE ELSE TRUE END;
+                    NEW.model_health_has_local_ai_tools := CASE
+                        WHEN raw -> 'local_ai_tools' IS NULL OR raw -> 'local_ai_tools' IN ('null'::JSONB, '{}'::JSONB, '[]'::JSONB)
+                        THEN FALSE ELSE TRUE END;
+                    NEW.model_health_snapshot_version := 1;
+                    NEW.decision_learning_snapshot := COALESCE(
+                        (
+                            SELECT jsonb_object_agg(item.key, item.value)
+                            FROM jsonb_each(raw) AS item(key, value)
+                            WHERE jsonb_typeof(item.value) IN ('number', 'boolean', 'null')
+                               OR (
+                                   jsonb_typeof(item.value) = 'string'
+                                   AND length(item.value #>> '{}') <= 1024
+                               )
+                               OR (
+                                   jsonb_typeof(item.value) IN ('object', 'array')
+                                   AND pg_column_size(item.value) <= 16384
+                               )
+                        ),
+                        '{}'::JSONB
+                    );
+                    NEW.decision_learning_snapshot_version := 1;
+                    RETURN NEW;
+                END;
+                $$
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgname = 'trg_ai_decisions_model_health_snapshot'
+                          AND tgrelid = 'ai_decisions'::regclass
+                    ) THEN
+                        CREATE TRIGGER trg_ai_decisions_model_health_snapshot
+                        BEFORE INSERT OR UPDATE OF raw_llm_response ON ai_decisions
+                        FOR EACH ROW EXECUTE FUNCTION bb_sync_ai_decision_model_health();
+                    END IF;
+                END;
+                $$
+                """
+            )
+        )
+        # Backfill only the most recent rows needed by health reports. The trigger
+        # handles all future writes without re-reading large historic payloads.
+        await conn.execute(
+            text(
+                """
+                WITH recent_unprojected AS (
+                    SELECT id
+                    FROM ai_decisions
+                    WHERE model_health_snapshot_version < 1
+                       OR decision_learning_snapshot_version < 1
+                    ORDER BY created_at DESC NULLS LAST, id DESC
+                    LIMIT 1500
+                )
+                UPDATE ai_decisions AS decision
+                SET raw_llm_response = decision.raw_llm_response
+                FROM recent_unprojected
+                WHERE decision.id = recent_unprojected.id
+                """
+            )
+        )
+        return
+
+    if "sqlite" not in settings.database_url:
+        return
+    result = await conn.execute(text("PRAGMA table_info(ai_decisions)"))
+    existing = {str(row[1]) for row in result.fetchall()}
+    sqlite_columns = (
+        ("model_health_timings", "JSON"),
+        ("model_health_fallback_timings", "JSON"),
+        ("model_health_experts", "JSON"),
+        ("model_health_opinions", "JSON"),
+        ("model_health_has_ml_signal", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("model_health_has_local_ml_signal", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("model_health_has_local_ai_tools", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("model_health_snapshot_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("decision_learning_snapshot", "JSON"),
+        ("decision_learning_snapshot_version", "INTEGER NOT NULL DEFAULT 0"),
+    )
+    for name, column_type in sqlite_columns:
+        if name not in existing:
+            await conn.execute(text(f"ALTER TABLE ai_decisions ADD COLUMN {name} {column_type}"))
+
+
+async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
+    """Store a bounded training feature view beside every large shadow payload."""
+
+    if "postgresql" in settings.database_url:
+        await conn.execute(
+            text(
+                "ALTER TABLE shadow_backtests "
+                "ADD COLUMN IF NOT EXISTS training_feature_snapshot JSONB"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE shadow_backtests "
+                "ADD COLUMN IF NOT EXISTS training_feature_snapshot_version INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                CREATE OR REPLACE FUNCTION bb_sync_shadow_training_feature_snapshot()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                DECLARE
+                    raw JSONB := COALESCE(NEW.feature_snapshot::JSONB, '{}'::JSONB);
+                BEGIN
+                    NEW.training_feature_snapshot := COALESCE(
+                        (
+                            SELECT jsonb_object_agg(item.key, item.value)
+                            FROM jsonb_each(
+                                CASE WHEN jsonb_typeof(raw) = 'object'
+                                THEN raw ELSE '{}'::JSONB END
+                            ) AS item(key, value)
+                            WHERE jsonb_typeof(item.value) IN ('number', 'boolean', 'null')
+                               OR (
+                                   jsonb_typeof(item.value) = 'string'
+                                   AND length(item.value #>> '{}') <= 512
+                               )
+                               OR (
+                                   jsonb_typeof(item.value) = 'object'
+                                   AND pg_column_size(item.value) <= 2048
+                               )
+                        ),
+                        '{}'::JSONB
+                    );
+                    NEW.training_feature_snapshot_version := 1;
+                    RETURN NEW;
+                END;
+                $$
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgname = 'trg_shadow_backtests_training_feature_snapshot'
+                          AND tgrelid = 'shadow_backtests'::regclass
+                    ) THEN
+                        CREATE TRIGGER trg_shadow_backtests_training_feature_snapshot
+                        BEFORE INSERT OR UPDATE OF feature_snapshot ON shadow_backtests
+                        FOR EACH ROW EXECUTE FUNCTION bb_sync_shadow_training_feature_snapshot();
+                    END IF;
+                END;
+                $$
+                """
+            )
+        )
+        # The trainer retains up to 20,000 completed samples. Backfill all
+        # historical shadows once so switching reads never shrinks that window.
+        await conn.execute(
+            text(
+                """
+                UPDATE shadow_backtests
+                SET feature_snapshot = feature_snapshot
+                WHERE training_feature_snapshot_version < 1
+                """
+            )
+        )
+        return
+
+    if "sqlite" not in settings.database_url:
+        return
+    result = await conn.execute(text("PRAGMA table_info(shadow_backtests)"))
+    existing = {str(row[1]) for row in result.fetchall()}
+    for name, column_type in (
+        ("training_feature_snapshot", "JSON"),
+        ("training_feature_snapshot_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in existing:
+            await conn.execute(text(f"ALTER TABLE shadow_backtests ADD COLUMN {name} {column_type}"))
 
 
 async def _ensure_okx_account_bill_indexes(conn: Any) -> None:
@@ -376,6 +639,19 @@ async def _ensure_okx_account_bill_indexes(conn: Any) -> None:
         return
     for _name, ddl in index_ddls:
         await conn.execute(text(ddl))
+
+
+async def _ensure_okx_position_history_column_widths(conn: Any) -> None:
+    """Keep evolving OKX lifecycle status text from failing settlement writes."""
+
+    if "postgresql" not in settings.database_url:
+        return
+    await conn.execute(
+        text(
+            "ALTER TABLE okx_position_history "
+            "ALTER COLUMN match_status TYPE VARCHAR(160)"
+        )
+    )
 
 
 async def _ensure_okx_position_history_indexes(conn: Any) -> None:

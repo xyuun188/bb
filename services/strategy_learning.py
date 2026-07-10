@@ -14,11 +14,13 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import structlog
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from config.settings import DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL, ENSEMBLE_TRADER_NAME, settings
 from core.model_runtime import apply_non_thinking_request_controls, completion_token_limit
@@ -7433,7 +7435,28 @@ class StrategyLearningService:
                 .limit(capped_limit * params.market_event_limit_multiplier)
             )
             decision_result = await session.execute(
-                select(AIDecision)
+                select(
+                    AIDecision.id,
+                    AIDecision.model_name,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.confidence,
+                    AIDecision.position_size_pct,
+                    AIDecision.suggested_leverage,
+                    AIDecision.stop_loss_pct,
+                    AIDecision.take_profit_pct,
+                    AIDecision.decision_learning_snapshot.label("raw_llm_response"),
+                    AIDecision.analysis_type,
+                    AIDecision.is_paper,
+                    AIDecision.was_executed,
+                    AIDecision.execution_reason,
+                    AIDecision.executed_at,
+                    AIDecision.execution_price,
+                    AIDecision.outcome,
+                    AIDecision.outcome_pnl_pct,
+                    AIDecision.created_at,
+                    AIDecision.updated_at,
+                )
                 .where(
                     AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                     AIDecision.is_paper.is_(is_paper),
@@ -7443,7 +7466,27 @@ class StrategyLearningService:
                 .limit(capped_limit)
             )
             shadow_result = await session.execute(
-                select(ShadowBacktest)
+                select(ShadowBacktest).options(
+                    load_only(
+                        ShadowBacktest.id,
+                        ShadowBacktest.model_name,
+                        ShadowBacktest.execution_mode,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.analysis_type,
+                        ShadowBacktest.decision_action,
+                        ShadowBacktest.decision_confidence,
+                        ShadowBacktest.status,
+                        ShadowBacktest.due_at,
+                        ShadowBacktest.horizon_minutes,
+                        ShadowBacktest.long_return_pct,
+                        ShadowBacktest.short_return_pct,
+                        ShadowBacktest.best_action,
+                        ShadowBacktest.missed_opportunity,
+                        ShadowBacktest.note,
+                        ShadowBacktest.created_at,
+                        ShadowBacktest.updated_at,
+                    )
+                )
                 .where(
                     ShadowBacktest.model_name == ENSEMBLE_TRADER_NAME,
                     ShadowBacktest.execution_mode == selected_mode,
@@ -7474,7 +7517,24 @@ class StrategyLearningService:
                 .limit(capped_limit)
             )
             strategy_event_result = await session.execute(
-                select(StrategyLearningEvent)
+                select(StrategyLearningEvent).options(
+                    load_only(
+                        StrategyLearningEvent.id,
+                        StrategyLearningEvent.created_at,
+                        StrategyLearningEvent.symbol,
+                        StrategyLearningEvent.side,
+                        StrategyLearningEvent.action,
+                        StrategyLearningEvent.event_type,
+                        StrategyLearningEvent.event_status,
+                        StrategyLearningEvent.severity,
+                        StrategyLearningEvent.reason,
+                        StrategyLearningEvent.order_id,
+                        StrategyLearningEvent.position_id,
+                        StrategyLearningEvent.profile_id,
+                        StrategyLearningEvent.attribution,
+                        StrategyLearningEvent.exclude_from_training,
+                    )
+                )
                 .where(
                     StrategyLearningEvent.model_name == ENSEMBLE_TRADER_NAME,
                     StrategyLearningEvent.execution_mode == selected_mode,
@@ -7487,7 +7547,9 @@ class StrategyLearningService:
                 "closed_positions": list(closed_result.scalars().all()),
                 "open_positions": list(open_result.scalars().all()),
                 "orders": list(order_result.scalars().all()),
-                "decisions": list(decision_result.scalars().all()),
+                "decisions": [
+                    SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()
+                ],
                 "shadows": list(shadow_result.scalars().all()),
                 "memories": list(memory_result.scalars().all()),
                 "reflections": list(reflection_result.scalars().all()),

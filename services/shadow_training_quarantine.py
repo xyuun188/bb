@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
@@ -40,13 +41,19 @@ def _safe_feature_snapshot(value: Any) -> dict[str, Any]:
 def shadow_quality_sample(row: Any) -> dict[str, Any]:
     """Build the canonical data-quality payload from a shadow row."""
 
+    compact_snapshot = getattr(row, "training_feature_snapshot", None)
+    feature_snapshot = (
+        compact_snapshot
+        if compact_snapshot is not None
+        else getattr(row, "feature_snapshot", None)
+    )
     return {
         "symbol": getattr(row, "symbol", ""),
         "analysis_type": getattr(row, "analysis_type", ""),
         "decision_action": getattr(row, "decision_action", ""),
         "decision_confidence": getattr(row, "decision_confidence", 0.0),
         "horizon_minutes": int(getattr(row, "horizon_minutes", 0) or 0),
-        "features": _safe_feature_snapshot(getattr(row, "feature_snapshot", None)),
+        "features": _safe_feature_snapshot(feature_snapshot),
         "long_return_pct": getattr(row, "long_return_pct", None),
         "short_return_pct": getattr(row, "short_return_pct", None),
         "label_timestamp": getattr(row, "due_at", None),
@@ -133,6 +140,24 @@ async def quarantine_dirty_shadow_samples(
                 ShadowBacktest.status == "completed",
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
+            ).options(
+                load_only(
+                    ShadowBacktest.id,
+                    ShadowBacktest.symbol,
+                    ShadowBacktest.analysis_type,
+                    ShadowBacktest.decision_action,
+                    ShadowBacktest.decision_confidence,
+                    ShadowBacktest.training_feature_snapshot,
+                    ShadowBacktest.due_at,
+                    ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.long_return_pct,
+                    ShadowBacktest.short_return_pct,
+                    ShadowBacktest.best_action,
+                    ShadowBacktest.missed_opportunity,
+                    ShadowBacktest.status,
+                    ShadowBacktest.note,
+                    ShadowBacktest.updated_at,
+                )
             )
             if only_newer_than_id is not None:
                 stmt = stmt.where(ShadowBacktest.id > int(only_newer_than_id))

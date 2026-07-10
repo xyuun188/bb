@@ -1,6 +1,7 @@
+import copy
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, event, inspect
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -74,6 +75,8 @@ class ShadowBacktest(Base, TimestampMixin):
     decision_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     entry_price: Mapped[float] = mapped_column(Float, default=0.0)
     feature_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    training_feature_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    training_feature_snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
     raw_llm_response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -84,6 +87,53 @@ class ShadowBacktest(Base, TimestampMixin):
     best_action: Mapped[str | None] = mapped_column(String(20), nullable=True)
     missed_opportunity: Mapped[bool] = mapped_column(Boolean, default=False)
     note: Mapped[str] = mapped_column(Text, default="")
+
+
+_TRAINING_FEATURE_MAX_STRING_CHARS = 512
+_TRAINING_FEATURE_MAX_DICT_DEPTH = 1
+_MISSING_TRAINING_FEATURE = object()
+
+
+def _compact_training_feature_value(value: object, *, depth: int = 0) -> object:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= _TRAINING_FEATURE_MAX_STRING_CHARS else _MISSING_TRAINING_FEATURE
+    if isinstance(value, dict) and depth < _TRAINING_FEATURE_MAX_DICT_DEPTH:
+        compact: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str) or len(key) > 120:
+                continue
+            compact_value = _compact_training_feature_value(nested_value, depth=depth + 1)
+            if compact_value is not _MISSING_TRAINING_FEATURE:
+                compact[key] = compact_value
+        return compact if compact else _MISSING_TRAINING_FEATURE
+    return _MISSING_TRAINING_FEATURE
+
+
+def _compact_training_feature_snapshot(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, object] = {}
+    for key, raw_value in value.items():
+        if not isinstance(key, str) or len(key) > 120:
+            continue
+        compact_value = _compact_training_feature_value(raw_value)
+        if compact_value is not _MISSING_TRAINING_FEATURE:
+            compact[key] = copy.deepcopy(compact_value)
+    return compact
+
+
+@event.listens_for(ShadowBacktest, "before_insert")
+@event.listens_for(ShadowBacktest, "before_update")
+def _sync_training_feature_snapshot(_mapper, _connection, target: ShadowBacktest) -> None:
+    """Keep SQLite/tests aligned with the PostgreSQL training-snapshot trigger."""
+
+    state = inspect(target)
+    if state.persistent and not state.attrs.feature_snapshot.history.has_changes():
+        return
+    target.training_feature_snapshot = _compact_training_feature_snapshot(target.feature_snapshot)
+    target.training_feature_snapshot_version = 1
 
 
 class StrategyProfileSnapshot(Base, TimestampMixin):

@@ -7,6 +7,7 @@ import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -14,7 +15,7 @@ from sqlalchemy import select
 
 from config.settings import settings
 from core.safe_output import safe_error_text
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.news import NewsArticle
 from services.vector_memory.store import VectorMemoryStore, build_vector_memory_store
@@ -22,6 +23,32 @@ from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
 logger = structlog.get_logger(__name__)
 PHASE3_VECTOR_MEMORY_RESET_MARKER = "phase3_vector_memory_reset_marker.json"
+_VECTOR_MEMORY_DECISION_RAW_KEYS = ("opportunity_score", "decision_maker")
+_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX = "vector_memory_raw__"
+
+
+def _vector_memory_decision_from_mapping(mapping: Any) -> SimpleNamespace:
+    raw = {
+        key: mapping.get(f"{_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX}{key}")
+        for key in _VECTOR_MEMORY_DECISION_RAW_KEYS
+        if mapping.get(f"{_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX}{key}") is not None
+    }
+    return SimpleNamespace(
+        id=mapping.get("id"),
+        symbol=mapping.get("symbol"),
+        action=mapping.get("action"),
+        confidence=mapping.get("confidence"),
+        reasoning=mapping.get("reasoning"),
+        position_size_pct=mapping.get("position_size_pct"),
+        analysis_type=mapping.get("analysis_type"),
+        is_paper=bool(mapping.get("is_paper")),
+        was_executed=bool(mapping.get("was_executed")),
+        execution_reason=mapping.get("execution_reason"),
+        outcome=mapping.get("outcome"),
+        outcome_pnl_pct=mapping.get("outcome_pnl_pct"),
+        created_at=mapping.get("created_at"),
+        raw_llm_response=raw,
+    )
 
 
 class VectorMemoryService:
@@ -484,21 +511,42 @@ class VectorMemoryService:
         *,
         since: datetime | None = None,
     ) -> list[VectorMemoryDocument]:
-        async with get_session_ctx() as session:
-            decision_query = select(AIDecision)
+        async with get_read_session_ctx() as session:
+            decision_query = select(
+                AIDecision.id,
+                AIDecision.symbol,
+                AIDecision.action,
+                AIDecision.confidence,
+                AIDecision.reasoning,
+                AIDecision.position_size_pct,
+                AIDecision.analysis_type,
+                AIDecision.is_paper,
+                AIDecision.was_executed,
+                AIDecision.execution_reason,
+                AIDecision.outcome,
+                AIDecision.outcome_pnl_pct,
+                AIDecision.created_at,
+                *(
+                    AIDecision.raw_llm_response[key].label(
+                        f"{_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX}{key}"
+                    )
+                    for key in _VECTOR_MEMORY_DECISION_RAW_KEYS
+                ),
+            )
             news_query = select(NewsArticle)
             if since is not None:
                 decision_query = decision_query.where(AIDecision.created_at >= since)
                 news_query = news_query.where(NewsArticle.fetched_at >= since)
-            decision_rows = list(
-                (
+            decision_rows = [
+                _vector_memory_decision_from_mapping(row)
+                for row in (
                     await session.execute(
                         decision_query.order_by(AIDecision.id.desc()).limit(
                             int(settings.vector_memory_decision_index_limit)
                         )
                     )
-                ).scalars().all()
-            )
+                ).mappings().all()
+            ]
             news_rows = list(
                 (
                     await session.execute(

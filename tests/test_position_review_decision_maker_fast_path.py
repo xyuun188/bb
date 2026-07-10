@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -22,7 +23,10 @@ def _decision(action: Action, confidence: float = 0.7, raw: dict | None = None) 
 
 
 class _FakeDecisionMaker:
+    calls = 0
+
     async def decide(self, _features, _context):
+        type(self).calls += 1
         return DecisionOutput(
             model_name="decision_maker",
             symbol="CRCL/USDT",
@@ -37,6 +41,31 @@ class _FakeDecisionMaker:
 class _FakeRegistry:
     def get(self, _name):
         return _FakeDecisionMaker()
+
+
+@pytest.mark.asyncio
+async def test_final_trader_defers_when_market_analysis_budget_is_exhausted() -> None:
+    _FakeDecisionMaker.calls = 0
+    coordinator = EnsembleCoordinator(_FakeRegistry())
+    preliminary = _decision(Action.LONG)
+
+    result = await coordinator._apply_decision_maker(
+        FeatureVector(symbol="CRCL/USDT"),
+        {
+            "_analysis_deadline_monotonic": asyncio.get_running_loop().time(),
+            "_analysis_budget_scope": "market_ai",
+            "_analysis_budget_seconds": 12.0,
+        },
+        preliminary,
+        {},
+        [],
+        None,
+    )
+
+    assert result is preliminary
+    assert _FakeDecisionMaker.calls == 0
+    assert result.raw_response["decision_maker"]["status"] == "analysis_budget_deferred"
+    assert result.raw_response["decision_maker_timing"]["status"] == "analysis_budget_deferred"
 
 
 def test_position_hold_skips_decision_maker_when_exit_evidence_is_insufficient() -> None:

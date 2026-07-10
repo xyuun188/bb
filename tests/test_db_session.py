@@ -230,9 +230,106 @@ async def test_postgres_trade_fact_indexes_skip_existing_indexes(
             "idx_orders_exchange_order_id",
             "idx_orders_okx_inst_id",
             "idx_orders_okx_sync_status",
+            "idx_ai_decisions_pending_entry_recent",
+            "idx_ai_decisions_recent_scan",
+            "idx_ai_decisions_strategy_learning_recent",
+            "idx_shadow_backtests_training_completed",
         }
     )
 
     await session_module._ensure_trade_fact_indexes(fake_conn)
 
     assert not any(statement.startswith("CREATE INDEX") for statement in fake_conn.statements)
+
+
+@pytest.mark.asyncio
+async def test_postgres_trade_fact_indexes_create_pending_entry_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_trade_fact_indexes(fake_conn)
+
+    assert any(
+        "CREATE INDEX IF NOT EXISTS idx_ai_decisions_pending_entry_recent" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE INDEX IF NOT EXISTS idx_ai_decisions_recent_scan" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE INDEX IF NOT EXISTS idx_ai_decisions_strategy_learning_recent" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_training_completed" in statement
+        for statement in fake_conn.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_ai_decision_model_health_columns(fake_conn)
+
+    assert any(
+        "ADD COLUMN IF NOT EXISTS model_health_timings JSONB" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE OR REPLACE FUNCTION bb_sync_ai_decision_model_health" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "trg_ai_decisions_model_health_snapshot" in statement
+        for statement in fake_conn.statements
+    )
+    assert any("LIMIT 1500" in statement for statement in fake_conn.statements)
+    assert any(
+        "decision_learning_snapshot_version" in statement for statement in fake_conn.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
+
+    assert any(
+        "ADD COLUMN IF NOT EXISTS training_feature_snapshot JSONB" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE OR REPLACE FUNCTION bb_sync_shadow_training_feature_snapshot" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "trg_shadow_backtests_training_feature_snapshot" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "UPDATE shadow_backtests" in statement and "training_feature_snapshot_version < 1" in statement
+        for statement in fake_conn.statements
+    )

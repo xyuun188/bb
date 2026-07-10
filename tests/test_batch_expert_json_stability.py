@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -448,6 +449,7 @@ class _ProviderBatchExpert(AbstractAIModel):
 class _BatchTimeoutExpert(AbstractAIModel):
     batch_calls = 0
     individual_calls = 0
+    batch_delay_seconds = 0.0
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -483,6 +485,8 @@ class _BatchTimeoutExpert(AbstractAIModel):
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
         type(self).batch_calls += 1
+        if type(self).batch_delay_seconds:
+            await asyncio.sleep(type(self).batch_delay_seconds)
         raise TimeoutError()
 
     def _local_expert_fallback(
@@ -640,6 +644,48 @@ async def test_batch_timeout_uses_bounded_independent_retry_before_fallback(
         decision.raw_response.get("provider_independent_expert_mode")
         for decision in decisions.values()
     )
+
+
+@pytest.mark.asyncio
+async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 5.0)
+    monkeypatch.setattr(settings, "ai_batch_expert_circuit_breaker_seconds", 60.0)
+    monkeypatch.setattr(_BatchTimeoutExpert, "batch_delay_seconds", 0.3)
+    _BatchTimeoutExpert.batch_calls = 0
+    _BatchTimeoutExpert.individual_calls = 0
+    registry = ModelRegistry()
+    for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    ):
+        registry.register(_BatchTimeoutExpert(name))
+
+    context: dict[str, Any] = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 0.45,
+        "_analysis_budget_scope": "market_ai",
+        "_analysis_budget_seconds": 0.45,
+    }
+    decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
+
+    assert set(decisions) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    }
+    assert _BatchTimeoutExpert.batch_calls == 1
+    assert _BatchTimeoutExpert.individual_calls == 0
+    assert {row["status"] for row in context["_model_timings"]} == {
+        "analysis_budget_deferred"
+    }
+    assert all(row["analysis_budget"]["scope"] == "market_ai" for row in context["_model_timings"])
 
 
 @pytest.mark.asyncio

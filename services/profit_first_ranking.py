@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from services.profit_first_brain_training import ProfitFirstBrainTrainingService
@@ -18,6 +19,60 @@ from services.trade_fact_trust import (
 
 DEFAULT_RANKING_HOURS = 72
 DEFAULT_RANKING_LIMIT = 800
+_RANKING_DECISION_RAW_KEYS = (
+    "profit_first_trade_plan",
+    "reason",
+    "skip_reason",
+    "skip_kind",
+    "rejection_reason",
+    "opportunity_score",
+    "entry_filters",
+    "review_feedback",
+    "memory_feedback",
+    "shadow_outcome",
+    "shadow_result",
+    "missed_opportunity",
+    "shadow_return_pct",
+    "shadow_realized_return_pct",
+    "realized_return_pct",
+    "return_pct",
+    "missed_opportunity_return_pct",
+)
+_RANKING_DECISION_RAW_COLUMN_PREFIX = "ranking_raw__"
+
+
+def _ranking_decision_columns(AIDecision: Any) -> tuple[Any, ...]:
+    return (
+        AIDecision.id,
+        AIDecision.model_name,
+        AIDecision.symbol,
+        AIDecision.action,
+        AIDecision.was_executed,
+        AIDecision.execution_reason,
+        *(
+            AIDecision.decision_learning_snapshot[key].label(
+                f"{_RANKING_DECISION_RAW_COLUMN_PREFIX}{key}"
+            )
+            for key in _RANKING_DECISION_RAW_KEYS
+        ),
+    )
+
+
+def _ranking_decision_from_mapping(mapping: Any) -> SimpleNamespace:
+    raw = {
+        key: mapping.get(f"{_RANKING_DECISION_RAW_COLUMN_PREFIX}{key}")
+        for key in _RANKING_DECISION_RAW_KEYS
+        if mapping.get(f"{_RANKING_DECISION_RAW_COLUMN_PREFIX}{key}") is not None
+    }
+    return SimpleNamespace(
+        id=mapping.get("id"),
+        model_name=mapping.get("model_name"),
+        symbol=mapping.get("symbol"),
+        action=mapping.get("action"),
+        was_executed=bool(mapping.get("was_executed")),
+        execution_reason=mapping.get("execution_reason"),
+        raw_llm_response=raw,
+    )
 
 
 class ProfitFirstRankingService:
@@ -281,7 +336,7 @@ class ProfitFirstRankingService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with session_factory() as session:
             decisions_result = await session.execute(
-                select(AIDecision)
+                select(*_ranking_decision_columns(AIDecision))
                 .where(AIDecision.created_at >= since)
                 .order_by(AIDecision.id.desc())
                 .limit(capped_limit)
@@ -297,7 +352,9 @@ class ProfitFirstRankingService:
                 .order_by(Position.closed_at.desc(), Position.id.desc())
                 .limit(capped_limit)
             )
-            decisions = list(decisions_result.scalars().all())
+            decisions = [
+                _ranking_decision_from_mapping(row) for row in decisions_result.mappings().all()
+            ]
             positions = list(positions_result.scalars().all())
             symbols = {str(_row_get(row, "symbol") or "") for row in positions}
             symbols.discard("")
@@ -340,12 +397,14 @@ class ProfitFirstRankingService:
             ]
             if missing_decision_ids:
                 linked_result = await session.execute(
-                    select(AIDecision)
+                    select(*_ranking_decision_columns(AIDecision))
                     .where(AIDecision.id.in_(missing_decision_ids))
                     .order_by(AIDecision.id.desc())
                     .limit(len(missing_decision_ids))
                 )
-                decisions.extend(list(linked_result.scalars().all()))
+                decisions.extend(
+                    _ranking_decision_from_mapping(row) for row in linked_result.mappings().all()
+                )
         decisions_by_id = {_safe_int(_row_get(row, "id")): row for row in decisions}
         linked_orders_by_id = orders_by_exchange_id(orders)
         trusted_positions, trade_fact_report = _filter_trusted_closed_positions_with_orders(

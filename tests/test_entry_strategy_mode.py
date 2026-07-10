@@ -203,12 +203,23 @@ async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = object.__new__(TradingService)
+    active_fetches = 0
+    peak_fetches = 0
+
+    async def slow_value(value: Any) -> Any:
+        nonlocal active_fetches, peak_fetches
+        active_fetches += 1
+        peak_fetches = max(peak_fetches, active_fetches)
+        try:
+            await asyncio.sleep(0.05)
+            return value
+        finally:
+            active_fetches -= 1
 
     class Daily:
         async def state(self, mode: str) -> dict[str, Any]:
             assert mode == "paper"
-            await asyncio.sleep(0.05)
-            return {"today_total_pnl": 1.0}
+            return await slow_value({"today_total_pnl": 1.0})
 
     class Exposure:
         def context(self, open_positions):
@@ -216,23 +227,19 @@ async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently
 
     async def side_perf(mode: str) -> dict[str, Any]:
         assert mode == "paper"
-        await asyncio.sleep(0.05)
-        return {"long": {"pnl": 1.0}}
+        return await slow_value({"long": {"pnl": 1.0}})
 
     async def symbol_side_perf(mode: str) -> dict[str, Any]:
         assert mode == "paper"
-        await asyncio.sleep(0.05)
-        return {"ETH/USDT|long": {"pnl": 2.0}}
+        return await slow_value({"ETH/USDT|long": {"pnl": 2.0}})
 
     async def contribution_perf(mode: str) -> dict[str, Any]:
         assert mode == "paper"
-        await asyncio.sleep(0.05)
-        return {"server_profit_model": {"pnl": 3.0}}
+        return await slow_value({"server_profit_model": {"pnl": 3.0}})
 
     async def balance(mode: str) -> float:
         assert mode == "paper"
-        await asyncio.sleep(0.05)
-        return 1_000.0
+        return await slow_value(1_000.0)
 
     monkeypatch.setattr(
         trading_service.TradingService,
@@ -268,7 +275,8 @@ async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently
     )
     elapsed = asyncio.get_running_loop().time() - started_at
 
-    assert elapsed < 0.18
+    assert peak_fetches == trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY
+    assert elapsed < 0.3
     assert result["account_equity"] == 1_000.0
     assert result["symbol_side_performance"] == {"ETH/USDT|long": {"pnl": 2.0}}
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 3.0}}

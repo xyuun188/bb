@@ -1093,6 +1093,49 @@ async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
     assert not any(row.id >= 20_000 for row in selected)
 
 
+@pytest.mark.asyncio
+async def test_load_shadow_training_rows_projects_only_training_and_quality_features(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
+    row = _db_shadow_row(
+        77,
+        created_at,
+        action="long",
+        best_action="long",
+    )
+    row.feature_snapshot = {
+        "current_price": 100.0,
+        "spread_pct": 0.01,
+        "feature_timestamp": created_at.isoformat(),
+        "market_data_quality": {"code": ""},
+        "unused_llm_context": {"transcript": "x" * 100_000},
+    }
+    async with get_session_ctx() as session:
+        session.add(row)
+
+    try:
+        selected = await load_shadow_training_rows(limit=10)
+        async with get_session_ctx() as session:
+            compact = await session.get(ShadowBacktest, 77)
+            assert compact is not None
+            assert compact.training_feature_snapshot_version == 1
+            assert compact.training_feature_snapshot["market_data_quality"] == {"code": ""}
+            assert "unused_llm_context" not in compact.training_feature_snapshot
+    finally:
+        await close_db()
+
+    assert len(selected) == 1
+    snapshot = selected[0].feature_snapshot
+    assert snapshot["current_price"] == 100.0
+    assert snapshot["spread_pct"] == 0.01
+    assert snapshot["feature_timestamp"] == created_at.isoformat()
+    assert snapshot["market_data_quality"] == {"code": ""}
+    assert "unused_llm_context" not in snapshot
+
+
 def test_ml_signal_quality_report_excludes_shadow_future_leakage() -> None:
     row = SimpleNamespace(
         symbol="BTC/USDT",

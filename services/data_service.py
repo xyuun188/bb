@@ -61,6 +61,7 @@ INDICATOR_SNAPSHOT_BUILD_CONCURRENCY = max(
     1,
     min(4, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)),
 )
+KLINE_PERSIST_CONCURRENCY = 2
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -116,6 +117,7 @@ class DataService:
         self._kline_fetch_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_refresh_scheduled_at: dict[tuple[str, str], datetime] = {}
+        self._kline_persist_semaphore = asyncio.Semaphore(KLINE_PERSIST_CONCURRENCY)
         self._kline_coverage_refresh_task: asyncio.Task | None = None
         self._kline_coverage_symbols: list[str] = []
         self._kline_coverage_index = 0
@@ -1090,6 +1092,14 @@ class DataService:
             self._kline_fetch_tasks = tasks
         return tasks
 
+    def _kline_persist_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_kline_persist_semaphore", None)
+        if isinstance(gate, asyncio.Semaphore):
+            return gate
+        gate = asyncio.Semaphore(KLINE_PERSIST_CONCURRENCY)
+        self._kline_persist_semaphore = gate
+        return gate
+
     def _kline_refresh_schedule_map(self) -> dict[tuple[str, str], datetime]:
         scheduled = getattr(self, "_kline_refresh_scheduled_at", None)
         if not isinstance(scheduled, dict):
@@ -1546,37 +1556,42 @@ class DataService:
             return {}
 
     async def _persist_klines(self, symbol: str, timeframe: str, klines: list) -> None:
-        try:
-            async with get_session_ctx() as session:
-                repo = MarketRepository(session)
-                normalized = self._normalize_symbols([symbol])[0]
-                for row in klines[-300:]:
-                    try:
-                        ts, open_, high, low, close, volume = row[:6]
-                        open_time = datetime.fromtimestamp(float(ts) / 1000.0, tz=UTC)
-                        await repo.upsert_kline(
-                            normalized,
-                            timeframe,
-                            open_time,
-                            {
-                                "open": self._safe_float(open_),
-                                "high": self._safe_float(high),
-                                "low": self._safe_float(low),
-                                "close": self._safe_float(close),
-                                "volume": self._safe_float(volume),
-                            },
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "skip invalid kline row",
-                            symbol=normalized,
-                            timeframe=timeframe,
-                            error=safe_error_text(exc),
-                        )
-                        continue
-                await repo.clean_old_klines(normalized, timeframe, keep=2000)
-        except Exception as exc:
-            logger.debug("persist klines failed", symbol=symbol, error=safe_error_text(exc))
+        # Kline persistence is cache maintenance.  It must never fan out enough
+        # long transactions to consume the trading and reconciliation connection pool.
+        async with self._kline_persist_gate():
+            try:
+                async with get_session_ctx() as session:
+                    repo = MarketRepository(session)
+                    normalized = self._normalize_symbols([symbol])[0]
+                    rows_to_persist: list[tuple[datetime, dict[str, float]]] = []
+                    for row in klines[-300:]:
+                        try:
+                            ts, open_, high, low, close, volume = row[:6]
+                            open_time = datetime.fromtimestamp(float(ts) / 1000.0, tz=UTC)
+                            rows_to_persist.append(
+                                (
+                                    open_time,
+                                    {
+                                    "open": self._safe_float(open_),
+                                    "high": self._safe_float(high),
+                                    "low": self._safe_float(low),
+                                    "close": self._safe_float(close),
+                                    "volume": self._safe_float(volume),
+                                    },
+                                )
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "skip invalid kline row",
+                                symbol=normalized,
+                                timeframe=timeframe,
+                                error=safe_error_text(exc),
+                            )
+                            continue
+                    await repo.upsert_klines_bulk(normalized, timeframe, rows_to_persist)
+                    await repo.clean_old_klines(normalized, timeframe, keep=2000)
+            except Exception as exc:
+                logger.debug("persist klines failed", symbol=symbol, error=safe_error_text(exc))
 
     async def _get_derivatives_snapshot(
         self,

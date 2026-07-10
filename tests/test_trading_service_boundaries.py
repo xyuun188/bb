@@ -1194,8 +1194,9 @@ async def test_analysis_service_loop_sleeps_interval_after_round_finishes(monkey
 
 
 @pytest.mark.asyncio
-async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
+async def test_market_analysis_loop_keeps_stage_budget_separate_from_outer_watchdog(monkeypatch):
     calls: list[str] = []
+    completed: list[str] = []
     running = True
     sleeps: list[float] = []
     original_sleep = asyncio.sleep
@@ -1208,7 +1209,8 @@ async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
 
     async def run_once(scope):
         calls.append(scope)
-        await original_sleep(60)
+        await original_sleep(0.03)
+        completed.append(scope)
         return {"scope": scope}
 
     service = MarketAnalysisService(
@@ -1222,6 +1224,7 @@ async def test_analysis_service_loop_times_out_stuck_round(monkeypatch):
     await service.loop(lambda: 30.0)
 
     assert calls == ["market"]
+    assert completed == ["market"]
     assert sleeps == [0.0, 30.0]
 
 
@@ -5402,6 +5405,44 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
     await task
 
 
+@pytest.mark.asyncio
+async def test_strategy_context_io_gate_bounds_shared_history_query_fanout() -> None:
+    service = TradingService.__new__(TradingService)
+    running = 0
+    peak_running = 0
+    release = asyncio.Event()
+    gate_filled = asyncio.Event()
+
+    async def load_value(value: int) -> int:
+        nonlocal running, peak_running
+        running += 1
+        peak_running = max(peak_running, running)
+        if running >= trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY:
+            gate_filled.set()
+        try:
+            await release.wait()
+            return value
+        finally:
+            running -= 1
+
+    tasks = [
+        asyncio.create_task(
+            service._bounded_strategy_context_value(
+                f"context_{index}",
+                load_value(index),
+                None,
+                1.0,
+            )
+        )
+        for index in range(3)
+    ]
+    await asyncio.wait_for(gate_filled.wait(), timeout=0.2)
+
+    assert peak_running == trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY
+    release.set()
+    assert await asyncio.gather(*tasks) == [0, 1, 2]
+
+
 def test_market_round_budget_is_not_used_as_outer_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8681,6 +8722,156 @@ async def test_refresh_position_prices_uses_injected_profit_peak_boundaries(
     assert peak_calls[0]["unrealized_pnl"] == 5.0
     assert peak_calls[0]["hold_minutes"] == 12.5
     assert pruned_contexts[0][0]["symbol"] == "BTC/USDT"
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_batches_loaded_position_updates(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    batch_updates: list[list[tuple[int, float, float]]] = []
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [
+                SimpleNamespace(
+                    id=71,
+                    model_name="ensemble_trader",
+                    symbol="BTC/USDT",
+                    side="long",
+                    entry_price=100.0,
+                    current_price=99.0,
+                    quantity=0.5,
+                    created_at="created",
+                    is_open=True,
+                ),
+                SimpleNamespace(
+                    id=72,
+                    model_name="ensemble_trader",
+                    symbol="ETH/USDT",
+                    side="short",
+                    entry_price=200.0,
+                    current_price=201.0,
+                    quantity=0.25,
+                    created_at="created",
+                    is_open=True,
+                ),
+            ]
+
+        async def update_open_position_prices(self, updates):
+            batch_updates.append(
+                [(pos.id, current_price, unrealized_pnl) for pos, current_price, unrealized_pnl in updates]
+            )
+
+        async def update_position_price(self, *_args):
+            raise AssertionError("single-position update path should not be used")
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    service = OkxSyncService(
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    result = await service.refresh_position_prices(
+        {
+            "BTC/USDT": SimpleNamespace(current_price=110.0),
+            "ETH/USDT": SimpleNamespace(current_price=190.0),
+        }
+    )
+
+    assert batch_updates == [[(71, 110.0, 5.0), (72, 190.0, 2.5)]]
+    assert result["updated_position_count"] == 2
+    assert result["persist_updates_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_fetches_active_and_paper_snapshots_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active_started = asyncio.Event()
+    paper_started = asyncio.Event()
+    active_saw_paper = False
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return []
+
+    class ActiveOkx:
+        async def get_positions_strict(self):
+            nonlocal active_saw_paper
+            active_started.set()
+            await asyncio.wait_for(paper_started.wait(), timeout=0.1)
+            active_saw_paper = True
+            return []
+
+    class PaperOkx:
+        async def get_positions_strict(self):
+            paper_started.set()
+            await asyncio.wait_for(active_started.wait(), timeout=0.1)
+            return []
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    service = OkxSyncService(
+        active_okx_provider=ActiveOkx,
+        paper_okx_provider=PaperOkx,
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    await service.refresh_position_prices({})
+
+    assert active_saw_paper is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_defers_database_write_when_pool_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            await asyncio.sleep(0.05)
+            return []
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(sync_module, "POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS", 0.01)
+    service = OkxSyncService(
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    result = await service.refresh_position_prices({})
+
+    assert result["database_deferred"]["reason"] == (
+        "connection_pool_or_open_position_query_timeout"
+    )
+    assert result["database_deferred"]["timeout_seconds"] == 0.01
 
 
 @pytest.mark.asyncio

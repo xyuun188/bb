@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from db.session import get_read_session_ctx
@@ -23,6 +24,16 @@ MIN_DECISION_SAMPLES = 3
 HIGH_JSON_ERROR_RATE = 0.25
 HIGH_NO_RETURN_RATE = 0.25
 NEGATIVE_PNL_DEGRADE_PCT = -0.01
+_MODEL_HEALTH_RAW_KEYS = (
+    "model_timings",
+    "_model_timings",
+    "experts",
+    "opinions",
+    "ml_signal",
+    "local_ml_signal",
+    "local_ai_tools",
+)
+_MODEL_HEALTH_RAW_COLUMN_PREFIX = "model_health_raw__"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -60,6 +71,29 @@ def _component_type(name: str) -> str:
 
 def _raw(row: Any) -> dict[str, Any]:
     return _safe_dict(getattr(row, "raw_llm_response", None))
+
+
+def _model_health_raw_from_mapping(mapping: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    for key in ("model_timings", "_model_timings", "experts", "opinions"):
+        value = mapping.get(f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}{key}")
+        if value is not None:
+            raw[key] = value
+    for key in ("ml_signal", "local_ml_signal", "local_ai_tools"):
+        if bool(mapping.get(f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_{key}")):
+            raw[key] = {"available": True}
+    return raw
+
+
+def _model_health_decision_from_mapping(mapping: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=mapping.get("id"),
+        action=mapping.get("action"),
+        was_executed=bool(mapping.get("was_executed")),
+        outcome_pnl_pct=mapping.get("outcome_pnl_pct"),
+        created_at=mapping.get("created_at"),
+        raw_llm_response=_model_health_raw_from_mapping(mapping),
+    )
 
 
 def _timing_rows(row: Any) -> list[dict[str, Any]]:
@@ -407,33 +441,76 @@ class ModelExpertHealthService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with self._session_context_factory() as session:
             decisions_result = await session.execute(
-                select(AIDecision)
-                .where(AIDecision.created_at >= since)
-                .order_by(AIDecision.created_at.desc())
+                select(
+                    AIDecision.id,
+                    AIDecision.action,
+                    AIDecision.was_executed,
+                    AIDecision.outcome_pnl_pct,
+                    AIDecision.created_at,
+                    AIDecision.model_health_timings.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}model_timings"
+                    ),
+                    AIDecision.model_health_fallback_timings.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}_model_timings"
+                    ),
+                    AIDecision.model_health_experts.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}experts"
+                    ),
+                    AIDecision.model_health_opinions.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}opinions"
+                    ),
+                    AIDecision.model_health_has_ml_signal.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_ml_signal"
+                    ),
+                    AIDecision.model_health_has_local_ml_signal.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_local_ml_signal"
+                    ),
+                    AIDecision.model_health_has_local_ai_tools.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_local_ai_tools"
+                    ),
+                )
+                .where(
+                    AIDecision.created_at >= since,
+                    AIDecision.model_health_snapshot_version >= 1,
+                )
+                .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
                 .limit(capped_limit)
             )
             shadows_result = await session.execute(
-                select(ShadowBacktest)
+                select(
+                    ShadowBacktest.decision_id,
+                    ShadowBacktest.status,
+                    ShadowBacktest.best_action,
+                    ShadowBacktest.created_at,
+                )
                 .where(ShadowBacktest.created_at >= since)
                 .order_by(ShadowBacktest.created_at.desc())
                 .limit(capped_limit)
             )
             memories_result = await session.execute(
-                select(ExpertMemory)
+                select(
+                    ExpertMemory.expert_name,
+                    ExpertMemory.evidence_count,
+                    ExpertMemory.success_count,
+                    ExpertMemory.failure_count,
+                )
                 .order_by(
                     ExpertMemory.updated_at.desc().nullslast(), ExpertMemory.created_at.desc()
                 )
                 .limit(500)
             )
             events_result = await session.execute(
-                select(StrategyLearningEvent)
+                select(StrategyLearningEvent.attribution)
                 .where(StrategyLearningEvent.created_at >= since)
                 .order_by(StrategyLearningEvent.created_at.desc())
                 .limit(capped_limit)
             )
         return summarize_model_expert_health(
-            list(decisions_result.scalars().all()),
-            list(shadows_result.scalars().all()),
-            list(memories_result.scalars().all()),
-            list(events_result.scalars().all()),
+            [
+                _model_health_decision_from_mapping(row)
+                for row in decisions_result.mappings().all()
+            ],
+            [SimpleNamespace(**dict(row)) for row in shadows_result.mappings().all()],
+            [SimpleNamespace(**dict(row)) for row in memories_result.mappings().all()],
+            [SimpleNamespace(**dict(row)) for row in events_result.mappings().all()],
         )

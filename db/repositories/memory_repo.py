@@ -166,6 +166,23 @@ class MemoryRepository(BaseRepository):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_pending_shadow_backtests_by_ids(
+        self, shadow_backtest_ids: list[int]
+    ) -> list[ShadowBacktest]:
+        """Reload due rows for a short write transaction after price collection."""
+
+        ids = {int(row_id or 0) for row_id in shadow_backtest_ids}
+        ids = sorted(row_id for row_id in ids if row_id > 0)
+        if not ids:
+            return []
+        result = await self.session.execute(
+            select(ShadowBacktest).where(
+                ShadowBacktest.id.in_(ids),
+                ShadowBacktest.status == "pending",
+            )
+        )
+        return list(result.scalars().all())
+
     async def complete_shadow_backtest(
         self,
         row: ShadowBacktest,

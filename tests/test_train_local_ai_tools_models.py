@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.learning import ShadowBacktest
 from scripts import train_local_ai_tools_models as train_script
 from scripts.train_local_ai_tools_models import (
     _build_auth_headers,
@@ -17,6 +21,14 @@ from scripts.train_local_ai_tools_models import (
     _position_settlement_metadata,
     _post_training_payload,
 )
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+
+
+async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    await close_db()
+    db_path = tmp_path / "local-ai-tools-shadow-training.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
 
 
 def test_local_ai_tools_autotrain_task_persists_artifacts() -> None:
@@ -24,6 +36,85 @@ def test_local_ai_tools_autotrain_task_persists_artifacts() -> None:
 
     assert "--persist-artifact" in command
     assert "--confirm-phase3-rebuild" in command
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(train_script, "_LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE", 1)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="OLD/USDT",
+                    analysis_type="market",
+                    decision_action="long",
+                    decision_confidence=0.7,
+                    feature_snapshot={"current_price": 10.0},
+                    status="completed",
+                    due_at=PHASE3_CLEAN_START_UTC,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.2,
+                    created_at=PHASE3_CLEAN_START_UTC - timedelta(seconds=1),
+                ),
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    analysis_type="market",
+                    decision_action="long",
+                    decision_confidence=0.7,
+                    feature_snapshot={
+                        "current_price": 100.0,
+                        "rsi_14": 53.0,
+                        "returns_1": 0.01,
+                        "unused_llm_context": {"transcript": "x" * 100_000},
+                    },
+                    raw_llm_response={"unused_full_response": "x" * 100_000},
+                    status="completed",
+                    due_at=created_at + timedelta(minutes=10),
+                    horizon_minutes=10,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.2,
+                    best_action="long",
+                    created_at=created_at,
+                ),
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ETH/USDT",
+                    analysis_type="market",
+                    decision_action="short",
+                    decision_confidence=0.6,
+                    feature_snapshot={"current_price": 10.0, "rsi_14": 47.0},
+                    status="completed",
+                    due_at=created_at + timedelta(minutes=11),
+                    horizon_minutes=10,
+                    long_return_pct=-0.1,
+                    short_return_pct=0.1,
+                    best_action="short",
+                    created_at=created_at + timedelta(minutes=1),
+                ),
+            ]
+        )
+
+    try:
+        samples = await train_script._load_shadow_samples(limit=10)
+    finally:
+        await close_db()
+
+    assert len(samples) == 2
+    assert samples[0]["symbol"] == "BTC/USDT"
+    assert samples[0]["features"]["current_price"] == 100.0
+    assert samples[0]["features"]["rsi_14"] == 53.0
+    assert "unused_llm_context" not in samples[0]["features"]
+    assert samples[1]["symbol"] == "ETH/USDT"
 
 
 def test_local_ai_tools_training_headers_use_bearer_token() -> None:

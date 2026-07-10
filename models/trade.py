@@ -107,7 +107,7 @@ class OkxPositionHistory(Base, TimestampMixin):
     close_order_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     linked_order_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     position_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    match_status: Mapped[str] = mapped_column(String(40), default="unmatched")
+    match_status: Mapped[str] = mapped_column(String(160), default="unmatched")
     evidence_gaps: Mapped[list | None] = mapped_column(JSON, nullable=True)
     source: Mapped[str] = mapped_column(String(80), default="okx_position_history")
     raw_row: Mapped[dict | None] = mapped_column(JSON, nullable=True)

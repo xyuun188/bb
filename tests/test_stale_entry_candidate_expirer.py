@@ -13,6 +13,8 @@ from services.decision_state import (
     decision_state_from_raw,
 )
 from services.stale_entry_candidate_expirer import (
+    STALE_ENTRY_MAINTENANCE_BATCH_LIMIT,
+    STALE_ENTRY_MAINTENANCE_LOOKBACK,
     StaleEntryCandidateExpirer,
     action_label,
     is_pending_execution_reason,
@@ -136,6 +138,120 @@ async def test_stale_entry_expirer_repairs_old_expired_reason_with_pending_state
     state = decision_state_from_raw(waiting[0].raw_llm_response)["summary"]
     assert state["final_stage"] == DecisionStage.RISK_CHECK
     assert state["final_status"] == DecisionStageStatus.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_stale_candidate_loader_bounds_one_background_batch() -> None:
+    statements: list[Any] = []
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeSession:
+        async def execute(self, statement):
+            statements.append(statement)
+            return FakeResult()
+
+    expirer = StaleEntryCandidateExpirer(_float)
+    since = datetime.utcnow() - STALE_ENTRY_MAINTENANCE_LOOKBACK
+    assert await expirer._load_rows(
+        FakeSession(),
+        since=since,
+        cutoff=datetime.utcnow(),
+        reason_patterns=("waiting%",),
+    ) == []
+
+    assert statements[0]._limit_clause.value == STALE_ENTRY_MAINTENANCE_BATCH_LIMIT
+    compiled = statements[0].compile()
+    assert "ai_decisions.created_at >=" in str(compiled)
+    assert since in compiled.params.values()
+
+    assert await expirer._load_stale_open_state_rows(
+        FakeSession(),
+        since=since,
+        cutoff=datetime.utcnow(),
+    ) == []
+    compiled_open_state = statements[1].compile()
+    assert "ai_decisions.created_at >=" in str(compiled_open_state)
+    assert since in compiled_open_state.params.values()
+
+
+@pytest.mark.asyncio
+async def test_stale_candidate_postgres_updates_patch_json_without_full_row_load() -> None:
+    from sqlalchemy.dialects import postgresql
+
+    row = _row(raw={"opportunity_score": {"score": 0.2}, "decision_state_machine": {}})
+    expirer = StaleEntryCandidateExpirer(_float)
+    expirer._apply_reason(
+        row,
+        "expired",
+        stage=DecisionStage.RISK_CHECK,
+        status=DecisionStageStatus.SKIPPED,
+        skip_kind="stale_entry_candidate_expired",
+        terminal=True,
+    )
+
+    class FakeSession:
+        statement: Any | None = None
+        payloads: Any | None = None
+
+        async def execute(self, statement, payloads):
+            self.statement = statement
+            self.payloads = payloads
+
+    session = FakeSession()
+    await expirer._persist_postgres_updates(session, {int(row.id): row})
+
+    compiled = session.statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled).lower()
+    assert sql.startswith("update ai_decisions")
+    assert "jsonb_set" in sql
+    assert "select" not in sql
+    assert session.payloads[0]["opportunity_patch"]["selection_reason"] == "expired"
+
+
+def test_stale_entry_expirer_preserves_full_audit_payload_when_writing_projection() -> None:
+    expirer = StaleEntryCandidateExpirer(_float)
+    row = _row(
+        raw={
+            "opportunity_score": {"score": 0.2},
+            "decision_state_machine": {"stages": []},
+            "full_model_transcript": "preserve-me",
+        }
+    )
+    expirer._apply_reason(
+        row,
+        "expired",
+        stage=DecisionStage.RISK_CHECK,
+        status=DecisionStageStatus.SKIPPED,
+        skip_kind="stale_entry_candidate_expired",
+        terminal=True,
+    )
+
+    from services.stale_entry_candidate_expirer import _merge_expired_raw_response
+
+    merged = _merge_expired_raw_response(
+        {
+            "full_model_transcript": "preserve-me",
+            "unrelated": {"keep": True},
+            "opportunity_score": {"full_evidence": {"keep": True}},
+            "decision_state_machine": {"historic_metadata": {"keep": True}},
+        },
+        row.raw_llm_response,
+    )
+
+    assert merged["full_model_transcript"] == "preserve-me"
+    assert merged["unrelated"] == {"keep": True}
+    assert merged["opportunity_score"]["full_evidence"] == {"keep": True}
+    assert merged["decision_state_machine"]["historic_metadata"] == {"keep": True}
+    assert merged["skip_kind"] == "stale_entry_candidate_expired"
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config.settings import settings
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text
 from core.url_safety import normalize_http_base_url
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
@@ -98,6 +98,7 @@ _LOCAL_AI_TOOLS_TEXT_KEYS = {
 _LOCAL_AI_TOOLS_MAX_SEQUENCE_LENGTH = 80
 _LOCAL_AI_TOOLS_MAX_TEXT_ITEMS = 12
 _LOCAL_AI_TOOLS_MAX_TEXT_CHARS = 220
+_LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE = 500
 _LOCAL_AI_TOOLS_SHADOW_TOOL_KEYS = {
     "available",
     "status",
@@ -128,6 +129,12 @@ _LOCAL_AI_TOOLS_SHADOW_TOOL_KEYS = {
     "chronos_shadow_confidence",
     "chronos_shadow_horizon_step",
 }
+_LOCAL_AI_TOOLS_SHADOW_FEATURE_SNAPSHOT_KEYS = tuple(
+    sorted(
+        _LOCAL_AI_TOOLS_FEATURE_KEYS - {"symbol", "decision_confidence", "horizon_minutes"}
+    )
+)
+_LOCAL_AI_TOOLS_SHADOW_FEATURE_COLUMN_PREFIX = "local_tools_feature__"
 _TRAINING_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
 _TRAINING_REPAIR_SOURCES = {
     "missing_closed_position_repair",
@@ -515,47 +522,95 @@ async def _post_training_payload(
     return dict(parsed) if isinstance(parsed, Mapping) else {"value": parsed}
 
 
-async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
-    async with get_session_ctx() as session:
-        result = await session.execute(
-            select(ShadowBacktest)
-            .where(
-                ShadowBacktest.status == "completed",
-                ShadowBacktest.long_return_pct.is_not(None),
-                ShadowBacktest.short_return_pct.is_not(None),
-            )
-            .order_by(ShadowBacktest.id.desc())
-            .limit(max(int(limit), 1))
-        )
-        rows = list(result.scalars().all())
+def _shadow_sample_columns() -> tuple[Any, ...]:
+    return (
+        ShadowBacktest.id,
+        ShadowBacktest.symbol,
+        ShadowBacktest.analysis_type,
+        ShadowBacktest.decision_action,
+        ShadowBacktest.decision_confidence,
+        ShadowBacktest.due_at,
+        ShadowBacktest.horizon_minutes,
+        ShadowBacktest.long_return_pct,
+        ShadowBacktest.short_return_pct,
+        ShadowBacktest.best_action,
+        ShadowBacktest.missed_opportunity,
+        ShadowBacktest.training_feature_snapshot,
+    )
 
+
+def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    features = _snapshot(mapping.get("training_feature_snapshot"))
+    due_at = mapping.get("due_at")
+    return {
+        "id": int(mapping.get("id") or 0),
+        "symbol": str(mapping.get("symbol") or ""),
+        "analysis_type": str(mapping.get("analysis_type") or ""),
+        "decision_action": str(mapping.get("decision_action") or ""),
+        "decision_confidence": _as_float(mapping.get("decision_confidence")),
+        "horizon_minutes": int(mapping.get("horizon_minutes") or 10),
+        "features": features,
+        "long_return_pct": _as_float(mapping.get("long_return_pct")),
+        "short_return_pct": _as_float(mapping.get("short_return_pct")),
+        "label_timestamp": due_at.isoformat() if isinstance(due_at, datetime) else None,
+        "best_action": mapping.get("best_action"),
+        "missed_opportunity": bool(mapping.get("missed_opportunity")),
+    }
+
+
+async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
+    remaining = max(int(limit), 1)
+    before_id: int | None = None
     samples: list[dict[str, Any]] = []
-    for row in rows:
-        features = _snapshot(row.feature_snapshot)
-        if not features:
-            continue
-        features.setdefault("symbol", row.symbol)
-        features.setdefault("decision_confidence", _as_float(row.decision_confidence))
-        features.setdefault("horizon_minutes", int(row.horizon_minutes or 10))
-        compact_features = _compact_local_ai_tools_features(features)
-        if not compact_features:
-            continue
-        samples.append(
-            {
-                "id": int(row.id or 0),
-                "symbol": row.symbol,
-                "analysis_type": row.analysis_type,
-                "decision_action": row.decision_action,
-                "decision_confidence": _as_float(row.decision_confidence),
-                "horizon_minutes": int(row.horizon_minutes or 10),
-                "features": compact_features,
-                "long_return_pct": _as_float(row.long_return_pct),
-                "short_return_pct": _as_float(row.short_return_pct),
-                "label_timestamp": row.due_at.isoformat() if row.due_at else None,
-                "best_action": row.best_action,
-                "missed_opportunity": bool(row.missed_opportunity),
-            }
-        )
+    while remaining > 0:
+        page_limit = min(_LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE, remaining)
+        async with get_read_session_ctx() as session:
+            stmt = (
+                select(*_shadow_sample_columns())
+                .where(
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                )
+                .order_by(ShadowBacktest.id.desc())
+                .limit(page_limit)
+            )
+            if before_id is not None:
+                stmt = stmt.where(ShadowBacktest.id < before_id)
+            rows = [_shadow_sample_from_mapping(row) for row in (await session.execute(stmt)).mappings().all()]
+        if not rows:
+            break
+        remaining -= len(rows)
+        before_id = int(rows[-1].get("id") or 0) or before_id
+        for row in rows:
+            features = _snapshot(row.get("features"))
+            if not features:
+                continue
+            features.setdefault("symbol", row.get("symbol"))
+            features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
+            features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
+            compact_features = _compact_local_ai_tools_features(features)
+            if not compact_features:
+                continue
+            samples.append(
+                {
+                    "id": int(row.get("id") or 0),
+                    "symbol": row.get("symbol"),
+                    "analysis_type": row.get("analysis_type"),
+                    "decision_action": row.get("decision_action"),
+                    "decision_confidence": _as_float(row.get("decision_confidence")),
+                    "horizon_minutes": int(row.get("horizon_minutes") or 10),
+                    "features": compact_features,
+                    "long_return_pct": _as_float(row.get("long_return_pct")),
+                    "short_return_pct": _as_float(row.get("short_return_pct")),
+                    "label_timestamp": row.get("label_timestamp"),
+                    "best_action": row.get("best_action"),
+                    "missed_opportunity": bool(row.get("missed_opportunity")),
+                }
+            )
+        if len(rows) < page_limit:
+            break
     samples.reverse()
     return samples
 

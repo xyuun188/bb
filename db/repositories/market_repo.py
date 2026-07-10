@@ -8,6 +8,10 @@ from db.repositories.base import BaseRepository
 from models.market_data import Kline, Ticker
 
 
+def _utc_time_key(value: datetime) -> datetime:
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
 class MarketRepository(BaseRepository):
     """Repository for market data (Klines, Tickers)."""
 
@@ -38,6 +42,43 @@ class MarketRepository(BaseRepository):
             self.session.add(kline)
         await self.session.flush()
         return kline
+
+    async def upsert_klines_bulk(
+        self,
+        symbol: str,
+        timeframe: str,
+        rows: list[tuple[datetime, dict]],
+    ) -> int:
+        """Upsert one symbol/timeframe batch with a single read and flush."""
+
+        payload_by_open_time = {
+            open_time: dict(data)
+            for open_time, data in rows
+            if isinstance(open_time, datetime) and isinstance(data, dict)
+        }
+        if not payload_by_open_time:
+            return 0
+        existing_result = await self.session.execute(
+            select(Kline).where(
+                Kline.symbol == symbol,
+                Kline.timeframe == timeframe,
+            )
+        )
+        existing_by_open_time = {
+            _utc_time_key(row.open_time): row
+            for row in existing_result.scalars().all()
+            if row.open_time is not None
+        }
+        for open_time, data in payload_by_open_time.items():
+            kline = existing_by_open_time.get(_utc_time_key(open_time))
+            if kline is None:
+                self.session.add(Kline(symbol=symbol, timeframe=timeframe, open_time=open_time, **data))
+                continue
+            for key, value in data.items():
+                if hasattr(kline, key):
+                    setattr(kline, key, value)
+        await self.session.flush()
+        return len(payload_by_open_time)
 
     async def get_tickers(self, symbols: list[str] | None = None) -> list[Ticker]:
         stmt = select(Ticker)

@@ -345,6 +345,9 @@ class Settings(BaseSettings):
 
     # --- Database ---
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"
+    database_pool_size: int = 16
+    database_max_overflow: int = 24
+    database_pool_timeout_seconds: float = 2.0
 
     # --- Redis ---
     redis_url: str = "redis://localhost:6379/0"

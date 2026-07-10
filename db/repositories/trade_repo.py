@@ -183,6 +183,23 @@ class TradeRepository(BaseRepository):
             position.unrealized_pnl = unrealized_pnl
             await self.session.flush()
 
+    async def update_open_position_prices(
+        self,
+        updates: list[tuple[Position, float, float]],
+    ) -> int:
+        """Flush price updates for already-loaded open positions as one unit of work."""
+
+        changed = 0
+        for position, current_price, unrealized_pnl in updates:
+            if not position.is_open:
+                continue
+            position.current_price = current_price
+            position.unrealized_pnl = unrealized_pnl
+            changed += 1
+        if changed:
+            await self.session.flush()
+        return changed
+
     async def count_orders(
         self,
         model_name: str | None = None,

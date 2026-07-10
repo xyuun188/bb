@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.decision import AIDecision
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
 from services.profit_first_ranking import (
     ProfitFirstRankingService,
     _filter_trusted_closed_positions_with_orders,
 )
 from services.trade_fact_trust import orders_by_exchange_id
+
+
+async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    await close_db()
+    db_path = tmp_path / "profit-first-ranking.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
 
 
 def _raw(
@@ -132,6 +145,53 @@ def test_profit_first_ranking_promotes_profitable_profile_after_sample_floor() -
     assert top["recommended_stage"] == "canary"
     assert top["can_increase_budget"] is True
     assert "positive_realized_net_pnl" in top["ranking_reasons"]
+
+
+@pytest.mark.asyncio
+async def test_profit_first_ranking_loads_only_required_decision_response_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    now = datetime.now(UTC)
+    raw = _raw(strategy="projected-profit-first", lane="validated_probe")
+    raw.update(
+        {
+            "review_feedback": {"missed_opportunity_count": 4},
+            "shadow_outcome": {"shadow_return_pct": 0.7},
+            "unused_full_transcript": "x" * 100_000,
+        }
+    )
+    async with get_session_ctx() as session:
+        session.add(
+            AIDecision(
+                model_name="ensemble_trader",
+                symbol="BTC/USDT",
+                action="long",
+                confidence=0.7,
+                was_executed=False,
+                execution_reason="profit_insufficient",
+                raw_llm_response=raw,
+                created_at=now,
+            )
+        )
+
+    try:
+        decisions, positions, trade_fact_report = await ProfitFirstRankingService()._load_recent(
+            hours=24,
+            limit=20,
+        )
+    finally:
+        await close_db()
+
+    assert positions == []
+    assert trade_fact_report["checked"] == 0
+    assert len(decisions) == 1
+    loaded_raw = decisions[0].raw_llm_response
+    assert loaded_raw["profit_first_trade_plan"]["strategy_profile_id"] == "projected-profit-first"
+    assert loaded_raw["review_feedback"]["missed_opportunity_count"] == 4
+    assert loaded_raw["shadow_outcome"]["shadow_return_pct"] == 0.7
+    assert "unused_full_transcript" not in loaded_raw
 
 
 def test_profit_first_ranking_exposes_strategy_generation_lifecycle() -> None:

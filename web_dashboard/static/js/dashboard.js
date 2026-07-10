@@ -6965,7 +6965,13 @@ function loopErrorLabel(message) {
         return '持仓复盘整轮超时：本轮已被保护性中断，通常是 OKX 同步、行情刷新或持仓复盘阶段累计过慢；系统会进入下一轮继续处理。';
     }
     if (text.includes('market analysis round cancelled by hard watchdog')) {
-        return '市场分析整轮超时：本轮已被保护性中断，通常是行情刷新、模型调用或执行阶段累计过慢；系统会进入下一轮继续扫描。';
+        return '市场分析曾被旧版整轮保护取消；当前版本会按具体阶段预算降级。请刷新后查看最新阶段耗时。';
+    }
+    if (text.includes('market analysis task cancelled during')) {
+        return '市场分析任务被外部取消；请查看当前阶段和耗时拆解，系统不会把它误记为模型或 OKX 超时。';
+    }
+    if (text.includes('position analysis task cancelled during')) {
+        return '持仓复盘任务被外部取消；请查看当前阶段和耗时拆解，系统不会把它误记为 OKX 或模型超时。';
     }
     if (text.includes('Invalid OK-ACCESS-KEY') || text.includes('50111')) {
         return 'OKX API Key 无效，余额/仓位同步可能失败，请检查当前模式的 OKX Key 配置。';

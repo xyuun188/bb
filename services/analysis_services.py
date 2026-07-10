@@ -118,6 +118,19 @@ class MarketAnalysisService(_ScopedAnalysisService):
     scope = "market"
     initial_delay_seconds = 3.0
 
+    async def _run_loop_round(self) -> None:
+        """Let the market pipeline enforce its own stage and symbol budgets.
+
+        TradingService already limits feature fetches, model calls, candidate
+        scheduling, and exchange execution independently.  A second outer
+        ``asyncio.wait_for`` used to cancel all of that work together, turning
+        one slow model or optional data source into a false whole-round failure.
+        Keep the watchdog value for diagnostics and the internal market budget,
+        but do not use it as a cancellation boundary here.
+        """
+
+        await self.run_once()
+
 
 class PositionReviewService(_ScopedAnalysisService):
     scope = "position"

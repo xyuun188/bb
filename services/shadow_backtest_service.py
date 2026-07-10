@@ -256,55 +256,85 @@ class ShadowBacktestService:
             )
 
     async def update_due(self, limit: int = 200) -> int:
-        """Complete due shadow samples using latest OKX swap price."""
+        """Complete due samples without holding a database session during OKX reads."""
         try:
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
                 rows = await repo.get_due_shadow_backtests(limit=max(1, int(limit or 1)))
-                if not rows:
-                    return 0
-                price_cache: dict[str, float] = {}
-                completed_count = 0
-                for row in rows:
-                    symbol = self.symbol_normalizer(row.symbol) or row.symbol
-                    if symbol not in price_cache:
-                        price_cache[symbol] = await self.latest_price_provider(symbol)
-                    actual_price = self.float_parser(price_cache.get(symbol), 0.0)
-                    entry_price = self.float_parser(row.entry_price, 0.0)
-                    if actual_price <= 0 or entry_price <= 0:
-                        continue
+            if not rows:
+                return 0
 
-                    long_return = (actual_price - entry_price) / entry_price
-                    short_return = (entry_price - actual_price) / entry_price
-                    threshold = max(
-                        float(settings.shadow_memory_min_return_pct or 0.40) / 100.0,
-                        self.missed_opportunity_threshold,
-                    )
-                    best_action = "hold"
-                    if long_return >= threshold and long_return >= short_return:
-                        best_action = "long"
-                    elif short_return >= threshold and short_return > long_return:
-                        best_action = "short"
+            # Price collection can wait on an exchange request.  Keep it outside the
+            # ORM context so low-priority shadow maintenance cannot exhaust the pool.
+            price_cache: dict[str, float] = {}
+            completions: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                row_id = int(getattr(row, "id", 0) or 0)
+                if row_id <= 0:
+                    continue
+                symbol = self.symbol_normalizer(row.symbol) or row.symbol
+                if symbol not in price_cache:
+                    price_cache[symbol] = await self.latest_price_provider(symbol)
+                actual_price = self.float_parser(price_cache.get(symbol), 0.0)
+                entry_price = self.float_parser(row.entry_price, 0.0)
+                if actual_price <= 0 or entry_price <= 0:
+                    continue
 
-                    decision_action = str(row.decision_action or "hold")
-                    missed = decision_action == "hold" and best_action in {"long", "short"}
-                    note = self._completion_note(
+                long_return = (actual_price - entry_price) / entry_price
+                short_return = (entry_price - actual_price) / entry_price
+                threshold = max(
+                    float(settings.shadow_memory_min_return_pct or 0.40) / 100.0,
+                    self.missed_opportunity_threshold,
+                )
+                best_action = "hold"
+                if long_return >= threshold and long_return >= short_return:
+                    best_action = "long"
+                elif short_return >= threshold and short_return > long_return:
+                    best_action = "short"
+
+                decision_action = str(row.decision_action or "hold")
+                missed = decision_action == "hold" and best_action in {"long", "short"}
+                completions[row_id] = {
+                    "actual_price": actual_price,
+                    "long_return": long_return,
+                    "short_return": short_return,
+                    "best_action": best_action,
+                    "missed": missed,
+                    "threshold": threshold,
+                    "note": self._completion_note(
                         decision_action,
                         best_action,
                         int(row.horizon_minutes),
                         long_return,
                         short_return,
                         missed,
-                    )
+                    ),
+                }
 
+            if not completions:
+                return 0
+
+            async with self.session_factory() as session:
+                repo = self.repository_factory(session)
+                reload_rows = getattr(repo, "get_pending_shadow_backtests_by_ids", None)
+                if callable(reload_rows):
+                    writable_rows = await reload_rows(list(completions))
+                else:
+                    # Keep isolated test doubles and external repository adapters working.
+                    writable_rows = rows
+                completed_count = 0
+                for row in writable_rows:
+                    completion = completions.get(int(getattr(row, "id", 0) or 0))
+                    if completion is None:
+                        continue
                     await repo.complete_shadow_backtest(
                         row,
-                        actual_price=actual_price,
-                        long_return_pct=long_return * 100,
-                        short_return_pct=short_return * 100,
-                        best_action=best_action,
-                        missed_opportunity=missed,
-                        note=note,
+                        actual_price=completion["actual_price"],
+                        long_return_pct=completion["long_return"] * 100,
+                        short_return_pct=completion["short_return"] * 100,
+                        best_action=completion["best_action"],
+                        missed_opportunity=completion["missed"],
+                        note=completion["note"],
                     )
                     completed_count += 1
                     quarantine_result = quarantine_completed_shadow_row(row)
@@ -320,13 +350,13 @@ class ShadowBacktestService:
                         await self._record_memory_in_session(
                             repo,
                             row,
-                            long_return=long_return,
-                            short_return=short_return,
-                            best_action=best_action,
-                            threshold=threshold,
+                            long_return=completion["long_return"],
+                            short_return=completion["short_return"],
+                            best_action=completion["best_action"],
+                            threshold=completion["threshold"],
                         )
-                logger.info("shadow backtests updated", count=len(rows))
-                return completed_count
+            logger.info("shadow backtests updated", count=completed_count)
+            return completed_count
         except Exception as exc:
             logger.debug("failed to update shadow backtests", error=safe_error_text(exc))
             return 0

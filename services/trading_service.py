@@ -292,9 +292,11 @@ OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
 MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 5.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
 ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
+ENTRY_SYMBOL_BLOCK_SCAN_LIMIT = 250
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
-STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_all_due"
+STRATEGY_CONTEXT_IO_CONCURRENCY = 2
+STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_batched_maintenance"
 MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
 ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
 DISCRETIONARY_CLOSE_CONFIDENCE = 0.66
@@ -2067,19 +2069,50 @@ class TradingService:
     ) -> Any:
         """Read optional strategy context without letting slow IO block the round."""
 
-        task = asyncio.ensure_future(awaitable)
         started_monotonic = asyncio.get_running_loop().time()
+        queue_started_monotonic = started_monotonic
+        queue_wait_seconds = 0.0
         status = "ok"
+        gate = self._strategy_context_io_gate()
+        acquired = False
         try:
             self._safe_set_strategy_context_stage(f"strategy_context:{label}")
-            done, pending = await asyncio.wait({task}, timeout=max(float(timeout_seconds), 0.0))
+            budget_seconds = max(float(timeout_seconds), 0.0)
+            try:
+                await asyncio.wait_for(gate.acquire(), timeout=budget_seconds)
+                acquired = True
+            except TimeoutError:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                status = "queue_timeout"
+                logger.warning(
+                    "strategy context database queue timed out; using baseline value",
+                    stage=label,
+                    timeout_seconds=round(budget_seconds, 3),
+                )
+                return fallback
+            queue_wait_seconds = max(
+                asyncio.get_running_loop().time() - queue_started_monotonic,
+                0.0,
+            )
+            remaining_seconds = max(budget_seconds - queue_wait_seconds, 0.0)
+            if remaining_seconds <= 0.0:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                status = "queue_timeout"
+                return fallback
+            task = asyncio.ensure_future(awaitable)
+            done, pending = await asyncio.wait(
+                {task},
+                timeout=remaining_seconds,
+            )
             if pending:
                 await drain_cancelled_tasks(pending, timeout_seconds=0.05)
                 status = "timeout"
                 logger.warning(
                     "strategy context stage timed out; using baseline value",
                     stage=label,
-                    timeout_seconds=round(timeout_seconds, 3),
+                    timeout_seconds=round(budget_seconds, 3),
                 )
                 return fallback
             return next(iter(done)).result()
@@ -2092,13 +2125,26 @@ class TradingService:
             )
             return fallback
         finally:
+            if acquired:
+                gate.release()
             if timings is not None:
                 elapsed = max(asyncio.get_running_loop().time() - started_monotonic, 0.0)
                 timings[label] = {
                     "duration_seconds": round(elapsed, 6),
+                    "queue_wait_seconds": round(queue_wait_seconds, 6),
                     "timeout_seconds": round(max(float(timeout_seconds), 0.0), 6),
                     "status": status,
                 }
+
+    def _strategy_context_io_gate(self) -> asyncio.Semaphore:
+        """Bound concurrent history queries shared by market and position loops."""
+
+        gate = getattr(self, "_strategy_context_io_semaphore", None)
+        if isinstance(gate, asyncio.Semaphore):
+            return gate
+        gate = asyncio.Semaphore(STRATEGY_CONTEXT_IO_CONCURRENCY)
+        self._strategy_context_io_semaphore = gate
+        return gate
 
     def _strategy_learning_refresh_tasks(self) -> dict[str, asyncio.Task]:
         tasks = getattr(self, "_strategy_learning_context_refresh_tasks", None)
@@ -3580,6 +3626,9 @@ class TradingService:
                 "position_last_error": position_state.last_error,
                 "market_stage_durations": self._recent_stage_durations(market_state),
                 "position_stage_durations": self._recent_stage_durations(position_state),
+                "last_position_price_refresh_diagnostics": self._safe_dict(
+                    getattr(self, "_last_position_price_refresh_diagnostics", {})
+                ),
                 "last_round_started_at": (
                     self._last_round_started_at.isoformat() if self._last_round_started_at else None
                 ),
@@ -5225,7 +5274,7 @@ class TradingService:
                         AIDecision.created_at >= cutoff,
                     )
                     .order_by(AIDecision.created_at.desc())
-                    .limit(2000)
+                    .limit(ENTRY_SYMBOL_BLOCK_SCAN_LIMIT)
                 )
                 for row in result.all():
                     reason = self._decision_execution_error_text(
@@ -5976,12 +6025,18 @@ class TradingService:
 
             self._set_loop_stage("refresh_position_prices")
             if self._should_refresh_position_prices_before_review(analysis_scope):
-                await self.okx_sync_service.refresh_position_prices(feature_vectors)
+                refresh_diagnostics = await self.okx_sync_service.refresh_position_prices(
+                    feature_vectors
+                )
+                self._last_position_price_refresh_diagnostics = self._safe_dict(
+                    refresh_diagnostics
+                )
                 results["position_price_refresh"] = {
                     "read_only": True,
                     "is_entry_gate": False,
                     "skipped": False,
                     "reason": "position/full round refreshes persisted open-position prices before review",
+                    "diagnostics": self._safe_dict(refresh_diagnostics),
                 }
             else:
                 results["position_price_refresh"] = {
@@ -6039,6 +6094,13 @@ class TradingService:
 
             market_feature_items = list(market_feature_vectors.items())
             market_ai_started_at = datetime.now(UTC)
+            market_ai_budget_seconds = self.market_round_time_budget_seconds(
+                strategy_context=strategy_mode_context,
+                market_symbol_count=len(market_feature_items),
+            )
+            market_ai_deadline_monotonic = (
+                asyncio.get_running_loop().time() + market_ai_budget_seconds
+            )
             for market_index, (symbol, fv) in enumerate(market_feature_items):
                 if market_index > 0 and self._market_ai_budget_exhausted(
                     market_ai_started_at,
@@ -6263,6 +6325,12 @@ class TradingService:
                         ),
                         "ml_signal_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
                         "local_ai_tools_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
+                        # The registry and final trader use this cooperative deadline to
+                        # bound batch fallbacks and arbitration to the current symbol's
+                        # remaining market-AI budget.  It is not a trading gate.
+                        "_analysis_deadline_monotonic": market_ai_deadline_monotonic,
+                        "_analysis_budget_scope": "market_ai",
+                        "_analysis_budget_seconds": market_ai_budget_seconds,
                     },
                 )
                 if isinstance(decision.raw_response, dict):
@@ -6727,17 +6795,26 @@ class TradingService:
             published_dashboard_update = True
 
         except asyncio.CancelledError:
+            active_stage = self._runtime_state(analysis_scope).current_stage
+            elapsed_seconds = round(self._round_elapsed_seconds(round_start), 3)
             error_text = (
-                f"{analysis_scope} analysis round cancelled by hard watchdog "
-                f"after {round(self._round_elapsed_seconds(round_start), 3)} seconds."
+                f"{analysis_scope} analysis task cancelled during {active_stage} "
+                f"after {elapsed_seconds} seconds."
             )
-            self._set_loop_stage("watchdog_cancelled", error_text)
+            results["cancellation_diagnostic"] = {
+                "scope": analysis_scope,
+                "active_stage": active_stage,
+                "elapsed_seconds": elapsed_seconds,
+                "stage_durations": self._stage_durations_for_scope(analysis_scope),
+            }
+            self._set_loop_stage("task_cancelled", error_text)
             results["status"] = "error"
             results["error"] = error_text
             logger.error(
-                "trading loop iteration cancelled by watchdog",
+                "trading loop iteration cancelled",
                 scope=analysis_scope,
-                elapsed_seconds=round(self._round_elapsed_seconds(round_start), 3),
+                active_stage=active_stage,
+                elapsed_seconds=elapsed_seconds,
             )
             await self._finalize_round_unresolved_decisions(
                 round_decision_ids,
@@ -10676,8 +10753,11 @@ class TradingService:
             "position_current_stage": position_state.current_stage,
             "position_round_active": position_state.active,
             "position_last_error": position_state.last_error,
-            "market_stage_durations": self._recent_stage_durations(market_state),
-            "position_stage_durations": self._recent_stage_durations(position_state),
+                "market_stage_durations": self._recent_stage_durations(market_state),
+                "position_stage_durations": self._recent_stage_durations(position_state),
+                "last_position_price_refresh_diagnostics": self._safe_dict(
+                    getattr(self, "_last_position_price_refresh_diagnostics", {})
+                ),
             "last_round_started_at": (
                 self._last_round_started_at.isoformat() if self._last_round_started_at else None
             ),

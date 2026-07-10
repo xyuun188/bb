@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
@@ -50,6 +51,7 @@ RECONCILE_ORIGIN_SYSTEM_PROTECTION = "system_protection"
 RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
+POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
 
 
 def _first_value(*values: Any) -> Any:
@@ -1133,12 +1135,29 @@ class OkxSyncService:
 
     async def refresh_position_prices(self, feature_vectors: dict[str, Any]) -> Any:
         """Update persisted open-position prices and unrealized PnL."""
+        refresh_started = time.perf_counter()
+        diagnostics: dict[str, Any] = {
+            "source": "position_price_refresh",
+            "exchange_snapshot_count": 0,
+            "open_position_count": 0,
+            "updated_position_count": 0,
+        }
         record_position_profit_peak = self._required_position_profit_peak_recorder()
         position_age_minutes = self._required_position_age_minutes_provider()
         prune_position_profit_peaks = self._required_position_profit_peak_pruner()
         normalize_symbol = self.symbol_normalizer or (lambda value: str(value or ""))
         parse_float = self.float_parser or _float_value
         exchange_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        def pool_status(session: Any) -> str | None:
+            try:
+                bind = session.get_bind()
+                pool = getattr(bind, "pool", None)
+                status = pool.status() if pool is not None else None
+                return str(status) if status else None
+            except Exception:
+                return None
+
         try:
             candidates: list[tuple[str, Any]] = []
             active_okx = self.active_okx_provider() if self.active_okx_provider else None
@@ -1149,7 +1168,10 @@ class OkxSyncService:
             if paper_okx and all(executor is not paper_okx for _mode, executor in candidates):
                 candidates.append(("paper", paper_okx))
 
-            for source_mode, executor in candidates:
+            async def fetch_source_positions(
+                source_mode: str,
+                executor: Any,
+            ) -> tuple[str, list[dict[str, Any]]]:
                 try:
                     exchange_positions = await asyncio.wait_for(
                         executor.get_positions_strict(),
@@ -1161,7 +1183,18 @@ class OkxSyncService:
                         source_mode=source_mode,
                         error=safe_error_text(exc),
                     )
-                    continue
+                    return source_mode, []
+                return source_mode, list(exchange_positions or [])
+
+            exchange_fetch_started = time.perf_counter()
+            source_snapshots = await asyncio.gather(
+                *(fetch_source_positions(source_mode, executor) for source_mode, executor in candidates)
+            )
+            diagnostics["exchange_snapshot_fetch_ms"] = round(
+                (time.perf_counter() - exchange_fetch_started) * 1000,
+                3,
+            )
+            for source_mode, exchange_positions in source_snapshots:
                 for exchange_pos in exchange_positions or []:
                     snapshot = parse_exchange_position_snapshot(
                         exchange_pos,
@@ -1171,7 +1204,9 @@ class OkxSyncService:
                         continue
                     key = (source_mode, str(snapshot["symbol"]), str(snapshot["side"]))
                     exchange_snapshots[key] = snapshot
+            diagnostics["exchange_snapshot_count"] = len(exchange_snapshots)
         except Exception as exc:
+            diagnostics["exchange_snapshot_error"] = safe_error_text(exc, limit=180)
             logger.debug(
                 "OKX position snapshot unavailable during price refresh; using feature prices",
                 error=safe_error_text(exc),
@@ -1179,8 +1214,32 @@ class OkxSyncService:
         try:
             async with get_session_ctx() as session:
                 trade_repo = TradeRepository(session)
-                positions = await trade_repo.get_open_positions()
+                diagnostics["database_pool_before_load"] = pool_status(session)
+                load_started = time.perf_counter()
+                try:
+                    positions = await asyncio.wait_for(
+                        trade_repo.get_open_positions(),
+                        timeout=POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    diagnostics["database_deferred"] = {
+                        "reason": "connection_pool_or_open_position_query_timeout",
+                        "timeout_seconds": POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS,
+                        "note": (
+                            "Price persistence was deferred because the database was busy; "
+                            "position review continues with the current round's feature data."
+                        ),
+                    }
+                    return diagnostics
+                diagnostics["load_open_positions_ms"] = round(
+                    (time.perf_counter() - load_started) * 1000,
+                    3,
+                )
+                diagnostics["database_pool_after_load"] = pool_status(session)
+                diagnostics["open_position_count"] = len(positions)
                 open_context: list[dict[str, Any]] = []
+                price_updates: list[tuple[Any, float, float]] = []
+                prepare_started = time.perf_counter()
 
                 for pos in positions:
                     execution_mode = _position_execution_mode(pos)
@@ -1214,10 +1273,8 @@ class OkxSyncService:
                     else:
                         unrealized_pnl = (current_price - pos.entry_price) * pos.quantity
 
-                    await trade_repo.update_position_price(
-                        pos.id,
-                        float(current_price),
-                        float(unrealized_pnl),
+                    price_updates.append(
+                        (pos, float(current_price), float(unrealized_pnl))
                     )
                     open_context.append(
                         {
@@ -1241,9 +1298,33 @@ class OkxSyncService:
                         hold_minutes=position_age_minutes(pos.created_at),
                         quantity=float(pos.quantity or 0.0),
                     )
+                diagnostics["prepare_updates_ms"] = round(
+                    (time.perf_counter() - prepare_started) * 1000,
+                    3,
+                )
+                persist_started = time.perf_counter()
+                update_many = getattr(trade_repo, "update_open_position_prices", None)
+                if callable(update_many):
+                    await update_many(price_updates)
+                else:
+                    # Compatibility for isolated test doubles and external repository adapters.
+                    for pos, current_price, unrealized_pnl in price_updates:
+                        await trade_repo.update_position_price(
+                            pos.id,
+                            current_price,
+                            unrealized_pnl,
+                        )
+                diagnostics["persist_updates_ms"] = round(
+                    (time.perf_counter() - persist_started) * 1000,
+                    3,
+                )
+                diagnostics["updated_position_count"] = len(price_updates)
                 prune_position_profit_peaks(open_context)
         except Exception as e:
+            diagnostics["database_error"] = safe_error_text(e, limit=180)
             logger.warning("failed to refresh DB position prices", error=safe_error_text(e))
+        diagnostics["total_ms"] = round((time.perf_counter() - refresh_started) * 1000, 3)
+        return diagnostics
 
     async def has_matching_exchange_exit_position(
         self,
