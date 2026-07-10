@@ -56,7 +56,12 @@ from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
 from services.decision_freshness import DecisionFreshnessPolicy
 from services.decision_persistence_service import DecisionPersistenceService
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
-from services.decision_state import DecisionStage, DecisionStageStatus
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    decision_state_from_raw,
+    is_decision_terminal_state,
+)
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
@@ -10550,14 +10555,8 @@ class TradingService:
         reason: str,
     ) -> None:
         executable_decisions = self._round_unresolved_executable_decisions(decisions)
-        executable_ids = [
-            int(decision_id)
-            for decision_id in decision_ids
-            if int(decision_id) in executable_decisions
-        ]
         if not executable_decisions:
             return
-        await self._fill_missing_decision_reasons(executable_ids, reason)
         await self._finalize_unresolved_decision_states(executable_decisions, reason)
 
     @staticmethod
@@ -10575,8 +10574,21 @@ class TradingService:
         return {
             int(decision_id): decision
             for decision_id, decision in decisions.items()
-            if decision_id and (decision.is_entry or decision.is_exit)
+            if decision_id
+            and (decision.is_entry or decision.is_exit)
+            and not TradingService._decision_has_terminal_state(decision)
         }
+
+    @staticmethod
+    def _decision_has_terminal_state(decision: DecisionOutput) -> bool:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        summary = decision_state_from_raw(raw).get("summary")
+        if not isinstance(summary, dict):
+            return False
+        return is_decision_terminal_state(
+            summary.get("final_stage"),
+            summary.get("final_status"),
+        )
 
     async def _finalize_unresolved_decision_states(
         self,

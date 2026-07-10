@@ -200,7 +200,7 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
     terminal = SimpleNamespace(
         id=3,
         was_executed=False,
-        execution_reason="已有明确终态",
+        execution_reason="",
         raw_llm_response=terminal_raw,
         position_size_pct=0.25,
         suggested_leverage=5.0,
@@ -258,7 +258,7 @@ async def test_finalize_unresolved_decisions_writes_terminal_state_only_when_nee
         ]
     )
 
-    assert updated == 2
+    assert updated == 3
     assert unresolved.execution_reason == "轮次结束未进入下单"
     assert unresolved.raw_llm_response["decision_state_machine"]["summary"]["final_stage"] == (
         DecisionStage.RISK_CHECK

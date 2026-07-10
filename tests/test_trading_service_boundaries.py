@@ -16,7 +16,7 @@ from executor.base_executor import ExecutionResult, OrderStatus
 from services.account_accounting_service import AccountAccountingService
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
-from services.decision_state import DecisionStage, DecisionStageStatus
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.entry_existing_winner import EntryExistingWinnerContextPolicy
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_market_data_quality import EntryMarketDataQualityPolicy, MarketValueReader
@@ -85,10 +85,7 @@ async def test_round_unresolved_decision_finalizer_fills_reason_and_terminal_sta
 
     await service._finalize_round_unresolved_decisions({7}, {7: decision}, "轮次被取消")
 
-    assert calls == [
-        ("fill", [7], "轮次被取消"),
-        ("finalize", [7], "轮次被取消"),
-    ]
+    assert calls == [("finalize", [7], "轮次被取消")]
 
 
 @pytest.mark.asyncio
@@ -111,10 +108,31 @@ async def test_round_unresolved_finalizer_ignores_hold_decisions() -> None:
         "round ended",
     )
 
-    assert calls == [
-        ("fill", [8], "round ended"),
-        ("finalize", [8], "round ended"),
-    ]
+    assert calls == [("finalize", [8], "round ended")]
+
+
+@pytest.mark.asyncio
+async def test_round_unresolved_finalizer_preserves_existing_terminal_entry_reason() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, Any]] = []
+
+    class _DecisionPersistence:
+        async def finalize_unresolved_decisions(self, decisions, reason):
+            calls.append(("finalize", sorted(decisions), reason))
+
+    service.decision_persistence = _DecisionPersistence()
+    decision = _decision(Action.LONG)
+    decision.raw_response = append_decision_stage(
+        decision.raw_response,
+        DecisionStage.STRATEGY_ARBITRATION,
+        DecisionStageStatus.SKIPPED,
+        "该币种正由另一条分析流程处理，本轮跳过重复开仓。",
+        {"skip_kind": "analysis_symbol_claimed"},
+    )
+
+    await service._finalize_round_unresolved_decisions({7}, {7: decision}, "round ended")
+
+    assert calls == []
 
 
 def test_trading_service_detects_policy_skipped_execution_result() -> None:

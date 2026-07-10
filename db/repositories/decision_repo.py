@@ -7,7 +7,11 @@ from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision
-from services.decision_state import DecisionStage, DecisionStageStatus, decision_state_from_raw
+from services.decision_state import (
+    DecisionStage,
+    decision_state_from_raw,
+    is_decision_terminal_state,
+)
 from services.text_integrity import sanitize_runtime_text
 
 
@@ -133,21 +137,17 @@ class DecisionRepository(BaseRepository):
             )
             current_status = str(current_summary.get("final_status") or "")
             current_stage = str(current_summary.get("final_stage") or "")
+            if is_decision_terminal_state(current_stage, current_status):
+                terminal_reason = str(current_summary.get("final_reason") or "").strip()
+                if not str(row.execution_reason or "").strip() and terminal_reason:
+                    row.execution_reason = sanitize_runtime_text(terminal_reason)
+                    updated += 1
+                continue
             if current_stage in {
                 DecisionStage.EXCHANGE_SUBMIT,
                 DecisionStage.EXCHANGE_CONFIRM,
                 DecisionStage.LOCAL_SYNC,
             }:
-                continue
-            if (
-                current_status
-                in {
-                    DecisionStageStatus.BLOCKED,
-                    DecisionStageStatus.FAILED,
-                    DecisionStageStatus.SKIPPED,
-                }
-                and str(row.execution_reason or "").strip()
-            ):
                 continue
             clean_reason = sanitize_runtime_text(reason)
             clean_response = sanitize_runtime_text(raw_response)

@@ -9,7 +9,7 @@ import pytest
 import services.decision_persistence_service as decision_persistence_module
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_persistence_service import DecisionPersistenceService
-from services.decision_state import DecisionStage, DecisionStageStatus
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 
 
 def _decision(action: Action = Action.LONG) -> DecisionOutput:
@@ -265,6 +265,30 @@ async def test_finalize_unresolved_decisions_adds_terminal_risk_skip() -> None:
     assert machine["summary"]["final_stage"] == DecisionStage.RISK_CHECK
     assert machine["summary"]["final_status"] == DecisionStageStatus.SKIPPED
     assert machine["stages"][-1]["data"]["skip_kind"] == "round_unresolved_terminal_skip"
+
+
+@pytest.mark.asyncio
+async def test_finalize_unresolved_decisions_preserves_existing_terminal_trail() -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision()
+    decision.raw_response = append_decision_stage(
+        decision.raw_response,
+        DecisionStage.STRATEGY_ARBITRATION,
+        DecisionStageStatus.SKIPPED,
+        "已有同币种分析流程占用执行权。",
+        {"skip_kind": "analysis_symbol_claimed"},
+    )
+
+    count = await service.finalize_unresolved_decisions({12: decision}, "round ended")
+
+    assert count == 1
+    _decision_id, reason, raw = repo.finalize_unresolved[0][0]
+    assert reason == "已有同币种分析流程占用执行权。"
+    machine = raw["decision_state_machine"]
+    assert machine["current_stage"] == DecisionStage.STRATEGY_ARBITRATION
+    assert machine["current_status"] == DecisionStageStatus.SKIPPED
+    assert raw.get("skip_kind") != "round_unresolved_terminal_skip"
 
 
 @pytest.mark.asyncio

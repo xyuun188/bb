@@ -23,7 +23,13 @@ from db.repositories.decision_repo import DecisionRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
-from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.decision_state import (
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+    decision_state_from_raw,
+    is_decision_terminal_state,
+)
 from services.profit_first_trade_plan import attach_profit_first_trade_plan
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
 
@@ -317,6 +323,19 @@ class DecisionPersistenceService:
             for decision_id, decision in decisions.items():
                 if not decision_id:
                     continue
+                terminal_reason = self._terminal_reason_from_decision(decision)
+                if terminal_reason is not None:
+                    # Preserve an already-recorded branch result when a persistence
+                    # callback was interrupted just before the round finalizer runs.
+                    raw = (
+                        dict(decision.raw_response)
+                        if isinstance(decision.raw_response, dict)
+                        else {}
+                    )
+                    updates.append(
+                        (int(decision_id), terminal_reason or sanitized_reason, raw)
+                    )
+                    continue
                 raw = self.record_stage(
                     decision,
                     DecisionStage.RISK_CHECK,
@@ -339,6 +358,26 @@ class DecisionPersistenceService:
                 error=safe_error_text(exc),
             )
             return 0
+
+    @staticmethod
+    def _terminal_reason_from_decision(decision: DecisionOutput) -> str | None:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        summary = decision_state_from_raw(raw).get("summary")
+        if not isinstance(summary, dict) or not is_decision_terminal_state(
+            summary.get("final_stage"),
+            summary.get("final_status"),
+        ):
+            return None
+        opportunity = raw.get("opportunity_score")
+        selection_reason = (
+            opportunity.get("selection_reason") if isinstance(opportunity, dict) else None
+        )
+        return str(
+            summary.get("final_reason")
+            or raw.get("reason")
+            or selection_reason
+            or ""
+        ).strip()
 
     async def mark_outcome(self, decision_id: int, outcome: str, pnl_pct: float) -> None:
         try:
