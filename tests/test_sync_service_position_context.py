@@ -256,3 +256,41 @@ def test_okx_close_fill_order_payload_persists_native_fill_fact() -> None:
     assert payload["okx_raw_fills"]["order_id"] == "3706182741831417856"
     assert payload["okx_raw_fills"]["trade_ids"] == ["sand-close-trade"]
     assert payload["okx_raw_fills"]["rows"][0]["instId"] == "SAND-USDT-SWAP"
+
+
+def test_okx_close_fill_order_payload_keeps_full_fill_quantity_for_shared_close_order() -> None:
+    filled_at = datetime(2026, 7, 10, 6, 20, 37, tzinfo=UTC)
+
+    payload = _okx_close_fill_order_payload(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="CHZ/USDT",
+        side="sell",
+        quantity=3715.7034542543734,
+        price=0.01673,
+        fee=0.013493,
+        decision_id=47778,
+        close_order_id="3729979028234018816",
+        filled_at=filled_at,
+        close_fill={
+            "source": "okx_fills_history",
+            "pnl": -7.245100000001463,
+            "contracts": 1613.0,
+            "contract_size": 10.0,
+            "quantity": 16130.0,
+            "order_info": {
+                "instId": "CHZ-USDT-SWAP",
+                "tradeId": "chz-close-trade",
+                "fillSz": "1613",
+                "fillPnl": "-7.245100000001463",
+                "ts": str(int(filled_at.timestamp() * 1000)),
+            },
+        },
+        okx_inst_id="CHZ-USDT-SWAP",
+    )
+
+    assert payload["quantity"] == pytest.approx(16130.0)
+    assert payload["okx_fill_contracts"] == pytest.approx(1613.0)
+    assert payload["okx_raw_fills"]["base_quantity"] == pytest.approx(16130.0)
+    assert payload["okx_raw_fills"]["contract_size"] == pytest.approx(10.0)
+    assert payload["okx_raw_fills"]["contract_size_verified"] is True

@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from services.profit_first_trade_plan import build_profit_first_trade_plan
 from services.trade_execution_contract import (
     TradeExecutionContractService,
     summarize_trade_execution_contract,
 )
-from services.profit_first_trade_plan import build_profit_first_trade_plan
 
 
 def _anchor_now() -> datetime:
@@ -364,6 +364,113 @@ def test_executed_entry_flags_weak_negative_and_unexplained_small_size() -> None
     }
     assert summary["profit_first_plan_incomplete_count"] == 1
     assert summary["shadow_lane_executed_count"] == 1
+
+
+def test_executed_entry_uses_final_profit_first_expected_net_for_contract() -> None:
+    report = summarize_trade_execution_contract(
+        decisions=[
+            _entry_decision(
+                decision_id=21,
+                expected_net=-0.02,
+                evidence_tier="exploration",
+                position_size_pct=0.012,
+                include_profit_first_plan=False,
+                raw_extra={
+                    "profit_first_trade_plan": {
+                        "decision_lane": "tiny_probe",
+                        "is_complete_for_real_trade": True,
+                        "expected_net_return_pct": 0.34,
+                        "expected_profit_usdt": 0.11,
+                        "exit_plan_id": "pfep-final-positive",
+                        "model_sources": ["decision_llm", "timeseries"],
+                    },
+                    "profit_risk_sizing": {
+                        "quality_tier": "base",
+                        "position_size_pct": 0.012,
+                        "final_notional_usdt": 32.0,
+                        "expected_profit_usdt": 0.11,
+                        "reason": "final profit-first adjudication is positive",
+                        "profit_first_position_ladder": {
+                            "version": "profit-first-position-ladder-v1",
+                            "lane": "tiny_probe",
+                            "target_min_pct": 0.01,
+                            "target_max_pct": 0.02,
+                            "adjusted_size_pct": 0.012,
+                            "post_stop_budget_size_pct": 0.012,
+                            "capped_by_stop_loss_budget": True,
+                        },
+                    },
+                },
+            )
+        ],
+        orders=[_order(21)],
+        positions=[],
+    )
+
+    assert report["summary"]["negative_expected_executed_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 0
+    explanation = report["entry_explanations"][0]
+    assert explanation["expected_net_return_pct"] == -0.02
+    assert explanation["adjudicated_expected_net_return_pct"] == 0.34
+    assert explanation["profit_first_real_trade_upgrade"] is True
+
+
+def test_weak_evidence_without_shadow_only_can_execute_after_profit_first_upgrade() -> None:
+    report = summarize_trade_execution_contract(
+        decisions=[
+            _entry_decision(
+                decision_id=22,
+                expected_net=1.1,
+                evidence_tier="weak_conflict_probe",
+                raw_extra={
+                    "opportunity_score": {
+                        "evidence_score": {
+                            "tier": "weak_conflict_probe",
+                            "effective_score": 42.0,
+                            "shadow_only": False,
+                            "tradeable_probe": False,
+                        }
+                    }
+                },
+            )
+        ],
+        orders=[_order(22)],
+        positions=[],
+    )
+
+    assert report["summary"]["weak_evidence_executed_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["entry_explanations"][0]["profit_first_real_trade_upgrade"] is True
+
+
+def test_shadow_only_weak_evidence_stays_contract_violation_even_if_profit_first_upgraded() -> None:
+    report = summarize_trade_execution_contract(
+        decisions=[
+            _entry_decision(
+                decision_id=23,
+                expected_net=2.0,
+                evidence_tier="weak_conflict_probe",
+                raw_extra={
+                    "opportunity_score": {
+                        "evidence_score": {
+                            "tier": "weak_conflict_probe",
+                            "effective_score": 35.0,
+                            "shadow_only": True,
+                            "tradeable_probe": False,
+                        }
+                    }
+                },
+            )
+        ],
+        orders=[_order(23)],
+        positions=[],
+    )
+
+    assert report["summary"]["weak_evidence_executed_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 1
+    explanation = report["entry_explanations"][0]
+    assert explanation["evidence_shadow_only"] is True
+    assert explanation["profit_first_real_trade_upgrade"] is True
 
 
 def test_fast_loss_exit_requires_strong_structured_exit_evidence() -> None:

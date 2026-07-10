@@ -336,6 +336,33 @@ class _Executor:
         return None
 
 
+class _StaleVerifiedContractSizeCcxt(_FillCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        start_ms = int((PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=11)).timestamp() * 1000)
+        self.rows.append(
+            {
+                "ordId": "xpl-stale-ctval-order",
+                "tradeId": "xpl-stale-trade",
+                "instId": "XPL-USDT-SWAP",
+                "side": "buy",
+                "fillSz": "178",
+                "fillPx": "0.01685",
+                "fee": "-0.0149965",
+                "fillPnl": "0",
+                "ts": str(start_ms),
+            }
+        )
+
+
+class _StaleVerifiedContractSizeExecutor(_Executor):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _StaleVerifiedContractSizeCcxt()
+
+    async def _get_ccxt(self) -> _StaleVerifiedContractSizeCcxt:
+        return self.ccxt
+
+
 class _FundingBillExecutor:
     ccxt_instances: list[_FundingBillCcxt] = []
 
@@ -1361,6 +1388,88 @@ async def test_order_fact_sync_repairs_confirmed_order_contract_size_from_instru
         assert row["okx_fill_contracts"] == pytest.approx(3.0)
         assert raw["contract_size"] == pytest.approx(0.01)
         assert raw["base_quantity"] == pytest.approx(0.03)
+        assert raw["contract_size_verified"] is True
+        assert raw["contract_size_source"] == "okx_public_instruments"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_rechecks_ambiguous_verified_contract_size_from_instruments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-ambiguous-verified-contract-size.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=11)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="XPL/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=178.0,
+                    price=0.01685,
+                    status="filled",
+                    fee=0.0149965,
+                    exchange_order_id="xpl-stale-ctval-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="XPL-USDT-SWAP",
+                    okx_trade_ids="xpl-stale-trade",
+                    okx_fill_contracts=178.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        "fills_history_confirmed": True,
+                        "order_id": "xpl-stale-ctval-order",
+                        "trade_ids": ["xpl-stale-trade"],
+                        "inst_id": "XPL-USDT-SWAP",
+                        "contracts": 178.0,
+                        "contract_size": 1.0,
+                        "contract_size_verified": True,
+                        "contract_size_source": "okx_public_instruments_or_fill_row",
+                        "base_quantity": 178.0,
+                        "avg_price": 0.01685,
+                        "fee_abs": 0.0149965,
+                        "fill_pnl": 0.0,
+                        "timestamp": phase3_time.isoformat(),
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_StaleVerifiedContractSizeExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == "xpl-stale-ctval-order"
+                    )
+                )
+            ).one()._mapping
+
+        raw = row["okx_raw_fills"]
+        assert report["okx_pull_available"] is True
+        assert row["quantity"] == pytest.approx(1780.0)
+        assert row["okx_fill_contracts"] == pytest.approx(178.0)
+        assert raw["contract_size"] == pytest.approx(10.0)
+        assert raw["base_quantity"] == pytest.approx(1780.0)
         assert raw["contract_size_verified"] is True
         assert raw["contract_size_source"] == "okx_public_instruments"
     finally:

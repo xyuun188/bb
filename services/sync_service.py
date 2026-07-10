@@ -414,6 +414,67 @@ def _exchange_reconcile_close_origin(
     return RECONCILE_ORIGIN_EXTERNAL_OKX
 
 
+def _okx_close_fill_fact_quantity(
+    *,
+    fill: dict[str, Any],
+    order_info: dict[str, Any],
+    contracts: float,
+    contract_size: float,
+    fallback_quantity: float,
+) -> float:
+    converted_quantity = (
+        float(contracts) * float(contract_size)
+        if float(contracts or 0.0) > 0 and float(contract_size or 0.0) > 0
+        else 0.0
+    )
+    if converted_quantity > 0:
+        return converted_quantity
+    explicit_quantity = _float_value(
+        _first_value(
+            fill.get("base_quantity"),
+            fill.get("baseQuantity"),
+            fill.get("fill_quantity"),
+            fill.get("filled_base_quantity"),
+            fill.get("filledBaseQuantity"),
+            fill.get("quantity"),
+            order_info.get("base_quantity"),
+            order_info.get("baseQuantity"),
+        ),
+        0.0,
+    )
+    if explicit_quantity > 0:
+        return explicit_quantity
+    return _float_value(fallback_quantity, 0.0)
+
+
+async def _position_entry_order_is_exchange_close_fill(
+    session: Any,
+    position: Position,
+) -> bool:
+    entry_order_ids = _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+    if not entry_order_ids:
+        return False
+    result = await session.execute(
+        select(Order).where(
+            Order.execution_mode == getattr(position, "execution_mode", None),
+            Order.exchange_order_id.in_(entry_order_ids),
+        )
+    )
+    orders = list(result.scalars().all())
+    for order in orders:
+        raw = _dict_value(getattr(order, "okx_raw_fills", None))
+        fill_pnl = _float_value(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
+        contracts = _float_value(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+        confirmed = (
+            raw.get("fills_history_confirmed") is True
+            or raw.get("execution_result_confirmed") is True
+            or str(getattr(order, "okx_sync_status", "") or "").startswith("okx_")
+        )
+        if confirmed and contracts > 0 and abs(fill_pnl) > 1e-12:
+            return True
+    return False
+
+
 def _okx_close_fill_order_payload(
     *,
     model_name: str,
@@ -442,6 +503,22 @@ def _okx_close_fill_order_payload(
     contracts = _float_value(fill.get("contracts"), 0.0)
     if contracts <= 0:
         contracts = _float_value(order_info.get("fillSz") or order_info.get("accFillSz"), 0.0)
+    contract_size = _float_value(
+        _first_value(
+            fill.get("contract_size"),
+            fill.get("contractSize"),
+            order_info.get("ctVal"),
+            order_info.get("contractSize"),
+        ),
+        0.0,
+    )
+    fact_quantity = _okx_close_fill_fact_quantity(
+        fill=fill,
+        order_info=order_info,
+        contracts=contracts,
+        contract_size=contract_size,
+        fallback_quantity=quantity,
+    )
     fill_pnl = _float_value(
         _first_value(fill.get("pnl"), fill.get("fillPnl"), order_info.get("fillPnl")),
         0.0,
@@ -457,8 +534,10 @@ def _okx_close_fill_order_payload(
         "trade_ids": [trade_id] if trade_id else [],
         "inst_id": okx_inst_id or _okx_inst_id_from_close_fill(fill, fallback=symbol),
         "contracts": contracts or None,
-        "contract_size": fill.get("contract_size"),
-        "base_quantity": quantity,
+        "contract_size": contract_size or fill.get("contract_size"),
+        "contract_size_verified": contract_size > 0,
+        "contract_size_source": "okx_close_fill" if contract_size > 0 else "missing",
+        "base_quantity": fact_quantity,
         "avg_price": price,
         "fee_abs": abs(float(fee or 0.0)),
         "fill_pnl": fill_pnl,
@@ -471,7 +550,7 @@ def _okx_close_fill_order_payload(
         "symbol": symbol,
         "side": side,
         "order_type": "market",
-        "quantity": quantity,
+        "quantity": fact_quantity,
         "price": price,
         "status": OrderStatus.FILLED.value,
         "fee": abs(float(fee or 0.0)),
@@ -1910,6 +1989,53 @@ class OkxSyncService:
                         )
                         continue
 
+                    if await _position_entry_order_is_exchange_close_fill(session, pos):
+                        now = datetime.now(UTC)
+                        opened_at = pos.created_at
+                        if opened_at and opened_at.tzinfo is None:
+                            opened_at = opened_at.replace(tzinfo=UTC)
+                        age_seconds = (now - opened_at).total_seconds() if opened_at else 0.0
+                        quarantined = self._quarantine_orphan_local_position(
+                            session=session,
+                            pos=pos,
+                            remove_memory_position=remove_memory_position,
+                            age_seconds=age_seconds,
+                            reason=(
+                                "The local entry order is an OKX-confirmed close/reduce fill "
+                                "with non-zero fillPnl, so this local open row is not an "
+                                "exchange-backed current position."
+                            ),
+                        )
+                        reconciled.append(
+                            {
+                                "kind": (
+                                    "entry_order_close_fill_position_quarantined"
+                                    if quarantined
+                                    else "entry_order_close_fill_position_quarantine_skipped"
+                                ),
+                                "source": "okx_authoritative_current_position",
+                                "model_name": pos.model_name,
+                                "symbol": pos.symbol,
+                                "side": pos.side,
+                                "exchange_order_id": getattr(pos, "entry_exchange_order_id", None),
+                                "requires_attention": False,
+                                "training_policy": "exclude_until_manual_trust",
+                                "note": (
+                                    "The local row was created from an OKX close/reduce fill, "
+                                    "not a clean entry fill; it was quarantined out of current "
+                                    "positions and clean training."
+                                ),
+                            }
+                        )
+                        if quarantined:
+                            logger.warning(
+                                "quarantined local position created from OKX close fill",
+                                position_id=pos.id,
+                                symbol=pos.symbol,
+                                side=pos.side,
+                            )
+                            continue
+
                     close_fill = await self._find_exchange_close_fill_with_timeout(
                         find_exchange_close_fill,
                         pos,
@@ -2234,6 +2360,7 @@ class OkxSyncService:
         pos: Position,
         remove_memory_position: Callable[[str, str, str], None],
         age_seconds: float,
+        reason: str | None = None,
     ) -> bool:
         """Move OKX-denied local open rows out of the current-position truth set.
 
@@ -2278,7 +2405,8 @@ class OkxSyncService:
             "old_unrealized_pnl": old_unrealized_pnl,
             "age_seconds": round(float(age_seconds or 0.0), 6),
             "source": ORPHAN_QUARANTINE_REFLECTION_SOURCE,
-            "reason": (
+            "reason": reason
+            or (
                 "OKX current positions do not contain this local open row, and no "
                 "matching close fill or active exchange order was found after the "
                 "confirmation grace window."

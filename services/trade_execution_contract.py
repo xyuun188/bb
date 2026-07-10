@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from services.profit_first_stage2 import profit_first_real_trade_upgrade_context
 from services.profit_first_trade_plan import build_profit_first_trade_plan
 
 WEAK_EVIDENCE_TIERS = {"weak_conflict_probe", "degraded_missing_probe"}
@@ -446,7 +447,12 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         plan = build_profit_first_trade_plan(row, analysis_type=_row_get(row, "analysis_type")).to_dict()
         plan_source = "derived_legacy_audit"
     evidence = _safe_dict(opportunity.get("evidence_score"))
-    expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+    opportunity_expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
+    profit_first_upgrade = profit_first_real_trade_upgrade_context(raw, row)
+    adjudicated_expected_net = _safe_float(
+        profit_first_upgrade.get("expected_net_return_pct"),
+        opportunity_expected_net,
+    )
     evidence_tier = str(evidence.get("tier") or "missing")
     execution_reason, execution_reason_source = _entry_execution_reason(
         row,
@@ -486,9 +492,12 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         and not bool(position_ladder.get("capped_by_stop_loss_budget"))
     ):
         violations.append("meaningful_lane_tiny_without_budget_reason")
-    if evidence_tier in WEAK_EVIDENCE_TIERS:
+    if evidence_tier in WEAK_EVIDENCE_TIERS and not _weak_evidence_can_execute(
+        evidence,
+        profit_first_upgrade,
+    ):
         violations.append("weak_evidence_executed")
-    if expected_net <= 0:
+    if adjudicated_expected_net <= 0:
         violations.append("non_positive_expected_net_executed")
     if size <= SMALL_SIZE_REASON_THRESHOLD and not _has_small_size_reason(sizing):
         violations.append("small_size_without_reason")
@@ -501,7 +510,8 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         "decision_id": _row_get(row, "id"),
         "symbol": _row_get(row, "symbol"),
         "action": _side(_row_get(row, "action")),
-        "expected_net_return_pct": round(expected_net, 6),
+        "expected_net_return_pct": round(opportunity_expected_net, 6),
+        "adjudicated_expected_net_return_pct": round(adjudicated_expected_net, 6),
         "profit_quality_ratio": round(_safe_float(opportunity.get("profit_quality_ratio")), 6),
         "loss_probability": round(
             _safe_float(opportunity.get("server_profit_loss_probability"), 1.0), 6
@@ -520,9 +530,13 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         "profit_first_expected_profit_usdt": plan.get("expected_profit_usdt"),
         "profit_first_exit_plan_id": plan.get("exit_plan_id"),
         "profit_first_model_sources": _safe_list(plan.get("model_sources"))[:12],
+        "profit_first_real_trade_upgrade": bool(profit_first_upgrade.get("ready")),
+        "profit_first_real_trade_upgrade_context": profit_first_upgrade,
         "profit_first_position_ladder": position_ladder,
         "evidence_tier": evidence_tier,
         "evidence_effective_score": evidence.get("effective_score"),
+        "evidence_shadow_only": bool(evidence.get("shadow_only")),
+        "evidence_tradeable_probe": bool(evidence.get("tradeable_probe")),
         "position_size_pct": round(size, 8),
         "suggested_leverage": round(_safe_float(_row_get(row, "suggested_leverage"), 1.0), 6),
         "has_execution_reason": bool(execution_reason),
@@ -535,6 +549,17 @@ def _entry_explanation(row: Any) -> dict[str, Any]:
         ),
         "violations": violations,
     }
+
+
+def _weak_evidence_can_execute(
+    evidence: dict[str, Any],
+    profit_first_upgrade: dict[str, Any],
+) -> bool:
+    if bool(evidence.get("tradeable_probe")):
+        return True
+    if bool(evidence.get("shadow_only")):
+        return False
+    return bool(profit_first_upgrade.get("ready"))
 
 
 def _exit_explanation(row: Any) -> dict[str, Any]:

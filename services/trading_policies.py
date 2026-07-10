@@ -377,7 +377,10 @@ class EntryPolicy:
             opportunity_data.get("evidence_score"), dict
         ):
             evidence_score = opportunity_data["evidence_score"]
-        should_wait_for_evidence = decision.position_size_pct <= 0 or (
+        evidence_shadow_only = bool(evidence_score.get("shadow_only")) and not bool(
+            evidence_score.get("tradeable_probe")
+        )
+        should_wait_for_evidence = decision.position_size_pct <= 0 or evidence_shadow_only or (
             evidence_tier == "blocked"
             and not bool(evidence_score.get("tradeable_probe"))
             and not profit_first_real_entry_upgrade
@@ -387,7 +390,8 @@ class EntryPolicy:
                 "entry_evidence_wait",
                 (
                     "动态证据仍未达到可执行状态：当前仓位预算已收敛为 0，"
-                    "或有效证据层级仍为 blocked 且没有被统一收益裁决提升。"
+                    "或动态证据明确标记为影子观察，或有效证据层级仍为 blocked "
+                    "且没有被统一收益裁决提升。"
                     "本轮不提交 OKX 订单，下一轮会用最新市场与模型证据重新评估。"
                 ),
                 {
@@ -396,6 +400,7 @@ class EntryPolicy:
                     "skip_kind": "entry_evidence_wait",
                     "evidence_tier": evidence_tier,
                     "evidence_score": evidence_score,
+                    "evidence_shadow_only": evidence_shadow_only,
                     "entry_evidence_advisory": entry_evidence_advisory,
                     "profit_first_decision_lane": profit_first_lane,
                     "profit_first_real_entry_upgrade": profit_first_real_entry_upgrade,

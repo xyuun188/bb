@@ -3793,6 +3793,55 @@ async def test_entry_policy_allows_positive_net_tradeable_probe_to_continue() ->
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_blocks_shadow_only_evidence_before_gate() -> None:
+    calls: list[str] = []
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.018
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 1.1,
+            "min_score_required": 0.7,
+            "expected_net_return_pct": 0.72,
+            "profit_quality_ratio": 0.55,
+            "tail_risk_score": 0.45,
+            "success_probability": 0.58,
+            "evidence_score": {
+                "tier": "weak_conflict_probe",
+                "effective_score": 35.0,
+                "size_multiplier": 0.03,
+                "tradeable_probe": False,
+                "shadow_only": True,
+            },
+        }
+    }
+
+    async def fake_sizing(sized_decision, model_mode, open_positions):
+        calls.append("sizing")
+        assert model_mode == "paper"
+        assert open_positions == []
+        assert sized_decision.position_size_pct > 0
+
+    class FakeGate:
+        def gate_reason(self, _decision):
+            calls.append("gate")
+            return None
+
+    policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_opportunity_gate=FakeGate(),
+    )
+
+    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
+
+    assert result.passed is False
+    assert result.blocker == "entry_evidence_wait"
+    assert result.data["skip_kind"] == "entry_evidence_wait"
+    assert result.data["evidence_tier"] == "weak_conflict_probe"
+    assert result.data["evidence_shadow_only"] is True
+    assert calls == ["sizing"]
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_blocks_blocked_evidence_without_tradeable_probe() -> None:
     calls: list[str] = []
     decision = _decision(Action.LONG)
@@ -7415,6 +7464,144 @@ async def test_sync_service_quarantines_orphan_local_position_without_close_fill
     assert result[0]["requires_attention"] is False
     assert result[0]["training_policy"] == "exclude_until_manual_trust"
     assert "quarantined" in result[0]["note"]
+
+
+@pytest.mark.asyncio
+async def test_sync_service_quarantines_position_created_from_entry_close_fill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    created_at = datetime.now(UTC)
+    local_position = SimpleNamespace(
+        id=4174,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LINK/USDT",
+        side="long",
+        is_open=True,
+        entry_price=7.9,
+        current_price=7.895,
+        quantity=3.8,
+        leverage=1.0,
+        unrealized_pnl=-0.019,
+        realized_pnl=0.0,
+        stop_loss_price=None,
+        take_profit_price=None,
+        entry_exchange_order_id="3730002078048428032",
+        close_exchange_order_id=None,
+        created_at=created_at,
+        closed_at=None,
+    )
+    entry_order = SimpleNamespace(
+        execution_mode="paper",
+        exchange_order_id="3730002078048428032",
+        okx_sync_status="okx_confirmed",
+        okx_fill_contracts=3.8,
+        okx_fill_pnl=-0.5472,
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": "3730002078048428032",
+            "inst_id": "LINK-USDT-SWAP",
+            "contracts": 3.8,
+            "fill_pnl": -0.5472,
+        },
+    )
+    quarantine_reflections: list[Any] = []
+    close_fill_calls: list[Any] = []
+
+    class FakeScalarResult:
+        def all(self):
+            return [entry_order]
+
+    class FakeExecuteResult:
+        def scalars(self):
+            return FakeScalarResult()
+
+    class FakeSession:
+        async def refresh(self, _pos):
+            return None
+
+        async def execute(self, _statement):
+            return FakeExecuteResult()
+
+        def add(self, row):
+            quarantine_reflections.append(row)
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return []
+
+    class FakeExecutor:
+        async def get_open_orders_strict(self, _symbol):
+            return []
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [local_position]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def close_fill(pos):
+        close_fill_calls.append(pos)
+        return {}
+
+    async def okx_executor(_mode):
+        return FakeExecutor()
+
+    async def protection_map(_paper_okx, _exchange_positions):
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    async def fresh_feature_vector(_symbol):
+        return SimpleNamespace(current_price=7.895)
+
+    async def entry_fee(_session, _pos, _close_qty):
+        return 0.0
+
+    async def log_close_decision(**_kwargs):
+        return None
+
+    async def record_reflection(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=lambda symbol: str(symbol or ""),
+        okx_executor_provider=okx_executor,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        exchange_close_fill_finder=close_fill,
+        fresh_feature_vector_provider=fresh_feature_vector,
+        market_value_reader=lambda source, key: getattr(source, key, None),
+        entry_fee_provider=entry_fee,
+        exchange_sync_close_decision_logger=log_close_decision,
+        trade_reflection_recorder=record_reflection,
+        position_margin_calculator=lambda notional, leverage: notional / float(leverage or 1.0),
+        memory_position_remover=lambda _model_name, _symbol, _side: None,
+    ).reconcile_exchange_positions()
+
+    assert close_fill_calls == []
+    assert local_position.is_open is False
+    assert local_position.close_exchange_order_id == "okx_orphan_quarantine:4174"
+    assert quarantine_reflections[0].expert_lessons["repair_plan"]["reason"].startswith(
+        "The local entry order is an OKX-confirmed close/reduce fill"
+    )
+    assert result[0]["kind"] == "entry_order_close_fill_position_quarantined"
+    assert result[0]["requires_attention"] is False
+    assert result[0]["training_policy"] == "exclude_until_manual_trust"
 
 
 @pytest.mark.asyncio

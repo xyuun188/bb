@@ -44,6 +44,32 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _entry_shadow_only_evidence_result(
+    raw: dict[str, Any],
+    base_data: dict[str, Any],
+) -> PolicyGateResult | None:
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    evidence = _safe_dict(opportunity.get("evidence_score"))
+    if not bool(evidence.get("shadow_only")) or bool(evidence.get("tradeable_probe")):
+        return None
+    return PolicyGateResult.block(
+        "entry_evidence_shadow_only",
+        (
+            "动态证据仍处于影子观察档，尚未升级为可交易探针；"
+            "系统已在提交 OKX 前拦截本次开仓。"
+        ),
+        {
+            **base_data,
+            "stage_status": "skipped",
+            "skip_kind": "entry_evidence_shadow_only",
+            "evidence_tier": evidence.get("tier") or "",
+            "evidence_effective_score": evidence.get("effective_score"),
+            "evidence_shadow_only": True,
+            "evidence_tradeable_probe": bool(evidence.get("tradeable_probe")),
+        },
+    )
+
+
 def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
     """Ensure an entry cannot reach OKX without the Profit-First v3 contract."""
 
@@ -150,6 +176,10 @@ def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateR
                 "profit_first_position_ladder": ladder,
             },
         )
+
+    shadow_only_evidence = _entry_shadow_only_evidence_result(raw, base_data)
+    if shadow_only_evidence is not None:
+        return shadow_only_evidence
 
     defensive_probe = DefensiveProbeShadowPolicy().evaluate(raw, decision)
     if not defensive_probe.allowed:

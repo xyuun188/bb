@@ -813,12 +813,17 @@ class OkxOrderFactSyncService:
                     contract_sizes=contract_sizes,
                 )
                 if pending_fill is not None:
+                    contract_size, contract_size_source = _contract_size_for_fill_with_source(
+                        pending_fill,
+                        contract_sizes,
+                    )
                     self._apply_fill_to_order(
                         order,
                         pending_fill,
                         now=now,
                         sync_status=OKX_SYNC_CONFIRMED,
-                        contract_size=_contract_size_for_fill(pending_fill, contract_sizes),
+                        contract_size=contract_size,
+                        contract_size_source=contract_size_source,
                         order_row=order_rows_by_id.get(str(pending_fill.order_id or "").strip()),
                     )
                     confirmed_count += 1
@@ -928,12 +933,17 @@ class OkxOrderFactSyncService:
                     order.okx_last_error = None
                     samples.append(_sample(order, kind="local_order_history_only"))
                 continue
+            contract_size, contract_size_source = _contract_size_for_fill_with_source(
+                fill,
+                contract_sizes,
+            )
             self._apply_fill_to_order(
                 order,
                 fill,
                 now=now,
                 sync_status=OKX_SYNC_CONFIRMED,
-                contract_size=_contract_size_for_fill(fill, contract_sizes),
+                contract_size=contract_size,
+                contract_size_source=contract_size_source,
                 order_row=order_row,
             )
             confirmed_count += 1
@@ -1008,13 +1018,17 @@ class OkxOrderFactSyncService:
                 continue
             if fill.timestamp is not None and _aware_utc(fill.timestamp) < since:
                 continue
+            contract_size, contract_size_source = _contract_size_for_fill_with_source(
+                fill,
+                contract_sizes,
+            )
             order = Order(
                 model_name="okx_authoritative_sync",
                 execution_mode=self.mode,
                 symbol=fill.symbol,
                 side=fill.side,
                 order_type=_fill_order_type(fill),
-                quantity=_fill_base_quantity(fill, _contract_size_for_fill(fill, contract_sizes)),
+                quantity=_fill_base_quantity(fill, contract_size),
                 price=fill.avg_price,
                 status="filled",
                 fee=fill.fee_abs,
@@ -1028,7 +1042,8 @@ class OkxOrderFactSyncService:
                 fill,
                 now=now,
                 sync_status=OKX_SYNC_OKX_ONLY,
-                contract_size=_contract_size_for_fill(fill, contract_sizes),
+                contract_size=contract_size,
+                contract_size_source=contract_size_source,
                 order_row=order_rows_by_id.get(fill.order_id),
             )
             session.add(order)
@@ -2174,8 +2189,12 @@ class OkxOrderFactSyncService:
         now: datetime,
         sync_status: str,
         contract_size: float = 0.0,
+        contract_size_source: str = "",
         order_row: dict[str, Any] | None = None,
     ) -> None:
+        contract_size_source = str(contract_size_source or "").strip()
+        if not contract_size_source:
+            contract_size_source = "okx_public_instruments_or_fill_row" if contract_size > 0 else "missing"
         order.exchange_order_id = fill.order_id
         order.okx_inst_id = fill.inst_id
         order.symbol = symbol_from_okx_inst_id(fill.inst_id) or fill.symbol
@@ -2201,9 +2220,7 @@ class OkxOrderFactSyncService:
             "contracts": fill.contracts,
             "contract_size": contract_size or None,
             "contract_size_verified": contract_size > 0,
-            "contract_size_source": (
-                "okx_public_instruments_or_fill_row" if contract_size > 0 else "missing"
-            ),
+            "contract_size_source": contract_size_source,
             "base_quantity": _fill_base_quantity(fill, contract_size),
             "avg_price": fill.avg_price,
             "fee_abs": fill.fee_abs,
@@ -2534,6 +2551,16 @@ def _repair_stored_fill_contract_size_from_instruments(
         and _relative_close_enough(local_quantity, base_quantity, 0.000001)
     )
     if already_verified:
+        if str(raw.get("contract_size_source") or "").strip() != "okx_public_instruments":
+            order.okx_inst_id = inst_id
+            order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
+            order.okx_synced_at = now
+            order.okx_last_error = None
+            raw["contract_size_source"] = "okx_public_instruments"
+            raw["contract_size_verified"] = True
+            raw["fills_history_confirmed"] = True
+            order.okx_raw_fills = raw
+            return True
         return False
 
     order.okx_inst_id = inst_id
@@ -2591,6 +2618,16 @@ def _repair_execution_result_contract_size_from_instruments(
         and _relative_close_enough(local_quantity, base_quantity, 0.000001)
     )
     if already_verified:
+        if str(raw.get("contract_size_source") or "").strip() != "okx_public_instruments":
+            order.okx_inst_id = inst_id
+            order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
+            order.okx_synced_at = now
+            order.okx_last_error = None
+            raw["contract_size_source"] = "okx_public_instruments"
+            raw["contract_size_verified"] = True
+            raw["execution_result_confirmed"] = True
+            order.okx_raw_fills = raw
+            return True
         return False
 
     order.okx_inst_id = inst_id
@@ -2718,15 +2755,29 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
         return _order_is_rejected_without_exchange_fill(order)
     status = str(getattr(order, "status", "") or "").lower().strip()
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
+    refreshable_status = status in {
+        "filled",
+        "partial",
+        "partially_filled",
+        "rejected",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+    }
     if sync_status == OKX_SYNC_CONFIRMED and _order_has_confirmed_okx_fill_fact(
         order,
         require_verified_contract_size=True,
     ):
+        if _stored_fill_contract_size_needs_public_reverification(order):
+            return refreshable_status
         return False
     if sync_status == OKX_SYNC_OKX_ONLY and _order_has_confirmed_okx_fill_fact(
         order,
         require_verified_contract_size=True,
     ):
+        if _stored_fill_contract_size_needs_public_reverification(order):
+            return refreshable_status
         return False
     if sync_status == OKX_SYNC_NO_FILL_REJECTED and status in {
         "rejected",
@@ -2736,15 +2787,7 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
         "canceled",
     }:
         return False
-    return status in {
-        "filled",
-        "partial",
-        "rejected",
-        "failed",
-        "error",
-        "cancelled",
-        "canceled",
-    }
+    return refreshable_status
 
 
 def _order_needs_local_stored_fact_recovery(order: Order) -> bool:
@@ -2876,6 +2919,22 @@ def _order_has_authoritative_stored_okx_fill_fact(order: Order) -> bool:
     if _safe_float(raw.get("avg_price") or raw.get("average") or getattr(order, "price", None), 0.0) <= 0:
         return False
     return True
+
+
+def _stored_fill_contract_size_needs_public_reverification(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if raw.get("fills_history_confirmed") is not True:
+        return False
+    if raw.get("contract_size_verified") is not True:
+        return True
+    source = str(raw.get("contract_size_source") or "").strip()
+    if source == "okx_public_instruments":
+        return False
+    inst_id = str(raw.get("inst_id") or getattr(order, "okx_inst_id", "") or "").strip().upper()
+    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    contract_size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), 0.0)
+    return bool(inst_id.endswith("-SWAP") and contracts > 0 and contract_size > 0)
 
 
 def sync_status_is_confirmed(value: Any) -> bool:
@@ -4324,15 +4383,22 @@ def _contract_size_for_fill(
     fill: OkxNativeFillGroup,
     contract_sizes: dict[str, float],
 ) -> float:
+    return _contract_size_for_fill_with_source(fill, contract_sizes)[0]
+
+
+def _contract_size_for_fill_with_source(
+    fill: OkxNativeFillGroup,
+    contract_sizes: dict[str, float],
+) -> tuple[float, str]:
     for key in (fill.inst_id, okx_inst_id_from_symbol(fill.symbol) or ""):
         size = _safe_float(contract_sizes.get(key), 0.0)
         if size > 0:
-            return size
+            return size, "okx_public_instruments"
     for row in fill.rows:
         size = _safe_float(row.get("ctVal") or row.get("contractSize"), 0.0)
         if size > 0:
-            return size
-    return 1.0
+            return size, "okx_fill_row"
+    return 1.0, "default_contract_size_1"
 
 
 def _fill_base_quantity(fill: OkxNativeFillGroup, contract_size: float) -> float:

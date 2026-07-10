@@ -182,6 +182,25 @@ def test_profit_first_entry_contract_late_attaches_position_review_plan_and_ladd
     assert ladder["late_attached_at"] == "execution_pre_submit"
 
 
+def test_profit_first_entry_contract_blocks_shadow_only_evidence_before_submit() -> None:
+    decision = _profit_first_ready_position_review_decision()
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["evidence_score"] = {
+        **opportunity["evidence_score"],
+        "tier": "weak_conflict_probe",
+        "effective_score": 35.0,
+        "shadow_only": True,
+        "tradeable_probe": False,
+    }
+
+    result = _profit_first_entry_contract_result(decision)
+
+    assert result.passed is False
+    assert result.blocker == "entry_evidence_shadow_only"
+    assert result.data["skip_kind"] == "entry_evidence_shadow_only"
+    assert result.data["evidence_shadow_only"] is True
+
+
 def test_profit_first_entry_contract_blocks_incomplete_entry_before_submit() -> None:
     decision = _entry_decision("BTC/USDT")
 
