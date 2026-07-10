@@ -7469,12 +7469,14 @@ class StrategyLearningService:
                 select(ShadowBacktest).options(
                     load_only(
                         ShadowBacktest.id,
+                        ShadowBacktest.decision_id,
                         ShadowBacktest.model_name,
                         ShadowBacktest.execution_mode,
                         ShadowBacktest.symbol,
                         ShadowBacktest.analysis_type,
                         ShadowBacktest.decision_action,
                         ShadowBacktest.decision_confidence,
+                        ShadowBacktest.training_feature_snapshot,
                         ShadowBacktest.status,
                         ShadowBacktest.due_at,
                         ShadowBacktest.horizon_minutes,
@@ -7543,15 +7545,63 @@ class StrategyLearningService:
                 .order_by(StrategyLearningEvent.created_at.desc())
                 .limit(capped_limit * params.market_event_limit_multiplier)
             )
+            decisions = [
+                SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()
+            ]
+            decision_snapshots = {
+                int(decision.id): _safe_dict(decision.raw_llm_response)
+                for decision in decisions
+                if _safe_int(getattr(decision, "id", None), 0) > 0
+            }
+            shadows = self._materialize_shadow_rows(
+                list(shadow_result.scalars().all()),
+                decision_snapshots,
+            )
             return {
                 "closed_positions": list(closed_result.scalars().all()),
                 "open_positions": list(open_result.scalars().all()),
                 "orders": list(order_result.scalars().all()),
-                "decisions": [
-                    SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()
-                ],
-                "shadows": list(shadow_result.scalars().all()),
+                "decisions": decisions,
+                "shadows": shadows,
                 "memories": list(memory_result.scalars().all()),
                 "reflections": list(reflection_result.scalars().all()),
                 "strategy_events": list(strategy_event_result.scalars().all()),
             }
+
+    @staticmethod
+    def _materialize_shadow_rows(
+        rows: list[Any],
+        decision_snapshots: dict[int, dict[str, Any]],
+    ) -> list[SimpleNamespace]:
+        """Detach compact shadow-learning evidence before the database session closes."""
+
+        materialized: list[SimpleNamespace] = []
+        for row in rows:
+            decision_id = _safe_int(getattr(row, "decision_id", None), 0)
+            materialized.append(
+                SimpleNamespace(
+                    id=getattr(row, "id", None),
+                    decision_id=decision_id or None,
+                    model_name=getattr(row, "model_name", None),
+                    execution_mode=getattr(row, "execution_mode", None),
+                    symbol=getattr(row, "symbol", None),
+                    analysis_type=getattr(row, "analysis_type", None),
+                    decision_action=getattr(row, "decision_action", None),
+                    decision_confidence=getattr(row, "decision_confidence", None),
+                    feature_snapshot=_safe_dict(
+                        getattr(row, "training_feature_snapshot", None)
+                    ),
+                    raw_llm_response=dict(decision_snapshots.get(decision_id, {})),
+                    status=getattr(row, "status", None),
+                    due_at=getattr(row, "due_at", None),
+                    horizon_minutes=getattr(row, "horizon_minutes", None),
+                    long_return_pct=getattr(row, "long_return_pct", None),
+                    short_return_pct=getattr(row, "short_return_pct", None),
+                    best_action=getattr(row, "best_action", None),
+                    missed_opportunity=bool(getattr(row, "missed_opportunity", False)),
+                    note=getattr(row, "note", ""),
+                    created_at=getattr(row, "created_at", None),
+                    updated_at=getattr(row, "updated_at", None),
+                )
+            )
+        return materialized

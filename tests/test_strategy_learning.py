@@ -3251,3 +3251,53 @@ def test_strategy_learning_rejects_structured_candidate_with_no_runtime_params(t
     assert backtest["consumed_runtime_params"] == []
     assert shadow["consumed_runtime_params"] == []
     assert payload["schedule"]["active_profile"]["id"] != "llm_inert_sample_target"
+
+
+def test_strategy_learning_materializes_compact_shadow_evidence_before_session_close() -> None:
+    class DetachedLegacyShadow:
+        id = 91
+        decision_id = 17
+        model_name = "ensemble_trader"
+        execution_mode = "paper"
+        symbol = "BTC/USDT"
+        analysis_type = "market"
+        decision_action = "hold"
+        decision_confidence = 0.68
+        training_feature_snapshot = {"market_regime": "trend", "volatility": 0.013}
+        status = "completed"
+        due_at = None
+        horizon_minutes = 30
+        long_return_pct = 0.42
+        short_return_pct = -0.31
+        best_action = "long"
+        missed_opportunity = True
+        note = "compact evidence only"
+        created_at = datetime.now(UTC)
+        updated_at = datetime.now(UTC)
+
+        @property
+        def feature_snapshot(self) -> dict[str, Any]:
+            raise AssertionError("deferred legacy JSON must not be accessed after session close")
+
+    rows = StrategyLearningService._materialize_shadow_rows(
+        [DetachedLegacyShadow()],
+        {17: {"opportunity_score": {"expected_net_return_pct": 0.42}}},
+    )
+
+    assert rows[0].feature_snapshot == {"market_regime": "trend", "volatility": 0.013}
+    assert rows[0].raw_llm_response["opportunity_score"]["expected_net_return_pct"] == 0.42
+
+    feedback = StrategyLearningEngine().compiler.compile(
+        mode="paper",
+        window_hours=24,
+        positions=[],
+        open_positions=[],
+        orders=[],
+        decisions=[],
+        shadows=rows,
+        memories=[],
+        max_open_positions=8,
+    )
+
+    assert feedback.shadow_feedback["completed_count"] == 1
+    assert feedback.shadow_feedback["missed_opportunity_count"] == 1
