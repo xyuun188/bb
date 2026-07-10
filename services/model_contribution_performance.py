@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
@@ -22,13 +22,17 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
-from services.trade_fact_trust import closed_position_trade_fact_trusted
+from services.trade_fact_trust import (
+    closed_position_trade_fact_trusted,
+    split_exchange_order_ids,
+)
 
 SessionFactory = Callable[[], Any]
 
 DEFAULT_CONTRIBUTION_LOOKBACK_DAYS = 7.0
 DEFAULT_POSITION_LIMIT = 800
 DEFAULT_ORDER_LIMIT = 3000
+MANUAL_CLOSE_LOOKUP_GRACE_SECONDS = 15.0
 OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 
 logger = structlog.get_logger(__name__)
@@ -127,15 +131,16 @@ class ModelContributionPerformanceService:
         self._position_limit = int(position_limit)
         self._order_limit = int(order_limit)
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._cache: dict[str, Any] = {"expires_at": None, "stats": {}}
+        self._cache_by_mode: dict[str, dict[str, Any]] = {}
 
     async def recent(self, mode: str) -> dict[str, dict[str, Any]]:
         """Return cached recent contribution performance for the selected mode."""
 
         selected_mode = "live" if mode == "live" else "paper"
         now = _aware(self._clock()) or datetime.now(UTC)
-        expires_at = self._cache.get("expires_at")
-        cached_stats = self._cache.get("stats")
+        cache_entry = self._cache_by_mode.get(selected_mode, {})
+        expires_at = cache_entry.get("expires_at")
+        cached_stats = cache_entry.get("stats")
         if isinstance(expires_at, datetime) and expires_at > now and isinstance(cached_stats, dict):
             return cached_stats
 
@@ -157,16 +162,27 @@ class ModelContributionPerformanceService:
                 )
                 positions = list(positions_result.scalars().all())
                 if not positions:
-                    self._cache = {
+                    self._cache_by_mode[selected_mode] = {
                         "expires_at": now + timedelta(minutes=15),
                         "stats": stats,
                     }
                     return stats
 
+                positions = [
+                    pos for pos in positions if closed_position_trade_fact_trusted(pos)
+                ]
                 symbols = {p.symbol for p in positions if p.symbol}
                 symbol_variants = symbol_query_variants(symbols)
+                close_times = [
+                    closed_at
+                    for pos in positions
+                    if (closed_at := _aware(getattr(pos, "closed_at", None))) is not None
+                ]
                 manual_close_orders = []
-                if symbol_variants:
+                if symbol_variants and close_times:
+                    grace = timedelta(seconds=MANUAL_CLOSE_LOOKUP_GRACE_SECONDS)
+                    close_window_start = min(close_times) - grace
+                    close_window_end = max(close_times) + grace
                     manual_close_result = await session.execute(
                         select(Order).where(
                             Order.model_name.in_(self._ledger_model_names),
@@ -174,6 +190,13 @@ class ModelContributionPerformanceService:
                             Order.status == "filled",
                             Order.symbol.in_(symbol_variants),
                             Order.exchange_order_id.like("manual_close:%"),
+                            or_(
+                                Order.filled_at.between(close_window_start, close_window_end),
+                                and_(
+                                    Order.filled_at.is_(None),
+                                    Order.created_at.between(close_window_start, close_window_end),
+                                ),
+                            ),
                         )
                     )
                     manual_close_orders = list(manual_close_result.scalars().all())
@@ -181,19 +204,26 @@ class ModelContributionPerformanceService:
                     pos
                     for pos in positions
                     if not position_has_manual_close_order(pos, manual_close_orders)
-                    and closed_position_trade_fact_trusted(pos)
                 ]
                 if not positions:
-                    self._cache = {
+                    self._cache_by_mode[selected_mode] = {
                         "expires_at": now + timedelta(minutes=15),
                         "stats": stats,
                     }
                     return stats
-                symbols = {p.symbol for p in positions if p.symbol}
-                symbol_variants = symbol_query_variants(symbols)
-                symbol_filter = (
-                    Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1
-                )
+                entry_order_ids = {
+                    order_id
+                    for pos in positions
+                    for order_id in split_exchange_order_ids(
+                        getattr(pos, "entry_exchange_order_id", None)
+                    )
+                }
+                if not entry_order_ids:
+                    self._cache_by_mode[selected_mode] = {
+                        "expires_at": now + timedelta(minutes=10),
+                        "stats": stats,
+                    }
+                    return stats
                 orders_result = await session.execute(
                     select(Order)
                     .where(
@@ -201,10 +231,9 @@ class ModelContributionPerformanceService:
                         Order.execution_mode == selected_mode,
                         Order.status == "filled",
                         Order.decision_id.is_not(None),
-                        symbol_filter,
+                        Order.exchange_order_id.in_(entry_order_ids),
                     )
                     .order_by(Order.filled_at.desc(), Order.created_at.desc())
-                    .limit(self._order_limit)
                 )
                 orders = list(orders_result.scalars().all())
                 decision_ids = [o.decision_id for o in orders if o.decision_id]
@@ -222,7 +251,7 @@ class ModelContributionPerformanceService:
             return {}
 
         stats = self.build_stats(positions, orders, decisions)
-        self._cache = {
+        self._cache_by_mode[selected_mode] = {
             "expires_at": now + timedelta(minutes=10),
             "stats": stats,
         }

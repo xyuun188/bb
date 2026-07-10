@@ -207,6 +207,7 @@ from services.position_time import PositionTimeParser
 from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
+from services.strategy_context_performance import StrategyContextPerformanceService
 from services.strategy_learning import StrategyLearningService
 from services.symbol_side_performance import SymbolSidePerformanceService
 from services.sync_service import OkxSyncService
@@ -301,6 +302,9 @@ ENTRY_SYMBOL_BLOCK_SCAN_LIMIT = 250
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
 STRATEGY_CONTEXT_IO_CONCURRENCY = 2
+STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS = 20.0
+STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS = 300.0
+STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS = 8.0
 STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_batched_maintenance"
 MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
 ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
@@ -566,6 +570,11 @@ class TradingService:
             lookback_limit=SYMBOL_SIDE_PROFILE_LOOKBACK,
             lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
             loss_cooldown_params=ENTRY_LOSS_COOLDOWN_PARAMS,
+        )
+        self.strategy_context_performance_service = StrategyContextPerformanceService(
+            daily_performance=self.daily_performance_service,
+            daily_side_performance=self.daily_side_performance_service,
+            symbol_side_performance=self.symbol_side_performance_service,
         )
         self.position_margin_calculator = PositionMarginCalculator()
         self.exchange_backed_position_provider = ExchangeBackedPositionProvider()
@@ -2166,6 +2175,268 @@ class TradingService:
         cache = {}
         self._strategy_learning_context_cache = cache
         return cache
+
+    def _strategy_context_performance_snapshot_store(self) -> dict[str, Any]:
+        cache = getattr(self, "_strategy_context_performance_snapshot_cache", None)
+        if isinstance(cache, dict):
+            return cache
+        cache = {}
+        self._strategy_context_performance_snapshot_cache = cache
+        return cache
+
+    def _strategy_context_performance_refresh_tasks(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_strategy_context_performance_refresh_task_store", None)
+        if isinstance(tasks, dict):
+            return tasks
+        tasks = {}
+        self._strategy_context_performance_refresh_task_store = tasks
+        return tasks
+
+    async def _refresh_strategy_context_performance_value(
+        self,
+        label: str,
+        loader: Any,
+    ) -> tuple[str, bool, Any, dict[str, Any]]:
+        """Load one optional performance value outside the analysis-round budget."""
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        gate = self._strategy_context_io_gate()
+        acquired = False
+        queue_wait_seconds = 0.0
+        status = "ok"
+        error = ""
+        try:
+            await asyncio.wait_for(
+                gate.acquire(),
+                timeout=STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS,
+            )
+            acquired = True
+            queue_wait_seconds = max(loop.time() - started, 0.0)
+            remaining_seconds = max(
+                STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS - queue_wait_seconds,
+                0.0,
+            )
+            if remaining_seconds <= 0.0:
+                status = "queue_timeout"
+                error = "background_refresh_queue_timeout"
+                return label, False, None, {
+                    "status": status,
+                    "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+                    "queue_wait_seconds": round(queue_wait_seconds, 6),
+                    "error": error,
+                }
+            value = await asyncio.wait_for(
+                loader(),
+                timeout=remaining_seconds,
+            )
+            return label, True, value, {
+                "status": status,
+                "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+                "queue_wait_seconds": round(queue_wait_seconds, 6),
+            }
+        except TimeoutError:
+            status = "queue_timeout" if not acquired else "timeout"
+            error = (
+                "background_refresh_queue_timeout"
+                if not acquired
+                else "background_refresh_timeout"
+            )
+        except Exception as exc:
+            status = "error"
+            error = safe_error_text(exc, limit=160)
+        finally:
+            if acquired:
+                gate.release()
+
+        logger.warning(
+            "strategy context performance refresh failed",
+            stage=label,
+            status=status,
+            error=error,
+        )
+        return label, False, None, {
+            "status": status,
+            "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+            "queue_wait_seconds": round(queue_wait_seconds, 6),
+            "error": error,
+        }
+
+    def _start_strategy_context_performance_refresh(self, mode: str) -> asyncio.Task:
+        """Start one bounded performance snapshot refresh per execution mode."""
+
+        selected_mode = "live" if mode == "live" else "paper"
+        tasks = self._strategy_context_performance_refresh_tasks()
+        existing = tasks.get(selected_mode)
+        if existing is not None and not existing.done():
+            return existing
+
+        async def _refresh() -> dict[str, Any]:
+            loaders = {
+                "position_performance": lambda: self._strategy_context_position_performance(
+                    selected_mode
+                ),
+                "model_contribution_perf": lambda: self._recent_model_contribution_performance(
+                    selected_mode
+                ),
+            }
+            rows = await asyncio.gather(
+                *[
+                    self._refresh_strategy_context_performance_value(label, loader)
+                    for label, loader in loaders.items()
+                ]
+            )
+            cache = self._strategy_context_performance_snapshot_store()
+            previous = cache.get(selected_mode)
+            previous_values = (
+                dict(previous.get("values") or {})
+                if isinstance(previous, dict)
+                else {}
+            )
+            values = dict(previous_values)
+            timings: dict[str, Any] = {}
+            successful_count = 0
+            failed_labels: list[str] = []
+            for label, succeeded, value, timing in rows:
+                if label == "position_performance":
+                    for performance_label in (
+                        "daily_perf",
+                        "today_side_perf",
+                        "multiday_side_perf",
+                        "symbol_side_perf",
+                    ):
+                        timings[performance_label] = {
+                            **timing,
+                            "source": "shared_position_performance_snapshot",
+                        }
+                else:
+                    timings[label] = timing
+                if succeeded:
+                    if label == "position_performance":
+                        bundle = self._safe_dict(value)
+                        for performance_label in (
+                            "daily_perf",
+                            "today_side_perf",
+                            "multiday_side_perf",
+                            "symbol_side_perf",
+                        ):
+                            values[performance_label] = self._json_safe_payload(
+                                self._safe_dict(bundle.get(performance_label))
+                            )
+                            successful_count += 1
+                    else:
+                        values[label] = self._json_safe_payload(value)
+                        successful_count += 1
+                else:
+                    if label == "position_performance":
+                        failed_labels.extend(
+                            (
+                                "daily_perf",
+                                "today_side_perf",
+                                "multiday_side_perf",
+                                "symbol_side_perf",
+                            )
+                        )
+                    else:
+                        failed_labels.append(label)
+
+            if successful_count:
+                version = int(previous.get("version") or 0) + 1 if isinstance(previous, dict) else 1
+                entry = {
+                    "created_at": datetime.now(UTC),
+                    "values": values,
+                    "version": version,
+                    "refresh_timings": timings,
+                    "failed_labels": failed_labels,
+                }
+                cache[selected_mode] = entry
+                return entry
+
+            if isinstance(previous, dict):
+                entry = {
+                    **previous,
+                    "refresh_timings": timings,
+                    "failed_labels": failed_labels,
+                    "last_refresh_failed_at": datetime.now(UTC),
+                }
+                cache[selected_mode] = entry
+                return entry
+
+            return {
+                "created_at": None,
+                "values": {},
+                "version": 0,
+                "refresh_timings": timings,
+                "failed_labels": failed_labels,
+            }
+
+        task = asyncio.create_task(_refresh())
+        tasks[selected_mode] = task
+        task.add_done_callback(_consume_task_result)
+        return task
+
+    async def _prime_strategy_context_performance_snapshot(self, mode: str) -> None:
+        """Warm the shared performance snapshot before analysis loops begin."""
+
+        task = self._start_strategy_context_performance_refresh(mode)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+        except TimeoutError:
+            logger.warning(
+                "strategy context performance warmup continues in background",
+                mode=mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "strategy context performance warmup failed",
+                mode=mode,
+                error=safe_error_text(exc),
+            )
+
+    def _recent_strategy_context_performance_snapshot(
+        self,
+        mode: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Return the latest performance snapshot with explicit freshness semantics."""
+
+        selected_mode = "live" if mode == "live" else "paper"
+        entry = self._strategy_context_performance_snapshot_store().get(selected_mode)
+        if not isinstance(entry, dict):
+            return None, {
+                "status": "baseline_background_refresh",
+                "source": "background_performance_snapshot",
+                "available": False,
+                "version": 0,
+            }
+        created_at = entry.get("created_at")
+        values = entry.get("values")
+        if not isinstance(created_at, datetime) or not isinstance(values, dict):
+            return None, {
+                "status": "baseline_background_refresh",
+                "source": "background_performance_snapshot",
+                "available": False,
+                "version": int(entry.get("version") or 0),
+            }
+        age_seconds = max((datetime.now(UTC) - created_at).total_seconds(), 0.0)
+        if age_seconds > STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS:
+            return None, {
+                "status": "expired_background_refresh",
+                "source": "background_performance_snapshot",
+                "available": False,
+                "version": int(entry.get("version") or 0),
+                "age_seconds": round(age_seconds, 3),
+            }
+        return dict(values), {
+            "status": (
+                "fresh" if age_seconds <= STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS else "stale"
+            ),
+            "source": "background_performance_snapshot",
+            "available": True,
+            "version": int(entry.get("version") or 0),
+            "age_seconds": round(age_seconds, 3),
+            "failed_labels": list(entry.get("failed_labels") or []),
+            "last_refresh_timings": dict(entry.get("refresh_timings") or {}),
+        }
 
     def _start_strategy_learning_context_refresh(
         self,
@@ -4214,6 +4485,7 @@ class TradingService:
         perf_timeout = self.strategy_learning_perf_timeout_seconds()
         account_timeout = self.strategy_learning_account_timeout_seconds()
         context_fetch_timings: dict[str, Any] = {}
+        analysis_scope = _analysis_scope_context.get()
 
         if not open_positions:
             try:
@@ -4228,56 +4500,37 @@ class TradingService:
         position_group_count = self.entry_symbol_universe.open_position_group_count(
             open_positions or []
         )
-        (
-            daily_state,
-            side_perf,
-            side_perf_multiday,
-            symbol_side_perf,
-            model_contribution_perf,
-            account_equity,
-        ) = await asyncio.gather(
-            self._bounded_strategy_context_value(
-                "daily_perf",
-                self.daily_performance_service.state(selected_mode),
-                {},
-                perf_timeout,
-                context_fetch_timings,
-            ),
-            self._bounded_strategy_context_value(
-                "today_side_perf",
-                self._today_side_performance(selected_mode),
-                {},
-                perf_timeout,
-                context_fetch_timings,
-            ),
-            self._bounded_strategy_context_value(
-                "multiday_side_perf",
-                self._multiday_side_performance(selected_mode),
-                {},
-                perf_timeout,
-                context_fetch_timings,
-            ),
-            self._bounded_strategy_context_value(
-                "symbol_side_perf",
-                self._recent_symbol_side_performance(selected_mode),
-                {},
-                perf_timeout,
-                context_fetch_timings,
-            ),
-            self._bounded_strategy_context_value(
-                "model_contribution_perf",
-                self._recent_model_contribution_performance(selected_mode),
-                {},
-                perf_timeout,
-                context_fetch_timings,
-            ),
-            self._bounded_strategy_context_value(
-                "account_equity",
-                self._strategy_context_account_equity(selected_mode),
-                0.0,
-                account_timeout,
-                context_fetch_timings,
-            ),
+        performance_values, performance_snapshot = (
+            self._recent_strategy_context_performance_snapshot(selected_mode)
+        )
+        performance_refresh = None
+        if performance_snapshot.get("status") != "fresh":
+            performance_refresh = self._start_strategy_context_performance_refresh(selected_mode)
+        if performance_values is None and analysis_scope != "market":
+            if performance_refresh is not None:
+                done, _pending = await asyncio.wait({performance_refresh}, timeout=perf_timeout)
+                if done:
+                    performance_values, performance_snapshot = (
+                        self._recent_strategy_context_performance_snapshot(selected_mode)
+                    )
+        performance_snapshot["refresh_in_flight"] = bool(
+            performance_refresh is not None and not performance_refresh.done()
+        )
+        context_fetch_timings["performance_snapshot"] = performance_snapshot
+        performance_values = performance_values or {}
+        daily_state = self._safe_dict(performance_values.get("daily_perf"))
+        side_perf = self._safe_dict(performance_values.get("today_side_perf"))
+        side_perf_multiday = self._safe_dict(performance_values.get("multiday_side_perf"))
+        symbol_side_perf = self._safe_dict(performance_values.get("symbol_side_perf"))
+        model_contribution_perf = self._safe_dict(
+            performance_values.get("model_contribution_perf")
+        )
+        account_equity = await self._bounded_strategy_context_value(
+            "account_equity",
+            self._strategy_context_account_equity(selected_mode),
+            0.0,
+            account_timeout,
+            context_fetch_timings,
         )
         context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
@@ -4293,6 +4546,7 @@ class TradingService:
         )
         self._sync_market_recent_loss_profiles(symbol_side_perf)
         context["account_equity"] = account_equity
+        context["strategy_context_performance"] = performance_snapshot
         if _analysis_scope_context.get() == "market":
             context["account_equity_source"] = getattr(
                 self,
@@ -4302,7 +4556,8 @@ class TradingService:
         context["strategy_context_runtime"] = {
             "perf_timeout_seconds": perf_timeout,
             "account_timeout_seconds": account_timeout,
-            "parallel_context_fetch": True,
+            "parallel_context_fetch": False,
+            "performance_snapshot_source": "background_single_flight",
             "fetch_timings": context_fetch_timings,
         }
         strategy_learning = getattr(self, "strategy_learning_service", None)
@@ -4831,6 +5086,19 @@ class TradingService:
             service = DailySidePerformanceService()
             self.daily_side_performance_service = service
         return await service.state(mode)
+
+    async def _strategy_context_position_performance(self, mode: str) -> dict[str, dict[str, Any]]:
+        """Load the four position-based strategy metrics from one bounded snapshot."""
+
+        service = getattr(self, "strategy_context_performance_service", None)
+        if service is None:
+            service = StrategyContextPerformanceService(
+                daily_performance=self.daily_performance_service,
+                daily_side_performance=getattr(self, "daily_side_performance_service", None),
+                symbol_side_performance=getattr(self, "symbol_side_performance_service", None),
+            )
+            self.strategy_context_performance_service = service
+        return await service.recent(mode)
 
     async def _multiday_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
         """Recent multi-day realized PnL split by side, for posture feedback."""
@@ -5395,6 +5663,7 @@ class TradingService:
 
         await self._refresh_entry_symbol_blocks_if_stale(force=True)
         await self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value)
+        await self._prime_strategy_context_performance_snapshot(mode_manager.mode.value)
 
         # Subscribe to mode changes to reinitialize LLM agent
         mode_manager.subscribe(self._on_mode_changed)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -7,6 +8,27 @@ import pytest
 
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.trading_service import TradingService
+
+
+class _FakeRowsResult:
+    def __init__(self, rows: list[object]) -> None:
+        self._rows = rows
+
+    def scalars(self) -> _FakeRowsResult:
+        return self
+
+    def all(self) -> list[object]:
+        return list(self._rows)
+
+
+class _FakeSession:
+    def __init__(self, rows_by_query: list[list[object]]) -> None:
+        self._rows_by_query = list(rows_by_query)
+        self.statements: list[object] = []
+
+    async def execute(self, statement: object) -> _FakeRowsResult:
+        self.statements.append(statement)
+        return _FakeRowsResult(self._rows_by_query.pop(0))
 
 
 def _decision(decision_id: int, raw: dict) -> SimpleNamespace:
@@ -168,6 +190,72 @@ def test_model_contribution_matches_okx_symbol_variants() -> None:
     assert diagnostics["matched_position_count"] == 1
     assert diagnostics["reason"] == "ok"
     assert stats["ml_profit_model"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_model_contribution_recent_reads_exact_entry_orders_in_closed_position_window() -> None:
+    now = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    raw = {"opportunity_score": {"ml_aligned": True}}
+    position = SimpleNamespace(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        realized_pnl=3.0,
+        is_open=False,
+        created_at=now - timedelta(minutes=1),
+        closed_at=now,
+        entry_exchange_order_id="entry-a,entry-b",
+        close_exchange_order_id="close-a",
+    )
+    order = _order(1, 1, created_at=now - timedelta(minutes=1))
+    order.exchange_order_id = "entry-a"
+    decision = _decision(1, raw)
+    session = _FakeSession([[position], [], [order], [decision]])
+
+    @asynccontextmanager
+    async def session_factory():
+        yield session
+
+    service = ModelContributionPerformanceService(
+        session_factory=session_factory,
+        clock=lambda: now,
+    )
+
+    stats = await service.recent("paper")
+
+    assert stats["ml_profit_model"]["count"] == 1
+    assert len(session.statements) == 4
+    manual_close_query = str(session.statements[1])
+    entry_order_query = session.statements[2]
+    assert "orders.filled_at BETWEEN" in manual_close_query
+    assert "orders.created_at BETWEEN" in manual_close_query
+    assert "orders.exchange_order_id IN" in str(entry_order_query)
+    entry_order_params = entry_order_query.compile().params
+    entry_id_lists = [value for value in entry_order_params.values() if isinstance(value, list)]
+    assert {"entry-a", "entry-b"} in [set(value) for value in entry_id_lists]
+
+
+@pytest.mark.asyncio
+async def test_model_contribution_recent_cache_is_isolated_per_execution_mode() -> None:
+    now = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    session = _FakeSession([[], []])
+
+    @asynccontextmanager
+    async def session_factory():
+        yield session
+
+    service = ModelContributionPerformanceService(
+        session_factory=session_factory,
+        clock=lambda: now,
+    )
+
+    await service.recent("paper")
+    await service.recent("paper")
+    await service.recent("live")
+
+    assert len(session.statements) == 2
+    assert set(service._cache_by_mode) == {"paper", "live"}
 
 
 def test_model_contribution_sources_fall_back_to_ai_only_without_quant() -> None:

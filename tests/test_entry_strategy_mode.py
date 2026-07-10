@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -181,6 +181,28 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
         target_position_groups=3,
         roster_fill_market_symbol_min=12,
     )
+    service._refresh_dynamic_capacity = (  # type: ignore[method-assign]
+        lambda **kwargs: {
+            **kwargs["strategy_context"],
+            "account_equity": kwargs["account_equity"],
+        }
+    )
+    service._json_safe_payload = lambda value: value  # type: ignore[method-assign]
+    service._strategy_context_performance_snapshot_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC),
+            "values": {
+                "daily_perf": {"today_total_pnl": 5.0, "today_high_water_pnl": 6.0},
+                "today_side_perf": {"long": {"pnl": 1.0}, "short": {"pnl": 0.0}},
+                "multiday_side_perf": {"long": {"pnl": 1.0}, "short": {"pnl": 0.0}},
+                "symbol_side_perf": {"BTC/USDT|long": {"pnl": 1.0}},
+                "model_contribution_perf": {"server_profit_model": {"pnl": 1.0}},
+            },
+            "version": 1,
+            "refresh_timings": {},
+            "failed_labels": [],
+        }
+    }
     service.strategy_learning_service = None
     result = await service._strategy_mode_context(
         "paper",
@@ -195,11 +217,12 @@ async def test_trading_service_strategy_mode_context_delegates_to_policy() -> No
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 1.0}}
     assert result["portfolio_roster"]["market_symbol_min"] == 12
     assert result["portfolio_roster"]["market_symbol_min_is_batch_size"] is False
-    assert result["strategy_context_runtime"]["parallel_context_fetch"] is True
+    assert result["strategy_context_performance"]["status"] == "fresh"
+    assert result["strategy_context_runtime"]["parallel_context_fetch"] is False
 
 
 @pytest.mark.asyncio
-async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently(
+async def test_trading_service_strategy_mode_context_builds_and_reuses_background_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = object.__new__(TradingService)
@@ -261,11 +284,28 @@ async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently
     service._multiday_side_performance = side_perf
     service._recent_symbol_side_performance = symbol_side_perf
     service._recent_model_contribution_performance = contribution_perf
+    service._strategy_context_position_performance = (  # type: ignore[method-assign]
+        lambda _mode: slow_value(
+            {
+                "daily_perf": {"today_total_pnl": 1.0},
+                "today_side_perf": {"long": {"pnl": 1.0}},
+                "multiday_side_perf": {"long": {"pnl": 1.0}},
+                "symbol_side_perf": {"ETH/USDT|long": {"pnl": 2.0}},
+            }
+        )
+    )
     service.entry_position_exposure = Exposure()
     service.entry_symbol_universe = EntrySymbolUniversePolicy(lambda symbol: str(symbol or ""))
     service.allocated_order_balance = balance
     service.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
     service.strategy_learning_service = None
+    service._refresh_dynamic_capacity = (  # type: ignore[method-assign]
+        lambda **kwargs: {
+            **kwargs["strategy_context"],
+            "account_equity": kwargs["account_equity"],
+        }
+    )
+    service._json_safe_payload = lambda value: value  # type: ignore[method-assign]
 
     started_at = asyncio.get_running_loop().time()
     result = await service._strategy_mode_context(
@@ -275,12 +315,249 @@ async def test_trading_service_strategy_mode_context_fetches_inputs_concurrently
     )
     elapsed = asyncio.get_running_loop().time() - started_at
 
+    task = service._strategy_context_performance_refresh_tasks()["paper"]
+    await task
+    result = await service._strategy_mode_context(
+        "paper",
+        {"mode": "uptrend_continuation", "confidence": 0.6},
+        open_positions=[{"symbol": "ETH/USDT"}],
+    )
+
     assert peak_fetches == trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY
     assert elapsed < 0.3
     assert result["account_equity"] == 1_000.0
     assert result["symbol_side_performance"] == {"ETH/USDT|long": {"pnl": 2.0}}
     assert result["model_contribution_performance"] == {"server_profit_model": {"pnl": 3.0}}
-    assert result["strategy_context_runtime"]["parallel_context_fetch"] is True
+    assert result["strategy_context_performance"]["status"] == "fresh"
+    assert result["strategy_context_runtime"]["parallel_context_fetch"] is False
+
+
+@pytest.mark.asyncio
+async def test_strategy_context_performance_snapshot_reuses_stale_value_while_refresh_runs() -> None:
+    service = object.__new__(TradingService)
+    service._json_safe_payload = lambda value: value  # type: ignore[method-assign]
+    service._strategy_context_performance_snapshot_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC) - timedelta(seconds=30),
+            "values": {"daily_perf": {"today_total_pnl": 7.0}},
+            "version": 4,
+            "refresh_timings": {},
+            "failed_labels": [],
+        }
+    }
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_value(value: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return value
+
+    service.daily_performance_service = SimpleNamespace(
+        state=lambda _mode: slow_value({"today_total_pnl": 8.0})
+    )
+    service._today_side_performance = lambda _mode: slow_value({"long": {"pnl": 1.0}})
+    service._multiday_side_performance = lambda _mode: slow_value({"long": {"pnl": 2.0}})
+    service._recent_symbol_side_performance = lambda _mode: slow_value({"BTC/USDT|long": {}})
+    service._recent_model_contribution_performance = lambda _mode: slow_value({"expert": {}})
+    service._strategy_context_position_performance = (  # type: ignore[method-assign]
+        lambda _mode: slow_value(
+            {
+                "daily_perf": {"today_total_pnl": 8.0},
+                "today_side_perf": {"long": {"pnl": 1.0}},
+                "multiday_side_perf": {"long": {"pnl": 2.0}},
+                "symbol_side_perf": {"BTC/USDT|long": {}},
+            }
+        )
+    )
+
+    values, snapshot = service._recent_strategy_context_performance_snapshot("paper")
+    task = service._start_strategy_context_performance_refresh("paper")
+    same_task = service._start_strategy_context_performance_refresh("paper")
+
+    assert values == {"daily_perf": {"today_total_pnl": 7.0}}
+    assert snapshot["status"] == "stale"
+    assert task is same_task
+    await started.wait()
+    assert calls <= trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY
+
+    release.set()
+    await task
+
+    refreshed_values, refreshed_snapshot = service._recent_strategy_context_performance_snapshot("paper")
+    assert refreshed_snapshot["status"] == "fresh"
+    assert refreshed_snapshot["version"] == 5
+    assert refreshed_values is not None
+    assert refreshed_values["daily_perf"]["today_total_pnl"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_strategy_context_performance_refresh_failure_preserves_last_valid_snapshot() -> None:
+    service = object.__new__(TradingService)
+    service._json_safe_payload = lambda value: value  # type: ignore[method-assign]
+    previous_values = {"daily_perf": {"today_total_pnl": 7.0}}
+    service._strategy_context_performance_snapshot_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC) - timedelta(seconds=30),
+            "values": previous_values,
+            "version": 4,
+            "refresh_timings": {},
+            "failed_labels": [],
+        }
+    }
+
+    async def fail(_mode: str) -> dict[str, Any]:
+        raise RuntimeError("database unavailable")
+
+    service.daily_performance_service = SimpleNamespace(state=fail)
+    service._today_side_performance = fail
+    service._multiday_side_performance = fail
+    service._recent_symbol_side_performance = fail
+    service._recent_model_contribution_performance = fail
+    service._strategy_context_position_performance = fail  # type: ignore[method-assign]
+
+    await service._start_strategy_context_performance_refresh("paper")
+
+    values, snapshot = service._recent_strategy_context_performance_snapshot("paper")
+    cached = service._strategy_context_performance_snapshot_cache["paper"]
+    assert values == previous_values
+    assert snapshot["status"] == "stale"
+    assert cached["version"] == 4
+    assert len(cached["failed_labels"]) == 5
+    assert isinstance(cached["last_refresh_failed_at"], datetime)
+
+
+@pytest.mark.asyncio
+async def test_strategy_context_performance_refresh_times_out_waiting_for_shared_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(TradingService)
+    gate = asyncio.Semaphore(1)
+    await gate.acquire()
+    service._strategy_context_io_semaphore = gate
+    monkeypatch.setattr(
+        trading_service,
+        "STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def unexpected_loader() -> dict[str, Any]:
+        raise AssertionError("loader must not run before a shared-gate timeout")
+
+    label, succeeded, value, timing = await service._refresh_strategy_context_performance_value(
+        "daily_perf",
+        unexpected_loader,
+    )
+
+    assert label == "daily_perf"
+    assert succeeded is False
+    assert value is None
+    assert timing["status"] == "queue_timeout"
+    gate.release()
+
+
+@pytest.mark.asyncio
+async def test_strategy_context_performance_warmup_waits_for_initial_snapshot() -> None:
+    service = object.__new__(TradingService)
+    completed = asyncio.Event()
+
+    async def refresh() -> None:
+        await asyncio.sleep(0)
+        completed.set()
+
+    service._start_strategy_context_performance_refresh = lambda _mode: asyncio.create_task(  # type: ignore[method-assign]
+        refresh()
+    )
+
+    await service._prime_strategy_context_performance_snapshot("paper")
+
+    assert completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_market_and_position_contexts_share_one_performance_refresh() -> None:
+    service = object.__new__(TradingService)
+    service._json_safe_payload = lambda value: value  # type: ignore[method-assign]
+    service._strategy_context_performance_snapshot_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC) - timedelta(seconds=30),
+            "values": {"daily_perf": {"today_total_pnl": 4.0}},
+            "version": 1,
+            "refresh_timings": {},
+            "failed_labels": [],
+        }
+    }
+    service.entry_position_exposure = SimpleNamespace(context=lambda positions: {"count": len(positions)})
+    service.entry_symbol_universe = SimpleNamespace(
+        open_position_group_count=lambda positions: len(positions)
+    )
+    service.entry_strategy_mode_context = EntryStrategyModeContextPolicy()
+    service._refresh_dynamic_capacity = (  # type: ignore[method-assign]
+        lambda **kwargs: {**kwargs["strategy_context"], "account_equity": kwargs["account_equity"]}
+    )
+
+    async def account_equity(_mode: str) -> float:
+        return 1_000.0
+
+    service._strategy_context_account_equity = account_equity  # type: ignore[method-assign]
+    service.strategy_learning_service = None
+    release = asyncio.Event()
+    started = asyncio.Event()
+    calls = 0
+
+    async def slow_value(value: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return value
+
+    service.daily_performance_service = SimpleNamespace(
+        state=lambda _mode: slow_value({"today_total_pnl": 5.0})
+    )
+    service._today_side_performance = lambda _mode: slow_value({"long": {"pnl": 1.0}})
+    service._multiday_side_performance = lambda _mode: slow_value({"long": {"pnl": 1.0}})
+    service._recent_symbol_side_performance = lambda _mode: slow_value({})
+    service._recent_model_contribution_performance = lambda _mode: slow_value({})
+    service._strategy_context_position_performance = (  # type: ignore[method-assign]
+        lambda _mode: slow_value(
+            {
+                "daily_perf": {"today_total_pnl": 5.0},
+                "today_side_perf": {"long": {"pnl": 1.0}},
+                "multiday_side_perf": {"long": {"pnl": 1.0}},
+                "symbol_side_perf": {},
+            }
+        )
+    )
+
+    async def build_context(scope: str) -> dict[str, Any]:
+        token = trading_service._analysis_scope_context.set(scope)
+        try:
+            return await service._strategy_mode_context(
+                "paper",
+                {"mode": "range", "confidence": 0.4},
+                open_positions=[{"symbol": "BTC/USDT"}],
+            )
+        finally:
+            trading_service._analysis_scope_context.reset(token)
+
+    market_context, position_context = await asyncio.gather(
+        build_context("market"),
+        build_context("position"),
+    )
+    task = service._strategy_context_performance_refresh_tasks()["paper"]
+
+    assert market_context["strategy_context_performance"]["status"] == "stale"
+    assert position_context["strategy_context_performance"]["status"] == "stale"
+    await started.wait()
+    assert calls <= trading_service.STRATEGY_CONTEXT_IO_CONCURRENCY
+
+    release.set()
+    await task
+    assert calls == 2
 
 
 @pytest.mark.asyncio

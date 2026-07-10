@@ -35,6 +35,17 @@ class DailyPerformanceService:
         """Return today's realized and open PnL for the selected execution mode."""
 
         selected_mode = "live" if mode == "live" else "paper"
+        async with self._session_factory() as session:
+            rows = await self._trade_repository_factory(session).get_position_records(
+                execution_mode=selected_mode,
+                model_name=self._model_name,
+                limit=5000,
+            )
+        return self.build_state(rows)
+
+    def build_state(self, rows: list[Any]) -> dict[str, float]:
+        """Build the daily posture state from an already-loaded position snapshot."""
+
         now_local = self._clock()
         if now_local.tzinfo is None:
             now_local = now_local.replace(tzinfo=timezone(timedelta(hours=8)))
@@ -48,39 +59,33 @@ class DailyPerformanceService:
         high_water = 0.0
         open_unrealized = 0.0
 
-        async with self._session_factory() as session:
-            rows = await self._trade_repository_factory(session).get_position_records(
-                execution_mode=selected_mode,
-                model_name=self._model_name,
-                limit=5000,
-            )
-            closed_today = []
-            for pos in rows:
-                if pos.is_open:
-                    open_unrealized += float(pos.unrealized_pnl or 0.0)
-                    continue
-                closed_at = pos.closed_at
-                if not closed_at:
-                    continue
-                if closed_at.tzinfo is None:
-                    closed_at = closed_at.replace(tzinfo=UTC)
-                if closed_at < start_utc:
-                    continue
-                if not closed_position_trade_fact_trusted(pos):
-                    continue
-                closed_today.append(pos)
+        closed_today = []
+        for pos in rows:
+            if pos.is_open:
+                open_unrealized += float(pos.unrealized_pnl or 0.0)
+                continue
+            closed_at = pos.closed_at
+            if not closed_at:
+                continue
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=UTC)
+            if closed_at < start_utc:
+                continue
+            if not closed_position_trade_fact_trusted(pos):
+                continue
+            closed_today.append(pos)
 
-            closed_today.sort(key=lambda p: p.closed_at or datetime.min)
-            running = 0.0
-            for pos in closed_today:
-                pnl = float(pos.realized_pnl or 0.0)
-                running += pnl
-                high_water = max(high_water, running)
-                trade_count += 1
-                if pnl >= 0:
-                    realized_profit += pnl
-                else:
-                    realized_loss += abs(pnl)
+        closed_today.sort(key=lambda p: p.closed_at or datetime.min)
+        running = 0.0
+        for pos in closed_today:
+            pnl = float(pos.realized_pnl or 0.0)
+            running += pnl
+            high_water = max(high_water, running)
+            trade_count += 1
+            if pnl >= 0:
+                realized_profit += pnl
+            else:
+                realized_loss += abs(pnl)
 
         realized_pnl = realized_profit - realized_loss
         today_total = realized_pnl + open_unrealized
