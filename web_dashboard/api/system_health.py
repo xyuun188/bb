@@ -1382,11 +1382,25 @@ async def _model_training_identity_item() -> dict[str, Any]:
         if isinstance(summary.get("identity_failure_models"), list)
         else []
     )
-    status = "warning" if alias_only or identity_failures else "ok"
+    scheduler_state = (
+        registry.get("scheduler_state")
+        if isinstance(registry.get("scheduler_state"), dict)
+        else {}
+    )
+    scheduler_unhealthy = bool(
+        scheduler_state.get("heartbeat_stale")
+        or scheduler_state.get("status") in {"error", "unavailable"}
+        or scheduler_state.get("training_timeout_exceeded")
+    )
+    status = "warning" if alias_only or identity_failures or scheduler_unhealthy else "ok"
     message = (
         "模型身份、训练和推理状态一致。"
         if status == "ok"
-        else "发现在线服务没有可验证的独立训练产物；该服务只能作为影子或兼容运行，不能冒充已训练模型。"
+        else (
+            "模型训练调度心跳过期或持久状态不可读。"
+            if scheduler_unhealthy
+            else "发现在线服务没有可验证的独立训练产物；该服务只能作为影子或兼容运行，不能冒充已训练模型。"
+        )
     )
     return _check_item(
         "model_training_identity",
@@ -1398,6 +1412,7 @@ async def _model_training_identity_item() -> dict[str, Any]:
             "alias_only_models": alias_only,
             "identity_failure_models": identity_failures,
             "summary": summary,
+            "scheduler_state": scheduler_state,
         },
     )
 

@@ -7,7 +7,7 @@ import importlib.util
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -32,6 +32,12 @@ from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Position
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
+from services.ml_signal_service import (
+    AUTO_TRAIN_LEASE_STALE_SECONDS,
+    AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
+    MODEL_TRAINING_STATE_STORE,
+)
+from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS
 from services.okx_training_gate import okx_training_refresh_gate
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
@@ -165,7 +171,7 @@ def _skipped_feature_coverage_status() -> dict[str, Any]:
 async def _run_status_section(
     factory: Callable[[], Awaitable[dict[str, Any]]],
     *,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109
 ) -> dict[str, Any] | Exception:
     try:
         result = factory()
@@ -970,6 +976,84 @@ async def _training_governance_snapshot() -> dict[str, Any]:
 
 
 async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
+    lease_attempt = MODEL_TRAINING_STATE_STORE.try_acquire_lease(
+        scheduler_id="local_ai_tools_auto_train",
+        stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+    )
+    if not lease_attempt.acquired or lease_attempt.lease is None:
+        return {
+            "trained": False,
+            "reason": lease_attempt.reason,
+            "recovered_stale_lease": lease_attempt.recovered_stale_lease,
+        }
+    lease = lease_attempt.lease
+    now = datetime.now(UTC)
+    try:
+        MODEL_TRAINING_STATE_STORE.heartbeat(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            interval_seconds=_LOCAL_ML_TRAINING_PARAMS.auto_train_check_interval_seconds,
+        )
+        MODEL_TRAINING_STATE_STORE.record_check(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=lease.run_id,
+            force=True,
+        )
+        MODEL_TRAINING_STATE_STORE.start_run(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=lease.run_id,
+            trigger_reason="dashboard_manual_refresh",
+            timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+    except Exception:
+        lease.release()
+        raise
+    try:
+        result = await _train_local_ai_tools_from_dashboard_process()
+        failed = str(result.get("reason") or "") in {
+            "error",
+            "load_samples_error",
+            "timeout",
+        }
+        delay = (
+            AUTO_TRAIN_RETRY_INTERVAL_SECONDS
+            if failed
+            else _LOCAL_ML_TRAINING_PARAMS.auto_train_check_interval_seconds
+        )
+        MODEL_TRAINING_STATE_STORE.finish_check(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=lease.run_id,
+            result=result,
+            next_check_at=datetime.now(UTC) + timedelta(seconds=delay),
+        )
+        return result
+    except asyncio.CancelledError:
+        MODEL_TRAINING_STATE_STORE.record_exception(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=lease.run_id,
+            error="training_cancelled",
+            next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+        )
+        raise
+    except Exception as exc:
+        error = safe_error_text(exc, limit=180)
+        MODEL_TRAINING_STATE_STORE.record_exception(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=lease.run_id,
+            error=error,
+            next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+        )
+        return {"trained": False, "reason": "error", "error": error}
+    finally:
+        lease.release()
+
+
+async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
     local_ai_tools = _dash._dashboard_local_ai_tools_client()
     if local_ai_tools is None:
         return {"trained": False, "reason": "client_not_ready"}

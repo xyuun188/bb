@@ -70,6 +70,7 @@ from services.exchange_position_state import (
 from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.model_training_registry import build_model_training_registry
+from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.runtime_entry_filters import entry_filters_from_context
 from services.server_monitor_status import get_server_monitor_status_async
@@ -85,6 +86,9 @@ OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 EXECUTION_LEDGER_MODEL_NAMES = (ENSEMBLE_TRADER_NAME, OKX_AUTHORITATIVE_LEDGER_MODEL)
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
+MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
+    settings.data_dir / "model_training_scheduler_state.json"
+)
 
 
 # In-memory reference to the trading service (set by main loop)
@@ -4903,6 +4907,16 @@ async def get_local_ai_tools_status():
             )
         except Exception as exc:
             _log_dashboard_fallback("local ai tools shadow count fallback", exc)
+        scheduler_state = MODEL_TRAINING_STATE_STORE.read()
+        scheduler_models = (
+            scheduler_state.get("models")
+            if isinstance(scheduler_state.get("models"), dict)
+            else {}
+        )
+        status["model_training_scheduler_state"] = scheduler_state
+        status["auto_train_persistent_models"] = {
+            model_id: scheduler_models.get(model_id, {}) for model_id in LOCAL_AI_TOOL_MODEL_IDS
+        }
     return status
 
 
@@ -4926,14 +4940,19 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     model_server_report = _load_model_training_report(
         "phase3_model_server_readiness_reports/latest.json"
     )
-    return sanitize_payload(
-        build_model_training_registry(
-            local_ml_status=local_ml_status,
-            local_tools_status=local_tools_status,
-            specialist_report=specialist_report,
-            model_server_report=model_server_report,
-        )
+    registry = build_model_training_registry(
+        local_ml_status=local_ml_status,
+        local_tools_status=local_tools_status,
+        specialist_report=specialist_report,
+        model_server_report=model_server_report,
     )
+    registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
+    return sanitize_payload(registry)
+
+
+@router.get("/model-training/scheduler")
+async def get_model_training_scheduler_status() -> dict[str, Any]:
+    return sanitize_payload(MODEL_TRAINING_STATE_STORE.read())
 
 
 @router.get("/server-monitor/status")

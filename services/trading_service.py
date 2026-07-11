@@ -156,9 +156,20 @@ from services.market_decision_risk_assessment import MarketDecisionRiskAssessmen
 from services.market_direct_entry_processor import MarketDirectEntryProcessor
 from services.market_queued_entry_processor import MarketQueuedEntryProcessor
 from services.memory_position_store import MemoryPositionStore
-from services.ml_signal_service import AUTO_TRAIN_CHECK_INTERVAL_SECONDS, MLSignalService
+from services.ml_signal_service import (
+    AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+    AUTO_TRAIN_LEASE_STALE_SECONDS,
+    AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
+    MODEL_TRAINING_STATE_STORE,
+    MLSignalService,
+)
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.model_promotion_policy import load_latest_paper_observation_report
+from services.model_training_state import (
+    ALL_TRAINABLE_MODEL_IDS,
+    LOCAL_AI_TOOL_MODEL_IDS,
+    ModelTrainingStateStore,
+)
 from services.new_pair_loss_pause import NewPairLossPausePolicy
 from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
@@ -365,6 +376,7 @@ class TradingService:
         model_registry: ModelRegistry,
         data_service: DataService,
         redis_client=None,
+        model_training_state_store: ModelTrainingStateStore | None = None,
     ) -> None:
         self.models = model_registry
         self.ensemble = EnsembleCoordinator(model_registry)
@@ -389,7 +401,12 @@ class TradingService:
             candidate_executor=self._execute_candidate,
             is_paper_provider=lambda: mode_manager.is_paper,
         )
-        self.ml_signal_service = MLSignalService()
+        self.model_training_state_store = (
+            model_training_state_store or MODEL_TRAINING_STATE_STORE
+        )
+        self.ml_signal_service = MLSignalService(
+            training_state_store=self.model_training_state_store
+        )
         self.local_ai_tools = LocalAIToolsClient()
         self.high_risk_review_service = HighRiskReviewService()
         self.agent_skills = TradingAgentSkillBook()
@@ -1009,6 +1026,8 @@ class TradingService:
         self._okx_authoritative_sync_success_count = 0
         self._okx_authoritative_sync_failure_count = 0
         self._ml_auto_train_task: asyncio.Task | None = None
+        self._model_training_heartbeat_task: asyncio.Task | None = None
+        self._local_tools_active_training_run_id: str | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
         self._strategy_learning_context_cache: dict[str, Any] = {}
@@ -1018,6 +1037,13 @@ class TradingService:
         """Expose lifecycle state without coupling loop services to private fields."""
 
         return bool(getattr(self, "_running", False))
+
+    def _model_training_state(self) -> ModelTrainingStateStore:
+        store = getattr(self, "model_training_state_store", None)
+        if store is None:
+            store = MODEL_TRAINING_STATE_STORE
+            self.model_training_state_store = store
+        return store
 
     def set_loop_stage(self, stage: str) -> None:
         """Set loop stage through an explicit analysis-service boundary."""
@@ -7264,49 +7290,169 @@ class TradingService:
     def _start_ml_auto_train_loop(self) -> None:
         if self._ml_auto_train_task and not self._ml_auto_train_task.done():
             return
+        try:
+            recovered = self._model_training_state().recover_interrupted_runs()
+            if recovered:
+                logger.warning("recovered interrupted model training runs", model_ids=recovered)
+        except Exception as exc:
+            logger.warning(
+                "model training state recovery failed; trading continues with training blocked",
+                error=safe_error_text(exc, limit=180),
+            )
         self._ml_auto_train_task = asyncio.create_task(self._ml_auto_train_loop())
+        self._model_training_heartbeat_task = asyncio.create_task(
+            self._model_training_heartbeat_loop()
+        )
 
     async def _stop_ml_auto_train_loop(self) -> None:
-        task = self._ml_auto_train_task
+        tasks = (
+            getattr(self, "_ml_auto_train_task", None),
+            getattr(self, "_model_training_heartbeat_task", None),
+        )
         self._ml_auto_train_task = None
-        if not task or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        self._model_training_heartbeat_task = None
+        for task in tasks:
+            if not task or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _model_training_heartbeat_loop(self) -> None:
+        heartbeat_interval = min(max(AUTO_TRAIN_CHECK_INTERVAL_SECONDS / 6, 30.0), 60.0)
+        while self._running:
+            try:
+                self._model_training_state().heartbeat(
+                    scheduler_id="platform_model_training_loop",
+                    model_ids=ALL_TRAINABLE_MODEL_IDS,
+                    interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "model training scheduler heartbeat write failed",
+                    error=safe_error_text(exc, limit=180),
+                )
+            await asyncio.sleep(heartbeat_interval)
 
     async def _ml_auto_train_loop(self) -> None:
         """Retrain local ML and server-side quant tools without blocking trading."""
         while self._running:
+            ml_result: dict[str, Any] = {}
+            local_tools_result: dict[str, Any] = {}
             try:
-                result = await self.ml_signal_service.maybe_auto_train()
-                if result.get("trained"):
+                ml_result = await self.ml_signal_service.maybe_auto_train()
+                if ml_result.get("trained"):
                     logger.info(
                         "local ML signal model auto-trained",
-                        sample_count=result.get("sample_count"),
-                        new_sample_count=result.get("new_sample_count"),
+                        sample_count=ml_result.get("sample_count"),
+                        new_sample_count=ml_result.get("new_sample_count"),
                     )
-                elif result.get("reason") not in {"not_due", "training_in_progress"}:
+                elif ml_result.get("reason") not in {"not_due", "training_in_progress"}:
                     logger.warning(
                         "local ML signal auto-train skipped",
-                        reason=result.get("reason"),
-                        error=result.get("error"),
+                        reason=ml_result.get("reason"),
+                        error=ml_result.get("error"),
                     )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning("local ML signal auto-train loop error", error=safe_error_text(e))
             try:
-                await self._maybe_train_local_ai_tools()
+                local_tools_result = await self._maybe_train_local_ai_tools()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning("local AI tools auto-train loop error", error=safe_error_text(e))
-            await asyncio.sleep(AUTO_TRAIN_CHECK_INTERVAL_SECONDS)
+            failed_reasons = {"error", "load_samples_error", "timeout"}
+            retry_due = any(
+                str(result.get("reason") or "") in failed_reasons
+                for result in (ml_result, local_tools_result)
+            )
+            await asyncio.sleep(
+                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
+                if retry_due
+                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+            )
 
     async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
+        state_store = self._model_training_state()
+        lease_attempt = state_store.try_acquire_lease(
+            scheduler_id="local_ai_tools_auto_train",
+            stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+        if not lease_attempt.acquired or lease_attempt.lease is None:
+            return {
+                "trained": False,
+                "reason": lease_attempt.reason,
+                "recovered_stale_lease": lease_attempt.recovered_stale_lease,
+            }
+        lease = lease_attempt.lease
+        self._local_tools_active_training_run_id = lease.run_id
+        now = datetime.now(UTC)
+        try:
+            state_store.heartbeat(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+            )
+            state_store.record_check(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                run_id=lease.run_id,
+                force=force,
+            )
+        except Exception:
+            self._local_tools_active_training_run_id = None
+            lease.release()
+            raise
+        try:
+            result = await self._maybe_train_local_ai_tools_process(force=force)
+            failed = str(result.get("reason") or "") in {
+                "error",
+                "load_samples_error",
+                "timeout",
+            }
+            delay = (
+                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
+                if failed
+                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+            )
+            state_store.finish_check(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                run_id=lease.run_id,
+                result=result,
+                next_check_at=datetime.now(UTC) + timedelta(seconds=delay),
+            )
+            return result
+        except asyncio.CancelledError:
+            state_store.record_exception(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                run_id=lease.run_id,
+                error="training_cancelled",
+                next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+            )
+            raise
+        except Exception as exc:
+            error = safe_error_text(exc, limit=180)
+            state_store.record_exception(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                run_id=lease.run_id,
+                error=error,
+                next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+            )
+            raise
+        finally:
+            self._local_tools_active_training_run_id = None
+            lease.release()
+
+    async def _maybe_train_local_ai_tools_process(
+        self, *, force: bool = False
+    ) -> dict[str, Any]:
         """Push fresh history to the server-side profit/time-series/exit models."""
         if not self.local_ai_tools.enabled():
             return {"trained": False, "reason": "disabled"}
@@ -7505,6 +7651,18 @@ class TradingService:
             }
 
         self._local_tools_last_train_started_at = now
+        if self._local_tools_active_training_run_id:
+            self._model_training_state().start_run(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                run_id=self._local_tools_active_training_run_id,
+                trigger_reason="forced" if force else "training_due",
+                sample_cursor={
+                    "shadow": completed_shadow_total,
+                    "trade": completed_trade_total,
+                },
+                timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+            )
         paper_observation_report = load_latest_paper_observation_report()
         result = await self.local_ai_tools.train(
             training_payload["shadow_samples"],

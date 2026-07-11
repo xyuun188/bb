@@ -13,7 +13,7 @@ import json
 import math
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,10 @@ from services.artifact_retirement_audit import (
 )
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
+from services.model_training_state import (
+    LOCAL_ML_MODEL_IDS,
+    ModelTrainingStateStore,
+)
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -58,6 +62,12 @@ ML_SIGNAL_ARTIFACT_REGISTRY = ModelArtifactRegistry(
     root=Path(settings.data_dir) / "model_artifacts",
     model_id="local_ml_profit_quality",
 )
+MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
+    Path(settings.data_dir) / "model_training_scheduler_state.json"
+)
+LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
+AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
+AUTO_TRAIN_LEASE_STALE_SECONDS = 60 * 60
 
 
 def _training_source_code_version() -> str:
@@ -1212,9 +1222,11 @@ class MLSignalService:
         model_path: Path | None = None,
         *,
         artifact_registry: ModelArtifactRegistry | None = None,
+        training_state_store: ModelTrainingStateStore | None = None,
     ) -> None:
         self._explicit_model_path = model_path
         self.artifact_registry = artifact_registry or ML_SIGNAL_ARTIFACT_REGISTRY
+        self.training_state_store = training_state_store or MODEL_TRAINING_STATE_STORE
         self.model_path = model_path or (
             self.artifact_registry.model_root / "unregistered-model.joblib"
         )
@@ -1232,6 +1244,7 @@ class MLSignalService:
         self._last_train_started_at: str | None = None
         self._last_train_finished_at: str | None = None
         self._last_train_result: dict[str, Any] | None = None
+        self._active_training_run_id: str | None = None
 
     def status(self) -> dict[str, Any]:
         self._ensure_loaded()
@@ -1367,6 +1380,82 @@ class MLSignalService:
         }
 
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
+        """Run one cross-process single-flight training check."""
+
+        lease_attempt = self.training_state_store.try_acquire_lease(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+        if not lease_attempt.acquired or lease_attempt.lease is None:
+            return {
+                "trained": False,
+                "reason": lease_attempt.reason,
+                "recovered_stale_lease": lease_attempt.recovered_stale_lease,
+            }
+        lease = lease_attempt.lease
+        self._active_training_run_id = lease.run_id
+        now = datetime.now(UTC)
+        try:
+            self.training_state_store.heartbeat(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+            )
+            self.training_state_store.record_check(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                run_id=lease.run_id,
+                force=force,
+            )
+        except Exception:
+            self._active_training_run_id = None
+            lease.release()
+            raise
+        try:
+            result = await self._maybe_auto_train_process(force=force)
+            failed = str(result.get("reason") or "") in {
+                "error",
+                "load_samples_error",
+                "timeout",
+            }
+            delay = (
+                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
+                if failed
+                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+            )
+            next_check = datetime.now(UTC) + timedelta(seconds=delay)
+            self.training_state_store.finish_check(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                run_id=lease.run_id,
+                result=result,
+                next_check_at=next_check,
+            )
+            return result
+        except asyncio.CancelledError:
+            self.training_state_store.record_exception(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                run_id=lease.run_id,
+                error="training_cancelled",
+                next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+            )
+            raise
+        except Exception as exc:
+            error = safe_error_text(exc, limit=180)
+            self.training_state_store.record_exception(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                run_id=lease.run_id,
+                error=error,
+                next_check_at=now + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+            )
+            raise
+        finally:
+            self._active_training_run_id = None
+            lease.release()
+
+    async def _maybe_auto_train_process(self, *, force: bool = False) -> dict[str, Any]:
         """Retrain in the background when enough fresh shadow samples exist."""
         if self._train_lock.locked():
             return {
@@ -1467,6 +1556,15 @@ class MLSignalService:
 
                 self._training = True
                 self._last_train_started_at = datetime.now(UTC).isoformat()
+                if self._active_training_run_id:
+                    self.training_state_store.start_run(
+                        scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                        model_ids=LOCAL_ML_MODEL_IDS,
+                        run_id=self._active_training_run_id,
+                        trigger_reason="forced" if force else "training_due",
+                        sample_cursor={"shadow": completed_count},
+                        timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+                    )
                 quarantine_result = await self._quarantine_dirty_training_samples()
                 completed_count = await self._completed_shadow_sample_count()
                 new_samples = max(completed_count - last_completed_count, 0)
@@ -1845,6 +1943,10 @@ class MLSignalService:
         }
 
     def _auto_train_status(self) -> dict[str, Any]:
+        persistent = self.training_state_store.read()
+        models = persistent.get("models") if isinstance(persistent.get("models"), dict) else {}
+        row = models.get(LOCAL_ML_MODEL_IDS[0]) if isinstance(models, dict) else {}
+        row = row if isinstance(row, dict) else {}
         return {
             "auto_train_enabled": True,
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
@@ -1852,12 +1954,16 @@ class MLSignalService:
             "auto_train_min_new_samples": AUTO_TRAIN_MIN_NEW_SAMPLES,
             "auto_train_learning_only_interval_seconds": AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS,
             "auto_train_learning_only_min_new_samples": AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES,
-            "auto_training": self._training,
-            "auto_train_last_check_at": self._last_check_at,
-            "auto_train_next_check_at": self._next_check_at,
-            "auto_train_last_started_at": self._last_train_started_at,
-            "auto_train_last_finished_at": self._last_train_finished_at,
-            "auto_train_last_result": self._last_train_result,
+            "auto_training": row.get("state") == "running",
+            "auto_train_last_check_at": row.get("last_check_at") or self._last_check_at,
+            "auto_train_next_check_at": row.get("next_check_at") or self._next_check_at,
+            "auto_train_last_started_at": row.get("last_started_at")
+            or self._last_train_started_at,
+            "auto_train_last_finished_at": row.get("last_finished_at")
+            or self._last_train_finished_at,
+            "auto_train_last_result": row.get("last_result") or self._last_train_result,
+            "auto_train_persistent_state": row,
+            "model_training_scheduler_state": persistent,
         }
 
     def _current_metadata(self) -> dict[str, Any]:

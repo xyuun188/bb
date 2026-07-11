@@ -44,6 +44,7 @@ from services.model_dynamic_routing import ModelDynamicRoutingService
 from services.model_expert_competition import ModelExpertCompetitionService
 from services.model_expert_health import ModelExpertHealthService
 from services.model_training_registry import build_model_training_registry
+from services.model_training_state import ModelTrainingStateStore
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
@@ -92,6 +93,9 @@ OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
 SYSTEM_AUDIT_MAX_CONCURRENCY = 4
+MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
+    settings.data_dir / "model_training_scheduler_state.json"
+)
 MODEL_EXPERT_AUDIT_HOURS = 24
 MODEL_EXPERT_AUDIT_LIMIT = 200
 SHADOW_MISSED_OPPORTUNITY_AUDIT_HOURS = 24
@@ -4404,6 +4408,11 @@ async def _model_training_audit() -> dict[str, Any]:
     runtime_probe_hard_failure = runtime_probe.get("status") == "warning" and not (
         runtime_probe_timeout_is_observing
     )
+    training_scheduler_state = MODEL_TRAINING_STATE_STORE.read()
+    training_scheduler_stale = bool(training_scheduler_state.get("heartbeat_stale"))
+    training_scheduler_error = training_scheduler_state.get("status") == "error"
+    training_scheduler_unavailable = training_scheduler_state.get("status") == "unavailable"
+    training_timeout_exceeded = bool(training_scheduler_state.get("training_timeout_exceeded"))
     hard_failure = (
         bool(model_critical)
         or bool(hard_source_warnings)
@@ -4419,6 +4428,10 @@ async def _model_training_audit() -> dict[str, Any]:
         or historical_trade_fact_audit_warning
         or artifact_retirement_audit_warning
         or artifact_retirement_required
+        or training_scheduler_stale
+        or training_scheduler_error
+        or training_scheduler_unavailable
+        or training_timeout_exceeded
     )
     evaluation_policy = (
         local_tools.get("evaluation_policy")
@@ -4475,6 +4488,7 @@ async def _model_training_audit() -> dict[str, Any]:
         specialist_report=specialist_shadow_evaluation,
         model_server_report=_load_phase3_model_server_readiness_latest_report(),
     )
+    model_registry["scheduler_state"] = training_scheduler_state
     status = _status_from_counts(
         critical=hard_failure
         and (bool(model_critical) or local_tools_hard_missing or runtime_probe_hard_failure),
@@ -4497,6 +4511,14 @@ async def _model_training_audit() -> dict[str, Any]:
             observing_reasons.append("Phase 3 artifact rebuild required")
         if artifact_retirement_audit_warning:
             observing_reasons.append("artifact retirement audit unavailable")
+        if training_scheduler_stale:
+            observing_reasons.append("训练调度心跳过期")
+        if training_scheduler_error:
+            observing_reasons.append("训练调度状态不可读")
+        if training_scheduler_unavailable:
+            observing_reasons.append("训练调度尚无持久心跳")
+        if training_timeout_exceeded:
+            observing_reasons.append("模型训练运行超时")
         reason_text = "、".join(observing_reasons) or "存在观察项"
         summary = f"模型服务可用；{reason_text}。"
     return _audit_card(
@@ -4557,6 +4579,7 @@ async def _model_training_audit() -> dict[str, Any]:
             },
             "historical_trade_fact_audit": historical_trade_fact_report,
             "artifact_retirement_audit": artifact_retirement_report,
+            "model_training_scheduler_state": training_scheduler_state,
             "governance_status": governance.get("status") if isinstance(governance, dict) else None,
             "runtime_probe": runtime_probe,
             "hard_failure": hard_failure,
