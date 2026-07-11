@@ -201,7 +201,7 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
 
     assert "function opportunityScorePrimaryReturn" in script
     assert "completedLocalTrade" in script
-    assert "累计去重样本" in script
+    assert "fetchJSON('/api/model-training/registry')" in script
     assert "手动平仓不参与训练" in script
     assert "const net = Number(score.expected_net_return_pct);" in script
     assert "if (Number.isFinite(net)) return { label: '预期净收益', value: net };" in script
@@ -887,7 +887,13 @@ def test_local_ml_loss_filter_uses_backend_model_contract() -> None:
         "loss_filter: ['loss_filter', 'loss_model', 'loss_probability', 'risk_filter']"
         in status_block
     )
-    assert "localModelStatus(local, 'loss_filter')" in script
+    registry_block = script[
+        script.index("function renderTrainableModels()") : script.index(
+            "// ========== Profit Attribution =========="
+        )
+    ]
+    assert "registryModels.map(model =>" in registry_block
+    assert "model.runtime_available && model.identity_verified" in registry_block
 
 
 def test_ml_signal_dashboard_renders_readiness_blockers() -> None:

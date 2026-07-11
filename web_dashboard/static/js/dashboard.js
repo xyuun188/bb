@@ -62,6 +62,7 @@ const state = {
     shadowBacktestStatus: '',
     mlSignalStatus: null,
     localAIToolsStatus: null,
+    modelTrainingRegistry: null,
     dataCollectionStatus: null,
     dataCollectionSettingsDirty: false,
     dataCollectionSettingsSaving: false,
@@ -4163,7 +4164,7 @@ function memoryActionLabel(action) {
 // ========== Local ML Signal Dashboard ==========
 
 async function fetchMLSignalDashboard() {
-    const [status, localToolsStatus, recordsData, contributionData] = await Promise.all([
+    const [status, localToolsStatus, registryData, recordsData, contributionData] = await Promise.all([
         fetchJSON('/api/ml-signal/status').catch(err => ({
             available: false,
             status: 'request_error',
@@ -4177,11 +4178,17 @@ async function fetchMLSignalDashboard() {
             error: err?.message || '本地量化工具状态接口请求失败',
             message: '本地量化工具状态接口请求失败，请检查 18001 或后端日志。',
         })),
+        fetchJSON('/api/model-training/registry').catch(err => ({
+            models: [],
+            summary: {},
+            error: err?.message || '模型训练注册表请求失败',
+        })),
         fetchJSON(`/api/analysis-records?limit=120&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
         fetchJSON(`/api/model-contribution/stats?mode=${state.mode === 'live' ? 'live' : 'paper'}&days=7`).catch(() => null),
     ]);
     state.mlSignalStatus = status || null;
     state.localAIToolsStatus = localToolsStatus || null;
+    state.modelTrainingRegistry = registryData || null;
     state.modelContributionStats = contributionData || null;
     state.mlSignalRecords = (recordsData?.records || []).filter(r => r && r.ml_signal && r.ml_signal.available !== false);
     const totalPages = Math.max(Math.ceil(state.mlSignalRecords.length / ML_SIGNAL_PAGE_SIZE), 1);
@@ -9549,120 +9556,47 @@ function renderLocalAIToolsStatus() {
 function renderTrainableModels() {
     const container = document.getElementById('ml-trainable-models');
     if (!container) return;
-    const local = state.localAIToolsStatus || {};
-    const ml = state.mlSignalStatus || {};
-    const modelsMap = local.models || {};
-    const localTrainedAt = local.trained_at ? toBeijingTime(local.trained_at) : '-';
-    const mlTrainedAt = ml.trained_at ? toBeijingTime(ml.trained_at) : '-';
-    const metrics = ml.metrics || {};
-    const autoLast = ml.auto_train_last_result || {};
-    const samples = mlSampleCounts();
-    const autoTrainText = ml.auto_train_enabled
-        ? `自动训练已开启；下次检查 ${ml.auto_train_next_check_at ? toBeijingTime(ml.auto_train_next_check_at) : '-'}`
-        : '自动训练未开启';
-    const windowText = `${samples.trainingMl} / ${samples.completedMl}（训练窗口/三期完成）`;
-    const localWindowText = `${samples.trainingLocal} / ${samples.completedLocal}（训练窗口/三期完成）`;
-    const localTradeWindowText = `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}（训练窗口/三期完成去重）`;
-    const phase3PolicyText = '三期重新开始训练；旧数据禁止进入新模型训练';
-    const models = [
-        {
-            title: '本地 ML 盈亏质量',
-            type: '本机 ExtraTrees 盈亏过滤',
-            ready: ml.available === true,
-            statusLabel: ml.influence_enabled ? '已介入' : (ml.available ? '学习中' : '未训练'),
-            description: '判断一笔交易是否有正期望，开仓时用于门槛、否决和机会排序。',
-            samples: windowText,
-            trainedAt: mlTrainedAt,
-            usage: ml.influence_enabled ? '开仓过滤 + 机会排序' : '只学习，不强制影响交易',
-            metrics: [
-                { label: '做多 AUC', value: Number(metrics.long_auc || 0).toFixed(3) },
-                { label: '做空 AUC', value: Number(metrics.short_auc || 0).toFixed(3) },
-                { label: '做多高分收益', value: signedPctValueLabel(metrics.top_long_avg_return_pct) },
-                { label: '做空高分收益', value: signedPctValueLabel(metrics.top_short_avg_return_pct) },
-            ],
-            note: autoLast.message || autoTrainText,
-        },
-        {
-            title: '开仓盈利预测',
-            type: mlTechName(modelsMap.profit),
-            ready: localModelStatus(local, 'profit'),
-            description: '预测做多/做空扣除成本后的预期收益，目标是净利润最大化。',
-            samples: localWindowText,
-            trainedAt: localTrainedAt,
-            usage: '给专家和最终裁决提供收益证据',
-            metrics: [
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-                { label: '预测周期', value: (local.horizons || []).join('/') || '-' },
-            ],
-            note: '胜率不是最终目标，真正目标是扣除手续费和滑点后的实现利润。',
-        },
-        {
-            title: '亏损风险过滤',
-            type: mlTechName(modelsMap.loss_filter),
-            ready: localModelStatus(local, 'loss_filter'),
-            description: '识别某个币种/方向近期是否容易亏损，避免反复交易亏损组合。',
-            samples: localWindowText,
-            trainedAt: localTrainedAt,
-            usage: '亏损概率提示 + 开仓风险过滤',
-            metrics: [
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-                { label: '特征数', value: String(Number(local.feature_count || 0)) },
-            ],
-            note: '比如某币种近期连续亏损时，会降低开仓优先级或要求更强证据。',
-        },
-        {
-            title: '多周期行情预测',
-            type: mlTechName(modelsMap.deep_timeseries || modelsMap.timeseries),
-            ready: localModelStatus(local, 'timeseries') || Boolean(local.torch_patch_status?.available),
-            description: '预测未来 10/30/60 分钟收益和波动，用来辅助判断入场窗口。',
-            samples: `${Number(local.sequence_sample_count || 0)} 条序列样本`,
-            trainedAt: localTrainedAt,
-            usage: '短周期方向 + 波动预判',
-            metrics: [
-                { label: '周期', value: (local.horizons || []).join('/') || '-' },
-                { label: 'MAE', value: local.torch_patch_status?.train_mae_pct !== undefined ? `${Number(local.torch_patch_status.train_mae_pct).toFixed(4)}%` : '-' },
-                { label: '输入维度', value: String(local.torch_patch_status?.input_dim || local.feature_count || '-') },
-            ],
-            note: '这部分用于辅助判断时机，不会单独决定买卖。',
-        },
-        {
-            title: '情绪风险校准',
-            type: mlTechName(modelsMap.deep_sentiment || modelsMap.sentiment),
-            ready: localModelStatus(local, 'sentiment') || localModelStatus(local, 'deep_sentiment'),
-            description: '学习新闻、公告和社媒情绪对收益/风险的影响。',
-            samples: `${Number(local.text_sentiment_sample_count || 0)} 条文本样本`,
-            trainedAt: localTrainedAt,
-            usage: '新闻情绪风险 + 收益校准',
-            metrics: [
-                { label: 'Transformers', value: local.transformers_sentiment_backend?.available ? '可用' : '未启用' },
-                { label: '库版本', value: local.transformers_sentiment_backend?.version || '-' },
-            ],
-            note: '文本样本越多，对突发新闻和事件风险的判断越有价值。',
-        },
-        {
-            title: '平仓/退出建议',
-            type: mlTechName(modelsMap.exit),
-            ready: localModelStatus(local, 'exit'),
-            description: '结合真实持仓盈亏、持仓时间和历史交易画像，判断止盈、止损、减仓或继续持有。',
-            samples: localTradeWindowText,
-            trainedAt: localTrainedAt,
-            usage: '持仓复盘 + 平仓建议',
-            metrics: [
-                { label: '训练窗口', value: String(samples.trainingLocalTrade) },
-                { label: '累计去重样本', value: String(samples.completedLocalTrade) },
-                { label: '币种画像', value: String(Number(local.profile_count || 0)) },
-            ],
-            note: '它服务于已实现净利润，不是单纯追求持仓浮盈。',
-        },
-    ];
+    const registry = state.modelTrainingRegistry || {};
+    const registryModels = Array.isArray(registry.models) ? registry.models : [];
+    const summary = registry.summary || {};
+    const lifecycleLabels = {
+        training: '训练中', trained: '已训练', inference_only: '仅推理',
+        shadow_evaluating: '影子评估', promotion_blocked: '禁止晋升',
+        canary: '小资金验证', live: '已介入实盘', not_trained: '未训练',
+        service_unavailable: '服务不可用',
+    };
+    const models = registryModels.map(model => ({
+        title: model.display_name || model.model_id || '-',
+        type: model.model_family || '-',
+        ready: Boolean(model.runtime_available && model.identity_verified),
+        statusLabel: lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
+        description: `任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
+        samples: `${Number(model.sample_count || 0)} 条可追溯样本`,
+        trainedAt: model.trained_at ? toBeijingTime(model.trained_at) : '-',
+        usage: model.live_influence ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
+        metrics: [
+            { label: '可训练', value: model.trainable ? '是' : '否' },
+            { label: '产物', value: model.artifact_available ? '已验证' : '无' },
+            { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
+            { label: '别名代理', value: model.alias_only ? '是' : '否' },
+        ],
+        note: Array.isArray(model.blocking_reasons) && model.blocking_reasons.length
+            ? `阻塞原因：${model.blocking_reasons.join('、')}`
+            : `质量状态：${model.quality_state || '-'}`,
+    }));
+
+    if (!models.length) {
+        container.innerHTML = `<div class="analysis-empty">${escHtml(registry.error || '模型训练注册表暂无数据。')}</div>`;
+        return;
+    }
 
     container.innerHTML = `
         <div class="ml-train-summary">
-            ${mlMetricCard('可训练模型', `${models.length} 个`, '覆盖开仓、亏损过滤、时序、情绪和平仓', 'good')}
-            ${mlMetricCard('自动训练', ml.auto_train_enabled ? '已开启' : '未开启', autoTrainText, ml.auto_train_enabled ? 'good' : 'warn')}
-            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), autoLast.message || '只统计三期完成样本减去本次训练窗口', samples.newCount >= Number(ml.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
-            ${mlMetricCard('三期训练策略', '从新开始', phase3PolicyText, 'good')}
-            ${mlMetricCard('样本显示说明', '训练窗口/三期完成', `训练窗口上限 ${samples.limit} 条；三期完成 ${samples.completedMl} 条；旧累计样本不展示为训练来源`, 'warn')}
+            ${mlMetricCard('模型总数', String(Number(summary.model_count || models.length)), `注册表版本 ${registry.version || '-'}`, 'good')}
+            ${mlMetricCard('可训练模型', String(Number(summary.trainable_count || 0)), '只有这些模型允许产生项目训练产物', 'good')}
+            ${mlMetricCard('仅推理/评估', String(Number(summary.inference_or_evaluation_only_count || 0)), '不会冒充持续训练', 'muted')}
+            ${mlMetricCard('别名代理', String(Number(summary.alias_only_count || 0)), summary.alias_only_models?.join('、') || '无', Number(summary.alias_only_count || 0) ? 'bad' : 'good')}
+            ${mlMetricCard('身份异常', String(Number(summary.identity_failure_count || 0)), summary.identity_failure_models?.join('、') || '无', Number(summary.identity_failure_count || 0) ? 'bad' : 'good')}
         </div>
         <div class="ml-train-model-list ml-train-model-list-clear">
             ${models.map(renderReadableTrainableModelCard).join('')}

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from services.model_training_registry import build_model_training_registry
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _by_id(payload: dict) -> dict[str, dict]:
@@ -108,3 +112,21 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
     assert rows["timesfm_2_5"]["lifecycle"] == "shadow_evaluating"
     assert rows["chronos_2"]["trainable"] is False
     assert rows["finbert"]["lifecycle"] == "inference_only"
+
+
+def test_dashboard_renders_model_cards_from_canonical_registry() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+    render_block = script[
+        script.index("function renderTrainableModels()") : script.index(
+            "// ========== Profit Attribution =========="
+        )
+    ]
+
+    assert "fetchJSON('/api/model-training/registry')" in script
+    assert "state.modelTrainingRegistry = registryData || null" in script
+    assert "const registryModels = Array.isArray(registry.models)" in render_block
+    assert "registryModels.map(model =>" in render_block
+    assert "alias_only" in render_block
+    assert "const models = [" not in render_block
