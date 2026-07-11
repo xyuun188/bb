@@ -123,8 +123,13 @@ class Phase3RebuildReadinessService:
         artifact_status = _status(artifacts.get("status"))
         if artifact_status in {"", "unavailable", "error"}:
             blockers.append("artifact_retirement_audit_unavailable")
-        elif _safe_int(artifacts.get("retired_or_untrusted_count")) > 0:
-            warnings.append("legacy_or_untrusted_artifacts_retired_before_rebuild")
+        elif (
+            artifact_status in {"retired_required", "untrusted", "blocked"}
+            or _safe_int(artifacts.get("unresolved_artifact_count")) > 0
+        ):
+            blockers.append("unresolved_or_untrusted_artifacts_block_rebuild")
+        elif _safe_int(artifacts.get("retired_legacy_count")) > 0:
+            warnings.append("legacy_artifacts_preserved_read_only")
         else:
             passed.append("artifact_retirement_audit_ready")
 

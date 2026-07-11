@@ -44,7 +44,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_id": "local_ml_profit_quality",
         "display_name": "Local ML profit quality",
-        "model_family": "ExtraTrees classifier/regressor",
+        "model_family": "sklearn RandomForest/Dummy classifier-regressor pipelines",
         "task": "after_cost_entry_profit_quality",
         "trainable": True,
         "training_owner": "platform_paper_runtime",

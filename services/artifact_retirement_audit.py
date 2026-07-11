@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ METADATA_SUFFIXES = {".json"}
 DEFAULT_SCAN_RELATIVE_PATHS = (
     "ml_signal",
     "local_ai_tools",
+    "model_artifacts",
     "models",
 )
 
@@ -48,6 +50,14 @@ def _read_json(path: Path) -> tuple[dict[str, Any], str | None]:
     except (OSError, json.JSONDecodeError) as exc:
         return {}, safe_error_text(exc, limit=160)
     return (parsed if isinstance(parsed, dict) else {}), None
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _relative_path(path: Path, root: Path) -> str:
@@ -100,6 +110,7 @@ def _phase3_evidence(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _artifact_classification(
     *,
+    artifact_path: Path,
     relative_path: str,
     metadata: dict[str, Any],
     metadata_error: str | None,
@@ -133,6 +144,11 @@ def _artifact_classification(
         reasons.append("metadata_allows_live_mutation")
     if metadata and not persisted_ok:
         reasons.append("artifact_persisted_not_confirmed")
+    registry_version = str(metadata.get("artifact_registry_version") or "").strip()
+    expected_hash = str(metadata.get("artifact_sha256") or "").strip()
+    if registry_version and artifact_path.suffix.lower() in ARTIFACT_SUFFIXES:
+        if not expected_hash or _sha256(artifact_path) != expected_hash:
+            reasons.append("registry_artifact_hash_verification_failed")
 
     if reasons:
         if "known_legacy_artifact_path" in reasons:
@@ -187,6 +203,7 @@ class ArtifactRetirementAuditService:
             relative = _relative_path(path, root)
             metadata_path, metadata, metadata_error = _metadata_for_artifact(path)
             classification, reasons, evidence = _artifact_classification(
+                artifact_path=path,
                 relative_path=relative,
                 metadata=metadata,
                 metadata_error=metadata_error,
@@ -206,7 +223,11 @@ class ArtifactRetirementAuditService:
                     "phase3_evidence": evidence,
                     "preserved": True,
                     "can_delete": False,
-                    "can_influence_live": classification == "phase3_compatible",
+                    "can_influence_live": bool(
+                        classification == "phase3_compatible"
+                        and path.suffix.lower() in ARTIFACT_SUFFIXES
+                        and str(evidence.get("model_stage") or "").lower() in {"canary", "live"}
+                    ),
                 }
             )
 
@@ -219,7 +240,21 @@ class ArtifactRetirementAuditService:
         phase3_compatible = [
             item for item in artifacts if item["classification"] == "phase3_compatible"
         ]
-        status = "retired_required" if retired_or_untrusted else "ready"
+        retired_legacy = [
+            item for item in artifacts if item["classification"] == "retired_legacy"
+        ]
+        unresolved = [
+            item
+            for item in artifacts
+            if item["classification"] in {"missing_manifest", "untrusted"}
+        ]
+        status = (
+            "retired_required"
+            if unresolved
+            else "ready_with_retired_legacy"
+            if retired_legacy
+            else "ready"
+        )
         return {
             "status": status,
             "audit_only": True,
@@ -232,6 +267,8 @@ class ArtifactRetirementAuditService:
             "scan_relative_paths": list(self.scan_relative_paths),
             "artifact_count": len(artifacts),
             "phase3_compatible_count": len(phase3_compatible),
+            "retired_legacy_count": len(retired_legacy),
+            "unresolved_artifact_count": len(unresolved),
             "retired_or_untrusted_count": len(retired_or_untrusted),
             "status_counts": status_counts,
             "artifacts": artifacts[:50],
@@ -240,7 +277,9 @@ class ArtifactRetirementAuditService:
             "duration_seconds": round((datetime.now(UTC) - started_at).total_seconds(), 6),
             "next_required_action": (
                 "rebuild_phase3_artifacts_from_clean_training_view"
-                if retired_or_untrusted
+                if unresolved
+                else "preserve_retired_legacy_read_only"
+                if retired_legacy
                 else "keep_phase3_artifact_manifest_attached"
             ),
         }

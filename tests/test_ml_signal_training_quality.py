@@ -20,6 +20,7 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.ml_readiness import build_ml_readiness_report
+from services.model_artifact_registry import ModelArtifactRegistry
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
@@ -254,6 +255,33 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["evaluation_policy"]["live_mutation"] is False
     assert not model_path.exists()
     assert not metadata_path.exists()
+
+
+def test_train_from_frame_persists_and_loads_registry_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    monkeypatch.setattr(ml_signal_module, "ML_SIGNAL_ARTIFACT_REGISTRY", registry)
+
+    metadata = train_from_frame(
+        _training_frame(),
+        min_samples=10,
+        completed_sample_count=80,
+        persist_artifact=True,
+    )
+    service = MLSignalService(artifact_registry=registry)
+    status = service.status()
+
+    assert metadata["artifact_registry_version"] == "2026-07-11.v1"
+    assert metadata["artifact_sha256"]
+    assert registry.current_path.exists()
+    assert status["available"] is True
+    assert status["artifact_registry"]["available"] is True
+    assert status["artifact_registry"]["sha256"] == metadata["artifact_sha256"]
 
 
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:

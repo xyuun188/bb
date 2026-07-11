@@ -8,6 +8,7 @@ execute trades by itself.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 from collections import Counter
@@ -37,6 +38,7 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
+from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -52,6 +54,24 @@ logger = structlog.get_logger(__name__)
 MODEL_DIR = Path("data/ml_signal")
 MODEL_PATH = MODEL_DIR / "winrate_model.joblib"
 METADATA_PATH = MODEL_DIR / "winrate_model_metadata.json"
+ML_SIGNAL_ARTIFACT_REGISTRY = ModelArtifactRegistry(
+    root=Path(settings.data_dir) / "model_artifacts",
+    model_id="local_ml_profit_quality",
+)
+
+
+def _training_source_code_version() -> str:
+    digest = hashlib.sha256()
+    source_paths = (
+        Path(__file__),
+        Path(__file__).with_name("training_data_quality.py"),
+        Path(__file__).with_name("ml_readiness.py"),
+        Path(__file__).with_name("model_artifact_registry.py"),
+    )
+    for path in source_paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return f"source-sha256:{digest.hexdigest()}"
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 AUTO_TRAIN_MIN_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_min_interval_seconds
@@ -1162,21 +1182,49 @@ def train_from_frame(
         "feature_keys": FEATURE_KEYS,
     }
     if persist_artifact:
-        dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
-        METADATA_PATH.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if MODEL_PATH != MODEL_DIR / "winrate_model.joblib" or METADATA_PATH != (
+            MODEL_DIR / "winrate_model_metadata.json"
+        ):
+            dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
+            METADATA_PATH.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_joblib(
+                bundle,
+                metadata,
+                parent_model_identity=(
+                    "sklearn RandomForest/Dummy classifier-regressor pipelines"
+                ),
+                code_version=_training_source_code_version(),
+            )
+            metadata.clear()
+            metadata.update(resolved.manifest)
     return metadata
 
 
 class MLSignalService:
     """Lazy loader and inference wrapper for the local profit-quality model."""
 
-    def __init__(self, model_path: Path = MODEL_PATH) -> None:
-        self.model_path = model_path
+    def __init__(
+        self,
+        model_path: Path | None = None,
+        *,
+        artifact_registry: ModelArtifactRegistry | None = None,
+    ) -> None:
+        self._explicit_model_path = model_path
+        self.artifact_registry = artifact_registry or ML_SIGNAL_ARTIFACT_REGISTRY
+        self.model_path = model_path or (
+            self.artifact_registry.model_root / "unregistered-model.joblib"
+        )
+        self.metadata_path = METADATA_PATH if model_path is not None else (
+            self.artifact_registry.model_root / "unregistered-metadata.json"
+        )
         self._bundle: dict[str, Any] | None = None
         self._loaded_mtime: float | None = None
+        self._loaded_pointer_mtime_ns: int | None = None
+        self._resolved_artifact: ResolvedModelArtifact | None = None
         self._train_lock = asyncio.Lock()
         self._training = False
         self._last_check_at: str | None = None
@@ -1200,6 +1248,7 @@ class MLSignalService:
                 "readiness": readiness,
                 "allow_live_position_influence": False,
                 "model_path": str(self.model_path),
+                "artifact_registry": self._artifact_registry_status(),
                 "message": "本地 ML 盈亏质量模型尚未训练。",
                 **auto_status,
             }
@@ -1216,6 +1265,7 @@ class MLSignalService:
         return {
             "available": True,
             "model_path": str(self.model_path),
+            "artifact_registry": self._artifact_registry_status(),
             **metadata,
             "training_shadow_sample_count": int(
                 metadata.get("training_shadow_sample_count") or training_count
@@ -1728,6 +1778,33 @@ class MLSignalService:
 
     def _ensure_loaded(self) -> None:
         try:
+            trusted_root = MODEL_DIR
+            if self._explicit_model_path is None:
+                pointer_mtime_ns = (
+                    self.artifact_registry.current_path.stat().st_mtime_ns
+                    if self.artifact_registry.current_path.exists()
+                    else None
+                )
+                if (
+                    self._bundle is not None
+                    and self._resolved_artifact is not None
+                    and self._loaded_pointer_mtime_ns == pointer_mtime_ns
+                    and self.model_path.exists()
+                    and self._loaded_mtime == self.model_path.stat().st_mtime
+                ):
+                    return
+                current = self.artifact_registry.resolve_current()
+                if current is None:
+                    self._bundle = None
+                    self._loaded_mtime = None
+                    self._loaded_pointer_mtime_ns = pointer_mtime_ns
+                    self._resolved_artifact = None
+                    return
+                self.model_path = current.model_path
+                self.metadata_path = current.metadata_path
+                trusted_root = self.artifact_registry.model_root
+                self._loaded_pointer_mtime_ns = pointer_mtime_ns
+                self._resolved_artifact = current
             if not self.model_path.exists():
                 self._bundle = None
                 self._loaded_mtime = None
@@ -1737,7 +1814,7 @@ class MLSignalService:
                 return
             self._bundle = load_trusted_joblib(
                 self.model_path,
-                trusted_root=MODEL_DIR,
+                trusted_root=trusted_root,
                 expected_type=dict,
             )
             self._loaded_mtime = mtime
@@ -1749,6 +1826,23 @@ class MLSignalService:
             )
             self._bundle = None
             self._loaded_mtime = None
+            self._loaded_pointer_mtime_ns = None
+            self._resolved_artifact = None
+
+    def _artifact_registry_status(self) -> dict[str, Any]:
+        current = self._resolved_artifact
+        if current is None:
+            return self.artifact_registry.status()
+        return {
+            "available": True,
+            "model_id": current.model_id,
+            "registry_version": current.manifest.get("artifact_registry_version"),
+            "version": current.version,
+            "model_path": str(current.model_path),
+            "manifest_path": str(current.manifest_path),
+            "sha256": current.sha256,
+            "manifest": current.manifest,
+        }
 
     def _auto_train_status(self) -> dict[str, Any]:
         return {
@@ -1773,13 +1867,13 @@ class MLSignalService:
             if isinstance(metadata, dict):
                 return metadata
         try:
-            if METADATA_PATH.exists():
-                parsed = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+            if self.metadata_path.exists():
+                parsed = json.loads(self.metadata_path.read_text(encoding="utf-8"))
                 return parsed if isinstance(parsed, dict) else {}
         except Exception as exc:
             logger.debug(
                 "failed to read ML signal metadata",
-                path=str(METADATA_PATH),
+                path=str(self.metadata_path),
                 error=safe_error_text(exc),
             )
         return {}

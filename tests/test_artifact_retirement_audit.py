@@ -33,7 +33,9 @@ async def test_legacy_ml_signal_artifact_is_preserved_but_retired(tmp_path) -> N
 
     assert artifact.exists()
     assert metadata.exists()
-    assert report["status"] == "retired_required"
+    assert report["status"] == "ready_with_retired_legacy"
+    assert report["retired_legacy_count"] == 2
+    assert report["unresolved_artifact_count"] == 0
     assert report["read_only"] is True
     assert report["can_delete_artifacts"] is False
     assert report["retired_or_untrusted_count"] == 2

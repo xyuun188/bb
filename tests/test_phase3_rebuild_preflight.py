@@ -72,10 +72,12 @@ async def _fake_historical_report(**_kwargs: Any) -> dict[str, Any]:
 
 async def _fake_artifact_report() -> dict[str, Any]:
     return {
-        "status": "retired_required",
+        "status": "ready_with_retired_legacy",
         "read_only": True,
         "audit_only": True,
         "retired_or_untrusted_count": 2,
+        "retired_legacy_count": 2,
+        "unresolved_artifact_count": 0,
     }
 
 
