@@ -68,6 +68,7 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
         "platform_runtime": {
             "ai_models": [
                 {
+                    "name": "decision_maker",
                     "model": "qwen3-32b-trade",
                     "api_base": "http://127.0.0.1:18000/v1",
                 },
@@ -91,6 +92,43 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
     assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
     assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
+
+
+def test_self_check_accepts_external_deepseek_final_decision_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "ai_models",
+        [
+            {
+                "name": "decision_maker",
+                "api_base": "https://api.deepseek.com/v1",
+                "api_key": "unit-key",
+                "model": "deepseek-v4-pro",
+                "route_mode": "online_slow_brain",
+                "enabled": True,
+            },
+            {
+                "name": "trend_expert",
+                "api_base": "http://127.0.0.1:18003/v1",
+                "model": "BB-FinQuant-Expert-14B",
+                "enabled": True,
+            },
+        ],
+    )
+    monkeypatch.setattr(settings, "local_ai_tools_api_base", "http://127.0.0.1:18001")
+    monkeypatch.setattr(settings, "high_risk_review_model", "deepseek-r1-14b-risk")
+    monkeypatch.setattr(settings, "high_risk_review_api_base", "http://127.0.0.1:18002/v1")
+
+    items = system_health._configured_endpoint_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert "endpoint_qwen3-32b-trade" not in by_key
+    assert by_key["endpoint_deepseek-v4-pro"]["status"] == "ok"
+    assert by_key["endpoint_deepseek-v4-pro"]["details"]["slot_name"] == (
+        "decision_maker"
+    )
 
 
 def test_server_monitor_items_keep_runtime_models_when_remote_monitor_unavailable() -> None:

@@ -227,7 +227,7 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         sqlite_position_columns = {
             "okx_inst_id": "VARCHAR(64)",
             "okx_pos_id": "VARCHAR(100)",
-            "entry_exchange_order_id": "VARCHAR(100)",
+            "entry_exchange_order_id": "VARCHAR(500)",
             "close_exchange_order_id": "VARCHAR(500)",
             "close_fill_pnl": "FLOAT",
             "entry_fee": "FLOAT",
@@ -265,7 +265,7 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
             "okx_inst_id": "ALTER TABLE positions ADD COLUMN okx_inst_id VARCHAR(64)",
             "okx_pos_id": "ALTER TABLE positions ADD COLUMN okx_pos_id VARCHAR(100)",
             "entry_exchange_order_id": (
-                "ALTER TABLE positions ADD COLUMN entry_exchange_order_id VARCHAR(100)"
+                "ALTER TABLE positions ADD COLUMN entry_exchange_order_id VARCHAR(500)"
             ),
             "close_exchange_order_id": (
                 "ALTER TABLE positions ADD COLUMN close_exchange_order_id VARCHAR(500)"
@@ -284,6 +284,30 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         for name, ddl in postgres_position_columns.items():
             if name not in position_columns:
                 await conn.execute(text(ddl))
+        if "entry_exchange_order_id" in position_columns:
+            await conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = current_schema()
+                              AND table_name = 'positions'
+                              AND column_name = 'entry_exchange_order_id'
+                              AND (
+                                  character_maximum_length IS NULL
+                                  OR character_maximum_length < 500
+                              )
+                        ) THEN
+                            ALTER TABLE positions
+                            ALTER COLUMN entry_exchange_order_id TYPE VARCHAR(500);
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
 
         order_columns = await _postgres_table_columns(conn, "orders")
         postgres_order_columns = {

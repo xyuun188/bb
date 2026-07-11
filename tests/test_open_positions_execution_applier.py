@@ -1,3 +1,5 @@
+import pytest
+
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
@@ -74,7 +76,7 @@ def test_open_positions_applier_adds_filled_entry() -> None:
     }
 
 
-def test_open_positions_applier_keeps_same_symbol_side_entries_separate() -> None:
+def test_open_positions_applier_merges_same_symbol_side_okx_net_entries() -> None:
     decision = _decision(Action.LONG)
     decision.raw_response = {
         "profit_first_trade_plan": {"exit_plan_id": "pfep-new"},
@@ -112,18 +114,19 @@ def test_open_positions_applier_keeps_same_symbol_side_entries_separate() -> Non
         _result(OrderStatus.FILLED, quantity=3.0),
     )
 
-    assert len(open_positions) == 2
-    assert open_positions[0]["entry_exchange_order_id"] == "okx-old"
-    assert open_positions[0]["profit_first_exit_plan_id"] == "pfep-old"
-    newest = open_positions[1]
-    assert newest["quantity"] == 3.0
-    assert newest["entry_price"] == 100.0
-    assert newest["current_price"] == 100.0
-    assert newest["stop_loss"] == 98.0
-    assert newest["take_profit"] == 104.0
-    assert newest["profit_first_exit_plan_id"] == "pfep-new"
-    assert newest["entry_exchange_order_id"] == "okx-1"
-    assert newest["entry_legs"][0]["exchange_order_id"] == "okx-1"
+    assert len(open_positions) == 1
+    merged = open_positions[0]
+    assert merged["quantity"] == pytest.approx(4.0)
+    assert merged["entry_price"] == pytest.approx(97.5)
+    assert merged["current_price"] == pytest.approx(100.0)
+    assert merged["stop_loss"] == pytest.approx(95.55)
+    assert merged["take_profit"] == pytest.approx(101.4)
+    assert merged["profit_first_exit_plan_id"] == "pfep-new"
+    assert merged["entry_exchange_order_id"] == "okx-old,okx-1"
+    assert [leg["exchange_order_id"] for leg in merged["entry_legs"]] == [
+        "okx-old",
+        "okx-1",
+    ]
 
 
 def test_open_positions_applier_ignores_duplicate_entry_callback_for_same_order_id() -> None:

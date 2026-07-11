@@ -186,7 +186,11 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     assert set(decisions) == {"sentiment_expert", "position_expert", "risk_expert"}
     assert len(calls) == 2
     json_kwargs = [kwargs for kwargs in captured_kwargs if kwargs.get("model_kwargs")]
-    assert json_kwargs == []
+    assert len(json_kwargs) == 2
+    assert all(
+        kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
+        for kwargs in json_kwargs
+    )
     assert all(
         kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
         for kwargs in captured_kwargs

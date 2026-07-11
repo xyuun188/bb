@@ -7,7 +7,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
-from services.trade_order_log_service import TradeOrderLogService
+from services.trade_order_log_service import TradeOrderLogService, TradeOrderPersistenceError
 
 
 class FakeSessionContext:
@@ -27,6 +27,11 @@ class FakeTradeRepo:
 
     async def create_order(self, data: dict[str, Any]) -> None:
         self.orders.append(data)
+
+
+class FailingTradeRepo(FakeTradeRepo):
+    async def create_order(self, data: dict[str, Any]) -> None:
+        raise RuntimeError("database write failed")
 
 
 def _decision() -> DecisionOutput:
@@ -80,6 +85,76 @@ async def test_trade_order_log_service_persists_order_payload() -> None:
             "exchange_order_id": "okx-1",
             "filled_at": filled_at,
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trade_order_log_service_surfaces_persistence_failure() -> None:
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda _model_name: "paper",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: FailingTradeRepo(),
+    )
+    result = ExecutionResult(
+        order_id="local-1",
+        exchange_order_id="okx-1",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        quantity=2.5,
+        price=101.2,
+        status=OrderStatus.FILLED,
+    )
+
+    with pytest.raises(TradeOrderPersistenceError):
+        await service.log_trade(result, "ensemble_trader", _decision(), decision_id=77)
+
+
+@pytest.mark.asyncio
+async def test_trade_order_log_service_persists_structured_okx_rejection_fact() -> None:
+    repo = FakeTradeRepo()
+    rejected_at = datetime(2026, 7, 11, 1, 2, tzinfo=UTC)
+    result = ExecutionResult(
+        order_id="okx_rejected",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.0,
+        price=101.2,
+        status=OrderStatus.REJECTED,
+        timestamp=rejected_at,
+        raw_response={
+            "okx_rejection": True,
+            "okx_symbol": "BTC-USDT-SWAP",
+            "raw_error": "OKX API error [59247]: Operation failed",
+            "okx_error_code": "59247",
+            "okx_error_payload": {
+                "code": "0",
+                "data": [{"sCode": "59247", "sMsg": "Operation failed"}],
+            },
+            "request_params": {"tdMode": "cross", "posSide": "long"},
+            "okx_order_rules": {"pre_submit_valid": True},
+            "leverage_check": {"actual_leverage": 2},
+        },
+    )
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda _model_name: "paper",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", _decision(), decision_id=78)
+
+    order = repo.orders[0]
+    assert order["status"] == "rejected"
+    assert order["okx_inst_id"] == "BTC-USDT-SWAP"
+    assert order["okx_state"] == "rejected_no_exchange_fill"
+    assert order["okx_sync_status"] == "okx_rejected_no_fill"
+    assert order["okx_synced_at"] == rejected_at
+    assert "59247" in order["okx_last_error"]
+    assert order["okx_raw_fills"]["error_code"] == "59247"
+    assert order["okx_raw_fills"]["error_payload"] == result.raw_response[
+        "okx_error_payload"
     ]
 
 

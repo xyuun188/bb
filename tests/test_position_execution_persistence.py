@@ -207,7 +207,7 @@ async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_keeps_same_symbol_side_add_entry_as_new_position() -> None:
+async def test_persist_entry_merges_same_symbol_side_add_into_okx_net_position() -> None:
     session = FakeSession()
     existing = _position(
         id=1,
@@ -230,27 +230,15 @@ async def test_persist_entry_keeps_same_symbol_side_add_entry_as_new_position() 
         execution_mode="paper",
     )
 
-    assert existing.quantity == 1.0
-    assert existing.entry_price == 90.0
-    assert repo.opened == [
-        {
-            "model_name": "ensemble_trader",
-            "execution_mode": "paper",
-            "symbol": "BTC/USDT",
-            "side": "long",
-            "quantity": 3.0,
-            "entry_price": 100.0,
-            "current_price": 100.0,
-            "leverage": 3.0,
-            "unrealized_pnl": 0.0,
-            "realized_pnl": 0.0,
-            "stop_loss_price": 98.0,
-            "take_profit_price": 104.0,
-            "okx_inst_id": "BTC-USDT-SWAP",
-            "okx_pos_id": "btc-net",
-            "entry_exchange_order_id": "new-entry",
-        }
-    ]
+    assert existing.quantity == pytest.approx(4.0)
+    assert existing.entry_price == pytest.approx(97.5)
+    assert existing.current_price == pytest.approx(100.0)
+    assert existing.okx_inst_id == "BTC-USDT-SWAP"
+    assert existing.okx_pos_id == "btc-net"
+    assert existing.entry_exchange_order_id == "old-entry,new-entry"
+    assert existing.stop_loss_price == pytest.approx(95.55)
+    assert existing.take_profit_price == pytest.approx(101.4)
+    assert repo.opened == []
 
 
 @pytest.mark.asyncio

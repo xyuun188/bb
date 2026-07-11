@@ -127,6 +127,45 @@ _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 
 
+def _bounded_dashboard_payload(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = 7,
+    max_items: int = 80,
+    max_text: int = 1600,
+) -> Any:
+    """Bound list/detail responses without returning stored model transcripts wholesale."""
+
+    if depth > max_depth:
+        return None
+    if isinstance(value, str):
+        return value if len(value) <= max_text else f"{value[:max_text]}..."
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_dashboard_payload(
+                nested,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_text=max_text,
+            )
+            for key, nested in list(value.items())[:max_items]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_dashboard_payload(
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_text=max_text,
+            )
+            for item in list(value)[:max_items]
+        ]
+    return value
+
+
 def _dashboard_heavy_cache_get(
     key: tuple[Any, ...], ttl_seconds: float = _DASHBOARD_HEAVY_CACHE_TTL_SECONDS
 ) -> Any | None:
@@ -2381,7 +2420,95 @@ def _dashboard_split_exchange_order_ids(value: Any) -> set[str]:
     return {token for token in tokens if token}
 
 
+async def _dashboard_closed_ledger_watermark(
+    session: Any,
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> tuple[Any, ...]:
+    """Return a compact invalidation key for the persisted closed-position read model."""
+
+    from sqlalchemy import func, select
+
+    from models.account import OkxAccountBill
+    from models.trade import OkxPositionHistory, Order, Position
+
+    position_filters = [Position.is_open.is_(False)]
+    order_filters = [Order.status == "filled"]
+    history_filters = []
+    bill_filters = []
+    if mode:
+        position_filters.append(Position.execution_mode == mode)
+        order_filters.append(Order.execution_mode == mode)
+        history_filters.append(OkxPositionHistory.mode == mode)
+        bill_filters.append(OkxAccountBill.mode == mode)
+    if model_names:
+        position_filters.append(Position.model_name.in_(model_names))
+        order_filters.append(Order.model_name.in_(model_names))
+
+    row = (
+        await session.execute(
+            select(
+                select(func.count(Position.id)).where(*position_filters).scalar_subquery(),
+                select(func.max(Position.id)).where(*position_filters).scalar_subquery(),
+                select(func.count(Order.id)).where(*order_filters).scalar_subquery(),
+                select(func.max(Order.id)).where(*order_filters).scalar_subquery(),
+                select(func.count(OkxPositionHistory.id))
+                .where(*history_filters)
+                .scalar_subquery(),
+                select(func.max(OkxPositionHistory.id))
+                .where(*history_filters)
+                .scalar_subquery(),
+                select(func.count(OkxAccountBill.id))
+                .where(*bill_filters)
+                .scalar_subquery(),
+                select(func.max(OkxAccountBill.id)).where(*bill_filters).scalar_subquery(),
+            )
+        )
+    ).one()
+    return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
+
+
 async def _dashboard_closed_position_ledger_rows(
+    session: Any,
+    repo: Any,
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    paginate: bool = True,
+) -> tuple[list[dict[str, Any]], int, int, int, str]:
+    watermark = await _dashboard_closed_ledger_watermark(
+        session,
+        mode=mode,
+        model_names=model_names,
+    )
+    cache_key = (
+        "closed-position-ledger",
+        mode or "all",
+        tuple(model_names or ()),
+        int(page or 1),
+        int(page_size or 20),
+        bool(paginate),
+        watermark,
+    )
+
+    async def build() -> tuple[list[dict[str, Any]], int, int, int, str]:
+        return await _dashboard_closed_position_ledger_rows_uncached(
+            session,
+            repo,
+            mode=mode,
+            model_names=model_names,
+            page=page,
+            page_size=page_size,
+            paginate=paginate,
+        )
+
+    return await _dashboard_heavy_cached(cache_key, build, ttl_seconds=300.0)
+
+
+async def _dashboard_closed_position_ledger_rows_uncached(
     session: Any,
     repo: Any,
     *,
@@ -2401,7 +2528,6 @@ async def _dashboard_closed_position_ledger_rows(
         OKX_SYNC_OKX_ONLY,
     )
     from services.okx_position_history_store import (
-        backfill_okx_position_history_from_positions,
         load_okx_position_history_records,
         okx_position_history_records_to_rows,
     )
@@ -2435,11 +2561,6 @@ async def _dashboard_closed_position_ledger_rows(
         for position in closed_rows
         if is_final_settlement_status(getattr(position, "settlement_status", None))
     ]
-    await backfill_okx_position_history_from_positions(
-        session,
-        mode=mode,
-        limit=5000,
-    )
     history_records = await load_okx_position_history_records(
         session,
         mode=mode,
@@ -5989,7 +6110,7 @@ async def get_analysis_records(
     page_size: int | None = None,
     decision_id: int | None = None,
     analysis_type: str | None = None,
-    include_detail: bool = True,
+    include_detail: bool = False,
     symbol: str | None = None,
     expert_name: str | None = None,
     is_paper: bool | None = None,
@@ -6349,6 +6470,12 @@ async def get_analysis_records(
             "disagreement": raw.get("disagreement"),
             "was_executed": d.was_executed,
             "execution_reason": display_execution_reason,
+            "ml_signal": _bounded_dashboard_payload(
+                raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else None,
+                max_depth=4,
+                max_items=40,
+                max_text=600,
+            ),
             "is_paper": d.is_paper,
             "flow_summary": (
                 f"{pre_expert_skip.get('label')}：{pre_expert_skip.get('reason')}"
@@ -6363,7 +6490,7 @@ async def get_analysis_records(
             ),
         }
         record.update(detail_payload)
-        records.append(sanitize_payload(record))
+        records.append(_bounded_dashboard_payload(sanitize_payload(record)))
 
     total = (
         total_without_server_filter
@@ -6419,7 +6546,7 @@ async def get_strategy_learning(
         max_open_positions,
         selected_detail,
     )
-    cached = _dashboard_heavy_cache_get(cache_key)
+    cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
     if cached is not None:
         return sanitize_payload(cached)
     service = getattr(_trading_service, "strategy_learning_service", None)
@@ -6482,6 +6609,53 @@ async def rollback_strategy_learning_profile():
     return sanitize_payload({"profile_id": "auto", "state": state})
 
 
+async def _profit_attribution_watermark(
+    session: Any,
+    *,
+    selected_mode: str,
+    since: datetime,
+) -> tuple[Any, ...]:
+    from sqlalchemy import func, select
+
+    from models.trade import Position
+
+    row = (
+        await session.execute(
+            select(
+                select(func.count(Position.id))
+                .where(
+                    Position.execution_mode == selected_mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at >= since,
+                )
+                .scalar_subquery(),
+                select(func.max(Position.id))
+                .where(
+                    Position.execution_mode == selected_mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at >= since,
+                )
+                .scalar_subquery(),
+                select(func.max(Position.updated_at))
+                .where(
+                    Position.execution_mode == selected_mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at >= since,
+                )
+                .scalar_subquery(),
+                select(func.max(Position.settlement_synced_at))
+                .where(
+                    Position.execution_mode == selected_mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at >= since,
+                )
+                .scalar_subquery(),
+            )
+        )
+    ).one()
+    return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
+
+
 @router.get("/profit-attribution")
 async def get_profit_attribution(
     mode: str | None = None,
@@ -6489,7 +6663,7 @@ async def get_profit_attribution(
     limit: int = 200,
 ):
     """Explain why recent closed trades made or lost money."""
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
 
     from db.session import get_session_ctx
     from models.decision import AIDecision
@@ -6502,16 +6676,25 @@ async def get_profit_attribution(
     )
 
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
-    is_paper = selected_mode == "paper"
     capped_hours = max(1, min(int(hours or 24), 720))
     max_rows = max(20, min(int(limit or 200), 1000))
     since = datetime.now(UTC) - timedelta(hours=capped_hours)
-    cache_key = ("profit-attribution", selected_mode, capped_hours, max_rows)
-    cached = _dashboard_heavy_cache_get(cache_key)
-    if cached is not None:
-        return sanitize_payload(cached)
-
     async with get_session_ctx() as session:
+        watermark = await _profit_attribution_watermark(
+            session,
+            selected_mode=selected_mode,
+            since=since,
+        )
+        cache_key = (
+            "profit-attribution",
+            selected_mode,
+            capped_hours,
+            max_rows,
+            watermark,
+        )
+        cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
+        if cached is not None:
+            return sanitize_payload(cached)
         position_result = await session.execute(
             select(Position)
             .where(
@@ -6580,25 +6763,6 @@ async def get_profit_attribution(
             decisions_by_id.update(
                 {int(row.id): row for row in decision_result.scalars().all() if row.id is not None}
             )
-        if symbol_variants:
-            fallback_decision_result = await session.execute(
-                select(AIDecision)
-                .where(
-                    AIDecision.model_name == ENSEMBLE_TRADER_NAME,
-                    AIDecision.symbol.in_(symbol_variants),
-                    AIDecision.is_paper.is_(is_paper),
-                    AIDecision.created_at >= order_since,
-                )
-                .order_by(AIDecision.created_at.desc())
-                .limit(max(max_rows * 12, 1200))
-            )
-            decisions_by_id.update(
-                {
-                    int(row.id): row
-                    for row in fallback_decision_result.scalars().all()
-                    if row.id is not None and int(row.id) not in decisions_by_id
-                }
-            )
         decisions = list(decisions_by_id.values())
 
         entry_decisions = match_entry_decisions_for_positions(positions, orders, decisions)
@@ -6614,42 +6778,6 @@ async def get_profit_attribution(
             shadows_by_id.update(
                 {int(row.id): row for row in shadow_result.scalars().all() if row.id is not None}
             )
-        shadow_time_conditions = []
-        for decision in entry_decisions:
-            decision_time = _as_utc_datetime(decision.created_at)
-            if not decision.symbol or not decision_time:
-                continue
-            decision_symbol_variants = _dashboard_symbol_query_variants({decision.symbol})
-            shadow_time_conditions.append(
-                (ShadowBacktest.symbol.in_(decision_symbol_variants))
-                & (ShadowBacktest.execution_mode == selected_mode)
-                & (ShadowBacktest.created_at >= decision_time - timedelta(minutes=30))
-                & (ShadowBacktest.created_at <= decision_time + timedelta(minutes=30))
-            )
-        for position in positions:
-            opened_at = _as_utc_datetime(position.created_at)
-            if not position.symbol or not opened_at:
-                continue
-            position_symbol_variants = _dashboard_symbol_query_variants({position.symbol})
-            shadow_time_conditions.append(
-                (ShadowBacktest.symbol.in_(position_symbol_variants))
-                & (ShadowBacktest.execution_mode == selected_mode)
-                & (ShadowBacktest.created_at >= opened_at - timedelta(minutes=45))
-                & (ShadowBacktest.created_at <= opened_at + timedelta(minutes=45))
-            )
-        if shadow_time_conditions:
-            fallback_shadow_result = await session.execute(
-                select(ShadowBacktest)
-                .where(or_(*shadow_time_conditions))
-                .order_by(ShadowBacktest.created_at.desc())
-            )
-            shadows_by_id.update(
-                {
-                    int(row.id): row
-                    for row in fallback_shadow_result.scalars().all()
-                    if row.id is not None and int(row.id) not in shadows_by_id
-                }
-            )
         shadows = list(shadows_by_id.values())
 
     payload = build_profit_attribution(positions, orders, decisions, shadows)
@@ -6658,6 +6786,7 @@ async def get_profit_attribution(
         "window_hours": capped_hours,
         "sample_limit": max_rows,
         "since": since.isoformat(),
+        "lineage_policy": "authoritative_order_decision_links_only",
         **payload,
         "message": "按已平仓真实盈亏，结合 AI 决策、订单、影子复盘和本地模型证据做交易级归因。",
     }

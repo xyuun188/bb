@@ -56,7 +56,18 @@ class InsufficientBalanceError(ExecutorError):
 
 
 class ExchangeAPIError(ExecutorError):
-    """OKX API returned an error response."""
+    """OKX API returned an error response with optional structured facts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code or "") or None
+        self.payload = dict(payload) if isinstance(payload, dict) else None
 
 
 class RateLimitError(ExchangeAPIError):

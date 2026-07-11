@@ -260,6 +260,7 @@ class ExecutionService:
         position_execution_persister: (
             Callable[[str, DecisionOutput, ExecutionResult, str], Awaitable[None]] | None
         ) = None,
+        order_fact_recovery_trigger: Callable[[str], None] | None = None,
         open_positions_execution_applier: (
             Callable[[list[dict[str, Any]], str, DecisionOutput, ExecutionResult], None] | None
         ) = None,
@@ -326,6 +327,7 @@ class ExecutionService:
         self.no_exchange_position_result_checker = no_exchange_position_result_checker
         self.trade_count_incrementer = trade_count_incrementer
         self.position_execution_persister = position_execution_persister
+        self.order_fact_recovery_trigger = order_fact_recovery_trigger
         self.open_positions_execution_applier = open_positions_execution_applier
         self.decision_executed_marker = decision_executed_marker
         self.market_no_opportunity_symbol_clearer = market_no_opportunity_symbol_clearer
@@ -519,6 +521,23 @@ class ExecutionService:
         if self.position_execution_persister is None:
             raise RuntimeError("ExecutionService requires position_execution_persister dependency")
         return self.position_execution_persister
+
+    def _trigger_order_fact_recovery(self, execution_mode: str) -> bool:
+        """Request a non-blocking OKX fill recovery after local order persistence fails."""
+
+        trigger = self.order_fact_recovery_trigger
+        if trigger is None:
+            return False
+        try:
+            trigger(execution_mode)
+            return True
+        except Exception as exc:  # pragma: no cover - defensive recovery boundary
+            logger.warning(
+                "failed to request order fact recovery",
+                execution_mode=execution_mode,
+                error=safe_error_text(exc, limit=180),
+            )
+            return False
 
     def _required_open_positions_execution_applier(
         self,
@@ -1501,10 +1520,40 @@ class ExecutionService:
                     result_text,
                     transient_entry_block_minutes(result_text),
                 )
-            await log_trade(execution_result, model_name, decision, decision_db_id)
             exchange_confirmed = is_exchange_confirmed_execution(execution_result)
             exit_progress = is_exit_progress_execution(execution_result)
             confirm_reason = execution_reason_from_result(execution_result)
+            local_order_persisted = True
+            local_order_persistence_error: str | None = None
+            recovery_requested = False
+            try:
+                await log_trade(execution_result, model_name, decision, decision_db_id)
+            except Exception as exc:
+                local_order_persisted = False
+                local_order_persistence_error = safe_error_text(exc, limit=180)
+                if exchange_confirmed or exit_progress:
+                    recovery_requested = self._trigger_order_fact_recovery(model_mode)
+                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                raw = dict(raw)
+                raw["local_order_persistence"] = {
+                    "status": "failed",
+                    "error": local_order_persistence_error,
+                    "exchange_order_id": getattr(execution_result, "exchange_order_id", None),
+                    "recovery_requested": recovery_requested,
+                }
+                decision.raw_response = raw
+                warning = (
+                    (
+                        "OKX 成交已确认，但本地订单事实写入失败；系统没有写入孤立持仓，"
+                        "并已触发 OKX 成交事实补偿。"
+                    )
+                    if exchange_confirmed or exit_progress
+                    else "本地订单执行记录写入失败；交易所没有确认成交，系统未改动本地持仓。"
+                )
+                results["warnings"].append(
+                    {"model": model_name, "symbol": symbol, "warning": warning}
+                )
+                await log_risk_event("warning", symbol, warning, model_name)
             if exchange_confirmed:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
@@ -1559,30 +1608,46 @@ class ExecutionService:
                     open_positions[:] = await get_open_positions_context()
             if exchange_confirmed or exit_progress:
                 increment_trade_count()
-                await persist_position_from_execution(
-                    model_name,
-                    decision,
-                    execution_result,
-                    model_mode,
-                )
-                if open_positions is not None:
-                    apply_execution_to_open_positions(
-                        open_positions,
+                if local_order_persisted:
+                    await persist_position_from_execution(
                         model_name,
                         decision,
                         execution_result,
+                        model_mode,
                     )
-                if decision.is_exit:
-                    remember_exit_cooldown(model_name, decision)
-                await mark_stage(
-                    DecisionStage.LOCAL_SYNC,
-                    DecisionStageStatus.COMPLETED,
-                    "成交结果已写入本地订单/持仓记录。",
-                    {
-                        "exit_progress": bool(exit_progress),
-                        "exchange_confirmed": bool(exchange_confirmed),
-                    },
-                )
+                    if open_positions is not None:
+                        apply_execution_to_open_positions(
+                            open_positions,
+                            model_name,
+                            decision,
+                            execution_result,
+                        )
+                    if decision.is_exit:
+                        remember_exit_cooldown(model_name, decision)
+                    await mark_stage(
+                        DecisionStage.LOCAL_SYNC,
+                        DecisionStageStatus.COMPLETED,
+                        "成交结果已写入本地订单/持仓记录。",
+                        {
+                            "exit_progress": bool(exit_progress),
+                            "exchange_confirmed": bool(exchange_confirmed),
+                        },
+                    )
+                else:
+                    await mark_stage(
+                        DecisionStage.LOCAL_SYNC,
+                        DecisionStageStatus.FAILED,
+                        (
+                            "OKX 成交已确认，但本地订单事实写入失败；系统未写入本地持仓，"
+                            "正在通过 OKX 成交事实补偿恢复。"
+                        ),
+                        {
+                            "exchange_confirmed": bool(exchange_confirmed),
+                            "exit_progress": bool(exit_progress),
+                            "local_order_persistence_error": local_order_persistence_error,
+                            "recovery_requested": recovery_requested,
+                        },
+                    )
             else:
                 await mark_stage(
                     DecisionStage.LOCAL_SYNC,

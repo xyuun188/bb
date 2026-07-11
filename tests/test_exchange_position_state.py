@@ -14,6 +14,34 @@ from services.exchange_position_state import (
 )
 
 
+def test_parse_position_prefers_notional_contract_size_when_ccxt_omits_ctval() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "INJ-USDT-SWAP",
+            "side": "long",
+            "contracts": 77.0,
+            "contractSize": None,
+            "markPrice": 5.078,
+            "entryPrice": 5.055376623376623,
+            "notional": 39.1006,
+            "info": {
+                "instId": "INJ-USDT-SWAP",
+                "pos": "77",
+                "posSide": "net",
+                "avgPx": "5.055376623376623",
+                "markPx": "5.078",
+                "upl": "0.015436575875486344",
+                "notionalUsd": "39.1006",
+            },
+        },
+        symbol_normalizer=lambda value: str(value).replace("-USDT-SWAP", "/USDT"),
+    )
+
+    assert snapshot is not None
+    assert snapshot["contract_size"] == pytest.approx(0.1, rel=0.002)
+    assert snapshot["quantity"] == pytest.approx(7.7, rel=0.002)
+
+
 def test_parse_okx_position_snapshot_prefers_info_markpx_upl_and_ctval() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

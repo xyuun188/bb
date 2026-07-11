@@ -165,6 +165,7 @@ def _native_position_row(
     *,
     pos: Any,
     pos_side: str = "long",
+    leverage: Any = "0",
     ct_val: Any = "1",
     avg_px: Any = "100",
     mark_px: Any = "100",
@@ -174,6 +175,7 @@ def _native_position_row(
         "instId": inst_id,
         "posSide": pos_side,
         "pos": str(pos),
+        "lever": str(leverage),
         "ctVal": str(ct_val),
         "avgPx": str(avg_px),
         "markPx": str(mark_px),
@@ -467,6 +469,54 @@ class _LeverageUnknownAfterOpenOrderLimitCcxt:
 
     async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(self.error_text)
+
+
+class _ExistingPositionLeverageCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.set_leverage_calls = 0
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "contractSize": 1.0,
+            "limits": {"amount": {"min": 1.0}},
+            "info": {"instId": "BTC-USDT-SWAP"},
+        }
+
+    async def fetch_market_leverage_tiers(self, _symbol: str) -> list[dict[str, Any]]:
+        return [{"maxLeverage": 20}]
+
+    async def fetch_leverage(
+        self,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"longLeverage": 1, "shortLeverage": 1, "info": []}
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _filter_native_rows(
+            [
+                _native_position_row(
+                    "BTC-USDT-SWAP",
+                    pos="2",
+                    pos_side="long",
+                    leverage="2",
+                )
+            ],
+            params,
+        )
+
+    async def set_leverage(
+        self,
+        _leverage: int,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.set_leverage_calls += 1
+        raise AssertionError("existing-position add-on must not mutate OKX leverage")
 
 
 class _PrecisionEntryCcxt:
@@ -1349,6 +1399,23 @@ async def test_okx_leverage_open_order_limit_with_unknown_actual_rejects_entry()
     assert hidden_value not in rendered
     assert "Authorization: ***" in rendered
     assert "password=***" in rendered
+
+
+@pytest.mark.asyncio
+async def test_okx_existing_position_add_on_reuses_authoritative_leverage() -> None:
+    exchange = _ExistingPositionLeverageCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+
+    result = await executor._set_leverage_if_needed(decision)
+
+    assert result["ok"] is True
+    assert result["skipped_set"] is True
+    assert result["existing_position"] is True
+    assert result["actual_leverage"] == 2
+    assert result["target_leverage"] == 2
+    assert decision.suggested_leverage == 2
+    assert exchange.set_leverage_calls == 0
 
 
 class _FloorAmountPrecisionCcxt:

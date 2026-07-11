@@ -428,7 +428,11 @@ class OKXExecutor(AbstractExecutor):
                     last_error = e
                     continue
                 logger.error("OKX SDK exchange error", error=message)
-                raise ExchangeAPIError(message) from e
+                raise ExchangeAPIError(
+                    message,
+                    code=getattr(e, "code", None),
+                    payload=getattr(e, "payload", None),
+                ) from e
             except Exception as e:
                 if self._is_broken_rest_url_error(e) and attempt < MAX_RETRIES - 1:
                     logger.warning(
@@ -968,6 +972,7 @@ class OKXExecutor(AbstractExecutor):
                             },
                         )
             params: dict[str, Any] = {"tdMode": "cross"}
+            leverage_check: dict[str, Any] | None = None
 
             if decision.is_entry:
                 quantity_leverage = self._safe_float(decision.suggested_leverage, 1.0)
@@ -1231,13 +1236,14 @@ class OKXExecutor(AbstractExecutor):
                             decision=decision,
                             side=side,
                             price=price,
-                            error_text=error_text,
+                            exchange_error=e,
                             okx_symbol=okx_symbol,
                             contract_size=contract_size,
                             order_quantity=order_quantity,
                             base_quantity=base_quantity,
                             okx_order_rules=okx_order_rules,
                             request_params=params,
+                            leverage_check=leverage_check,
                         )
                 else:
                     raise
@@ -1599,13 +1605,14 @@ class OKXExecutor(AbstractExecutor):
                     decision=decision,
                     side=side,
                     price=0.0,
-                    error_text=error_text,
+                    exchange_error=e,
                     okx_symbol=okx_symbol,
                     contract_size=contract_size,
                     order_quantity=order_quantity,
                     base_quantity=base_quantity,
                     okx_order_rules=okx_order_rules,
                     request_params=params,
+                    leverage_check=leverage_check,
                 )
             raise
         except RateLimitError:
@@ -3018,15 +3025,20 @@ class OKXExecutor(AbstractExecutor):
         decision: DecisionOutput,
         side: str,
         price: float,
-        error_text: str,
+        exchange_error: Exception | str,
         okx_symbol: str,
         contract_size: float,
         order_quantity: float,
         base_quantity: float,
         okx_order_rules: dict[str, Any],
         request_params: dict[str, Any],
+        leverage_check: dict[str, Any] | None = None,
     ) -> ExecutionResult:
         """Return a structured rejected result when OKX still rejects an entry."""
+
+        error_text = safe_error_text(exchange_error, limit=500)
+        error_code = str(getattr(exchange_error, "code", "") or "") or None
+        error_payload = getattr(exchange_error, "payload", None)
 
         return ExecutionResult(
             order_id="okx_rejected",
@@ -3042,6 +3054,10 @@ class OKXExecutor(AbstractExecutor):
                     "最终张数和交易所返回原因，供执行详情定位。"
                 ),
                 "raw_error": error_text,
+                "okx_error_code": error_code,
+                "okx_error_payload": (
+                    error_payload if isinstance(error_payload, dict) else None
+                ),
                 "execution_blocker": "okx_exchange_rejection",
                 "system_pre_submit_rejection": False,
                 "okx_rejection": True,
@@ -3051,6 +3067,7 @@ class OKXExecutor(AbstractExecutor):
                 "planned_base_quantity": base_quantity,
                 "okx_order_rules": okx_order_rules,
                 "request_params": request_params,
+                "leverage_check": dict(leverage_check or {}),
             },
         )
 
@@ -3570,6 +3587,73 @@ class OKXExecutor(AbstractExecutor):
                 "okx_max_leverage": max_leverage,
                 "target_leverage": leverage,
                 "actual_leverage": actual,
+                "set_response": None,
+                "verify_response": verify_response,
+                "params": params,
+            }
+
+        # Cross-margin leverage belongs to the existing OKX position lifecycle.
+        # An add-on entry must use that accepted leverage rather than trying to
+        # mutate the instrument while the position is open.
+        existing_position: dict[str, Any] | None = None
+        target_side = "long" if decision.action == Action.LONG else "short"
+        try:
+            positions = await self.get_positions_strict(decision.symbol)
+            for position in positions or []:
+                if self._position_matches_exit_side(
+                    position,
+                    target_side,
+                    decision_symbol=decision.symbol,
+                ):
+                    existing_position = position
+                    break
+        except Exception as e:
+            logger.debug(
+                "fetch existing position before leverage mutation failed",
+                symbol=okx_symbol,
+                side=target_side,
+                error=safe_error_text(e),
+            )
+        if existing_position is not None:
+            info = existing_position.get("info") or {}
+            position_leverage = self._safe_float(
+                existing_position.get("leverage")
+                or info.get("lever")
+                or info.get("leverage"),
+                actual,
+            )
+            if position_leverage <= 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        "OKX 已有同方向持仓，但当前持仓快照没有返回可确认的实际杠杆；"
+                        "系统不会在未知杠杆下修改现有仓位或继续加仓。"
+                    ),
+                    "ai_requested_leverage": requested_leverage,
+                    "okx_max_leverage": max_leverage,
+                    "target_leverage": leverage,
+                    "actual_leverage": None,
+                    "existing_position": True,
+                    "existing_position_side": target_side,
+                    "set_response": None,
+                    "verify_response": verify_response,
+                    "params": params,
+                }
+            decision.suggested_leverage = float(position_leverage)
+            self._cache_leverage(okx_symbol, params, position_leverage)
+            return {
+                "ok": True,
+                "skipped_set": True,
+                "reason": (
+                    f"OKX 已有同方向持仓，系统沿用该仓位已接受的 "
+                    f"{position_leverage:g}x 杠杆，不在加仓前修改杠杆。"
+                ),
+                "ai_requested_leverage": requested_leverage,
+                "okx_max_leverage": max_leverage,
+                "target_leverage": position_leverage,
+                "actual_leverage": position_leverage,
+                "existing_position": True,
+                "existing_position_side": target_side,
                 "set_response": None,
                 "verify_response": verify_response,
                 "params": params,

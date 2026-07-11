@@ -160,6 +160,10 @@ async def test_postgres_trade_fact_columns_skip_existing_columns(
     await session_module._ensure_trade_fact_columns(fake_conn)
 
     assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+    assert any(
+        "ALTER COLUMN entry_exchange_order_id TYPE VARCHAR(500)" in statement
+        for statement in fake_conn.statements
+    )
 
 
 @pytest.mark.asyncio

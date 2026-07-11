@@ -32,7 +32,6 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
-from services.manual_close_marker import is_manual_close_order
 from services.okx_native_facts import (
     OkxNativeAccountBill,
     OkxNativeFactsClient,
@@ -42,7 +41,11 @@ from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
     find_current_position_entry_confirmation,
 )
-from services.okx_position_history_store import upsert_okx_position_history_row
+from services.okx_position_history_store import (
+    load_okx_position_history_records,
+    okx_position_history_records_to_rows,
+    upsert_okx_position_history_row,
+)
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 from services.position_settlement import (
     apply_position_settlement_snapshot,
@@ -64,6 +67,7 @@ DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 12
 DEFAULT_MAX_ORDER_GAP_QUERIES = 20
 CORE_OKX_STAGE_TIMEOUT_SECONDS = 6.0
 TARGET_ORDER_PULL_TIMEOUT_SECONDS = 12.0
+ACCOUNT_HISTORY_MAX_TIMEOUT_SECONDS = 30.0
 CURRENT_POSITION_ENTRY_LINK_WINDOW_SECONDS = 10 * 60
 CURRENT_POSITION_ENTRY_PRICE_TOLERANCE_RATIO = 0.002
 CURRENT_POSITION_ENTRY_QUANTITY_TOLERANCE_RATIO = 0.02
@@ -274,6 +278,11 @@ class OkxOrderFactSyncService:
         account_bills: list[OkxNativeAccountBill] = []
         account_bill_error: str | None = None
         optional_stage_errors: list[str] = []
+        history_page_count = max(3, min(10, (self.limit // 100) + 2))
+        history_timeout_seconds = min(
+            ACCOUNT_HISTORY_MAX_TIMEOUT_SECONDS,
+            max(self.timeout_seconds, history_page_count * 3.0),
+        )
 
         def record_optional_stage_error(stage: str, exc: Exception) -> str:
             error = safe_error_text(exc, limit=180)
@@ -332,12 +341,12 @@ class OkxOrderFactSyncService:
                         inst_ids=fact_target_inst_ids,
                         since=since,
                         limit=100,
-                        max_pages=1,
+                        max_pages=history_page_count,
                         account_wide_only=True,
                         account_wide_fallback=False,
                         strict=True,
                     ),
-                    max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
+                    history_timeout_seconds,
                 )
                 fills = _dedupe_fills_by_order_id([*fills, *account_wide_fills])
             except Exception as exc:
@@ -346,38 +355,15 @@ class OkxOrderFactSyncService:
             try:
                 account_order_rows = await _bounded(
                     native_facts.fetch_order_history_rows(
-                        inst_ids=fact_target_inst_ids,
                         since=since,
                         limit=100,
-                        max_pages=(
-                            1
-                            if fact_target_inst_ids
-                            else max(3, min(10, (self.limit // 100) + 2))
-                        ),
+                        max_pages=history_page_count,
                         strict=True,
                     ),
-                    max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
+                    history_timeout_seconds,
                 )
             except Exception as exc:
                 record_optional_stage_error("orders_history_by_inst", exc)
-            if fact_target_inst_ids:
-                try:
-                    account_order_rows = _dedupe_order_rows(
-                        [
-                            *account_order_rows,
-                            *await _bounded(
-                                native_facts.fetch_order_history_rows(
-                                    since=since,
-                                    limit=100,
-                                    max_pages=1,
-                                    strict=True,
-                                ),
-                                max(4.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
-                            ),
-                        ]
-                    )
-                except Exception as exc:
-                    record_optional_stage_error("orders_history_account_context", exc)
             account_order_ids = set(_order_rows_by_id(account_order_rows))
             missing_order_ids = sorted(target_order_ids - account_order_ids)
             if fills:
@@ -462,13 +448,12 @@ class OkxOrderFactSyncService:
                             *position_history_rows,
                             *await _bounded(
                                 native_facts.fetch_position_history_rows(
-                                    inst_ids=position_target_inst_ids or fact_target_inst_ids,
                                     since=since,
                                     limit=100,
-                                    max_pages=1,
+                                    max_pages=history_page_count,
                                     strict=True,
                                 ),
-                                max(0.5, min(self.timeout_seconds * 0.5, 3.0)),
+                                history_timeout_seconds,
                             ),
                         ]
                     )
@@ -558,6 +543,26 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
                 await session.flush()
+                mirrored_position_history = await load_okx_position_history_records(
+                    session,
+                    mode=self.mode,
+                    limit=min(self.limit * 4, 5000),
+                )
+                mirrored_position_history_rows = okx_position_history_records_to_rows(
+                    mirrored_position_history
+                )
+                if mirrored_position_history_rows:
+                    live_position_history_count = len(position_history_rows)
+                    position_history_rows = _dedupe_position_history_rows(
+                        [*position_history_rows, *mirrored_position_history_rows]
+                    )
+                    samples.append(
+                        {
+                            "kind": "okx_position_history_mirror_reused",
+                            "record_count": len(mirrored_position_history_rows),
+                            "live_record_count": live_position_history_count,
+                        }
+                    )
                 position_history_result = await self._sync_position_history_rows(
                     session,
                     position_history_rows=position_history_rows,
@@ -1222,6 +1227,20 @@ class OkxOrderFactSyncService:
                     entry_order_ids=entry_order_ids,
                     close_order_ids=close_order_ids,
                 )
+            if existing is None and (not entry_order_ids or not close_order_ids):
+                skipped += 1
+                samples.append(
+                    {
+                        "kind": "okx_position_history_projection_deferred",
+                        "symbol": symbol_from_okx_inst_id(inst_id)
+                        or normalize_trading_symbol(inst_id),
+                        "side": side,
+                        "okx_pos_id": pos_id,
+                        "missing_entry_orders": not bool(entry_order_ids),
+                        "missing_close_orders": not bool(close_order_ids),
+                    }
+                )
+                continue
             if existing is None:
                 session.add(Position(**payload))
                 backfilled += 1
@@ -1625,17 +1644,27 @@ class OkxOrderFactSyncService:
                 now=now,
                 contract_size=_current_position_contract_size(row, contract_sizes),
             )
-            entry_order = _matching_current_position_entry_order(payload, candidate_orders)
-            if entry_order is not None:
-                payload["entry_exchange_order_id"] = str(
-                    getattr(entry_order, "exchange_order_id", "") or ""
-                ).strip() or None
-            existing = await self._find_current_position_cache_row(
+            entry_orders = _matching_current_position_entry_orders(payload, candidate_orders)
+            if entry_orders:
+                strategy_models = {
+                    str(getattr(order, "model_name", "") or "").strip()
+                    for order in entry_orders
+                    if str(getattr(order, "model_name", "") or "").strip()
+                    not in {"", "okx_authoritative_sync"}
+                }
+                if len(strategy_models) == 1:
+                    payload["model_name"] = next(iter(strategy_models))
+                payload["entry_exchange_order_id"] = _merge_exchange_order_ids(
+                    *(getattr(order, "exchange_order_id", None) for order in entry_orders),
+                    max_length=500,
+                ) or None
+            existing_rows = await self._find_current_position_cache_rows(
                 session,
                 pos_id=str(payload.get("okx_pos_id") or ""),
                 inst_id=inst_id,
                 side=side,
             )
+            existing = _best_current_position_cache_row(existing_rows)
             if existing is None:
                 session.add(Position(**payload))
                 backfilled += 1
@@ -1649,7 +1678,22 @@ class OkxOrderFactSyncService:
                     }
                 )
                 continue
+            payload["entry_exchange_order_id"] = _merge_exchange_order_ids(
+                payload.get("entry_exchange_order_id"),
+                *(getattr(position, "entry_exchange_order_id", None) for position in existing_rows),
+                max_length=500,
+            ) or None
             _apply_current_position_payload(existing, payload, now=now)
+            duplicate_ids: list[int] = []
+            for duplicate in existing_rows:
+                if duplicate is existing:
+                    continue
+                duplicate_ids.append(int(getattr(duplicate, "id", 0) or 0))
+                _retire_duplicate_current_position(
+                    duplicate,
+                    canonical=existing,
+                    now=now,
+                )
             updated += 1
             samples.append(
                 {
@@ -1659,6 +1703,7 @@ class OkxOrderFactSyncService:
                     "side": getattr(existing, "side", None),
                     "okx_pos_id": getattr(existing, "okx_pos_id", None),
                     "entry_exchange_order_id": getattr(existing, "entry_exchange_order_id", None),
+                    "retired_duplicate_position_ids": duplicate_ids,
                 }
             )
         return OkxPositionFactSyncSummary(
@@ -2032,16 +2077,16 @@ class OkxOrderFactSyncService:
             .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
             .limit(self.limit * 3)
         )
-        return [order for order in rows.scalars().all() if not is_manual_close_order(order)]
+        return list(rows.scalars().all())
 
-    async def _find_current_position_cache_row(
+    async def _find_current_position_cache_rows(
         self,
         session: Any,
         *,
         pos_id: str,
         inst_id: str,
         side: str,
-    ) -> Position | None:
+    ) -> list[Position]:
         if pos_id:
             result = await session.execute(
                 select(Position)
@@ -2053,8 +2098,8 @@ class OkxOrderFactSyncService:
                 .order_by(Position.updated_at.desc().nullslast(), Position.id.desc())
                 .limit(100)
             )
-            existing = _best_current_position_cache_row(result.scalars().all())
-            if existing is not None:
+            existing = list(result.scalars().all())
+            if existing:
                 return existing
         result = await session.execute(
             select(Position)
@@ -2067,7 +2112,24 @@ class OkxOrderFactSyncService:
             .order_by(Position.updated_at.desc().nullslast(), Position.id.desc())
             .limit(100)
         )
-        return _best_current_position_cache_row(result.scalars().all())
+        return list(result.scalars().all())
+
+    async def _find_current_position_cache_row(
+        self,
+        session: Any,
+        *,
+        pos_id: str,
+        inst_id: str,
+        side: str,
+    ) -> Position | None:
+        return _best_current_position_cache_row(
+            await self._find_current_position_cache_rows(
+                session,
+                pos_id=pos_id,
+                inst_id=inst_id,
+                side=side,
+            )
+        )
 
     async def _find_open_position_history_cache_row(
         self,
@@ -3237,8 +3299,16 @@ def _position_from_history_row(
         "updated_at": now,
         "okx_inst_id": inst_id,
         "okx_pos_id": _position_history_pos_id(row),
-        "entry_exchange_order_id": ",".join(entry_order_ids) or None,
-        "close_exchange_order_id": ",".join(close_order_ids) or None,
+        "entry_exchange_order_id": _merge_exchange_order_ids(
+            *entry_order_ids,
+            max_length=500,
+        )
+        or None,
+        "close_exchange_order_id": _merge_exchange_order_ids(
+            *close_order_ids,
+            max_length=500,
+        )
+        or None,
     }
 
 
@@ -3606,7 +3676,7 @@ def _apply_position_history_payload(position: Position, payload: dict[str, Any],
     position.updated_at = now
 
 
-def _merge_position_history_order_ids(existing: Any, incoming: Any, *, max_length: int = 100) -> str:
+def _merge_position_history_order_ids(existing: Any, incoming: Any, *, max_length: int = 500) -> str:
     incoming_text = str(incoming or "").strip()
     if not incoming_text:
         return str(existing or "").strip()
@@ -3776,6 +3846,7 @@ def _best_current_position_cache_row(candidates: list[Position]) -> Position | N
     return sorted(
         candidates,
         key=lambda position: (
+            str(getattr(position, "model_name", "") or "") != "okx_authoritative_sync",
             bool(str(getattr(position, "entry_exchange_order_id", "") or "").strip()),
             abs(_safe_float(getattr(position, "quantity", None), 0.0)),
             _db_datetime_to_utc(getattr(position, "updated_at", None)) or datetime.min.replace(tzinfo=UTC),
@@ -3785,13 +3856,41 @@ def _best_current_position_cache_row(candidates: list[Position]) -> Position | N
     )[0]
 
 
+def _retire_duplicate_current_position(
+    position: Position,
+    *,
+    canonical: Position,
+    now: datetime,
+) -> None:
+    position.is_open = False
+    position.closed_at = now
+    position.current_price = getattr(canonical, "current_price", None)
+    position.unrealized_pnl = 0.0
+    position.realized_pnl = 0.0
+    position.settlement_status = "superseded_position_residual"
+    position.settlement_source = "okx_current_position_deduplication"
+    position.settlement_synced_at = now
+    position.settlement_raw = {
+        "reason": "duplicate_local_open_position_for_same_okx_pos_id",
+        "canonical_position_id": getattr(canonical, "id", None),
+        "okx_pos_id": getattr(canonical, "okx_pos_id", None),
+        "entry_exchange_order_id": getattr(position, "entry_exchange_order_id", None),
+    }
+    position.updated_at = now
+
+
 def _apply_current_position_payload(position: Position, payload: dict[str, Any], *, now: datetime) -> None:
+    existing_model_name = str(getattr(position, "model_name", "") or "").strip()
     existing_entry_exchange_order_id = getattr(position, "entry_exchange_order_id", None)
     existing_close_exchange_order_id = _okx_numeric_exchange_order_ids(
         getattr(position, "close_exchange_order_id", None)
     )
     existing_realized_pnl = _safe_float(getattr(position, "realized_pnl", None), 0.0)
-    position.model_name = str(payload["model_name"])
+    position.model_name = (
+        existing_model_name
+        if existing_model_name and existing_model_name != "okx_authoritative_sync"
+        else str(payload["model_name"])
+    )
     position.execution_mode = str(payload["execution_mode"])
     position.symbol = str(payload["symbol"])
     position.side = str(payload["side"])
@@ -3813,6 +3912,7 @@ def _apply_current_position_payload(position: Position, payload: dict[str, Any],
     position.entry_exchange_order_id = _merge_exchange_order_ids(
         existing_entry_exchange_order_id,
         payload.get("entry_exchange_order_id"),
+        max_length=500,
     ) or None
     position.close_exchange_order_id = _merge_exchange_order_ids(
         existing_close_exchange_order_id,
@@ -3820,6 +3920,97 @@ def _apply_current_position_payload(position: Position, payload: dict[str, Any],
         max_length=500,
     ) or None
     position.updated_at = now
+
+
+def _matching_current_position_entry_orders(
+    payload: dict[str, Any],
+    orders: list[Order],
+) -> list[Order]:
+    side = str(payload.get("side") or "").lower().strip()
+    expected_side = "buy" if side == "long" else "sell" if side == "short" else ""
+    close_side = "sell" if expected_side == "buy" else "buy" if expected_side else ""
+    if not expected_side:
+        return []
+    inst_id = str(payload.get("okx_inst_id") or "").strip().upper()
+    symbol = str(payload.get("symbol") or "").strip()
+    reference_time = _db_datetime_to_utc(payload.get("created_at"))
+    if reference_time is None:
+        return []
+    lower_bound = reference_time - timedelta(seconds=CURRENT_POSITION_ENTRY_LINK_WINDOW_SECONDS)
+    upper_bound = datetime.now(UTC) + timedelta(seconds=5)
+    lifecycle_orders: list[Order] = []
+    for order in orders:
+        order_side = str(getattr(order, "side", "") or "").lower().strip()
+        if order_side not in {expected_side, close_side}:
+            continue
+        if not _order_matches_current_position_symbol(order, inst_id=inst_id, symbol=symbol):
+            continue
+        if str(getattr(order, "okx_sync_status", "") or "").strip() not in {
+            OKX_SYNC_CONFIRMED,
+            OKX_SYNC_OKX_ONLY,
+            OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        }:
+            continue
+        order_time = _db_datetime_to_utc(
+            getattr(order, "filled_at", None) or getattr(order, "created_at", None)
+        )
+        if order_time is None or order_time < lower_bound or order_time > upper_bound:
+            continue
+        if _safe_float(getattr(order, "quantity", None), 0.0) <= 0:
+            continue
+        lifecycle_orders.append(order)
+
+    entry_orders = [
+        order
+        for order in lifecycle_orders
+        if str(getattr(order, "side", "") or "").lower().strip() == expected_side
+    ]
+    close_orders = [
+        order
+        for order in lifecycle_orders
+        if str(getattr(order, "side", "") or "").lower().strip() == close_side
+    ]
+    entry_quantity = sum(
+        _safe_float(getattr(order, "quantity", None), 0.0) for order in entry_orders
+    )
+    close_quantity = sum(
+        _safe_float(getattr(order, "quantity", None), 0.0) for order in close_orders
+    )
+    current_quantity = _safe_float(payload.get("quantity"), 0.0)
+    reconstructed_quantity = entry_quantity - close_quantity
+    if (
+        entry_orders
+        and reconstructed_quantity > 0
+        and _relative_close_enough(
+            reconstructed_quantity,
+            current_quantity,
+            CURRENT_POSITION_ENTRY_QUANTITY_TOLERANCE_RATIO,
+        )
+    ):
+        weighted_price = sum(
+            _safe_float(getattr(order, "quantity", None), 0.0)
+            * _safe_float(getattr(order, "price", None), 0.0)
+            for order in entry_orders
+        ) / max(entry_quantity, 1e-12)
+        if _relative_close_enough(
+            weighted_price,
+            _safe_float(payload.get("entry_price"), 0.0),
+            CURRENT_POSITION_ENTRY_PRICE_TOLERANCE_RATIO,
+        ):
+            return sorted(
+                entry_orders,
+                key=lambda order: (
+                    _db_datetime_to_utc(
+                        getattr(order, "filled_at", None)
+                        or getattr(order, "created_at", None)
+                    )
+                    or datetime.min.replace(tzinfo=UTC),
+                    int(getattr(order, "id", 0) or 0),
+                ),
+            )
+
+    single = _matching_current_position_entry_order(payload, orders)
+    return [single] if single is not None else []
 
 
 def _matching_current_position_entry_order(

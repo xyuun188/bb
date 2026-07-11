@@ -77,10 +77,51 @@ async def test_phase3_okx_fact_sync_apply_runs_order_fact_sync(monkeypatch: pyte
 
     assert result["mutated_database"] is True
     assert result["order_sync_applied"] is True
-    assert result["cleanup_result"]["execution_equity_snapshots_deleted"] == 1
+    assert result["local_cache_reset_requested"] is False
+    assert result["cleanup_result"] is None
     assert result["equity_snapshot_result"]["status"] == "created"
     assert result["order_sync_result"]["confirmed_count"] == 2
     assert result["after_reconciliation"]["status"] == "ok"
+    assert calls == ["equity:paper", "sync:paper"]
+
+
+@pytest.mark.asyncio
+async def test_phase3_okx_fact_sync_reset_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def fake_collect_report(*, allow_cache: bool = False) -> dict:
+        return _report()
+
+    async def fake_cleanup(*, mode: str) -> dict:
+        calls.append(f"cleanup:{mode}")
+        return {"orders_deleted": 3}
+
+    async def fake_equity_snapshot(*, mode: str) -> dict:
+        calls.append(f"equity:{mode}")
+        return {"status": "created"}
+
+    class FakeOrderSync:
+        def __init__(self, *, mode: str) -> None:
+            self.mode = mode
+
+        async def sync(self) -> dict:
+            calls.append(f"sync:{self.mode}")
+            return {"status": "ok"}
+
+    monkeypatch.setattr(script, "collect_report", fake_collect_report)
+    monkeypatch.setattr(script, "_cleanup_phase3_local_okx_cache", fake_cleanup)
+    monkeypatch.setattr(script, "_sync_okx_equity_snapshot", fake_equity_snapshot)
+    monkeypatch.setattr(script, "OkxOrderFactSyncService", FakeOrderSync)
+
+    result = await script.run(
+        mode="paper",
+        apply_order_sync=True,
+        allow_cache=False,
+        reset_local_cache=True,
+    )
+
+    assert result["local_cache_reset_requested"] is True
+    assert result["cleanup_result"]["orders_deleted"] == 3
     assert calls == ["cleanup:paper", "equity:paper", "sync:paper"]
 
 

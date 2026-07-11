@@ -83,6 +83,17 @@ class _FakeExecutor:
         self.shutdown_called = True
 
 
+class _AgedUnlinkedFillExecutor(_FakeExecutor):
+    async def _get_ccxt(self) -> _FakeCcxt:
+        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=10)).timestamp() * 1000)
+        return _FakeCcxt(timestamp_ms=timestamp_ms)
+
+
+class _FreshUnlinkedFillExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+
 class _RetryOnceExecutor(_FakeExecutor):
     attempts = 0
 
@@ -239,7 +250,7 @@ async def test_okx_authoritative_sync_reports_exchange_and_local_mismatches(
         report = await OkxAuthoritativeSyncService(
             mode="paper",
             lookback_hours=24,
-            executor_factory=_FakeExecutor,
+            executor_factory=_AgedUnlinkedFillExecutor,
         ).collect()
 
         kinds = {issue["kind"] for issue in report["issues"]}
@@ -367,6 +378,35 @@ async def test_okx_authoritative_sync_reports_exact_timeout_stage(
         ]
         assert stages[-1]["status"] == "error"
         assert stages[-1]["error_type"] == "TimeoutError"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_observes_fresh_fill_until_local_order_sync_window_expires(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-fresh-fill.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_FreshUnlinkedFillExecutor,
+        ).collect()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["pending_local_order_sync_count"] == 1
+        assert report["issues"] == []
+        assert report["observations"][0]["kind"] == "okx_fill_pending_local_order_sync"
+        assert report["observations"][0]["severity"] == "info"
     finally:
         await close_db()
 

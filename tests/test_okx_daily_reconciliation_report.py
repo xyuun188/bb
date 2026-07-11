@@ -68,8 +68,10 @@ def test_okx_daily_reconciliation_report_writes_dated_and_latest_files(tmp_path)
     assert latest_path.exists()
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["report_type"] == "okx_daily_reconciliation"
+    assert payload["completed"] is True
     assert payload["artifacts"] == artifacts
     assert latest_path.read_text(encoding="utf-8") == report_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_okx_daily_reconciliation_report_serializes_nested_datetimes(tmp_path) -> None:

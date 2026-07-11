@@ -65,7 +65,7 @@ class Position(Base, TimestampMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     okx_inst_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     okx_pos_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    entry_exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    entry_exchange_order_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     close_exchange_order_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 

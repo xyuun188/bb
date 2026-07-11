@@ -40,6 +40,7 @@ DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 200
 DEFAULT_TIMEOUT_SECONDS = 6.0
 DEFAULT_MAX_PULL_ATTEMPTS = 2
+LOCAL_ORDER_SYNC_GRACE_SECONDS = 120.0
 QUANTITY_TOLERANCE_RATIO = 0.02
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_COLD_START_MARKER_PATH = ROOT / "data" / "phase3_cold_start_reset_marker.json"
@@ -223,7 +224,7 @@ class OkxAuthoritativeSyncService:
             known_exchange_order_ids=target_order_ids,
         )
 
-        issues = (
+        findings = (
             []
             if fetch_errors
             else self._diff_facts(
@@ -236,8 +237,13 @@ class OkxAuthoritativeSyncService:
                 instrument_contract_sizes=instrument_contract_sizes,
                 context_local_orders=context_orders,
                 context_local_decisions=context_decisions,
+                observed_at=started_at,
             )
         )
+        observations = [
+            item for item in findings if item.classification == "observation"
+        ]
+        issues = [item for item in findings if item.classification != "observation"]
         classification_counts = Counter(issue.classification for issue in issues)
         severity_counts = Counter(issue.severity for issue in issues)
         status = "warning" if issues or fetch_errors else "ok"
@@ -275,12 +281,19 @@ class OkxAuthoritativeSyncService:
             "pull_stages": pull_stages,
             "fetch_errors": fetch_errors,
             "issue_count": len(issues),
+            "observation_count": len(observations),
+            "pending_local_order_sync_count": sum(
+                1
+                for item in observations
+                if item.kind == "okx_fill_pending_local_order_sync"
+            ),
             "classification_counts": dict(classification_counts),
             "severity_counts": dict(severity_counts),
             "repairable_count": int(classification_counts.get("repairable", 0)),
             "manual_review_count": int(classification_counts.get("manual_review", 0)),
             "skipped_count": int(classification_counts.get("skipped", 0)),
             "issues": [issue.as_dict() for issue in issues[:50]],
+            "observations": [item.as_dict() for item in observations[:50]],
             "okx_position_samples": [
                 _safe_position_sample(row) for row in exchange_positions[:10]
             ],
@@ -697,6 +710,7 @@ class OkxAuthoritativeSyncService:
         instrument_contract_sizes: dict[str, float] | None = None,
         context_local_orders: list[Order] | None = None,
         context_local_decisions: dict[int, AIDecision] | None = None,
+        observed_at: datetime | None = None,
     ) -> list[OkxAuthoritativeIssue]:
         issues: list[OkxAuthoritativeIssue] = []
         fills_by_order_id = {fill.order_id: fill for fill in exchange_fills}
@@ -716,6 +730,7 @@ class OkxAuthoritativeSyncService:
             for token in _split_exchange_order_ids(order.exchange_order_id)
         }
         linked_position_order_ids = _linked_position_order_ids(local_positions)
+        observed_at = observed_at or datetime.now(UTC)
 
         open_position_keys: set[tuple[str, str]] = set()
         for position in local_positions:
@@ -917,6 +932,26 @@ class OkxAuthoritativeSyncService:
                     )
                 )
                 continue
+            if _is_pending_local_order_sync(fill, observed_at=observed_at):
+                issues.append(
+                    OkxAuthoritativeIssue(
+                        kind="okx_fill_pending_local_order_sync",
+                        classification="observation",
+                        severity="info",
+                        reason=(
+                            "OKX fill is within the local order-fact synchronization window. "
+                            "It is observed while the background sync persists the local order; "
+                            "it becomes an integrity issue only after that window expires."
+                        ),
+                        symbol=fill.symbol,
+                        side=fill.side,
+                        exchange_order_id=fill.order_id,
+                        okx_contracts=fill.contracts,
+                        okx_price=fill.avg_price,
+                        okx_timestamp=fill.timestamp,
+                    )
+                )
+                continue
             issues.append(
                 OkxAuthoritativeIssue(
                     kind="okx_fill_missing_local_order",
@@ -966,6 +1001,22 @@ class OkxAuthoritativeSyncService:
                     )
                 )
         return issues
+
+
+def _is_pending_local_order_sync(
+    fill: OkxFillGroup,
+    *,
+    observed_at: datetime,
+) -> bool:
+    timestamp = fill.timestamp
+    if timestamp is None:
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    age_seconds = (observed_at - timestamp).total_seconds()
+    return -5.0 <= age_seconds <= LOCAL_ORDER_SYNC_GRACE_SECONDS
 
 
 def _local_orders_by_exchange_id(local_orders: list[Order]) -> dict[str, Order]:

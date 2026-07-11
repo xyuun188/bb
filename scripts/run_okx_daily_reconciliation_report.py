@@ -401,9 +401,14 @@ def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None
     latest_path = output_dir / "latest.json"
     artifacts = {"report_path": str(report_path), "latest_path": str(latest_path)}
     report["artifacts"] = artifacts
+    report["completed"] = True
     text = json.dumps(_json_safe(report), ensure_ascii=False, indent=indent, sort_keys=True)
-    report_path.write_text(text + "\n", encoding="utf-8")
-    latest_path.write_text(text + "\n", encoding="utf-8")
+    report_tmp = report_path.with_suffix(f"{report_path.suffix}.tmp")
+    latest_tmp = latest_path.with_suffix(f"{latest_path.suffix}.tmp")
+    report_tmp.write_text(text + "\n", encoding="utf-8")
+    latest_tmp.write_text(text + "\n", encoding="utf-8")
+    report_tmp.replace(report_path)
+    latest_tmp.replace(latest_path)
     return artifacts
 
 

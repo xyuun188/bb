@@ -179,7 +179,12 @@ def test_profit_first_recovery_blockers_card_from_existing_cards() -> None:
     assert card["details"]["read_only"] is True
     assert card["details"]["starts_trading_service"] is False
     assert card["details"]["submits_orders"] is False
-    assert card["details"]["blocking_item_count"] == 4
+    assert card["details"]["blocking_item_count"] == 3
+    ranking_item = next(
+        item for item in card["details"]["items"] if item.get("code") == "strategy_disable"
+    )
+    assert ranking_item["severity"] == "warning"
+    assert ranking_item["lane_scoped_containment"] is True
     assert card["details"]["category_counts"]["okx_reconciliation"] == 1
 
 
@@ -664,6 +669,9 @@ async def test_system_audit_status_aggregates_root_causes(
         ),
     )
 
+    monkeypatch.setattr(system_audit, "_load_latest_audit_snapshot", lambda: None)
+    monkeypatch.setattr(system_audit, "_store_latest_audit_snapshot", lambda _payload: None)
+    system_audit._system_audit_status_cache = None
     payload = await system_audit.system_audit_status()
 
     assert payload["status"] == "critical"
@@ -1014,6 +1022,9 @@ async def test_system_audit_collect_uses_process_lock(
 async def test_system_audit_status_wraps_failed_section(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(system_audit, "_load_latest_audit_snapshot", lambda: None)
+    monkeypatch.setattr(system_audit, "_store_latest_audit_snapshot", lambda _payload: None)
+    system_audit._system_audit_status_cache = None
     _patch_phase3_server_migration_audit(monkeypatch)
     _patch_phase3_model_server_readiness_audit(monkeypatch)
     _patch_phase3_paper_resume_preflight_audit(monkeypatch)
@@ -1201,6 +1212,60 @@ async def test_phase3_server_migration_audit_blocks_go_live(
     assert card["evidence"][0]["value"] is True
     assert state == "unresolved"
     assert "未修复" in label or "鏈慨澶" in label
+
+
+@pytest.mark.asyncio
+async def test_phase3_server_migration_ready_old_takeover_is_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePhase3ServerMigrationAuditService:
+        def __init__(self, *, timeout_seconds: int) -> None:
+            assert timeout_seconds == system_audit.PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS
+
+        async def report(self) -> dict[str, Any]:
+            return {
+                "status": "ready",
+                "read_only": True,
+                "audit_only": True,
+                "can_mutate_remote": False,
+                "can_delete_remote_data": False,
+                "phase3_go_live_blocked": False,
+                "deployment_contract": "old_one_gpu_timesfm_takeover",
+                "old_takeover": {
+                    "active": True,
+                    "service_ready": True,
+                    "endpoint_ready": True,
+                    "artifact_ready": True,
+                },
+                "forbidden_path_count": 0,
+                "forbidden_service_count": 0,
+                "legacy_process_count": 0,
+                "legacy_data_path_count": 3,
+                "migration_manifest": {"present": False, "item_count": 0},
+                "blockers": [],
+                "warnings": [
+                    {
+                        "code": "old_model_server_takeover_active",
+                        "severity": "warning",
+                        "message": "temporary takeover remains active",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3ServerMigrationAuditService",
+        FakePhase3ServerMigrationAuditService,
+    )
+
+    card = await system_audit._phase3_server_migration_audit()
+    state, label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
+
+    assert card["status"] == "warning"
+    assert card["details"]["observing"] is True
+    assert "under observation" in card["summary"]
+    assert state == "observing"
+    assert "Observation" in label
 
 
 @pytest.mark.asyncio
@@ -5726,3 +5791,24 @@ def test_audit_nodes_use_issue_state_for_display_status() -> None:
     assert nodes["runtime_loop"]["display_status"] == "critical"
     assert nodes["strategy_gate_contract"]["state"] == "fixed"
     assert nodes["strategy_gate_contract"]["display_status"] == "ok"
+def test_latest_audit_snapshot_serializes_nested_datetimes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setattr(system_audit.settings, "_data_dir", tmp_path, raising=False)
+    checked_at = datetime(2026, 7, 11, 10, 0, tzinfo=UTC)
+    payload = {
+        "status": "ok",
+        "checked_at": checked_at.isoformat(),
+        "cards": [{"details": {"settlement_synced_at": checked_at}}],
+    }
+
+    system_audit._store_latest_audit_snapshot(payload)
+    loaded = system_audit._load_latest_audit_snapshot()
+
+    assert loaded is not None
+    loaded_at, loaded_payload = loaded
+    assert loaded_at == checked_at
+    assert loaded_payload["cards"][0]["details"]["settlement_synced_at"] == (
+        checked_at.isoformat()
+    )

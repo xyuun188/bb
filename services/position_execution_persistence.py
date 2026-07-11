@@ -84,7 +84,7 @@ def _split_exchange_order_ids(value: Any) -> list[str]:
     return [token for token in tokens if token]
 
 
-def _merge_exchange_order_ids(*values: Any, max_length: int = 100) -> str:
+def _merge_exchange_order_ids(*values: Any, max_length: int = 500) -> str:
     ordered: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -289,11 +289,33 @@ class PositionExecutionPersistenceService:
             side=side,
             execution_mode=execution_mode,
         )
+        exchange_loader = getattr(repo, "get_exchange_matching_open_positions", None)
+        exchange_positions = (
+            await exchange_loader(
+                symbol=symbol,
+                side=side,
+                execution_mode=execution_mode,
+            )
+            if callable(exchange_loader)
+            else existing_positions
+        )
+        candidate_positions = existing_positions or [
+            position
+            for position in exchange_positions
+            if (
+                (okx_pos_id and str(getattr(position, "okx_pos_id", "") or "") == okx_pos_id)
+                or (
+                    okx_inst_id
+                    and str(getattr(position, "okx_inst_id", "") or "").upper()
+                    == okx_inst_id.upper()
+                )
+            )
+        ]
         if entry_exchange_order_id:
             primary = next(
                 (
                     position
-                    for position in existing_positions
+                    for position in candidate_positions
                     if _position_has_entry_order_id(position, entry_exchange_order_id)
                 ),
                 None,
@@ -321,6 +343,48 @@ class PositionExecutionPersistenceService:
                     * (1 - decision.take_profit_pct)
                 )
                 return
+        primary = next(
+            (
+                position
+                for position in candidate_positions
+                if okx_pos_id
+                and str(getattr(position, "okx_pos_id", "") or "") == okx_pos_id
+            ),
+            candidate_positions[0] if len(candidate_positions) == 1 else None,
+        )
+        if primary is not None:
+            old_quantity = max(float(getattr(primary, "quantity", 0.0) or 0.0), 0.0)
+            added_quantity = max(float(result.quantity or 0.0), 0.0)
+            total_quantity = old_quantity + added_quantity
+            if total_quantity > 0:
+                primary.entry_price = (
+                    old_quantity * float(getattr(primary, "entry_price", result.price) or 0.0)
+                    + added_quantity * float(result.price or 0.0)
+                ) / total_quantity
+                primary.quantity = total_quantity
+            primary.model_name = model_name
+            primary.current_price = result.price
+            primary.leverage = decision.suggested_leverage
+            primary.is_open = True
+            if okx_inst_id:
+                primary.okx_inst_id = okx_inst_id
+            if okx_pos_id:
+                primary.okx_pos_id = okx_pos_id
+            primary.entry_exchange_order_id = _merge_exchange_order_ids(
+                getattr(primary, "entry_exchange_order_id", None),
+                entry_exchange_order_id,
+            ) or None
+            primary.stop_loss_price = (
+                primary.entry_price * (1 - decision.stop_loss_pct)
+                if side == "long"
+                else primary.entry_price * (1 + decision.stop_loss_pct)
+            )
+            primary.take_profit_price = (
+                primary.entry_price * (1 + decision.take_profit_pct)
+                if side == "long"
+                else primary.entry_price * (1 - decision.take_profit_pct)
+            )
+            return
         await repo.open_position(payload)
 
     async def _persist_exit(

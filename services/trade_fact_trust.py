@@ -79,6 +79,15 @@ def closed_position_trade_fact_untrusted_reason(position: Any) -> str | None:
         return None
     if not _should_enforce_fact_links(position):
         return None
+    settlement_status = _text(getattr(position, "settlement_status", None))
+    settlement_raw = getattr(position, "settlement_raw", None)
+    settlement_raw = settlement_raw if isinstance(settlement_raw, dict) else {}
+    if settlement_status == "superseded_position_residual" or (
+        _text(settlement_raw.get("reason"))
+        == "duplicate_local_open_position_for_same_okx_pos_id"
+        and _text(settlement_raw.get("canonical_position_id"))
+    ):
+        return "superseded_position_residual"
     if not _text(getattr(position, "entry_exchange_order_id", None)):
         return "missing_entry_exchange_order_id"
     close_exchange_order_id = getattr(position, "close_exchange_order_id", None)

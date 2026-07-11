@@ -79,6 +79,10 @@ class OpenPositionsExecutionApplier:
             entry_exchange_order_id=entry_exchange_order_id,
         )
         if existing is not None:
+            is_replay = self._position_has_entry_order_id(
+                existing,
+                entry_exchange_order_id,
+            )
             self._refresh_existing_entry(
                 existing,
                 decision,
@@ -86,6 +90,7 @@ class OpenPositionsExecutionApplier:
                 trade_plan,
                 exit_plan,
                 entry_exchange_order_id=entry_exchange_order_id,
+                add_execution=not is_replay,
             )
             return
 
@@ -136,15 +141,18 @@ class OpenPositionsExecutionApplier:
         *,
         entry_exchange_order_id: str,
     ) -> dict[str, Any] | None:
-        if not entry_exchange_order_id:
-            return None
+        fallback: dict[str, Any] | None = None
         for position in open_positions:
-            if (
-                self._matches_position(position, model_name, decision, side)
-                and self._position_has_entry_order_id(position, entry_exchange_order_id)
+            if not self._matches_position(position, model_name, decision, side):
+                continue
+            if entry_exchange_order_id and self._position_has_entry_order_id(
+                position,
+                entry_exchange_order_id,
             ):
                 return position
-        return None
+            if fallback is None:
+                fallback = position
+        return fallback
 
     def _refresh_existing_entry(
         self,
@@ -155,8 +163,34 @@ class OpenPositionsExecutionApplier:
         exit_plan: dict[str, Any],
         *,
         entry_exchange_order_id: str,
+        add_execution: bool,
     ) -> None:
         side = "long" if decision.action == Action.LONG else "short"
+        if add_execution:
+            old_quantity = max(float(position.get("quantity") or 0.0), 0.0)
+            added_quantity = max(float(execution_result.quantity or 0.0), 0.0)
+            total_quantity = old_quantity + added_quantity
+            if total_quantity > 0:
+                position["entry_price"] = (
+                    old_quantity
+                    * float(position.get("entry_price") or execution_result.price or 0.0)
+                    + added_quantity * float(execution_result.price or 0.0)
+                ) / total_quantity
+                position["quantity"] = total_quantity
+            legs = position.setdefault("entry_legs", [])
+            if isinstance(legs, list):
+                legs.append(
+                    {
+                        "quantity": execution_result.quantity,
+                        "price": execution_result.price,
+                        "exchange_order_id": entry_exchange_order_id,
+                        "profit_first_exit_plan_id": (
+                            exit_plan.get("exit_plan_id")
+                            or trade_plan.get("exit_plan_id")
+                            or ""
+                        ),
+                    }
+                )
         position["symbol"] = decision.symbol
         position["side"] = side
         position["current_price"] = execution_result.price
@@ -181,7 +215,10 @@ class OpenPositionsExecutionApplier:
             exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
         )
         if entry_exchange_order_id:
-            position["entry_exchange_order_id"] = entry_exchange_order_id
+            position["entry_exchange_order_id"] = self._merge_entry_order_ids(
+                position.get("entry_exchange_order_id"),
+                entry_exchange_order_id,
+            )
 
     @staticmethod
     def _entry_exchange_order_id(execution_result: ExecutionResult) -> str:
@@ -208,6 +245,22 @@ class OpenPositionsExecutionApplier:
             if str(leg.get("exchange_order_id") or "").strip() == order_id:
                 return True
         return False
+
+    @staticmethod
+    def _merge_entry_order_ids(*values: Any) -> str:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            for token in str(value or "").replace(";", ",").split(","):
+                order_id = token.strip()
+                if not order_id or order_id in seen:
+                    continue
+                candidate = ",".join([*result, order_id]) if result else order_id
+                if len(candidate) > 500:
+                    return ",".join(result)
+                seen.add(order_id)
+                result.append(order_id)
+        return ",".join(result)
 
     def _apply_exit(
         self,

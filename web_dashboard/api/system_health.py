@@ -545,12 +545,22 @@ def _okx_config_item(mode: str) -> dict[str, Any]:
     ]
     title = "实盘 OKX 配置" if mode == "live" else "模拟盘 OKX 配置"
     if missing:
+        active_mode = mode_manager.mode.value == mode
         return _check_item(
             f"okx_{mode}",
             title,
-            "critical" if mode_manager.mode.value == mode else "warning",
-            f"{title}不完整，缺少：{'、'.join(missing)}。",
-            details={"mode": mode, "missing_fields": missing, "settings_tab": "okx"},
+            "critical" if active_mode else "info",
+            (
+                f"{title}不完整，缺少：{'、'.join(missing)}。"
+                if active_mode
+                else f"{title}未启用且当前运行模式为 {mode_manager.mode.value}，不计入当前系统故障。"
+            ),
+            details={
+                "mode": mode,
+                "active_mode": active_mode,
+                "missing_fields": missing,
+                "settings_tab": "okx",
+            },
         )
     return _check_item(
         f"okx_{mode}",
@@ -572,12 +582,22 @@ def _configured_endpoint_items(
         else {}
     )
     model_configs = settings.get_fixed_ai_models(include_empty=False)
+    configured_by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in model_configs
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
     configured_by_model = {
         str(item.get("model") or "").strip(): _mask_endpoint(item.get("api_base"))
         for item in model_configs
         if isinstance(item, dict)
     }
     runtime_models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
+    runtime_by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in runtime_models
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
     for item in runtime_models:
         if not isinstance(item, dict):
             continue
@@ -597,7 +617,62 @@ def _configured_endpoint_items(
     high_risk_base = _mask_endpoint(getattr(settings, "high_risk_review_api_base", ""))
     if high_risk_model and high_risk_base:
         configured_by_model[high_risk_model] = high_risk_base
+    decision_route = runtime_by_name.get(DECISION_MAKER_NAME) or configured_by_name.get(
+        DECISION_MAKER_NAME
+    )
+    if not isinstance(decision_route, dict):
+        decision_route = next(
+            (
+                item
+                for item in runtime_models
+                if isinstance(item, dict)
+                and str(item.get("model") or "").strip() == "qwen3-32b-trade"
+            ),
+            None,
+        )
+    decision_model = str((decision_route or {}).get("model") or "").strip()
+    decision_api_base = _mask_endpoint((decision_route or {}).get("api_base"))
+    decision_key = f"endpoint_{decision_model or DECISION_MAKER_NAME}"
+    if not decision_model or not decision_api_base:
+        items.append(
+            _check_item(
+                decision_key,
+                "最终决策模型平台调用地址",
+                "critical",
+                "最终决策模型未配置可用的平台调用地址。",
+                details={"slot_name": DECISION_MAKER_NAME},
+            )
+        )
+    else:
+        expected_decision_endpoint = EXPECTED_PLATFORM_ENDPOINTS.get(decision_model)
+        endpoint_matches = not expected_decision_endpoint or (
+            decision_api_base.rstrip("/") == expected_decision_endpoint.rstrip("/")
+        )
+        items.append(
+            _check_item(
+                decision_key,
+                f"{decision_model} 最终决策调用地址",
+                "ok" if endpoint_matches else "critical",
+                (
+                    f"最终决策槽正在使用 {decision_model}。"
+                    if endpoint_matches
+                    else (
+                        f"{decision_model} 调用地址不符合部署契约，应使用 "
+                        f"{expected_decision_endpoint}。"
+                    )
+                ),
+                details={
+                    "slot_name": DECISION_MAKER_NAME,
+                    "model": decision_model,
+                    "actual": decision_api_base,
+                    "expected_platform_endpoint": expected_decision_endpoint,
+                    "route_mode": str((decision_route or {}).get("route_mode") or ""),
+                },
+            )
+        )
     for model, expected in EXPECTED_PLATFORM_ENDPOINTS.items():
+        if model == "qwen3-32b-trade":
+            continue
         actual = configured_by_model.get(model, "")
         if not actual:
             items.append(
@@ -1293,7 +1368,7 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
 async def _run_self_check_section(
     coro: Any,
     *,
-    timeout: float = SELF_CHECK_SECTION_TIMEOUT_SECONDS,
+    timeout: float = SELF_CHECK_SECTION_TIMEOUT_SECONDS,  # noqa: ASYNC109
 ) -> Any:
     return await asyncio.wait_for(coro, timeout=timeout)
 

@@ -9,6 +9,27 @@ from services import okx_perpetual_sdk
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
 
+def test_sdk_error_preserves_top_level_okx_code_and_payload() -> None:
+    payload = {"code": "50026", "msg": "System error. Try again later.", "data": []}
+
+    with pytest.raises(ExchangeAPIError) as captured:
+        okx_perpetual_sdk.raise_if_okx_error(payload)
+
+    assert captured.value.code == "50026"
+    assert captured.value.payload == payload
+
+
+def test_sdk_error_preserves_order_item_code_and_payload() -> None:
+    item = {"ordId": "", "sCode": "51008", "sMsg": "Insufficient USDT margin"}
+    payload = {"code": "0", "msg": "", "data": [item]}
+
+    with pytest.raises(ExchangeAPIError) as captured:
+        okx_perpetual_sdk.raise_if_okx_error(payload, check_data_code=True)
+
+    assert captured.value.code == "51008"
+    assert captured.value.payload == {"response": payload, "item": item}
+
+
 class _PublicApi:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []

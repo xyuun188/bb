@@ -61,6 +61,23 @@ def _infer_contract_size_from_pnl(
     return inferred
 
 
+def _infer_contract_size_from_notional(
+    *,
+    contracts: float,
+    mark_price: float,
+    notional: float,
+) -> float:
+    """Infer OKX ctVal from the stable quote notional of a USDT swap position."""
+
+    denominator = abs(contracts) * abs(mark_price)
+    if denominator <= 1e-12 or notional <= 0:
+        return 0.0
+    inferred = abs(notional) / denominator
+    if inferred <= 0 or inferred > 100000:
+        return 0.0
+    return inferred
+
+
 def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
     return (
         _first_positive_float(
@@ -242,12 +259,29 @@ def parse_exchange_position_snapshot(
         info.get("avg_price"),
         default=0.0,
     )
-    contract_size = explicit_contract_size or _infer_contract_size_from_pnl(
-        side=side,
-        contracts=contracts,
-        mark_price=mark_price,
-        entry_price=entry_price,
-        upl=upl,
+    notional = abs(
+        _first_nonzero_float(
+            position.get("notional"),
+            position.get("notionalValue"),
+            info.get("notionalUsd"),
+            info.get("notional"),
+            default=0.0,
+        )
+    )
+    contract_size = (
+        explicit_contract_size
+        or _infer_contract_size_from_notional(
+            contracts=contracts,
+            mark_price=mark_price or last_price or index_price,
+            notional=notional,
+        )
+        or _infer_contract_size_from_pnl(
+            side=side,
+            contracts=contracts,
+            mark_price=mark_price,
+            entry_price=entry_price,
+            upl=upl,
+        )
     )
     if contract_size <= 0:
         contract_size = 1.0
@@ -271,6 +305,7 @@ def parse_exchange_position_snapshot(
         "contract_size": contract_size,
         "quantity": quantity,
         "raw_quantity": raw_quantity,
+        "notional": notional,
         "margin_used": margin_used,
         "raw_symbol": info.get("instId") or position.get("symbol"),
         "ccxt_symbol": position.get("symbol"),

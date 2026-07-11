@@ -9,7 +9,10 @@ from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.manual_close_marker import ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
-from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
+from services.okx_trade_fact_integrity import (
+    OkxTradeFactIntegrityService,
+    _start_consistent_read_snapshot,
+)
 
 
 async def _reset_db(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -20,6 +23,48 @@ async def _reset_db(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         f"sqlite+aiosqlite:///{(tmp_path / 'trade_fact.db').as_posix()}",
     )
     await init_db()
+
+
+@pytest.mark.asyncio
+async def test_trade_fact_audit_uses_postgres_consistent_read_snapshot() -> None:
+    class _FakeBind:
+        class dialect:
+            name = "postgresql"
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.statements = []
+
+        def get_bind(self):
+            return _FakeBind()
+
+        async def execute(self, statement) -> None:
+            self.statements.append(statement)
+
+    session = _FakeSession()
+
+    await _start_consistent_read_snapshot(session)
+
+    assert len(session.statements) == 1
+    assert str(session.statements[0]) == (
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trade_fact_audit_keeps_sqlite_test_reads_compatible() -> None:
+    class _FakeBind:
+        class dialect:
+            name = "sqlite"
+
+    class _FakeSession:
+        def get_bind(self):
+            return _FakeBind()
+
+        async def execute(self, _statement) -> None:
+            raise AssertionError("SQLite must not receive PostgreSQL transaction SQL")
+
+    await _start_consistent_read_snapshot(_FakeSession())
 
 
 def _execution_raw(
@@ -48,6 +93,66 @@ def _execution_raw(
 
 def _recent_filled_at(*, minutes_ago: int) -> datetime:
     return datetime.now(UTC) - timedelta(minutes=minutes_ago)
+
+
+def test_legacy_position_history_projection_gap_is_not_a_runtime_blocker() -> None:
+    opened_at = _recent_filled_at(minutes_ago=30)
+    closed_at = _recent_filled_at(minutes_ago=10)
+    position = Position(
+        id=101,
+        model_name="okx_authoritative_sync",
+        execution_mode="paper",
+        symbol="ADA/USDT",
+        side="long",
+        quantity=100.0,
+        entry_price=0.6,
+        current_price=0.64,
+        realized_pnl=4.0,
+        settlement_status="okx_position_history",
+        settlement_source="okx_position_history",
+        is_open=False,
+        closed_at=closed_at,
+        created_at=opened_at,
+    )
+    orders = [
+        Order(
+            id=201,
+            model_name="okx_authoritative_sync",
+            execution_mode="paper",
+            symbol="ADA/USDT",
+            side="buy",
+            order_type="market",
+            quantity=100.0,
+            price=0.6,
+            status="filled",
+            exchange_order_id="ada-entry",
+            filled_at=opened_at,
+            created_at=opened_at,
+        ),
+        Order(
+            id=202,
+            model_name="okx_authoritative_sync",
+            execution_mode="paper",
+            symbol="ADA/USDT",
+            side="sell",
+            order_type="market",
+            quantity=100.0,
+            price=0.64,
+            status="filled",
+            exchange_order_id="ada-close",
+            filled_at=closed_at,
+            created_at=closed_at,
+        ),
+    ]
+
+    issues = OkxTradeFactIntegrityService()._audit_position_authority_links(
+        [position],
+        orders,
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+
+    assert [issue.kind for issue in issues] == ["legacy_position_history_projection_gap"]
+    assert issues[0].severity == "info"
 
 
 @pytest.mark.asyncio
@@ -993,6 +1098,125 @@ async def test_superseded_position_residual_is_info_not_critical(
         assert report["status"] == "ok"
         assert {issue["kind"] for issue in issues} == {"superseded_position_residual"}
         assert {issue["severity"] for issue in issues} == {"info"}
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_complete_lifecycle_supersedes_nonzero_stale_projection(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        opened_at = _recent_filled_at(minutes_ago=120)
+        official_closed_at = _recent_filled_at(minutes_ago=30)
+        stale_closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="GRASS/USDT",
+                        side="short",
+                        quantity=500.0,
+                        entry_price=0.42,
+                        current_price=0.40,
+                        realized_pnl=5.39,
+                        leverage=2.0,
+                        is_open=False,
+                        okx_inst_id="GRASS-USDT-SWAP",
+                        okx_pos_id="grass-pos-1",
+                        entry_exchange_order_id="grass-entry-a,grass-entry-b",
+                        close_exchange_order_id="grass-close-a,grass-close-b",
+                        created_at=opened_at,
+                        closed_at=official_closed_at,
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="GRASS/USDT",
+                        side="short",
+                        quantity=398.5,
+                        entry_price=0.42,
+                        current_price=0.40,
+                        realized_pnl=4.25,
+                        leverage=2.0,
+                        is_open=False,
+                        okx_inst_id="GRASS-USDT-SWAP",
+                        okx_pos_id="grass-pos-1",
+                        entry_exchange_order_id="grass-entry-a,grass-entry-b",
+                        close_exchange_order_id=None,
+                        created_at=opened_at,
+                        closed_at=stale_closed_at,
+                    ),
+                    Position(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="GRASS/USDT",
+                        side="short",
+                        quantity=100.0,
+                        entry_price=0.42,
+                        current_price=0.40,
+                        realized_pnl=1.0,
+                        leverage=2.0,
+                        is_open=False,
+                        okx_inst_id="GRASS-USDT-SWAP",
+                        okx_pos_id="grass-pos-1",
+                        entry_exchange_order_id=None,
+                        close_exchange_order_id="grass-close-a",
+                        created_at=opened_at,
+                        closed_at=stale_closed_at,
+                    ),
+                    *[
+                        Order(
+                            model_name="ensemble_trader",
+                            execution_mode="paper",
+                            symbol="GRASS/USDT",
+                            side=side,
+                            order_type="market",
+                            quantity=250.0,
+                            price=price,
+                            status="filled",
+                            exchange_order_id=order_id,
+                            filled_at=filled_at,
+                            created_at=filled_at,
+                            okx_inst_id="GRASS-USDT-SWAP",
+                            okx_sync_status="okx_confirmed",
+                        )
+                        for order_id, side, price, filled_at in (
+                            ("grass-entry-a", "sell", 0.42, opened_at),
+                            (
+                                "grass-entry-b",
+                                "sell",
+                                0.421,
+                                opened_at + timedelta(minutes=1),
+                            ),
+                            (
+                                "grass-close-a",
+                                "buy",
+                                0.405,
+                                official_closed_at - timedelta(minutes=1),
+                            ),
+                            (
+                                "grass-close-b",
+                                "buy",
+                                0.40,
+                                official_closed_at,
+                            ),
+                        )
+                    ],
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        issues = report["issues"]
+
+        assert report["critical_count"] == 0
+        assert report["status"] == "ok"
+        assert [issue["kind"] for issue in issues].count(
+            "superseded_position_residual"
+        ) == 2
     finally:
         await close_db()
 

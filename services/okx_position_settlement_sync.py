@@ -46,6 +46,9 @@ DEFAULT_SETTLEMENT_RETRY_SECONDS = 10.0
 DEFAULT_SETTLEMENT_TIMEOUT_SECONDS = 6.0
 POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS = 45 * 60
 POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS = 24 * 60 * 60
+SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
+SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
+SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
@@ -237,6 +240,10 @@ class OkxPositionSettlementSyncService:
                     Position.closed_at >= _db_naive(since),
                     or_(
                         Position.settlement_status.is_(None),
+                        Position.settlement_status != "superseded_position_residual",
+                    ),
+                    or_(
+                        Position.settlement_status.is_(None),
                         Position.settlement_status == "",
                         Position.settlement_status.not_in(final_statuses),
                     ),
@@ -245,16 +252,21 @@ class OkxPositionSettlementSyncService:
                 .limit(self.limit * 5)
             )
             rows = list(result.scalars().all())
-
-        candidates: list[SettlementCandidate] = []
-        for row in rows:
-            raw = getattr(row, "settlement_raw", None)
-            raw = raw if isinstance(raw, dict) else {}
-            if _retry_after(raw, now):
-                continue
-            candidates.append(_candidate_from_position(row, raw))
-            if len(candidates) >= self.limit:
-                break
+            candidates: list[SettlementCandidate] = []
+            restored_superseded = False
+            for row in rows:
+                raw = getattr(row, "settlement_raw", None)
+                raw = raw if isinstance(raw, dict) else {}
+                if _has_superseded_position_metadata(row, raw):
+                    _restore_superseded_position_status(row, raw, now=now)
+                    restored_superseded = True
+                    continue
+                if _retry_after(raw, now):
+                    continue
+                if len(candidates) < self.limit:
+                    candidates.append(_candidate_from_position(row, raw))
+            if restored_superseded:
+                await session.flush()
         return candidates
 
     async def _settle_candidate(
@@ -463,6 +475,12 @@ class OkxPositionSettlementSyncService:
             position = await session.get(Position, candidate.position_id)
             if position is None or bool(position.is_open):
                 return False
+            raw = getattr(position, "settlement_raw", None)
+            raw = raw if isinstance(raw, dict) else {}
+            if _has_superseded_position_metadata(position, raw):
+                _restore_superseded_position_status(position, raw, now=now)
+                await session.flush()
+                return False
             if is_final_settlement_status(getattr(position, "settlement_status", None)):
                 return False
             apply_position_settlement_snapshot(position, success.snapshot)
@@ -502,10 +520,14 @@ class OkxPositionSettlementSyncService:
             position = await session.get(Position, candidate.position_id)
             if position is None or bool(position.is_open):
                 return
-            if is_final_settlement_status(getattr(position, "settlement_status", None)):
-                return
             raw = getattr(position, "settlement_raw", None)
             raw = raw if isinstance(raw, dict) else {}
+            if _has_superseded_position_metadata(position, raw):
+                _restore_superseded_position_status(position, raw, now=now)
+                await session.flush()
+                return
+            if is_final_settlement_status(getattr(position, "settlement_status", None)):
+                return
             attempts = _safe_int(raw.get("settlement_attempt_count"), 0) + 1
             position.settlement_status = SETTLEMENT_STATUS_EXCEPTION
             position.settlement_source = "okx_position_history_settlement"
@@ -676,6 +698,38 @@ def _allocate_total_fee(
 def _retry_after(raw: dict[str, Any], now: datetime) -> bool:
     next_retry = _parse_datetime(raw.get("next_settlement_retry_at"))
     return next_retry is not None and next_retry > now
+
+
+def _has_superseded_position_metadata(position: Position, raw: dict[str, Any]) -> bool:
+    if str(getattr(position, "settlement_status", "") or "") == SUPERSEDED_POSITION_STATUS:
+        return True
+    return bool(
+        str(raw.get("reason") or "") == SUPERSEDED_POSITION_REASON
+        and _safe_int(raw.get("canonical_position_id"), 0) > 0
+    )
+
+
+def _restore_superseded_position_status(
+    position: Position,
+    raw: dict[str, Any],
+    *,
+    now: datetime,
+) -> None:
+    previous_status = str(getattr(position, "settlement_status", "") or "")
+    previous_source = str(getattr(position, "settlement_source", "") or "")
+    position.settlement_status = SUPERSEDED_POSITION_STATUS
+    position.settlement_source = SUPERSEDED_POSITION_SOURCE
+    position.settlement_synced_at = now
+    position.settlement_raw = {
+        **raw,
+        "status": SUPERSEDED_POSITION_STATUS,
+        "source": SUPERSEDED_POSITION_SOURCE,
+        "reason": str(raw.get("reason") or SUPERSEDED_POSITION_REASON),
+        "restored_from_status": previous_status,
+        "restored_from_source": previous_source,
+        "superseded_status_restored_at": now.isoformat(),
+    }
+    position.updated_at = now
 
 
 def _first_present_float(row: dict[str, Any], keys: tuple[str, ...]) -> tuple[float, str | None]:

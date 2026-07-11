@@ -27,6 +27,7 @@ from services.okx_order_fact_sync import (
     OkxOrderFactSyncService,
     _apply_position_history_payload,
     _db_naive_since,
+    _matching_current_position_entry_orders,
     _matching_native_full_close_pending_fill,
     _order_needs_okx_fact_refresh,
     _order_needs_okx_pull,
@@ -43,6 +44,59 @@ def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_qua
             "base_quantity": 15.265700483091791,
         }
     ) == pytest.approx(16.0)
+
+
+def test_current_position_entry_links_reconstruct_multi_entry_net_lifecycle() -> None:
+    opened_at = datetime.now(UTC) - timedelta(minutes=5)
+
+    def order(
+        exchange_order_id: str,
+        side: str,
+        quantity: float,
+        price: float,
+        offset_seconds: int,
+    ) -> Order:
+        row = Order(
+            model_name="okx_authoritative_sync",
+            execution_mode="paper",
+            symbol="CELO/USDT",
+            side=side,
+            order_type="market",
+            quantity=quantity,
+            price=price,
+            status="filled",
+            fee=0.0,
+            exchange_order_id=exchange_order_id,
+            filled_at=opened_at + timedelta(seconds=offset_seconds),
+            created_at=opened_at + timedelta(seconds=offset_seconds),
+        )
+        row.okx_inst_id = "CELO-USDT-SWAP"
+        row.okx_sync_status = OKX_SYNC_OKX_ONLY
+        return row
+
+    orders = [
+        order("entry-1", "buy", 5.0, 10.0, 1),
+        order("entry-2", "buy", 5.0, 12.0, 2),
+        order("partial-close", "sell", 2.0, 13.0, 3),
+    ]
+
+    matched = _matching_current_position_entry_orders(
+        {
+            "side": "long",
+            "symbol": "CELO/USDT",
+            "okx_inst_id": "CELO-USDT-SWAP",
+            "created_at": opened_at,
+            "quantity": 8.0,
+            "entry_price": 11.0,
+        },
+        orders,
+    )
+
+    assert [row.exchange_order_id for row in matched] == ["entry-1", "entry-2"]
+
+
+def test_position_entry_order_link_column_supports_multi_order_lifecycle() -> None:
+    assert Position.__table__.c.entry_exchange_order_id.type.length == 500
 
 
 def test_native_full_close_pending_order_targets_and_matches_real_fill() -> None:
@@ -1659,7 +1713,8 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
         assert report["unverified_count"] == 1
         assert report["backfilled_count"] == 1
         assert report["position_history_checked_count"] == 1
-        assert report["position_history_backfilled_count"] == 1
+        assert report["position_history_backfilled_count"] == 0
+        assert report["position_history_skipped_count"] == 1
         assert "old-order" in orders
         assert orders["old-order"]["okx_sync_status"] is None
         assert orders["phase3-order"]["okx_sync_status"] == OKX_SYNC_CONFIRMED
@@ -1691,16 +1746,7 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
                 )
             )
         ).all()
-        assert len(position_rows) == 1
-        position = position_rows[0]._mapping
-        assert position["model_name"] == "okx_authoritative_sync"
-        assert position["symbol"] == "SPK/USDT"
-        assert position["side"] == "short"
-        assert position["quantity"] == pytest.approx(12.0)
-        assert position["entry_price"] == pytest.approx(0.039)
-        assert position["current_price"] == pytest.approx(0.0345)
-        assert position["realized_pnl"] == pytest.approx(1.23)
-        assert position["close_exchange_order_id"] == "phase3-order"
+        assert position_rows == []
     finally:
         await close_db()
 
@@ -1923,7 +1969,8 @@ async def test_order_fact_sync_slow_account_bills_do_not_starve_core_order_facts
         assert report["account_bill_error"]
         assert report["confirmed_count"] == 1
         assert report["unverified_count"] == 0
-        assert report["position_history_backfilled_count"] == 1
+        assert report["position_history_backfilled_count"] == 0
+        assert report["position_history_skipped_count"] == 1
     finally:
         await close_db()
 
@@ -3343,6 +3390,73 @@ async def test_order_fact_sync_marks_current_position_confirmed_without_fill_con
 
 
 @pytest.mark.asyncio
+async def test_order_fact_sync_uses_full_account_history_page_budget(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-account-history-pages.db').as_posix()}",
+    )
+    await init_db()
+    calls: dict[str, list[int]] = {"fills": [], "orders": [], "positions": []}
+
+    class FakeNativeFacts:
+        def __init__(self, _executor: Any) -> None:
+            pass
+
+        async def fetch_positions(self) -> list[dict[str, Any]]:
+            return []
+
+        async def fetch_fill_groups(self, **kwargs: Any) -> list[Any]:
+            if kwargs.get("account_wide_only"):
+                calls["fills"].append(int(kwargs["max_pages"]))
+            return []
+
+        async def fetch_order_history_rows(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if not kwargs.get("order_ids"):
+                calls["orders"].append(int(kwargs["max_pages"]))
+            return []
+
+        async def fetch_contract_sizes(self, **_kwargs: Any) -> dict[str, float]:
+            return {}
+
+        async def fetch_account_bills(self, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def fetch_position_history_rows(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if not kwargs.get("pos_ids"):
+                calls["positions"].append(int(kwargs["max_pages"]))
+            return []
+
+    class FakeExecutor:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr("services.okx_order_fact_sync.OkxNativeFactsClient", FakeNativeFacts)
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            limit=500,
+            executor_factory=FakeExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+    finally:
+        await close_db()
+
+    assert report["okx_pull_available"] is True
+    assert calls == {"fills": [7], "orders": [7], "positions": [7]}
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_keeps_okx_execution_result_confirmed_when_history_lags(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3645,7 +3759,7 @@ async def test_order_fact_sync_updates_existing_open_position_cache_from_okx_cur
         assert report["current_position_updated_count"] == 1
         assert len(rows) == 1
         position = rows[0]._mapping
-        assert position["model_name"] == "okx_authoritative_sync"
+        assert position["model_name"] == "old_local_cache"
         assert position["quantity"] == pytest.approx(600000.0)
         assert position["entry_price"] == pytest.approx(0.00002174)
         assert position["current_price"] == pytest.approx(0.00002156)

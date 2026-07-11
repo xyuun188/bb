@@ -214,6 +214,34 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                 )
                 passed.append("model_training_available")
                 continue
+            if key == "profit_first_ranking" and ranking.get("report_available") is not False:
+                ranking_hard_items = [
+                    item
+                    for item in _safe_list(ranking.get("blockers"))
+                    if _safe_dict(item).get("severity") == "blocking"
+                ]
+                if not any(
+                    not _ranking_blocker_is_lane_scoped(item)
+                    for item in ranking_hard_items
+                ):
+                    warnings.append(
+                        _warning(
+                            "profit_first_ranking_affected_lanes_contained",
+                            (
+                                "Profit-First ranking is critical only for identified "
+                                "losing lanes; those lanes remain ineligible for promotion "
+                                "or budget increase."
+                            ),
+                            evidence={
+                                "disable_count": _safe_int(
+                                    ranking_summary.get("disable_count")
+                                ),
+                                "contained_blockers": ranking_hard_items[:8],
+                            },
+                        )
+                    )
+                    passed.append("profit_first_ranking_lane_containment_active")
+                    continue
             if (
                 key == "trade_execution_contract"
                 and trade_contract_unresolved_violation_count <= 0
@@ -436,14 +464,38 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             for item in _safe_list(ranking.get("blockers"))
             if _safe_dict(item).get("severity") == "blocking"
         ]
-        if disable_count or hard_ranking_blockers:
+        unscoped_hard_ranking_blockers = [
+            item
+            for item in hard_ranking_blockers
+            if not _ranking_blocker_is_lane_scoped(item)
+        ]
+        lane_scoped_hard_ranking_blockers = [
+            item
+            for item in hard_ranking_blockers
+            if _ranking_blocker_is_lane_scoped(item)
+        ]
+        if unscoped_hard_ranking_blockers:
             blockers.append(
                 _blocker(
                     "profit_first_ranking_has_disable_blockers",
-                    "Losing model/strategy/lane combinations must be disabled or kept shadow-only before resume.",
+                    "Profit-First ranking contains an unscoped hard blocker that cannot be contained to one model/strategy lane.",
                     evidence={
                         "disable_count": disable_count,
-                        "blockers": hard_ranking_blockers[:8],
+                        "blockers": unscoped_hard_ranking_blockers[:8],
+                    },
+                )
+            )
+        elif disable_count or lane_scoped_hard_ranking_blockers:
+            warnings.append(
+                _warning(
+                    "profit_first_ranking_lanes_contained",
+                    "Losing model/strategy/lane combinations remain disabled or shadow-only without blocking healthy paper runtime.",
+                    evidence={
+                        "disable_count": disable_count,
+                        "contained_blockers": lane_scoped_hard_ranking_blockers[:8],
+                        "containment_policy": (
+                            "affected lanes cannot receive promotion or budget increase"
+                        ),
                     },
                 )
             )
@@ -858,3 +910,20 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             ),
         },
     }
+
+
+def _ranking_blocker_is_lane_scoped(item: Any) -> bool:
+    item = _safe_dict(item)
+    if not str(item.get("code") or "").startswith("strategy_"):
+        return False
+    evidence = _safe_dict(item.get("evidence"))
+    return any(
+        str(evidence.get(key) or "").strip()
+        for key in (
+            "model_name",
+            "strategy_profile_id",
+            "symbol",
+            "side",
+            "decision_lane",
+        )
+    )

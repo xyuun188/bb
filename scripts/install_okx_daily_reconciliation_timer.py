@@ -49,6 +49,7 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+SuccessExitStatus=1
 ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_okx_fact_sync.py --mode paper --apply-order-sync --json-indent 0'
 """
 
@@ -119,8 +120,8 @@ def install_timer(
             timeout=60,
             check=True,
         )
-        staged_service = f"/tmp/{SERVICE_NAME}"
-        staged_timer = f"/tmp/{TIMER_NAME}"
+        staged_service = f"/tmp/{SERVICE_NAME}"  # noqa: S108 - fixed remote root path
+        staged_timer = f"/tmp/{TIMER_NAME}"  # noqa: S108 - fixed remote root path
         _upload_text(ssh, staged_service, service)
         _upload_text(ssh, staged_timer, timer)
         commands = [

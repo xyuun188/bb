@@ -26,6 +26,9 @@ def _test_execution_service(
     raw_updates: list[dict[str, Any] | None] | None = None,
     reasons: list[str | None] | None = None,
     stages: list[tuple[str, str, str]] | None = None,
+    trade_logger=None,
+    position_execution_persister=None,
+    order_fact_recovery_trigger=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
         if reasons is not None:
@@ -71,7 +74,7 @@ def _test_execution_service(
         transient_entry_exchange_error_checker=lambda _text: False,
         temporary_entry_block_rememberer=lambda *_args: None,
         transient_entry_block_minutes_provider=lambda _text: 5.0,
-        trade_logger=_noop_async,
+        trade_logger=trade_logger or _noop_async,
         exchange_confirmed_checker=lambda result: bool(
             result
             and result.status == OrderStatus.FILLED
@@ -80,7 +83,8 @@ def _test_execution_service(
         exit_progress_checker=lambda _result: False,
         no_exchange_position_result_checker=lambda _result: False,
         trade_count_incrementer=lambda: None,
-        position_execution_persister=_noop_async,
+        position_execution_persister=position_execution_persister or _noop_async,
+        order_fact_recovery_trigger=order_fact_recovery_trigger,
         open_positions_execution_applier=lambda *_args: None,
         decision_executed_marker=_noop_async,
         market_no_opportunity_symbol_clearer=lambda _symbol: None,
@@ -411,6 +415,73 @@ async def test_execution_service_marks_entry_policy_cancellation_terminal_before
     assert final_raw["high_risk_review"]["approved"] is False
     assert any(
         stage == DecisionStage.RISK_CHECK and status == DecisionStageStatus.FAILED
+        for stage, status, _reason in stages
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_service_recovers_when_confirmed_order_fact_write_fails() -> None:
+    persisted_positions: list[str] = []
+    recovery_requests: list[str] = []
+    stages: list[tuple[str, str, str]] = []
+
+    class FilledExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(
+                order_id="local-order-1",
+                exchange_order_id="okx-order-1",
+                symbol=decision.symbol,
+                side="sell",
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    async def failed_trade_logger(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("database write failed")
+
+    async def persist_position(*_args: Any, **_kwargs: Any) -> None:
+        persisted_positions.append("called")
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return FilledExecutor()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        trade_logger=failed_trade_logger,
+        position_execution_persister=persist_position,
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode),
+        stages=stages,
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+    decision = _profit_first_ready_position_review_decision()
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        992,
+        results,
+        open_positions=[],
+    )
+
+    assert result is not None
+    assert result.status == OrderStatus.FILLED
+    assert persisted_positions == []
+    assert recovery_requests == ["paper"]
+    assert decision.raw_response["local_order_persistence"]["status"] == "failed"
+    assert decision.raw_response["local_order_persistence"]["recovery_requested"] is True
+    assert results["warnings"]
+    assert any(
+        stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.FAILED
         for stage, status, _reason in stages
     )
 

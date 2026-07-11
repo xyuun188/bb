@@ -238,6 +238,55 @@ async def test_okx_position_settlement_sync_records_funding_fee_failure_reason(
 
 
 @pytest.mark.asyncio
+async def test_settlement_sync_restores_superseded_residual_before_api_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-superseded.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    try:
+        position_id = await _create_closed_position(
+            status="settlement_exception",
+            closed_at=closed_at,
+            settlement_raw={
+                "reason": "duplicate_local_open_position_for_same_okx_pos_id",
+                "canonical_position_id": 99,
+                "last_error_code": "positions_history_no_rows",
+            },
+        )
+        ccxt = _FakeCcxt(history_rows=[])
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["checked_count"] == 0
+        assert ccxt.history_calls == []
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            assert position is not None
+            assert position.settlement_status == "superseded_position_residual"
+            assert position.settlement_source == "okx_current_position_deduplication"
+            assert position.settlement_raw["canonical_position_id"] == 99
+            assert position.settlement_raw["last_error_code"] == (
+                "positions_history_no_rows"
+            )
+            assert position.settlement_raw["restored_from_status"] == (
+                "settlement_exception"
+            )
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_closed_history_hides_unsettled_positions(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

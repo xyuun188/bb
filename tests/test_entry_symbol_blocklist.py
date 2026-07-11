@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from ai_brain.base_model import Action, DecisionOutput
 from services.entry_symbol_blocklist import (
     TRANSIENT_ENTRY_BLOCK_MINUTES,
     EntrySymbolBlocklistPolicy,
@@ -80,3 +81,71 @@ def test_entry_symbol_blocklist_recognizes_price_guard_skip_terms() -> None:
     assert policy.is_entry_price_guard_skip("避免追高，系统跳过本次开仓")
     assert policy.is_entry_price_guard_skip("下单前行情质量复核未通过")
     assert not policy.is_entry_price_guard_skip("普通机会评分未达标")
+
+
+def _entry_decision(action: Action = Action.LONG) -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=action,
+        confidence=0.82,
+        reasoning="recovery test",
+        position_size_pct=0.08,
+        suggested_leverage=5.0,
+        feature_snapshot={
+            "market_regime": "trend",
+            "adx": 31.24,
+            "timestamp": "volatile-value",
+        },
+        raw_response={"opportunity_score": {"score": 0.78}},
+    )
+
+
+def test_exchange_recovery_block_is_symbol_side_and_evidence_specific() -> None:
+    now = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    policy = EntrySymbolBlocklistPolicy(_normalize, clock=lambda: now)
+    decision = _entry_decision()
+    rejection = {
+        "okx_rejection": True,
+        "okx_error_code": "59247",
+        "okx_error_payload": {
+            "code": "0",
+            "data": [{"sCode": "59247", "sMsg": "Operation failed"}],
+        },
+        "leverage_check": {"actual_leverage": 2},
+    }
+
+    policy.remember_exchange_rejection(decision, rejection)
+
+    assert "59247" in str(policy.exchange_recovery_block_reason(decision, []))
+    assert policy.exchange_recovery_block_reason(_entry_decision(Action.SHORT), []) is None
+
+    decision.feature_snapshot["timestamp"] = "another-volatile-value"
+    assert policy.exchange_recovery_block_reason(decision, []) is not None
+
+    decision.feature_snapshot["market_regime"] = "range"
+    assert policy.exchange_recovery_block_reason(decision, []) is None
+
+
+def test_exchange_recovery_block_releases_when_position_leverage_changes() -> None:
+    now = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    policy = EntrySymbolBlocklistPolicy(_normalize, clock=lambda: now)
+    decision = _entry_decision()
+    policy.remember_exchange_rejection(
+        decision,
+        {
+            "okx_rejection": True,
+            "okx_error_code": "50026",
+            "okx_error_payload": {"code": "50026", "msg": "System error. Try again later."},
+            "leverage_check": {"actual_leverage": 2},
+        },
+    )
+
+    assert policy.exchange_recovery_block_reason(
+        decision,
+        [{"symbol": "BTC/USDT", "side": "long", "leverage": 2}],
+    ) is not None
+    assert policy.exchange_recovery_block_reason(
+        decision,
+        [{"symbol": "BTC/USDT", "side": "long", "leverage": 3}],
+    ) is None

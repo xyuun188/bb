@@ -169,6 +169,15 @@ def _ranking_items(ranking: dict[str, Any]) -> list[dict[str, Any]]:
             severity = "warning"
         evidence = _safe_dict(item.get("evidence"))
         if str(item.get("code") or "").startswith("strategy_"):
+            lane_contained = bool(
+                evidence.get("model_name")
+                or evidence.get("strategy_profile_id")
+                or evidence.get("symbol")
+                or evidence.get("side")
+                or evidence.get("decision_lane")
+            )
+            if severity == "blocking" and lane_contained:
+                severity = "warning"
             items.append(
                 {
                     "category": "ranking",
@@ -183,10 +192,11 @@ def _ranking_items(ranking: dict[str, Any]) -> list[dict[str, Any]]:
                     "decision_lane": evidence.get("decision_lane"),
                     "realized_net_pnl": evidence.get("realized_net_pnl"),
                     "ranking_reasons": evidence.get("ranking_reasons") or [],
+                    "lane_scoped_containment": lane_contained,
                     "required_resolution": (
-                        "keep_shadow_only_or_operator_approved_disable_before_resume"
-                        if severity == "blocking"
-                        else "do_not_increase_budget_until_clean_samples"
+                        "keep_affected_lane_disabled_until_clean_samples"
+                        if lane_contained
+                        else "operator_review_unscoped_ranking_blocker"
                     ),
                 }
             )
@@ -200,14 +210,15 @@ def _ranking_items(ranking: dict[str, Any]) -> list[dict[str, Any]]:
         items.append(
             {
                 "category": "ranking",
-                "severity": "blocking",
+                "severity": "warning",
                 "code": "strategy_disable_summary",
                 "count": disable_count,
                 "message": (
                     "Ranking summary reports disabled model/strategy/lane combinations, "
                     "but detailed blockers were truncated or unavailable."
                 ),
-                "required_resolution": "keep_shadow_only_or_operator_approved_disable_before_resume",
+                "lane_scoped_containment": True,
+                "required_resolution": "keep_affected_lanes_disabled_until_details_refresh",
             }
         )
     warning_demote_items = [

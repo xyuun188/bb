@@ -648,17 +648,38 @@ def test_phase3_go_no_go_blocks_resume_when_profit_first_ranking_audit_unavailab
     assert report["inputs"]["profit_first_ranking_ready"] is False
 
 
-def test_phase3_go_no_go_blocks_resume_when_profit_first_ranking_disables_profile() -> None:
+def test_phase3_go_no_go_contains_disabled_profit_first_profile_to_its_lane() -> None:
     report = evaluate_phase3_go_no_go_cards(
         _base_cards(ranking_disable_count=1, ranking_demote_count=1)
     )
 
-    assert report["status"] == "blocked"
-    assert report["can_start_paper_with_operator_approval"] is False
+    assert report["status"] != "blocked"
+    assert report["can_start_paper_with_operator_approval"] is True
     blocker_codes = {item["code"] for item in report["blockers"]}
-    assert "profit_first_ranking_has_disable_blockers" in blocker_codes
+    warning_codes = {item["code"] for item in report["warnings"]}
+    assert "profit_first_ranking_has_disable_blockers" not in blocker_codes
+    assert "profit_first_ranking_lanes_contained" in warning_codes
     assert report["inputs"]["profit_first_ranking_disable_count"] == 1
     assert report["inputs"]["profit_first_ranking_demote_count"] == 1
+
+
+def test_phase3_go_no_go_still_blocks_unscoped_ranking_failure() -> None:
+    cards = _base_cards(ranking_disable_count=1)
+    ranking_card = next(card for card in cards if card["key"] == "profit_first_ranking")
+    ranking_card["details"]["blockers"] = [
+        {
+            "code": "ranking_integrity_failure",
+            "severity": "blocking",
+            "evidence": {},
+        }
+    ]
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["status"] == "blocked"
+    assert "profit_first_ranking_has_disable_blockers" in {
+        item["code"] for item in report["blockers"]
+    }
 
 
 def test_phase3_go_no_go_surfaces_recovery_blocker_checklist() -> None:

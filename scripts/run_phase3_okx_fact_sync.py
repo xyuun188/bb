@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,21 +28,24 @@ from scripts.runtime_env_bootstrap import (  # noqa: E402
 load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
-from core.safe_output import safe_error_text  # noqa: E402
-from db.session import close_db  # noqa: E402
-from scripts.run_okx_daily_reconciliation_report import collect_report  # noqa: E402
-from services.okx_order_fact_sync import OkxOrderFactSyncService  # noqa: E402
+from sqlalchemy import delete, or_, select  # noqa: E402
+
 from config.settings import ENSEMBLE_TRADER_NAME  # noqa: E402
-from db.session import get_session_ctx  # noqa: E402
+from core.safe_output import safe_error_text  # noqa: E402
+from db.session import close_db, get_session_ctx  # noqa: E402
 from executor.okx_executor import OKXExecutor  # noqa: E402
 from models.account import ExecutionEquitySnapshot  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
-from services.okx_order_fact_sync import _db_naive_since, PHASE3_DEFAULT_ORDER_SYNC_START  # noqa: E402
-from sqlalchemy import delete, or_, select  # noqa: E402
-
+from scripts.run_okx_daily_reconciliation_report import collect_report  # noqa: E402
+from services.okx_order_fact_sync import (  # noqa: E402
+    PHASE3_DEFAULT_ORDER_SYNC_START,
+    OkxOrderFactSyncService,
+    _db_naive_since,
+)
 
 PHASE3_CLEAN_SNAPSHOT_DATE = "2026-06-28"
 BEIJING_TZ = timezone(timedelta(hours=8))
+logger = logging.getLogger(__name__)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,12 +57,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write local order/fill fact cache from OKX native fills history.",
     )
     parser.add_argument(
+        "--reset-local-cache",
+        action="store_true",
+        help=(
+            "Explicit recovery-only reset before rebuilding local Phase 3 facts. "
+            "Normal scheduled sync remains incremental."
+        ),
+    )
+    parser.add_argument(
         "--allow-cache",
         action="store_true",
         help="Allow cached reconciliation cards. Default forces a fresh report.",
     )
     parser.add_argument("--json-indent", type=int, default=2)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.reset_local_cache and not args.apply_order_sync:
+        parser.error("--reset-local-cache requires --apply-order-sync")
+    return args
 
 
 def _json_safe(value: Any) -> Any:
@@ -75,7 +90,13 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-async def run(*, mode: str, apply_order_sync: bool, allow_cache: bool) -> dict[str, Any]:
+async def run(
+    *,
+    mode: str,
+    apply_order_sync: bool,
+    allow_cache: bool,
+    reset_local_cache: bool = False,
+) -> dict[str, Any]:
     before_report = await collect_report(allow_cache=allow_cache)
     sync_result: dict[str, Any] | None = None
     sync_error: str | None = None
@@ -83,7 +104,8 @@ async def run(*, mode: str, apply_order_sync: bool, allow_cache: bool) -> dict[s
     equity_snapshot_result: dict[str, Any] | None = None
     if apply_order_sync:
         try:
-            cleanup_result = await _cleanup_phase3_local_okx_cache(mode=mode)
+            if reset_local_cache:
+                cleanup_result = await _cleanup_phase3_local_okx_cache(mode=mode)
             equity_snapshot_result = await _sync_okx_equity_snapshot(mode=mode)
             sync_result = await OkxOrderFactSyncService(mode=mode).sync()
         except Exception as exc:  # pragma: no cover - defensive operator output
@@ -96,6 +118,7 @@ async def run(*, mode: str, apply_order_sync: bool, allow_cache: bool) -> dict[s
             "generated_at": datetime.now(UTC).isoformat(),
             "mutated_database": bool(apply_order_sync and not sync_error),
             "order_sync_applied": bool(apply_order_sync),
+            "local_cache_reset_requested": bool(reset_local_cache),
             "cleanup_result": cleanup_result,
             "equity_snapshot_result": equity_snapshot_result,
             "order_sync_result": sync_result,
@@ -200,7 +223,7 @@ async def _sync_okx_equity_snapshot(*, mode: str, now: datetime | None = None) -
         try:
             await executor.shutdown()
         except Exception:
-            pass
+            logger.debug("OKX equity snapshot executor shutdown failed", exc_info=True)
 
     if not isinstance(snapshot, dict) or snapshot.get("error"):
         return {
@@ -513,6 +536,7 @@ async def async_main(argv: list[str] | None = None) -> int:
             mode=str(args.mode or "paper"),
             apply_order_sync=bool(args.apply_order_sync),
             allow_cache=bool(args.allow_cache),
+            reset_local_cache=bool(args.reset_local_cache),
         )
     finally:
         await close_db()

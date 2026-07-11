@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import structlog
 from fastapi import APIRouter
 from sqlalchemy import and_, func, or_, select
 
@@ -48,7 +49,10 @@ from services.phase3_model_server_readiness import Phase3ModelServerReadinessAud
 from services.phase3_paper_resume_observation import Phase3PaperResumeObservationService
 from services.phase3_paper_resume_preflight import Phase3PaperResumePreflightService
 from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
-from services.phase3_server_migration_audit import Phase3ServerMigrationAuditService
+from services.phase3_server_migration_audit import (
+    OLD_TAKEOVER_CONTRACT_ID,
+    Phase3ServerMigrationAuditService,
+)
 from services.phase3_stage_handoff import Phase3StageHandoffService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.profit_first_governance_report import ProfitFirstGovernanceReportService
@@ -67,6 +71,7 @@ from web_dashboard.api import data_collection as data_collection_api
 from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 _skip_okx_daily_reconciliation_latest: ContextVar[bool] = ContextVar(
     "skip_okx_daily_reconciliation_latest",
     default=False,
@@ -77,6 +82,7 @@ EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 KLINE_STALE_LIMIT_SECONDS = {"1m": 180, "5m": 600, "15m": 1800, "1h": 7200}
 STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
+SYSTEM_AUDIT_LATEST_FILE = "system_audit_latest.json"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
@@ -215,6 +221,8 @@ NODE_OWNER_PATHS = {
 }
 
 _okx_reconciliation_cache: tuple[datetime, dict[str, Any]] | None = None
+_system_audit_status_cache: tuple[datetime, dict[str, Any]] | None = None
+_system_audit_refresh_task: asyncio.Task[Any] | None = None
 _okx_authoritative_sync_cache: tuple[datetime, dict[str, Any]] | None = None
 _system_audit_collect_lock: asyncio.Lock | None = None
 
@@ -593,23 +601,59 @@ def _load_okx_daily_reconciliation_report_summary() -> dict[str, Any]:
             "skip_reason": "daily_report_generation_avoids_self_referential_latest",
         }
     try:
-        if not path.exists():
+        report_dir = path.parent
+        candidates = [path]
+        if report_dir.exists():
+            candidates.extend(
+                candidate
+                for candidate in report_dir.glob("okx-daily-reconciliation-*.json")
+                if candidate != path
+            )
+        completed_reports: list[tuple[datetime, Path, dict[str, Any]]] = []
+        invalid_candidates: list[str] = []
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                candidate_payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                invalid_candidates.append(str(candidate))
+                continue
+            if not isinstance(candidate_payload, dict):
+                invalid_candidates.append(str(candidate))
+                continue
+            generated = _parse_utc_datetime(candidate_payload.get("generated_at"))
+            completed = bool(candidate_payload.get("completed", True))
+            if generated is None or not completed or candidate_payload.get("artifact_error"):
+                invalid_candidates.append(str(candidate))
+                continue
+            completed_reports.append((generated, candidate, candidate_payload))
+        if not completed_reports:
+            if path.exists():
+                return {
+                    **base,
+                    "status": "invalid",
+                    "stale": True,
+                    "invalid_candidates": invalid_candidates[:8],
+                }
             return {**base, "status": "missing", "stale": True}
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return {**base, "status": "invalid", "stale": True}
-        generated_at = _parse_utc_datetime(payload.get("generated_at"))
+        generated_at, selected_path, payload = max(
+            completed_reports,
+            key=lambda item: item[0],
+        )
         age = _age_seconds(generated_at) if generated_at is not None else None
         stale = (
             age is None
             or age > OKX_DAILY_RECONCILIATION_REPORT_MAX_AGE_SECONDS
-            or bool(payload.get("artifact_error"))
         )
         gates = _safe_dict(payload.get("operational_gates"))
         ledger = _safe_dict(payload.get("issue_ledger"))
         return {
             **base,
             "available": True,
+            "selected_path": str(selected_path),
+            "latest_path": str(path),
+            "latest_fallback_used": selected_path != path,
             "status": payload.get("status") or "unknown",
             "generated_at": _iso(generated_at),
             "age_seconds": None if age is None else round(age, 3),
@@ -840,7 +884,6 @@ def _safe_profit_first_ranking_report(report: dict[str, Any]) -> dict[str, Any]:
 def _profit_first_ranking_observation_only(details: dict[str, Any]) -> bool:
     if not isinstance(details, dict):
         return False
-    summary = _safe_dict(details.get("summary"))
     blockers = [_safe_dict(item) for item in _safe_list(details.get("blockers"))]
     unsafe_flags = (
         bool(details.get("live_mutation"))
@@ -856,10 +899,13 @@ def _profit_first_ranking_observation_only(details: dict[str, Any]) -> bool:
         or not bool(details.get("read_only"))
         or unsafe_flags
         or not bool(details.get("ranking_ready"))
-        or int(summary.get("disable_count") or 0) > 0
     ):
         return False
-    if any(str(item.get("severity") or "") == "blocking" for item in blockers):
+    if any(
+        str(item.get("severity") or "") == "blocking"
+        and not str(item.get("code") or "").startswith("strategy_disable")
+        for item in blockers
+    ):
         return False
     for key in ("strategy_rankings", "source_rankings"):
         rows = details.get(key) if isinstance(details.get(key), list) else []
@@ -3802,15 +3848,26 @@ async def _profit_first_ranking_audit() -> dict[str, Any]:
     summary = _safe_dict(report.get("summary"))
     blockers = _safe_list(report.get("blockers"))
     hard_blockers = [row for row in blockers if _safe_dict(row).get("severity") == "blocking"]
+    global_hard_blockers = [
+        row
+        for row in hard_blockers
+        if not str(_safe_dict(row).get("code") or "").startswith("strategy_disable")
+    ]
     demote_count = int(summary.get("demote_count") or 0)
     disable_count = int(summary.get("disable_count") or 0)
     ranking_ready = bool(report.get("ranking_ready"))
-    if hard_blockers or disable_count:
+    if global_hard_blockers:
         status = "critical"
-        summary_text = "Profit-First ranking found model/strategy combinations that must be disabled before resume."
-    elif demote_count or blockers:
+        summary_text = "Profit-First ranking found a global integrity blocker outside lane containment."
+    elif hard_blockers or disable_count or demote_count or blockers:
         status = "warning"
-        summary_text = "Profit-First ranking found losing model/source evidence; keep affected routes shadow or reduced."
+        summary_text = "Profit-First ranking contained losing model/strategy lanes; unaffected runtime lanes remain available."
+        report["lane_scoped_containment"] = {
+            "active": True,
+            "disabled_lane_count": disable_count,
+            "demoted_lane_count": demote_count,
+            "global_runtime_blocked": False,
+        }
     elif not ranking_ready:
         status = "warning"
         summary_text = "Profit-First ranking is still collecting realized-PnL evidence."
@@ -4529,6 +4586,25 @@ def _source_scan_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _phase3_old_takeover_observation_only(report: dict[str, Any]) -> bool:
+    if str(report.get("deployment_contract") or "") != OLD_TAKEOVER_CONTRACT_ID:
+        return False
+    if str(report.get("status") or "") != "ready":
+        return False
+    if bool(report.get("phase3_go_live_blocked")) or _safe_list(report.get("blockers")):
+        return False
+    if any(
+        int(report.get(key) or 0) > 0
+        for key in ("forbidden_path_count", "forbidden_service_count", "legacy_process_count")
+    ):
+        return False
+    old_takeover = _safe_dict(report.get("old_takeover"))
+    return all(
+        bool(old_takeover.get(key))
+        for key in ("active", "service_ready", "endpoint_ready", "artifact_ready")
+    )
+
+
 async def _phase3_server_migration_audit() -> dict[str, Any]:
     report = await Phase3ServerMigrationAuditService(
         timeout_seconds=PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS
@@ -4536,12 +4612,19 @@ async def _phase3_server_migration_audit() -> dict[str, Any]:
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     phase3_blocked = bool(report.get("phase3_go_live_blocked"))
+    old_takeover_observing = _phase3_old_takeover_observation_only(report)
+    report["observing"] = old_takeover_observing
     status = "warning" if phase3_blocked or warnings else "ok"
     summary = "Phase 3 model-server reset and migration gate is ready."
     if phase3_blocked:
         summary = (
             "Phase 3 model-server go-live is blocked until legacy resource release, "
             "/data/BB isolation, and whitelist migration are verified."
+        )
+    elif old_takeover_observing:
+        summary = (
+            "Temporary old-server takeover is ready; isolated legacy data and the "
+            "switch-back contract remain under observation."
         )
     elif warnings:
         summary = "Phase 3 model-server gate is usable but has non-blocking migration warnings."
@@ -6405,6 +6488,72 @@ def _history_path() -> Path:
     return settings.data_dir / SYSTEM_AUDIT_HISTORY_FILE
 
 
+def _latest_audit_path() -> Path:
+    return settings.data_dir / SYSTEM_AUDIT_LATEST_FILE
+
+
+def _load_latest_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
+    path = _latest_audit_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    checked_at = _parse_utc_datetime(payload.get("checked_at"))
+    if checked_at is None:
+        return None
+    return checked_at, payload
+
+
+def _store_latest_audit_snapshot(payload: dict[str, Any]) -> None:
+    path = _latest_audit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(f"{path.suffix}.tmp")
+    temp.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=_audit_snapshot_json_default,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temp.replace(path)
+
+
+def _audit_snapshot_json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        normalized = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return normalized.astimezone(UTC).isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _cached_system_audit_status() -> tuple[datetime, dict[str, Any]] | None:
+    global _system_audit_status_cache
+    if _system_audit_status_cache is None:
+        _system_audit_status_cache = _load_latest_audit_snapshot()
+    if _system_audit_status_cache is None:
+        return None
+    checked_at, payload = _system_audit_status_cache
+    return checked_at, copy.deepcopy(payload)
+
+
+async def _refresh_system_audit_status() -> None:
+    global _system_audit_refresh_task
+    try:
+        await collect_system_audit_status(record_history=True, source="background_api_refresh")
+    finally:
+        _system_audit_refresh_task = None
+
+
+def _schedule_system_audit_refresh() -> None:
+    global _system_audit_refresh_task
+    if _system_audit_refresh_task is None or _system_audit_refresh_task.done():
+        _system_audit_refresh_task = asyncio.create_task(_refresh_system_audit_status())
+
+
 def _history_record(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
     root_causes = payload.get("root_causes") if isinstance(payload.get("root_causes"), list) else []
     return {
@@ -6585,12 +6734,33 @@ async def _collect_system_audit_status_unlocked(
     )
     if record_history:
         _append_history_record(payload, source=source)
+    global _system_audit_status_cache
+    checked_at = _parse_utc_datetime(payload.get("checked_at")) or _now()
+    _system_audit_status_cache = (checked_at, copy.deepcopy(payload))
+    try:
+        _store_latest_audit_snapshot(payload)
+    except OSError as exc:
+        logger.warning("failed to store system audit snapshot", error=safe_error_text(exc))
     return payload
 
 
 @router.get("/system-audit/status")
 async def system_audit_status() -> dict[str, Any]:
-    return await collect_system_audit_status(record_history=True, source="api")
+    cached = _cached_system_audit_status()
+    if cached is None:
+        return await collect_system_audit_status(record_history=True, source="api_cold_start")
+    checked_at, payload = cached
+    age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
+    refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
+    if age_seconds >= refresh_after:
+        _schedule_system_audit_refresh()
+    payload["cache"] = {
+        "hit": True,
+        "age_seconds": round(age_seconds, 3),
+        "refresh_after_seconds": round(refresh_after, 3),
+        "refresh_in_background": age_seconds >= refresh_after,
+    }
+    return sanitize_payload(payload)
 
 
 @router.get("/model-expert-health/status")

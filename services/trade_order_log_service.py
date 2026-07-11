@@ -33,6 +33,10 @@ TradeRepoFactory = Callable[[Any], TradeRepository]
 ExecutionModeProvider = Callable[[str], str]
 
 
+class TradeOrderPersistenceError(RuntimeError):
+    """An exchange-confirmed order could not be written to the local fact cache."""
+
+
 class TradeOrderLogService:
     """Persist order rows without leaking repository details into orchestration."""
 
@@ -79,7 +83,11 @@ class TradeOrderLogService:
                     }
                 )
         except Exception as exc:
-            logger.error("failed to log trade", error=safe_error_text(exc))
+            error = safe_error_text(exc)
+            logger.error("failed to log trade", error=error)
+            raise TradeOrderPersistenceError(
+                "failed to persist local order fact after execution result"
+            ) from exc
 
     @staticmethod
     def _should_skip_order_log(result: Any) -> bool:
@@ -163,6 +171,33 @@ class TradeOrderLogService:
         order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
         info_order_id = str(info.get("ordId") or raw.get("ordId") or raw.get("id") or "").strip()
         status = str(getattr(getattr(result, "status", None), "value", getattr(result, "status", "")) or "").lower()
+        if status == OrderStatus.REJECTED.value and raw.get("okx_rejection"):
+            error_code = str(raw.get("okx_error_code") or "").strip() or None
+            error_payload = raw.get("okx_error_payload")
+            return {
+                "okx_inst_id": inst_id or okx_inst_id_from_payload(
+                    raw,
+                    fallback=raw.get("okx_symbol") or getattr(result, "symbol", None),
+                ),
+                "okx_state": "rejected_no_exchange_fill",
+                "okx_sync_status": "okx_rejected_no_fill",
+                "okx_synced_at": getattr(result, "timestamp", None),
+                "okx_last_error": safe_error_text(
+                    raw.get("raw_error") or raw.get("error") or "OKX rejected order",
+                    limit=500,
+                ),
+                "okx_raw_fills": {
+                    "source": "okx_execution_rejection",
+                    "fills_history_confirmed": False,
+                    "execution_result_confirmed": True,
+                    "rejected_without_exchange_fill": True,
+                    "error_code": error_code,
+                    "error_payload": error_payload if isinstance(error_payload, dict) else None,
+                    "request_params": raw.get("request_params"),
+                    "order_rules": raw.get("okx_order_rules"),
+                    "leverage_check": raw.get("leverage_check"),
+                },
+            }
         pending_backfill_payload = TradeOrderLogService._okx_native_backfill_payload(result, raw)
         if pending_backfill_payload:
             return pending_backfill_payload

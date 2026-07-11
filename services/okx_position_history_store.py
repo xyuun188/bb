@@ -23,22 +23,16 @@ def okx_position_history_row_identity(row: dict[str, Any], *, mode: str | None =
     inst_id = _inst_id(row)
     pos_id = _text(row.get("posId") or row.get("pos_id"))
     pos_side = _text(row.get("posSide") or row.get("pos_side")).lower()
-    close_type = _text(row.get("type") or row.get("closeType") or row.get("close_type"))
     c_time = _text(row.get("cTime") or row.get("createdTime") or row.get("openTime"))
     u_time = _text(row.get("uTime") or row.get("updatedTime") or row.get("closeTime"))
-    close_total_pos = _number_text(row.get("closeTotalPos") or row.get("close_total_pos"))
-    open_max_pos = _number_text(row.get("openMaxPos") or row.get("open_max_pos"))
+    lifecycle_time = c_time or u_time
     return "|".join(
         [
             _text(mode),
             inst_id,
             pos_id,
             pos_side,
-            close_type,
-            c_time,
-            u_time,
-            close_total_pos,
-            open_max_pos,
+            lifecycle_time,
         ]
     )
 
@@ -183,8 +177,22 @@ async def load_okx_position_history_records(
     )
     if mode:
         stmt = stmt.where(OkxPositionHistory.mode == mode)
-    result = await session.execute(stmt.limit(max(1, int(limit or 1))))
-    return list(result.scalars().all())
+    safe_limit = max(1, int(limit or 1))
+    result = await session.execute(stmt.limit(min(safe_limit * 4, 20000)))
+    records: list[OkxPositionHistory] = []
+    seen_lifecycles: set[str] = set()
+    for record in result.scalars().all():
+        stable_identity = okx_position_history_row_identity(
+            dict(record.raw_row or {}),
+            mode=record.mode,
+        )
+        if stable_identity in seen_lifecycles:
+            continue
+        seen_lifecycles.add(stable_identity)
+        records.append(record)
+        if len(records) >= safe_limit:
+            break
+    return records
 
 
 def okx_position_history_records_to_rows(

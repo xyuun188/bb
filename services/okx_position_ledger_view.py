@@ -252,6 +252,7 @@ def build_okx_position_ledger_groups(
         for position in positions
         if not bool(getattr(position, "is_open", False))
         and not _is_zero_quantity_residual(position)
+        and not _has_explicit_superseded_position_metadata(position)
     ]
     closed_positions = _split_polluted_sequential_lifecycle_positions(
         closed_positions,
@@ -2042,6 +2043,20 @@ def _position_evidence_score(position: Position) -> tuple[int, int, int, int, fl
         1 if realized > 1e-12 else 0,
         updated_key,
         int(getattr(position, "id", 0) or 0),
+    )
+
+
+def _has_explicit_superseded_position_metadata(position: Position) -> bool:
+    if str(getattr(position, "settlement_status", "") or "") == (
+        "superseded_position_residual"
+    ):
+        return True
+    raw = getattr(position, "settlement_raw", None)
+    raw = raw if isinstance(raw, dict) else {}
+    return bool(
+        str(raw.get("reason") or "")
+        == "duplicate_local_open_position_for_same_okx_pos_id"
+        and _safe_float(raw.get("canonical_position_id")) > 0
     )
 
 

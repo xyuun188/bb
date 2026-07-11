@@ -125,6 +125,22 @@ class TradeRepository(BaseRepository):
         result = await self.session.execute(stmt.order_by(Position.created_at.asc()))
         return list(result.scalars().all())
 
+    async def get_exchange_matching_open_positions(
+        self,
+        symbol: str,
+        side: str,
+        execution_mode: str,
+    ) -> list[Position]:
+        symbol_variants = trading_symbol_variants(symbol) or {symbol}
+        stmt = select(Position).where(
+            Position.symbol.in_(symbol_variants),
+            Position.side == side,
+            Position.execution_mode == execution_mode,
+            Position.is_open.is_(True),
+        )
+        result = await self.session.execute(stmt.order_by(Position.created_at.asc()))
+        return list(result.scalars().all())
+
     async def get_position_records(
         self,
         execution_mode: str | None = None,

@@ -236,7 +236,14 @@ class FakeCcxt:
 class RejectingCreateOrderCcxt(FakeCcxt):
     async def create_order(self, symbol, order_type, side, quantity, price, params):
         self.create_calls.append((symbol, order_type, side, quantity, price, params))
-        raise ExchangeAPIError("51008 Insufficient USDT margin")
+        raise ExchangeAPIError(
+            "OKX API error [51008]: Insufficient USDT margin",
+            code="51008",
+            payload={
+                "code": "1",
+                "data": [{"sCode": "51008", "sMsg": "Insufficient USDT margin"}],
+            },
+        )
 
 
 class MissingNativeTickerCcxt(FakeCcxt):
@@ -557,6 +564,12 @@ async def test_okx_entry_exchange_rejection_is_structured_not_raised():
     assert result.raw_response["system_pre_submit_rejection"] is False
     assert result.raw_response["execution_blocker"] == "okx_exchange_rejection"
     assert "51008" in result.raw_response["raw_error"]
+    assert result.raw_response["okx_error_code"] == "51008"
+    assert result.raw_response["okx_error_payload"] == {
+        "code": "1",
+        "data": [{"sCode": "51008", "sMsg": "Insufficient USDT margin"}],
+    }
+    assert result.raw_response["leverage_check"]["actual_leverage"] == 3.0
     assert result.raw_response["okx_order_rules"]["pre_submit_valid"] is True
 
 

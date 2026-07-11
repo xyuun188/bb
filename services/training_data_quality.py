@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -630,11 +632,20 @@ def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
         _trade_sizing(sample).get("final_notional_usdt"),
         _trade_sizing(sample).get("target_min_notional_usdt"),
     )
-    if explicit is not None:
-        return abs(explicit)
-    if quantity is None or entry_price is None:
-        return None
-    return abs(quantity * entry_price)
+    derived = (
+        abs(quantity * entry_price)
+        if quantity is not None and entry_price is not None
+        else None
+    )
+    # Historical rows can contain contract-count placeholders in notional_usdt.
+    # Prefer the largest internally valid candidate so a tiny malformed denominator
+    # cannot turn an ordinary perpetual PnL into a million-percent training return.
+    candidates = [
+        abs(value)
+        for value in (explicit, derived)
+        if value is not None and math.isfinite(value) and abs(value) > 0
+    ]
+    return max(candidates) if candidates else None
 
 
 def _trade_actual_leverage(sample: dict[str, Any]) -> float | None:
@@ -1537,7 +1548,11 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
     }
 
 
-def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
+def governance_report(
+    quality: dict[str, Any],
+    *,
+    artifact_quality_fingerprint: str | None = None,
+) -> dict[str, Any]:
     """Return an operator-facing cleanup report for historical training samples.
 
     Historical rows are preserved for audit and PnL traceability.  Cleanup means
@@ -1583,6 +1598,27 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
         status = "quarantined"
     elif downweighted:
         status = "downweighted"
+    quality_fingerprint_payload = {
+        "version": quality.get("data_quality_version") or DATA_QUALITY_VERSION,
+        "total": total,
+        "included": included,
+        "downweighted": downweighted,
+        "excluded": excluded,
+        "effective_weight_ratio": round(effective_weight_ratio, 8),
+        "top_reasons": top_reasons,
+    }
+    quality_fingerprint = hashlib.sha256(
+        json.dumps(
+            quality_fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    artifact_matches_quality = bool(
+        artifact_quality_fingerprint
+        and artifact_quality_fingerprint == quality_fingerprint
+    )
     return {
         "status": status,
         "data_quality_version": quality.get("data_quality_version") or DATA_QUALITY_VERSION,
@@ -1599,7 +1635,10 @@ def governance_report(quality: dict[str, Any]) -> dict[str, Any]:
         "blocked_reason_ratio": round(blocked_reason_ratio, 6),
         "contamination_risk": contamination_risk,
         "blocked_reason_count": blocked_reason_count,
-        "requires_artifact_refresh": bool(has_contamination),
+        "requires_artifact_refresh": bool(has_contamination and not artifact_matches_quality),
+        "quality_fingerprint": quality_fingerprint,
+        "artifact_quality_fingerprint": artifact_quality_fingerprint,
+        "artifact_matches_quality": artifact_matches_quality,
         "refresh_targets": list(_RETRAIN_TARGETS),
         "summary": (
             f"已保留 {total} 条原始样本；{excluded} 条隔离不训练，"

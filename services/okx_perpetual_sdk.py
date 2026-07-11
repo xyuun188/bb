@@ -71,7 +71,11 @@ def raise_if_okx_error(
     code = str(result.get("code") or "")
     if code not in {"", "0"}:
         message = safe_error_text(result.get("msg") or fallback, limit=240)
-        raise ExchangeAPIError(f"OKX API error [{safe_error_text(code, limit=40)}]: {message}")
+        raise ExchangeAPIError(
+            f"OKX API error [{safe_error_text(code, limit=40)}]: {message}",
+            code=code,
+            payload=dict(result),
+        )
     if not check_data_code:
         return
     rows = result.get("data")
@@ -84,7 +88,11 @@ def raise_if_okx_error(
         if item_code in {"", "0"}:
             continue
         message = safe_error_text(row.get("sMsg") or row.get("msg") or fallback, limit=240)
-        raise ExchangeAPIError(f"OKX API error [{safe_error_text(item_code, limit=40)}]: {message}")
+        raise ExchangeAPIError(
+            f"OKX API error [{safe_error_text(item_code, limit=40)}]: {message}",
+            code=item_code,
+            payload={"response": dict(result), "item": dict(row)},
+        )
 
 
 def _format_number(value: Any) -> str:

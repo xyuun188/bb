@@ -165,6 +165,8 @@ async def test_position_history_mirror_sync_updates_existing_rows(
         )
         first = await service.sync_once()
         ccxt.rows[0]["realizedPnl"] = "2.3"
+        ccxt.rows[0]["uTime"] = _ms(now - timedelta(minutes=1))
+        ccxt.rows[0]["closeTotalPos"] = "90"
         second = await service.sync_once()
 
         assert first["inserted_count"] == 1

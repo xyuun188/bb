@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
+from core.safe_output import safe_error_text
 from web_dashboard.api.auth import dashboard_login_page_html
 from web_dashboard.api.router import api_router
 from web_dashboard.api.security import (
@@ -55,7 +56,7 @@ async def _system_audit_history_loop() -> None:
         except Exception as exc:
             logger.warning(
                 "system audit history loop failed",
-                error=type(exc).__name__,
+                error=safe_error_text(exc, limit=240),
             )
         await asyncio.sleep(interval)
 

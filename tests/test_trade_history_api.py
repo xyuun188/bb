@@ -488,7 +488,7 @@ async def test_dashboard_position_history_uses_persisted_okx_official_snapshot_w
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_position_history_mirror"
+    assert payload["ledger_source"] == "okx_position_history_snapshot_backfill_pending"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"

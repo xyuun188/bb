@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 
 from core.symbols import (
     normalize_trading_symbol,
@@ -105,6 +105,7 @@ class OkxTradeFactIntegrityService:
         since = datetime.now(UTC) - timedelta(hours=self.lookback_hours)
         since_naive = since.replace(tzinfo=None)
         async with get_read_session_ctx() as session:
+            await _start_consistent_read_snapshot(session)
             order_rows = await session.execute(
                 select(Order)
                 .where(
@@ -236,6 +237,8 @@ class OkxTradeFactIntegrityService:
             if raw_contracts > 0 and contract_size > 0
             else raw_base_quantity if raw_base_quantity > 0 else raw_contracts
         )
+
+
         if (
             local_quantity > 0
             and expected_base_quantity > 0
@@ -423,6 +426,24 @@ class OkxTradeFactIntegrityService:
                 item for item in raw_entry_ids if not is_local_non_exchange_close_marker(item)
             }
             close_ids = raw_close_ids - local_marker_ids
+            if (
+                str(getattr(position, "settlement_status", "") or "")
+                == "superseded_position_residual"
+            ):
+                issues.append(
+                    TradeFactIssue(
+                        kind="superseded_position_residual",
+                        severity="info",
+                        position_id=int(position.id),
+                        symbol=position_symbol,
+                        expected_symbol=position_symbol,
+                        reason=(
+                            "This preserved local row was retired after another row became "
+                            "the canonical projection for the same OKX position lifecycle."
+                        ),
+                    )
+                )
+                continue
             if _is_superseded_position_residual(position, positions):
                 if not entry_ids or (
                     not bool(position.is_open)
@@ -445,6 +466,29 @@ class OkxTradeFactIntegrityService:
                         )
                     )
                     continue
+            if (
+                not bool(position.is_open)
+                and str(getattr(position, "model_name", "") or "")
+                == "okx_authoritative_sync"
+                and str(getattr(position, "settlement_status", "") or "")
+                == "okx_position_history"
+                and (not entry_ids or not close_ids)
+            ):
+                issues.append(
+                    TradeFactIssue(
+                        kind="legacy_position_history_projection_gap",
+                        severity="info",
+                        position_id=int(position.id),
+                        symbol=position_symbol,
+                        expected_symbol=position_symbol,
+                        reason=(
+                            "Legacy Position projection lacks complete order links; the "
+                            "authoritative OKX position-history mirror remains preserved, "
+                            "while this projection stays excluded from training and dashboard truth."
+                        ),
+                    )
+                )
+                continue
             for local_marker_id in sorted(local_marker_ids):
                 is_orphan = local_marker_id.startswith(ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX)
                 issues.append(
@@ -525,6 +569,25 @@ class OkxTradeFactIntegrityService:
                         )
                     )
         return issues
+
+
+async def _start_consistent_read_snapshot(session: Any) -> None:
+    """Keep a PostgreSQL integrity audit on one immutable read view.
+
+    The order-fact synchronizer can atomically update an order while a long
+    system audit is running. PostgreSQL's default READ COMMITTED mode would
+    otherwise let one audit combine pre-update orders with post-update linked
+    positions, producing a transient false critical. SQLite test databases do
+    not support this transaction command, so they keep their existing behavior.
+    """
+
+    try:
+        bind = session.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "")
+    except Exception:
+        return
+    if dialect_name == "postgresql":
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
 
 
 def _execution_result_payload(decision: AIDecision | None) -> dict[str, Any]:
@@ -790,6 +853,8 @@ def _position_model_matches_order(position: Position, order: Order) -> bool:
 
 
 def _is_superseded_position_residual(position: Position, positions: list[Position]) -> bool:
+    if _has_explicit_superseded_position_metadata(position):
+        return True
     return any(
         other is not position and _position_supersedes_for_integrity(other, position)
         for other in positions
@@ -811,6 +876,19 @@ def _position_supersedes_for_integrity(candidate: Position, other: Position) -> 
         return False
     if not (candidate_entry_ids and candidate_close_ids):
         return False
+    if (
+        candidate_pos_id
+        and other_pos_id
+        and candidate_pos_id == other_pos_id
+        and _position_open_times_align(candidate, other)
+        and (not other_entry_ids or candidate_entry_ids.issuperset(other_entry_ids))
+        and (not other_close_ids or candidate_close_ids.issuperset(other_close_ids))
+        and (
+            candidate_entry_ids != other_entry_ids
+            or candidate_close_ids != other_close_ids
+        )
+    ):
+        return True
     if other_close_ids and candidate_close_ids and not candidate_close_ids.issuperset(other_close_ids):
         return False
     if other_entry_ids and candidate_entry_ids and not candidate_entry_ids.issuperset(other_entry_ids):
@@ -820,6 +898,20 @@ def _position_supersedes_for_integrity(candidate: Position, other: Position) -> 
     if not _position_times_align(candidate, other):
         return False
     return _position_integrity_score(candidate) > _position_integrity_score(other)
+
+
+def _has_explicit_superseded_position_metadata(position: Position) -> bool:
+    if str(getattr(position, "settlement_status", "") or "") == (
+        "superseded_position_residual"
+    ):
+        return True
+    raw = getattr(position, "settlement_raw", None)
+    raw = raw if isinstance(raw, dict) else {}
+    return bool(
+        str(raw.get("reason") or "")
+        == "duplicate_local_open_position_for_same_okx_pos_id"
+        and _safe_float(raw.get("canonical_position_id"), 0.0) > 0
+    )
 
 
 def _position_integrity_base_key(position: Position) -> tuple[str, str, str]:

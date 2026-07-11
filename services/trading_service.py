@@ -463,6 +463,7 @@ class TradingService:
             no_exchange_position_result_checker=self.result_has_no_exchange_position,
             trade_count_incrementer=self.increment_trade_count,
             position_execution_persister=self.persist_position_from_execution,
+            order_fact_recovery_trigger=self.request_okx_order_fact_recovery,
             open_positions_execution_applier=self.apply_execution_to_open_positions,
             decision_executed_marker=self.mark_decision_executed,
             market_no_opportunity_symbol_clearer=self.clear_market_no_opportunity_symbol,
@@ -1653,7 +1654,12 @@ class TradingService:
             "order_fact_sync": report,
         }
 
-    def _start_okx_order_fact_sync_background(self) -> None:
+    def request_okx_order_fact_recovery(self, _execution_mode: str) -> None:
+        """Force a background fill sync after an exchange-confirmed local write failure."""
+
+        self._start_okx_order_fact_sync_background(force=True)
+
+    def _start_okx_order_fact_sync_background(self, *, force: bool = False) -> None:
         """Start optional OKX order-fact sync without delaying current-position sync."""
 
         if getattr(self, "okx_order_fact_sync_factory", None) is None:
@@ -1663,7 +1669,7 @@ class TradingService:
             return
         now = datetime.now(UTC)
         last_finished_at = getattr(self, "_okx_order_fact_sync_last_finished_at", None)
-        if isinstance(last_finished_at, datetime):
+        if not force and isinstance(last_finished_at, datetime):
             last_row = getattr(self, "_okx_order_fact_sync_last_row", None)
             degraded = bool(
                 isinstance(last_row, dict)
@@ -3216,6 +3222,20 @@ class TradingService:
 
         await self._refresh_entry_symbol_blocks_if_stale()
         if decision.is_entry:
+            recovery_reason = self._entry_symbol_blocklist_policy().exchange_recovery_block_reason(
+                decision,
+                open_positions,
+            )
+            if recovery_reason:
+                return PolicyGateResult.block(
+                    "okx_exchange_recovery_cooldown",
+                    recovery_reason,
+                    {
+                        "stage_status": "blocked",
+                        "execution_blocker": "okx_exchange_recovery_cooldown",
+                        "recovery_scope": "symbol_side_candidate_state",
+                    },
+                )
             okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
             if okx_sync_reason:
                 return PolicyGateResult.block(
@@ -3291,6 +3311,16 @@ class TradingService:
     ) -> None:
         """Persist trade logs through an explicit execution-service boundary."""
 
+        raw = (
+            execution_result.raw_response
+            if isinstance(execution_result.raw_response, dict)
+            else {}
+        )
+        if decision.is_entry and raw.get("okx_rejection"):
+            self._entry_symbol_blocklist_policy().remember_exchange_rejection(
+                decision,
+                raw,
+            )
         await self._log_trade(execution_result, model_name, decision, decision_id)
 
     def is_exchange_confirmed_execution(self, execution_result: ExecutionResult | None) -> bool:

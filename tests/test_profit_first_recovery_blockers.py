@@ -73,12 +73,15 @@ def test_recovery_blockers_summarize_contract_ranking_and_okx_items() -> None:
 
     assert report["read_only"] is True
     assert report["resume_clear"] is False
-    assert report["blocking_item_count"] == 5
+    assert report["blocking_item_count"] == 4
     assert report["category_counts"]["trade_contract"] == 3
     assert report["category_counts"]["ranking"] == 2
     assert report["category_counts"]["okx_reconciliation"] == 1
     assert report["items"][0]["samples"][0]["decision_id"] == 9300
     assert any(item["code"] == "strategy_disable" for item in report["items"])
+    disabled_lane = next(item for item in report["items"] if item["code"] == "strategy_disable")
+    assert disabled_lane["severity"] == "warning"
+    assert disabled_lane["lane_scoped_containment"] is True
     assert any(item.get("symbol") == "LAB/USDT" for item in report["items"])
 
 
@@ -141,13 +144,14 @@ def test_recovery_blockers_preserve_ranking_summary_disable_when_details_truncat
         observation={"blockers": []},
     )
 
-    assert report["status"] == "blocked"
-    assert report["resume_clear"] is False
-    assert report["blocking_item_count"] == 1
+    assert report["status"] == "ready"
+    assert report["resume_clear"] is True
+    assert report["blocking_item_count"] == 0
     disable_item = next(
         item for item in report["items"] if item["code"] == "strategy_disable_summary"
     )
-    assert disable_item["severity"] == "blocking"
+    assert disable_item["severity"] == "warning"
+    assert disable_item["lane_scoped_containment"] is True
     assert disable_item["count"] == 1
     demote_item = next(
         item for item in report["items"] if item["code"] == "strategy_demote_summary"

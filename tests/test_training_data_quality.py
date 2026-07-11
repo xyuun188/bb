@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from services import training_data_quality
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
     annotate_training_payload,
@@ -736,3 +737,49 @@ def test_training_governance_marks_small_quarantined_slice_as_medium_risk() -> N
     assert report["excluded_ratio"] == 0.001306
     assert report["blocked_reason_count"] == 13
     assert report["requires_artifact_refresh"] is True
+
+    refreshed = governance_report(
+        {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {
+                "total": 9951,
+                "included": 9914,
+                "downweighted": 24,
+                "excluded": 13,
+                "effective_weight_ratio": 0.9974,
+            },
+            "top_reasons": [{"reason": "sequence:abnormal_future_return", "count": 13}],
+        },
+        artifact_quality_fingerprint=report["quality_fingerprint"],
+    )
+    assert refreshed["artifact_matches_quality"] is True
+    assert refreshed["requires_artifact_refresh"] is False
+
+
+def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> None:
+    payload = annotate_training_payload(
+        trade_samples=[
+            _trade_sample(
+                quantity=2.0,
+                entry_price=100.0,
+                realized_pnl=4.0,
+                notional_usdt=0.000001,
+            )
+        ],
+        shadow_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    labels = payload["trade_samples"][0]["profit_learning_labels"]
+    assert labels["notional_usdt"] == 200.0
+    assert labels["return_after_cost_pct"] == 2.0
+
+
+def test_trade_return_is_missing_for_zero_or_malformed_notional() -> None:
+    assert (
+        training_data_quality._trade_notional_usdt(
+            {"quantity": "bad", "entry_price": "bad", "notional_usdt": 0}
+        )
+        is None
+    )

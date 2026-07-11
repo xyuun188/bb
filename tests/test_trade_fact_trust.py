@@ -5,9 +5,9 @@ from types import SimpleNamespace
 from models.trade import Position
 from services.okx_order_fact_sync import OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from services.trade_fact_trust import (
-    closed_position_trade_fact_untrusted_reason_with_orders,
     closed_position_trade_fact_trusted,
     closed_position_trade_fact_untrusted_reason,
+    closed_position_trade_fact_untrusted_reason_with_orders,
     filter_trusted_closed_positions,
 )
 
@@ -122,3 +122,22 @@ def test_execution_result_confirmed_orders_are_trusted_trade_facts() -> None:
     }
 
     assert closed_position_trade_fact_untrusted_reason_with_orders(position, orders) is None
+
+
+def test_superseded_position_residual_is_never_a_training_fact() -> None:
+    position = SimpleNamespace(
+        id=7,
+        is_open=False,
+        realized_pnl=0.0,
+        entry_exchange_order_id="entry-ok",
+        close_exchange_order_id="",
+        settlement_status="settlement_exception",
+        settlement_raw={
+            "reason": "duplicate_local_open_position_for_same_okx_pos_id",
+            "canonical_position_id": 8,
+        },
+    )
+
+    assert closed_position_trade_fact_untrusted_reason(position) == (
+        "superseded_position_residual"
+    )
