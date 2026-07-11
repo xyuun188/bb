@@ -37,9 +37,7 @@ def _ready_snapshot() -> dict:
                 ],
             },
         },
-        "forbidden_paths": [
-            {"path": "/data/trade_models/Qwen/Qwen3.5-122B", "exists": True}
-        ],
+        "forbidden_paths": [{"path": "/data/trade_models/Qwen/Qwen3.5-122B", "exists": True}],
         "phase3_roots": [
             {"path": "/data/BB", "exists": True},
             {"path": "/data/BB/models", "exists": True},
@@ -85,7 +83,7 @@ def _old_takeover_snapshot() -> dict:
         "old_takeover_services": [
             {"name": "qwen3-14b-trade.service", "active": True, "enabled": True},
             {"name": "deepseek-r1-14b-risk.service", "active": True, "enabled": True},
-            {"name": "bb-finquant-expert-alias.service", "active": True, "enabled": True},
+            {"name": "bb-finquant-expert-gateway.service", "active": True, "enabled": True},
             {"name": "bb-phase3-quant-api.service", "active": True, "enabled": True},
         ],
         "old_takeover_artifacts": [
@@ -228,7 +226,7 @@ def test_phase3_server_migration_ignores_self_audit_probe_processes() -> None:
         "2077059 bash -c python3 - <<'PY' import json import os import subprocess "
         'DOWNLOAD_MANIFEST_PATH = "/data/BB/manifests/phase3_model_download_manifest.json" '
         'SERVICE_MANIFEST_PATH = "/data/BB/manifests/phase3_model_service_manifest.json" '
-        'MODEL_RUNTIME_PORTS = [8000, 8001, 8002] '
+        "MODEL_RUNTIME_PORTS = [8000, 8001, 8002] "
         '"Qwen3-32B|Qwen3.5-122B|trade_ai|trade_models|vllm"'
     )
     snapshot["candidate_model_processes"] = [process]

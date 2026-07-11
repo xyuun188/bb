@@ -12,10 +12,11 @@ from services.strategy_context_performance import StrategyContextPerformanceServ
 @pytest.mark.asyncio
 async def test_strategy_context_performance_uses_one_position_read_for_all_metrics() -> None:
     calls: list[dict[str, object]] = []
+    now = datetime.now(UTC)
     row = SimpleNamespace(
         is_open=False,
-        closed_at=datetime(2026, 7, 11, tzinfo=UTC),
-        created_at=datetime(2026, 7, 11, tzinfo=UTC),
+        closed_at=now,
+        created_at=now,
         realized_pnl=2.0,
         unrealized_pnl=0.0,
         symbol="BTC/USDT",

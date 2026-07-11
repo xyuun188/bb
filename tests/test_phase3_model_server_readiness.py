@@ -101,12 +101,8 @@ def _artifact_ready_snapshot(*, runtime_ready: bool = False) -> dict[str, Any]:
             if runtime_ready
             else []
         ),
-        "gpu": [
-            f"{index}, NVIDIA GeForce RTX 5090, 2, 32607, 0, 27" for index in range(8)
-        ],
-        "gpu_processes": (
-            ["GPU-0, 1001, python, 12000"] if runtime_ready else []
-        ),
+        "gpu": [f"{index}, NVIDIA GeForce RTX 5090, 2, 32607, 0, 27" for index in range(8)],
+        "gpu_processes": (["GPU-0, 1001, python, 12000"] if runtime_ready else []),
         "listening_ports": (
             [
                 "LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:* users:(('python',pid=1001,fd=3))",
@@ -167,7 +163,7 @@ def _old_one_gpu_takeover_snapshot(*, runtime_ready: bool = True) -> dict[str, A
             [
                 "qwen3-14b-trade.service loaded active running Qwen3 14B",
                 "deepseek-r1-14b-risk.service loaded active running DeepSeek risk",
-                "bb-finquant-expert-alias.service loaded active running FinQuant alias",
+                "bb-finquant-expert-gateway.service loaded active running FinQuant verified gateway",
                 "bb-phase3-quant-api.service loaded active running Phase 3 Quant API",
             ]
             if runtime_ready
@@ -246,9 +242,7 @@ def test_phase3_model_server_artifacts_ready_but_services_pending() -> None:
 
 
 def test_phase3_model_server_ready_requires_services_and_endpoint() -> None:
-    report = evaluate_phase3_model_server_snapshot(
-        _artifact_ready_snapshot(runtime_ready=True)
-    )
+    report = evaluate_phase3_model_server_snapshot(_artifact_ready_snapshot(runtime_ready=True))
 
     assert report["status"] == "ready"
     assert report["artifact_ready"] is True
@@ -273,6 +267,12 @@ def test_phase3_model_server_accepts_old_one_gpu_timesfm_takeover_contract() -> 
     assert report["gpu_count"] == 1
     assert report["required_slot_count"] == 3
     assert report["required_slot_ready_count"] == 3
+    assert {row["slot"] for row in report["required_slots"]} == {
+        "timeseries_primary",
+        "timeseries_challenger",
+        "sentiment_primary",
+        "llm_expert_pool",
+    }
     assert report["active_endpoint_count"] == 4
     assert blocker_codes == set()
     assert "old_model_server_takeover_active" in warning_codes
@@ -422,12 +422,8 @@ def test_phase3_model_server_allows_distinct_decision_and_expert_models() -> Non
     report = evaluate_phase3_model_server_snapshot(snapshot)
 
     assert report["status"] == "ready"
-    assert "llm_role_diversity_missing" not in {
-        item["code"] for item in report["blockers"]
-    }
-    assert "finquant_expert_specialization_pending" in {
-        item["code"] for item in report["warnings"]
-    }
+    assert "llm_role_diversity_missing" not in {item["code"] for item in report["blockers"]}
+    assert "finquant_expert_specialization_pending" in {item["code"] for item in report["warnings"]}
 
 
 def test_phase3_model_server_blocks_legacy_expert_pool_runtime_name() -> None:
@@ -534,10 +530,28 @@ def test_phase3_model_server_accepts_specialized_finquant_expert_evidence() -> N
                 row["repo_id"] = "Qwen/Qwen3-32B-AWQ"
             if row["slot"] == "llm_expert_pool":
                 row["repo_id"] = "Qwen/Qwen3-14B-AWQ"
-                row["specialization_id"] = "BB-FinQuant-Expert-14B-v1"
-                row["specialization_manifest"] = (
-                    "/data/BB/manifests/bb_finquant_expert_14b_v1.json"
-                )
+                row["specialization_evidence"] = {
+                    "verification_status": "verified",
+                    "identity_verified": True,
+                    "legacy_read_only": False,
+                    "adapter_version": "20260712T010203Z-aaaaaaaaaaaa",
+                    "adapter_path": "/data/BB/models/finquant_lora/versions/v2",
+                    "specialization_manifest": "/data/BB/models/finquant_lora/versions/v2/specialization_manifest.json",
+                    "specialization_id": "BB-FinQuant-Expert-14B-v2",
+                    "dataset_version": "bb-finquant-sft-v2-aaaaaaaaaaaa-bbbbbbbb",
+                    "source_code_version": "commit-sha",
+                    "base_model_repo": "Qwen/Qwen3-14B",
+                    "trained_at": "2026-07-12T01:02:03+00:00",
+                    "adapter_sha256": "a" * 64,
+                    "manifest_sha256": "b" * 64,
+                    "dataset_sha256": "c" * 64,
+                    "dataset_lineage_sha256": "1" * 64,
+                    "dataset_manifest_sha256": "d" * 64,
+                    "source_script_sha256": "e" * 64,
+                    "trainer_code_sha256": "2" * 64,
+                    "base_model_config_sha256": "f" * 64,
+                    "inference_base_model_config_sha256": "0" * 64,
+                }
 
     report = evaluate_phase3_model_server_snapshot(snapshot)
 
@@ -545,6 +559,19 @@ def test_phase3_model_server_accepts_specialized_finquant_expert_evidence() -> N
     assert "finquant_expert_specialization_pending" not in {
         item["code"] for item in report["warnings"]
     }
+
+
+def test_phase3_model_server_rejects_unverified_finquant_manifest_name_only() -> None:
+    snapshot = _artifact_ready_snapshot(runtime_ready=True)
+    for manifest_key in ("download_manifest", "validation_manifest"):
+        for row in snapshot[manifest_key]["data"]["models"]:
+            if row["slot"] == "llm_expert_pool":
+                row["specialization_id"] = "BB-FinQuant-Expert-14B-v1"
+                row["specialization_manifest"] = "/data/BB/models/finquant_lora/unverified.json"
+
+    report = evaluate_phase3_model_server_snapshot(snapshot)
+
+    assert "finquant_expert_specialization_pending" in {item["code"] for item in report["warnings"]}
 
 
 def test_phase3_model_server_accepts_systemctl_aligned_active_columns() -> None:
@@ -575,16 +602,17 @@ def test_phase3_model_server_service_manifest_requires_declared_endpoint() -> No
     assert report["runtime_ready"] is False
     assert report["manifest_service_ready_count"] == 2
     assert "manifest_model_endpoints_not_ready" in warning_codes
-    assert [
-        item["slot"] for item in report["manifest_services"] if not item["endpoint_ready"]
-    ] == ["llm_decision_maker"]
+    assert [item["slot"] for item in report["manifest_services"] if not item["endpoint_ready"]] == [
+        "llm_decision_maker"
+    ]
 
 
 def test_phase3_model_server_blocks_cuda_and_missing_required_slot() -> None:
     snapshot = _artifact_ready_snapshot()
     snapshot["validation_manifest"]["data"]["torch"]["cuda_available"] = False
     snapshot["validation_manifest"]["data"]["models"] = [
-        row for row in snapshot["validation_manifest"]["data"]["models"]
+        row
+        for row in snapshot["validation_manifest"]["data"]["models"]
         if row["slot"] != "llm_high_risk_review"
     ]
 

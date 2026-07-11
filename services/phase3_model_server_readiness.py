@@ -59,7 +59,7 @@ OLD_TAKEOVER_REQUIRED_ARTIFACT_SLOTS = (
 OLD_TAKEOVER_REQUIRED_SERVICES = (
     "qwen3-14b-trade.service",
     "deepseek-r1-14b-risk.service",
-    "bb-finquant-expert-alias.service",
+    "bb-finquant-expert-gateway.service",
     OLD_TAKEOVER_QUANT_API_SERVICE,
 )
 
@@ -70,9 +70,7 @@ OLD_TAKEOVER_REQUIRED_ENDPOINTS = (
     (OLD_TAKEOVER_QUANT_API_PORT, ""),
 )
 
-LLM_ROLE_DIVERSITY_REQUIRED_PAIRS = (
-    ("llm_decision_maker", "llm_expert_pool"),
-)
+LLM_ROLE_DIVERSITY_REQUIRED_PAIRS = (("llm_decision_maker", "llm_expert_pool"),)
 
 LLM_POLICY_CANDIDATE_SLOT_MAP = {
     "decision_maker": "llm_decision_maker",
@@ -240,6 +238,43 @@ def _slot_specialization_evidence(row: dict[str, Any]) -> dict[str, str]:
     return evidence
 
 
+def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool:
+    required_sha256 = (
+        "adapter_sha256",
+        "manifest_sha256",
+        "dataset_sha256",
+        "dataset_lineage_sha256",
+        "dataset_manifest_sha256",
+        "source_script_sha256",
+        "trainer_code_sha256",
+        "base_model_config_sha256",
+        "inference_base_model_config_sha256",
+    )
+    if evidence.get("verification_status") != "verified":
+        return False
+    if evidence.get("identity_verified", "").lower() != "true":
+        return False
+    if evidence.get("legacy_read_only", "").lower() == "true":
+        return False
+    required_text = (
+        "adapter_version",
+        "adapter_path",
+        "specialization_manifest",
+        "specialization_id",
+        "dataset_version",
+        "source_code_version",
+        "base_model_repo",
+        "trained_at",
+    )
+    if any(not evidence.get(key) for key in required_text):
+        return False
+    return all(
+        len(evidence.get(key, "")) == 64
+        and all(character in "0123456789abcdef" for character in evidence[key].lower())
+        for key in required_sha256
+    )
+
+
 def _llm_role_diversity_blockers(
     reports_by_slot: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -285,7 +320,7 @@ def _finquant_specialization_warnings(
     if not expert:
         return []
     evidence = _slot_specialization_evidence(expert)
-    if evidence:
+    if _finquant_specialization_evidence_verified(evidence):
         return []
     return [
         _warning(
@@ -535,7 +570,9 @@ def _looks_like_old_one_gpu_takeover(
     signals = 0
     if artifact_signal:
         signals += 1
-    if _service_fragment_active("qwen3-14b-trade.service", active_services) or _endpoint_model_ready(
+    if _service_fragment_active(
+        "qwen3-14b-trade.service", active_services
+    ) or _endpoint_model_ready(
         8000,
         "qwen3-14b-trade",
         active_endpoints,
@@ -546,12 +583,15 @@ def _looks_like_old_one_gpu_takeover(
         active_services,
     ) or _endpoint_model_ready(8002, "deepseek-r1-14b-risk", active_endpoints):
         signals += 1
-    if _service_fragment_active(
-        "bb-finquant-expert-alias.service",
-        active_services,
-    ) or _endpoint_model_ready(8003, FINQUANT_EXPERT_SERVED_MODEL_NAME, active_endpoints):
+    if (
+        _service_fragment_active("bb-finquant-expert-gateway.service", active_services)
+        or _service_fragment_active("bb-finquant-expert-alias.service", active_services)
+        or _endpoint_model_ready(8003, FINQUANT_EXPERT_SERVED_MODEL_NAME, active_endpoints)
+    ):
         signals += 2
-    if _service_fragment_active(OLD_TAKEOVER_QUANT_API_SERVICE, active_services) or _endpoint_port_ready(
+    if _service_fragment_active(
+        OLD_TAKEOVER_QUANT_API_SERVICE, active_services
+    ) or _endpoint_port_ready(
         OLD_TAKEOVER_QUANT_API_PORT,
         active_endpoints,
     ):
@@ -579,9 +619,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
     active_endpoints = _active_endpoints(snapshot)
     gpu_rows = _gpu_rows(snapshot)
     gpu_processes = [
-        str(item).strip()
-        for item in _safe_list(snapshot.get("gpu_processes"))
-        if str(item).strip()
+        str(item).strip() for item in _safe_list(snapshot.get("gpu_processes")) if str(item).strip()
     ]
     validation_gpu_count = int(torch_info.get("device_count") or 0)
     observed_gpu_count = max(len(gpu_rows), validation_gpu_count)
@@ -595,9 +633,12 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         OLD_TAKEOVER_EXPECTED_GPU_COUNT if old_takeover_contract else EXPECTED_GPU_COUNT
     )
     required_artifact_slots = (
-        OLD_TAKEOVER_REQUIRED_ARTIFACT_SLOTS
+        OLD_TAKEOVER_REQUIRED_ARTIFACT_SLOTS if old_takeover_contract else REQUIRED_ARTIFACT_SLOTS
+    )
+    reported_artifact_slots = (
+        tuple(dict.fromkeys((*required_artifact_slots, FINQUANT_EXPERT_SLOT)))
         if old_takeover_contract
-        else REQUIRED_ARTIFACT_SLOTS
+        else required_artifact_slots
     )
     old_takeover_runtime = (
         _old_takeover_runtime_checks(
@@ -702,10 +743,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         blockers.append(
             _blocker(
                 "gpu_count_below_phase3_plan",
-                (
-                    "Model-server GPU count is below the active deployment "
-                    "contract requirement."
-                ),
+                ("Model-server GPU count is below the active deployment " "contract requirement."),
                 evidence={
                     "deployment_contract": (
                         OLD_TAKEOVER_CONTRACT_ID
@@ -718,10 +756,13 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
             )
         )
 
-    for slot in required_artifact_slots:
+    for slot in reported_artifact_slots:
+        required_slot = slot in required_artifact_slots
         download_row = download_by_slot.get(slot, {})
         validation_row = validation_by_slot.get(slot, {})
-        validation_slot_missing = bool(validation_present and not validation_row)
+        validation_slot_missing = bool(
+            required_slot and validation_present and not validation_row
+        )
         ok = _slot_ok(download_row, validation_row) and not validation_slot_missing
         live_routing_enabled = bool(
             validation_row.get("live_routing_enabled", download_row.get("live_routing_enabled"))
@@ -752,13 +793,18 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
             "base_model_carrier": validation_row.get("base_model_carrier")
             or download_row.get("base_model_carrier")
             or "",
-            "required_missing": _required_missing(validation_row) or _required_missing(download_row),
+            "required_missing": _required_missing(validation_row)
+            or _required_missing(download_row),
             "live_routing_enabled": live_routing_enabled,
             "specialization_evidence": _slot_specialization_evidence(validation_row)
             or _slot_specialization_evidence(download_row),
         }
+        if slot == FINQUANT_EXPERT_SLOT:
+            report["specialization_evidence_verified"] = _finquant_specialization_evidence_verified(
+                _safe_dict(report["specialization_evidence"])
+            )
         slot_reports.append(report)
-        if not ok:
+        if required_slot and not ok:
             blockers.append(
                 _blocker(
                     "required_model_slot_not_ready",
@@ -825,7 +871,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
                     "old_takeover_service_manifest_not_required",
                     (
                         "Old one-GPU takeover uses live legacy Qwen/DeepSeek, "
-                        "BB-FinQuant alias, and Phase 3 quant API service checks "
+                        "BB-FinQuant verified adapter gateway and Phase 3 quant API checks "
                         "instead of the full new-server service manifest."
                     ),
                     evidence={
@@ -960,7 +1006,9 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         old_takeover_runtime_ready if old_takeover_contract else full_runtime_ready
     )
     service_go_live_blocked = bool(blockers or not runtime_ready)
-    status = "blocked" if blockers else ("ready" if runtime_ready else "artifact_ready_service_pending")
+    status = (
+        "blocked" if blockers else ("ready" if runtime_ready else "artifact_ready_service_pending")
+    )
 
     return {
         "status": status,
@@ -1007,7 +1055,11 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "manifest_services": manifest_service_reports,
         "required_slots": slot_reports,
         "required_slot_count": len(required_artifact_slots),
-        "required_slot_ready_count": sum(1 for item in slot_reports if item.get("ok")),
+        "required_slot_ready_count": sum(
+            1
+            for item in slot_reports
+            if item.get("slot") in required_artifact_slots and item.get("ok")
+        ),
         "gpu_count": observed_gpu_count,
         "gpu_rows": gpu_rows[:16],
         "gpu_process_count": len(gpu_processes),
@@ -1028,8 +1080,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
 def render_phase3_model_server_probe() -> str:
     """Render the read-only remote probe executed on the model server."""
 
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         import json
         import os
         import subprocess
@@ -1195,8 +1246,7 @@ def render_phase3_model_server_probe() -> str:
             "port_probes": [port_probe(port) for port in PROBED_RUNTIME_PORTS],
         }}
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        """
-    ).strip()
+        """).strip()
 
 
 def _remote_command() -> str:
@@ -1309,9 +1359,11 @@ class Phase3ModelServerReadinessAuditService:
         return report
 
     def _unavailable_report(self, exc: Exception, *, started_at: datetime) -> dict[str, Any]:
-        status = "model_server_not_configured" if isinstance(
-            exc, ModelServerConfigNotConfigured
-        ) else "model_server_probe_unavailable"
+        status = (
+            "model_server_not_configured"
+            if isinstance(exc, ModelServerConfigNotConfigured)
+            else "model_server_probe_unavailable"
+        )
         if isinstance(exc, ModelServerConfigError):
             status = "model_server_config_error"
         blocker = _blocker(

@@ -29,7 +29,7 @@ OLD_TAKEOVER_CONTRACT_ID = "old_one_gpu_timesfm_takeover"
 OLD_TAKEOVER_REQUIRED_SERVICES = (
     "qwen3-14b-trade.service",
     "deepseek-r1-14b-risk.service",
-    "bb-finquant-expert-alias.service",
+    "bb-finquant-expert-gateway.service",
     "bb-phase3-quant-api.service",
 )
 OLD_TAKEOVER_REQUIRED_ENDPOINTS = (
@@ -397,7 +397,9 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     phase3_root = str(marker_data.get("phase3_root") or PHASE3_ROOT).strip()
 
     legacy_paths = [
-        _safe_dict(item) for item in _safe_list(snapshot.get("legacy_data_paths")) if _path_hit(item)
+        _safe_dict(item)
+        for item in _safe_list(snapshot.get("legacy_data_paths"))
+        if _path_hit(item)
     ]
     if not legacy_paths:
         legacy_paths = [
@@ -594,7 +596,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                 "old_takeover_legacy_14b_processes_allowed",
                 (
                     "Old-server takeover intentionally reuses existing 14B Qwen/"
-                    "DeepSeek vLLM services and the BB-FinQuant alias; these "
+                    "DeepSeek vLLM services and the BB-FinQuant adapter gateway; these "
                     "remain isolated from the full new-server migration contract."
                 ),
                 evidence=old_takeover_allowed_process_evidence[:10],
@@ -714,9 +716,9 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         },
         "migration_manifest": {
             "present": manifest_present,
-            "whitelist_only": bool(manifest_data.get("whitelist_only", True))
-            if manifest_present
-            else False,
+            "whitelist_only": (
+                bool(manifest_data.get("whitelist_only", True)) if manifest_present else False
+            ),
             "item_count": len(manifest_items),
             "disallowed_categories": disallowed_categories,
             "disallowed_sources": disallowed_sources,
@@ -749,8 +751,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 def render_phase3_server_probe() -> str:
     """Render the read-only remote probe executed on the model server."""
 
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         import json
         import os
         import subprocess
@@ -955,8 +956,7 @@ def render_phase3_server_probe() -> str:
             ],
         }}
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        """
-    ).strip()
+        """).strip()
 
 
 def _remote_command() -> str:
@@ -1057,9 +1057,11 @@ class Phase3ServerMigrationAuditService:
         return report
 
     def _unavailable_report(self, exc: Exception, *, started_at: datetime) -> dict[str, Any]:
-        status = "model_server_not_configured" if isinstance(
-            exc, ModelServerConfigNotConfigured
-        ) else "model_server_probe_unavailable"
+        status = (
+            "model_server_not_configured"
+            if isinstance(exc, ModelServerConfigNotConfigured)
+            else "model_server_probe_unavailable"
+        )
         if isinstance(exc, ModelServerConfigError):
             status = "model_server_config_error"
         blocker = _blocker(

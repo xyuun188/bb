@@ -27,11 +27,51 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _finquant_specialization_verified(
+    slot: dict[str, Any],
+    evidence: dict[str, Any],
+) -> bool:
+    if slot.get("specialization_evidence_verified") is False:
+        return False
+    if str(evidence.get("verification_status") or "") != "verified":
+        return False
+    if str(evidence.get("identity_verified") or "").lower() != "true":
+        return False
+    if str(evidence.get("legacy_read_only") or "").lower() == "true":
+        return False
+    required_text = (
+        "adapter_version",
+        "adapter_path",
+        "specialization_manifest",
+        "specialization_id",
+        "dataset_version",
+        "source_code_version",
+        "base_model_repo",
+        "trained_at",
+    )
+    if any(not str(evidence.get(key) or "").strip() for key in required_text):
+        return False
+    required_hashes = (
+        "adapter_sha256",
+        "manifest_sha256",
+        "dataset_sha256",
+        "dataset_lineage_sha256",
+        "dataset_manifest_sha256",
+        "source_script_sha256",
+        "trainer_code_sha256",
+        "base_model_config_sha256",
+        "inference_base_model_config_sha256",
+    )
+    for key in required_hashes:
+        value = str(evidence.get(key) or "").lower()
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            return False
+    return True
+
+
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
-    live = bool(
-        status.get("allow_live_position_influence") or status.get("influence_enabled")
-    )
+    live = bool(status.get("allow_live_position_influence") or status.get("influence_enabled"))
     readiness = str(status.get("readiness_state") or status.get("status") or "unknown")
     if live:
         lifecycle = "live"
@@ -198,11 +238,11 @@ def _specialist_rows(
         lifecycle = (
             "canary"
             if promotion_ready
-            else "shadow_evaluating"
-            if inference_count > 0
-            else "inference_only"
-            if runtime_available
-            else "service_unavailable"
+            else (
+                "shadow_evaluating"
+                if inference_count > 0
+                else "inference_only" if runtime_available else "service_unavailable"
+            )
         )
         rows.append(
             {
@@ -243,7 +283,9 @@ def _llm_rows(model_server_report: dict[str, Any]) -> list[dict[str, Any]]:
     slot_reports = {
         str(row.get("slot") or ""): row
         for row in _safe_list(
-            model_server_report.get("required_slots") or model_server_report.get("slot_reports")
+            model_server_report.get("required_slots")
+            or model_server_report.get("slot_reports")
+            or model_server_report.get("identity_slots")
         )
         if isinstance(row, dict)
     }
@@ -252,13 +294,11 @@ def _llm_rows(model_server_report: dict[str, Any]) -> list[dict[str, Any]]:
     finquant_runtime = bool(
         _safe_dict(endpoint_by_model.get("BB-FinQuant-Expert-14B")).get("ready")
     )
-    finquant_specialized = bool(specialization)
+    finquant_specialized = _finquant_specialization_verified(finquant_slot, specialization)
     finquant = {
         "model_id": "bb_finquant_expert_14b",
         "display_name": "BB-FinQuant-Expert-14B",
-        "model_family": str(
-            finquant_slot.get("base_model_carrier") or "Qwen3-14B base carrier"
-        ),
+        "model_family": str(finquant_slot.get("base_model_carrier") or "Qwen3-14B base carrier"),
         "task": "quant_expert_reasoning",
         "trainable": True,
         "training_owner": "bb_finquant_qlora_pipeline",
