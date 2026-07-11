@@ -14,13 +14,39 @@ from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncServi
 
 
 class _FakeCcxt:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        history_error: Exception | None = None,
+    ) -> None:
         self.rows = rows
+        self.history_error = history_error
         self.history_calls: list[dict[str, Any]] = []
+        self.instrument_calls: list[dict[str, Any]] = []
 
     async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         self.history_calls.append(dict(params))
+        if self.history_error:
+            raise self.history_error
         return {"data": list(self.rows)}
+
+    async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.instrument_calls.append(dict(params))
+        return {
+            "data": [
+                {
+                    "instId": row["instId"],
+                    "instType": "SWAP",
+                    "ctVal": "0.1",
+                    "ctMult": "1",
+                    "lotSz": "1",
+                    "minSz": "1",
+                    "settleCcy": "USDT",
+                }
+                for row in self.rows
+            ]
+        }
 
 
 class _FakeExecutor:
@@ -112,6 +138,7 @@ async def test_position_history_mirror_sync_persists_account_rows_without_local_
         assert report["inserted_count"] == 2
         assert report["updated_count"] == 0
         assert ccxt.history_calls
+        assert ccxt.instrument_calls == [{"instType": "SWAP"}]
         assert ccxt.history_calls[0]["instType"] == "SWAP"
         assert "instId" not in ccxt.history_calls[0]
         assert "posId" not in ccxt.history_calls[0]
@@ -126,6 +153,17 @@ async def test_position_history_mirror_sync_persists_account_rows_without_local_
         assert records[0].match_status == "okx_account_position_history"
         assert records[1].realized_pnl == pytest.approx(4.2)
         assert records[1].funding_fee == pytest.approx(-0.03)
+        assert records[1].raw_row["_bb_contract_spec"] == {
+            "instId": "ADA-USDT-SWAP",
+            "instType": "SWAP",
+            "ctVal": "0.1",
+            "ctMult": "1",
+            "ctValCcy": "",
+            "lotSz": "1",
+            "minSz": "1",
+            "settleCcy": "USDT",
+            "source": "okx_public_instruments",
+        }
     finally:
         await close_db()
 
@@ -177,5 +215,54 @@ async def test_position_history_mirror_sync_updates_existing_rows(
             records = list(result.scalars().all())
         assert len(records) == 1
         assert records[0].realized_pnl == pytest.approx(2.3)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_contract_specs_backfill_even_when_private_history_temporarily_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'history-spec-fallback.db').as_posix()}",
+    )
+    await init_db()
+    now = datetime.now(UTC)
+    async with get_session_ctx() as session:
+        session.add(
+            OkxPositionHistory(
+                mode="paper",
+                row_identity="paper|ADA-USDT-SWAP|ada-pos-2|long|2",
+                inst_id="ADA-USDT-SWAP",
+                symbol="ADA/USDT",
+                pos_id="ada-pos-2",
+                pos_side="long",
+                side="long",
+                close_status="full",
+                raw_row={"instId": "ADA-USDT-SWAP", "posId": "ada-pos-2"},
+                sync_status="synced",
+                synced_at=now,
+            )
+        )
+    ccxt = _FakeCcxt(
+        [{"instId": "ADA-USDT-SWAP"}],
+        history_error=RuntimeError("temporary private history failure"),
+    )
+    try:
+        report = await OkxPositionHistoryMirrorSyncService(
+            mode="paper",
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert report["status"] == "degraded"
+        assert ccxt.instrument_calls == [{"instType": "SWAP"}]
+        async with get_session_ctx() as session:
+            record = (await session.execute(select(OkxPositionHistory))).scalars().one()
+        assert record.raw_row["_bb_contract_spec"]["ctVal"] == "0.1"
+        assert record.raw_row["_bb_contract_spec"]["ctMult"] == "1"
     finally:
         await close_db()

@@ -4,7 +4,6 @@ import json
 import sys
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -18,7 +17,6 @@ from scripts.train_local_ai_tools_models import (
     _compact_local_ai_tools_features,
     _merge_trade_samples,
     _normalize_base_url,
-    _position_settlement_metadata,
     _post_training_payload,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
@@ -147,12 +145,21 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
             "hold_minutes": 3.0,
         },
         {"source": "trade_reflection", "id": 12, "position_id": 8, "realized_pnl": 2.4},
-    ]
-    closed_position_samples = [
         {
-            "source": "closed_position",
+            "source": "trade_reflection",
+            "id": 13,
+            "position_id": 9,
+            "realized_pnl": 99.0,
+            "trade_fact_repair_source": "okx_position_link_repair",
+        },
+    ]
+    authoritative_samples = [
+        {
+            "source": "okx_position_history",
             "id": 7,
+            "lifecycle_key": "paper|AAA-USDT-SWAP|pos-7|long|1",
             "position_id": 7,
+            "position_ids": [7],
             "realized_pnl": -1.2,
             "raw_llm_response": {
                 "profit_first_trade_plan": {
@@ -161,46 +168,26 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
                 }
             },
         },
-        {"source": "closed_position", "id": 9, "position_id": 9, "realized_pnl": 0.4},
+        {
+            "source": "okx_position_history",
+            "id": 9,
+            "lifecycle_key": "paper|BBB-USDT-SWAP|pos-9|long|2",
+            "position_id": 9,
+            "position_ids": [9],
+            "realized_pnl": 0.4,
+        },
     ]
 
-    merged = _merge_trade_samples(reflection_samples, closed_position_samples)
+    merged = _merge_trade_samples(reflection_samples, authoritative_samples)
 
-    assert [item["source"] for item in merged] == ["closed_position", "trade_reflection", "closed_position"]
-    assert [item["position_id"] for item in merged] == [7, 8, 9]
+    assert [item["source"] for item in merged] == [
+        "okx_position_history",
+        "okx_position_history",
+    ]
+    assert [item["position_id"] for item in merged] == [7, 9]
     assert merged[0]["hold_minutes"] == 3.0
     assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
-
-
-def test_closed_position_training_sample_preserves_settlement_truth_sources() -> None:
-    position = SimpleNamespace(
-        settlement_source="okx_position_history_settlement",
-        settlement_status="reconciled",
-        close_fill_pnl=1.2,
-        entry_fee=0.1,
-        close_fee=0.2,
-        funding_fee=-0.03,
-        settlement_raw={
-            "fee_source": "okx_positions_history.fee",
-            "funding_fee_source": "okx_positions_history.fundingFee",
-            "official_realized_pnl": 0.87,
-            "formula": "realizedPnl = closeFillPnl - fee - fundingFee",
-        },
-    )
-
-    metadata = _position_settlement_metadata(position)
-
-    assert metadata["pnl_source"] == "okx_position_history_settlement"
-    assert metadata["settlement_status"] == "reconciled"
-    assert metadata["settlement_source"] == "okx_position_history_settlement"
-    assert metadata["close_fill_pnl"] == 1.2
-    assert metadata["entry_fee"] == 0.1
-    assert metadata["close_fee"] == 0.2
-    assert metadata["funding_fee"] == -0.03
-    assert metadata["fee_source"] == "okx_positions_history.fee"
-    assert metadata["funding_fee_source"] == "okx_positions_history.fundingFee"
-    assert metadata["official_realized_pnl"] == 0.87
-    assert metadata["settlement_formula"] == "realizedPnl = closeFillPnl - fee - fundingFee"
+    assert merged[1]["realized_pnl"] == 0.4
 
 
 @pytest.mark.asyncio
@@ -509,7 +496,7 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     )
     monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
     monkeypatch.setattr(train_script, "_load_trade_reflection_samples", empty_samples)
-    monkeypatch.setattr(train_script, "_load_closed_position_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_load_authoritative_trade_samples", empty_samples)
     monkeypatch.setattr(train_script, "_load_sequence_samples", empty_samples)
     monkeypatch.setattr(train_script, "_load_text_sentiment_samples", empty_samples)
     monkeypatch.setattr(train_script, "_completed_shadow_sample_count", completed_shadow_count)

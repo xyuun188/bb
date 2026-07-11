@@ -13,8 +13,8 @@ from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-07-03.v4"
-PROFIT_LEARNING_VERSION = "profit-first-training-v1"
+DATA_QUALITY_VERSION = "2026-07-11.v5"
+PROFIT_LEARNING_VERSION = "profit-first-training-v2"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 HIGH_CONTAMINATION_EXCLUDED_RATIO = 0.05
 HIGH_CONTAMINATION_BLOCKED_REASON_RATIO = 0.02
@@ -423,6 +423,18 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(0.0, guard_reasons, exclude=True)
 
     source = _safe_str(sample.get("source")).lower()
+    if source == "okx_position_history":
+        evidence_gaps = [
+            _safe_str(reason)
+            for reason in sample.get("training_evidence_gaps") or []
+            if _safe_str(reason)
+        ]
+        if evidence_gaps:
+            return _final_assessment(
+                0.0,
+                [f"incomplete_okx_lifecycle:{reason}" for reason in evidence_gaps],
+                exclude=True,
+            )
     model_name = _safe_str(sample.get("model_name")).lower()
     if source in set(_QUALITY_PARAMS.manual_trade_sources) or "manual" in model_name:
         return _final_assessment(0.0, ["manual_or_test_trade"], exclude=True)
@@ -465,7 +477,7 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         fee_source = sample.get("fee")
     if fee_source is None:
         return _final_assessment(0.0, ["missing_fee_estimate"], exclude=True)
-    if source == "closed_position":
+    if source in {"closed_position", "okx_position_history"}:
         pnl_source = _trade_pnl_source(sample)
         if not _trade_pnl_source_trusted(pnl_source):
             return _final_assessment(
@@ -518,7 +530,13 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         if attribution == "okx_slippage_or_execution":
             return _final_assessment(0.0, ["execution_anomaly_trade"], exclude=True)
         if attribution == "unknown_requires_review":
-            return _final_assessment(0.0, ["unknown_losing_exit_attribution"], exclude=True)
+            if source == "okx_position_history":
+                score -= _QUALITY_PARAMS.unknown_outcome_penalty
+                reasons.append("unknown_losing_exit_attribution_downweighted")
+            else:
+                return _final_assessment(
+                    0.0, ["unknown_losing_exit_attribution"], exclude=True
+                )
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -632,9 +650,10 @@ def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
         _trade_sizing(sample).get("final_notional_usdt"),
         _trade_sizing(sample).get("target_min_notional_usdt"),
     )
+    quantity_is_contracts = _safe_str(sample.get("quantity_unit")).lower() == "contracts"
     derived = (
         abs(quantity * entry_price)
-        if quantity is not None and entry_price is not None
+        if not quantity_is_contracts and quantity is not None and entry_price is not None
         else None
     )
     # Historical rows can contain contract-count placeholders in notional_usdt.
@@ -646,6 +665,17 @@ def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
         if value is not None and math.isfinite(value) and abs(value) > 0
     ]
     return max(candidates) if candidates else None
+
+
+def _trade_return_after_cost_pct(
+    sample: dict[str, Any], *, pnl: float, notional: float | None
+) -> float | None:
+    authoritative = _safe_float(sample.get("authoritative_pnl_ratio_pct"), None)
+    if authoritative is not None:
+        return authoritative
+    if notional is None or notional <= 0:
+        return None
+    return pnl / max(notional, 1e-9) * 100.0
 
 
 def _trade_actual_leverage(sample: dict[str, Any]) -> float | None:
@@ -801,13 +831,19 @@ def _trade_profit_learning_labels(
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     fee_dominated = bool(fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple)
     notional = _trade_notional_usdt(sample)
-    return_after_cost_pct = (
-        None if notional is None or notional <= 0 else pnl / max(notional, 1e-9) * 100.0
+    return_after_cost_pct = _trade_return_after_cost_pct(
+        sample,
+        pnl=pnl,
+        notional=notional,
     )
     return {
         "version": PROFIT_LEARNING_VERSION,
         "sample_kind": "trade",
         "training_supervision_ready": bool(
+            not assessment.exclude_from_training
+            and attribution != "okx_slippage_or_execution"
+        ),
+        "exit_attribution_supervision_ready": bool(
             not assessment.exclude_from_training
             and attribution not in {"okx_slippage_or_execution", "unknown_requires_review"}
         ),
@@ -1006,6 +1042,79 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             key: [{"value": value, "count": count} for value, count in counter.most_common(20)]
             for key, counter in counters.items()
         },
+    }
+
+
+def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    ready_count = 0
+    pnl_total = 0.0
+    return_total = 0.0
+    return_count = 0
+    positive_pnl_count = 0
+    negative_pnl_count = 0
+    for sample in samples:
+        labels = _safe_dict(sample.get("profit_learning_labels"))
+        if not labels.get("training_supervision_ready"):
+            continue
+        ready_count += 1
+        pnl = _safe_float(labels.get("realized_net_pnl_usdt"), None)
+        return_pct = _safe_float(labels.get("return_after_cost_pct"), None)
+        sample_key = _safe_str(sample.get("lifecycle_key") or sample.get("position_id"))
+        if pnl is None:
+            errors.append({"sample_key": sample_key, "reason": "missing_realized_net_pnl"})
+            continue
+        pnl_total += pnl
+        positive_pnl_count += int(pnl > 0)
+        negative_pnl_count += int(pnl < 0)
+        if return_pct is None:
+            errors.append({"sample_key": sample_key, "reason": "missing_return_after_cost"})
+            continue
+        return_total += return_pct
+        return_count += 1
+        if (pnl > 0 and return_pct <= 0) or (pnl < 0 and return_pct >= 0):
+            errors.append(
+                {
+                    "sample_key": sample_key,
+                    "reason": "pnl_return_sign_mismatch",
+                    "pnl": round(pnl, 8),
+                    "return_after_cost_pct": round(return_pct, 8),
+                }
+            )
+        components = _safe_float(sample.get("settlement_components_total"), None)
+        if components is not None and abs(pnl - components) > max(1e-6, abs(pnl) * 1e-5):
+            errors.append(
+                {
+                    "sample_key": sample_key,
+                    "reason": "settlement_component_sum_mismatch",
+                    "pnl": round(pnl, 8),
+                    "component_sum": round(components, 8),
+                }
+            )
+    avg_return = return_total / max(return_count, 1)
+    if (
+        pnl_total > 0
+        and positive_pnl_count > negative_pnl_count
+        and return_count > 0
+        and avg_return <= 0
+    ):
+        errors.append(
+            {
+                "sample_key": "aggregate",
+                "reason": "positive_net_pnl_but_negative_average_return",
+                "net_pnl": round(pnl_total, 8),
+                "avg_return_after_cost_pct": round(avg_return, 8),
+            }
+        )
+    return {
+        "status": "blocked" if errors else "consistent",
+        "promotion_blocked": bool(errors),
+        "supervision_ready_count": ready_count,
+        "checked_return_count": return_count,
+        "net_realized_pnl_usdt": round(pnl_total, 8),
+        "avg_return_after_cost_pct": round(avg_return, 8),
+        "error_count": len(errors),
+        "errors": errors[:100],
     }
 
 
@@ -1522,6 +1631,9 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
             kind: _profit_learning_report(samples) for kind, samples in samples_by_kind.items()
         },
         "specialist_shadow_models": _shadow_model_report(samples_by_kind.get("shadow", [])),
+        "training_label_consistency": _training_label_consistency(
+            samples_by_kind.get("trade", [])
+        ),
         "totals": {
             "total": total_count,
             "included": int(totals.get("included", 0)),

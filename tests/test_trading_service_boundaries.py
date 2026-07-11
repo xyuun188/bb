@@ -1740,7 +1740,7 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
     )
     monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
     monkeypatch.setattr(train_script, "_load_trade_reflection_samples", load_trade_reflections)
-    monkeypatch.setattr(train_script, "_load_closed_position_samples", load_empty)
+    monkeypatch.setattr(train_script, "_load_authoritative_trade_samples", load_empty)
     monkeypatch.setattr(train_script, "_load_sequence_samples", load_empty)
     monkeypatch.setattr(train_script, "_load_text_sentiment_samples", load_empty)
     monkeypatch.setattr(train_script, "_merge_trade_samples", lambda a, b: [*a, *b])

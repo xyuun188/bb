@@ -406,6 +406,10 @@ class OKXExecutor(AbstractExecutor):
                     attempt=attempt,
                     timeout=OKX_REST_CALL_TIMEOUT,
                 )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
                 raise ExchangeAPIError(
                     f"OKX REST call timed out after {OKX_REST_CALL_TIMEOUT:.0f}s: {method_name}"
                 ) from e
@@ -424,6 +428,16 @@ class OKXExecutor(AbstractExecutor):
                     continue
                 if self._is_rate_limit_error(message) and attempt < MAX_RETRIES - 1:
                     logger.warning("OKX SDK rate limited", method=method_name, attempt=attempt)
+                    await asyncio.sleep(RETRY_DELAY * (2**attempt))
+                    last_error = e
+                    continue
+                if self._is_transient_system_error(message) and attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        "OKX SDK temporary system error; retrying",
+                        method=method_name,
+                        attempt=attempt,
+                        error=message,
+                    )
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
@@ -486,6 +500,11 @@ class OKXExecutor(AbstractExecutor):
                 "remote protocol error",
             )
         )
+
+    @staticmethod
+    def _is_transient_system_error(message: Any) -> bool:
+        text = str(message or "").lower()
+        return "50026" in text or "system error. try again later" in text
 
     async def place_order(
         self,

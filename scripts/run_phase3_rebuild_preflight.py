@@ -31,8 +31,8 @@ from core.safe_output import safe_error_text
 from services.artifact_retirement_audit import ArtifactRetirementAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.model_promotion_policy import (
-    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
+    build_profit_first_promotion_report,
     load_latest_paper_observation_report,
 )
 from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
@@ -161,7 +161,7 @@ async def _collect_training_payload(
     from scripts.train_local_ai_tools_models import (
         _completed_shadow_sample_count,
         _completed_trade_sample_count,
-        _load_closed_position_samples,
+        _load_authoritative_trade_samples,
         _load_sequence_samples,
         _load_shadow_samples,
         _load_text_sentiment_samples,
@@ -171,8 +171,8 @@ async def _collect_training_payload(
 
     shadow_samples = await _load_shadow_samples(shadow_limit)
     trade_reflection_samples = await _load_trade_reflection_samples(trade_limit)
-    closed_position_samples = await _load_closed_position_samples(trade_limit)
-    trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
+    authoritative_samples = await _load_authoritative_trade_samples(trade_limit)
+    trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
     sequence_samples = await _load_sequence_samples(sequence_limit)
     text_sentiment_samples = await _load_text_sentiment_samples(text_limit)
     payload = annotate_training_payload(

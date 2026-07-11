@@ -586,6 +586,21 @@ class OkxNativeFactsClient:
         symbols: Iterable[Any] | None = None,
         inst_ids: Iterable[Any] | None = None,
     ) -> dict[str, float]:
+        specs = await self.fetch_contract_specs(symbols=symbols, inst_ids=inst_ids)
+        return {
+            inst_id: _safe_float(spec.get("ctVal"), 0.0)
+            for inst_id, spec in specs.items()
+            if _safe_float(spec.get("ctVal"), 0.0) > 0
+        }
+
+    async def fetch_contract_specs(
+        self,
+        *,
+        symbols: Iterable[Any] | None = None,
+        inst_ids: Iterable[Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return the OKX instrument fields needed for SWAP notional accounting."""
+
         ccxt = await self.executor._get_ccxt()
         fetch_instruments = getattr(ccxt, "publicGetPublicInstruments", None)
         if not callable(fetch_instruments):
@@ -593,7 +608,7 @@ class OkxNativeFactsClient:
 
         target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
         response = await self.executor._with_retry(fetch_instruments, {"instType": "SWAP"})
-        sizes: dict[str, float] = {}
+        specs: dict[str, dict[str, Any]] = {}
         for row in _response_rows(response):
             inst_id = str(row.get("instId") or "").strip().upper()
             if not inst_id or not inst_id.endswith("-USDT-SWAP"):
@@ -602,8 +617,18 @@ class OkxNativeFactsClient:
                 continue
             contract_size = _safe_float(row.get("ctVal"), 0.0)
             if contract_size > 0:
-                sizes[inst_id] = contract_size
-        return sizes
+                specs[inst_id] = {
+                    "instId": inst_id,
+                    "instType": str(row.get("instType") or "SWAP"),
+                    "ctVal": str(row.get("ctVal") or ""),
+                    "ctMult": str(row.get("ctMult") or "1"),
+                    "ctValCcy": str(row.get("ctValCcy") or ""),
+                    "lotSz": str(row.get("lotSz") or ""),
+                    "minSz": str(row.get("minSz") or ""),
+                    "settleCcy": str(row.get("settleCcy") or ""),
+                    "source": "okx_public_instruments",
+                }
+        return specs
 
     async def fetch_order_history_contexts(
         self,

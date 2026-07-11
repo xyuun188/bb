@@ -160,6 +160,25 @@ class _TimestampExpiredOnceCcxt:
         return {"data": []}
 
 
+class _SystemErrorOnceCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.position_history_calls = 0
+
+    async def privateGetAccountPositionsHistory(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.position_history_calls += 1
+        if self.position_history_calls == 1:
+            raise ExchangeAPIError(
+                "OKX API error [50026]: System error. Try again later.",
+                code="50026",
+            )
+        return {"data": []}
+
+
 def _native_position_row(
     inst_id: str,
     *,
@@ -1038,6 +1057,23 @@ async def test_okx_with_retry_resyncs_time_difference_after_timestamp_expired() 
     assert result == {"data": []}
     assert exchange.position_calls == 2
     assert exchange.load_time_difference_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_with_retry_recovers_from_temporary_50026(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _SystemErrorOnceCcxt()
+    executor = _executor(exchange)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+
+    result = await executor._with_retry(
+        exchange.privateGetAccountPositionsHistory,
+        {"instType": "SWAP"},
+    )
+
+    assert result == {"data": []}
+    assert exchange.position_history_calls == 2
 
 
 def _exit_decision() -> DecisionOutput:

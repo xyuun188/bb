@@ -104,23 +104,54 @@ class OkxPositionHistoryMirrorSyncService:
         since = started_at - timedelta(hours=self.lookback_hours)
         executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
         rows: list[dict[str, Any]] = []
+        contract_specs: dict[str, dict[str, Any]] = {}
+        contract_spec_error = ""
         fatal_error: str | None = None
         try:
             await asyncio.wait_for(executor.initialize(), timeout=min(self.timeout_seconds, 3.0))
             native_facts = OkxNativeFactsClient(executor)
-            rows = await asyncio.wait_for(
-                native_facts.fetch_position_history_rows(
-                    inst_ids=None,
-                    pos_ids=None,
-                    since=since,
-                    limit=self.limit,
-                    max_pages=self.max_pages,
-                    strict=True,
-                ),
-                timeout=self.timeout_seconds,
-            )
+            try:
+                rows = await asyncio.wait_for(
+                    native_facts.fetch_position_history_rows(
+                        inst_ids=None,
+                        pos_ids=None,
+                        since=since,
+                        limit=self.limit,
+                        max_pages=self.max_pages,
+                        strict=True,
+                    ),
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as exc:
+                fatal_error = safe_error_text(exc, limit=220)
+                logger.warning(
+                    "OKX position history mirror sync failed",
+                    mode=self.mode,
+                    error=fatal_error,
+                )
+            inst_ids = {
+                str(row.get("instId") or "").strip().upper()
+                for row in rows
+                if str(row.get("instId") or "").strip()
+            }
+            if not inst_ids:
+                inst_ids = await self._stored_inst_ids()
+            if inst_ids:
+                try:
+                    contract_specs = await asyncio.wait_for(
+                        native_facts.fetch_contract_specs(inst_ids=inst_ids),
+                        timeout=min(self.timeout_seconds, 5.0),
+                    )
+                except Exception as exc:
+                    contract_spec_error = safe_error_text(exc, limit=220)
+                    logger.warning(
+                        "OKX position history contract spec enrichment failed",
+                        mode=self.mode,
+                        error=contract_spec_error,
+                    )
         except Exception as exc:
-            fatal_error = safe_error_text(exc, limit=220)
+            if not fatal_error:
+                fatal_error = safe_error_text(exc, limit=220)
             logger.warning(
                 "OKX position history mirror sync failed",
                 mode=self.mode,
@@ -135,6 +166,9 @@ class OkxPositionHistoryMirrorSyncService:
                     error=safe_error_text(exc, limit=120),
                 )
 
+        if contract_specs:
+            await self._persist_contract_specs(contract_specs, synced_at=started_at)
+
         if fatal_error:
             return OkxPositionHistoryMirrorSyncSummary(
                 status="degraded",
@@ -146,9 +180,60 @@ class OkxPositionHistoryMirrorSyncService:
                 error=fatal_error,
             ).as_dict()
 
+        for row in rows:
+            inst_id = str(row.get("instId") or "").strip().upper()
+            spec = contract_specs.get(inst_id)
+            if spec:
+                row["_bb_contract_spec"] = dict(spec)
+            elif contract_spec_error:
+                row["_bb_contract_spec_error"] = contract_spec_error
+
         return (
             await self._persist_rows(rows, checked_at=started_at, since=since)
         ).as_dict()
+
+    async def _stored_inst_ids(self) -> set[str]:
+        async with self.session_context_factory() as session:
+            result = await session.execute(
+                select(OkxPositionHistory.inst_id).where(
+                    OkxPositionHistory.mode == self.mode
+                )
+            )
+            return {
+                str(value or "").strip().upper()
+                for value in result.scalars().all()
+                if str(value or "").strip()
+            }
+
+    async def _persist_contract_specs(
+        self,
+        specs: dict[str, dict[str, Any]],
+        *,
+        synced_at: datetime,
+    ) -> int:
+        if not specs:
+            return 0
+        async with self.session_context_factory() as session:
+            result = await session.execute(
+                select(OkxPositionHistory).where(
+                    OkxPositionHistory.mode == self.mode,
+                    OkxPositionHistory.inst_id.in_(sorted(specs)),
+                )
+            )
+            updated = 0
+            for record in result.scalars().all():
+                spec = specs.get(str(record.inst_id or "").strip().upper())
+                if not spec:
+                    continue
+                raw = dict(record.raw_row or {})
+                if raw.get("_bb_contract_spec") == spec:
+                    continue
+                raw["_bb_contract_spec"] = dict(spec)
+                raw.pop("_bb_contract_spec_error", None)
+                record.raw_row = raw
+                record.synced_at = synced_at
+                updated += 1
+            return updated
 
     async def _persist_rows(
         self,

@@ -7360,7 +7360,7 @@ class TradingService:
         try:
             from scripts.train_local_ai_tools_models import (
                 _completed_trade_sample_count,
-                _load_closed_position_samples,
+                _load_authoritative_trade_samples,
                 _load_sequence_samples,
                 _load_shadow_samples,
                 _load_text_sentiment_samples,
@@ -7375,10 +7375,10 @@ class TradingService:
             trade_reflection_samples = await _load_trade_reflection_samples(
                 LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
             )
-            closed_position_samples = await _load_closed_position_samples(
+            authoritative_samples = await _load_authoritative_trade_samples(
                 LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
             )
-            trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
+            trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
             sequence_samples = await _load_sequence_samples(
                 LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
             )

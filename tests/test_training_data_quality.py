@@ -327,7 +327,7 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
 
     trade = payload["trade_samples"][0]
     labels = trade["profit_learning_labels"]
-    assert labels["version"] == "profit-first-training-v1"
+    assert labels["version"] == "profit-first-training-v2"
     assert labels["training_supervision_ready"] is True
     assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
     assert labels["trade_profit_class"] == "cost_drag_loss"

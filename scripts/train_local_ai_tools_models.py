@@ -24,24 +24,16 @@ from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
-from models.trade import Order, Position
-from services.manual_close_marker import position_has_manual_close_order
+from models.trade import OkxPositionHistory, Order, Position
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_profit_first_promotion_report,
     load_latest_paper_observation_report,
 )
-from services.okx_order_fact_sync import (
-    OKX_SYNC_CONFIRMED,
-    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
-    OKX_SYNC_OKX_ONLY,
-)
+from services.okx_training_facts import build_okx_history_training_sample
 from services.okx_training_gate import okx_training_refresh_gate
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
-from services.trade_fact_trust import (
-    closed_position_trade_fact_untrusted_reason,
-)
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import annotate_training_payload
 
@@ -135,14 +127,6 @@ _LOCAL_AI_TOOLS_SHADOW_FEATURE_SNAPSHOT_KEYS = tuple(
     )
 )
 _LOCAL_AI_TOOLS_SHADOW_FEATURE_COLUMN_PREFIX = "local_tools_feature__"
-_TRAINING_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
-_TRAINING_REPAIR_SOURCES = {
-    "missing_closed_position_repair",
-    "okx_native_full_close_fill_correction",
-    "okx_order_pair_repair",
-    "okx_orphan_position_quarantine",
-    "okx_position_link_repair",
-}
 _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "kind",
     "primary_model",
@@ -196,96 +180,6 @@ def _snapshot(value: Any) -> dict[str, Any]:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
-
-
-def _trade_fact_metadata(position: Position | None) -> dict[str, Any]:
-    if position is None:
-        return {
-            "trade_fact_trusted": True,
-            "trade_fact_trust_reason": "",
-        }
-    trust_reason = closed_position_trade_fact_untrusted_reason(position) or ""
-    return {
-        "trade_fact_trusted": not bool(trust_reason),
-        "trade_fact_trust_reason": trust_reason,
-    }
-
-
-def _position_settlement_metadata(position: Position) -> dict[str, Any]:
-    raw = _snapshot(getattr(position, "settlement_raw", None))
-    funding_fee = getattr(position, "funding_fee", None)
-    return {
-        "pnl_source": getattr(position, "settlement_source", None) or "",
-        "settlement_status": getattr(position, "settlement_status", None) or "",
-        "settlement_source": getattr(position, "settlement_source", None) or "",
-        "close_fill_pnl": _as_float(getattr(position, "close_fill_pnl", None), 0.0),
-        "entry_fee": _as_float(getattr(position, "entry_fee", None), 0.0),
-        "close_fee": _as_float(getattr(position, "close_fee", None), 0.0),
-        "funding_fee": _as_float(funding_fee, 0.0) if funding_fee is not None else None,
-        "fee_source": raw.get("fee_source") or raw.get("fee_source_detail") or "",
-        "funding_fee_source": raw.get("funding_fee_source") or "",
-        "official_realized_pnl": raw.get("official_realized_pnl"),
-        "settlement_formula": raw.get("formula") or "",
-    }
-
-
-def _split_exchange_order_ids(value: Any) -> set[str]:
-    text = str(value or "").strip()
-    if not text:
-        return set()
-    tokens = {text}
-    for separator in (",", ";", "|", "\n", "\t", " "):
-        pieces: set[str] = set()
-        for token in tokens:
-            pieces.update(part.strip() for part in token.split(separator) if part.strip())
-        tokens = pieces
-    return {token for token in tokens if token}
-
-
-def _okx_confirmed_order_fee_by_id(orders: list[Order]) -> dict[str, float]:
-    confirmed_statuses = {
-        OKX_SYNC_CONFIRMED,
-        OKX_SYNC_OKX_ONLY,
-        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
-    }
-    confirmed: dict[str, float] = {}
-    for order in orders:
-        sync_status = str(getattr(order, "okx_sync_status", "") or "").lower().strip()
-        status = str(getattr(order, "status", "") or "").lower().strip()
-        if sync_status not in confirmed_statuses or status != "filled":
-            continue
-        fee = abs(_as_float(getattr(order, "fee", None), 0.0))
-        for order_id in _split_exchange_order_ids(getattr(order, "exchange_order_id", None)):
-            confirmed[order_id] = fee
-    return confirmed
-
-
-def _position_order_sync_reason(
-    position: Position,
-    confirmed_order_fee_by_id: dict[str, float],
-) -> str:
-    entry_ids = _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
-    close_ids = _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
-    confirmed_order_ids = set(confirmed_order_fee_by_id)
-    if not entry_ids or not any(order_id in confirmed_order_ids for order_id in entry_ids):
-        return "entry_order_not_okx_confirmed"
-    realized_pnl = _as_float(getattr(position, "realized_pnl", None), 0.0)
-    if realized_pnl != 0.0 and (
-        not close_ids or not any(order_id in confirmed_order_ids for order_id in close_ids)
-    ):
-        return "close_order_not_okx_confirmed"
-    return ""
-
-
-def _position_fee_estimate(
-    position: Position,
-    confirmed_order_fee_by_id: dict[str, float],
-) -> float:
-    order_ids = (
-        _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
-        | _split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
-    )
-    return sum(confirmed_order_fee_by_id.get(order_id, 0.0) for order_id in order_ids)
 
 
 def _trade_reflection_repair_source(reflection: TradeReflection) -> str:
@@ -622,20 +516,9 @@ async def _load_trade_reflection_samples(limit: int | None) -> list[dict[str, An
             stmt = stmt.limit(max(int(limit), 1))
         result = await session.execute(stmt)
         rows = list(result.scalars().all())
-        position_ids = {int(row.position_id or 0) for row in rows if int(row.position_id or 0) > 0}
-        positions_by_id = {}
-        if position_ids:
-            position_result = await session.execute(
-                select(Position).where(Position.id.in_(position_ids))
-            )
-            positions_by_id = {
-                int(position.id): position for position in position_result.scalars().all()
-            }
 
     samples: list[dict[str, Any]] = []
     for row in rows:
-        position = positions_by_id.get(int(row.position_id or 0))
-        trade_fact_metadata = _trade_fact_metadata(position)
         repair_source = _trade_reflection_repair_source(row)
         samples.append(
             {
@@ -655,7 +538,6 @@ async def _load_trade_reflection_samples(limit: int | None) -> list[dict[str, An
                 "outcome": row.outcome,
                 "reflection_source": _text(row.source),
                 "trade_fact_repair_source": repair_source,
-                **trade_fact_metadata,
             }
         )
     samples.reverse()
@@ -738,99 +620,67 @@ def _match_entry_decision_for_training(
     return best
 
 
-async def _load_closed_position_samples(limit: int | None) -> list[dict[str, Any]]:
+async def _load_authoritative_trade_samples(limit: int | None) -> list[dict[str, Any]]:
+    """Load one training sample per mirrored OKX positions-history lifecycle."""
+
     async with get_session_ctx() as session:
         stmt = (
-            select(Position)
-            .where(Position.is_open.is_(False), Position.closed_at.is_not(None))
-            .order_by(Position.closed_at.desc(), Position.id.desc())
+            select(OkxPositionHistory)
+            .order_by(
+                OkxPositionHistory.updated_at_okx.desc().nullslast(),
+                OkxPositionHistory.id.desc(),
+            )
         )
         if limit is not None:
             stmt = stmt.limit(max(int(limit), 1))
-        result = await session.execute(stmt)
-        rows = list(result.scalars().all())
-        symbols = {row.symbol for row in rows if row.symbol}
-        linked_order_ids = set()
-        for row in rows:
-            linked_order_ids.update(_split_exchange_order_ids(row.entry_exchange_order_id))
-            linked_order_ids.update(_split_exchange_order_ids(row.close_exchange_order_id))
-        manual_orders = []
-        if symbols:
-            manual_order_result = await session.execute(
-                select(Order).where(
-                    Order.symbol.in_(symbols),
-                    Order.exchange_order_id.like("manual_close:%"),
-                )
+        records = list((await session.execute(stmt)).scalars().all())
+        position_ids = {
+            int(value)
+            for record in records
+            for value in (record.position_ids or [])
+            if str(value or "").isdigit() and int(value) > 0
+        }
+        order_ids = {
+            str(value or "").strip()
+            for record in records
+            for value in [
+                *(record.entry_order_ids or []),
+                *(record.close_order_ids or []),
+                *(record.linked_order_ids or []),
+            ]
+            if str(value or "").strip()
+        }
+        positions_by_id: dict[int, Position] = {}
+        if position_ids:
+            position_rows = await session.execute(
+                select(Position).where(Position.id.in_(sorted(position_ids)))
             )
-            manual_orders = list(manual_order_result.scalars().all())
-        confirmed_order_fee_by_id = {}
-        if linked_order_ids:
-            order_result = await session.execute(
-                select(Order).where(Order.exchange_order_id.in_(sorted(linked_order_ids)))
+            positions_by_id = {
+                int(position.id): position for position in position_rows.scalars().all()
+            }
+        orders_by_exchange_id: dict[str, Order] = {}
+        if order_ids:
+            order_rows = await session.execute(
+                select(Order).where(Order.exchange_order_id.in_(sorted(order_ids)))
             )
-            confirmed_order_fee_by_id = _okx_confirmed_order_fee_by_id(
-                list(order_result.scalars().all())
-            )
+            orders_by_exchange_id = {
+                str(order.exchange_order_id): order
+                for order in order_rows.scalars().all()
+                if str(order.exchange_order_id or "").strip()
+            }
 
-    decision_raw_by_position_id = await _decision_raw_by_position_id(
-        {int(row.id or 0) for row in rows if int(row.id or 0) > 0}
-    )
-    samples: list[dict[str, Any]] = []
-    for row in rows:
-        if position_has_manual_close_order(row, manual_orders):
-            continue
-        opened = _as_utc(row.created_at)
-        closed = _as_utc(row.closed_at)
-        hold_minutes = 0.0
-        if opened and closed:
-            hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0)
-        trade_fact_metadata = _trade_fact_metadata(row)
-        order_sync_reason = _position_order_sync_reason(row, confirmed_order_fee_by_id)
-        if order_sync_reason:
-            trade_fact_metadata = {
-                **trade_fact_metadata,
-                "trade_fact_trusted": False,
-                "trade_fact_trust_reason": order_sync_reason,
-            }
-        samples.append(
-            {
-                "source": "closed_position",
-                "id": int(row.id or 0),
-                "position_id": int(row.id or 0),
-                "model_name": row.model_name,
-                "execution_mode": row.execution_mode,
-                "symbol": row.symbol,
-                "side": row.side,
-                "entry_price": _as_float(row.entry_price),
-                "exit_price": _as_float(row.current_price),
-                "quantity": _as_float(row.quantity),
-                "realized_pnl": _as_float(row.realized_pnl),
-                "fee_estimate": _position_fee_estimate(row, confirmed_order_fee_by_id),
-                "hold_minutes": hold_minutes,
-                "leverage": _as_float(row.leverage, 1.0),
-                "raw_llm_response": decision_raw_by_position_id.get(int(row.id or 0), {}),
-                "outcome": (
-                    "profit"
-                    if _as_float(row.realized_pnl) > 0
-                    else "loss" if _as_float(row.realized_pnl) < 0 else "flat"
-                ),
-                **_position_settlement_metadata(row),
-                **trade_fact_metadata,
-            }
+    decision_raw_by_position_id = await _decision_raw_by_position_id(position_ids)
+    samples = [
+        build_okx_history_training_sample(
+            record,
+            positions_by_id=positions_by_id,
+            orders_by_exchange_id=orders_by_exchange_id,
+            decision_raw_by_position_id=decision_raw_by_position_id,
         )
+        for record in records
+    ]
     samples.reverse()
     return samples
-
-
-def _trade_sample_key(sample: dict[str, Any]) -> str | None:
-    position_id = int(sample.get("position_id") or 0)
-    if position_id > 0:
-        return f"position:{position_id}"
-    source = str(sample.get("source") or "sample").strip()
-    sample_id = int(sample.get("id") or 0)
-    if sample_id > 0:
-        return f"{source}:{sample_id}"
-    return None
 
 
 def _deep_merge_trade_sample_dict(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -845,56 +695,52 @@ def _deep_merge_trade_sample_dict(base: dict[str, Any], extra: dict[str, Any]) -
     return merged
 
 
-def _merge_trade_sample_pair(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
-    primary_trusted = _sample_is_training_trusted(primary)
-    secondary_trusted = _sample_is_training_trusted(secondary)
-    if secondary.get("source") == "closed_position" and (
-        secondary_trusted or not primary_trusted
-    ):
-        merged = _deep_merge_trade_sample_dict(secondary, primary)
-        merged["source"] = "closed_position"
-        return merged
-    merged = _deep_merge_trade_sample_dict(primary, secondary)
-    if primary_trusted and not secondary_trusted:
-        merged["trade_fact_trusted"] = bool(primary.get("trade_fact_trusted", True))
-        merged["trade_fact_trust_reason"] = str(primary.get("trade_fact_trust_reason") or "")
-    return merged
-
-
-def _sample_is_training_trusted(sample: dict[str, Any]) -> bool:
-    trust_reason = str(sample.get("trade_fact_trust_reason") or "").strip()
-    if trust_reason:
-        return False
-    for candidate in (
-        str(sample.get("trade_fact_repair_source") or "").strip().lower(),
-        str(sample.get("reflection_source") or "").strip().lower(),
-    ):
-        if not candidate:
-            continue
-        if candidate in _TRAINING_REPAIR_SOURCES:
-            return False
-        if any(token in candidate for token in _TRAINING_REPAIR_SOURCE_MARKERS):
-            return False
-    return bool(sample.get("trade_fact_trusted", True))
-
-
 def _merge_trade_samples(
     reflection_samples: list[dict[str, Any]],
-    closed_position_samples: list[dict[str, Any]],
+    authoritative_samples: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    index_by_key: dict[str, int] = {}
-    for sample in [*reflection_samples, *closed_position_samples]:
-        key = _trade_sample_key(sample)
-        if not key:
-            merged.append(sample)
+    """Attach reflection features to official lifecycle samples without duplicating labels."""
+
+    merged = [
+        dict(sample)
+        for sample in authoritative_samples
+        if str(sample.get("source") or "").strip() == "okx_position_history"
+        and str(sample.get("lifecycle_key") or "").strip()
+    ]
+    index_by_position_id: dict[int, int] = {}
+    for index, sample in enumerate(merged):
+        position_ids = sample.get("position_ids") or [sample.get("position_id")]
+        for value in position_ids:
+            try:
+                position_id = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if position_id > 0:
+                index_by_position_id[position_id] = index
+    for reflection in reflection_samples:
+        repair_source = str(reflection.get("trade_fact_repair_source") or "").strip().lower()
+        reflection_source = str(reflection.get("reflection_source") or "").strip().lower()
+        if any(
+            candidate in _TRAINING_REPAIR_SOURCES
+            or any(token in candidate for token in _TRAINING_REPAIR_SOURCE_MARKERS)
+            for candidate in (repair_source, reflection_source)
+            if candidate
+        ):
             continue
-        existing_index = index_by_key.get(key)
-        if existing_index is None:
-            index_by_key[key] = len(merged)
-            merged.append(sample)
+        position_id = int(reflection.get("position_id") or 0)
+        index = index_by_position_id.get(position_id)
+        if index is None:
             continue
-        merged[existing_index] = _merge_trade_sample_pair(merged[existing_index], sample)
+        official = merged[index]
+        combined = _deep_merge_trade_sample_dict(official, reflection)
+        combined["source"] = "okx_position_history"
+        combined["realized_pnl"] = official.get("realized_pnl")
+        combined["fee_estimate"] = official.get("fee_estimate")
+        combined["funding_fee"] = official.get("funding_fee")
+        combined["pnl_source"] = official.get("pnl_source")
+        combined["trade_fact_trusted"] = official.get("trade_fact_trusted")
+        combined["trade_fact_trust_reason"] = official.get("trade_fact_trust_reason")
+        merged[index] = combined
     return merged
 
 
@@ -920,10 +766,10 @@ async def _completed_trade_sample_count() -> int:
     """
 
     reflection_samples = await _load_trade_reflection_samples(None)
-    closed_position_samples = await _load_closed_position_samples(None)
+    authoritative_samples = await _load_authoritative_trade_samples(None)
     payload = annotate_training_payload(
         shadow_samples=[],
-        trade_samples=_merge_trade_samples(reflection_samples, closed_position_samples),
+        trade_samples=_merge_trade_samples(reflection_samples, authoritative_samples),
         sequence_samples=[],
         text_sentiment_samples=[],
     )
@@ -1108,8 +954,8 @@ async def _main() -> None:
 
     shadow_samples = await _load_shadow_samples(args.shadow_limit)
     trade_reflection_samples = await _load_trade_reflection_samples(args.trade_limit)
-    closed_position_samples = await _load_closed_position_samples(args.trade_limit)
-    trade_samples = _merge_trade_samples(trade_reflection_samples, closed_position_samples)
+    authoritative_samples = await _load_authoritative_trade_samples(args.trade_limit)
+    trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
     sequence_samples = await _load_sequence_samples(args.sequence_limit)
     text_sentiment_samples = await _load_text_sentiment_samples(args.text_limit)
     training_payload = annotate_training_payload(
@@ -1118,6 +964,14 @@ async def _main() -> None:
         sequence_samples=sequence_samples,
         text_sentiment_samples=text_sentiment_samples,
     )
+    label_consistency = training_payload["quality_report"].get(
+        "training_label_consistency", {}
+    )
+    if label_consistency.get("promotion_blocked"):
+        raise SystemExit(
+            "Training labels failed algebra consistency checks: "
+            + json.dumps(label_consistency, ensure_ascii=False)
+        )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = await _completed_trade_sample_count()
     raw_trade_sample_count = len(trade_samples)
