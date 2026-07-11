@@ -39,9 +39,11 @@ from services.exchange_position_state import (
 from services.execution_reason_localizer import localize_execution_reason
 from services.high_risk_review_audit import HighRiskReviewAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
+from services.ml_signal_service import MLSignalService
 from services.model_dynamic_routing import ModelDynamicRoutingService
 from services.model_expert_competition import ModelExpertCompetitionService
 from services.model_expert_health import ModelExpertHealthService
+from services.model_training_registry import build_model_training_registry
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
@@ -4459,6 +4461,20 @@ async def _model_training_audit() -> dict[str, Any]:
         local_tools=local_tools if isinstance(local_tools, dict) else {},
         specialist_shadow_evaluation=specialist_shadow_evaluation,
     )
+    try:
+        local_ml_status = MLSignalService().status()
+    except Exception as exc:
+        local_ml_status = {
+            "available": False,
+            "status": "status_error",
+            "error": safe_error_text(exc, limit=180),
+        }
+    model_registry = build_model_training_registry(
+        local_ml_status=local_ml_status,
+        local_tools_status=local_tools if isinstance(local_tools, dict) else {},
+        specialist_report=specialist_shadow_evaluation,
+        model_server_report=_load_phase3_model_server_readiness_latest_report(),
+    )
     status = _status_from_counts(
         critical=hard_failure
         and (bool(model_critical) or local_tools_hard_missing or runtime_probe_hard_failure),
@@ -4511,6 +4527,7 @@ async def _model_training_audit() -> dict[str, Any]:
             },
             "phase3_training_governance": phase3_training_governance,
             "training_health_summary": training_health_summary,
+            "model_registry": model_registry,
             "phase3_rebuild_readiness": phase3_rebuild_readiness,
             "specialist_shadow_evaluation": {
                 "available": bool(specialist_shadow_evaluation.get("available")),

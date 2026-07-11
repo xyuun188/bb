@@ -1373,10 +1373,39 @@ async def _run_self_check_section(
     return await asyncio.wait_for(coro, timeout=timeout)
 
 
+async def _model_training_identity_item() -> dict[str, Any]:
+    registry = await _dash.get_model_training_registry_status()
+    summary = registry.get("summary") if isinstance(registry.get("summary"), dict) else {}
+    alias_only = summary.get("alias_only_models") if isinstance(summary.get("alias_only_models"), list) else []
+    identity_failures = (
+        summary.get("identity_failure_models")
+        if isinstance(summary.get("identity_failure_models"), list)
+        else []
+    )
+    status = "warning" if alias_only or identity_failures else "ok"
+    message = (
+        "模型身份、训练和推理状态一致。"
+        if status == "ok"
+        else "发现在线服务没有可验证的独立训练产物；该服务只能作为影子或兼容运行，不能冒充已训练模型。"
+    )
+    return _check_item(
+        "model_training_identity",
+        "模型身份与训练产物",
+        status,
+        message,
+        details={
+            "registry_version": registry.get("version"),
+            "alias_only_models": alias_only,
+            "identity_failure_models": identity_failures,
+            "summary": summary,
+        },
+    )
+
+
 @router.get("/system/self-check")
 async def system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
-    trading_result, monitor_result, data_result, recent_result = await asyncio.gather(
+    trading_result, monitor_result, data_result, recent_result, model_identity_result = await asyncio.gather(
         _run_self_check_section(_trading_service_running_item()),
         _run_self_check_section(
             get_server_monitor_status_async(),
@@ -1384,6 +1413,7 @@ async def system_self_check() -> dict[str, Any]:
         ),
         _run_self_check_section(_data_source_items()),
         _run_self_check_section(_recent_execution_items()),
+        _run_self_check_section(_model_training_identity_item()),
         return_exceptions=True,
     )
 
@@ -1461,6 +1491,19 @@ async def system_self_check() -> dict[str, Any]:
         )
     else:
         items.extend(recent_result)
+
+    if isinstance(model_identity_result, Exception):
+        items.append(
+            _check_item(
+                "model_training_identity",
+                "模型身份与训练产物",
+                "warning",
+                "模型身份注册表读取超时或失败。",
+                details={"error": safe_error_text(model_identity_result, limit=180)},
+            )
+        )
+    else:
+        items.append(model_identity_result)
 
     items = sorted(
         items, key=lambda item: (ISSUE_ORDER.get(str(item.get("status")), 9), item["key"])

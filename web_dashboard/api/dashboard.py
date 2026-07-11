@@ -69,6 +69,7 @@ from services.exchange_position_state import (
 )
 from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
+from services.model_training_registry import build_model_training_registry
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.runtime_entry_filters import entry_filters_from_context
 from services.server_monitor_status import get_server_monitor_status_async
@@ -4903,6 +4904,36 @@ async def get_local_ai_tools_status():
         except Exception as exc:
             _log_dashboard_fallback("local ai tools shadow count fallback", exc)
     return status
+
+
+def _load_model_training_report(relative_path: str) -> dict[str, Any]:
+    try:
+        payload = json.loads((settings.data_dir / relative_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+@router.get("/model-training/registry")
+async def get_model_training_registry_status() -> dict[str, Any]:
+    """Return one truthful lifecycle view for trained and pretrained models."""
+
+    local_ml_status = await get_ml_signal_status()
+    local_tools_status = await get_local_ai_tools_status()
+    specialist_report = _load_model_training_report(
+        "phase3/specialist_shadow_evaluation_latest.json"
+    )
+    model_server_report = _load_model_training_report(
+        "phase3_model_server_readiness_reports/latest.json"
+    )
+    return sanitize_payload(
+        build_model_training_registry(
+            local_ml_status=local_ml_status,
+            local_tools_status=local_tools_status,
+            specialist_report=specialist_report,
+            model_server_report=model_server_report,
+        )
+    )
 
 
 @router.get("/server-monitor/status")
